@@ -11,12 +11,21 @@ use std::{
     collections::BTreeSet,
     error::Error,
     fs::{self, File},
-    io::{self, Write},
+    io::{self, BufWriter, Seek, SeekFrom, Write},
     path::{Path, PathBuf},
 };
 
 pub(super) const SIDECAR_FILE_NAME: &str = "evidence.jsonl";
 const TEMP_FILE_PREFIX: &str = ".l2solver-evidence-case-";
+const RECORD_BUFFER_CAPACITY: usize = 64 * 1024;
+// The serialized first field prefix `{"case_id":"` occupies twelve bytes
+const CASE_ID_VALUE_OFFSET: u64 = 12;
+// Equal width lets the final digest replace this field without serializing the record again
+const CASE_ID_PLACEHOLDER: &str = concat!(
+    "case-", "00000000", "00000000", "00000000", "00000000", "00000000", "00000000", "00000000",
+    "00000000",
+);
+const CASE_ID_HASH_DOMAIN: &[u8] = b"l2solver-export-case-v2\0";
 
 /// Exact aggregate selection, retention, omission, and byte totals for Case evidence
 #[derive(Clone, Copy, Debug, Default, Serialize)]
@@ -63,25 +72,35 @@ impl EvidenceSidecar {
         scope: &Value,
     ) -> Result<EvidenceRecordResult, Box<dyn Error>> {
         self.coverage.selected_cases = evidence_add(self.coverage.selected_cases, 1)?;
-        let case_id = stable_case_id(scope, case, self.coverage.selected_cases)?;
         let spool_path = self.staging.join(format!(
             "{TEMP_FILE_PREFIX}{}.jsonl",
             self.coverage.selected_cases
         ));
-        let mut spool = File::options()
+        let spool_file = File::options()
             .write(true)
             .create_new(true)
             .open(&spool_path)?;
-        let record = CaseRecord::new(&case_id, scope, case);
+        let mut spool = BufWriter::with_capacity(
+            RECORD_BUFFER_CAPACITY,
+            HashingWriter::new(spool_file, self.coverage.selected_cases),
+        );
+        let record = CaseRecord::new(CASE_ID_PLACEHOLDER, scope, case);
         let write_result = serde_json::to_writer(&mut spool, &record)
-            .and_then(|()| spool.write_all(b"\n").map_err(serde_json::Error::io));
+            .and_then(|()| spool.write_all(b"\n").map_err(serde_json::Error::io))
+            .and_then(|()| spool.flush().map_err(serde_json::Error::io));
         if let Err(error) = write_result {
             drop(spool);
             fs::remove_file(&spool_path)?;
             return Err(error.into());
         }
+
+        // V2 hashes the JSONL record with a zero ID and the one-based ordinal prefix
+        // Persisted blob IDs already carry SHA-256 payload digests
+        let case_id = spool.get_mut().finish_case_id()?;
+        spool.seek(SeekFrom::Start(CASE_ID_VALUE_OFFSET))?;
+        spool.write_all(case_id.as_bytes())?;
         spool.flush()?;
-        let encoded_bytes = spool.metadata()?.len();
+        let encoded_bytes = spool.get_ref().inner.metadata()?.len();
         let retained_end = self
             .coverage
             .retained_bytes
@@ -126,29 +145,53 @@ fn evidence_add(value: u64, increment: u64) -> Result<u64, Box<dyn Error>> {
         .ok_or_else(|| "evidence coverage count overflow".into())
 }
 
-fn stable_case_id(scope: &Value, case: &Case, ordinal: u64) -> Result<String, Box<dyn Error>> {
-    let mut writer = HashingWriter(Sha256::new());
-    writer.write_all(b"l2solver-export-case-v1\0")?;
-    serde_json::to_writer(&mut writer, scope)?;
-    writer.write_all(b"\0case\0")?;
-    serde_json::to_writer(&mut writer, case)?;
-    writer.write_all(&ordinal.to_be_bytes())?;
-    Ok(format!("case-{:x}", writer.0.finalize()))
+struct HashingWriter<W> {
+    inner: W,
+    digest: Option<Sha256>,
 }
 
-struct HashingWriter(Sha256);
+impl<W> HashingWriter<W> {
+    fn new(inner: W, ordinal: u64) -> Self {
+        let mut digest = Sha256::new();
+        // The fixed-size ordinal prefix keeps otherwise identical source Cases distinct
+        digest.update(CASE_ID_HASH_DOMAIN);
+        digest.update(ordinal.to_be_bytes());
+        Self {
+            inner,
+            digest: Some(digest),
+        }
+    }
 
-impl Write for HashingWriter {
+    fn finish_case_id(&mut self) -> io::Result<String> {
+        let digest = self
+            .digest
+            .take()
+            .ok_or_else(|| io::Error::other("case digest was already finalized"))?;
+        Ok(format!("case-{:x}", digest.finalize()))
+    }
+}
+
+impl<W: Write> Write for HashingWriter<W> {
     fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
-        self.0.update(bytes);
+        self.inner.write_all(bytes)?;
+        if let Some(digest) = &mut self.digest {
+            digest.update(bytes);
+        }
         Ok(bytes.len())
     }
 
     fn flush(&mut self) -> io::Result<()> {
-        Ok(())
+        self.inner.flush()
     }
 }
 
+impl<W: Seek> Seek for HashingWriter<W> {
+    fn seek(&mut self, position: SeekFrom) -> io::Result<u64> {
+        self.inner.seek(position)
+    }
+}
+
+/// Field order is part of the v2 case identity encoding
 #[derive(Serialize)]
 struct CaseRecord<'a> {
     case_id: &'a str,

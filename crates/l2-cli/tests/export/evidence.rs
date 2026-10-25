@@ -4,6 +4,7 @@ use super::{
 };
 use l2_workbench::evidence::{Case, Edge, EvidenceStatus, SourceRange};
 use serde_json::{Value, json};
+use sha2::{Digest, Sha256};
 use std::{error::Error, fs};
 
 #[test]
@@ -241,6 +242,42 @@ fn same_scope_gets_distinct_case_ids_when_graph_content_differs() -> Result<(), 
     let second_result = sidecar.record_case(&second, &scope)?;
 
     assert_ne!(first_result.case_id, second_result.case_id);
+    Ok(())
+}
+
+#[test]
+fn case_id_matches_the_digest_of_its_persisted_record() -> Result<(), Box<dyn Error>> {
+    const CASE_ID_PREFIX: &[u8] = b"{\"case_id\":\"";
+    const HASH_DOMAIN: &[u8] = b"l2solver-export-case-v2\0";
+
+    let temporary = tempfile::tempdir()?;
+    let case = case_with_receipt(b"persisted record identity")?;
+    let scope = json!({"kind": "flow", "flow_id": 11});
+    let mut sidecar = EvidenceSidecar::new(temporary.path(), 1_000_000)?;
+    let record = sidecar.record_case(&case, &scope)?;
+    assert!(record.retained);
+    sidecar.finish()?;
+
+    let mut encoded = fs::read(temporary.path().join("evidence.jsonl"))?;
+    assert!(encoded.ends_with(b"\n"));
+    let placeholder = format!("case-{}", "0".repeat(64));
+    assert_eq!(record.case_id.len(), placeholder.len());
+    let id_start = CASE_ID_PREFIX.len();
+    let id_end = id_start + record.case_id.len();
+    assert_eq!(encoded.get(..id_start), Some(CASE_ID_PREFIX));
+    assert_eq!(
+        encoded.get(id_start..id_end),
+        Some(record.case_id.as_bytes())
+    );
+
+    encoded[id_start..id_end].copy_from_slice(placeholder.as_bytes());
+    let mut digest = Sha256::new();
+    digest.update(HASH_DOMAIN);
+    digest.update(1_u64.to_be_bytes());
+    digest.update(encoded);
+    let recomputed_id = format!("case-{:x}", digest.finalize());
+
+    assert_eq!(record.case_id, recomputed_id);
     Ok(())
 }
 
