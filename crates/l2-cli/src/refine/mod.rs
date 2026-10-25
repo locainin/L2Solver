@@ -29,19 +29,6 @@ use std::{
     path::Path,
 };
 
-/// Analyze one file or manifest-listed artifact directory and publish a new result directory
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "direct callers use the entry point without a shared job"
-    )
-)]
-pub fn run(options: &RefineOptions, output: &mut impl Write) -> Result<bool, Box<dyn Error>> {
-    let job = Job::new("refine files");
-    run_with_job(options, output, &job)
-}
-
 /// Run refinement while updating the shared job state and honoring cancellation
 pub fn run_with_job(
     options: &RefineOptions,
@@ -67,20 +54,23 @@ pub fn run_with_job(
     let identity = output::result_identity(&sources, &options.recovery, &policy)?;
 
     if !options.recovery.refresh
-        && let Some(reused) = result_directory.reuse(&identity, None, false)?
+        && let Some(reused) =
+            result_directory.reuse(&identity, None, options.recovery.strict_cache)?
     {
         skip_file_irrelevant_phases(job)?;
         record_source_counters(job, &sources)?;
         start_input_phases(job, &sources)?;
         skip_refinement_work_phases(job)?;
         job.increment(Counter::CacheHits, 1)?;
-        output::write_reused_summary(
-            output,
-            &destination,
-            reused.complete,
-            reused.artifacts.len(),
-            options.dry_run,
-        )?;
+        if !options.recovery.quiet {
+            output::write_reused_summary(
+                output,
+                &destination,
+                reused.complete,
+                reused.artifacts.len(),
+                options.dry_run,
+            )?;
+        }
         return Ok(reused.complete);
     }
 
@@ -205,15 +195,17 @@ fn analyze_and_publish<W: Write>(
 
     if options.dry_run {
         job.finish(Phase::Publication, PhaseOutcome::Skipped)?;
-        output::write_summary(
-            output,
-            destination,
-            &selected,
-            &analyzed.source_records,
-            analyzed.complete,
-            true,
-        )?;
-        output::write_cache_warnings(output, cache_warnings)?;
+        if !options.recovery.quiet {
+            output::write_summary(
+                output,
+                destination,
+                &selected,
+                &analyzed.source_records,
+                analyzed.complete,
+                true,
+            )?;
+            output::write_cache_warnings(output, cache_warnings)?;
+        }
         return Ok(analyzed.complete);
     }
 
@@ -224,15 +216,17 @@ fn analyze_and_publish<W: Write>(
         output::write_summary_file(staging, &summary)?;
         Ok(())
     })?;
-    output::write_summary(
-        output,
-        destination,
-        &selected,
-        &analyzed.source_records,
-        analyzed.complete,
-        false,
-    )?;
-    output::write_cache_warnings(output, cache_warnings)?;
+    if !options.recovery.quiet {
+        output::write_summary(
+            output,
+            destination,
+            &selected,
+            &analyzed.source_records,
+            analyzed.complete,
+            false,
+        )?;
+        output::write_cache_warnings(output, cache_warnings)?;
+    }
     Ok(analyzed.complete)
 }
 

@@ -1,6 +1,7 @@
 use std::{
     error::Error,
     fs,
+    io::Write,
     path::{Path, PathBuf},
 };
 
@@ -10,8 +11,13 @@ use serde_json::json;
 use super::policy::RefinePolicy;
 use super::{
     LoadedSource, analyze_source_cached, analyzer_options, default_output_path, prepare_input_set,
-    read_sources, result_identity, run, run_with_job,
+    read_sources, result_identity, run_with_job,
 };
+
+fn run(options: &RefineOptions, output: &mut impl Write) -> Result<bool, Box<dyn Error>> {
+    let job = l2_workbench::job::Job::new("refine test");
+    run_with_job(options, output, &job)
+}
 
 #[test]
 fn manifest_input_uses_only_listed_artifacts_and_ignores_sidecars() -> Result<(), Box<dyn Error>> {
@@ -329,6 +335,77 @@ fn matching_result_directory_is_reused_before_artifact_analysis() -> Result<(), 
             .map(|phase| phase.state),
         Some(l2_workbench::job::PhaseState::Skipped)
     );
+    Ok(())
+}
+
+#[test]
+fn strict_reuse_rejects_mutated_artifact_bytes() -> Result<(), Box<dyn Error>> {
+    let directory = tempfile::tempdir()?;
+    let input = directory.path().join("source.bin");
+    let output_dir = directory.path().join("result.refined");
+    let png = structural_png()?;
+    fs::write(&input, &png)?;
+    let mut recovery = RecoveryOptions::default();
+    recovery.no_cache = true;
+    let mut options = RefineOptions {
+        input,
+        output: Some(output_dir.clone()),
+        dry_run: false,
+        salvage: false,
+        recovery,
+    };
+    let mut first_output = Vec::new();
+    assert!(run(&options, &mut first_output)?);
+
+    let manifest: serde_json::Value =
+        serde_json::from_slice(&fs::read(output_dir.join("manifest.json"))?)?;
+    let artifact_file = manifest["artifacts"][0]["file"]
+        .as_str()
+        .ok_or("manifest artifact name is missing")?;
+    let artifact_path = output_dir.join(artifact_file);
+    let mut mutated = fs::read(&artifact_path)?;
+    let first_byte = mutated.first_mut().ok_or("artifact is empty")?;
+    *first_byte ^= 0xff;
+    fs::write(&artifact_path, &mutated)?;
+
+    options.recovery.strict_cache = true;
+    let error = run(&options, &mut Vec::new())
+        .err()
+        .ok_or("strict reuse accepted mutated artifact bytes")?;
+
+    assert!(
+        error
+            .to_string()
+            .contains("result output changed after publication")
+    );
+    assert_eq!(fs::read(artifact_path)?, mutated);
+    Ok(())
+}
+
+#[test]
+fn quiet_mode_suppresses_fresh_and_reused_completion_messages() -> Result<(), Box<dyn Error>> {
+    let directory = tempfile::tempdir()?;
+    let input = directory.path().join("source.bin");
+    let output_dir = directory.path().join("result.refined");
+    fs::write(&input, structural_png()?)?;
+    let mut recovery = RecoveryOptions::default();
+    recovery.no_cache = true;
+    recovery.quiet = true;
+    let options = RefineOptions {
+        input,
+        output: Some(output_dir),
+        dry_run: false,
+        salvage: false,
+        recovery,
+    };
+
+    let mut fresh_output = Vec::new();
+    assert!(run(&options, &mut fresh_output)?);
+    let mut reused_output = Vec::new();
+    assert!(run(&options, &mut reused_output)?);
+
+    assert!(fresh_output.is_empty());
+    assert!(reused_output.is_empty());
     Ok(())
 }
 
