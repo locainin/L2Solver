@@ -1,5 +1,6 @@
 //! Inspect, reuse, and atomically publish owned extraction and refinement directories
 
+mod bounded;
 mod manifest;
 mod publish;
 mod reuse;
@@ -30,8 +31,10 @@ pub struct ResultIdentity {
     /// Version of the result-producing algorithm
     pub algorithm_version: u32,
     /// Strong or fast identity for the source inputs
+    #[serde(deserialize_with = "bounded::deserialize_source_identity")]
     pub source: SourceIdentity,
     /// Canonically encoded algorithm settings
+    #[serde(deserialize_with = "bounded::deserialize_settings")]
     pub settings: Value,
 }
 

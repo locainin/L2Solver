@@ -12,10 +12,15 @@ const HASH_BUFFER_BYTES: usize = 64 * 1024;
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct OutputFileStamp {
     /// Safe flat output file name
+    #[serde(deserialize_with = "super::bounded::deserialize_file_name")]
     pub file: String,
     /// File size in bytes
     pub byte_length: u64,
     /// SHA-256 available from the manifest or calculated once for strict verification
+    #[serde(
+        default,
+        deserialize_with = "super::bounded::deserialize_optional_sha256"
+    )]
     pub sha256: Option<String>,
     /// Device number when the platform exposes one
     pub device_id: Option<u64>,

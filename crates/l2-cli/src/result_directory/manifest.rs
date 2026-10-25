@@ -1,11 +1,12 @@
-use super::{ResultIdentity, ResultKind};
+use super::{ResultIdentity, ResultKind, bounded};
 use crate::{publish, safe_filename::is_safe_flat_file_name};
 use l2_workbench::{job::JobSnapshot, job::cache::SourceIdentity};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use std::{
     collections::{BTreeMap, BTreeSet},
     error::Error,
-    fs, io,
+    fs,
+    io::{self, Read},
     path::Path,
 };
 
@@ -17,6 +18,12 @@ const EVIDENCE_FILE: &str = "evidence.jsonl";
 const LIMITATIONS_FILE: &str = "limitations.txt";
 const MAX_DIRECTORY_ENTRIES: usize = 100_000;
 const MAX_MANIFEST_BYTES: u64 = 512 * 1024 * 1024;
+/// Matches the default extraction artifact-count ceiling
+pub(super) const MAX_RESULT_ARTIFACTS: usize = 16_384;
+/// Matches the maximum refinement source-record count
+pub(super) const MAX_RESULT_SOURCES: usize = 4_096;
+/// Allows one stamp for each artifact and each declared metadata output
+pub(super) const MAX_RESULT_OUTPUT_STAMPS: usize = MAX_RESULT_ARTIFACTS + 3;
 
 /// State retained after the destination has been inspected
 pub(super) enum DirectoryState {
@@ -54,11 +61,13 @@ pub(super) struct OwnedManifest {
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
 pub(super) struct ManifestArtifact {
     /// Safe flat artifact name
+    #[serde(deserialize_with = "bounded::deserialize_file_name")]
     pub file: String,
     /// Byte length recorded by the generating workflow
     pub byte_length: u64,
     /// Strong digest when the workflow's manifest already contains one
     #[serde(default)]
+    #[serde(deserialize_with = "bounded::deserialize_optional_sha256")]
     pub sha256: Option<String>,
 }
 
@@ -72,12 +81,16 @@ pub(super) struct ResultReceipt {
     /// Whether the published result completed every requested component
     pub complete: bool,
     /// Strong source identities copied from the generating manifest
+    #[serde(deserialize_with = "bounded::deserialize_source_digests")]
     pub source_sha256s: Vec<String>,
     /// Strong identity for the complete ordered source set
+    #[serde(deserialize_with = "bounded::deserialize_sha256")]
     pub source_identity_sha256: String,
     /// Job state at the start of atomic publication
+    #[serde(deserialize_with = "bounded::deserialize_job_snapshot")]
     pub job: JobSnapshot,
     /// File stamps for every output except the manifest containing this receipt
+    #[serde(deserialize_with = "bounded::deserialize_output_stamps")]
     pub output_files: Vec<OutputFileStamp>,
 }
 
@@ -85,14 +98,17 @@ pub(super) struct ResultReceipt {
 struct RawManifest {
     schema_version: u32,
     #[serde(default)]
+    #[serde(deserialize_with = "bounded::deserialize_status")]
     export_status: Option<String>,
     #[serde(default)]
     complete: Option<bool>,
     #[serde(default)]
     full_source_coverage: Option<RawFullSourceCoverage>,
     #[serde(default)]
+    #[serde(deserialize_with = "bounded::deserialize_optional_sources")]
     sources: Option<Vec<RawSource>>,
     #[serde(default)]
+    #[serde(deserialize_with = "bounded::deserialize_artifacts")]
     artifacts: Vec<ManifestArtifact>,
     #[serde(default)]
     l2solver_result: Option<ResultReceipt>,
@@ -105,12 +121,14 @@ struct RawFullSourceCoverage {
 
 #[derive(Deserialize)]
 struct RawSourceIdentity {
+    #[serde(deserialize_with = "bounded::deserialize_source_id")]
     source_id: String,
 }
 
 #[derive(Deserialize)]
 struct RawSource {
     byte_length: u64,
+    #[serde(deserialize_with = "bounded::deserialize_sha256")]
     sha256: String,
 }
 
@@ -150,9 +168,10 @@ fn inspect_existing(
             "could not safely open the existing result manifest: {error}"
         ))
     })?;
-    let raw = read_manifest(manifest_file).map_err(|error| {
+    let (raw, manifest_identity) = read_manifest(manifest_file).map_err(|error| {
         actionable_conflict(&format!("existing result manifest is invalid: {error}"))
     })?;
+    verify_named_manifest(&prepared, manifest_identity)?;
     inspect_prepared(path, kind, prepared, raw).map_err(|error| {
         actionable_conflict(&format!(
             "existing result directory cannot be reused: {error}"
@@ -247,20 +266,141 @@ pub(super) fn staged_output_files(
     validate_staged_entries(path, kind, manifest, None)
 }
 
-fn read_manifest<T: DeserializeOwned>(file: fs::File) -> Result<T, Box<dyn Error>> {
-    if file.metadata()?.len() > MAX_MANIFEST_BYTES {
-        return Err(invalid_result("result manifest exceeds the safe size limit").into());
-    }
-    Ok(serde_json::from_reader(file)?)
+fn read_manifest<T: DeserializeOwned>(
+    file: fs::File,
+) -> Result<(T, ManifestFileIdentity), Box<dyn Error>> {
+    deserialize_limited_manifest(file, MAX_MANIFEST_BYTES)
 }
 
 fn read_manifest_path<T: DeserializeOwned>(path: &Path) -> Result<T, Box<dyn Error>> {
     let manifest_path = path.join(MANIFEST_FILE);
     let file = super::stamp::open_regular_path(&manifest_path)?;
-    if file.metadata()?.len() > MAX_MANIFEST_BYTES {
+    let (value, identity) = deserialize_limited_manifest(file, MAX_MANIFEST_BYTES)?;
+    let current = super::stamp::open_regular_path(&manifest_path)?;
+    ensure_same_manifest_identity(
+        identity,
+        ManifestFileIdentity::from_metadata(&current.metadata()?)?,
+    )?;
+    Ok(value)
+}
+
+fn deserialize_limited_manifest<T: DeserializeOwned>(
+    mut file: fs::File,
+    maximum_bytes: u64,
+) -> Result<(T, ManifestFileIdentity), Box<dyn Error>> {
+    let before = ManifestFileIdentity::from_metadata(&file.metadata()?)?;
+    if before.length > maximum_bytes {
         return Err(invalid_result("result manifest exceeds the safe size limit").into());
     }
-    Ok(serde_json::from_reader(file)?)
+    let value = deserialize_manifest_value(&mut file, maximum_bytes)?;
+    let after = ManifestFileIdentity::from_metadata(&file.metadata()?)?;
+    ensure_same_manifest_identity(before, after)?;
+    Ok((value, after))
+}
+
+pub(super) fn deserialize_manifest_value<T: DeserializeOwned>(
+    file: &mut fs::File,
+    maximum_bytes: u64,
+) -> Result<T, Box<dyn Error>> {
+    let read_limit = maximum_bytes
+        .checked_add(1)
+        .ok_or_else(|| invalid_result("result manifest size limit overflow"))?;
+    let mut limited = (&mut *file).take(read_limit);
+    let value = {
+        let mut deserializer = serde_json::Deserializer::from_reader(&mut limited);
+        let value = T::deserialize(&mut deserializer)?;
+        deserializer.end()?;
+        value
+    };
+    if limited.limit() == 0 {
+        return Err(invalid_result("result manifest exceeds the safe size limit").into());
+    }
+    Ok(value)
+}
+
+fn verify_named_manifest(
+    prepared: &publish::PreparedDirectoryReplacement,
+    expected: ManifestFileIdentity,
+) -> Result<(), Box<dyn Error>> {
+    let file = prepared.open_file(MANIFEST_FILE)?;
+    ensure_same_manifest_identity(
+        expected,
+        ManifestFileIdentity::from_metadata(&file.metadata()?)?,
+    )?;
+    prepared.check_location()?;
+    Ok(())
+}
+
+pub(super) fn ensure_same_manifest_identity(
+    expected: ManifestFileIdentity,
+    actual: ManifestFileIdentity,
+) -> io::Result<()> {
+    if expected != actual {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "result manifest changed while it was parsed",
+        ));
+    }
+    Ok(())
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) struct ManifestFileIdentity {
+    length: u64,
+    #[cfg(unix)]
+    device_id: u64,
+    #[cfg(unix)]
+    file_id: u64,
+    #[cfg(unix)]
+    modified_seconds: i64,
+    #[cfg(unix)]
+    modified_nanoseconds: i64,
+    #[cfg(unix)]
+    changed_seconds: i64,
+    #[cfg(unix)]
+    changed_nanoseconds: i64,
+    #[cfg(unix)]
+    link_count: u64,
+    #[cfg(not(unix))]
+    modified: Option<std::time::SystemTime>,
+}
+
+impl ManifestFileIdentity {
+    pub(super) fn from_metadata(metadata: &fs::Metadata) -> io::Result<Self> {
+        if !metadata.is_file() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "result manifest is not a regular file",
+            ));
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            if metadata.nlink() != 1 {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "result manifest has multiple hard links",
+                ));
+            }
+            Ok(Self {
+                length: metadata.len(),
+                device_id: metadata.dev(),
+                file_id: metadata.ino(),
+                modified_seconds: metadata.mtime(),
+                modified_nanoseconds: metadata.mtime_nsec(),
+                changed_seconds: metadata.ctime(),
+                changed_nanoseconds: metadata.ctime_nsec(),
+                link_count: metadata.nlink(),
+            })
+        }
+        #[cfg(not(unix))]
+        {
+            Ok(Self {
+                length: metadata.len(),
+                modified: metadata.modified().ok(),
+            })
+        }
+    }
 }
 
 fn manifest_identity_facts(

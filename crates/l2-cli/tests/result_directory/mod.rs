@@ -1,4 +1,4 @@
-use l2_workbench::job::{Job, Phase, PhaseState, cache::SourceIdentity};
+use l2_workbench::job::{Job, Phase, PhaseState, cache::SourceFingerprint, cache::SourceIdentity};
 use serde_json::json;
 use std::{error::Error, fs, io, path::PathBuf};
 use tempfile::TempDir;
@@ -117,6 +117,25 @@ fn newly_published_complete_result_is_reused_with_declared_artifacts() -> TestRe
 }
 
 #[test]
+fn bounded_identity_deserialization_accepts_fast_source_fingerprints() -> TestResult {
+    let fixture = Fixture::new()?;
+    let identity = ResultIdentity {
+        kind: ResultKind::Extract,
+        algorithm_version: 1,
+        source: SourceIdentity::Fast(SourceFingerprint::fast(&fixture.input)?),
+        settings: json!({"profile": "balanced"}),
+    };
+    let serialized = serde_json::to_vec(&identity)?;
+    let parsed: ResultIdentity = serde_json::from_slice(&serialized)?;
+    assert_eq!(parsed, identity);
+
+    let mut value = serde_json::to_value(&identity)?;
+    value["source"]["value"]["sample_sha256"] = json!("invalid");
+    assert!(serde_json::from_value::<ResultIdentity>(value).is_err());
+    Ok(())
+}
+
+#[test]
 fn partial_result_is_reused_as_partial_not_a_complete_negative() -> TestResult {
     let fixture = Fixture::new()?;
     fixture.publish("partial", b"partial-artifact")?;
@@ -201,6 +220,267 @@ fn strict_reuse_detects_same_length_changed_input() -> TestResult {
             .is_err()
     );
     Ok(())
+}
+
+#[test]
+fn result_manifest_rejects_artifact_arrays_above_the_export_budget() -> TestResult {
+    let fixture = Fixture::new()?;
+    fixture.publish("complete", b"artifact-content")?;
+    let mut manifest = read_manifest(&fixture.output)?;
+    manifest["artifacts"] = json!(
+        (0..crate::result_directory::manifest::MAX_RESULT_ARTIFACTS + 1)
+            .map(|index| json!({
+                "file": format!("artifact-{index}.bin"),
+                "byte_length": 1,
+                "provenance": []
+            }))
+            .collect::<Vec<_>>()
+    );
+    write_manifest(&fixture.output, &manifest)?;
+
+    assert_manifest_limit_error(&fixture.output, ResultKind::Extract)
+}
+
+#[test]
+fn result_manifest_rejects_oversized_artifact_names_during_deserialization() -> TestResult {
+    let fixture = Fixture::new()?;
+    fixture.publish("complete", b"artifact-content")?;
+    let mut manifest = read_manifest(&fixture.output)?;
+    manifest["artifacts"][0]["file"] = json!("a".repeat(256));
+    write_manifest(&fixture.output, &manifest)?;
+
+    assert_manifest_limit_error(&fixture.output, ResultKind::Extract)
+}
+
+#[test]
+fn result_manifest_rejects_malformed_json() -> TestResult {
+    let fixture = Fixture::new()?;
+    fixture.publish("complete", b"artifact-content")?;
+    fs::write(
+        fixture.output.join("manifest.json"),
+        b"{\"schema_version\":",
+    )?;
+
+    assert!(ResultDirectory::inspect(&fixture.output, ResultKind::Extract).is_err());
+    Ok(())
+}
+
+#[test]
+fn result_manifest_rejects_refine_source_arrays_above_the_input_budget() -> TestResult {
+    let root = tempfile::tempdir()?;
+    let output = root.path().join("refined");
+    publish_refine_result(&output)?;
+    let mut manifest = read_manifest(&output)?;
+    manifest["sources"] = json!(
+        (0..crate::result_directory::manifest::MAX_RESULT_SOURCES + 1)
+            .map(|_| json!({"byte_length": 1, "sha256": "a".repeat(64)}))
+            .collect::<Vec<_>>()
+    );
+    write_manifest(&output, &manifest)?;
+
+    assert_manifest_limit_error(&output, ResultKind::Refine)
+}
+
+#[test]
+fn result_receipt_rejects_output_stamps_above_the_artifact_budget() -> TestResult {
+    let fixture = Fixture::new()?;
+    fixture.publish("complete", b"artifact-content")?;
+    let mut manifest = read_manifest(&fixture.output)?;
+    let stamp = json!({
+        "file": "artifact.bin",
+        "byte_length": 16,
+        "sha256": "a".repeat(64),
+        "device_id": null,
+        "file_id": null,
+        "modified_seconds": null,
+        "modified_nanoseconds": null,
+        "changed_seconds": null,
+        "changed_nanoseconds": null
+    });
+    manifest["l2solver_result"]["output_files"] = json!(vec![
+        stamp;
+        crate::result_directory::manifest::MAX_RESULT_OUTPUT_STAMPS
+            + 1
+    ]);
+    write_manifest(&fixture.output, &manifest)?;
+
+    assert_manifest_limit_error(&fixture.output, ResultKind::Extract)
+}
+
+#[test]
+fn result_receipt_rejects_source_digest_arrays_above_the_input_budget() -> TestResult {
+    let fixture = Fixture::new()?;
+    fixture.publish("complete", b"artifact-content")?;
+    let mut manifest = read_manifest(&fixture.output)?;
+    manifest["l2solver_result"]["source_sha256s"] = json!(vec![
+        "a".repeat(64);
+        crate::result_directory::manifest::MAX_RESULT_SOURCES
+            + 1
+    ]);
+    write_manifest(&fixture.output, &manifest)?;
+
+    assert_manifest_limit_error(&fixture.output, ResultKind::Extract)
+}
+
+#[test]
+fn result_receipt_rejects_settings_arrays_over_the_node_budget() -> TestResult {
+    let fixture = Fixture::new()?;
+    fixture.publish("complete", b"artifact-content")?;
+    let mut manifest = read_manifest(&fixture.output)?;
+    let values = vec![false; crate::result_directory::bounded::MAX_SETTINGS_ITEMS];
+    manifest["l2solver_result"]["identity"]["settings"] = json!(vec![values; 5]);
+    write_manifest(&fixture.output, &manifest)?;
+
+    assert_manifest_limit_error(&fixture.output, ResultKind::Extract)
+}
+
+#[test]
+fn result_receipt_rejects_settings_maps_over_the_entry_budget() -> TestResult {
+    let fixture = Fixture::new()?;
+    fixture.publish("complete", b"artifact-content")?;
+    let mut manifest = read_manifest(&fixture.output)?;
+    manifest["l2solver_result"]["identity"]["settings"] = json!(
+        (0..crate::result_directory::bounded::MAX_SETTINGS_ITEMS + 1)
+            .map(|index| (format!("setting-{index}"), json!(true)))
+            .collect::<serde_json::Map<_, _>>()
+    );
+    write_manifest(&fixture.output, &manifest)?;
+
+    assert_manifest_limit_error(&fixture.output, ResultKind::Extract)
+}
+
+#[test]
+fn result_receipt_rejects_individually_oversized_settings_strings() -> TestResult {
+    let fixture = Fixture::new()?;
+    fixture.publish("complete", b"artifact-content")?;
+    let mut manifest = read_manifest(&fixture.output)?;
+    manifest["l2solver_result"]["identity"]["settings"]["large"] = json!("s".repeat(64 * 1024 + 1));
+    write_manifest(&fixture.output, &manifest)?;
+
+    assert_manifest_limit_error(&fixture.output, ResultKind::Extract)
+}
+
+#[test]
+fn result_receipt_rejects_phase_arrays_over_the_snapshot_budget() -> TestResult {
+    let fixture = Fixture::new()?;
+    fixture.publish("complete", b"artifact-content")?;
+    let mut manifest = read_manifest(&fixture.output)?;
+    let phase = manifest["l2solver_result"]["job"]["phases"][0].clone();
+    manifest["l2solver_result"]["job"]["phases"] = json!(vec![phase; 65]);
+    write_manifest(&fixture.output, &manifest)?;
+
+    assert_manifest_limit_error(&fixture.output, ResultKind::Extract)
+}
+
+#[test]
+fn result_manifest_keeps_large_unrelated_report_fields_streamed() -> TestResult {
+    let fixture = Fixture::new()?;
+    fixture.publish("complete", b"artifact-content")?;
+    let mut manifest = read_manifest(&fixture.output)?;
+    manifest["large_report_field"] = json!("r".repeat(2 * 1024 * 1024));
+    write_manifest(&fixture.output, &manifest)?;
+
+    ResultDirectory::inspect(&fixture.output, ResultKind::Extract)?;
+    Ok(())
+}
+
+#[test]
+fn result_manifest_reader_enforces_the_limit_after_open() -> TestResult {
+    let root = tempfile::tempdir()?;
+    let path = root.path().join("manifest.json");
+    fs::write(&path, br#"{"a":1}"#)?;
+
+    let mut exact_limit = fs::File::open(&path)?;
+    let parsed: serde_json::Value =
+        crate::result_directory::manifest::deserialize_manifest_value(&mut exact_limit, 7)?;
+    assert_eq!(parsed["a"], 1);
+
+    let mut lower_limit = fs::File::open(&path)?;
+    assert!(
+        crate::result_directory::manifest::deserialize_manifest_value::<serde_json::Value>(
+            &mut lower_limit,
+            6
+        )
+        .is_err()
+    );
+    Ok(())
+}
+
+#[cfg(unix)]
+#[test]
+fn result_manifest_identity_detects_replacement_after_parse() -> TestResult {
+    let root = tempfile::tempdir()?;
+    let manifest = root.path().join("manifest.json");
+    let replacement = root.path().join("replacement.json");
+    fs::write(&manifest, b"original")?;
+    let before = crate::result_directory::manifest::ManifestFileIdentity::from_metadata(
+        &fs::File::open(&manifest)?.metadata()?,
+    )?;
+
+    fs::write(&replacement, b"replaced")?;
+    fs::rename(&replacement, &manifest)?;
+    let after = crate::result_directory::manifest::ManifestFileIdentity::from_metadata(
+        &fs::File::open(&manifest)?.metadata()?,
+    )?;
+
+    assert!(
+        crate::result_directory::manifest::ensure_same_manifest_identity(before, after).is_err()
+    );
+    Ok(())
+}
+
+fn read_manifest(directory: &std::path::Path) -> TestResult<serde_json::Value> {
+    Ok(serde_json::from_slice(&fs::read(
+        directory.join("manifest.json"),
+    )?)?)
+}
+
+fn write_manifest(directory: &std::path::Path, manifest: &serde_json::Value) -> TestResult {
+    fs::write(
+        directory.join("manifest.json"),
+        serde_json::to_vec(manifest)?,
+    )?;
+    Ok(())
+}
+
+fn assert_manifest_limit_error(path: &std::path::Path, kind: ResultKind) -> TestResult {
+    let error = match ResultDirectory::inspect(path, kind) {
+        Ok(_) => return Err("over-limit result manifest should be rejected during parsing".into()),
+        Err(error) => error,
+    };
+    let message = error.to_string();
+    assert!(message.contains("limit"), "{message}");
+    Ok(())
+}
+
+fn publish_refine_result(output: &std::path::Path) -> TestResult<ResultIdentity> {
+    let source_bytes = b"one refine source";
+    let source_sha256 = l2_workbench::sha256(source_bytes);
+    let source_identity_sha256 = crate::refine::refine_source_identity_sha256([(
+        u64::try_from(source_bytes.len())?,
+        source_sha256.as_str(),
+    )])?;
+    let identity = ResultIdentity {
+        kind: ResultKind::Refine,
+        algorithm_version: 1,
+        source: SourceIdentity::from_sha256(source_identity_sha256)?,
+        settings: json!({"profile": "balanced"}),
+    };
+    let destination = ResultDirectory::inspect(output, ResultKind::Refine)?;
+    destination.publish(&identity, &Job::new("refine"), |staging| {
+        fs::write(staging.join("summary.txt"), b"refined summary")?;
+        fs::write(
+            staging.join("manifest.json"),
+            serde_json::to_vec(&json!({
+                "schema_version": 1,
+                "complete": true,
+                "sources": [{"byte_length": source_bytes.len(), "sha256": source_sha256}],
+                "artifacts": []
+            }))?,
+        )?;
+        Ok(())
+    })?;
+    Ok(identity)
 }
 
 #[test]
@@ -334,32 +614,7 @@ fn legacy_extract_requires_explicit_refresh() -> TestResult {
 fn refine_result_identity_uses_the_ordered_manifest_source_set() -> TestResult {
     let root = tempfile::tempdir()?;
     let output = root.path().join("refined");
-    let source_bytes = b"one refine source";
-    let source_sha256 = l2_workbench::sha256(source_bytes);
-    let source_identity_sha256 = crate::refine::refine_source_identity_sha256([(
-        u64::try_from(source_bytes.len())?,
-        source_sha256.as_str(),
-    )])?;
-    let identity = ResultIdentity {
-        kind: ResultKind::Refine,
-        algorithm_version: 1,
-        source: SourceIdentity::from_sha256(source_identity_sha256)?,
-        settings: json!({"profile": "balanced"}),
-    };
-    let destination = ResultDirectory::inspect(&output, ResultKind::Refine)?;
-    destination.publish(&identity, &Job::new("refine"), |staging| {
-        fs::write(staging.join("summary.txt"), b"refined summary")?;
-        fs::write(
-            staging.join("manifest.json"),
-            serde_json::to_vec(&json!({
-                "schema_version": 1,
-                "complete": true,
-                "sources": [{"byte_length": source_bytes.len(), "sha256": source_sha256}],
-                "artifacts": []
-            }))?,
-        )?;
-        Ok(())
-    })?;
+    let identity = publish_refine_result(&output)?;
 
     let existing = ResultDirectory::inspect(&output, ResultKind::Refine)?;
     let reused = existing
