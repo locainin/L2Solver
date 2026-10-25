@@ -43,6 +43,57 @@ def run_with_group_signal_observer(command, directory, timeout):
 
 
 class ProcessTests(unittest.TestCase):
+    @unittest.skipUnless(sys.platform == "linux", "requires Linux process metrics")
+    def test_child_cpu_and_io_metrics_cover_analyzer_work(self):
+        with tempfile.TemporaryDirectory() as directory:
+            payload_size = 262_144
+            command = [
+                sys.executable,
+                "-c",
+                textwrap.dedent(
+                    f"""
+                    import os
+                    payload = b'x' * {payload_size}
+                    with open('input.bin', 'wb') as target:
+                        target.write(payload)
+                        target.flush()
+                        os.fsync(target.fileno())
+                    with open('input.bin', 'rb') as source:
+                        observed = source.read()
+                    checksum = 0
+                    for value in range(500_000):
+                        checksum = (checksum + value) & 0xffffffff
+                    with open('output.bin', 'wb') as target:
+                        target.write(observed)
+                        target.flush()
+                        os.fsync(target.fileno())
+                    """
+                ),
+            ]
+
+            result = run_child(command, Path(directory), 5)
+
+            self.assertEqual(result[:3], (0, None, None))
+            metrics = result[3]
+            self.assertGreater(metrics["user_cpu_seconds"], 0)
+            self.assertGreaterEqual(metrics["system_cpu_seconds"], 0)
+            self.assertEqual(
+                metrics["cpu_measurement_scope"],
+                "rusage_children_delta_for_waited_children",
+            )
+            self.assertIsNotNone(metrics["process_io_bytes"])
+            self.assertGreaterEqual(metrics["io_samples"], 1)
+            self.assertEqual(
+                set(metrics["process_io_bytes"]),
+                {"rchar_bytes", "wchar_bytes", "read_bytes", "write_bytes"},
+            )
+            self.assertGreaterEqual(
+                metrics["process_io_bytes"]["rchar_bytes"], payload_size
+            )
+            self.assertGreaterEqual(
+                metrics["process_io_bytes"]["wchar_bytes"], payload_size * 2
+            )
+
     def test_exit_drains_all_buffered_chunks(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

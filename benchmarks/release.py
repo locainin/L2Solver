@@ -141,6 +141,21 @@ def coverage_rows(summary):
             for value in metrics
             if value.get("peak_sampled_rss_bytes") is not None
         ]
+        io_metrics = [
+            value["process_io_bytes"]
+            for value in metrics
+            if isinstance(value.get("process_io_bytes"), dict)
+        ]
+        cpu_scopes = {
+            value["cpu_measurement_scope"]
+            for value in metrics
+            if value.get("user_cpu_seconds") is not None
+        }
+        io_scopes = {
+            value["io_measurement_scope"]
+            for value in metrics
+            if isinstance(value.get("process_io_bytes"), dict)
+        }
         rows.append(
             {
                 "sample_id": result["sample_id"],
@@ -163,10 +178,40 @@ def coverage_rows(summary):
                 "validation_seconds": result["validation_seconds"],
                 "peak_sampled_analyzer_rss_bytes": max(rss) if rss else None,
                 "memory_scope": "single_analyzer_process_samples_excluding_descendants",
+                "analyzer_user_cpu_seconds": _sum_metric(metrics, "user_cpu_seconds"),
+                "analyzer_system_cpu_seconds": _sum_metric(
+                    metrics, "system_cpu_seconds"
+                ),
+                "cpu_measurement_scope": (
+                    next(iter(cpu_scopes)) if len(cpu_scopes) == 1 else None
+                ),
+                "analyzer_process_io_bytes": (
+                    {
+                        field: sum(metric[field] for metric in io_metrics)
+                        for field in (
+                            "rchar_bytes",
+                            "wchar_bytes",
+                            "read_bytes",
+                            "write_bytes",
+                        )
+                    }
+                    if io_metrics
+                    else None
+                ),
+                "io_measurement_scope": (
+                    next(iter(io_scopes)) if len(io_scopes) == 1 else None
+                ),
+                "output_bytes": result.get("output_bytes"),
+                "evidence_bytes": result.get("evidence_bytes"),
                 "artifact_bytes": result.get("artifact_bytes"),
             }
         )
     return rows
+
+
+def _sum_metric(metrics, name):
+    values = [metric[name] for metric in metrics if metric.get(name) is not None]
+    return sum(values) if values else None
 
 
 def arguments(values):
@@ -225,7 +270,10 @@ def execute(options):
         selected = []
         for sample in samples:
             source_hash = sample.metadata["capture_sha256"]
-            sources[str(sample.capture)] = (source_hash, sample.metadata["capture_bytes"])
+            sources[str(sample.capture)] = (
+                source_hash,
+                sample.metadata["capture_bytes"],
+            )
             key = (mode, source_hash)
             if key in seen:
                 aliases.append(

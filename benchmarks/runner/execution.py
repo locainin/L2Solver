@@ -40,6 +40,36 @@ def artifact_bytes(directory):
     )
 
 
+def output_bytes(directory):
+    # Exclude captured command logs from analyzer output size
+    return sum(
+        path.stat().st_size
+        for path in directory.rglob("*")
+        if path.is_file()
+        and not path.is_symlink()
+        and not path.name.endswith((".stdout.log", ".stderr.log"))
+    )
+
+
+def evidence_bytes(directory, mode):
+    if mode == "case":
+        paths = [directory / "case.json"]
+    elif mode == "stream":
+        paths = (directory / "bundle").rglob("*")
+    else:
+        paths = [
+            *(directory / "index").rglob("*"),
+            directory / "verify.json",
+            directory / "flows.jsonl",
+            directory / "relationships.jsonl",
+        ]
+    return sum(
+        path.stat().st_size
+        for path in paths
+        if path.is_file() and not path.is_symlink()
+    )
+
+
 def validate_output(directory, sample, exit_code):
     document = read_json(directory / "case.json", MAX_CASE_BYTES)
     with (
@@ -134,6 +164,7 @@ def run_sample(
                     result["validation"] = validate_output(directory, sample, code)
                     result["case_bytes"] = (directory / "case.json").stat().st_size
                     result["case_sha256"] = hash_file(directory / "case.json")
+                    result["evidence_bytes"] = evidence_bytes(directory, mode)
                 else:
                     result["validation"] = validate_stream_output(
                         directory, sample, code
@@ -147,6 +178,7 @@ def run_sample(
                         path.stat().st_size for path in bundle_files
                     )
                     result["manifest_sha256"] = hash_file(bundle / "manifest.json")
+                    result["evidence_bytes"] = evidence_bytes(directory, mode)
                 result["status"] = "complete" if code == 0 else "partial"
             except ValidationLimit as error:
                 result.update(status="validation_limit", error=str(error))
@@ -167,6 +199,7 @@ def run_sample(
         )
     result["elapsed_seconds"] = time.monotonic() - started
     result["artifact_bytes"] = artifact_bytes(directory)
+    result["output_bytes"] = output_bytes(directory)
     write_json_new(directory / "result.json", result)
     return result
 
@@ -243,6 +276,9 @@ def run_index_pipeline(sample, binary, directory, timeout, result, started):
             result.update(status="evidence_failure", error=str(error)[:2048])
     result["elapsed_seconds"] = time.monotonic() - started
     result["artifact_bytes"] = artifact_bytes(directory)
+    result["output_bytes"] = output_bytes(directory)
+    if result["status"] == "complete":
+        result["evidence_bytes"] = evidence_bytes(directory, "index")
     write_json_new(directory / "result.json", result)
     return result
 

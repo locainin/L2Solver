@@ -10,8 +10,14 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import BinaryIO
 
+try:
+    import resource
+except ImportError:
+    resource = None
+
 DEFAULT_MAX_LOG_BYTES = 1024 * 1024
 _LOG_READ_CHUNK_BYTES = 64 * 1024
+_PROCESS_IO_FIELDS = ("rchar", "wchar", "read_bytes", "write_bytes")
 _HAS_WAITID_WNOWAIT = os.name == "posix" and all(
     hasattr(os, name)
     for name in ("waitid", "P_PID", "WEXITED", "WNOHANG", "WNOWAIT")
@@ -81,6 +87,48 @@ def sampled_rss(pid):
     except (OSError, ValueError, IndexError):
         pass
     return None
+
+
+def _sampled_process_io(pid):
+    # Linux procfs separates syscall bytes from storage-layer bytes
+    try:
+        counters = {}
+        for line in Path(f"/proc/{pid}/io").read_text(encoding="ascii").splitlines():
+            name, value = line.split(":", maxsplit=1)
+            if name in _PROCESS_IO_FIELDS:
+                counters[name] = int(value.strip())
+        if any(name not in counters for name in _PROCESS_IO_FIELDS):
+            return None
+        return {
+            "rchar_bytes": counters["rchar"],
+            "wchar_bytes": counters["wchar"],
+            "read_bytes": counters["read_bytes"],
+            "write_bytes": counters["write_bytes"],
+        }
+    except (OSError, ValueError):
+        return None
+
+
+def _sample_process_io(metrics, pid):
+    observed = _sampled_process_io(pid)
+    if observed is None:
+        return
+    previous = metrics["process_io_bytes"] or {}
+    metrics["process_io_bytes"] = {
+        name: max(value, previous.get(name, 0)) for name, value in observed.items()
+    }
+    metrics["io_samples"] += 1
+
+
+def _child_cpu_usage():
+    # RUSAGE_CHILDREN is available on Unix and measured after Popen reaps the analyzer
+    if resource is None:
+        return None
+    try:
+        usage = resource.getrusage(resource.RUSAGE_CHILDREN)
+    except OSError:
+        return None
+    return usage.ru_utime, usage.ru_stime
 
 
 def _log_path_matches(stream):
@@ -153,6 +201,7 @@ def _drain_available(stream, maximum_logs, deadline=None):
 
 
 def _stop_result(child, streams, status, message, metrics):
+    _sample_process_io(metrics, child.pid)
     stop_owned_processes(child)
     if any(not _log_path_matches(stream) for stream in streams):
         status, message = "tool_failure", "Analyzer log was removed or replaced"
@@ -174,6 +223,12 @@ def monitor(child, streams, deadline, maximum_logs):
         "sampling_interval_seconds": 0.05,
         "process_cleanup_scope": _PROCESS_CLEANUP_SCOPE,
         "log_capture_complete": False,
+        "user_cpu_seconds": None,
+        "system_cpu_seconds": None,
+        "cpu_measurement_scope": "rusage_children_delta_for_waited_children",
+        "process_io_bytes": None,
+        "io_measurement_scope": "linux_procfs_analyzer_process_only",
+        "io_samples": 0,
     }
     while True:
         # A process observed after its deadline cannot be accepted as a successful run
@@ -185,6 +240,7 @@ def monitor(child, streams, deadline, maximum_logs):
             metrics["peak_sampled_rss_bytes"] = max(
                 rss, metrics["peak_sampled_rss_bytes"] or 0
             )
+        _sample_process_io(metrics, child.pid)
         data_read = False
         for stream in streams:
             if not _log_path_matches(stream):
@@ -233,6 +289,7 @@ def monitor(child, streams, deadline, maximum_logs):
                     metrics,
                 )
             metrics["log_capture_complete"] = True
+            _sample_process_io(metrics, child.pid)
             stop_owned_processes(child)
             return child.returncode, None, None, metrics
         if not data_read:
@@ -251,6 +308,7 @@ def run_child(
         raise ValueError("log budget must be a positive byte count")
     deadline = time.monotonic() + timeout
     prefix = f"{log_prefix}." if log_prefix else ""
+    cpu_before = _child_cpu_usage()
     with (
         (directory / f"{prefix}stdout.log").open("xb") as stdout,
         (directory / f"{prefix}stderr.log").open("xb") as stderr,
@@ -282,6 +340,15 @@ def run_child(
             stop_owned_processes(child)
             for stream in streams:
                 stream.pipe.close()
+        if cpu_before is not None:
+            cpu_after = _child_cpu_usage()
+            if cpu_after is not None:
+                result[3]["user_cpu_seconds"] = max(
+                    0.0, cpu_after[0] - cpu_before[0]
+                )
+                result[3]["system_cpu_seconds"] = max(
+                    0.0, cpu_after[1] - cpu_before[1]
+                )
         if any(not _log_path_matches(stream) for stream in streams):
             result[3]["log_capture_complete"] = False
             return (

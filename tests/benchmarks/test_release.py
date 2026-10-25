@@ -8,7 +8,7 @@ from pathlib import Path
 import pytest
 from support import case_for, program, write_sample
 
-from benchmarks.release import compare_coverage, load_baseline, main
+from benchmarks.release import compare_coverage, coverage_rows, load_baseline, main
 
 
 @pytest.mark.parametrize("version", [True, 1.0, "1", None])
@@ -31,6 +31,76 @@ def test_baseline_requires_integer_schema_version(tmp_path, version):
 
     with pytest.raises(ValueError, match="version 1 release receipt"):
         load_baseline(baseline, 4096)
+
+
+def test_coverage_rows_sum_cpu_and_io_metrics_across_index_stages():
+    stages = {
+        "index": {
+            "analyzer_metrics": {
+                "user_cpu_seconds": 1.25,
+                "system_cpu_seconds": 0.25,
+                "cpu_measurement_scope": "rusage_children_delta_for_waited_children",
+                "process_io_bytes": {
+                    "rchar_bytes": 100,
+                    "wchar_bytes": 50,
+                    "read_bytes": 80,
+                    "write_bytes": 40,
+                },
+                "io_measurement_scope": "linux_procfs_analyzer_process_only",
+                "peak_sampled_rss_bytes": 4096,
+            }
+        },
+        "verify": {
+            "analyzer_metrics": {
+                "user_cpu_seconds": 0.75,
+                "system_cpu_seconds": 0.5,
+                "cpu_measurement_scope": "rusage_children_delta_for_waited_children",
+                "process_io_bytes": {
+                    "rchar_bytes": 30,
+                    "wchar_bytes": 20,
+                    "read_bytes": 10,
+                    "write_bytes": 5,
+                },
+                "io_measurement_scope": "linux_procfs_analyzer_process_only",
+                "peak_sampled_rss_bytes": 8192,
+            }
+        },
+    }
+    row = coverage_rows(
+        {
+            "results": [
+                {
+                    "sample_id": "metrics",
+                    "mode": "index",
+                    "source": {"capture_sha256": "a" * 64},
+                    "status": "complete",
+                    "validation": {
+                        "packet_rows_checked": 2,
+                        "source_bytes": 20,
+                    },
+                    "analyzer_elapsed_seconds": 3.0,
+                    "validation_seconds": 0.2,
+                    "artifact_bytes": 256,
+                    "output_bytes": 128,
+                    "evidence_bytes": 96,
+                    "stages": stages,
+                }
+            ]
+        }
+    )[0]
+
+    assert row["analyzer_user_cpu_seconds"] == 2.0
+    assert row["analyzer_system_cpu_seconds"] == 0.75
+    assert row["analyzer_process_io_bytes"] == {
+        "rchar_bytes": 130,
+        "wchar_bytes": 70,
+        "read_bytes": 90,
+        "write_bytes": 45,
+    }
+    assert row["peak_sampled_analyzer_rss_bytes"] == 8192
+    assert row["output_bytes"] == 128
+    assert row["evidence_bytes"] == 96
+    assert row["artifact_bytes"] == 256
 
 
 class ReleaseTests(unittest.TestCase):

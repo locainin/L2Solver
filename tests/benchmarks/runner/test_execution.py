@@ -109,6 +109,9 @@ class ExecutionTests(unittest.TestCase):
             self.assertGreaterEqual(result["validation_seconds"], 0.04)
             self.assertNotIn("binary_argument", result)
             self.assertEqual(result["validation"]["literal_nodes_checked"], 1)
+            self.assertEqual(result["output_bytes"], result["case_bytes"])
+            self.assertEqual(result["evidence_bytes"], result["case_bytes"])
+            self.assertGreaterEqual(result["artifact_bytes"], result["output_bytes"])
             self.assertTrue((sample / "runs/run-one/result.json").is_file())
             with self.assertRaises(FileExistsError):
                 run_sample(load_catalogue(catalogue)[0], binary, "run-one", 5)
