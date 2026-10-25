@@ -410,6 +410,8 @@ def run_recovery_benchmark(
             raise RuntimeError(f"warm recovery failed with status {warm['status']}")
         if warm["progress"]["cache_hits"] <= 0:
             raise RuntimeError("warm run did not report a cache hit")
+        if not warm["progress"]["index_cache_hit"]:
+            raise RuntimeError("warm run did not reuse the capture index")
         warm["same_output_identity_as_cold"] = (
             cold["output"]["files"] == warm["output"]["files"]
         )
@@ -436,10 +438,8 @@ def run_recovery_benchmark(
         _write_report(report_path, report)
         if deep["status"] not in ("complete", "partial"):
             raise RuntimeError(f"deep recovery failed with status {deep['status']}")
-        if deep["progress"]["cache_hits"] <= 0:
-            raise RuntimeError(
-                "deep run did not report a reused index or recovery stage"
-            )
+        if not deep["progress"]["index_cache_hit"]:
+            raise RuntimeError("deep run did not reuse the capture index")
 
         watcher = ProgressWatcher(
             interrupt_phase,
@@ -495,8 +495,14 @@ def run_recovery_benchmark(
             _write_report(report_path, report)
             if resumed["status"] not in ("complete", "partial"):
                 raise RuntimeError(f"resume failed with status {resumed['status']}")
-            if resumed["progress"]["cache_hits"] <= 0:
-                raise RuntimeError("resume completed without a reported cache hit")
+            interrupted_job = interrupted["progress"]["job_created_at_unix_ms"]
+            resumed_job = resumed["progress"]["job_created_at_unix_ms"]
+            if interrupted_job is None or resumed_job != interrupted_job:
+                raise RuntimeError(
+                    "resume did not restore the interrupted job checkpoint"
+                )
+            if not resumed["progress"]["index_cache_hit"]:
+                raise RuntimeError("resume did not reuse the capture index")
             report["status"] = "complete"
         elif (
             not interrupted["metrics"]["interrupt_sent"]

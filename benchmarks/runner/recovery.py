@@ -120,7 +120,14 @@ def read_progress_log(path, maximum_bytes=DEFAULT_MAX_LOG_BYTES):
     cache_hits = []
     cache_misses = []
     phases = set()
+    job_identities = set()
+    index_cache_hit = False
     for event in events:
+        created_at = event.get("created_at_unix_ms")
+        if created_at is not None:
+            if type(created_at) is not int or created_at < 0:
+                raise ValueError("progress log contains an invalid job identity")
+            job_identities.add(created_at)
         for field, values in (
             ("cache_hits", cache_hits),
             ("cache_misses", cache_misses),
@@ -131,12 +138,27 @@ def read_progress_log(path, maximum_bytes=DEFAULT_MAX_LOG_BYTES):
         current = event.get("current_phase")
         if current is not None:
             phases.add(current)
+        # The capture-index cache path records its hit and skips ingestion together
+        ingestion_skipped = any(
+            isinstance(phase, dict)
+            and phase.get("phase") == "ingestion"
+            and phase.get("state") == "skipped"
+            for phase in event["phases"]
+        )
+        event_cache_hits = event["counters"].get("cache_hits")
+        if ingestion_skipped and type(event_cache_hits) is int and event_cache_hits > 0:
+            index_cache_hit = True
+
+    if len(job_identities) > 1:
+        raise ValueError("progress log contains multiple job identities")
 
     return {
         "events": len(events),
         "ignored_lines": ignored_lines,
         "cache_hits": max(cache_hits, default=0),
         "cache_misses": max(cache_misses, default=0),
+        "index_cache_hit": index_cache_hit,
+        "job_created_at_unix_ms": next(iter(job_identities), None),
         "phases_seen": sorted(phases),
     }
 
