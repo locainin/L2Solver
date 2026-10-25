@@ -8,11 +8,8 @@ use std::{
     path::{Path, PathBuf},
 };
 #[path = "publish/directory.rs"]
-mod directory;
-pub use directory::{
-    DirectoryEntry, DirectoryEntryKind, PreparedDirectoryReplacement, create_directory,
-    prepare_directory_replacement, replace_directory,
-};
+pub(crate) mod directory;
+pub use directory::create_directory;
 
 /// A directory publication failure with its commit status
 #[derive(Debug)]

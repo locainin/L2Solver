@@ -42,6 +42,8 @@ pub struct PreparedDirectoryReplacement {
     pub(super) name: OsString,
     #[cfg(target_os = "linux")]
     pub(super) target_identity: DirectoryIdentity,
+    #[cfg(target_os = "linux")]
+    pub(super) parent_identity: DirectoryIdentity,
 }
 
 #[cfg(target_os = "linux")]
@@ -52,27 +54,56 @@ pub(super) struct DirectoryIdentity {
 }
 
 impl PreparedDirectoryReplacement {
-    /// Read one bounded regular file beneath the held directory without following links
+    /// Open one single-link regular file beneath the held directory without following links
     ///
-    /// Parent and final path components are opened relative to held descriptors, and
-    /// hard-linked files are rejected so a different path cannot modify the inspected bytes
+    /// Every parent component is opened relative to held descriptors. This keeps readers bound
+    /// to the inspected directory even if another process changes its pathname
     ///
     /// # Errors
     /// Returns an error if the relative path is unsafe, the entry is not a single-link regular
-    /// file, the file exceeds `max_bytes`, or reading fails
-    pub fn read_file(
-        &self,
-        relative_path: impl AsRef<Path>,
-        max_bytes: usize,
-    ) -> io::Result<Vec<u8>> {
+    /// file, the destination moved after inspection, or opening fails
+    pub fn open_file(&self, relative_path: impl AsRef<Path>) -> io::Result<std::fs::File> {
         #[cfg(target_os = "linux")]
         {
-            read_file_linux(self, relative_path.as_ref(), max_bytes)
+            self.check_location()?;
+            open_file_linux(self, relative_path.as_ref())
         }
         #[cfg(not(target_os = "linux"))]
         {
-            let _ = (relative_path, max_bytes);
-            Err(super::unsupported_platform())
+            let _ = relative_path;
+            Err(super::super::unsupported_platform())
+        }
+    }
+
+    /// Check that the held destination still occupies the inspected path
+    ///
+    /// The saved parent and target identities are compared with freshly opened path components
+    /// before a caller trusts files read through the held target descriptor
+    ///
+    /// # Errors
+    /// Returns an error if a path component is unsafe or either directory identity changed
+    pub fn check_location(&self) -> io::Result<()> {
+        #[cfg(target_os = "linux")]
+        {
+            let (parent_path, name) = super::super::parent_and_name(&self.destination_path)?;
+            let current_parent = super::super::open_parent(parent_path)?;
+            if identity_from_fd(&current_parent)? != self.parent_identity {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "destination parent changed after it was inspected",
+                ));
+            }
+            if identity_from_fd(&self.target_fd)? != self.target_identity {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "held destination identity changed after inspection",
+                ));
+            }
+            verify_named_directory(&current_parent, name, self.target_identity)
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            Err(super::super::unsupported_platform())
         }
     }
 
@@ -101,13 +132,11 @@ impl PreparedDirectoryReplacement {
 }
 
 #[cfg(target_os = "linux")]
-fn read_file_linux(
+fn open_file_linux(
     prepared: &PreparedDirectoryReplacement,
     relative_path: &Path,
-    max_bytes: usize,
-) -> io::Result<Vec<u8>> {
+) -> io::Result<std::fs::File> {
     use rustix::fs::{FileType, Mode, OFlags};
-    use std::io::Read;
 
     let components = normal_components(relative_path)?;
     let mut current = rustix::fs::openat(
@@ -124,7 +153,6 @@ fn read_file_linux(
             Mode::empty(),
         )?;
     }
-
     let final_name = components
         .last()
         .ok_or_else(|| invalid_relative_path(relative_path))?;
@@ -141,33 +169,7 @@ fn read_file_linux(
             "inspected entry is not a single-link regular file",
         ));
     }
-
-    let file_length = nonnegative_length(metadata.st_size)?;
-    let max_bytes = u64::try_from(max_bytes)
-        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "file byte limit is too large"))?;
-    if file_length > max_bytes {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            format!("inspected file exceeds the {max_bytes}-byte limit"),
-        ));
-    }
-    let read_limit = max_bytes.checked_add(1).ok_or_else(|| {
-        io::Error::new(io::ErrorKind::InvalidInput, "file byte limit is too large")
-    })?;
-    let max_bytes = usize::try_from(max_bytes)
-        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "file byte limit is too large"))?;
-    let capacity = usize::try_from(file_length)
-        .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "inspected file is too large"))?;
-    let mut bytes = Vec::with_capacity(capacity);
-    let mut reader = std::fs::File::from(file_fd).take(read_limit);
-    reader.read_to_end(&mut bytes)?;
-    if bytes.len() > max_bytes {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            format!("inspected file exceeds the {max_bytes}-byte limit"),
-        ));
-    }
-    Ok(bytes)
+    Ok(std::fs::File::from(file_fd))
 }
 
 #[cfg(target_os = "linux")]

@@ -6,12 +6,12 @@ use std::{
 };
 
 #[path = "directory/inspection.rs"]
-mod inspection;
+pub(crate) mod inspection;
 #[cfg(target_os = "linux")]
 #[path = "directory/tree.rs"]
 mod tree;
 
-pub use inspection::{DirectoryEntry, DirectoryEntryKind, PreparedDirectoryReplacement};
+pub use inspection::{DirectoryEntryKind, PreparedDirectoryReplacement};
 #[cfg(target_os = "linux")]
 use inspection::{
     destination_entry_exists, identity_from_fd, open_directory_at, stat_identity_at,
@@ -19,6 +19,30 @@ use inspection::{
 };
 #[cfg(target_os = "linux")]
 use tree::{remove_directory_at, sync_tree};
+
+/// Validate the safe parent of a new directory destination and confirm its name is absent
+///
+/// # Errors
+/// Returns an error when a parent component is unsafe or the destination already exists
+pub fn check_new_directory_destination(path: &Path) -> io::Result<()> {
+    #[cfg(target_os = "linux")]
+    {
+        let (parent, name) = super::parent_and_name(path)?;
+        let parent_fd = super::open_parent(parent)?;
+        if destination_entry_exists(&parent_fd, name)? {
+            return Err(io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                "result destination appeared while it was being inspected",
+            ));
+        }
+        Ok(())
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = path;
+        Err(unsupported_platform())
+    }
+}
 
 /// Publish a complete directory only when its destination name is absent
 ///
@@ -33,6 +57,18 @@ use tree::{remove_directory_at, sync_tree};
 pub fn create_directory<T>(
     path: &Path,
     write: impl FnOnce(&Path) -> Result<T, Box<dyn Error>>,
+) -> Result<T, super::DirectoryPublishError> {
+    create_directory_with_precommit(path, write, || Ok(()))
+}
+
+/// Publish a new complete directory after one final caller check
+///
+/// `before_commit` runs after the staged tree is synced and immediately before the atomic
+/// no-replace rename. A failure leaves the destination name absent
+pub fn create_directory_with_precommit<T>(
+    path: &Path,
+    write: impl FnOnce(&Path) -> Result<T, Box<dyn Error>>,
+    before_commit: impl FnOnce() -> Result<(), Box<dyn Error>>,
 ) -> Result<T, super::DirectoryPublishError> {
     #[cfg(target_os = "linux")]
     {
@@ -57,6 +93,7 @@ pub fn create_directory<T>(
         let result = write(staging.path())?;
         sync_tree(&staging_fd, path)?;
         verify_named_directory(&parent_fd, &staging_name, staging_identity)?;
+        before_commit().map_err(super::DirectoryPublishError::BeforePublication)?;
 
         renameat_with(
             &parent_fd,
@@ -87,7 +124,7 @@ pub fn create_directory<T>(
     }
     #[cfg(not(target_os = "linux"))]
     {
-        let _ = (path, write);
+        let _ = (path, write, before_commit);
         Err(unsupported_platform().into())
     }
 }
@@ -110,6 +147,7 @@ pub fn prepare_directory_replacement(
 
         let (parent, name) = super::parent_and_name(path)?;
         let parent_fd = super::open_parent(parent)?;
+        let parent_identity = identity_from_fd(&parent_fd)?;
         let target_fd = rustix::fs::openat(
             &parent_fd,
             name,
@@ -126,6 +164,7 @@ pub fn prepare_directory_replacement(
             target_fd,
             name: name.to_owned(),
             target_identity,
+            parent_identity,
         })
     }
     #[cfg(not(target_os = "linux"))]
@@ -135,27 +174,22 @@ pub fn prepare_directory_replacement(
     }
 }
 
-/// Atomically replace a prepared directory after the new tree has been fully written and synced
+/// Replace a prepared directory after one final caller check
 ///
-/// The old directory remains at its destination until staging completes. Linux exchanges the
-/// two names with `RENAME_EXCHANGE`, then checks both resulting inodes before deleting the old
-/// tree. A detected race keeps the displaced entry at a reported recovery path.
-///
-/// # Errors
-/// Returns [`super::DirectoryPublishError::BeforePublication`] when writing, syncing, or the
-/// pre-exchange identity check fails; returns an uncertainty error when an exchange races with
-/// another destination change or parent-directory synchronization fails
-pub fn replace_directory<T>(
+/// `before_commit` runs after the staged tree and destination identity are checked and
+/// immediately before the atomic exchange. A failure preserves the old destination
+pub fn replace_directory_with_precommit<T>(
     prepared: PreparedDirectoryReplacement,
     write: impl FnOnce(&Path) -> Result<T, Box<dyn Error>>,
+    before_commit: impl FnOnce() -> Result<(), Box<dyn Error>>,
 ) -> Result<T, super::DirectoryPublishError> {
     #[cfg(target_os = "linux")]
     {
-        replace_directory_linux(prepared, write)
+        replace_directory_linux(prepared, write, before_commit)
     }
     #[cfg(not(target_os = "linux"))]
     {
-        let _ = (prepared, write);
+        let _ = (prepared, write, before_commit);
         Err(unsupported_platform().into())
     }
 }
@@ -164,6 +198,7 @@ pub fn replace_directory<T>(
 fn replace_directory_linux<T>(
     prepared: PreparedDirectoryReplacement,
     write: impl FnOnce(&Path) -> Result<T, Box<dyn Error>>,
+    before_commit: impl FnOnce() -> Result<(), Box<dyn Error>>,
 ) -> Result<T, super::DirectoryPublishError> {
     use rustix::fs::{RenameFlags, renameat_with};
     use std::{os::fd::AsRawFd, path::PathBuf};
@@ -203,6 +238,7 @@ fn replace_directory_linux<T>(
             format!("destination changed after it was validated: {error}"),
         )
     })?;
+    before_commit().map_err(super::DirectoryPublishError::BeforePublication)?;
 
     #[cfg(test)]
     if super::test_hooks::take_fault(super::test_hooks::TestFault::UnsupportedDirectoryExchange) {
