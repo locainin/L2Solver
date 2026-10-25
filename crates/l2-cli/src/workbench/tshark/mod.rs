@@ -1,4 +1,5 @@
 mod budget;
+mod cache_identity;
 mod count;
 mod model;
 mod objects;
@@ -6,6 +7,11 @@ mod process;
 
 pub use budget::{ObjectExportBudget, ObjectExportStatus, ObjectExportUsage};
 pub use objects::{ExportObjectSet, export_objects_with_job};
+
+/// Build an optional cache identity for the selected `TShark` executable
+pub fn tshark_cache_identity(job: Option<&l2_workbench::job::Job>) -> serde_json::Value {
+    cache_identity::identity(job)
+}
 
 use crate::arguments::TsharkOptions;
 use count::CaptureCount;
@@ -703,7 +709,14 @@ fn resolve_executable(program: &Path) -> io::Result<PathBuf> {
         return executable_file(program)?.ok_or_else(|| executable_not_found(program));
     }
     let search_path = std::env::var_os("PATH").unwrap_or_default();
-    for directory in std::env::split_paths(&search_path) {
+    resolve_executable_in_search_path(program, &search_path)
+}
+
+fn resolve_executable_in_search_path(
+    program: &Path,
+    search_path: &std::ffi::OsStr,
+) -> io::Result<PathBuf> {
+    for directory in std::env::split_paths(search_path) {
         let candidate = directory.join(program);
         if let Some(resolved) = executable_file(&candidate)? {
             return Ok(resolved);

@@ -136,6 +136,30 @@ pub(super) fn run(
     stdout_maximum: usize,
     stderr_maximum: usize,
 ) -> Result<Output, ProcessError> {
+    run_with_job(
+        executable,
+        arguments,
+        environment,
+        timeout,
+        stdout_maximum,
+        stderr_maximum,
+        None,
+    )
+}
+
+/// Run a bounded command while observing shared cancellation
+pub(super) fn run_with_job(
+    executable: &Path,
+    arguments: &[OsString],
+    environment: &[(OsString, OsString)],
+    timeout: Duration,
+    stdout_maximum: usize,
+    stderr_maximum: usize,
+    job: Option<&Job>,
+) -> Result<Output, ProcessError> {
+    if job.is_some_and(Job::is_cancelled) {
+        return Err(ProcessError::Cancelled);
+    }
     let deadline = Instant::now()
         .checked_add(timeout)
         .ok_or(ProcessError::TimedOut)?;
@@ -165,6 +189,11 @@ pub(super) fn run(
     let mut status = None;
 
     loop {
+        if job.is_some_and(Job::is_cancelled) {
+            stop_and_reap(&mut child);
+            join_workers_after_stop([stdout_worker, stderr_worker]);
+            return Err(ProcessError::Cancelled);
+        }
         while let Ok((is_stdout, result)) = receiver.try_recv() {
             match result {
                 Ok(bytes) if is_stdout => stdout_result = Some(bytes),
