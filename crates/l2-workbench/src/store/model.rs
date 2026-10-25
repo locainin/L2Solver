@@ -1,7 +1,7 @@
 use super::{Result, invalid};
 use crate::{evidence::SourceRange, investigation::BuildResult};
 use l2_pcap::CollectionSummary;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::{error::Error, fmt};
 use std::{net::IpAddr, str::FromStr};
@@ -27,14 +27,17 @@ impl Options {
     }
 }
 
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct IngestReceipt {
     pub source_id: String,
     pub bytes: u64,
     pub packets: u64,
     pub transport_packets: u64,
     pub unsupported_transport_packets: u64,
-    #[serde(serialize_with = "crate::capture_collection::serialize")]
+    #[serde(
+        serialize_with = "crate::capture_collection::serialize",
+        deserialize_with = "crate::capture_collection::deserialize"
+    )]
     pub collection_summary: CollectionSummary,
 }
 

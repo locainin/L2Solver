@@ -88,6 +88,24 @@ pub struct FullSourceCoverage {
     pub cohort_analysis: Option<FlowCohortCoverage>,
 }
 
+/// Controls bounded analysis of one source already present in a disk index
+#[derive(Clone, Copy, Debug)]
+pub struct IndexedAnalysisOptions {
+    /// Retention budgets applied to each flow and cohort analysis
+    pub limits: Limits,
+    /// Whether cross-flow IP-pair cohorts are analyzed after individual flows
+    pub include_cohorts: bool,
+}
+
+impl Default for IndexedAnalysisOptions {
+    fn default() -> Self {
+        Self {
+            limits: Limits::default(),
+            include_cohorts: true,
+        }
+    }
+}
+
 /// Capture-summary omission totals for one set of analyzed Cases
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize)]
 pub struct ReconstructionOmissionCoverage {
@@ -230,11 +248,19 @@ fn acquire_full_source(
 ) -> Result<FullSourceCoverage, Box<dyn Error>> {
     let temporary_parent = std::env::temp_dir();
     let mut flow_visitor = visitor;
-    acquire_full_source_inner(path, &temporary_parent, limits, false, |item| match item {
-        FullSourceItem::Flow(analysis) => flow_visitor(*analysis),
-        FullSourceItem::FlowPage(_) => Ok(()),
-        FullSourceItem::Cohort(_) => Err(invalid("flow-only acquisition emitted a cohort")),
-    })
+    acquire_full_source_inner(
+        path,
+        &temporary_parent,
+        IndexedAnalysisOptions {
+            limits,
+            include_cohorts: false,
+        },
+        |item| match item {
+            FullSourceItem::Flow(analysis) => flow_visitor(*analysis),
+            FullSourceItem::FlowPage(_) => Ok(()),
+            FullSourceItem::Cohort(_) => Err(invalid("flow-only acquisition emitted a cohort")),
+        },
+    )
 }
 
 /// Index a full capture in a caller-selected directory and visit every indexed flow
@@ -249,11 +275,19 @@ pub fn acquire_full_source_in(
     visitor: impl FnMut(FlowAnalysis) -> Result<(), Box<dyn Error>>,
 ) -> Result<FullSourceCoverage, Box<dyn Error>> {
     let mut flow_visitor = visitor;
-    acquire_full_source_inner(path, temporary_parent, limits, false, |item| match item {
-        FullSourceItem::Flow(analysis) => flow_visitor(*analysis),
-        FullSourceItem::FlowPage(_) => Ok(()),
-        FullSourceItem::Cohort(_) => Err(invalid("flow-only acquisition emitted a cohort")),
-    })
+    acquire_full_source_inner(
+        path,
+        temporary_parent,
+        IndexedAnalysisOptions {
+            limits,
+            include_cohorts: false,
+        },
+        |item| match item {
+            FullSourceItem::Flow(analysis) => flow_visitor(*analysis),
+            FullSourceItem::FlowPage(_) => Ok(()),
+            FullSourceItem::Cohort(_) => Err(invalid("flow-only acquisition emitted a cohort")),
+        },
+    )
 }
 
 /// Index a full capture, then analyze bounded flows and IP-pair cohorts
@@ -266,18 +300,25 @@ pub fn acquire_full_source_with_cohorts_in(
     limits: Limits,
     visitor: impl FnMut(FullSourceItem) -> Result<(), Box<dyn Error>>,
 ) -> Result<FullSourceCoverage, Box<dyn Error>> {
-    acquire_full_source_inner(path, temporary_parent, limits, true, visitor)
+    acquire_full_source_inner(
+        path,
+        temporary_parent,
+        IndexedAnalysisOptions {
+            limits,
+            include_cohorts: true,
+        },
+        visitor,
+    )
 }
 
 fn acquire_full_source_inner(
     path: &Path,
     temporary_parent: &Path,
-    limits: Limits,
-    include_cohorts: bool,
-    mut visitor: impl FnMut(FullSourceItem) -> Result<(), Box<dyn Error>>,
+    options: IndexedAnalysisOptions,
+    visitor: impl FnMut(FullSourceItem) -> Result<(), Box<dyn Error>>,
 ) -> Result<FullSourceCoverage, Box<dyn Error>> {
-    // Validate even for captures with no supported flows
-    Reconstructor::with_limits(limits)?;
+    // Reject invalid budgets before reading a capture into the temporary index
+    Reconstructor::with_limits(options.limits)?;
 
     // Keep the full source and SQLite index on the caller-selected filesystem
     let temporary_directory = tempfile::tempdir_in(temporary_parent)?;
@@ -285,7 +326,63 @@ fn acquire_full_source_inner(
     let receipt = store
         .ingest(label(path, "capture"), input::capture(path)?)
         .map_err(|error| input::boxed_capture_error(path, error))?;
-    let source = source_coverage(&receipt);
+    analyze_indexed_source(&store, &receipt, options, visitor)
+}
+
+/// Analyze one validated source from an existing disk index with bounded working memory
+///
+/// The receipt must identify exactly one indexed source with matching byte and packet counts,
+/// including when the source has no supported flows.
+///
+/// # Errors
+/// Returns invalid receipt, source/indexing, analysis, visitor, or coverage counter failures
+pub fn analyze_indexed_source(
+    store: &Store,
+    receipt: &IngestReceipt,
+    options: IndexedAnalysisOptions,
+    visitor: impl FnMut(FullSourceItem) -> Result<(), Box<dyn Error>>,
+) -> Result<FullSourceCoverage, Box<dyn Error>> {
+    // Validate before visiting flows so empty sources receive the same budget checks
+    Reconstructor::with_limits(options.limits)?;
+    let source = validate_indexed_receipt(store, receipt)?;
+    analyze_indexed_source_flows(store, receipt, source, options, visitor)
+}
+
+fn validate_indexed_receipt(
+    store: &Store,
+    receipt: &IngestReceipt,
+) -> Result<SourceCoverage, Box<dyn Error>> {
+    let mut matching_source_found = false;
+    store.visit_sources(|source| {
+        if source.source_id == receipt.source_id {
+            if matching_source_found {
+                return Err(invalid("ingest receipt matches multiple indexed sources"));
+            }
+            matching_source_found = true;
+            if source.bytes != receipt.bytes || source.packets != receipt.packets {
+                return Err(invalid(
+                    "ingest receipt does not match indexed source metadata",
+                ));
+            }
+        }
+        Ok(())
+    })?;
+    if !matching_source_found {
+        return Err(invalid(
+            "ingest receipt must identify exactly one indexed source",
+        ));
+    }
+
+    Ok(source_coverage(receipt))
+}
+
+fn analyze_indexed_source_flows(
+    store: &Store,
+    receipt: &IngestReceipt,
+    source: SourceCoverage,
+    options: IndexedAnalysisOptions,
+    mut visitor: impl FnMut(FullSourceItem) -> Result<(), Box<dyn Error>>,
+) -> Result<FullSourceCoverage, Box<dyn Error>> {
     let mut analysis = FlowAnalysisCoverage::default();
     let mut cohort_reconstruction = ReconstructionOmissionCoverage::default();
     let mut cohort_analysis = None;
@@ -308,7 +405,7 @@ fn acquire_full_source_inner(
             if flow.source_id != receipt.source_id {
                 return Err(invalid("indexed flow belongs to a different source"));
             }
-            let result = store.investigate_flows(&[flow.id], limits)?;
+            let result = store.investigate_flows(&[flow.id], options.limits)?;
             let flow_coverage = per_flow_coverage(&flow, &result)?;
             add_flow_coverage(&mut analysis, &flow_coverage)?;
             let flow_id = flow.id;
@@ -323,7 +420,7 @@ fn acquire_full_source_inner(
             let page_coverage = store.visit_flow_pages_after_prefix(
                 flow_id,
                 retained_prefix_records,
-                limits,
+                options.limits,
                 |page| {
                     page_reconstruction
                         .record(reconstruction_case_omissions(&page.result.case)?)?;
@@ -344,16 +441,20 @@ fn acquire_full_source_inner(
         after = page_end;
     }
 
-    if include_cohorts {
-        cohort_analysis = Some(store.visit_ip_pair_cohort_analyses(limits, |analysis| {
-            cohort_reconstruction.record(reconstruction_case_omissions(&analysis.result.case)?)?;
-            visitor(FullSourceItem::Cohort(Box::new(CohortAnalysis {
-                member_flows: analysis.member_flows,
-                packet_flow_ids: analysis.packet_flow_ids,
-                result: analysis.result,
-                split: analysis.split,
-            })))
-        })?);
+    if options.include_cohorts {
+        cohort_analysis = Some(store.visit_ip_pair_cohort_analyses(
+            options.limits,
+            |analysis| {
+                cohort_reconstruction
+                    .record(reconstruction_case_omissions(&analysis.result.case)?)?;
+                visitor(FullSourceItem::Cohort(Box::new(CohortAnalysis {
+                    member_flows: analysis.member_flows,
+                    packet_flow_ids: analysis.packet_flow_ids,
+                    result: analysis.result,
+                    split: analysis.split,
+                })))
+            },
+        )?);
     }
     Ok(FullSourceCoverage {
         source,
@@ -612,3 +713,7 @@ fn invalid(message: &'static str) -> Box<dyn Error> {
 #[cfg(test)]
 #[path = "../../tests/workbench/full_source.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "../../tests/workbench/full_source_index.rs"]
+mod index_tests;
