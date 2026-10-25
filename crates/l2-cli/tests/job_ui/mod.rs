@@ -45,6 +45,22 @@ fn redirected_human_output_never_contains_ansi_codes() -> Result<(), Box<dyn Err
 }
 
 #[test]
+fn human_status_escapes_control_characters_in_label_and_phase_message() -> Result<(), Box<dyn Error>>
+{
+    let job = Job::new("source\n\u{1b}[2J");
+    job.start(Phase::Ingestion, None)?;
+    job.set_current(Phase::Ingestion, "record\t\u{1b}[31m")?;
+    let snapshot = job.snapshot()?;
+
+    let line = render_human_line(&snapshot, RenderVerbosity::Normal);
+
+    assert!(line.chars().all(|character| !character.is_control()));
+    assert!(line.contains("source\\n\\u{1b}[2J"));
+    assert!(line.contains("record\\t\\u{1b}[31m"));
+    Ok(())
+}
+
+#[test]
 fn quiet_verbosity_suppresses_human_status() -> Result<(), Box<dyn Error>> {
     let job = Job::new("quiet run");
     let snapshot = job.snapshot()?;

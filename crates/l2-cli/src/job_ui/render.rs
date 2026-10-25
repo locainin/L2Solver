@@ -52,7 +52,8 @@ pub(super) fn render_human_line(snapshot: &JobSnapshot, verbosity: RenderVerbosi
         return String::new();
     }
 
-    let mut line = snapshot.label.clone();
+    // Source labels can contain terminal controls, so display their escaped form
+    let mut line = snapshot.label.escape_debug().to_string();
     if let Some(phase) = snapshot.current_phase {
         if let Some(progress) = snapshot.phase(phase) {
             let _ = write!(line, ": {}", phase.label());
@@ -125,7 +126,8 @@ fn append_phase_detail(line: &mut String, phase: &PhaseSnapshot) {
         line.push_str(" · ETA unknown");
     }
     if let Some(message) = &phase.message {
-        let _ = write!(line, " · {message}");
+        // Phase details can carry source metadata, so escape them before terminal output
+        let _ = write!(line, " · {}", message.escape_debug());
     }
     if phase.state != PhaseState::InProgress {
         let _ = write!(line, " · {}", phase_state_label(phase.state));
