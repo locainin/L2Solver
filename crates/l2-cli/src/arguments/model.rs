@@ -1,4 +1,5 @@
 use super::WorkbenchCommand;
+use clap::{Args, Subcommand, ValueEnum};
 use l2_audit::{AssessmentProfile, SourceLabelMap, SourceLabelMapError};
 use l2_capture::InterfaceId;
 use std::{path::PathBuf, time::Duration};
@@ -233,12 +234,134 @@ pub struct ExportOptions {
     pub output: Option<PathBuf>,
     /// Require optional `TShark` enrichment to finish before reporting success
     pub require_tshark: bool,
+    pub recovery: RecoveryOptions,
+}
+
+/// Recovery search effort, ordered from quickest to most thorough
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, ValueEnum)]
+pub enum RecoveryProfile {
+    Fast,
+    #[default]
+    Normal,
+    Deep,
+}
+
+/// How progress is presented while recovery work is running
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, ValueEnum)]
+pub enum ProgressMode {
+    #[default]
+    Auto,
+    Always,
+    Never,
+    Json,
+}
+
+/// Shared search, cache, reporting, and resource controls for recovery commands
+#[derive(Clone, Debug, Args, PartialEq, Eq)]
+#[expect(
+    clippy::struct_excessive_bools,
+    reason = "recovery controls are independent CLI switches"
+)]
+pub struct RecoveryOptions {
+    /// Select the search effort: fast, normal, or deep
+    #[arg(long, value_enum, default_value = "normal")]
+    pub profile: RecoveryProfile,
+    /// Recompute cached recovery results before using them
+    #[arg(long)]
+    pub refresh: bool,
+    /// Skip recovery cache reads and writes
+    #[arg(long)]
+    pub no_cache: bool,
+    /// Verify cached content in full before reuse
+    #[arg(long)]
+    pub strict_cache: bool,
+    /// Choose progress output: auto, always, never, or json
+    #[arg(long, value_enum, default_value = "auto")]
+    pub progress: ProgressMode,
+    /// Limit the number of parallel workers; default chooses automatically
+    #[arg(long, value_name = "COUNT", value_parser = super::value::nonzero_jobs)]
+    pub jobs: Option<usize>,
+    /// Hide routine recovery progress and status messages
+    #[arg(long)]
+    pub quiet: bool,
+    /// Increase diagnostic detail; repeat for more detail
+    #[arg(short = 'v', long = "verbose", action = clap::ArgAction::Count)]
+    pub verbosity: u8,
+    /// Set the recovery memory limit using bytes, KB/MB/GB/TB, or KiB/MiB/GiB/TiB
+    #[arg(
+        long,
+        value_name = "SIZE",
+        default_value = "512MiB",
+        value_parser = super::value::parse_byte_size
+    )]
+    pub memory_limit: u64,
+    /// Set the maximum retained cache size using bytes, KB/MB/GB/TB, or KiB/MiB/GiB/TiB
+    #[arg(
+        long,
+        value_name = "SIZE",
+        default_value = "2GiB",
+        value_parser = super::value::parse_byte_size
+    )]
+    pub cache_max_bytes: u64,
+}
+
+impl Default for RecoveryOptions {
+    fn default() -> Self {
+        Self {
+            profile: RecoveryProfile::Normal,
+            refresh: false,
+            no_cache: false,
+            strict_cache: false,
+            progress: ProgressMode::Auto,
+            jobs: None,
+            quiet: false,
+            verbosity: 0,
+            memory_limit: 512 * 1024 * 1024,
+            cache_max_bytes: 2 * 1024 * 1024 * 1024,
+        }
+    }
+}
+
+/// File refinement options and its shared recovery policy
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RefineOptions {
+    pub input: PathBuf,
+    pub output: Option<PathBuf>,
+    pub dry_run: bool,
+    pub salvage: bool,
+    pub recovery: RecoveryOptions,
+}
+
+/// Requested operation on the on-disk recovery cache
+#[derive(Clone, Debug, PartialEq, Eq, Subcommand)]
+pub enum CacheCommand {
+    /// Show current cache size and entry counts
+    Stats,
+    /// Remove old cache entries until the selected size is reached
+    Prune {
+        /// Target cache size, such as 512MiB
+        #[arg(long, value_name = "SIZE", value_parser = super::value::parse_byte_size)]
+        max_bytes: Option<u64>,
+    },
+    /// Remove all retained recovery cache entries
+    Clear,
+}
+
+/// Supported shell formats for generated command completions
+#[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
+pub enum CompletionShell {
+    Bash,
+    Zsh,
+    Fish,
 }
 
 // Compatibility forms are normalized into this one command model
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Command {
     Export(ExportOptions),
+    Refine(RefineOptions),
+    Cache(CacheCommand),
+    Completions(CompletionShell),
     Inspect(PathBuf),
     Relationships(PathBuf),
     Json(PathBuf),

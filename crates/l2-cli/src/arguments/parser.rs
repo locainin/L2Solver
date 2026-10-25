@@ -2,8 +2,9 @@ mod capture;
 
 use super::{
     model::{
-        ColorChoice, Command, DevCommand, DevDecodeCommand, ExportOptions, ReportOptions,
-        SurveyInput, SurveyOptions, WifiOptions,
+        CacheCommand, ColorChoice, Command, CompletionShell, DevCommand, DevDecodeCommand,
+        ExportOptions, RecoveryOptions, RefineOptions, ReportOptions, SurveyInput, SurveyOptions,
+        WifiOptions,
     },
     value,
 };
@@ -16,7 +17,34 @@ use std::{
     time::Duration,
 };
 
-const LONG_HELP: &str = "Examples:\n  l2solver extract traffic.pcapng -o recovered/\n  l2solver inspect traffic.pcapng\n  l2solver workbench --help\n\nExit status:\n  0  Command completed within its declared scope\n  1  Runtime, I/O, or internal failure\n  2  Usage error\n  3  Assessment, collection, export, or workbench result is incomplete\n  4  Findings found with --fail-on-findings/--ci, or baseline changes with --fail-on-change\n\nDeveloper:\n  l2solver dev --help       Internal diagnostics and fixture tooling";
+const LONG_HELP: &str = r"Examples:
+  l2solver extract traffic.pcapng -o recovered/
+  l2solver refine unknown.bin --dry-run
+  l2solver cache stats
+  l2solver completions bash
+  l2solver inspect traffic.pcapng
+  l2solver workbench --help
+
+Exit status:
+  0  Command completed within its declared scope
+  1  Runtime, I/O, or internal failure
+  2  Usage error
+  3  Assessment, collection, export, or workbench result is incomplete
+  4  Findings found with --fail-on-findings/--ci, or baseline changes with --fail-on-change
+
+Developer:
+  l2solver dev --help       Internal diagnostics and fixture tooling";
+
+const EXTRACT_HELP: &str = r"--output must not already exist; otherwise use CAPTURE.export. Standard input requires --output and skips TShark.
+
+Profile defaults to normal. Progress defaults to automatic terminal detection. Cached recovery results are reused by default. --refresh recomputes results, --no-cache skips reads and writes, and --strict-cache checks cached content in full.
+
+TShark enrichment is optional. If TShark is missing or object export fails, available artifacts are still published. --require-tshark requires successful enrichment. Incomplete native analysis or a required TShark failure returns status 3. Packets outside discovery scope are reported without failing extraction. summary.txt shows native and TShark status separately.
+
+Examples:
+  l2solver extract traffic.pcapng -o recovered/
+  l2solver extract traffic.pcapng --profile deep --progress json
+  l2solver extract traffic.pcapng --strict-cache --memory-limit 1GiB";
 
 #[derive(Debug, Parser)]
 #[command(
@@ -24,6 +52,7 @@ const LONG_HELP: &str = "Examples:\n  l2solver extract traffic.pcapng -o recover
     version,
     about = "Network forensics and artifact recovery",
     long_about = None,
+    after_help = LONG_HELP,
     after_long_help = LONG_HELP,
     arg_required_else_help = true
 )]
@@ -36,11 +65,28 @@ struct Cli {
 enum TopCommand {
     /// Recover artifacts from a PCAP/PCAPNG capture
     #[command(
+        arg_required_else_help = true,
         alias = "export",
         display_order = 0,
-        long_about = "Recover complete native HTTP bodies and FTP transfer candidates. Recursively validated archive members are published with their parent archives. TShark on PATH adds objects with safe generated names. TShark objects do not include packet provenance; native provenance is retained in the export reports.\n\n--output must not already exist; otherwise use CAPTURE.export. Standard input requires --output and skips TShark.\n\nTShark enrichment is optional. If TShark is missing or object export fails, available artifacts are still published. --require-tshark requires successful enrichment. Incomplete native analysis or a required TShark failure returns status 3. Packets outside discovery scope are reported without failing extraction. summary.txt shows native and TShark status separately."
+        long_about = "Recover complete native HTTP bodies and FTP transfer candidates. Recursively validated archive members are published with their parent archives. TShark on PATH adds objects with safe generated names. TShark objects do not include packet provenance; native provenance is retained in the export reports.",
+        after_help = EXTRACT_HELP
     )]
     Extract(ExportArgs),
+    /// Refine an ordinary file or export directory without requiring a capture
+    #[command(
+        long_about = "Analyze an ordinary file or export directory, including .bin files, without requiring a PCAP or PCAPNG input. Refinement writes the original, immutable derived artifacts, a manifest, and a summary into a result directory. By default the directory is INPUT.refined; use --output to select another directory. Use --dry-run to report planned work without writing a result. --salvage enables recovery of supported partial archive members; it does not repair arbitrary damaged files. An existing matching owned result is reused. --refresh recomputes and atomically replaces that owned result. Unrelated existing paths are refused. Shared search, progress, cache, worker, and memory controls are available through the recovery options."
+    )]
+    Refine(RefineArgs),
+    /// Inspect or manage persistent recovery results
+    Cache {
+        #[command(subcommand)]
+        command: CacheCommand,
+    },
+    /// Generate shell completion scripts
+    Completions {
+        #[arg(value_enum, value_name = "SHELL")]
+        shell: CompletionShell,
+    },
     /// Decode captured frames and inspect protocol details
     Inspect(CapturePath),
     /// Show MAC/IP, ARP, DNS, and transport relationships in one capture
@@ -114,6 +160,26 @@ struct ExportArgs {
     /// Return status 3 if `TShark` enrichment is missing, skipped, or incomplete
     #[arg(long)]
     require_tshark: bool,
+    #[command(flatten)]
+    recovery: RecoveryOptions,
+}
+
+#[derive(Debug, Args)]
+struct RefineArgs {
+    /// Input file or export directory to refine
+    #[arg(value_name = "INPUT", allow_hyphen_values = true)]
+    input: PathBuf,
+    /// Write the refined result to this directory instead of INPUT.refined
+    #[arg(short, long, value_name = "NEW_DIRECTORY")]
+    output: Option<PathBuf>,
+    /// Show planned work without writing a result
+    #[arg(long)]
+    dry_run: bool,
+    /// Recover supported partial archive members
+    #[arg(long)]
+    salvage: bool,
+    #[command(flatten)]
+    recovery: RecoveryOptions,
 }
 
 #[derive(Debug, Args)]
@@ -417,7 +483,17 @@ impl TopCommand {
                 capture: arguments.capture,
                 output: arguments.output,
                 require_tshark: arguments.require_tshark,
+                recovery: arguments.recovery,
             })),
+            Self::Refine(arguments) => Ok(Command::Refine(RefineOptions {
+                input: arguments.input,
+                output: arguments.output,
+                dry_run: arguments.dry_run,
+                salvage: arguments.salvage,
+                recovery: arguments.recovery,
+            })),
+            Self::Cache { command } => Ok(Command::Cache(command)),
+            Self::Completions { shell } => Ok(Command::Completions(shell)),
             Self::Assess(arguments) | Self::Survey(arguments) => {
                 arguments.finish().map(Command::Assess)
             }

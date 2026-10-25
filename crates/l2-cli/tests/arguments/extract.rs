@@ -30,7 +30,7 @@ fn extraction_accepts_explicit_required_tshark_policy() -> Result<(), Box<dyn Er
 }
 
 #[test]
-fn extraction_keeps_assessment_profiles_out_of_its_policy() {
+fn extraction_rejects_assessment_only_profile_names() {
     let result = arguments::parse_from([
         "l2solver",
         "extract",
@@ -38,5 +38,5 @@ fn extraction_keeps_assessment_profiles_out_of_its_policy() {
         "--profile",
         "opportunistic",
     ]);
-    assert!(result.is_err_and(|error| error.kind() == clap::error::ErrorKind::UnknownArgument));
+    assert!(result.is_err_and(|error| error.kind() != clap::error::ErrorKind::UnknownArgument));
 }

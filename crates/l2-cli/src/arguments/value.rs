@@ -6,6 +6,54 @@ const MAX_LIVE_PACKETS: u32 = 10_000;
 const MAX_LIVE_DURATION_SECONDS: u64 = 5 * 60;
 const INVALID_XOR_HEX: &str = "XOR key must contain only ASCII hexadecimal digits";
 
+const BYTE_UNITS: &[(&str, u64)] = &[
+    ("", 1),
+    ("tib", 1_099_511_627_776),
+    ("gib", 1_073_741_824),
+    ("mib", 1_048_576),
+    ("kib", 1_024),
+    ("tb", 1_000_000_000_000),
+    ("gb", 1_000_000_000),
+    ("mb", 1_000_000),
+    ("kb", 1_000),
+    ("b", 1),
+];
+
+pub(super) fn nonzero_jobs(value: &str) -> Result<usize, String> {
+    value
+        .parse::<usize>()
+        .ok()
+        .filter(|count| *count > 0)
+        .ok_or_else(|| String::from("worker count must be a positive integer"))
+}
+
+/// Parse a byte count with optional decimal or binary units
+///
+/// # Errors
+/// Returns an error when the count, unit, or multiplication overflows `u64`
+pub fn parse_byte_size(value: &str) -> Result<u64, String> {
+    let split = value
+        .bytes()
+        .position(|byte| !byte.is_ascii_digit())
+        .unwrap_or(value.len());
+    let (digits, unit) = value.split_at(split);
+    if digits.is_empty() {
+        return Err(String::from("byte size must start with an integer"));
+    }
+
+    let count = digits
+        .parse::<u64>()
+        .map_err(|_| String::from("byte size is too large"))?;
+    let unit = unit.to_ascii_lowercase();
+    let multiplier = BYTE_UNITS
+        .iter()
+        .find_map(|(suffix, multiplier)| (*suffix == unit).then_some(*multiplier))
+        .ok_or_else(|| String::from("byte size unit must be B, KB/MB/GB/TB, or KiB/MiB/GiB/TiB"))?;
+    count
+        .checked_mul(multiplier)
+        .ok_or_else(|| String::from("byte size is too large"))
+}
+
 pub(super) fn output_format(value: &str) -> Result<OutputFormat, String> {
     match value {
         "text" => Ok(OutputFormat::Text),

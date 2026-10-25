@@ -33,12 +33,30 @@ fn extract_help_describes_recovery_and_optional_enrichment()
         "TShark enrichment is optional",
         "--require-tshark",
         "Packets outside discovery scope are reported without failing extraction",
+        "Select the search effort: fast, normal, or deep",
+        "default: normal",
+        "Progress defaults to automatic terminal detection",
+        "Choose progress output: auto, always, never, or json",
+        "--refresh recomputes results",
+        "--no-cache skips reads and writes",
+        "--strict-cache checks cached content in full",
+        "--memory-limit",
+        "--cache-max-bytes",
+        "KB/MB/GB/TB",
+        "KiB/MiB/GiB/TiB",
+        "default: 512MiB",
+        "default: 2GiB",
+        "--jobs",
+        "--quiet",
+        "--verbose",
+        "--progress",
+        "Examples:",
         "status 3",
     ] {
         assert!(text.contains(detail), "missing {detail}: {text}");
     }
     assert!(
-        text.split_whitespace().count() <= 150,
+        text.split_whitespace().count() <= 320,
         "help is too long: {text}"
     );
 
