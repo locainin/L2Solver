@@ -1,5 +1,12 @@
 //! Full-source disk acquisition followed by bounded per-flow analysis
 
+mod cache;
+
+pub use cache::NATIVE_CASE_VERSION;
+pub use cache::{
+    AcquisitionOptions, IndexedAnalysisContext, IndexedSource, acquire_indexed_source,
+};
+
 use super::{input, label};
 use l2_workbench::{
     investigation::BuildResult,
@@ -342,10 +349,27 @@ pub fn analyze_indexed_source(
     options: IndexedAnalysisOptions,
     visitor: impl FnMut(FullSourceItem) -> Result<(), Box<dyn Error>>,
 ) -> Result<FullSourceCoverage, Box<dyn Error>> {
+    analyze_indexed_source_with_context(
+        store,
+        receipt,
+        options,
+        IndexedAnalysisContext::default(),
+        visitor,
+    )
+}
+
+/// Analyze one validated indexed source with optional persistent case caching
+pub fn analyze_indexed_source_with_context(
+    store: &Store,
+    receipt: &IngestReceipt,
+    options: IndexedAnalysisOptions,
+    context: IndexedAnalysisContext<'_>,
+    visitor: impl FnMut(FullSourceItem) -> Result<(), Box<dyn Error>>,
+) -> Result<FullSourceCoverage, Box<dyn Error>> {
     // Validate before visiting flows so empty sources receive the same budget checks
     Reconstructor::with_limits(options.limits)?;
     let source = validate_indexed_receipt(store, receipt)?;
-    analyze_indexed_source_flows(store, receipt, source, options, visitor)
+    analyze_indexed_source_flows(store, receipt, source, options, context, visitor)
 }
 
 fn validate_indexed_receipt(
@@ -381,11 +405,52 @@ fn analyze_indexed_source_flows(
     receipt: &IngestReceipt,
     source: SourceCoverage,
     options: IndexedAnalysisOptions,
+    context: IndexedAnalysisContext<'_>,
     mut visitor: impl FnMut(FullSourceItem) -> Result<(), Box<dyn Error>>,
 ) -> Result<FullSourceCoverage, Box<dyn Error>> {
     let mut analysis = FlowAnalysisCoverage::default();
+    analyze_indexed_flows(
+        store,
+        receipt,
+        options,
+        context,
+        &mut analysis,
+        &mut visitor,
+    )?;
+
     let mut cohort_reconstruction = ReconstructionOmissionCoverage::default();
-    let mut cohort_analysis = None;
+    let cohort_analysis = if options.include_cohorts {
+        Some(
+            store.visit_ip_pair_cohort_analyses(options.limits, |analysis| {
+                cohort_reconstruction
+                    .record(reconstruction_case_omissions(&analysis.result.case)?)?;
+                visitor(FullSourceItem::Cohort(Box::new(CohortAnalysis {
+                    member_flows: analysis.member_flows,
+                    packet_flow_ids: analysis.packet_flow_ids,
+                    result: analysis.result,
+                    split: analysis.split,
+                })))
+            })?,
+        )
+    } else {
+        None
+    };
+    Ok(FullSourceCoverage {
+        source,
+        analysis,
+        cohort_reconstruction,
+        cohort_analysis,
+    })
+}
+
+fn analyze_indexed_flows(
+    store: &Store,
+    receipt: &IngestReceipt,
+    options: IndexedAnalysisOptions,
+    context: IndexedAnalysisContext<'_>,
+    analysis: &mut FlowAnalysisCoverage,
+    visitor: &mut impl FnMut(FullSourceItem) -> Result<(), Box<dyn Error>>,
+) -> Result<(), Box<dyn Error>> {
     let mut after = 0_i64;
 
     loop {
@@ -405,9 +470,15 @@ fn analyze_indexed_source_flows(
             if flow.source_id != receipt.source_id {
                 return Err(invalid("indexed flow belongs to a different source"));
             }
-            let result = store.investigate_flows(&[flow.id], options.limits)?;
+            let result = cache::investigate_flow(
+                store,
+                &receipt.source_id,
+                flow.id,
+                options.limits,
+                context,
+            )?;
             let flow_coverage = per_flow_coverage(&flow, &result)?;
-            add_flow_coverage(&mut analysis, &flow_coverage)?;
+            add_flow_coverage(analysis, &flow_coverage)?;
             let flow_id = flow.id;
             let retained_prefix_records = flow_coverage.retained_records;
             let page_flow = flow.clone();
@@ -441,27 +512,7 @@ fn analyze_indexed_source_flows(
         after = page_end;
     }
 
-    if options.include_cohorts {
-        cohort_analysis = Some(store.visit_ip_pair_cohort_analyses(
-            options.limits,
-            |analysis| {
-                cohort_reconstruction
-                    .record(reconstruction_case_omissions(&analysis.result.case)?)?;
-                visitor(FullSourceItem::Cohort(Box::new(CohortAnalysis {
-                    member_flows: analysis.member_flows,
-                    packet_flow_ids: analysis.packet_flow_ids,
-                    result: analysis.result,
-                    split: analysis.split,
-                })))
-            },
-        )?);
-    }
-    Ok(FullSourceCoverage {
-        source,
-        analysis,
-        cohort_reconstruction,
-        cohort_analysis,
-    })
+    Ok(())
 }
 
 fn source_coverage(receipt: &IngestReceipt) -> SourceCoverage {
