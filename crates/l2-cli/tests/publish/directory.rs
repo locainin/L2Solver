@@ -18,22 +18,22 @@ fn set_fault(fault: TestFault) {
 }
 
 fn replace_directory<T>(
-    prepared: publish::directory::PreparedDirectoryReplacement,
+    prepared: &publish::PreparedDirectoryReplacement,
     write: impl FnOnce(&std::path::Path) -> Result<T, Box<dyn Error>>,
 ) -> Result<T, publish::DirectoryPublishError> {
-    publish::directory::replace_directory_with_precommit(prepared, write, || Ok(()))
+    publish::replace_directory_with_precommit(prepared, write, || Ok(()))
 }
 
 #[test]
 fn publishes_complete_directory() -> Result<(), Box<dyn Error>> {
     let root = tempfile::tempdir()?;
     let destination = root.path().join("bundle");
-    publish::directory::check_new_directory_destination(&destination)?;
+    publish::check_new_directory_destination(&destination)?;
     publish::create_directory(&destination, |staging| {
         fs::write(staging.join("page.json"), b"evidence")?;
         Ok(())
     })?;
-    assert!(publish::directory::check_new_directory_destination(&destination).is_err());
+    assert!(publish::check_new_directory_destination(&destination).is_err());
     assert_eq!(fs::read(destination.join("page.json"))?, b"evidence");
     let repeated = publish::create_directory(&destination, |staging| {
         fs::write(staging.join("page.json"), b"replacement")?;
@@ -74,7 +74,7 @@ fn precommit_failure_leaves_new_directory_unpublished() -> Result<(), Box<dyn Er
     let destination = root.path().join("bundle");
     let mut writer_called = false;
 
-    let result = publish::directory::create_directory_with_precommit(
+    let result = publish::create_directory_with_precommit(
         &destination,
         |staging| {
             writer_called = true;
@@ -102,10 +102,10 @@ fn failed_refresh_preserves_the_existing_directory() -> Result<(), Box<dyn Error
         fs::write(staging.join("page.json"), b"old output")?;
         Ok(())
     })?;
-    let prepared: publish::directory::PreparedDirectoryReplacement =
-        publish::directory::prepare_directory_replacement(&destination)?;
+    let prepared: publish::PreparedDirectoryReplacement =
+        publish::prepare_directory_replacement(&destination)?;
 
-    let result = replace_directory(prepared, |staging| {
+    let result = replace_directory(&prepared, |staging| {
         fs::write(staging.join("page.json"), b"partial new output")?;
         Err::<(), Box<dyn Error>>("injected refresh failure".into())
     });
@@ -134,7 +134,7 @@ fn prepared_directory_opens_files_without_following_links_and_inventories_entrie
     fs::write(destination.join("nested/payload"), b"nested bytes")?;
     fs::write(&foreign, b"outside bytes")?;
     symlink(&foreign, destination.join("outside-link"))?;
-    let prepared = publish::directory::prepare_directory_replacement(&destination)?;
+    let prepared = publish::prepare_directory_replacement(&destination)?;
 
     let mut manifest = prepared.open_file("manifest.json")?;
     let mut manifest_bytes = Vec::new();
@@ -142,14 +142,14 @@ fn prepared_directory_opens_files_without_following_links_and_inventories_entrie
     assert_eq!(manifest_bytes, b"{\"ok\":true}");
     assert!(prepared.open_file("outside-link").is_err());
     assert!(prepared.open_file("../outside.txt").is_err());
-    let entries: Vec<publish::directory::inspection::DirectoryEntry> = prepared.entries(8)?;
+    let entries = prepared.entries(8)?;
     assert!(entries.iter().any(|entry| {
         entry.relative_path == std::path::Path::new("nested/payload")
-            && entry.kind == publish::directory::DirectoryEntryKind::File
+            && entry.kind == publish::DirectoryEntryKind::File
     }));
     assert!(entries.iter().any(|entry| {
         entry.relative_path == std::path::Path::new("outside-link")
-            && entry.kind == publish::directory::DirectoryEntryKind::Symlink
+            && entry.kind == publish::DirectoryEntryKind::Symlink
     }));
     assert_eq!(fs::read(&foreign)?, b"outside bytes");
     Ok(())
@@ -164,7 +164,7 @@ fn prepared_directory_rejects_a_symlink_destination() -> Result<(), Box<dyn Erro
     fs::write(target.join("page.json"), b"target")?;
     symlink(&target, &destination)?;
 
-    assert!(publish::directory::prepare_directory_replacement(&destination).is_err());
+    assert!(publish::prepare_directory_replacement(&destination).is_err());
     assert!(fs::symlink_metadata(&destination)?.file_type().is_symlink());
     assert_eq!(fs::read(target.join("page.json"))?, b"target");
     Ok(())
@@ -181,12 +181,12 @@ fn replacement_rejects_a_changed_target_before_running_writer() -> Result<(), Bo
         fs::write(staging.join("page.json"), b"old output")?;
         Ok(())
     })?;
-    let prepared = publish::directory::prepare_directory_replacement(&destination)?;
+    let prepared = publish::prepare_directory_replacement(&destination)?;
     fs::rename(&destination, &moved)?;
     symlink(&foreign, &destination)?;
     let mut writer_called = false;
 
-    let result = replace_directory(prepared, |_| {
+    let result = replace_directory(&prepared, |_| {
         writer_called = true;
         Ok(())
     });
@@ -211,7 +211,7 @@ fn refresh_exposes_only_complete_old_or_new_directory_contents() -> Result<(), B
         fs::write(staging.join("payload"), b"old complete payload")?;
         Ok(())
     })?;
-    let prepared = publish::directory::prepare_directory_replacement(&destination)?;
+    let prepared = publish::prepare_directory_replacement(&destination)?;
     let running = Arc::new(AtomicBool::new(true));
     let read_errors = Arc::new(std::sync::Mutex::new(Vec::new()));
     let reader_running = Arc::clone(&running);
@@ -235,7 +235,7 @@ fn refresh_exposes_only_complete_old_or_new_directory_contents() -> Result<(), B
         }
     });
 
-    replace_directory(prepared, |staging| {
+    replace_directory(&prepared, |staging| {
         fs::write(staging.join("payload"), b"new complete payload")?;
         Ok(())
     })?;
@@ -264,10 +264,10 @@ fn unsupported_exchange_preserves_existing_directory() -> Result<(), Box<dyn Err
         fs::write(staging.join("page.json"), b"old output")?;
         Ok(())
     })?;
-    let prepared = publish::directory::prepare_directory_replacement(&destination)?;
+    let prepared = publish::prepare_directory_replacement(&destination)?;
     set_fault(TestFault::UnsupportedDirectoryExchange);
 
-    let result = replace_directory(prepared, |staging| {
+    let result = replace_directory(&prepared, |staging| {
         fs::write(staging.join("page.json"), b"new output")?;
         Ok(())
     });
@@ -296,7 +296,7 @@ fn refresh_race_keeps_foreign_symlink_at_reported_path() -> Result<(), Box<dyn E
         fs::write(staging.join("page.json"), b"old output")?;
         Ok(())
     })?;
-    let prepared = publish::directory::prepare_directory_replacement(&destination)?;
+    let prepared = publish::prepare_directory_replacement(&destination)?;
     let raced_destination = destination.clone();
     let raced_moved = moved.clone();
     let raced_foreign = foreign.clone();
@@ -305,7 +305,7 @@ fn refresh_race_keeps_foreign_symlink_at_reported_path() -> Result<(), Box<dyn E
         symlink(&raced_foreign, &raced_destination)
     });
 
-    let result = replace_directory(prepared, |staging| {
+    let result = replace_directory(&prepared, |staging| {
         fs::write(staging.join("page.json"), b"new output")?;
         Ok(())
     });
@@ -349,7 +349,7 @@ fn retained_race_path_tracks_a_renamed_held_parent() -> Result<(), Box<dyn Error
         fs::write(staging.join("page.json"), b"old output")?;
         Ok(())
     })?;
-    let prepared = publish::directory::prepare_directory_replacement(&destination)?;
+    let prepared = publish::prepare_directory_replacement(&destination)?;
     let raced_parent = parent.clone();
     let raced_moved_parent = moved_parent.clone();
     let raced_destination = moved_destination.clone();
@@ -362,7 +362,7 @@ fn retained_race_path_tracks_a_renamed_held_parent() -> Result<(), Box<dyn Error
         symlink(&raced_foreign, &raced_destination)
     });
 
-    let result = replace_directory(prepared, |staging| {
+    let result = replace_directory(&prepared, |staging| {
         fs::write(staging.join("page.json"), b"new output")?;
         Ok(())
     });
@@ -454,10 +454,10 @@ fn replacement_sync_failure_reports_uncertainty_after_atomic_commit() -> Result<
         fs::write(staging.join("page.json"), b"old output")?;
         Ok(())
     })?;
-    let prepared = publish::directory::prepare_directory_replacement(&destination)?;
+    let prepared = publish::prepare_directory_replacement(&destination)?;
     set_fault(TestFault::DirectorySync);
 
-    let result = replace_directory(prepared, |staging| {
+    let result = replace_directory(&prepared, |staging| {
         fs::write(staging.join("page.json"), b"new output")?;
         Ok(())
     });

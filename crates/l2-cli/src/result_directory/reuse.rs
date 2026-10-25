@@ -140,7 +140,6 @@ fn verify_source_by_digest(
 fn source_digest(identity: &SourceIdentity) -> Option<&str> {
     match identity {
         SourceIdentity::Sha256(digest) => Some(digest),
-        SourceIdentity::Fast(_) => None,
         _ => None,
     }
 }

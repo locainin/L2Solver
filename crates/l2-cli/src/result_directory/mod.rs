@@ -101,5 +101,5 @@ impl ResultDirectory {
 }
 
 #[cfg(test)]
-#[path = "../../tests/result_directory.rs"]
+#[path = "../../tests/result_directory/mod.rs"]
 mod tests;

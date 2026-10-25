@@ -6,7 +6,7 @@ use std::{
 };
 
 #[path = "directory/inspection.rs"]
-pub(crate) mod inspection;
+pub mod inspection;
 #[cfg(target_os = "linux")]
 #[path = "directory/tree.rs"]
 mod tree;
@@ -14,8 +14,8 @@ mod tree;
 pub use inspection::{DirectoryEntryKind, PreparedDirectoryReplacement};
 #[cfg(target_os = "linux")]
 use inspection::{
-    destination_entry_exists, identity_from_fd, open_directory_at, stat_identity_at,
-    verify_named_directory,
+    DirectoryIdentity, destination_entry_exists, identity_from_fd, open_directory_at,
+    stat_identity_at, verify_named_directory,
 };
 #[cfg(target_os = "linux")]
 use tree::{remove_directory_at, sync_tree};
@@ -179,7 +179,7 @@ pub fn prepare_directory_replacement(
 /// `before_commit` runs after the staged tree and destination identity are checked and
 /// immediately before the atomic exchange. A failure preserves the old destination
 pub fn replace_directory_with_precommit<T>(
-    prepared: PreparedDirectoryReplacement,
+    prepared: &PreparedDirectoryReplacement,
     write: impl FnOnce(&Path) -> Result<T, Box<dyn Error>>,
     before_commit: impl FnOnce() -> Result<(), Box<dyn Error>>,
 ) -> Result<T, super::DirectoryPublishError> {
@@ -196,11 +196,10 @@ pub fn replace_directory_with_precommit<T>(
 
 #[cfg(target_os = "linux")]
 fn replace_directory_linux<T>(
-    prepared: PreparedDirectoryReplacement,
+    prepared: &PreparedDirectoryReplacement,
     write: impl FnOnce(&Path) -> Result<T, Box<dyn Error>>,
     before_commit: impl FnOnce() -> Result<(), Box<dyn Error>>,
 ) -> Result<T, super::DirectoryPublishError> {
-    use rustix::fs::{RenameFlags, renameat_with};
     use std::{os::fd::AsRawFd, path::PathBuf};
 
     let path = &prepared.destination_path;
@@ -240,6 +239,21 @@ fn replace_directory_linux<T>(
     })?;
     before_commit().map_err(super::DirectoryPublishError::BeforePublication)?;
 
+    finish_directory_replacement(prepared, staging, &staging_name, staging_identity, result)
+}
+
+#[cfg(target_os = "linux")]
+fn finish_directory_replacement<T>(
+    prepared: &PreparedDirectoryReplacement,
+    staging: tempfile::TempDir,
+    staging_name: &OsStr,
+    staging_identity: DirectoryIdentity,
+    result: T,
+) -> Result<T, super::DirectoryPublishError> {
+    use rustix::fs::{RenameFlags, renameat_with};
+
+    let path = &prepared.destination_path;
+
     #[cfg(test)]
     if super::test_hooks::take_fault(super::test_hooks::TestFault::UnsupportedDirectoryExchange) {
         return Err(unsupported_directory_exchange(path).into());
@@ -249,7 +263,7 @@ fn replace_directory_linux<T>(
 
     renameat_with(
         &prepared.parent_fd,
-        &staging_name,
+        staging_name,
         &prepared.parent_fd,
         &prepared.name,
         RenameFlags::EXCHANGE,
@@ -263,10 +277,10 @@ fn replace_directory_linux<T>(
         }
     })?;
 
-    let retained_path = retained_display_path(&prepared.parent_fd, path, &staging_name);
+    let retained_path = retained_display_path(&prepared.parent_fd, path, staging_name);
     // From this point TempDir must not clean a name whose inode may have changed
     let _retained_path = staging.keep();
-    let identities = stat_identity_at(&prepared.parent_fd, &staging_name).and_then(|displaced| {
+    let identities = stat_identity_at(&prepared.parent_fd, staging_name).and_then(|displaced| {
         stat_identity_at(&prepared.parent_fd, &prepared.name)
             .map(|published| (displaced, published))
     });
@@ -295,7 +309,7 @@ fn replace_directory_linux<T>(
 
     // The retained name is checked before cleanup, and cleanup opens every directory without following links
     if let Err(error) =
-        remove_directory_at(&prepared.parent_fd, &staging_name, prepared.target_identity)
+        remove_directory_at(&prepared.parent_fd, staging_name, prepared.target_identity)
     {
         return Err(
             super::DirectoryPublishError::PublishedReplacementUncertain {

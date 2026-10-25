@@ -24,44 +24,14 @@ pub(super) fn publish<T>(
         let write = writer
             .take()
             .ok_or_else(|| io::Error::other("result writer was already consumed"))?;
-        let result = write(staging)?;
-
-        // Record publication separately from analysis, beginning only after the writer succeeds
-        job.check_cancelled()?;
-        job.start(Phase::Publication, None)?;
-        publication_started.set(true);
-        let snapshot = job.snapshot()?;
-
-        let parsed = manifest::parse_staged_manifest(staging, kind)?;
-        validate_identity(identity, kind, &parsed.source_identity_sha256)?;
-        let file_names = manifest::staged_output_files(staging, kind, &parsed)?;
-        let output_files = file_names
-            .iter()
-            .map(|file| {
-                let artifact = parsed
-                    .artifacts
-                    .iter()
-                    .find(|artifact| artifact.file == *file);
-                OutputFileStamp::capture_path(
-                    staging,
-                    file,
-                    artifact.and_then(|artifact| artifact.sha256.as_deref()),
-                    artifact.is_some(),
-                )
-            })
-            .collect::<io::Result<Vec<_>>>()?;
-        let receipt = manifest::ResultReceipt {
-            schema_version: 1,
-            identity: identity.clone(),
-            complete: parsed.complete,
-            source_sha256s: parsed.source_sha256s.clone(),
-            source_identity_sha256: parsed.source_identity_sha256.clone(),
-            job: snapshot,
-            output_files,
-        };
-        manifest::append_receipt(&staging.join("manifest.json"), &receipt)?;
-        manifest::validate_staged_receipt(staging, kind)?;
-        value = Some(result);
+        value = Some(write_result_stage(
+            staging,
+            kind,
+            identity,
+            job,
+            write,
+            &publication_started,
+        )?);
         Ok(())
     };
     let before_commit = || -> Result<(), Box<dyn Error>> {
@@ -72,20 +42,12 @@ pub(super) fn publish<T>(
 
     let publication = match state {
         manifest::DirectoryState::Missing => {
-            crate::publish::directory::create_directory_with_precommit(
-                &path,
-                write_stage,
-                before_commit,
-            )
+            crate::publish::create_directory_with_precommit(&path, write_stage, before_commit)
         }
         manifest::DirectoryState::Legacy { prepared }
         | manifest::DirectoryState::Owned { prepared, .. } => {
             prepared.check_location()?;
-            crate::publish::directory::replace_directory_with_precommit(
-                prepared,
-                write_stage,
-                before_commit,
-            )
+            crate::publish::replace_directory_with_precommit(&prepared, write_stage, before_commit)
         }
     };
 
@@ -102,6 +64,53 @@ pub(super) fn publish<T>(
     }
     job.finish(Phase::Publication, PhaseOutcome::Completed)?;
     value.ok_or_else(|| io::Error::other("result writer completed without a value").into())
+}
+
+fn write_result_stage<T>(
+    staging: &Path,
+    kind: ResultKind,
+    identity: &ResultIdentity,
+    job: &Job,
+    write: impl FnOnce(&Path) -> Result<T, Box<dyn Error>>,
+    publication_started: &Cell<bool>,
+) -> Result<T, Box<dyn Error>> {
+    let result = write(staging)?;
+    // Mark publication only after the writer has produced all user-visible files
+    job.check_cancelled()?;
+    job.start(Phase::Publication, None)?;
+    publication_started.set(true);
+    let snapshot = job.snapshot()?;
+
+    let parsed = manifest::parse_staged_manifest(staging, kind)?;
+    validate_identity(identity, kind, &parsed.source_identity_sha256)?;
+    let file_names = manifest::staged_output_files(staging, kind, &parsed)?;
+    let output_files = file_names
+        .iter()
+        .map(|file| {
+            let artifact = parsed
+                .artifacts
+                .iter()
+                .find(|artifact| artifact.file == *file);
+            OutputFileStamp::capture_path(
+                staging,
+                file,
+                artifact.and_then(|artifact| artifact.sha256.as_deref()),
+                artifact.is_some(),
+            )
+        })
+        .collect::<io::Result<Vec<_>>>()?;
+    let receipt = manifest::ResultReceipt {
+        schema_version: 1,
+        identity: identity.clone(),
+        complete: parsed.complete,
+        source_sha256s: parsed.source_sha256s,
+        source_identity_sha256: parsed.source_identity_sha256,
+        job: snapshot,
+        output_files,
+    };
+    manifest::append_receipt(&staging.join("manifest.json"), &receipt)?;
+    manifest::validate_staged_receipt(staging, kind)?;
+    Ok(result)
 }
 
 fn validate_identity(

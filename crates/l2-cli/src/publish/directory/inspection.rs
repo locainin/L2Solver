@@ -139,13 +139,16 @@ fn open_file_linux(
     use rustix::fs::{FileType, Mode, OFlags};
 
     let components = normal_components(relative_path)?;
+    let Some((final_name, parent_components)) = components.split_last() else {
+        return Err(invalid_relative_path(relative_path));
+    };
     let mut current = rustix::fs::openat(
         &prepared.target_fd,
         Path::new("."),
         OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC,
         Mode::empty(),
     )?;
-    for component in &components[..components.len() - 1] {
+    for component in parent_components {
         current = rustix::fs::openat(
             &current,
             component,
@@ -153,9 +156,6 @@ fn open_file_linux(
             Mode::empty(),
         )?;
     }
-    let final_name = components
-        .last()
-        .ok_or_else(|| invalid_relative_path(relative_path))?;
     let file_fd = rustix::fs::openat(
         &current,
         final_name,
@@ -343,7 +343,7 @@ pub(super) fn identity_from_fd(fd: &rustix::fd::OwnedFd) -> io::Result<Directory
 }
 
 #[cfg(target_os = "linux")]
-pub(super) fn identity_from_stat(stat: &rustix::fs::Stat) -> DirectoryIdentity {
+pub(super) const fn identity_from_stat(stat: &rustix::fs::Stat) -> DirectoryIdentity {
     DirectoryIdentity {
         device: stat.st_dev,
         inode: stat.st_ino,

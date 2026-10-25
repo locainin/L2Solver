@@ -1,4 +1,4 @@
-use crate::publish::directory::PreparedDirectoryReplacement;
+use crate::publish::PreparedDirectoryReplacement;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::{
@@ -49,7 +49,7 @@ impl OutputFileStamp {
             (None, false) => None,
         };
         let after = file.metadata()?;
-        let after_stamp = metadata_stamp(file_name.to_owned(), sha256.clone(), &after);
+        let after_stamp = metadata_stamp(file_name.to_owned(), sha256, &after);
         let named_after = std::fs::symlink_metadata(&path)?;
         if !same_fast_metadata(&before_stamp, &after_stamp)
             || !single_link(&after)
@@ -126,13 +126,16 @@ pub(super) fn open_regular_path(path: &std::path::Path) -> io::Result<std::fs::F
 fn hash_file(file: &mut std::fs::File) -> io::Result<String> {
     file.seek(SeekFrom::Start(0))?;
     let mut hasher = Sha256::new();
-    let mut buffer = [0_u8; HASH_BUFFER_BYTES];
+    let mut buffer = vec![0_u8; HASH_BUFFER_BYTES].into_boxed_slice();
     loop {
         let read = file.read(&mut buffer)?;
         if read == 0 {
             break;
         }
-        hasher.update(&buffer[..read]);
+        let chunk = buffer
+            .get(..read)
+            .ok_or_else(|| io::Error::other("file reader returned an oversized chunk"))?;
+        hasher.update(chunk);
     }
     Ok(format!("{:x}", hasher.finalize()))
 }

@@ -25,16 +25,16 @@ pub(super) enum DirectoryState {
     /// An older extraction is safe but has no reusable receipt
     Legacy {
         /// Held directory and its verified manifest
-        prepared: publish::directory::PreparedDirectoryReplacement,
+        prepared: publish::PreparedDirectoryReplacement,
     },
     /// A result published with the current receipt format
     Owned {
         /// Held directory and its verified manifest
-        prepared: publish::directory::PreparedDirectoryReplacement,
+        prepared: publish::PreparedDirectoryReplacement,
         /// Parsed manifest data used for the whitelist
         manifest: OwnedManifest,
         /// Job and output receipts stored in the manifest
-        receipt: ResultReceipt,
+        receipt: Box<ResultReceipt>,
     },
 }
 
@@ -124,7 +124,7 @@ pub(super) fn inspect(
             Err(actionable_conflict("result destination exists and is not a real directory").into())
         }
         Err(error) if error.kind() == io::ErrorKind::NotFound => {
-            publish::directory::check_new_directory_destination(path)?;
+            publish::check_new_directory_destination(path)?;
             Ok(super::ResultDirectory {
                 path: path.to_owned(),
                 kind,
@@ -139,7 +139,7 @@ fn inspect_existing(
     path: &Path,
     kind: ResultKind,
 ) -> Result<super::ResultDirectory, Box<dyn Error>> {
-    let prepared = publish::directory::prepare_directory_replacement(path).map_err(|error| {
+    let prepared = publish::prepare_directory_replacement(path).map_err(|error| {
         actionable_conflict(&format!("existing result destination is unsafe: {error}"))
     })?;
     let manifest_file = prepared.open_file(MANIFEST_FILE).map_err(|error| {
@@ -164,7 +164,7 @@ fn inspect_existing(
 fn inspect_prepared(
     path: &Path,
     kind: ResultKind,
-    prepared: publish::directory::PreparedDirectoryReplacement,
+    prepared: publish::PreparedDirectoryReplacement,
     raw: RawManifest,
 ) -> Result<super::ResultDirectory, Box<dyn Error>> {
     prepared.check_location()?;
@@ -181,7 +181,7 @@ fn inspect_prepared(
         DirectoryState::Owned {
             prepared,
             manifest,
-            receipt,
+            receipt: Box::new(receipt),
         }
     } else if kind == ResultKind::Extract {
         validate_directory_entries(&prepared, kind, &manifest, None)?;
@@ -445,12 +445,12 @@ fn validate_source_receipt(
 }
 
 fn validate_directory_entries(
-    prepared: &publish::directory::PreparedDirectoryReplacement,
+    prepared: &publish::PreparedDirectoryReplacement,
     kind: ResultKind,
     manifest: &OwnedManifest,
     receipt: Option<&ResultReceipt>,
 ) -> Result<(), Box<dyn Error>> {
-    use publish::directory::DirectoryEntryKind;
+    use publish::DirectoryEntryKind;
 
     let mut expected = expected_names(kind, manifest);
     if let Some(receipt) = receipt {
@@ -576,7 +576,7 @@ fn last_non_whitespace_offset(file: &mut fs::File, mut length: u64) -> io::Resul
             return Ok(length);
         }
     }
-    Err(invalid_result("generated result manifest is empty").into())
+    Err(invalid_result("generated result manifest is empty"))
 }
 
 fn validate_staged_entries(
