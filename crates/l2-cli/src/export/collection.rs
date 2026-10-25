@@ -31,6 +31,13 @@ use std::{
 
 const TSHARK_OBJECT_BUDGET: workbench::ObjectExportBudget = workbench::ObjectExportBudget::DEFAULT;
 
+struct CaseCollection {
+    artifacts: ArtifactCollection,
+    evidence: EvidenceSidecar,
+    limitations: LimitationSpool,
+    recovery: RecoveryCoverage,
+}
+
 pub(super) struct CollectedExport {
     pub(super) artifacts: ArtifactCollection,
     pub(super) evidence: EvidenceSidecar,
@@ -47,10 +54,12 @@ pub(super) fn collect_export(
     limits: ArtifactLimits,
     context: &RecoveryContext<'_>,
 ) -> Result<CollectedExport, Box<dyn Error>> {
-    let mut artifacts = ArtifactCollection::new(staging, limits)?;
-    let mut evidence = EvidenceSidecar::new(staging, limits.evidence_bytes)?;
-    let mut limitations = LimitationSpool::new(staging)?;
-    let mut recovery = RecoveryCoverage::default();
+    let mut collection = CaseCollection {
+        artifacts: ArtifactCollection::new(staging, limits)?,
+        evidence: EvidenceSidecar::new(staging, limits.evidence_bytes)?,
+        limitations: LimitationSpool::new(staging)?,
+        recovery: RecoveryCoverage::default(),
+    };
     let capture_cache = context
         .cache
         .filter(|_| !context.options.no_cache && options.capture != Path::new("-"));
@@ -66,7 +75,7 @@ pub(super) fn collect_export(
     )?;
     let worker_count = recovery_worker_count(
         context.options.jobs,
-        std::thread::available_parallelism().map_or(1, |count| count.get()),
+        std::thread::available_parallelism().map_or(1, std::num::NonZeroUsize::get),
         context.options.memory_limit,
     );
     let pool = rayon::ThreadPoolBuilder::new()
@@ -76,52 +85,31 @@ pub(super) fn collect_export(
     if let Some(job) = context.job {
         job.set_current(
             Phase::Expansion,
-            &format!("Analyzing capture with {worker_count} recovery worker(s)"),
+            format!("Analyzing capture with {worker_count} recovery worker(s)"),
         )?;
     }
     let coverage = collect_flow_cases(
         &indexed,
         options,
-        &mut artifacts,
-        &mut evidence,
-        &mut limitations,
-        &mut recovery,
+        &mut collection,
         context,
         &pool,
         worker_count,
     )?;
-    if let Some(job) = context.job {
-        job.set_current(
-            Phase::NativeExtraction,
-            "Collecting optional TShark objects",
-        )?;
-    }
-    let tshark_result = collect_tshark_objects(
+    let (tshark, tshark_error) = collect_tshark_and_finish(
         &options.capture,
         staging,
         &coverage.source,
-        &mut artifacts,
-        TSHARK_OBJECT_BUDGET,
+        &mut collection.artifacts,
+        phases,
         context.job,
-    );
-    let phase_result = phases.finish(match &tshark_result {
-        Ok(_) => l2_workbench::job::PhaseOutcome::Completed,
-        Err(_) if context.job.is_some_and(|job| job.is_cancelled()) => {
-            l2_workbench::job::PhaseOutcome::Cancelled
-        }
-        Err(_) => l2_workbench::job::PhaseOutcome::Failed,
-    });
-    let (tshark, tshark_error) = match (tshark_result, phase_result) {
-        (Ok(result), Ok(())) => result,
-        (Err(error), Ok(())) => return Err(error),
-        (Ok(_), Err(error)) => return Err(error),
-        (Err(tshark_error), Err(phase_error)) => {
-            return Err(io::Error::other(format!(
-                "TShark object collection failed: {tshark_error}; could not finish collection progress: {phase_error}"
-            ))
-            .into());
-        }
-    };
+    )?;
+    let CaseCollection {
+        artifacts,
+        evidence,
+        limitations,
+        recovery,
+    } = collection;
     Ok(CollectedExport {
         artifacts,
         evidence,
@@ -133,21 +121,56 @@ pub(super) fn collect_export(
     })
 }
 
+fn collect_tshark_and_finish(
+    capture: &Path,
+    staging: &Path,
+    source: &workbench::full_source::SourceCoverage,
+    artifacts: &mut ArtifactCollection,
+    phases: CollectionPhases<'_>,
+    job: Option<&l2_workbench::job::Job>,
+) -> Result<(tshark_objects::Collection, Option<String>), Box<dyn Error>> {
+    if let Some(job) = job {
+        job.set_current(
+            Phase::NativeExtraction,
+            "Collecting optional TShark objects",
+        )?;
+    }
+    let tshark_result = collect_tshark_objects(
+        capture,
+        staging,
+        source,
+        artifacts,
+        TSHARK_OBJECT_BUDGET,
+        job,
+    );
+    let phase_result = phases.finish(match &tshark_result {
+        Ok(_) => l2_workbench::job::PhaseOutcome::Completed,
+        Err(_) if job.is_some_and(l2_workbench::job::Job::is_cancelled) => {
+            l2_workbench::job::PhaseOutcome::Cancelled
+        }
+        Err(_) => l2_workbench::job::PhaseOutcome::Failed,
+    });
+    match (tshark_result, phase_result) {
+        (Ok(result), Ok(())) => Ok(result),
+        (Err(error), Ok(())) | (Ok(_), Err(error)) => Err(error),
+        (Err(tshark_error), Err(phase_error)) => Err(io::Error::other(format!(
+            "TShark object collection failed: {tshark_error}; could not finish collection progress: {phase_error}"
+        ))
+        .into()),
+    }
+}
+
 fn collect_flow_cases(
     indexed: &workbench::full_source::IndexedSource,
     options: &ExportOptions,
-    artifacts: &mut ArtifactCollection,
-    evidence: &mut EvidenceSidecar,
-    limitations: &mut LimitationSpool,
-    recovery_coverage: &mut RecoveryCoverage,
+    collection: &mut CaseCollection,
     context: &RecoveryContext<'_>,
     pool: &rayon::ThreadPool,
     worker_count: usize,
 ) -> Result<workbench::full_source::FullSourceCoverage, Box<dyn Error>> {
     let native_cache = context.cache.filter(|_| !context.options.no_cache);
     let mut batch = Vec::with_capacity(worker_count);
-    let mut collect_case =
-        |case| collect_recovered_case(case, artifacts, evidence, limitations, recovery_coverage);
+    let mut collect_case = |case| collect_recovered_case(case, collection);
     let analysis = workbench::full_source::analyze_indexed_source_with_context(
         &indexed.store,
         &indexed.receipt,
@@ -161,10 +184,10 @@ fn collect_flow_cases(
         },
         |item| {
             let pending = PendingCase::new(item)?;
-            if let Some(job) = context.job {
-                if let Some(counter) = pending.progress_counter() {
-                    job.increment(counter, 1)?;
-                }
+            if let Some(job) = context.job
+                && let Some(counter) = pending.progress_counter()
+            {
+                job.increment(counter, 1)?;
             }
             batch.push(pending);
             if batch.len() == worker_count {
@@ -183,61 +206,42 @@ fn collect_flow_cases(
             format!("could not analyze {}: {error}", options.capture.display()),
         )
     })?;
-    add_source_limitations(limitations, &coverage.source)?;
+    add_source_limitations(&mut collection.limitations, &coverage.source)?;
     Ok(coverage)
 }
 
 fn collect_recovered_case(
     case: RecoveredCase,
-    artifacts: &mut ArtifactCollection,
-    evidence: &mut EvidenceSidecar,
-    limitations: &mut LimitationSpool,
-    recovery_coverage: &mut RecoveryCoverage,
+    collection: &mut CaseCollection,
 ) -> Result<(), Box<dyn Error>> {
-    match case.item {
-        workbench::full_source::FullSourceItem::Flow(analysis) => collect_flow_case(
-            *analysis,
-            case.recovery,
-            &case.scope,
-            artifacts,
-            evidence,
-            limitations,
-            recovery_coverage,
-        ),
-        workbench::full_source::FullSourceItem::FlowPage(page) => collect_flow_page_case(
-            *page,
-            case.recovery,
-            &case.scope,
-            artifacts,
-            evidence,
-            limitations,
-            recovery_coverage,
-        ),
-        workbench::full_source::FullSourceItem::Cohort(cohort) => collect_cohort_case(
-            *cohort,
-            case.recovery,
-            &case.scope,
-            artifacts,
-            evidence,
-            limitations,
-            recovery_coverage,
-        ),
+    let RecoveredCase {
+        item,
+        recovery,
+        scope,
+    } = case;
+    match item {
+        workbench::full_source::FullSourceItem::Flow(analysis) => {
+            collect_flow_case(&analysis, &recovery, &scope, collection)
+        }
+        workbench::full_source::FullSourceItem::FlowPage(page) => {
+            collect_flow_page_case(&page, &recovery, &scope, collection)
+        }
+        workbench::full_source::FullSourceItem::Cohort(cohort) => {
+            collect_cohort_case(&cohort, &recovery, &scope, collection)
+        }
     }
 }
 
 fn collect_flow_case(
-    analysis: workbench::full_source::FlowAnalysis,
-    recovery: CachedRecovery,
+    analysis: &workbench::full_source::FlowAnalysis,
+    recovery: &CachedRecovery,
     scope: &serde_json::Value,
-    artifacts: &mut ArtifactCollection,
-    evidence: &mut EvidenceSidecar,
-    limitations: &mut LimitationSpool,
-    recovery_coverage: &mut RecoveryCoverage,
+    collection: &mut CaseCollection,
 ) -> Result<(), Box<dyn Error>> {
     let flow_id = analysis.flow.id;
-    recovery_coverage.merge(&recovery.coverage)?;
+    collection.recovery.merge(&recovery.coverage)?;
     for omission in &recovery.omissions {
-        limitations.push(
+        collection.limitations.push(
             Some(flow_id),
             format!("Default recovery omission: {omission}"),
         )?;
@@ -245,7 +249,7 @@ fn collect_flow_case(
     let omissions = analysis.coverage.reconstruction_omissions;
     if analysis.coverage.omitted_records != 0 || omissions.has_omissions() {
         let limits = retention_limit_names(&analysis.coverage.retention_limits);
-        limitations.push_with_impact(
+        collection.limitations.push_with_impact(
             Some(flow_id),
             format!(
                 "Flow analysis selected {} records, retained {}, and omitted {}; retention ceilings reached: {limits}; reconstruction omissions: {} TCP records, {} fragments, {} ranges, {} TCP byte positions affected by omitted observations or rejected ranges, {} TCP observations, {} fragment byte positions affected by omitted observations or rejected ranges, {} fragment observations, {} state observations, {} unmeasured ranges",
@@ -266,38 +270,37 @@ fn collect_flow_case(
         )?;
     }
     let case_id = record_case_evidence(
-        evidence,
+        &mut collection.evidence,
         &analysis.result.case,
-        &scope,
+        scope,
         CaseLimitationOrigin::Flow(flow_id),
-        limitations,
+        &mut collection.limitations,
     )?;
     collect_case_artifacts(
-        artifacts,
+        &mut collection.artifacts,
         &analysis.result.case,
         &analysis.flow,
         case_id.as_deref(),
-        &scope,
+        scope,
     )?;
     for message in analysis.result.case.limitations() {
-        limitations.push_case_limitation(CaseLimitationOrigin::Flow(flow_id), message)?;
+        collection
+            .limitations
+            .push_case_limitation(CaseLimitationOrigin::Flow(flow_id), message)?;
     }
     Ok(())
 }
 
 fn collect_flow_page_case(
-    page: workbench::full_source::SupplementaryFlowPage,
-    recovery: CachedRecovery,
+    page: &workbench::full_source::SupplementaryFlowPage,
+    recovery: &CachedRecovery,
     scope: &serde_json::Value,
-    artifacts: &mut ArtifactCollection,
-    evidence: &mut EvidenceSidecar,
-    limitations: &mut LimitationSpool,
-    recovery_coverage: &mut RecoveryCoverage,
+    collection: &mut CaseCollection,
 ) -> Result<(), Box<dyn Error>> {
     let flow_id = page.flow.id;
-    recovery_coverage.merge(&recovery.coverage)?;
+    collection.recovery.merge(&recovery.coverage)?;
     for omission in &recovery.omissions {
-        limitations.push(
+        collection.limitations.push(
             Some(flow_id),
             format!(
                 "Flow page {} (packets {}–{}): default recovery omission: {omission}",
@@ -305,7 +308,7 @@ fn collect_flow_page_case(
             ),
         )?;
     }
-    limitations.push_with_impact(
+    collection.limitations.push_with_impact(
         Some(flow_id),
         format!(
             "Flow page {} (packets {}–{}): selected records {}, retained records {}, omitted records {}; TCP/session/application state was not joined across page boundaries",
@@ -319,33 +322,32 @@ fn collect_flow_page_case(
         false,
     )?;
     let case_id = record_case_evidence(
-        evidence,
+        &mut collection.evidence,
         &page.result.case,
-        &scope,
+        scope,
         CaseLimitationOrigin::Flow(flow_id),
-        limitations,
+        &mut collection.limitations,
     )?;
     collect_case_artifacts(
-        artifacts,
+        &mut collection.artifacts,
         &page.result.case,
         &page.flow,
         case_id.as_deref(),
-        &scope,
+        scope,
     )?;
     for message in page.result.case.limitations() {
-        limitations.push_case_limitation(CaseLimitationOrigin::Flow(flow_id), message)?;
+        collection
+            .limitations
+            .push_case_limitation(CaseLimitationOrigin::Flow(flow_id), message)?;
     }
     Ok(())
 }
 
 fn collect_cohort_case(
-    cohort: workbench::full_source::CohortAnalysis,
-    recovery: CachedRecovery,
+    cohort: &workbench::full_source::CohortAnalysis,
+    recovery: &CachedRecovery,
     scope: &serde_json::Value,
-    artifacts: &mut ArtifactCollection,
-    evidence: &mut EvidenceSidecar,
-    limitations: &mut LimitationSpool,
-    recovery_coverage: &mut RecoveryCoverage,
+    collection: &mut CaseCollection,
 ) -> Result<(), Box<dyn Error>> {
     let flow_ids = cohort
         .member_flows
@@ -353,23 +355,25 @@ fn collect_cohort_case(
         .map(|flow| flow.id)
         .collect::<Vec<_>>();
     let cohort_label = format!("IP-pair cohort flows {flow_ids:?}");
-    recovery_coverage.merge(&recovery.coverage)?;
+    collection.recovery.merge(&recovery.coverage)?;
     for omission in &recovery.omissions {
-        limitations.push(
+        collection.limitations.push(
             None,
             format!("{cohort_label}: Default recovery omission: {omission}"),
         )?;
     }
     let case_id = record_case_evidence(
-        evidence,
+        &mut collection.evidence,
         &cohort.result.case,
-        &scope,
+        scope,
         CaseLimitationOrigin::Cohort(&cohort_label),
-        limitations,
+        &mut collection.limitations,
     )?;
-    collect_cohort_artifacts(artifacts, &cohort, case_id.as_deref(), &scope)?;
+    collect_cohort_artifacts(&mut collection.artifacts, cohort, case_id.as_deref(), scope)?;
     for message in cohort.result.case.limitations() {
-        limitations.push_case_limitation(CaseLimitationOrigin::Cohort(&cohort_label), message)?;
+        collection
+            .limitations
+            .push_case_limitation(CaseLimitationOrigin::Cohort(&cohort_label), message)?;
     }
     Ok(())
 }

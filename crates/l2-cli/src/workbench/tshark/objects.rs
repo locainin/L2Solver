@@ -55,7 +55,7 @@ struct ResolvedObjectExport {
     partial_directories: Vec<(String, PathBuf)>,
 }
 
-/// Export TShark objects with the shared isolated profile and cooperative cancellation state
+/// Export `TShark` objects with the shared isolated profile and cooperative cancellation state
 pub fn export_objects_with_job(
     capture: &Path,
     temporary_parent: &Path,
@@ -152,7 +152,6 @@ fn resolve_object_export(
             &timeout.stable_objects,
             timeout.describe(),
         )?,
-        Err(error @ process::ProcessError::Cancelled) => return Err(error.into()),
         Err(error) => return Err(error.into()),
     };
     Ok(ResolvedObjectExport {

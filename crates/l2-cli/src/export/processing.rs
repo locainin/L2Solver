@@ -34,15 +34,13 @@ impl<'job> CollectionPhases<'job> {
     pub(super) fn start(job: Option<&'job Job>) -> Result<Self, Box<dyn Error>> {
         if let Some(job) = job {
             // These phases overlap while Cases move through recovery and expansion
-            let mut started = 0;
-            for phase in COLLECTION_PHASES {
+            for (started, phase) in COLLECTION_PHASES.into_iter().enumerate() {
                 if let Err(error) = job.start(phase, None) {
                     for started_phase in COLLECTION_PHASES.into_iter().take(started) {
                         let _ = job.finish(started_phase, PhaseOutcome::Failed);
                     }
                     return Err(error.into());
                 }
-                started += 1;
             }
         }
         Ok(Self {

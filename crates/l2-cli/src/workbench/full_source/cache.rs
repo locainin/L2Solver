@@ -9,8 +9,8 @@ use l2_workbench::{
     job::{
         Counter, Job, Phase, PhaseOutcome,
         cache::{
-            Cache, CacheEntry, CacheError, CacheReadPolicy, SourceFingerprint, SourceIdentity,
-            StageKey, StageStatus, Value,
+            Cache, CacheEntry, CacheError, CacheReadPolicy, Lease, SourceFingerprint,
+            SourceIdentity, StageKey, StageStatus, Value,
         },
     },
     store::{Options, SCHEMA_VERSION, Store},
@@ -21,7 +21,9 @@ use std::{
     error::Error,
     fs,
     io::{self, Read},
-    path::Path,
+    path::{Path, PathBuf},
+    thread,
+    time::{Duration, Instant},
 };
 
 const SOURCE_ALIAS_STAGE: &str = "capture_source";
@@ -29,6 +31,9 @@ const SOURCE_ALIAS_ALGORITHM: &str = "pcap-source-alias-v1";
 const SOURCE_INDEX_STAGE: &str = "capture_index";
 const SOURCE_INDEX_ALGORITHM: &str = "pcap-index-v1";
 const INDEX_DIRECTORY: &str = "index";
+const CACHE_CONTENTION_WAIT: Duration = Duration::from_secs(5);
+const CACHE_CONTENTION_POLL: Duration = Duration::from_millis(20);
+const CACHE_BUSY_FALLBACK_MESSAGE: &str = "Cache is busy; building a temporary index";
 
 pub const NATIVE_CASE_VERSION: u32 = 1;
 
@@ -62,6 +67,7 @@ pub struct IndexedSource {
 enum IndexedSourceStorage {
     Temporary { _directory: tempfile::TempDir },
     Cached { _entry: CacheEntry },
+    Uncached { _lease: Lease },
 }
 
 /// Optional cache and progress services used for indexed flow analysis
@@ -71,6 +77,39 @@ pub struct IndexedAnalysisContext<'a> {
     pub cache: Option<&'a Cache>,
     /// Cumulative progress and cache counters
     pub job: Option<&'a Job>,
+}
+
+struct CachedIndexWork<'a> {
+    cache: &'a Cache,
+    path: &'a Path,
+    fingerprint: SourceFingerprint,
+    job: Option<&'a Job>,
+    deadline: Instant,
+    alias_lease: Lease,
+    index_directory: PathBuf,
+    expected_source_id: Option<String>,
+    cache_miss_counted: bool,
+}
+
+enum WaitedCacheLookup<T> {
+    Ready(T),
+    Busy,
+}
+
+enum AliasDecision {
+    Reused(Box<IndexedSource>),
+    Build {
+        entry: Option<CacheEntry>,
+        source_id: Option<String>,
+        cache_miss_counted: bool,
+    },
+    Busy,
+}
+
+enum ContentIndexLookup {
+    Cached(Box<CacheEntry>, IngestReceipt),
+    Missing,
+    Busy,
 }
 
 /// Index a capture or reopen its complete content-addressed disk index
@@ -89,12 +128,18 @@ pub fn acquire_indexed_source(
 ) -> Result<IndexedSource> {
     let fingerprint = current_fingerprint(path, options)?;
     if options.cache.is_none() {
-        return acquire_temporary_index(path, temporary_parent, fingerprint.as_ref(), options.job);
+        return acquire_temporary_index(
+            path,
+            temporary_parent,
+            fingerprint.as_ref(),
+            options.job,
+            None,
+        );
     }
 
     let fingerprint = fingerprint
         .ok_or_else(|| invalid("standard input cannot use the persistent capture index cache"))?;
-    acquire_cached_index(path, &fingerprint, options)
+    acquire_cached_index(path, temporary_parent, &fingerprint, options)
 }
 
 fn current_fingerprint(
@@ -135,24 +180,36 @@ fn acquire_temporary_index(
     temporary_parent: &Path,
     fingerprint: Option<&SourceFingerprint>,
     job: Option<&Job>,
+    progress_message: Option<&str>,
 ) -> Result<IndexedSource> {
     let temporary = tempfile::tempdir_in(temporary_parent)?;
-    let (store, receipt) = ingest_capture(path, temporary.path(), fingerprint, job)?;
-    drop(store);
-    let store = Store::open(temporary.path(), Options::default())?;
-    validate_indexed_receipt(&store, &receipt)?;
-    check_fingerprint_unchanged(path, fingerprint)?;
-    Ok(IndexedSource {
-        store,
-        receipt,
-        _storage: IndexedSourceStorage::Temporary {
-            _directory: temporary,
+    let temporary_path = temporary.path().to_path_buf();
+    let indexed_path = temporary_path.clone();
+    ingest_capture_then(
+        path,
+        &temporary_path,
+        fingerprint,
+        job,
+        progress_message,
+        move |store, receipt| {
+            drop(store);
+            let store = Store::open(&indexed_path, Options::default())?;
+            validate_indexed_receipt(&store, &receipt)?;
+            check_fingerprint_unchanged(path, fingerprint)?;
+            Ok(IndexedSource {
+                store,
+                receipt,
+                _storage: IndexedSourceStorage::Temporary {
+                    _directory: temporary,
+                },
+            })
         },
-    })
+    )
 }
 
 fn acquire_cached_index(
     path: &Path,
+    temporary_parent: &Path,
     fingerprint: &SourceFingerprint,
     options: &AcquisitionOptions<'_>,
 ) -> Result<IndexedSource> {
@@ -160,97 +217,163 @@ fn acquire_cached_index(
         .cache
         .ok_or_else(|| invalid("capture cache is missing"))?;
     let alias_key = source_alias_key(fingerprint)?;
-    let alias_entry = cache.lookup(&alias_key, CacheReadPolicy::CompleteOnly)?;
-    let alias_metadata = alias_entry
-        .as_ref()
-        .and_then(|entry| decode_alias_metadata(entry.metadata()).ok());
-    let alias_is_current = alias_metadata
-        .as_ref()
-        .is_some_and(|metadata| metadata.fingerprint == *fingerprint);
+    let deadline = Instant::now() + CACHE_CONTENTION_WAIT;
+    loop {
+        let (entry, source_id, cache_miss_counted) = match inspect_cached_alias(
+            path,
+            fingerprint,
+            options.strict_cache,
+            cache,
+            &alias_key,
+            options.job,
+            deadline,
+        )? {
+            AliasDecision::Reused(indexed) => return Ok(*indexed),
+            AliasDecision::Busy => {
+                return temporary_cache_fallback(path, temporary_parent, fingerprint, options.job);
+            }
+            AliasDecision::Build {
+                entry,
+                source_id,
+                cache_miss_counted,
+            } => (entry, source_id, cache_miss_counted),
+        };
 
-    // An exact fingerprint allows reuse of the saved digest without reading the full source
-    let known_source_id = if options.strict_cache || (alias_metadata.is_some() && !alias_is_current)
-    {
-        let identity = SourceIdentity::sha256_file(path)?;
-        check_fingerprint_unchanged(path, Some(fingerprint))?;
-        Some(source_id_from_identity(&identity)?)
-    } else if alias_is_current {
-        alias_metadata
-            .as_ref()
-            .map(|metadata| metadata.receipt.source_id.clone())
-    } else {
-        None
-    };
+        // Hold the alias lease so another process cannot publish a stale sample mapping
+        drop(entry);
+        let alias_lease = match cache.lease(&alias_key) {
+            Ok(lease) => lease,
+            Err(CacheError::LockBusy) => {
+                if wait_for_cache_key(cache, &alias_key, options.job, deadline, true)? {
+                    continue;
+                }
+                if !cache_miss_counted {
+                    return temporary_cache_fallback(
+                        path,
+                        temporary_parent,
+                        fingerprint,
+                        options.job,
+                    );
+                }
+                return acquire_temporary_index(
+                    path,
+                    temporary_parent,
+                    Some(fingerprint),
+                    options.job,
+                    Some(CACHE_BUSY_FALLBACK_MESSAGE),
+                );
+            }
+            Err(error) => return Err(error.into()),
+        };
+        let index_directory = alias_lease.directory().join(INDEX_DIRECTORY);
+        fs::create_dir(&index_directory)?;
+        let work = CachedIndexWork {
+            cache,
+            path,
+            fingerprint: fingerprint.clone(),
+            job: options.job,
+            deadline,
+            alias_lease,
+            index_directory: index_directory.clone(),
+            expected_source_id: source_id,
+            cache_miss_counted,
+        };
 
-    if let Some(source_id) = &known_source_id {
-        let key = source_index_key(source_id)?;
-        if let Some(entry) = cached_index(cache, &key, source_id)? {
-            drop(alias_entry);
-            let indexed = indexed_from_cache(entry.0, entry.1)?;
-            check_fingerprint_unchanged(path, Some(fingerprint))?;
-            ensure_source_alias(cache, &alias_key, fingerprint, &indexed.receipt)?;
-            count_cache_hit(options.job)?;
-            skip_ingestion(options.job)?;
-            return Ok(indexed);
-        }
-        count_cache_miss(options.job)?;
+        return ingest_capture_then(
+            path,
+            &index_directory,
+            Some(fingerprint),
+            options.job,
+            None,
+            move |store, receipt| publish_ingested_index(store, receipt, work),
+        );
     }
-
-    // Hold the fast alias lease while ingesting so temporary index data stays on the cache
-    // filesystem and competing processes cannot publish a stale alias for this sample
-    drop(alias_entry);
-    let alias_lease = cache.lease(&alias_key)?;
-    let index_directory = alias_lease.directory().join(INDEX_DIRECTORY);
-    fs::create_dir(&index_directory)?;
-    let (store, receipt) = ingest_capture(path, &index_directory, Some(fingerprint), options.job)?;
-    check_fingerprint_unchanged(path, Some(fingerprint))?;
-    // Closing SQLite releases all handles before the index directory moves to its content key
-    drop(store);
-
-    if known_source_id
-        .as_ref()
-        .is_some_and(|source_id| source_id != &receipt.source_id)
-    {
-        return Err(CacheError::SourceChanged.into());
-    }
-
-    let source_key = source_index_key(&receipt.source_id)?;
-    let cached_entry = cached_index(cache, &source_key, &receipt.source_id)?;
-    if let Some((entry, cached_receipt)) = cached_entry {
-        count_cache_hit(options.job)?;
-        drop(alias_lease);
-        let indexed = indexed_from_cache(entry, cached_receipt)?;
-        check_fingerprint_unchanged(path, Some(fingerprint))?;
-        ensure_source_alias(cache, &alias_key, fingerprint, &indexed.receipt)?;
-        return Ok(indexed);
-    }
-    if known_source_id.is_none() {
-        count_cache_miss(options.job)?;
-    }
-
-    let store_lease = cache.lease(&source_key)?;
-    let destination = store_lease.directory().join(INDEX_DIRECTORY);
-    fs::rename(&index_directory, &destination)?;
-    let entry = store_lease.commit(StageStatus::Complete, json!({"receipt": receipt}))?;
-    let alias_entry = alias_lease.commit(
-        StageStatus::Complete,
-        alias_metadata_value(fingerprint, &receipt)?,
-    )?;
-    drop(alias_entry);
-    let receipt = receipt_from_index_entry(&entry, &receipt.source_id)?;
-    let indexed = indexed_from_cache(entry, receipt)?;
-    check_fingerprint_unchanged(path, Some(fingerprint))?;
-    Ok(indexed)
 }
 
-fn ingest_capture(
+fn inspect_cached_alias(
+    path: &Path,
+    fingerprint: &SourceFingerprint,
+    strict_cache: bool,
+    cache: &Cache,
+    alias_key: &StageKey,
+    job: Option<&Job>,
+    deadline: Instant,
+) -> Result<AliasDecision> {
+    let entry = match lookup_alias_after_wait(cache, alias_key, job, deadline)? {
+        WaitedCacheLookup::Ready(entry) => entry,
+        WaitedCacheLookup::Busy => return Ok(AliasDecision::Busy),
+    };
+    let source_id = trusted_source_id(path, fingerprint, strict_cache, entry.as_ref())?;
+    let Some(source_id) = source_id else {
+        return Ok(AliasDecision::Build {
+            entry,
+            source_id: None,
+            cache_miss_counted: false,
+        });
+    };
+
+    let key = source_index_key(&source_id)?;
+    match lookup_index_after_wait(cache, &key, &source_id, job, deadline)? {
+        WaitedCacheLookup::Ready(Some((cached_entry, receipt))) => {
+            drop(entry);
+            let indexed = indexed_from_cache(cached_entry, receipt)?;
+            check_fingerprint_unchanged(path, Some(fingerprint))?;
+            ensure_source_alias(
+                cache,
+                alias_key,
+                fingerprint,
+                &indexed.receipt,
+                job,
+                deadline,
+            )?;
+            count_cache_hit(job)?;
+            skip_ingestion(job)?;
+            Ok(AliasDecision::Reused(Box::new(indexed)))
+        }
+        WaitedCacheLookup::Ready(None) => {
+            count_cache_miss(job)?;
+            Ok(AliasDecision::Build {
+                entry,
+                source_id: Some(source_id),
+                cache_miss_counted: true,
+            })
+        }
+        WaitedCacheLookup::Busy => {
+            drop(entry);
+            Ok(AliasDecision::Busy)
+        }
+    }
+}
+
+fn temporary_cache_fallback(
+    path: &Path,
+    temporary_parent: &Path,
+    fingerprint: &SourceFingerprint,
+    job: Option<&Job>,
+) -> Result<IndexedSource> {
+    count_cache_miss(job)?;
+    acquire_temporary_index(
+        path,
+        temporary_parent,
+        Some(fingerprint),
+        job,
+        Some(CACHE_BUSY_FALLBACK_MESSAGE),
+    )
+}
+
+fn ingest_capture_then<T>(
     path: &Path,
     directory: &Path,
     fingerprint: Option<&SourceFingerprint>,
     job: Option<&Job>,
-) -> Result<(Store, IngestReceipt)> {
+    progress_message: Option<&str>,
+    complete: impl FnOnce(Store, IngestReceipt) -> Result<T>,
+) -> Result<T> {
     if let Some(job) = job {
         job.start(Phase::Ingestion, fingerprint.map(|value| value.size_bytes))?;
+        if let Some(message) = progress_message {
+            job.set_current(Phase::Ingestion, message)?;
+        }
     }
 
     let ingestion = (|| {
@@ -263,7 +386,7 @@ fn ingest_capture(
         if let Some(job) = job {
             job.check_cancelled()?;
         }
-        Ok((store, receipt))
+        complete(store, receipt)
     })();
 
     if let Some(job) = job {
@@ -275,6 +398,128 @@ fn ingest_capture(
         job.finish(Phase::Ingestion, outcome)?;
     }
     ingestion
+}
+
+fn publish_ingested_index(
+    store: Store,
+    receipt: IngestReceipt,
+    work: CachedIndexWork<'_>,
+) -> Result<IndexedSource> {
+    check_fingerprint_unchanged(work.path, Some(&work.fingerprint))?;
+    // Closing SQLite releases all handles before the index directory moves to its content key
+    drop(store);
+
+    if work
+        .expected_source_id
+        .as_ref()
+        .is_some_and(|source_id| source_id != &receipt.source_id)
+    {
+        return Err(CacheError::SourceChanged.into());
+    }
+
+    let source_key = source_index_key(&receipt.source_id)?;
+    loop {
+        match lookup_content_index(
+            work.cache,
+            &source_key,
+            &receipt.source_id,
+            work.job,
+            work.deadline,
+        )? {
+            ContentIndexLookup::Cached(entry, cached_receipt) => {
+                count_cache_hit(work.job)?;
+                return open_cached_winner(*entry, cached_receipt, work);
+            }
+            ContentIndexLookup::Missing => {}
+            ContentIndexLookup::Busy => return use_uncached_index(receipt, work),
+        }
+
+        match work.cache.lease(&source_key) {
+            Ok(store_lease) => return commit_content_index(store_lease, &receipt, work),
+            Err(CacheError::LockBusy) => {
+                if wait_for_cache_key(work.cache, &source_key, work.job, work.deadline, false)? {
+                    continue;
+                }
+                return use_uncached_index(receipt, work);
+            }
+            Err(error) => return Err(error.into()),
+        }
+    }
+}
+
+fn lookup_content_index(
+    cache: &Cache,
+    key: &StageKey,
+    source_id: &str,
+    job: Option<&Job>,
+    deadline: Instant,
+) -> Result<ContentIndexLookup> {
+    loop {
+        match cached_index(cache, key, source_id) {
+            Ok(Some((entry, receipt))) => {
+                return Ok(ContentIndexLookup::Cached(Box::new(entry), receipt));
+            }
+            Ok(None) => return Ok(ContentIndexLookup::Missing),
+            Err(error) if is_cache_lock_busy(error.as_ref()) => {
+                if wait_for_cache_key(cache, key, job, deadline, false)? {
+                    continue;
+                }
+                return Ok(ContentIndexLookup::Busy);
+            }
+            Err(error) => return Err(error),
+        }
+    }
+}
+
+fn open_cached_winner(
+    entry: CacheEntry,
+    receipt: IngestReceipt,
+    work: CachedIndexWork<'_>,
+) -> Result<IndexedSource> {
+    let alias_entry = work.alias_lease.commit(
+        StageStatus::Complete,
+        alias_metadata_value(&work.fingerprint, receipt)?,
+    )?;
+    drop(alias_entry);
+    let indexed = indexed_from_cache(entry, receipt)?;
+    check_fingerprint_unchanged(work.path, Some(&work.fingerprint))?;
+    Ok(indexed)
+}
+
+fn commit_content_index(
+    lease: Lease,
+    receipt: &IngestReceipt,
+    work: CachedIndexWork<'_>,
+) -> Result<IndexedSource> {
+    if !work.cache_miss_counted {
+        count_cache_miss(work.job)?;
+    }
+    let destination = lease.directory().join(INDEX_DIRECTORY);
+    fs::rename(&work.index_directory, &destination)?;
+    let entry = lease.commit(StageStatus::Complete, json!({"receipt": receipt}))?;
+    let alias_entry = work.alias_lease.commit(
+        StageStatus::Complete,
+        alias_metadata_value(&work.fingerprint, &receipt)?,
+    )?;
+    drop(alias_entry);
+    let receipt = receipt_from_index_entry(&entry, &receipt.source_id)?;
+    let indexed = indexed_from_cache(entry, receipt)?;
+    check_fingerprint_unchanged(work.path, Some(&work.fingerprint))?;
+    Ok(indexed)
+}
+
+fn use_uncached_index(receipt: IngestReceipt, work: CachedIndexWork<'_>) -> Result<IndexedSource> {
+    if !work.cache_miss_counted {
+        count_cache_miss(work.job)?;
+    }
+    indexed_from_uncached_lease(
+        &work.index_directory,
+        receipt,
+        work.alias_lease,
+        work.path,
+        &work.fingerprint,
+        work.job,
+    )
 }
 
 struct IngestionReader<'a, R> {
@@ -376,6 +621,75 @@ fn cached_index(
     Ok(Some((entry, receipt)))
 }
 
+fn lookup_alias_after_wait(
+    cache: &Cache,
+    key: &StageKey,
+    job: Option<&Job>,
+    deadline: Instant,
+) -> Result<WaitedCacheLookup<Option<CacheEntry>>> {
+    loop {
+        match cache.lookup(key, CacheReadPolicy::CompleteOnly) {
+            Ok(entry) => return Ok(WaitedCacheLookup::Ready(entry)),
+            Err(CacheError::LockBusy) => {
+                if wait_for_cache_key(cache, key, job, deadline, true)? {
+                    continue;
+                }
+                return Ok(WaitedCacheLookup::Busy);
+            }
+            Err(error) => return Err(error.into()),
+        }
+    }
+}
+
+fn lookup_index_after_wait(
+    cache: &Cache,
+    key: &StageKey,
+    source_id: &str,
+    job: Option<&Job>,
+    deadline: Instant,
+) -> Result<WaitedCacheLookup<Option<(CacheEntry, IngestReceipt)>>> {
+    loop {
+        match cached_index(cache, key, source_id) {
+            Ok(index) => return Ok(WaitedCacheLookup::Ready(index)),
+            Err(error) if is_cache_lock_busy(error.as_ref()) => {
+                if wait_for_cache_key(cache, key, job, deadline, true)? {
+                    continue;
+                }
+                return Ok(WaitedCacheLookup::Busy);
+            }
+            Err(error) => return Err(error),
+        }
+    }
+}
+
+fn trusted_source_id(
+    path: &Path,
+    fingerprint: &SourceFingerprint,
+    strict_cache: bool,
+    alias_entry: Option<&CacheEntry>,
+) -> Result<Option<String>> {
+    let alias_metadata = alias_entry.and_then(|entry| decode_alias_metadata(entry.metadata()).ok());
+    let alias_is_current = alias_metadata
+        .as_ref()
+        .is_some_and(|metadata| metadata.fingerprint == *fingerprint);
+
+    // Exact metadata can reuse the digest unless the caller requested strict verification
+    if strict_cache || (alias_metadata.is_some() && !alias_is_current) {
+        let identity = SourceIdentity::sha256_file(path)?;
+        check_fingerprint_unchanged(path, Some(fingerprint))?;
+        return Ok(Some(source_id_from_identity(&identity)?));
+    }
+    Ok(alias_metadata
+        .filter(|_| alias_is_current)
+        .map(|metadata| metadata.receipt.source_id))
+}
+
+fn is_cache_lock_busy(error: &(dyn Error + 'static)) -> bool {
+    error
+        .downcast_ref::<CacheError>()
+        .is_some_and(|cache_error| matches!(cache_error, CacheError::LockBusy))
+}
+
 fn receipt_from_index_entry(entry: &CacheEntry, expected_source_id: &str) -> Result<IngestReceipt> {
     let receipt = entry
         .metadata()
@@ -402,23 +716,96 @@ fn indexed_from_cache(entry: CacheEntry, receipt: IngestReceipt) -> Result<Index
     })
 }
 
+fn indexed_from_uncached_lease(
+    index_directory: &Path,
+    receipt: IngestReceipt,
+    lease: Lease,
+    path: &Path,
+    fingerprint: &SourceFingerprint,
+    job: Option<&Job>,
+) -> Result<IndexedSource> {
+    if let Some(job) = job {
+        job.set_current(Phase::Ingestion, CACHE_BUSY_FALLBACK_MESSAGE)?;
+    }
+    let store = Store::open(index_directory, Options::default())?;
+    validate_indexed_receipt(&store, &receipt)?;
+    check_fingerprint_unchanged(path, Some(fingerprint))?;
+    Ok(IndexedSource {
+        store,
+        receipt,
+        _storage: IndexedSourceStorage::Uncached { _lease: lease },
+    })
+}
+
+fn wait_for_cache_key(
+    cache: &Cache,
+    key: &StageKey,
+    job: Option<&Job>,
+    deadline: Instant,
+    ingestion_pending: bool,
+) -> Result<bool> {
+    loop {
+        if let Some(job) = job
+            && job.is_cancelled()
+        {
+            if ingestion_pending {
+                job.start(Phase::Ingestion, None)?;
+                job.finish(Phase::Ingestion, PhaseOutcome::Cancelled)?;
+            }
+            return Err(l2_workbench::job::JobError::Cancelled.into());
+        }
+
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return Ok(false);
+        }
+        thread::sleep(remaining.min(CACHE_CONTENTION_POLL));
+        match cache.lookup(key, CacheReadPolicy::CompleteOnly) {
+            Ok(entry) => {
+                drop(entry);
+                return Ok(true);
+            }
+            Err(CacheError::LockBusy) => {}
+            Err(error) => return Err(error.into()),
+        }
+    }
+}
+
 fn ensure_source_alias(
     cache: &Cache,
     alias_key: &StageKey,
     fingerprint: &SourceFingerprint,
     receipt: &IngestReceipt,
+    job: Option<&Job>,
+    deadline: Instant,
 ) -> Result<()> {
     let value = alias_metadata_value(fingerprint, receipt)?;
-    if cache
-        .lookup(alias_key, CacheReadPolicy::CompleteOnly)?
-        .is_some_and(|entry| entry.metadata() == &value)
-    {
-        return Ok(());
-    }
+    loop {
+        match cache.lookup(alias_key, CacheReadPolicy::CompleteOnly) {
+            Ok(Some(entry)) if entry.metadata() == &value => return Ok(()),
+            Ok(entry) => drop(entry),
+            Err(CacheError::LockBusy) => {
+                if !wait_for_cache_key(cache, alias_key, job, deadline, true)? {
+                    return Ok(());
+                }
+                continue;
+            }
+            Err(error) => return Err(error.into()),
+        }
 
-    let lease = cache.lease(alias_key)?;
-    drop(lease.commit(StageStatus::Complete, value)?);
-    Ok(())
+        match cache.lease(alias_key) {
+            Ok(lease) => {
+                drop(lease.commit(StageStatus::Complete, value)?);
+                return Ok(());
+            }
+            Err(CacheError::LockBusy) => {
+                if !wait_for_cache_key(cache, alias_key, job, deadline, true)? {
+                    return Ok(());
+                }
+            }
+            Err(error) => return Err(error.into()),
+        }
+    }
 }
 
 pub(super) fn count_cache_hit(job: Option<&Job>) -> Result<()> {

@@ -11,7 +11,14 @@ use l2_workbench::{
     store::{IngestReceipt, Options, SCHEMA_VERSION, Store},
 };
 use serde_json::json;
-use std::{error::Error, fs, io::Cursor};
+use std::{
+    error::Error,
+    fs,
+    io::Cursor,
+    sync::mpsc,
+    thread,
+    time::{Duration, Instant},
+};
 
 const LLDP_CAPTURE: &[u8] = include_bytes!("../../../../tests/pcaps/lldp.pcap");
 const STP_CAPTURE: &[u8] = include_bytes!("../../../../tests/pcaps/linux-stp.pcap");
@@ -316,6 +323,180 @@ fn cancelled_capture_ingestion_drops_uncommitted_cache_work() -> Result<(), Box<
 }
 
 #[test]
+fn concurrent_capture_acquisition_waits_for_alias_writer_and_reuses_its_index()
+-> Result<(), Box<dyn Error>> {
+    let directory = tempfile::tempdir()?;
+    let capture_path = directory.path().join("capture.pcap");
+    fs::write(&capture_path, LLDP_CAPTURE)?;
+    let cache = open_test_cache(directory.path())?;
+    let initial = acquire_indexed_source(
+        &capture_path,
+        directory.path(),
+        &AcquisitionOptions {
+            cache: Some(&cache),
+            ..AcquisitionOptions::default()
+        },
+    )?;
+    let source_id = initial.receipt.source_id.clone();
+    drop(initial);
+
+    // Hold the source alias as though a competing process is updating the index
+    let fingerprint = Cache::fingerprint_source(&capture_path)?;
+    let alias_key = source_alias_key(&fingerprint)?;
+    let writer_lease = cache.lease(&alias_key)?;
+    let job = Job::new("concurrent capture acquisition");
+    let (sender, receiver) = mpsc::channel();
+    let worker_cache = cache.clone();
+    let worker_path = capture_path.clone();
+    let worker_parent = directory.path().to_path_buf();
+    let worker_job = job.clone();
+    let worker = thread::spawn(move || {
+        let options = AcquisitionOptions {
+            cache: Some(&worker_cache),
+            job: Some(&worker_job),
+            ..AcquisitionOptions::default()
+        };
+        let result = acquire_indexed_source(&worker_path, &worker_parent, &options)
+            .map(|indexed| indexed.receipt.source_id)
+            .map_err(|error| error.to_string());
+        let _ = sender.send(result);
+    });
+
+    assert!(receiver.recv_timeout(Duration::from_millis(100)).is_err());
+    drop(writer_lease);
+    assert_eq!(
+        receiver.recv_timeout(Duration::from_secs(3))?,
+        Ok(source_id)
+    );
+    worker
+        .join()
+        .expect("capture acquisition worker must finish");
+
+    let snapshot = job.snapshot()?;
+    assert_eq!(
+        snapshot.phase(Phase::Ingestion).map(|phase| phase.state),
+        Some(PhaseState::Skipped)
+    );
+    assert!(
+        snapshot
+            .counters
+            .get(&Counter::CacheHits)
+            .copied()
+            .unwrap_or(0)
+            > 0
+    );
+    Ok(())
+}
+
+#[test]
+fn persistently_busy_alias_falls_back_to_temporary_index_with_progress_message()
+-> Result<(), Box<dyn Error>> {
+    let directory = tempfile::tempdir()?;
+    let capture_path = directory.path().join("capture.pcap");
+    fs::write(&capture_path, LLDP_CAPTURE)?;
+    let cache = open_test_cache(directory.path())?;
+    let fingerprint = Cache::fingerprint_source(&capture_path)?;
+    let alias_key = source_alias_key(&fingerprint)?;
+    let writer_lease = cache.lease(&alias_key)?;
+    let job = Job::new("busy capture cache");
+    let options = AcquisitionOptions {
+        cache: Some(&cache),
+        job: Some(&job),
+        ..AcquisitionOptions::default()
+    };
+
+    let indexed = acquire_indexed_source(&capture_path, directory.path(), &options)?;
+    assert!(indexed.receipt.source_id.starts_with("sha256:"));
+    let phase = job
+        .snapshot()?
+        .phase(Phase::Ingestion)
+        .cloned()
+        .expect("capture acquisition records ingestion progress");
+    assert_eq!(phase.state, PhaseState::Completed);
+    assert!(phase.message.as_deref().is_some_and(|message| {
+        let message = message.to_ascii_lowercase();
+        message.contains("temporary") && message.contains("cache")
+    }));
+    assert!(
+        job.snapshot()?
+            .counters
+            .get(&Counter::CacheMisses)
+            .copied()
+            .unwrap_or(0)
+            > 0
+    );
+    drop(indexed);
+    drop(writer_lease);
+    Ok(())
+}
+
+#[test]
+fn busy_content_index_lease_does_not_restart_completed_ingestion() -> Result<(), Box<dyn Error>> {
+    let directory = tempfile::tempdir()?;
+    let capture_path = directory.path().join("capture.pcap");
+    fs::write(&capture_path, LLDP_CAPTURE)?;
+    let cache = open_test_cache(directory.path())?;
+    let identity = SourceIdentity::sha256_file(&capture_path)?;
+    let source_key = source_index_key(&identity)?;
+    cache.clear()?;
+    let writer_lease = cache.lease(&source_key)?;
+    let job = Job::new("contended content index");
+    let (sender, receiver) = mpsc::channel();
+    let worker_cache = cache.clone();
+    let worker_path = capture_path.clone();
+    let worker_parent = directory.path().to_path_buf();
+    let worker_job = job.clone();
+    let worker = thread::spawn(move || {
+        let options = AcquisitionOptions {
+            cache: Some(&worker_cache),
+            job: Some(&worker_job),
+            ..AcquisitionOptions::default()
+        };
+        let result = acquire_indexed_source(&worker_path, &worker_parent, &options)
+            .map(|indexed| indexed.receipt.source_id)
+            .map_err(|error| error.to_string());
+        let _ = sender.send(result);
+    });
+
+    let expected_bytes = u64::try_from(LLDP_CAPTURE.len())?;
+    let deadline = Instant::now() + Duration::from_secs(3);
+    loop {
+        let completed = job
+            .snapshot()?
+            .phase(Phase::Ingestion)
+            .map(|phase| phase.completed)
+            .unwrap_or_default();
+        if completed == expected_bytes {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "capture ingestion must reach EOF"
+        );
+        thread::sleep(Duration::from_millis(10));
+    }
+
+    drop(writer_lease);
+    let SourceIdentity::Sha256(digest) = identity else {
+        return Err("source hashing must return a strong identity".into());
+    };
+    assert_eq!(
+        receiver.recv_timeout(Duration::from_secs(3))?,
+        Ok(format!("sha256:{digest}"))
+    );
+    worker
+        .join()
+        .expect("capture acquisition worker must finish");
+    assert_eq!(
+        job.snapshot()?
+            .phase(Phase::Ingestion)
+            .map(|phase| phase.completed),
+        Some(expected_bytes)
+    );
+    Ok(())
+}
+
+#[test]
 fn indexed_flow_analysis_reuses_a_validated_native_case() -> Result<(), Box<dyn Error>> {
     let directory = tempfile::tempdir()?;
     let capture_path = directory.path().join("flow.pcap");
@@ -372,6 +553,30 @@ fn open_test_cache(directory: &std::path::Path) -> Result<Cache, Box<dyn Error>>
         directory.join("cache"),
         directory.join("state"),
         256 * 1024 * 1024,
+    )?)
+}
+
+fn source_alias_key(
+    fingerprint: &l2_workbench::job::cache::SourceFingerprint,
+) -> Result<StageKey, Box<dyn Error>> {
+    Ok(StageKey::new(
+        "capture_source",
+        SCHEMA_VERSION,
+        "pcap-source-alias-v1",
+        &json!({}),
+        &SourceIdentity::Fast(fingerprint.sample_hint()),
+        &[],
+    )?)
+}
+
+fn source_index_key(identity: &SourceIdentity) -> Result<StageKey, Box<dyn Error>> {
+    Ok(StageKey::new(
+        "capture_index",
+        SCHEMA_VERSION,
+        "pcap-index-v1",
+        &json!({}),
+        identity,
+        &[],
     )?)
 }
 
