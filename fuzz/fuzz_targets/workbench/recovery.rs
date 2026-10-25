@@ -772,28 +772,15 @@ fn exercise_generated_record_proposal(messages: &[Vec<u8>; 3], limits: RecordLim
     require(first_report == second_report);
     require(first_report.training_message_count == training.len());
     require(first_report.held_out_message_count == held_out.len());
+    // Work limits cap examined work, not the size of omitted search domains
     require(
-        first_report
-            .examined_field_checks
-            .saturating_add(first_report.omitted_field_checks)
+        first_report.examined_field_checks
             <= proposal_limits
                 .max_field_checks_per_domain
                 .saturating_mul(2),
     );
     require(first_report.examined_pair_checks <= proposal_limits.max_pair_checks);
-    require(
-        first_report
-            .examined_pair_checks
-            .saturating_add(first_report.omitted_pair_checks)
-            <= proposal_limits.max_pair_checks,
-    );
     require(first_report.examined_length_checks <= proposal_limits.max_length_checks);
-    require(
-        first_report
-            .examined_length_checks
-            .saturating_add(first_report.omitted_length_checks)
-            <= proposal_limits.max_length_checks,
-    );
     require(
         first_report.omitted_schema_combinations
             == first_report
