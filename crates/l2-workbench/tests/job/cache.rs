@@ -2,8 +2,9 @@ use std::{
     error::Error,
     fs, io,
     path::{Path, PathBuf},
+    process::{Command, Stdio},
     thread,
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use l2_workbench::job::{
@@ -176,6 +177,76 @@ fn completed_entries_round_trip_metadata_and_relative_files() -> Result<(), Box<
 }
 
 #[test]
+fn committing_a_new_entry_evicts_the_oldest_unpinned_entry_automatically()
+-> Result<(), Box<dyn Error>> {
+    let temporary = tempfile::tempdir()?;
+    let cache = cache_at(temporary.path(), 3)?;
+    let oldest_key = stage_key("automatic-lru-oldest")?;
+    let newest_key = stage_key("automatic-lru-newest")?;
+    let oldest_directory = write_entry(&cache, &oldest_key, b"old")?;
+    thread::sleep(Duration::from_millis(2));
+
+    let newest_directory = write_entry(&cache, &newest_key, b"new")?;
+
+    assert!(!oldest_directory.exists());
+    assert!(newest_directory.is_dir());
+    let stats = cache.stats()?;
+    assert_eq!(stats.entries, 1);
+    assert_eq!(stats.entry_bytes, cache.max_bytes());
+    assert_eq!(stats.over_limit_bytes, 0);
+    Ok(())
+}
+
+#[test]
+fn committing_an_oversized_stage_is_rejected_without_retaining_it() -> Result<(), Box<dyn Error>> {
+    let temporary = tempfile::tempdir()?;
+    let cache = cache_at(temporary.path(), 2)?;
+    let key = stage_key("oversized-stage")?;
+    let lease = cache.lease(&key)?;
+    let staging_path = lease.directory().to_path_buf();
+    fs::write(staging_path.join("result.bin"), b"three")?;
+
+    assert!(matches!(
+        lease.commit(StageStatus::Complete, json!({})),
+        Err(CacheError::QuotaExceeded {
+            limit_bytes: 2,
+            required_bytes: 5,
+        })
+    ));
+    assert!(!staging_path.exists());
+    assert_eq!(cache.stats()?.entry_bytes, 0);
+    Ok(())
+}
+
+#[test]
+fn committing_rejects_growth_when_existing_entries_are_pinned() -> Result<(), Box<dyn Error>> {
+    let temporary = tempfile::tempdir()?;
+    let cache = cache_at(temporary.path(), 3)?;
+    let pinned_key = stage_key("pinned-entry")?;
+    let incoming_key = stage_key("quota-blocked-entry")?;
+    let pinned_directory = {
+        let lease = cache.lease(&pinned_key)?;
+        fs::write(lease.directory().join("result.bin"), b"old")?;
+        lease.commit(StageStatus::Complete, json!({}))?
+    };
+    let lease = cache.lease(&incoming_key)?;
+    fs::write(lease.directory().join("result.bin"), b"new")?;
+
+    assert!(matches!(
+        lease.commit(StageStatus::Complete, json!({})),
+        Err(CacheError::QuotaExceeded { .. })
+    ));
+    assert!(pinned_directory.directory().join("result.bin").is_file());
+    assert_eq!(cache.stats()?.entry_bytes, 3);
+    assert!(
+        cache
+            .lookup(&incoming_key, CacheReadPolicy::CompleteOnly)?
+            .is_none()
+    );
+    Ok(())
+}
+
+#[test]
 fn complete_empty_results_remain_terminal_cache_hits() -> Result<(), Box<dyn Error>> {
     let temporary = tempfile::tempdir()?;
     let cache = cache_at(temporary.path(), 1024)?;
@@ -225,6 +296,126 @@ fn cache_schema_rejects_an_incompatible_database_version() -> Result<(), Box<dyn
 }
 
 #[test]
+fn version_zero_database_with_existing_tables_is_rejected_without_rewriting_it()
+-> Result<(), Box<dyn Error>> {
+    let temporary = tempfile::tempdir()?;
+    let cache_root = temporary.path().join("cache");
+    let state_root = temporary.path().join("state");
+    fs::create_dir_all(&state_root)?;
+    let database_path = state_root.join("cache.sqlite3");
+    let database = rusqlite::Connection::open(&database_path)?;
+    database.execute("CREATE TABLE unrecognized_data (value TEXT)", [])?;
+    drop(database);
+
+    let error = Cache::open_at(&cache_root, &state_root, 1024)
+        .expect_err("unversioned user tables must not be treated as a new cache");
+    assert!(matches!(&error, CacheError::IncompatibleDatabase));
+    assert!(error.to_string().contains("unrecognized or incomplete"));
+    let database = rusqlite::Connection::open(&database_path)?;
+    let table_count: i64 = database.query_row(
+        "SELECT count(*) FROM sqlite_master WHERE type = 'table' AND name = 'unrecognized_data'",
+        [],
+        |row| row.get(0),
+    )?;
+    let version: i64 = database.pragma_query_value(None, "user_version", |row| row.get(0))?;
+    assert_eq!(table_count, 1);
+    assert_eq!(version, 0);
+    Ok(())
+}
+
+#[cfg(unix)]
+#[test]
+fn concurrent_processes_can_initialize_the_same_cache() -> Result<(), Box<dyn Error>> {
+    const PROCESS_COUNT: usize = 4;
+
+    let temporary = tempfile::tempdir()?;
+    let cache_root = temporary.path().join("cache");
+    let state_root = temporary.path().join("state");
+    let release = temporary.path().join("release-open");
+    let mut children = Vec::with_capacity(PROCESS_COUNT);
+    let executable = std::env::current_exe()?;
+
+    for index in 0..PROCESS_COUNT {
+        let ready = temporary.path().join(format!("ready-{index}"));
+        let child = Command::new(&executable)
+            .args([
+                "--exact",
+                "cache::concurrent_cache_open_child",
+                "--nocapture",
+            ])
+            .env("L2_CACHE_OPEN_CACHE_ROOT", &cache_root)
+            .env("L2_CACHE_OPEN_STATE_ROOT", &state_root)
+            .env("L2_CACHE_OPEN_READY", &ready)
+            .env("L2_CACHE_OPEN_RELEASE", &release)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()?;
+        children.push((ready, child));
+    }
+
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while children.iter().any(|(ready, _)| !ready.exists()) {
+        if Instant::now() >= deadline {
+            fs::write(&release, b"open")?;
+            for (_, child) in &mut children {
+                let _ = child.kill();
+            }
+            return Err("cache-open children did not reach the start barrier".into());
+        }
+        thread::sleep(Duration::from_millis(5));
+    }
+    fs::write(&release, b"open")?;
+
+    for (_, child) in children {
+        let output = child.wait_with_output()?;
+        assert!(
+            output.status.success(),
+            "cache-open child failed: {}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr),
+        );
+    }
+    let cache = Cache::open_at(cache_root, state_root, 1024)?;
+    assert_eq!(cache.stats()?.entries, 0);
+    Ok(())
+}
+
+#[cfg(unix)]
+#[test]
+fn concurrent_cache_open_child() -> Result<(), Box<dyn Error>> {
+    let child_configuration = (
+        std::env::var_os("L2_CACHE_OPEN_CACHE_ROOT"),
+        std::env::var_os("L2_CACHE_OPEN_STATE_ROOT"),
+        std::env::var_os("L2_CACHE_OPEN_READY"),
+        std::env::var_os("L2_CACHE_OPEN_RELEASE"),
+    );
+    if child_configuration.0.is_none()
+        && child_configuration.1.is_none()
+        && child_configuration.2.is_none()
+        && child_configuration.3.is_none()
+    {
+        return Ok(());
+    }
+    let (Some(cache_root), Some(state_root), Some(ready), Some(release)) = child_configuration
+    else {
+        return Err("cache-open child environment is incomplete".into());
+    };
+    let release = PathBuf::from(release);
+    fs::write(ready, b"ready")?;
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while !release.exists() {
+        if Instant::now() >= deadline {
+            return Err("cache-open child timed out at the start barrier".into());
+        }
+        thread::sleep(Duration::from_millis(5));
+    }
+
+    let cache = Cache::open_at(cache_root, state_root, 1024)?;
+    assert_eq!(cache.stats()?.entries, 0);
+    Ok(())
+}
+
+#[test]
 fn leases_exclude_writers_while_shared_entry_readers_can_coexist() -> Result<(), Box<dyn Error>> {
     let temporary = tempfile::tempdir()?;
     let cache = cache_at(temporary.path(), 1024)?;
@@ -261,7 +452,7 @@ fn leases_exclude_writers_while_shared_entry_readers_can_coexist() -> Result<(),
 fn pruning_skips_live_reader_pins_then_evicts_oldest_unpinned_entries() -> Result<(), Box<dyn Error>>
 {
     let temporary = tempfile::tempdir()?;
-    let cache = cache_at(temporary.path(), 0)?;
+    let cache = cache_at(temporary.path(), 6)?;
     let oldest_key = stage_key("oldest-stage")?;
     let newest_key = stage_key("newest-stage")?;
     let oldest_directory = write_entry(&cache, &oldest_key, b"old")?;
@@ -272,22 +463,22 @@ fn pruning_skips_live_reader_pins_then_evicts_oldest_unpinned_entries() -> Resul
         .lookup(&oldest_key, CacheReadPolicy::CompleteOnly)?
         .ok_or_else(|| missing("old entry should be pinned"))?;
 
-    let report = cache.prune()?;
-    assert_eq!(report.removed_entries, 1);
+    let tight_cache = cache_at(temporary.path(), 0)?;
     assert!(oldest_directory.is_dir());
     assert!(!newest_directory.exists());
+    assert_eq!(tight_cache.stats()?.over_limit_bytes, 3);
 
     drop(oldest_pin);
-    let report = cache.prune()?;
+    let report = tight_cache.prune()?;
     assert_eq!(report.removed_entries, 1);
     assert!(!oldest_directory.exists());
     Ok(())
 }
 
 #[test]
-fn lru_pruning_evicts_the_least_recently_used_unpinned_entry() -> Result<(), Box<dyn Error>> {
+fn opening_cache_evicts_the_least_recently_used_unpinned_entry() -> Result<(), Box<dyn Error>> {
     let temporary = tempfile::tempdir()?;
-    let cache = cache_at(temporary.path(), 3)?;
+    let cache = cache_at(temporary.path(), 6)?;
     let oldest_key = stage_key("least-recent-stage")?;
     let newest_key = stage_key("most-recent-stage")?;
     let oldest_directory = write_entry(&cache, &oldest_key, b"old")?;
@@ -295,22 +486,23 @@ fn lru_pruning_evicts_the_least_recently_used_unpinned_entry() -> Result<(), Box
     let newest_directory = write_entry(&cache, &newest_key, b"new")?;
     drop(cache.lookup(&oldest_key, CacheReadPolicy::CompleteOnly)?);
 
-    let report = cache.prune()?;
-    assert_eq!(report.removed_entries, 1);
+    let tight_cache = cache_at(temporary.path(), 3)?;
     assert!(oldest_directory.is_dir());
     assert!(!newest_directory.exists());
+    assert_eq!(tight_cache.stats()?.over_limit_bytes, 0);
     Ok(())
 }
 
 #[test]
 fn active_checkpoints_pin_entries_and_preserve_the_job_snapshot() -> Result<(), Box<dyn Error>> {
     let temporary = tempfile::tempdir()?;
-    let cache = cache_at(temporary.path(), 0)?;
+    let cache = cache_at(temporary.path(), 1024)?;
     let key = stage_key("resumable-stage")?;
     let directory = write_entry(&cache, &key, b"stage-output")?;
     let snapshot = Job::new("durable recovery").snapshot()?;
 
     cache.write_checkpoint(&key, &snapshot, CheckpointStatus::Active)?;
+    let tight_cache = cache_at(temporary.path(), 0)?;
     let checkpoint = cache
         .read_checkpoint(&key)?
         .ok_or_else(|| missing("durable checkpoint should be available"))?;
@@ -321,12 +513,16 @@ fn active_checkpoints_pin_entries_and_preserve_the_job_snapshot() -> Result<(), 
         l2_workbench::job::cache::JOB_SNAPSHOT_VERSION
     );
     assert_eq!(checkpoint.snapshot, snapshot);
-    let report = cache.clear()?;
+    let report = tight_cache.clear()?;
     assert_eq!(report.removed_entries, 0);
     assert!(directory.is_dir());
+    assert_eq!(
+        tight_cache.stats()?.over_limit_bytes,
+        b"stage-output".len() as u64
+    );
 
-    cache.write_checkpoint(&key, &snapshot, CheckpointStatus::Complete)?;
-    assert_eq!(cache.clear()?.removed_entries, 1);
+    tight_cache.write_checkpoint(&key, &snapshot, CheckpointStatus::Complete)?;
+    assert_eq!(tight_cache.clear()?.removed_entries, 1);
     assert!(!directory.exists());
     Ok(())
 }

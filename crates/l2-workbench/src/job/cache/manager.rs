@@ -24,6 +24,7 @@ use super::{
 };
 
 const KEY_LOCK_SUFFIX: &str = ".lock";
+const QUOTA_LOCK: &str = "quota.lock";
 
 /// A process-safe `SQLite` and filesystem cache for stable recovery stages
 #[derive(Clone)]
@@ -38,6 +39,23 @@ pub(super) struct CacheInner {
     staging: HeldDirectory,
     locks: HeldDirectory,
     max_bytes: u64,
+}
+
+struct EvictionSnapshot {
+    total_bytes: u64,
+    rows: Vec<(String, u64)>,
+    active_checkpoints: HashSet<String>,
+}
+
+struct CapacityCandidate {
+    key: String,
+    _lock: LockGuard,
+}
+
+struct CapacityPlan {
+    base_bytes: u64,
+    incoming_bytes: u64,
+    candidates: Vec<CapacityCandidate>,
 }
 
 impl std::fmt::Debug for Cache {
@@ -67,6 +85,11 @@ impl CacheInner {
         // The lock file stays in place while the kernel releases ownership with the held descriptor
         self.locks
             .lock(&format!("{}{KEY_LOCK_SUFFIX}", key.as_str()), exclusive)
+    }
+
+    fn quota_lock(&self) -> Result<LockGuard> {
+        self.check_locations()?;
+        self.locks.lock_with_retry(QUOTA_LOCK, true)
     }
 
     pub(super) fn active_checkpoint(&self, key: &str) -> Result<bool> {
@@ -175,8 +198,8 @@ impl Cache {
     /// Opens a cache in explicit cache and state directories
     ///
     /// The cache directory stores stage files. The state directory stores the versioned `SQLite`
-    /// index and held-file lock objects. Both roots and their managed subdirectories are opened
-    /// without following a final symlink and checked before operations
+    /// index and held-file lock objects. Opening also prunes old unpinned entries; active leases
+    /// can leave `stats().over_limit_bytes` positive until a later prune
     ///
     /// # Errors
     /// Returns an error when either root is unsafe, the `SQLite` schema is incompatible, or storage
@@ -208,8 +231,13 @@ impl Cache {
             max_bytes,
         });
         inner.check_locations()?;
-        database::initialize(&inner.state_root)?;
-        Ok(Self { inner })
+        database::initialize(&inner.state_root, &inner.locks)?;
+        let cache = Self { inner };
+        match cache.prune() {
+            Ok(_) | Err(CacheError::CacheBusy) => {}
+            Err(error) => return Err(error),
+        }
+        Ok(cache)
     }
 
     /// Opens the default cache under the user's XDG cache and state directories
@@ -408,7 +436,7 @@ impl Cache {
         .transpose()
     }
 
-    /// Reports indexed entry and checkpoint usage
+    /// Reports indexed entry usage, checkpoints, and bytes retained above the configured limit
     ///
     /// # Errors
     /// Returns an error when `SQLite` cannot read the cache index
@@ -424,16 +452,19 @@ impl Cache {
             [],
             |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
         )?;
+        let entry_bytes = nonnegative(bytes)?;
         Ok(CacheStats {
             entries: nonnegative(entries)?,
-            entry_bytes: nonnegative(bytes)?,
+            entry_bytes,
+            over_limit_bytes: entry_bytes.saturating_sub(self.inner.max_bytes),
             checkpoints: nonnegative(checkpoints)?,
         })
     }
 
     /// Removes least-recently-used unpinned entries until the configured size is met
     ///
-    /// Active OS leases and active durable checkpoints keep their entries in place
+    /// Active OS leases and active durable checkpoints keep their entries in place. A remaining
+    /// overage is available through [`CacheStats::over_limit_bytes`]
     ///
     /// # Errors
     /// Returns an error when the index or entry directories cannot be updated safely
@@ -472,94 +503,254 @@ impl Cache {
         database::checkpoint_wal(&self.inner.state_root)
     }
 
-    fn evict(&self, limit: Option<u64>) -> Result<PruneReport> {
+    pub(super) fn reserve_capacity(
+        &self,
+        key: &StageKey,
+        incoming_bytes: u64,
+    ) -> Result<LockGuard> {
+        let quota_lock = self.inner.quota_lock()?;
         self.inner.check_locations()?;
-        let (mut remaining, rows, active_checkpoints) = self.eviction_snapshot()?;
-        self.cleanup_stale_staging(&active_checkpoints)?;
-        self.cleanup_orphan_generations()?;
-        let mut report = PruneReport::default();
+        if incoming_bytes > self.inner.max_bytes {
+            return Err(CacheError::QuotaExceeded {
+                limit_bytes: self.inner.max_bytes,
+                required_bytes: incoming_bytes,
+            });
+        }
 
-        for (key, snapshot_bytes) in rows {
-            if limit.is_some_and(|limit| remaining <= limit) {
-                break;
-            }
-            if active_checkpoints.contains(&key) {
-                report.skipped_checkpoints = report.skipped_checkpoints.saturating_add(1);
-                continue;
-            }
+        let plan = self.capacity_plan(key, incoming_bytes)?;
+        self.remove_capacity_candidates(&plan)?;
+        drop(plan);
+        Ok(quota_lock)
+    }
 
-            let lock = match self
-                .inner
-                .locks
-                .lock(&format!("{key}{KEY_LOCK_SUFFIX}"), true)
-            {
-                Ok(lock) => lock,
-                Err(CacheError::LockBusy) => {
-                    report.skipped_locked = report.skipped_locked.saturating_add(1);
+    fn capacity_plan(&self, key: &StageKey, incoming_bytes: u64) -> Result<CapacityPlan> {
+        let snapshot = self.eviction_snapshot()?;
+        let replaced_bytes = snapshot
+            .rows
+            .iter()
+            .find(|(candidate, _)| candidate == key.as_str())
+            .map_or(0, |(_, bytes)| *bytes);
+        let base_bytes = snapshot
+            .total_bytes
+            .checked_sub(replaced_bytes)
+            .ok_or(CacheError::CorruptDatabase)?;
+        let mut required_bytes = base_bytes
+            .checked_add(incoming_bytes)
+            .ok_or(CacheError::SizeOverflow)?;
+        let mut candidates = Vec::new();
+        if required_bytes > self.inner.max_bytes {
+            for (candidate_key, _) in snapshot.rows {
+                if candidate_key == key.as_str()
+                    || snapshot.active_checkpoints.contains(&candidate_key)
+                {
                     continue;
                 }
-                Err(error) => return Err(error),
-            };
-            let mut connection =
-                database::open_connection(&self.inner.state_root, Durability::Recomputable)?;
-            let transaction =
-                connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
-            // Recheck the durable pin in the same transaction that removes the entry row
+                let lock = match self
+                    .inner
+                    .locks
+                    .lock(&format!("{candidate_key}{KEY_LOCK_SUFFIX}"), true)
+                {
+                    Ok(lock) => lock,
+                    Err(CacheError::LockBusy) => continue,
+                    Err(error) => return Err(error),
+                };
+                if self.inner.active_checkpoint(&candidate_key)? {
+                    drop(lock);
+                    continue;
+                }
+                let Some(bytes) = self.current_entry_bytes(&candidate_key)? else {
+                    drop(lock);
+                    continue;
+                };
+                required_bytes = required_bytes
+                    .checked_sub(bytes)
+                    .ok_or(CacheError::CorruptDatabase)?;
+                candidates.push(CapacityCandidate {
+                    key: candidate_key,
+                    _lock: lock,
+                });
+                if required_bytes <= self.inner.max_bytes {
+                    break;
+                }
+            }
+        }
+
+        if required_bytes > self.inner.max_bytes {
+            return Err(CacheError::QuotaExceeded {
+                limit_bytes: self.inner.max_bytes,
+                required_bytes,
+            });
+        }
+        Ok(CapacityPlan {
+            base_bytes,
+            incoming_bytes,
+            candidates,
+        })
+    }
+
+    fn remove_capacity_candidates(&self, plan: &CapacityPlan) -> Result<()> {
+        if plan.candidates.is_empty() {
+            return Ok(());
+        }
+        let mut connection =
+            database::open_connection(&self.inner.state_root, Durability::Recomputable)?;
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let mut remaining_bytes = plan
+            .base_bytes
+            .checked_add(plan.incoming_bytes)
+            .ok_or(CacheError::SizeOverflow)?;
+        let mut removed = Vec::new();
+        for candidate in &plan.candidates {
+            if remaining_bytes <= self.inner.max_bytes {
+                break;
+            }
             let active: bool = transaction.query_row(
                 "SELECT EXISTS(SELECT 1 FROM checkpoints WHERE key = ?1 AND status = ?2)",
-                params![&key, CheckpointStatus::Active.to_database()],
+                params![candidate.key, CheckpointStatus::Active.to_database()],
                 |row| row.get(0),
             )?;
             if active {
-                report.skipped_checkpoints = report.skipped_checkpoints.saturating_add(1);
-                let current_bytes = transaction
-                    .query_row("SELECT bytes FROM entries WHERE key = ?1", [&key], |row| {
-                        row.get::<_, i64>(0)
-                    })
-                    .optional()?;
-                remaining = match current_bytes {
-                    Some(bytes) => remaining
-                        .saturating_sub(snapshot_bytes)
-                        .checked_add(nonnegative(bytes)?)
-                        .ok_or(CacheError::SizeOverflow)?,
-                    None => remaining.saturating_sub(snapshot_bytes),
-                };
-                drop(transaction);
-                drop(lock);
                 continue;
             }
-
             let current = transaction
                 .query_row(
                     "SELECT relative_path, bytes FROM entries WHERE key = ?1",
-                    [&key],
+                    [&candidate.key],
                     |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?)),
                 )
                 .optional()?;
             let Some((relative_path, bytes)) = current else {
-                remaining = remaining.saturating_sub(snapshot_bytes);
-                drop(transaction);
-                drop(lock);
                 continue;
             };
             let bytes = nonnegative(bytes)?;
-            remaining = remaining
-                .saturating_sub(snapshot_bytes)
-                .checked_add(bytes)
-                .ok_or(CacheError::SizeOverflow)?;
-            safe_entry_path(self.inner.entries.path(), &key, &relative_path)?;
-            transaction.execute("DELETE FROM entries WHERE key = ?1", [&key])?;
-            transaction.commit()?;
+            safe_entry_path(self.inner.entries.path(), &candidate.key, &relative_path)?;
+            if transaction.execute("DELETE FROM entries WHERE key = ?1", [&candidate.key])? == 1 {
+                remaining_bytes = remaining_bytes
+                    .checked_sub(bytes)
+                    .ok_or(CacheError::CorruptDatabase)?;
+                removed.push((candidate.key.clone(), relative_path));
+            }
+        }
+        if remaining_bytes > self.inner.max_bytes {
+            return Err(CacheError::QuotaExceeded {
+                limit_bytes: self.inner.max_bytes,
+                required_bytes: remaining_bytes,
+            });
+        }
+        transaction.commit()?;
+        for (candidate_key, relative_path) in removed {
+            remove_generation(&self.inner.entries, &candidate_key, &relative_path)?;
+        }
+        Ok(())
+    }
 
-            remove_generation(&self.inner.entries, &key, &relative_path)?;
-            remaining = remaining.saturating_sub(bytes);
-            report.removed_entries = report.removed_entries.saturating_add(1);
-            report.removed_bytes = report.removed_bytes.saturating_add(bytes);
-            drop(lock);
+    fn current_entry_bytes(&self, key: &str) -> Result<Option<u64>> {
+        let connection =
+            database::open_connection(&self.inner.state_root, Durability::Recomputable)?;
+        connection
+            .query_row("SELECT bytes FROM entries WHERE key = ?1", [key], |row| {
+                row.get::<_, i64>(0)
+            })
+            .optional()?
+            .map(nonnegative)
+            .transpose()
+    }
+
+    fn evict(&self, limit: Option<u64>) -> Result<PruneReport> {
+        let _quota_lock = self.inner.quota_lock()?;
+        self.inner.check_locations()?;
+        let snapshot = self.eviction_snapshot()?;
+        self.cleanup_stale_staging(&snapshot.active_checkpoints)?;
+        self.cleanup_orphan_generations()?;
+        let mut remaining = snapshot.total_bytes;
+        let mut report = PruneReport::default();
+
+        for (key, snapshot_bytes) in snapshot.rows {
+            if limit.is_some_and(|limit| remaining <= limit) {
+                break;
+            }
+            if snapshot.active_checkpoints.contains(&key) {
+                report.skipped_checkpoints = report.skipped_checkpoints.saturating_add(1);
+                continue;
+            }
+            self.evict_entry(&key, snapshot_bytes, &mut remaining, &mut report)?;
         }
 
         report.remaining_bytes = self.stats()?.entry_bytes;
         Ok(report)
+    }
+
+    fn evict_entry(
+        &self,
+        key: &str,
+        snapshot_bytes: u64,
+        remaining: &mut u64,
+        report: &mut PruneReport,
+    ) -> Result<()> {
+        let lock = match self
+            .inner
+            .locks
+            .lock(&format!("{key}{KEY_LOCK_SUFFIX}"), true)
+        {
+            Ok(lock) => lock,
+            Err(CacheError::LockBusy) => {
+                report.skipped_locked = report.skipped_locked.saturating_add(1);
+                return Ok(());
+            }
+            Err(error) => return Err(error),
+        };
+        let mut connection =
+            database::open_connection(&self.inner.state_root, Durability::Recomputable)?;
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        // Recheck the durable pin in the same transaction that removes the entry row
+        let active: bool = transaction.query_row(
+            "SELECT EXISTS(SELECT 1 FROM checkpoints WHERE key = ?1 AND status = ?2)",
+            params![key, CheckpointStatus::Active.to_database()],
+            |row| row.get(0),
+        )?;
+        if active {
+            report.skipped_checkpoints = report.skipped_checkpoints.saturating_add(1);
+            let current_bytes = transaction
+                .query_row("SELECT bytes FROM entries WHERE key = ?1", [key], |row| {
+                    row.get::<_, i64>(0)
+                })
+                .optional()?;
+            *remaining = match current_bytes {
+                Some(bytes) => remaining
+                    .saturating_sub(snapshot_bytes)
+                    .checked_add(nonnegative(bytes)?)
+                    .ok_or(CacheError::SizeOverflow)?,
+                None => remaining.saturating_sub(snapshot_bytes),
+            };
+            return Ok(());
+        }
+
+        let current = transaction
+            .query_row(
+                "SELECT relative_path, bytes FROM entries WHERE key = ?1",
+                [key],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?)),
+            )
+            .optional()?;
+        let Some((relative_path, bytes)) = current else {
+            *remaining = remaining.saturating_sub(snapshot_bytes);
+            return Ok(());
+        };
+        let bytes = nonnegative(bytes)?;
+        *remaining = remaining
+            .saturating_sub(snapshot_bytes)
+            .checked_add(bytes)
+            .ok_or(CacheError::SizeOverflow)?;
+        safe_entry_path(self.inner.entries.path(), key, &relative_path)?;
+        transaction.execute("DELETE FROM entries WHERE key = ?1", [key])?;
+        transaction.commit()?;
+
+        remove_generation(&self.inner.entries, key, &relative_path)?;
+        *remaining = remaining.saturating_sub(bytes);
+        report.removed_entries = report.removed_entries.saturating_add(1);
+        report.removed_bytes = report.removed_bytes.saturating_add(bytes);
+        drop(lock);
+        Ok(())
     }
 
     fn cleanup_stale_staging(&self, active_checkpoints: &HashSet<String>) -> Result<()> {
@@ -654,7 +845,7 @@ impl Cache {
         Ok(())
     }
 
-    fn eviction_snapshot(&self) -> Result<(u64, Vec<(String, u64)>, HashSet<String>)> {
+    fn eviction_snapshot(&self) -> Result<EvictionSnapshot> {
         let connection =
             database::open_connection(&self.inner.state_root, Durability::Recomputable)?;
         let mut statement = connection
@@ -677,7 +868,11 @@ impl Cache {
         let active_checkpoints = statement
             .query_map([CheckpointStatus::Active.to_database()], |row| row.get(0))?
             .collect::<rusqlite::Result<HashSet<_>>>()?;
-        Ok((total_bytes, keys, active_checkpoints))
+        Ok(EvictionSnapshot {
+            total_bytes,
+            rows: keys,
+            active_checkpoints,
+        })
     }
 }
 

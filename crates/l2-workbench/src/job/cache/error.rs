@@ -24,12 +24,21 @@ pub enum CacheError {
     CorruptCheckpoint,
     /// Another process currently holds a conflicting entry lease
     LockBusy,
+    /// Cache initialization or quota maintenance stayed busy past its retry window
+    CacheBusy,
     /// An input used to build a cache identity is invalid
     InvalidInput(&'static str),
     /// A source changed while its fingerprint or digest was being calculated
     SourceChanged,
     /// A source or cache size cannot be represented by the stored metadata
     SizeOverflow,
+    /// An entry cannot fit without evicting protected cache data
+    QuotaExceeded {
+        /// Configured limit for indexed stage files
+        limit_bytes: u64,
+        /// Minimum bytes needed after safe eviction
+        required_bytes: u64,
+    },
 }
 
 impl fmt::Display for CacheError {
@@ -42,16 +51,26 @@ impl fmt::Display for CacheError {
             Self::IncompatibleSchema(version) => {
                 write!(formatter, "unsupported cache schema version {version}")
             }
-            Self::IncompatibleDatabase => {
-                formatter.write_str("cache database belongs to another application")
-            }
+            Self::IncompatibleDatabase => formatter.write_str(
+                "cache database schema is unrecognized or incomplete; preserve it and use a new state path",
+            ),
             Self::CorruptDatabase => formatter.write_str("cache database is corrupt"),
             Self::CorruptEntry(message) => write!(formatter, "cached entry is corrupt: {message}"),
             Self::CorruptCheckpoint => formatter.write_str("saved job checkpoint is corrupt"),
             Self::LockBusy => formatter.write_str("cache entry is currently in use"),
+            Self::CacheBusy => {
+                formatter.write_str("cache maintenance stayed busy; retry the operation")
+            }
             Self::InvalidInput(message) => write!(formatter, "invalid cache input: {message}"),
             Self::SourceChanged => formatter.write_str("source changed while it was fingerprinted"),
             Self::SizeOverflow => formatter.write_str("cache size exceeded its supported range"),
+            Self::QuotaExceeded {
+                limit_bytes,
+                required_bytes,
+            } => write!(
+                formatter,
+                "cache stage needs at least {required_bytes} bytes under a {limit_bytes}-byte quota"
+            ),
         }
     }
 }

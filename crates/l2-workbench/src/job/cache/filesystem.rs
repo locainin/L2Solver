@@ -2,9 +2,14 @@ use std::{
     fs::{self, File, Metadata},
     io,
     path::{Path, PathBuf},
+    thread,
+    time::{Duration, Instant},
 };
 
 use super::error::{CacheError, Result};
+
+const INTERNAL_LOCK_WAIT: Duration = Duration::from_secs(5);
+const INTERNAL_LOCK_RETRY: Duration = Duration::from_millis(10);
 
 /// A directory held open so later path operations can check that its name still points to it
 pub(super) struct HeldDirectory {
@@ -247,6 +252,20 @@ impl HeldDirectory {
         set_private_file_mode(&file)?;
         acquire_lock(&file, exclusive)?;
         Ok(LockGuard { file })
+    }
+
+    pub(super) fn lock_with_retry(&self, file_name: &str, exclusive: bool) -> Result<LockGuard> {
+        let deadline = Instant::now() + INTERNAL_LOCK_WAIT;
+        loop {
+            match self.lock(file_name, exclusive) {
+                Ok(lock) => return Ok(lock),
+                Err(CacheError::LockBusy) if Instant::now() < deadline => {
+                    thread::sleep(INTERNAL_LOCK_RETRY);
+                }
+                Err(CacheError::LockBusy) => return Err(CacheError::CacheBusy),
+                Err(error) => return Err(error),
+            }
+        }
     }
 }
 

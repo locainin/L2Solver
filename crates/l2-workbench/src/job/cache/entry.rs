@@ -160,12 +160,13 @@ impl Lease {
 
     /// Atomically seals the work directory and publishes its metadata
     ///
-    /// The returned entry downgrades the writer lease to a shared reader pin. A partial result
-    /// remains explicitly partial and is never selected by a complete-only lookup
+    /// Space is reserved first by pruning older unpinned entries. The returned entry downgrades
+    /// the writer lease to a shared reader pin. A partial result remains explicitly partial and
+    /// is never selected by a complete-only lookup
     ///
     /// # Errors
     /// Returns an error when the work directory contains unsafe files, has changed location,
-    /// or cannot be committed to the `SQLite` index
+    /// exceeds the configured cache quota, or cannot be committed to the `SQLite` index
     pub fn commit(mut self, status: StageStatus, metadata: Value) -> Result<CacheEntry> {
         self.cache.inner.check_locations()?;
         self.directory.check_location()?;
@@ -177,7 +178,11 @@ impl Lease {
         }
         let manifest = Manifest::scan(self.directory.path())?;
         let manifest_json = serde_json::to_string(&manifest)?;
-        let bytes = i64::try_from(manifest.total_bytes()).map_err(|_| CacheError::SizeOverflow)?;
+        let entry_bytes = manifest.total_bytes();
+        let bytes = i64::try_from(entry_bytes).map_err(|_| CacheError::SizeOverflow)?;
+        let _quota_lock = self.cache.reserve_capacity(&self.key, entry_bytes)?;
+        self.cache.inner.check_locations()?;
+        self.directory.check_location()?;
 
         let staging_path = self.staging_path.clone();
         let generation = staging_path

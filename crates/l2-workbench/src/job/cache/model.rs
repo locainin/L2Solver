@@ -81,7 +81,7 @@ pub struct Checkpoint {
     pub snapshot: JobSnapshot,
 }
 
-/// Counts and storage use for entries and checkpoints in one cache
+/// Counts, storage use, and quota pressure for one cache
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 #[non_exhaustive]
 pub struct CacheStats {
@@ -89,6 +89,8 @@ pub struct CacheStats {
     pub entries: u64,
     /// Total bytes occupied by indexed stage directories
     pub entry_bytes: u64,
+    /// Indexed bytes above the configured limit because leases or checkpoints prevent eviction
+    pub over_limit_bytes: u64,
     /// Number of saved job checkpoints
     pub checkpoints: u64,
 }

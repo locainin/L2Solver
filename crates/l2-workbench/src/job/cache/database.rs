@@ -10,6 +10,7 @@ use super::{
 pub(super) const DATABASE_NAME: &str = "cache.sqlite3";
 const SCHEMA_VERSION: u32 = 1;
 const APPLICATION_ID: i64 = 0x4c32_5343;
+const INITIALIZATION_LOCK: &str = "cache-init.lock";
 
 #[derive(Clone, Copy)]
 pub(super) enum Durability {
@@ -17,7 +18,8 @@ pub(super) enum Durability {
     Checkpoint,
 }
 
-pub(super) fn initialize(state: &HeldDirectory) -> Result<()> {
+pub(super) fn initialize(state: &HeldDirectory, locks: &HeldDirectory) -> Result<()> {
+    let _lock = locks.lock_with_retry(INITIALIZATION_LOCK, true)?;
     let connection = open_connection(state, Durability::Checkpoint)?;
     // Check ownership and schema before changing another database's journal mode
     let application_id = pragma_i64(&connection, "application_id")?;
