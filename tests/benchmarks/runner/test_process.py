@@ -33,9 +33,7 @@ def run_with_group_signal_observer(command, directory, timeout):
         return original_killpg(process_group, requested_signal)
 
     with (
-        patch.object(
-            process_module.subprocess, "Popen", side_effect=recording_popen
-        ),
+        patch.object(process_module.subprocess, "Popen", side_effect=recording_popen),
         patch.object(process_module.os, "killpg", side_effect=recording_killpg),
     ):
         result = run_child(command, directory, timeout)
@@ -43,6 +41,55 @@ def run_with_group_signal_observer(command, directory, timeout):
 
 
 class ProcessTests(unittest.TestCase):
+    def test_child_receives_explicit_environment_overrides(self):
+        with tempfile.TemporaryDirectory() as directory:
+            result = run_child(
+                [
+                    sys.executable,
+                    "-c",
+                    "import os; print(os.environ['L2SOLVER_BENCHMARK_ENV'])",
+                ],
+                Path(directory),
+                5,
+                env={**os.environ, "L2SOLVER_BENCHMARK_ENV": "isolated"},
+            )
+
+            self.assertEqual(result[:3], (0, None, None))
+            self.assertEqual((Path(directory) / "stdout.log").read_text(), "isolated\n")
+
+    @unittest.skipUnless(os.name == "posix", "requires process-group signal handling")
+    def test_child_can_be_interrupted_after_a_log_event(self):
+        with tempfile.TemporaryDirectory() as directory:
+            command = [
+                sys.executable,
+                "-c",
+                textwrap.dedent(
+                    """
+                    import signal, sys, time
+                    def stop(_signal, _frame):
+                        print('received-interrupt', file=sys.stderr, flush=True)
+                        raise SystemExit(130)
+                    signal.signal(signal.SIGINT, stop)
+                    print('active-search', file=sys.stderr, flush=True)
+                    while True:
+                        time.sleep(0.01)
+                    """
+                ),
+            ]
+
+            def active_search(logs):
+                return "active-search" in logs["stderr"].read_text()
+
+            result = run_child(
+                command, Path(directory), 5, interrupt_when=active_search
+            )
+
+            self.assertEqual(result[:3], (130, None, None))
+            self.assertTrue(result[3]["interrupt_sent"])
+            self.assertIn(
+                "received-interrupt", (Path(directory) / "stderr.log").read_text()
+            )
+
     @unittest.skipUnless(sys.platform == "linux", "requires Linux process metrics")
     def test_child_cpu_and_io_metrics_cover_analyzer_work(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -130,7 +177,9 @@ class ProcessTests(unittest.TestCase):
                 try:
                     with (
                         patch.object(
-                            process_module, "_capture_available", side_effect=capture_tail
+                            process_module,
+                            "_capture_available",
+                            side_effect=capture_tail,
                         ),
                         patch.object(
                             process_module, "_child_exit_observed", observe_exit

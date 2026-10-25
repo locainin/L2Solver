@@ -6,6 +6,7 @@ import signal
 import stat
 import subprocess
 import time
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from pathlib import Path
 from typing import BinaryIO
@@ -19,8 +20,7 @@ DEFAULT_MAX_LOG_BYTES = 1024 * 1024
 _LOG_READ_CHUNK_BYTES = 64 * 1024
 _PROCESS_IO_FIELDS = ("rchar", "wchar", "read_bytes", "write_bytes")
 _HAS_WAITID_WNOWAIT = os.name == "posix" and all(
-    hasattr(os, name)
-    for name in ("waitid", "P_PID", "WEXITED", "WNOHANG", "WNOWAIT")
+    hasattr(os, name) for name in ("waitid", "P_PID", "WEXITED", "WNOHANG", "WNOWAIT")
 )
 _PROCESS_CLEANUP_SCOPE = (
     "owned_process_group"
@@ -69,9 +69,7 @@ def stop_owned_processes(child):
 def _child_exit_observed(child):
     # WNOWAIT keeps the leader unreaped until its owned process group is signaled
     if _HAS_WAITID_WNOWAIT:
-        status = os.waitid(
-            os.P_PID, child.pid, os.WEXITED | os.WNOHANG | os.WNOWAIT
-        )
+        status = os.waitid(os.P_PID, child.pid, os.WEXITED | os.WNOHANG | os.WNOWAIT)
         return status is not None and status.si_pid == child.pid
     return child.poll() is not None
 
@@ -209,13 +207,25 @@ def _stop_result(child, streams, status, message, metrics):
     return child.returncode, status, message, metrics
 
 
+def _send_interrupt(child):
+    # Signal only the process group created for this analyzer invocation
+    try:
+        if os.name == "posix":
+            os.killpg(child.pid, signal.SIGINT)
+        else:
+            child.send_signal(signal.SIGINT)
+    except ProcessLookupError:
+        return False
+    return True
+
+
 def _timeout_result(child, streams, metrics):
     return _stop_result(
         child, streams, "timeout", "Analyzer deadline exceeded", metrics
     )
 
 
-def monitor(child, streams, deadline, maximum_logs):
+def monitor(child, streams, deadline, maximum_logs, interrupt_when=None):
     metrics = {
         "peak_sampled_rss_bytes": None,
         "rss_samples": 0,
@@ -229,7 +239,9 @@ def monitor(child, streams, deadline, maximum_logs):
         "process_io_bytes": None,
         "io_measurement_scope": "linux_procfs_analyzer_process_only",
         "io_samples": 0,
+        "interrupt_sent": False,
     }
+    interrupt_condition_seen = False
     while True:
         # A process observed after its deadline cannot be accepted as a successful run
         if time.monotonic() >= deadline:
@@ -258,8 +270,15 @@ def monitor(child, streams, deadline, maximum_logs):
             if issue is not None:
                 return _stop_result(child, streams, "tool_failure", issue, metrics)
 
-        # Recheck after the poll; a scheduler delay must not turn a late exit into success
+        # Check exit before a callback so a completed child is never interrupted
         exited = _child_exit_observed(child)
+        if not exited and interrupt_when is not None and not interrupt_condition_seen:
+            logs = {stream.name: stream.path for stream in streams}
+            if interrupt_when(logs):
+                interrupt_condition_seen = True
+                metrics["interrupt_sent"] = _send_interrupt(child)
+
+        # Recheck after the poll; a scheduler delay must not turn a late exit into success
         if time.monotonic() >= deadline:
             return _timeout_result(child, streams, metrics)
         if exited:
@@ -297,7 +316,13 @@ def monitor(child, streams, deadline, maximum_logs):
 
 
 def run_child(
-    command, directory, timeout, log_prefix=None, max_log_bytes=DEFAULT_MAX_LOG_BYTES
+    command,
+    directory,
+    timeout,
+    log_prefix=None,
+    max_log_bytes=DEFAULT_MAX_LOG_BYTES,
+    env=None,
+    interrupt_when: Callable[[Mapping[str, Path]], bool] | None = None,
 ):
     validate_timeout(timeout)
     if (
@@ -322,6 +347,7 @@ def run_child(
             shell=False,
             start_new_session=os.name == "posix",
             bufsize=0,
+            env=env,
         )
         streams = [
             _CapturedStream(
@@ -334,7 +360,7 @@ def run_child(
         try:
             for stream in streams:
                 os.set_blocking(stream.pipe.fileno(), False)
-            result = monitor(child, streams, deadline, max_log_bytes)
+            result = monitor(child, streams, deadline, max_log_bytes, interrupt_when)
         finally:
             # Also stop descendants still in the owned group after completion or cancellation
             stop_owned_processes(child)
@@ -343,12 +369,8 @@ def run_child(
         if cpu_before is not None:
             cpu_after = _child_cpu_usage()
             if cpu_after is not None:
-                result[3]["user_cpu_seconds"] = max(
-                    0.0, cpu_after[0] - cpu_before[0]
-                )
-                result[3]["system_cpu_seconds"] = max(
-                    0.0, cpu_after[1] - cpu_before[1]
-                )
+                result[3]["user_cpu_seconds"] = max(0.0, cpu_after[0] - cpu_before[0])
+                result[3]["system_cpu_seconds"] = max(0.0, cpu_after[1] - cpu_before[1])
         if any(not _log_path_matches(stream) for stream in streams):
             result[3]["log_capture_complete"] = False
             return (
