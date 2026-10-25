@@ -5,6 +5,7 @@ use super::{
     process::StreamingPolicy,
     run_phase, verify_executable_unchanged, verify_prepared_capture,
 };
+use l2_workbench::job::Job;
 
 use std::{
     error::Error,
@@ -54,14 +55,24 @@ struct ResolvedObjectExport {
     partial_directories: Vec<(String, PathBuf)>,
 }
 
-/// Run `TShark` object export against the shared isolated capture preparation
-pub fn export_objects(
+/// Export TShark objects with the shared isolated profile and cooperative cancellation state
+pub fn export_objects_with_job(
     capture: &Path,
     temporary_parent: &Path,
     budget: ObjectExportBudget,
+    job: Option<&Job>,
 ) -> Result<ExportObjectSet, Box<dyn Error>> {
+    if let Some(job) = job {
+        job.check_cancelled()?;
+    }
     let mut prepared = prepare_export_capture(capture, temporary_parent)?;
+    if let Some(job) = job {
+        job.check_cancelled()?;
+    }
     let types = available_types(&prepared)?;
+    if let Some(job) = job {
+        job.check_cancelled()?;
+    }
     let object_root = prepared.directory.path().join("export-objects");
     fs::create_dir(&object_root)?;
     let invocation = build_object_arguments(&prepared, &object_root, types)?;
@@ -76,6 +87,7 @@ pub fn export_objects(
             object_root: &object_root,
             protocol_directory_count: u64::try_from(invocation.directories.len())?,
             object_budget: budget,
+            job,
         },
     );
     let resolved = resolve_object_export(
@@ -140,6 +152,7 @@ fn resolve_object_export(
             &timeout.stable_objects,
             timeout.describe(),
         )?,
+        Err(error @ process::ProcessError::Cancelled) => return Err(error.into()),
         Err(error) => return Err(error.into()),
     };
     Ok(ResolvedObjectExport {

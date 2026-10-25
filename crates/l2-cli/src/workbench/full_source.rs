@@ -11,10 +11,15 @@ use super::{input, label};
 use l2_workbench::{
     investigation::BuildResult,
     reconstruction::{Limits, Reconstructor, RecordRetentionLimit},
-    store::{Flow, FlowCohortCoverage, IngestReceipt, Options, Store},
+    store::{Flow, FlowCohortCoverage, IngestReceipt, Store},
 };
 use serde::Serialize;
-use std::{error::Error, io, path::Path};
+use std::{error::Error, io};
+
+#[cfg(test)]
+use l2_workbench::store::Options;
+#[cfg(test)]
+use std::path::Path;
 
 const FLOW_PAGE_SIZE: usize = 256;
 
@@ -301,6 +306,7 @@ pub fn acquire_full_source_in(
 ///
 /// # Errors
 /// Returns source parsing, disk-indexing, analysis, visitor, or counter failures
+#[cfg(test)]
 pub fn acquire_full_source_with_cohorts_in(
     path: &Path,
     temporary_parent: &Path,
@@ -318,6 +324,7 @@ pub fn acquire_full_source_with_cohorts_in(
     )
 }
 
+#[cfg(test)]
 fn acquire_full_source_inner(
     path: &Path,
     temporary_parent: &Path,
@@ -343,6 +350,7 @@ fn acquire_full_source_inner(
 ///
 /// # Errors
 /// Returns invalid receipt, source/indexing, analysis, visitor, or coverage counter failures
+#[cfg(test)]
 pub fn analyze_indexed_source(
     store: &Store,
     receipt: &IngestReceipt,

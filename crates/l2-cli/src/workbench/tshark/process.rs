@@ -2,6 +2,7 @@ use super::budget::{
     ObjectExportBudget, ObjectExportLimit, ObjectExportResource, ObjectExportUsage,
     ObjectFileSnapshot, StableObject,
 };
+use l2_workbench::job::Job;
 #[cfg(unix)]
 use nix::{
     sys::signal::{Signal, killpg},
@@ -95,6 +96,7 @@ pub(super) struct StreamingPolicy<'a> {
     pub object_root: &'a Path,
     pub protocol_directory_count: u64,
     pub object_budget: ObjectExportBudget,
+    pub job: Option<&'a Job>,
 }
 
 /// Process failure that cannot be represented by a successful receipt
@@ -102,6 +104,7 @@ pub(super) struct StreamingPolicy<'a> {
 pub(super) enum ProcessError {
     Spawn(io::Error),
     Read(io::Error),
+    Cancelled,
     TimedOut,
     OutputLimit,
     ObjectExportLimit(ObjectExportLimit),
@@ -113,6 +116,7 @@ impl fmt::Display for ProcessError {
         match self {
             Self::Spawn(error) => write!(formatter, "could not start TShark: {error}"),
             Self::Read(error) => write!(formatter, "could not capture TShark output: {error}"),
+            Self::Cancelled => formatter.write_str("TShark object export was cancelled"),
             Self::TimedOut => formatter.write_str("TShark exceeded its time budget"),
             Self::OutputLimit => formatter.write_str("TShark output exceeded its byte budget"),
             Self::ObjectExportLimit(limit) => formatter.write_str(&limit.describe()),
@@ -211,6 +215,9 @@ pub(super) fn run_streaming(
     environment: &[(OsString, OsString)],
     policy: StreamingPolicy<'_>,
 ) -> Result<StreamOutput, ProcessError> {
+    if policy.job.is_some_and(Job::is_cancelled) {
+        return Err(ProcessError::Cancelled);
+    }
     if Instant::now() >= policy.deadline {
         return Err(ProcessError::ObjectExportTimeout(ObjectExportTimeout {
             stderr: Vec::new(),
@@ -250,6 +257,11 @@ pub(super) fn run_streaming(
     let mut monitor = StreamingMonitor::new(policy, Arc::clone(&diagnostics));
 
     loop {
+        if policy.job.is_some_and(Job::is_cancelled) {
+            stop_and_reap(&mut child);
+            join_workers_after_stop([worker]);
+            return Err(ProcessError::Cancelled);
+        }
         match monitor.poll(&mut child, policy) {
             Ok(Some(output)) => {
                 let _ = worker.join();

@@ -1,3 +1,4 @@
+use super::processing::{PendingCase, RecoveredCase, process_case_batch};
 use super::{
     artifact_collection::{
         AddOutcome, ArtifactCollection, ArtifactCoverage, ArtifactLimits, ArtifactProvenance,
@@ -8,9 +9,250 @@ use super::{
 use crate::workbench::full_source::{
     FlowAnalysisCoverage, FullSourceCoverage, ReconstructionOmissionCoverage, SourceCoverage,
 };
-use l2_workbench::reconstruction::Limits;
+use crate::{
+    arguments::{ExportOptions, RecoveryOptions, RecoveryProfile},
+    export::recovery_cache::RecoveryContext,
+};
+use l2_workbench::{
+    job::{Counter, Job, Phase, PhaseState},
+    reconstruction::Limits,
+};
 use serde_json::Value;
 use std::{error::Error, fs, io, io::Write};
+
+#[test]
+fn recovery_worker_count_respects_cpu_and_memory_bounds() {
+    const MIB: u64 = 1024 * 1024;
+
+    assert_eq!(
+        super::processing::recovery_worker_count(Some(3), 8, 512 * MIB),
+        3
+    );
+    assert_eq!(
+        super::processing::recovery_worker_count(None, 8, 256 * MIB),
+        2
+    );
+    assert_eq!(
+        super::processing::recovery_worker_count(Some(8), 2, 64 * MIB),
+        1
+    );
+}
+
+#[test]
+fn collection_jobs_one_and_two_preserve_logical_output() -> Result<(), Box<dyn Error>> {
+    let temporary = tempfile::tempdir()?;
+    let capture = temporary.path().join("flows.pcap");
+    fs::write(&capture, two_udp_flows()?)?;
+
+    let single = collect_with_jobs(&capture, temporary.path(), 1)?;
+    let parallel = collect_with_jobs(&capture, temporary.path(), 2)?;
+
+    assert_eq!(parallel.source_coverage, single.source_coverage);
+    assert_eq!(parallel.recovery_coverage, single.recovery_coverage);
+    assert_eq!(parallel.artifact_manifest, single.artifact_manifest);
+    assert_eq!(parallel.artifact_files, single.artifact_files);
+    Ok(())
+}
+
+#[test]
+fn collection_phases_cover_indexed_analysis_and_optional_tshark() -> Result<(), Box<dyn Error>> {
+    let temporary = tempfile::tempdir()?;
+    let capture = temporary.path().join("flows.pcap");
+    let staging = temporary.path().join("staging");
+    fs::write(&capture, two_udp_flows()?)?;
+    fs::create_dir(&staging)?;
+    let options = ExportOptions {
+        capture,
+        output: None,
+        require_tshark: false,
+        recovery: RecoveryOptions {
+            profile: RecoveryProfile::Fast,
+            jobs: Some(1),
+            ..RecoveryOptions::default()
+        },
+    };
+    let job = Job::new("collection phase test");
+    let context = RecoveryContext {
+        cache: None,
+        job: Some(&job),
+        options: &options.recovery,
+    };
+
+    let _collected = super::collection::collect_export(
+        &staging,
+        &options,
+        super::artifact_collection::ArtifactLimits::default(),
+        &context,
+    )?;
+    let snapshot = job.snapshot()?;
+
+    for phase in [
+        Phase::Ingestion,
+        Phase::Reconstruction,
+        Phase::NativeExtraction,
+        Phase::FramingRecordDiscovery,
+        Phase::TransformDiscovery,
+        Phase::AssemblyValidation,
+        Phase::Expansion,
+    ] {
+        assert_eq!(
+            snapshot.phase(phase).map(|progress| progress.state),
+            Some(PhaseState::Completed),
+            "phase {phase:?} should finish after collection"
+        );
+    }
+    assert_eq!(snapshot.counters.get(&Counter::Flows), Some(&2));
+    Ok(())
+}
+
+#[test]
+fn parallel_case_recovery_preserves_serial_event_order() -> Result<(), Box<dyn Error>> {
+    let temporary = tempfile::tempdir()?;
+    let capture = temporary.path().join("flows.pcap");
+    fs::write(&capture, two_udp_flows()?)?;
+
+    let single = recover_indexed_cases(&capture, temporary.path(), 1)?;
+    let parallel = recover_indexed_cases(&capture, temporary.path(), 2)?;
+
+    assert_eq!(parallel.scopes, single.scopes);
+    assert_eq!(parallel.cases, single.cases);
+    assert_eq!(parallel.coverage, single.coverage);
+    assert_eq!(parallel.source_coverage, single.source_coverage);
+    Ok(())
+}
+
+struct RecoveredCaseSnapshot {
+    scopes: Vec<Value>,
+    cases: Vec<Vec<u8>>,
+    coverage: Value,
+    source_coverage: Value,
+}
+
+fn recover_indexed_cases(
+    capture: &std::path::Path,
+    temporary_parent: &std::path::Path,
+    worker_count: usize,
+) -> Result<RecoveredCaseSnapshot, Box<dyn Error>> {
+    let options = RecoveryOptions {
+        profile: RecoveryProfile::Fast,
+        jobs: Some(worker_count),
+        ..RecoveryOptions::default()
+    };
+    let context = RecoveryContext {
+        cache: None,
+        job: None,
+        options: &options,
+    };
+    let pool = rayon::ThreadPoolBuilder::new()
+        .num_threads(worker_count)
+        .build()?;
+    let mut scopes = Vec::new();
+    let mut cases = Vec::new();
+    let mut coverage = super::RecoveryCoverage::default();
+    let mut batch = Vec::with_capacity(worker_count);
+    let mut emit = |case: RecoveredCase| {
+        let RecoveredCase {
+            item,
+            scope,
+            recovery,
+        } = case;
+        let mut encoded_case = Vec::new();
+        match item {
+            crate::workbench::full_source::FullSourceItem::Flow(analysis) => {
+                analysis.result.case.write_json(&mut encoded_case)?;
+            }
+            crate::workbench::full_source::FullSourceItem::FlowPage(page) => {
+                page.result.case.write_json(&mut encoded_case)?;
+            }
+            crate::workbench::full_source::FullSourceItem::Cohort(cohort) => {
+                cohort.result.case.write_json(&mut encoded_case)?;
+            }
+        }
+        coverage.merge(&recovery.coverage)?;
+        scopes.push(scope);
+        cases.push(encoded_case);
+        Ok(())
+    };
+    let source = crate::workbench::full_source::acquire_full_source_with_cohorts_in(
+        capture,
+        temporary_parent,
+        Limits::default(),
+        |item| {
+            batch.push(PendingCase::new(item)?);
+            if batch.len() == worker_count {
+                process_case_batch(&mut batch, &pool, &context, &mut emit)?;
+            }
+            Ok(())
+        },
+    )?;
+    process_case_batch(&mut batch, &pool, &context, &mut emit)?;
+    Ok(RecoveredCaseSnapshot {
+        scopes,
+        cases,
+        coverage: serde_json::to_value(coverage)?,
+        source_coverage: serde_json::to_value(&source.source)?,
+    })
+}
+
+struct CollectionSnapshot {
+    source_coverage: Value,
+    recovery_coverage: Value,
+    artifact_manifest: Vec<u8>,
+    artifact_files: Vec<(String, Vec<u8>)>,
+}
+
+fn collect_with_jobs(
+    capture: &std::path::Path,
+    temporary_parent: &std::path::Path,
+    jobs: usize,
+) -> Result<CollectionSnapshot, Box<dyn Error>> {
+    let staging = tempfile::tempdir_in(temporary_parent)?;
+    let options = ExportOptions {
+        capture: capture.to_owned(),
+        output: None,
+        require_tshark: false,
+        recovery: RecoveryOptions {
+            profile: RecoveryProfile::Fast,
+            jobs: Some(jobs),
+            ..RecoveryOptions::default()
+        },
+    };
+    let context = RecoveryContext {
+        cache: None,
+        job: None,
+        options: &options.recovery,
+    };
+    let mut collected = super::collection::collect_export(
+        staging.path(),
+        &options,
+        super::artifact_collection::ArtifactLimits::default(),
+        &context,
+    )?;
+    let mut artifact_manifest = Vec::new();
+    collected
+        .artifacts
+        .write_manifest_artifacts(&mut artifact_manifest)?;
+    let mut artifact_names = collected
+        .artifacts
+        .file_names()?
+        .into_iter()
+        .collect::<Vec<_>>();
+    artifact_names.sort();
+    let artifact_files = artifact_names
+        .into_iter()
+        .map(|name| {
+            let display_name = name.to_string_lossy().into_owned();
+            Ok((display_name, fs::read(staging.path().join(name))?))
+        })
+        .collect::<Result<Vec<_>, Box<dyn Error>>>()?;
+
+    Ok(CollectionSnapshot {
+        source_coverage: serde_json::to_value(&collected.coverage.source)?,
+        recovery_coverage: serde_json::to_value(&collected.recovery)?,
+        artifact_manifest,
+        artifact_files,
+    })
+}
 
 #[test]
 fn rejects_unsafe_flat_file_names() -> Result<(), Box<dyn Error>> {

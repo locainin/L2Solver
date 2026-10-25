@@ -1,5 +1,6 @@
 use super::{ProcessError, StreamingMonitor, StreamingPolicy, run_streaming};
 use crate::workbench::tshark::ObjectExportBudget;
+use l2_workbench::job::Job;
 #[cfg(target_os = "linux")]
 use std::fs;
 use std::{
@@ -26,6 +27,7 @@ fn policy(
         object_root,
         protocol_directory_count,
         object_budget,
+        job: None,
     }
 }
 
@@ -102,6 +104,39 @@ fn streaming_deadline_stops_process_group() -> Result<(), Box<dyn Error>> {
         let pid = fs::read_to_string(pid_path)?.parse::<u32>()?;
         assert!(!process_is_running(pid)?);
     }
+    Ok(())
+}
+
+#[test]
+fn streaming_cancellation_stops_process_before_deadline() -> Result<(), Box<dyn Error>> {
+    let job = Job::new("test TShark cancellation");
+    let cancellation_job = job.clone();
+    let cancellation = std::thread::spawn(move || {
+        std::thread::sleep(Duration::from_millis(75));
+        cancellation_job.request_cancel();
+    });
+    let temporary = tempfile::tempdir()?;
+    let object_root = temporary.path().join("objects");
+    empty_object_root(&object_root)?;
+    let arguments = [OsString::from("-c"), OsString::from("exec sleep 30")];
+    let mut streaming_policy = policy(
+        Instant::now() + Duration::from_secs(5),
+        &object_root,
+        0,
+        ObjectExportBudget::default(),
+    );
+    streaming_policy.job = Some(&job);
+    let started = Instant::now();
+
+    let error = run_streaming(Path::new("/bin/sh"), &arguments, &[], streaming_policy)
+        .err()
+        .ok_or("cancelled TShark work should stop with a cancellation error")?;
+    cancellation
+        .join()
+        .map_err(|_| "cancellation worker panicked")?;
+
+    assert!(matches!(error, ProcessError::Cancelled));
+    assert!(started.elapsed() < Duration::from_secs(2));
     Ok(())
 }
 

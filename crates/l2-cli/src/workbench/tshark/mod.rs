@@ -5,7 +5,7 @@ mod objects;
 mod process;
 
 pub use budget::{ObjectExportBudget, ObjectExportStatus, ObjectExportUsage};
-pub use objects::{ExportObjectSet, export_objects};
+pub use objects::{ExportObjectSet, export_objects_with_job};
 
 use crate::arguments::TsharkOptions;
 use count::CaptureCount;
