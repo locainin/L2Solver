@@ -468,13 +468,18 @@ impl Job {
     /// is not active
     pub fn set_current(&self, phase: Phase, message: impl Into<String>) -> Result<(), JobError> {
         let mut state = self.lock_state()?;
-        let phase_snapshot = find_phase_mut(&mut state.snapshot.phases, phase)
-            .ok_or(JobError::PhaseNotInProgress(phase))?;
-        if phase_snapshot.state != PhaseState::InProgress {
-            return Err(JobError::PhaseNotInProgress(phase));
+        {
+            let phase_snapshot = find_phase_mut(&mut state.snapshot.phases, phase)
+                .ok_or(JobError::PhaseNotInProgress(phase))?;
+            if phase_snapshot.state != PhaseState::InProgress {
+                return Err(JobError::PhaseNotInProgress(phase));
+            }
+
+            phase_snapshot.message = Some(message.into());
         }
 
-        phase_snapshot.message = Some(message.into());
+        // Overlapping work can make the most recently updated phase differ from the last one started
+        state.snapshot.current_phase = Some(phase);
         drop(state);
         Ok(())
     }

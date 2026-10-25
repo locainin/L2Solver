@@ -97,6 +97,27 @@ fn setting_an_absolute_count_does_not_double_count_replayed_work() -> TestResult
 }
 
 #[test]
+fn setting_current_selects_the_phase_reported_in_the_snapshot() -> TestResult {
+    let job = Job::new("interleaved discovery");
+    job.start(Phase::Expansion, None)?;
+    job.start(Phase::TransformDiscovery, None)?;
+
+    job.set_current(Phase::Expansion, "expanding validated containers")?;
+
+    let snapshot = job.snapshot()?;
+    assert_eq!(snapshot.current_phase, Some(Phase::Expansion));
+    assert_eq!(
+        phase(&snapshot, Phase::Expansion)?.message.as_deref(),
+        Some("expanding validated containers")
+    );
+    assert_eq!(
+        phase(&snapshot, Phase::TransformDiscovery)?.state,
+        PhaseState::InProgress
+    );
+    Ok(())
+}
+
+#[test]
 fn restore_rejects_replacing_live_phase_progress() -> TestResult {
     let job = Job::new("active recovery");
     job.start(Phase::Preparation, Some(2))?;

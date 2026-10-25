@@ -1,10 +1,34 @@
 use std::error::Error;
+use std::sync::Mutex;
+use std::sync::atomic::AtomicBool;
 use std::time::{Duration, Instant};
 
 use super::RenderVerbosity;
 use super::cancellation::{HandlerTarget, record_interrupt};
-use super::render::{RedrawGate, render_human_line, render_json_line};
-use l2_workbench::job::{Job, Phase};
+use super::render::{JsonEvent, JsonEventTracker, RedrawGate, render_human_line, render_json_line};
+use super::renderer::{LinePolicy, observe_lines};
+use l2_workbench::job::{Counter, Job, Phase, PhaseOutcome, PhaseState};
+
+fn capture_json_lines(job: &Job, policy: LinePolicy) -> Result<Vec<String>, Box<dyn Error>> {
+    let stop = AtomicBool::new(true);
+    let output = Mutex::new(Vec::new());
+    observe_lines(
+        job,
+        &stop,
+        render_json_line,
+        |line| {
+            output
+                .lock()
+                .map_err(|_| std::io::Error::other("test output lock is poisoned"))?
+                .push(line.to_owned());
+            Ok(())
+        },
+        policy,
+    )?;
+    Ok(output
+        .into_inner()
+        .map_err(|_| std::io::Error::other("test output lock is poisoned"))?)
+}
 
 #[test]
 fn redirected_human_output_never_contains_ansi_codes() -> Result<(), Box<dyn Error>> {
@@ -30,6 +54,24 @@ fn quiet_verbosity_suppresses_human_status() -> Result<(), Box<dyn Error>> {
 }
 
 #[test]
+fn normal_human_status_shows_candidates_rate_and_unknown_eta() -> Result<(), Box<dyn Error>> {
+    let job = Job::new("dynamic candidate scan");
+    job.start(Phase::TransformDiscovery, None)?;
+    job.advance(Phase::TransformDiscovery, 12)?;
+    job.increment(Counter::CandidatesExamined, 12)?;
+    job.increment(Counter::CandidatesRejected, 3)?;
+    std::thread::sleep(Duration::from_millis(10));
+    let snapshot = job.snapshot()?;
+
+    let line = render_human_line(&snapshot, RenderVerbosity::Normal);
+
+    assert!(line.contains("candidates 12 examined, 3 rejected"));
+    assert!(line.contains("rate ") && line.contains("items/s"));
+    assert!(line.contains("ETA unknown"));
+    Ok(())
+}
+
+#[test]
 fn json_mode_emits_a_parseable_newline_delimited_snapshot() -> Result<(), Box<dyn Error>> {
     let job = Job::new("machine-readable run");
     job.start(Phase::Preparation, None)?;
@@ -41,6 +83,81 @@ fn json_mode_emits_a_parseable_newline_delimited_snapshot() -> Result<(), Box<dy
     assert!(line.ends_with('\n'));
     assert_eq!(parsed["label"], "machine-readable run");
     assert_eq!(parsed["current_phase"], "preparation");
+    Ok(())
+}
+
+#[test]
+fn quiet_json_filters_routine_progress_but_keeps_cancel_and_failure_ndjson()
+-> Result<(), Box<dyn Error>> {
+    let running_job = Job::new("quiet machine-readable run");
+    running_job.start(Phase::TransformDiscovery, None)?;
+    running_job.advance(Phase::TransformDiscovery, 4)?;
+    let running_snapshot = running_job.snapshot()?;
+    let mut events = JsonEventTracker::default();
+
+    assert_eq!(events.pending_event(&running_snapshot), None);
+    assert!(capture_json_lines(&running_job, LinePolicy::QuietJsonEvents)?.is_empty());
+
+    running_job.request_cancel();
+    let cancellation_snapshot = running_job.snapshot()?;
+    let cancellation_event = events
+        .pending_event(&cancellation_snapshot)
+        .ok_or_else(|| std::io::Error::other("cancellation event should be emitted"))?;
+    assert_eq!(cancellation_event, JsonEvent::CancellationRequested);
+    let cancellation_lines = capture_json_lines(&running_job, LinePolicy::QuietJsonEvents)?;
+    assert_eq!(cancellation_lines.len(), 1);
+    let cancellation_json: serde_json::Value =
+        serde_json::from_str(cancellation_lines[0].trim_end())?;
+    assert!(cancellation_lines[0].ends_with('\n'));
+    assert_eq!(cancellation_json["cancel_requested"], true);
+    events.mark_emitted(cancellation_event);
+    assert_eq!(events.pending_event(&cancellation_snapshot), None);
+
+    running_job.finish(Phase::TransformDiscovery, PhaseOutcome::Cancelled)?;
+    let terminal_cancellation = running_job.snapshot()?;
+    let terminal_event = events
+        .pending_event(&terminal_cancellation)
+        .ok_or_else(|| std::io::Error::other("cancelled phase event should be emitted"))?;
+    assert_eq!(
+        terminal_event,
+        JsonEvent::TerminalPhase(Phase::TransformDiscovery, PhaseState::Cancelled)
+    );
+    let terminal_line = render_json_line(&terminal_cancellation)?;
+    let terminal_json: serde_json::Value = serde_json::from_str(terminal_line.trim_end())?;
+    assert!(terminal_line.ends_with('\n'));
+    let transform_phase = terminal_json["phases"]
+        .as_array()
+        .and_then(|phases| {
+            phases
+                .iter()
+                .find(|phase| phase["phase"] == "transform_discovery")
+        })
+        .ok_or_else(|| std::io::Error::other("transform phase should be in the JSON snapshot"))?;
+    assert_eq!(transform_phase["state"], "cancelled");
+    events.mark_emitted(terminal_event);
+    assert_eq!(events.pending_event(&terminal_cancellation), None);
+
+    let failed_job = Job::new("failed machine-readable run");
+    failed_job.start(Phase::Preparation, None)?;
+    failed_job.set_current(Phase::Preparation, "invalid source metadata")?;
+    failed_job.finish(Phase::Preparation, PhaseOutcome::Failed)?;
+    let failed_snapshot = failed_job.snapshot()?;
+    let failed_event = events
+        .pending_event(&failed_snapshot)
+        .ok_or_else(|| std::io::Error::other("failed phase event should be emitted"))?;
+    assert_eq!(
+        failed_event,
+        JsonEvent::TerminalPhase(Phase::Preparation, PhaseState::Failed)
+    );
+    let failed_lines = capture_json_lines(&failed_job, LinePolicy::QuietJsonEvents)?;
+    assert_eq!(failed_lines.len(), 1);
+    let failed_json: serde_json::Value = serde_json::from_str(failed_lines[0].trim_end())?;
+    assert!(failed_lines[0].ends_with('\n'));
+    let preparation_phase = failed_json["phases"]
+        .as_array()
+        .and_then(|phases| phases.iter().find(|phase| phase["phase"] == "preparation"))
+        .ok_or_else(|| std::io::Error::other("preparation phase should be in the JSON snapshot"))?;
+    assert_eq!(preparation_phase["state"], "failed");
     Ok(())
 }
 

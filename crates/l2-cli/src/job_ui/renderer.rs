@@ -10,13 +10,19 @@ use l2_workbench::job::{Job, JobSnapshot, Phase};
 use crate::arguments::ProgressMode;
 
 use super::model::{RenderVerbosity, RendererError, RendererOptions};
-use super::render::{RedrawGate, render_human_line, render_json_line};
+use super::render::{JsonEventTracker, RedrawGate, render_human_line, render_json_line};
 
 const POLL_INTERVAL: Duration = Duration::from_millis(100);
 const SPINNER_INTERVAL: Duration = Duration::from_secs(1);
 const DRAW_RATE_HZ: u8 = 4;
 const BAR_TEMPLATE: &str = "[{elapsed_precise}] {bar:40.cyan/blue} {pos}/{len} {msg}";
 const SPINNER_TEMPLATE: &str = "[{elapsed_precise}] {spinner:.cyan} {msg}";
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum LinePolicy {
+    EverySnapshot,
+    QuietJsonEvents,
+}
 
 /// Observes job snapshots and writes progress to stderr
 #[must_use = "keep this renderer alive while progress should be observed"]
@@ -29,8 +35,9 @@ pub struct Renderer {
 impl Renderer {
     /// Starts a background observer using the requested output mode
     ///
-    /// JSON mode always emits NDJSON to stderr. Auto mode is silent when stderr is redirected,
-    /// while Always mode emits plain lines in that case
+    /// JSON mode emits NDJSON snapshots to stderr, with quiet mode limited to cancellation and
+    /// failure events. Auto mode is silent when stderr is redirected, while Always mode emits
+    /// plain lines in that case
     ///
     /// # Errors
     /// Returns an I/O or thread creation error when the observer cannot be started
@@ -89,15 +96,20 @@ impl Drop for Renderer {
 fn run(job: &Job, options: RendererOptions, stop: &AtomicBool) -> Result<(), RendererError> {
     let terminal = is_interactive_terminal();
     match options.mode {
-        ProgressMode::Json => run_json(job, stop),
+        ProgressMode::Json => run_json(job, stop, options.verbosity),
         ProgressMode::Auto | ProgressMode::Always if terminal => run_terminal(job, stop, options),
         ProgressMode::Always => run_lines(job, stop, options.verbosity),
         ProgressMode::Auto | ProgressMode::Never => Ok(()),
     }
 }
 
-fn run_json(job: &Job, stop: &AtomicBool) -> Result<(), RendererError> {
-    observe_lines(job, stop, render_json_line, write_stderr)
+fn run_json(job: &Job, stop: &AtomicBool, verbosity: RenderVerbosity) -> Result<(), RendererError> {
+    let line_policy = if verbosity == RenderVerbosity::Quiet {
+        LinePolicy::QuietJsonEvents
+    } else {
+        LinePolicy::EverySnapshot
+    };
+    observe_lines(job, stop, render_json_line, write_stderr, line_policy)
 }
 
 fn run_lines(
@@ -110,17 +122,20 @@ fn run_lines(
         stop,
         |snapshot| Ok(render_human_line(snapshot, verbosity)),
         write_stderr_line,
+        LinePolicy::EverySnapshot,
     )
 }
 
-fn observe_lines(
+pub(super) fn observe_lines(
     job: &Job,
     stop: &AtomicBool,
     render_line: impl Fn(&JobSnapshot) -> Result<String, RendererError>,
     write_line: impl Fn(&str) -> Result<(), RendererError>,
+    line_policy: LinePolicy,
 ) -> Result<(), RendererError> {
     let mut gate = RedrawGate::default();
     let mut previous_line = None;
+    let mut json_events = JsonEventTracker::default();
 
     loop {
         let snapshot = job.snapshot()?;
@@ -128,8 +143,21 @@ fn observe_lines(
         // The gate caps changed output and still refreshes unchanged status as a heartbeat
         let changed = previous_line.as_deref() != Some(line.as_str());
         let finishing = stop.load(Ordering::Acquire);
-        if finishing || gate.should_render(Instant::now(), changed) {
-            write_line(&line)?;
+        let pending_event = if line_policy == LinePolicy::QuietJsonEvents {
+            json_events.pending_event(&snapshot)
+        } else {
+            None
+        };
+        if line_policy == LinePolicy::EverySnapshot || pending_event.is_some() {
+            let should_render =
+                finishing || gate.should_render(Instant::now(), changed || pending_event.is_some());
+            if should_render {
+                write_line(&line)?;
+                if let Some(event) = pending_event {
+                    // Keep throttled events pending until a write succeeds
+                    json_events.mark_emitted(event);
+                }
+            }
         }
         previous_line = Some(line);
         if finishing {
