@@ -17,6 +17,10 @@ dev-fixtures = []
 
 [dependencies]
 clap = { version = "4.6", features = ["derive", "string"] }
+clap_complete = "4"
+ctrlc = "3"
+indicatif = "0.18"
+rayon = "1.11"
 l2-audit = { version = "=0.2.0", path = "../l2-audit" }
 l2-capture = { version = "=0.1.0", path = "../l2-capture" }
 l2-engine = { version = "=0.1.0", path = "../l2-engine" }

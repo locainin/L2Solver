@@ -35,9 +35,9 @@ Exit status:
 Developer:
   l2solver dev --help       Internal diagnostics and fixture tooling";
 
-const EXTRACT_HELP: &str = r"--output must not already exist; otherwise use CAPTURE.export. Standard input requires --output and skips TShark.
+const EXTRACT_HELP: &str = r"The default is CAPTURE.export. Matching owned output is reused; --refresh replaces it atomically. Unrelated destinations are refused. Standard input requires --output and skips TShark.
 
-Profile defaults to normal. Progress defaults to automatic terminal detection. Cached recovery results are reused by default. --refresh recomputes results, --no-cache skips reads and writes, and --strict-cache checks cached content in full.
+Profile defaults to normal. Progress defaults to automatic terminal detection. Cached work is reused. --refresh recomputes results, --no-cache skips reads and writes, and --strict-cache checks cached content in full.
 
 TShark enrichment is optional. If TShark is missing or object export fails, available artifacts are still published. --require-tshark requires successful enrichment. Incomplete native analysis or a required TShark failure returns status 3. Packets outside discovery scope are reported without failing extraction. summary.txt shows native and TShark status separately.
 
@@ -154,8 +154,8 @@ struct CapturePath {
 struct ExportArgs {
     #[arg(value_name = "CAPTURE", allow_hyphen_values = true)]
     capture: PathBuf,
-    /// Create this new directory instead of CAPTURE.export; it must not exist
-    #[arg(short, long, value_name = "NEW_DIRECTORY")]
+    /// Write to DIRECTORY instead of CAPTURE.export; reuse matching owned results
+    #[arg(short, long, value_name = "DIRECTORY")]
     output: Option<PathBuf>,
     /// Return status 3 if `TShark` enrichment is missing, skipped, or incomplete
     #[arg(long)]
@@ -170,7 +170,7 @@ struct RefineArgs {
     #[arg(value_name = "INPUT", allow_hyphen_values = true)]
     input: PathBuf,
     /// Write the refined result to this directory instead of INPUT.refined
-    #[arg(short, long, value_name = "NEW_DIRECTORY")]
+    #[arg(short, long, value_name = "DIRECTORY")]
     output: Option<PathBuf>,
     /// Show planned work without writing a result
     #[arg(long)]

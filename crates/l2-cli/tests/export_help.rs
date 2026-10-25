@@ -23,7 +23,8 @@ fn extract_help_describes_recovery_and_optional_enrichment()
         "TShark objects do not include packet provenance; native provenance is retained in the export reports",
         "CAPTURE.export",
         "--output",
-        "must not already exist",
+        "Matching owned output is reused",
+        "--refresh replaces it atomically",
         "Standard input",
         "Incomplete native analysis",
         "TShark is missing",
@@ -59,6 +60,7 @@ fn extract_help_describes_recovery_and_optional_enrichment()
         text.split_whitespace().count() <= 320,
         "help is too long: {text}"
     );
+    assert!(!text.contains("must not already exist"));
 
     let root = Command::new(env!("CARGO_BIN_EXE_l2solver"))
         .arg("--help")

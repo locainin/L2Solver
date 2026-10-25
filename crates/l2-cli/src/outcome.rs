@@ -7,6 +7,7 @@ pub enum RunOutcome {
     Completed,
     Incomplete,
     Findings,
+    Interrupted,
 }
 
 impl RunOutcome {
@@ -16,6 +17,7 @@ impl RunOutcome {
             Self::Completed => ExitCode::SUCCESS,
             Self::Incomplete => ExitCode::from(3),
             Self::Findings => ExitCode::from(4),
+            Self::Interrupted => ExitCode::from(130),
         }
     }
 }

@@ -10,6 +10,9 @@ use std::{
 const BODY: &[u8] = b"object bytes";
 const FTP_BODY: &[u8] = b"example FTP transfer bytes\r\n";
 
+#[path = "export/repeated.rs"]
+mod repeated;
+
 #[test]
 fn exports_named_artifact() -> Result<(), Box<dyn Error>> {
     let temporary = tempfile::tempdir()?;
@@ -820,7 +823,7 @@ fn tshark_imf_count() -> Result<(), Box<dyn Error>> {
 
 #[cfg(unix)]
 #[test]
-fn tshark_capture_symlink() -> Result<(), Box<dyn Error>> {
+fn rejects_symlinked_capture_before_running_optional_tshark() -> Result<(), Box<dyn Error>> {
     use std::os::unix::fs::symlink;
 
     let temporary = tempfile::tempdir()?;
@@ -836,19 +839,9 @@ fn tshark_capture_symlink() -> Result<(), Box<dyn Error>> {
 
     let output = export_with_tshark(&capture_link, &destination, &executable)?;
 
-    assert_eq!(
-        output.status.code(),
-        Some(0),
-        "{}\n{}",
-        String::from_utf8_lossy(&output.stdout),
-        fs::read_to_string(destination.join("summary.txt"))?
-    );
-    assert_eq!(
-        fs::read(destination.join("000001-tshark-http.bin"))?,
-        b"tshark bytes"
-    );
-    let summary = fs::read_to_string(destination.join("summary.txt"))?;
-    assert!(summary.contains("TShark export: complete"));
+    assert_eq!(output.status.code(), Some(1));
+    assert!(!destination.exists());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("symlink"));
     Ok(())
 }
 

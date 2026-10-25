@@ -5,6 +5,7 @@
 mod baseline;
 mod baseline_model;
 mod bounded_json;
+mod cache_cli;
 mod capture_compare;
 mod capture_tcp;
 mod completion;
@@ -22,11 +23,14 @@ mod output;
 mod presentation;
 mod publish;
 mod record;
+mod recovery_job;
+mod refine;
 mod relationships;
 mod relationships_report;
 mod render;
 mod replay_time;
 mod report;
+mod result_directory;
 mod safe_filename;
 mod source_collection;
 mod stp_render;
@@ -72,7 +76,21 @@ fn run(command: &Command) -> Result<RunOutcome, Box<dyn Error>> {
 fn execute(command: &Command, output: &mut impl Write) -> Result<RunOutcome, Box<dyn Error>> {
     // One dispatcher keeps exit semantics identical across compatibility aliases
     match command {
-        Command::Export(options) => Ok(completion_outcome(export::run(options, output)?)),
+        Command::Export(options) => {
+            recovery_job::run(&options.recovery, "capture extraction", |job| {
+                export::run_with_job(options, output, job)
+            })
+        }
+        Command::Refine(options) => {
+            recovery_job::run(&options.recovery, "file refinement", |job| {
+                refine::run_with_job(options, output, job)
+            })
+        }
+        Command::Cache(command) => cache_cli::run(command, output).map(|()| RunOutcome::Completed),
+        Command::Completions(shell) => {
+            arguments::generate_completions(*shell, output)?;
+            Ok(RunOutcome::Completed)
+        }
         Command::Inspect(path) => inspect_capture(path, output),
         Command::Relationships(path) => Ok(completion_outcome(relationships::run(path, output)?)),
         Command::Json(path) => {
@@ -309,13 +327,31 @@ fn main() -> ExitCode {
         }
         Err(error) => {
             // Preserve failure even when stderr itself is unavailable
-            let _ = writeln!(
-                io::stderr().lock(),
-                "error: {}",
-                error.to_string().escape_debug()
-            );
+            if structured_progress(&command) {
+                let _ = writeln!(
+                    io::stderr().lock(),
+                    "{}",
+                    serde_json::json!({
+                        "type": "error", "message": error.to_string()
+                    })
+                );
+            } else {
+                let _ = writeln!(
+                    io::stderr().lock(),
+                    "error: {}",
+                    error.to_string().escape_debug()
+                );
+            }
             ExitCode::FAILURE
         }
+    }
+}
+
+fn structured_progress(command: &Command) -> bool {
+    match command {
+        Command::Export(options) => options.recovery.progress == arguments::ProgressMode::Json,
+        Command::Refine(options) => options.recovery.progress == arguments::ProgressMode::Json,
+        _ => false,
     }
 }
 

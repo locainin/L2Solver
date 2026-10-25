@@ -6,7 +6,10 @@ mod coverage;
 mod evidence;
 mod limitations;
 mod manifest;
+mod processing;
 mod provenance;
+mod recovery_cache;
+mod session;
 mod summary;
 mod tshark_objects;
 
@@ -64,7 +67,13 @@ use self::{
         write_recovery_status, write_tshark_contents,
     },
 };
-use crate::{arguments::ExportOptions, publish};
+use crate::{
+    arguments::ExportOptions,
+    publish,
+    result_directory::{ResultDirectory, ResultKind},
+};
+use l2_workbench::job::{Counter, Job, Phase, PhaseOutcome, cache::Cache};
+use recovery_cache::RecoveryContext;
 use std::{
     collections::HashSet,
     error::Error,
@@ -80,25 +89,92 @@ use std::{
 ///
 /// # Errors
 /// Returns capture, analysis, storage, or publication failures
-pub fn run(options: &ExportOptions, output: &mut impl Write) -> Result<bool, Box<dyn Error>> {
-    run_with_artifact_limits(options, output, ArtifactLimits::default())
-}
-
-fn run_with_artifact_limits(
+pub fn run_with_job(
     options: &ExportOptions,
     output: &mut impl Write,
-    artifact_limits: ArtifactLimits,
+    job: &Job,
 ) -> Result<bool, Box<dyn Error>> {
+    let artifact_limits = ArtifactLimits::default();
     let destination = destination(options)?;
-    let (count, complete) = publish::create_directory(&destination, |staging| {
-        build_export(staging, options, artifact_limits)
-    })?;
+    let directory = ResultDirectory::inspect(&destination, ResultKind::Extract)?;
+    if options.capture == Path::new("-") {
+        return run_standard_input(options, output, artifact_limits, job, &destination);
+    }
+    let identity = session::identity(options, job)?;
+    if !options.recovery.refresh
+        && let Some(reused) = directory.reuse(
+            &identity,
+            Some(&options.capture),
+            options.recovery.strict_cache,
+        )?
+    {
+        job.increment(Counter::CacheHits, 1)?;
+        if !options.recovery.quiet {
+            writeln!(
+                output,
+                "Reused {} artifacts in {}{}",
+                reused.artifacts.len(),
+                destination.display().to_string().escape_debug(),
+                if reused.complete {
+                    ""
+                } else {
+                    " (partial; summary.txt explains the limits)"
+                }
+            )?;
+        }
+        return Ok(reused.complete);
+    }
+    let cache = (!options.recovery.no_cache)
+        .then(|| Cache::from_environment(options.recovery.cache_max_bytes))
+        .transpose()?;
+    let checkpoint = cache
+        .as_ref()
+        .map(|cache| {
+            crate::recovery_job::CheckpointWriter::start(
+                cache,
+                &identity,
+                job,
+                options.recovery.refresh,
+            )
+        })
+        .transpose()?;
+    job.start(Phase::Preparation, None)?;
+    job.set_current(Phase::Preparation, "input and output policies accepted")?;
+    job.check_cancelled()?;
+    job.finish(Phase::Preparation, PhaseOutcome::Completed)?;
+    let context = RecoveryContext {
+        cache: cache.as_ref(),
+        job: Some(job),
+        options: &options.recovery,
+    };
+    let result = directory.publish(&identity, job, |staging| {
+        let result = build_export(staging, options, artifact_limits, &context)?;
+        session::check_source_unchanged(options, &identity)?;
+        Ok(result)
+    });
+    if let Some(checkpoint) = checkpoint {
+        checkpoint.finish(result.is_ok() && !job.is_cancelled())?;
+    }
+    let (count, complete) = result?;
+    print_completion(output, options, &destination, count, complete)?;
+    Ok(complete)
+}
 
+fn print_completion(
+    output: &mut impl Write,
+    options: &ExportOptions,
+    destination: &Path,
+    count: u64,
+    complete: bool,
+) -> io::Result<()> {
+    if options.recovery.quiet {
+        return Ok(());
+    }
     writeln!(
         output,
         "Exported {count} {} into {}",
         if count == 1 { "artifact" } else { "artifacts" },
-        destination.display()
+        destination.display().to_string().escape_debug()
     )?;
     if !complete {
         writeln!(
@@ -106,15 +182,16 @@ fn run_with_artifact_limits(
             "The export is partial; summary.txt explains what could not be completed"
         )?;
     }
-    Ok(complete)
+    Ok(())
 }
 
 fn build_export(
     staging: &Path,
     options: &ExportOptions,
     limits: ArtifactLimits,
+    context: &RecoveryContext<'_>,
 ) -> Result<(u64, bool), Box<dyn Error>> {
-    let mut collected = collect_export(staging, options, limits)?;
+    let mut collected = collect_export(staging, options, limits, context)?;
     let artifact_coverage = collected.artifacts.coverage();
     let evidence_coverage = collected.evidence.coverage();
     let tshark_complete = tshark_is_complete(&collected.tshark, collected.tshark_error.as_deref());
@@ -145,6 +222,11 @@ fn build_export(
         || !tshark_complete;
     let complete = completion.complete;
     let artifact_count = artifact_coverage.unique_artifacts_retained;
+    if let Some(job) = context.job {
+        job.check_cancelled()?;
+        job.start(Phase::Reports, None)?;
+        job.set_current(Phase::Reports, "writing manifest and source evidence")?;
+    }
     {
         let mut summary = Summary {
             capture: &options.capture,
@@ -174,7 +256,42 @@ fn build_export(
     collected.artifacts.cleanup_index()?;
     validate_stage(staging, &expected_names)?;
     File::open(staging)?.sync_all()?;
+    if let Some(job) = context.job {
+        job.finish(Phase::Reports, PhaseOutcome::Completed)?;
+    }
     Ok((artifact_count, complete))
+}
+
+fn run_standard_input(
+    options: &ExportOptions,
+    output: &mut impl Write,
+    limits: ArtifactLimits,
+    job: &Job,
+    destination: &Path,
+) -> Result<bool, Box<dyn Error>> {
+    let context = RecoveryContext {
+        cache: None,
+        job: Some(job),
+        options: &options.recovery,
+    };
+    job.start(Phase::Preparation, None)?;
+    job.finish(Phase::Preparation, PhaseOutcome::Completed)?;
+    let (count, complete) = publish::create_directory_with_precommit(
+        destination,
+        |staging| {
+            let result = build_export(staging, options, limits, &context)?;
+            job.check_cancelled()?;
+            job.start(Phase::Publication, None)?;
+            Ok(result)
+        },
+        || {
+            job.check_cancelled()?;
+            Ok(())
+        },
+    )?;
+    job.finish(Phase::Publication, PhaseOutcome::Completed)?;
+    print_completion(output, options, destination, count, complete)?;
+    Ok(complete)
 }
 
 fn destination(options: &ExportOptions) -> Result<PathBuf, Box<dyn Error>> {

@@ -12,6 +12,7 @@
 /review.zip.sha256
 /review-*.zip
 /review-*.zip.sha256
+/review-*.manifest
 
 # Public capture bytes and generated reports remain local benchmark data
 /benchmarks/cache/
@@ -47,4 +48,5 @@
 /docs/evidence-review*/
 /docs/profiles/
 /docs/screenshots/
+/docs/reports/*.html
 __pycache__/

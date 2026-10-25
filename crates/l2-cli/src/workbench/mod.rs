@@ -39,10 +39,12 @@ mod visit;
 
 pub use recovery_executor::{
     RecoveryOmission, RecoveryResourceSummary, RecoveryRunSummary, recover_case,
+    recover_case_with_job,
 };
+pub use tshark::tshark_cache_identity;
 pub use tshark::{ExportObjectSet, ObjectExportBudget, ObjectExportStatus, ObjectExportUsage};
 
-/// Export TShark objects while observing the shared cancellation state
+/// Export `TShark` objects while observing the shared cancellation state
 pub fn export_tshark_objects_with_job(
     capture: &Path,
     temporary_parent: &Path,
