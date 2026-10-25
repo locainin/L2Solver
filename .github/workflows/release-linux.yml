@@ -1,0 +1,88 @@
+---
+name: Linux release candidate
+
+"on":
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: linux-release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  linux-x86_64:
+    name: Validate and package Linux x86_64
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    permissions:
+      contents: read
+    env:
+      CARGO_TERM_COLOR: always
+    steps:
+      - name: Check out the requested commit
+        # Pin the checkout implementation to the reviewed v7.0.1 commit
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+
+      - name: Install stable Rust components
+        run: |
+          rustup toolchain install stable --profile minimal \
+            --component clippy --component rustfmt \
+            --target x86_64-unknown-linux-gnu
+          rustup default stable
+
+      - name: Gate 1 of 6 - rustfmt
+        run: cargo fmt --all -- --check
+
+      - name: Gate 2 of 6 - clippy
+        run: >-
+          cargo clippy --workspace --all-targets --all-features --locked --
+          -D warnings
+
+      - name: Gate 3 of 6 - tests
+        run: >-
+          cargo test --workspace --all-targets --all-features --locked
+
+      - name: Gate 4 of 6 - Linux release build
+        run: >-
+          cargo build --locked --release --package l2-cli
+          --target x86_64-unknown-linux-gnu
+
+      - name: Install pinned cargo-deny
+        run: cargo install cargo-deny --locked --version 0.19.0
+
+      - name: Gate 5 of 6 - dependency policy
+        run: |
+          cargo deny --frozen check
+          cargo deny --frozen --manifest-path fuzz/Cargo.toml check
+
+      - name: Install pinned cargo-audit
+        run: cargo install cargo-audit --locked --version 0.22.0
+
+      - name: Gate 6 of 6 - security advisories
+        run: |
+          cargo audit --file Cargo.lock
+          cargo audit --file fuzz/Cargo.lock
+
+      - name: Package build provenance and checksum
+        run: >-
+          python3 -m benchmarks.package_release
+          --binary target/x86_64-unknown-linux-gnu/release/l2solver
+          --lockfile Cargo.lock
+          --output-directory dist
+
+      - name: Upload review artifact
+        # Pin the upload implementation to the reviewed v7.0.0 commit
+        uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f
+        with:
+          name: l2solver-linux-x86_64
+          path: dist/
+          if-no-files-found: error
+          retention-days: 30
+          compression-level: 0
