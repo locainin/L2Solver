@@ -1,0 +1,98 @@
+use std::{error::Error, fmt, io};
+
+/// Errors returned by persistent cache operations
+#[derive(Debug)]
+#[non_exhaustive]
+pub enum CacheError {
+    /// The filesystem rejected a cache operation
+    Io(io::Error),
+    /// `SQLite` rejected a cache operation
+    Database(Box<dyn Error + Send + Sync>),
+    /// Cache metadata could not be encoded or decoded
+    Json(Box<dyn Error + Send + Sync>),
+    /// A cache directory or file was replaced or is not a regular object
+    UnsafePath(&'static str),
+    /// The cache database was created by an incompatible version
+    IncompatibleSchema(u32),
+    /// The cache database belongs to another application
+    IncompatibleDatabase,
+    /// `SQLite` reported that its database file is corrupt
+    CorruptDatabase,
+    /// A cached entry failed its manifest or metadata checks
+    CorruptEntry(String),
+    /// A saved job checkpoint failed its schema or JSON checks
+    CorruptCheckpoint,
+    /// Another process currently holds a conflicting entry lease
+    LockBusy,
+    /// An input used to build a cache identity is invalid
+    InvalidInput(&'static str),
+    /// A source changed while its fingerprint or digest was being calculated
+    SourceChanged,
+    /// A source or cache size cannot be represented by the stored metadata
+    SizeOverflow,
+}
+
+impl fmt::Display for CacheError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Io(error) => write!(formatter, "cache filesystem error: {error}"),
+            Self::Database(error) => write!(formatter, "cache database error: {error}"),
+            Self::Json(error) => write!(formatter, "cache metadata error: {error}"),
+            Self::UnsafePath(message) => write!(formatter, "unsafe cache path: {message}"),
+            Self::IncompatibleSchema(version) => {
+                write!(formatter, "unsupported cache schema version {version}")
+            }
+            Self::IncompatibleDatabase => {
+                formatter.write_str("cache database belongs to another application")
+            }
+            Self::CorruptDatabase => formatter.write_str("cache database is corrupt"),
+            Self::CorruptEntry(message) => write!(formatter, "cached entry is corrupt: {message}"),
+            Self::CorruptCheckpoint => formatter.write_str("saved job checkpoint is corrupt"),
+            Self::LockBusy => formatter.write_str("cache entry is currently in use"),
+            Self::InvalidInput(message) => write!(formatter, "invalid cache input: {message}"),
+            Self::SourceChanged => formatter.write_str("source changed while it was fingerprinted"),
+            Self::SizeOverflow => formatter.write_str("cache size exceeded its supported range"),
+        }
+    }
+}
+
+impl Error for CacheError {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        match self {
+            Self::Io(error) => Some(error),
+            Self::Database(error) | Self::Json(error) => Some(error.as_ref()),
+            _ => None,
+        }
+    }
+}
+
+impl From<io::Error> for CacheError {
+    fn from(error: io::Error) -> Self {
+        Self::Io(error)
+    }
+}
+
+impl From<serde_json::Error> for CacheError {
+    fn from(error: serde_json::Error) -> Self {
+        Self::Json(Box::new(error))
+    }
+}
+
+impl From<rusqlite::Error> for CacheError {
+    fn from(error: rusqlite::Error) -> Self {
+        match &error {
+            rusqlite::Error::SqliteFailure(code, _)
+                if matches!(
+                    code.code,
+                    rusqlite::ErrorCode::DatabaseCorrupt | rusqlite::ErrorCode::NotADatabase
+                ) =>
+            {
+                Self::CorruptDatabase
+            }
+            _ => Self::Database(Box::new(error)),
+        }
+    }
+}
+
+/// Result type for persistent cache operations
+pub type Result<T> = std::result::Result<T, CacheError>;

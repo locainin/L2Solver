@@ -1,0 +1,294 @@
+#[cfg(not(unix))]
+use std::{
+    fs,
+    time::{SystemTime, UNIX_EPOCH},
+};
+use std::{
+    fs::{File, Metadata},
+    io::{Read, Seek, SeekFrom},
+    path::Path,
+};
+
+use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
+
+use crate::hashing::is_sha256_digest;
+
+use super::error::{CacheError, Result};
+
+const SAMPLE_BYTES: u64 = 64 * 1024;
+const WHOLE_FILE_SAMPLE_LIMIT: u64 = SAMPLE_BYTES * 3;
+const READ_BUFFER_BYTES: usize = 64 * 1024;
+
+/// A timestamp with second and nanosecond parts
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[non_exhaustive]
+pub struct FileTimestamp {
+    /// Whole seconds from the Unix epoch
+    pub seconds: i64,
+    /// Additional nanoseconds within the second
+    pub nanoseconds: u32,
+}
+
+/// Fast source identity from file metadata and deterministic content samples
+///
+/// This fingerprint is a cache hint. Its bounded samples do not prove that every source byte
+/// is unchanged; use [`SourceIdentity::sha256_file`] when a strong content identity is needed
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[non_exhaustive]
+pub struct SourceFingerprint {
+    /// Source length in bytes
+    pub size_bytes: u64,
+    /// Unix device number when the platform provides one
+    pub device_id: Option<u64>,
+    /// Filesystem object number when the platform provides one
+    pub file_id: Option<u64>,
+    /// Modification time when the platform provides one
+    pub modified: Option<FileTimestamp>,
+    /// Metadata change time when the platform provides one
+    pub changed: Option<FileTimestamp>,
+    /// SHA-256 of the bounded sample bytes and their offsets
+    pub sample_sha256: String,
+}
+
+/// Source identity used as an input to a stage key
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[non_exhaustive]
+#[serde(tag = "kind", content = "value", rename_all = "snake_case")]
+pub enum SourceIdentity {
+    /// Metadata and bounded content samples, suitable for quick local invalidation
+    Fast(SourceFingerprint),
+    /// Full-file SHA-256, suitable for content identity across moves and renames
+    Sha256(String),
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct MetadataIdentity {
+    size_bytes: u64,
+    device_id: Option<u64>,
+    file_id: Option<u64>,
+    modified: Option<FileTimestamp>,
+    changed: Option<FileTimestamp>,
+}
+
+impl SourceFingerprint {
+    /// Calculates a bounded metadata and sample fingerprint for a regular file
+    ///
+    /// Small files are sampled in full. Larger files are sampled at the beginning, middle,
+    /// and end. The total content read is bounded to 192 KiB
+    ///
+    /// # Errors
+    /// Returns an error for non-regular, symlinked, unreadable, or changing files
+    pub fn fast(path: impl AsRef<Path>) -> Result<Self> {
+        let file = open_source(path.as_ref())?;
+        let before = file.metadata()?;
+        let identity = metadata_identity(&before);
+        let sample_sha256 = sample_digest(file.try_clone()?, identity.size_bytes)?;
+        let after = file.metadata()?;
+        if identity != metadata_identity(&after) {
+            return Err(CacheError::SourceChanged);
+        }
+
+        Ok(Self {
+            size_bytes: identity.size_bytes,
+            device_id: identity.device_id,
+            file_id: identity.file_id,
+            modified: identity.modified,
+            changed: identity.changed,
+            sample_sha256,
+        })
+    }
+
+    /// Returns the bounded size and sample hint without file metadata
+    ///
+    /// The result remains a fast fingerprint and does not provide content identity. It can
+    /// locate a likely moved copy before a caller opts into a full SHA-256 digest
+    #[must_use]
+    pub fn sample_hint(&self) -> Self {
+        Self {
+            size_bytes: self.size_bytes,
+            device_id: None,
+            file_id: None,
+            modified: None,
+            changed: None,
+            sample_sha256: self.sample_sha256.clone(),
+        }
+    }
+}
+
+impl SourceIdentity {
+    /// Validates and stores an existing lowercase SHA-256 digest
+    ///
+    /// # Errors
+    /// Returns an error when the digest is not 64 lowercase hexadecimal characters
+    pub fn from_sha256(digest: impl Into<String>) -> Result<Self> {
+        let digest = digest.into();
+        if !is_sha256_digest(&digest) {
+            return Err(CacheError::InvalidInput(
+                "source SHA-256 must be lowercase hexadecimal",
+            ));
+        }
+        Ok(Self::Sha256(digest))
+    }
+
+    /// Reads a source file once and calculates its full SHA-256 identity
+    ///
+    /// # Errors
+    /// Returns an error for non-regular, symlinked, unreadable, or changing files
+    pub fn sha256_file(path: impl AsRef<Path>) -> Result<Self> {
+        let file = open_source(path.as_ref())?;
+        let before = file.metadata()?;
+        let identity = metadata_identity(&before);
+        let digest = full_digest(file.try_clone()?)?;
+        let after = file.metadata()?;
+        if identity != metadata_identity(&after) {
+            return Err(CacheError::SourceChanged);
+        }
+        Ok(Self::Sha256(digest))
+    }
+
+    pub(super) fn validate(&self) -> Result<()> {
+        let digest = match self {
+            Self::Fast(fingerprint) => &fingerprint.sample_sha256,
+            Self::Sha256(digest) => digest,
+        };
+        if !is_sha256_digest(digest) {
+            return Err(CacheError::InvalidInput(
+                "source identity must contain lowercase SHA-256 hexadecimal",
+            ));
+        }
+        Ok(())
+    }
+}
+
+fn open_source(path: &Path) -> Result<File> {
+    #[cfg(unix)]
+    let file = File::from(
+        rustix::fs::open(
+            path,
+            rustix::fs::OFlags::RDONLY
+                | rustix::fs::OFlags::NOFOLLOW
+                | rustix::fs::OFlags::NONBLOCK
+                | rustix::fs::OFlags::CLOEXEC,
+            rustix::fs::Mode::empty(),
+        )
+        .map_err(std::io::Error::from)?,
+    );
+    #[cfg(not(unix))]
+    let file = {
+        let metadata = fs::symlink_metadata(path)?;
+        if metadata.file_type().is_symlink() {
+            return Err(CacheError::UnsafePath("source file is a symlink"));
+        }
+        File::open(path)?
+    };
+
+    if !file.metadata()?.is_file() {
+        return Err(CacheError::UnsafePath("source is not a regular file"));
+    }
+    Ok(file)
+}
+
+fn sample_digest(mut file: File, size_bytes: u64) -> Result<String> {
+    // Fixed ranges keep large source reads bounded and repeatable
+    let ranges = sample_ranges(size_bytes);
+    let mut hasher = Sha256::new();
+    let mut buffer =
+        vec![0_u8; usize::try_from(SAMPLE_BYTES).map_err(|_| CacheError::SizeOverflow)?];
+    for (offset, length) in ranges {
+        file.seek(SeekFrom::Start(offset))?;
+        let length = usize::try_from(length).map_err(|_| CacheError::SizeOverflow)?;
+        let sample = buffer.get_mut(..length).ok_or(CacheError::SizeOverflow)?;
+        if let Err(error) = file.read_exact(sample) {
+            if error.kind() == std::io::ErrorKind::UnexpectedEof {
+                return Err(CacheError::SourceChanged);
+            }
+            return Err(error.into());
+        }
+        hasher.update(offset.to_be_bytes());
+        hasher.update(
+            u64::try_from(length)
+                .map_err(|_| CacheError::SizeOverflow)?
+                .to_be_bytes(),
+        );
+        hasher.update(buffer.get(..length).ok_or(CacheError::SizeOverflow)?);
+    }
+    Ok(format!("{:x}", hasher.finalize()))
+}
+
+fn sample_ranges(size_bytes: u64) -> Vec<(u64, u64)> {
+    if size_bytes <= WHOLE_FILE_SAMPLE_LIMIT {
+        return vec![(0, size_bytes)];
+    }
+
+    let middle = (size_bytes / 2).saturating_sub(SAMPLE_BYTES / 2);
+    vec![
+        (0, SAMPLE_BYTES),
+        (middle, SAMPLE_BYTES),
+        (size_bytes - SAMPLE_BYTES, SAMPLE_BYTES),
+    ]
+}
+
+fn full_digest(mut file: File) -> Result<String> {
+    let mut hasher = Sha256::new();
+    let mut buffer = vec![0_u8; READ_BUFFER_BYTES].into_boxed_slice();
+    loop {
+        let count = file.read(&mut buffer)?;
+        if count == 0 {
+            break;
+        }
+        hasher.update(buffer.get(..count).ok_or(CacheError::SizeOverflow)?);
+    }
+    Ok(format!("{:x}", hasher.finalize()))
+}
+
+fn metadata_identity(metadata: &Metadata) -> MetadataIdentity {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+
+        MetadataIdentity {
+            size_bytes: metadata.len(),
+            device_id: Some(metadata.dev()),
+            file_id: Some(metadata.ino()),
+            modified: Some(FileTimestamp {
+                seconds: metadata.mtime(),
+                nanoseconds: u32::try_from(metadata.mtime_nsec()).unwrap_or_default(),
+            }),
+            changed: Some(FileTimestamp {
+                seconds: metadata.ctime(),
+                nanoseconds: u32::try_from(metadata.ctime_nsec()).unwrap_or_default(),
+            }),
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        MetadataIdentity {
+            size_bytes: metadata.len(),
+            device_id: None,
+            file_id: None,
+            modified: metadata.modified().ok().and_then(system_timestamp),
+            changed: None,
+        }
+    }
+}
+
+#[cfg(not(unix))]
+fn system_timestamp(time: SystemTime) -> Option<FileTimestamp> {
+    let (seconds, nanoseconds, negative) = match time.duration_since(UNIX_EPOCH) {
+        Ok(duration) => (
+            i64::try_from(duration.as_secs()).ok()?,
+            duration.subsec_nanos(),
+            false,
+        ),
+        Err(error) => (
+            i64::try_from(error.duration().as_secs()).ok()?,
+            error.duration().subsec_nanos(),
+            true,
+        ),
+    };
+    Some(FileTimestamp {
+        seconds: if negative { -seconds } else { seconds },
+        nanoseconds,
+    })
+}
