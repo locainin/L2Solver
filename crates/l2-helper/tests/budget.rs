@@ -1,0 +1,35 @@
+use std::time::Duration;
+
+use l2_helper::{BudgetError, SessionBudget, SessionLimits};
+
+#[test]
+fn session_limits_checked_capture_starts() {
+    assert!(SessionLimits::new(1, 1, Duration::from_secs(1)).is_ok());
+    assert_eq!(
+        SessionLimits::new(0, 1, Duration::from_secs(1)),
+        Err(BudgetError::ZeroFrameLimit)
+    );
+    assert_eq!(
+        SessionLimits::new(1, 0, Duration::from_secs(1)),
+        Err(BudgetError::ZeroByteLimit)
+    );
+    assert_eq!(
+        SessionLimits::new(1, 1, Duration::ZERO),
+        Err(BudgetError::DurationTooShort)
+    );
+}
+
+#[test]
+fn session_budget_accounts_without_overflow() -> Result<(), Box<dyn std::error::Error>> {
+    let limits = SessionLimits::new(2, 4, Duration::from_secs(1))?;
+    let mut budget = SessionBudget::start(limits);
+    budget.reserve(3)?;
+    budget.commit(3)?;
+    assert_eq!(budget.frames(), 1);
+    assert_eq!(budget.bytes(), 3);
+    assert_eq!(budget.reserve(2), Err(BudgetError::FrameWouldExceedBytes));
+    assert_eq!(budget.reserve(1), Ok(()));
+    budget.commit(1)?;
+    assert_eq!(budget.reserve(1), Err(BudgetError::FrameWouldExceedCount));
+    Ok(())
+}

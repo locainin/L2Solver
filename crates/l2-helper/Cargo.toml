@@ -1,0 +1,16 @@
+[package]
+name = "l2-helper"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[lints]
+workspace = true
+
+[dependencies]
+l2-helper-protocol = { version = "=0.1.0", path = "../l2-helper-protocol" }
+nix = { version = "=0.31.3", features = ["fs", "socket", "user"] }
+
+[dev-dependencies]
+rustix = { version = "=1.1.4", features = ["net"] }
+tempfile = "=3.27.0"

@@ -1,0 +1,15 @@
+[package]
+name = "l2-discovery"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[lints]
+workspace = true
+
+[dependencies]
+l2-core = { version = "=0.1.0", path = "../l2-core" }
+serde = { version = "1", features = ["derive"] }
+
+[dev-dependencies]
+serde_json = "1"

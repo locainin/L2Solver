@@ -1,0 +1,16 @@
+//! File-signature observations at format-defined offsets
+
+mod catalogue;
+mod model;
+mod scan;
+
+pub use model::{
+    FileSignatureCatalogue, FileSignatureEvidence, FileSignatureMatch, FileSignatureMatchKind,
+    FileSignatureReport,
+};
+pub use scan::scan_file_signatures;
+
+pub use catalogue::{ELF_MAGIC, MZ_MAGIC};
+
+/// Evidence wording shared by every graph edge from a byte object to a signature match
+pub const FILE_SIGNATURE_RELATION_REASON: &str = "The retained bytes satisfy a supported exact or explicitly masked signature pattern at its declared object-relative offset";

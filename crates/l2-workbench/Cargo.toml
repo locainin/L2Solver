@@ -1,0 +1,32 @@
+[package]
+name = "l2-workbench"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[lints]
+workspace = true
+
+[dependencies]
+l2-audit = { version = "=0.2.0", path = "../l2-audit" }
+l2-capture = { version = "=0.1.0", path = "../l2-capture" }
+l2-core = { version = "=0.1.0", path = "../l2-core" }
+l2-pcap = { version = "=0.1.0", path = "../l2-pcap" }
+l2-discovery = { version = "=0.1.0", path = "../l2-discovery" }
+augmented-rbtree = { version = "=0.3.0", default-features = false, features = ["alloc", "interval-tree"] }
+aes-gcm = { version = "=0.11.1", default-features = false, features = ["aes", "alloc"] }
+scrypt = { version = "=0.12.0", default-features = false }
+serde = { version = "1", features = ["derive"] }
+serde_json = { version = "1", features = ["raw_value"] }
+sha2 = "0.10.9"
+base64 = { version = "0.23", default-features = false, features = ["std"] }
+flate2 = { version = "1.1", default-features = false, features = ["rust_backend"] }
+rusqlite = { version = "0.40.2", features = ["fallible_uint","limits","hooks","blob","backup"] }
+tempfile = "3"
+crc32fast = "1.5"
+png = "=0.18.1"
+der = { version = "=0.8.2", default-features = false, features = ["oid"] }
+# Keep the duplicate-attribute check on the patched linear-time parser
+quick-xml = "0.41"
+rustix = { version = "1", features = ["fs"] }
+zip = { version = "=9.0.5", default-features = false, features = ["deflate-flate2-zlib-rs"] }

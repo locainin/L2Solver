@@ -1,0 +1,3 @@
+# Captures and generated reports are workloads, not mutation-test source inputs
+gitignore = true
+copy_target = false

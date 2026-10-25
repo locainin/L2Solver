@@ -1,0 +1,26 @@
+[workspace]
+members = ["crates/*", "xtask"]
+resolver = "3"
+exclude = ["fuzz"]
+
+[workspace.lints.rust]
+unsafe_code = "forbid"
+unfulfilled_lint_expectations = "deny"
+
+[workspace.lints.clippy]
+pedantic = { level = "deny", priority = -1 }
+nursery = { level = "deny", priority = -1 }
+todo = "deny"
+unimplemented = "deny"
+unreachable = "deny"
+allow_attributes = "deny"
+allow_attributes_without_reason = "deny"
+unwrap_used = "deny"
+expect_used = "deny"
+panic = "deny"
+indexing_slicing = "deny"
+cognitive_complexity = "deny"
+
+[profile.release]
+debug = 1
+strip = false

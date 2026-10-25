@@ -1,0 +1,22 @@
+[package]
+name = "l2-audit"
+version = "0.2.0"
+edition = "2024"
+publish = false
+
+[lints]
+workspace = true
+
+[dependencies]
+l2-canary = { version = "=0.1.0", path = "../l2-canary" }
+l2-capture = { version = "=0.1.0", path = "../l2-capture" }
+l2-core = { version = "=0.1.0", path = "../l2-core" }
+l2-codecs = { version = "=0.1.0", path = "../l2-codecs" }
+l2-discovery = { version = "=0.1.0", path = "../l2-discovery" }
+l2-segmentation = { version = "=0.1.0", path = "../l2-segmentation" }
+serde = { version = "1", features = ["derive"] }
+sha2 = "0.10.9"
+
+[dev-dependencies]
+l2-pcap = { version = "=0.1.0", path = "../l2-pcap" }
+serde_json = "1"

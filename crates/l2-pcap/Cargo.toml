@@ -1,0 +1,14 @@
+[package]
+name = "l2-pcap"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[lib]
+path = "src/lib.rs"
+
+[lints]
+workspace = true
+
+[dependencies]
+l2-capture = { version = "=0.1.0", path = "../l2-capture" }

@@ -1,0 +1,194 @@
+[package]
+name = "l2solver-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2024"
+
+[lints.rust]
+unsafe_code = "forbid"
+
+[lints.clippy]
+# Fuzz crash oracles intentionally panic; production crates deny panic, unwrap, and expect
+pedantic = { level = "deny", priority = -1 }
+nursery = { level = "deny", priority = -1 }
+indexing_slicing = "deny"
+cognitive_complexity = "deny"
+
+[package.metadata]
+cargo-fuzz = true
+
+[package.metadata.cargo-machete]
+# The shared endpoint fixture imports this dependency through an external path module
+ignored = ["crc32fast"]
+
+[dependencies]
+crc32fast = "1.5"
+l2-audit = { path = "../crates/l2-audit", version = "0.2.0" }
+l2-capture = { path = "../crates/l2-capture", version = "0.1.0" }
+libfuzzer-sys = "0.4"
+serde_json = "1"
+l2-core = { path = "../crates/l2-core", version = "0.1.0" }
+l2-codecs = { path = "../crates/l2-codecs", version = "0.1.0" }
+l2-canary = { path = "../crates/l2-canary", version = "0.1.0" }
+l2-cli = { path = "../crates/l2-cli", version = "0.2.0" }
+l2-discovery = { path = "../crates/l2-discovery", version = "0.1.0" }
+l2-workbench = { path = "../crates/l2-workbench", version = "0.1.0" }
+l2-engine = { path = "../crates/l2-engine", version = "0.1.0" }
+l2-helper-protocol = { path = "../crates/l2-helper-protocol", version = "0.1.0" }
+l2-onpath = { path = "../crates/l2-onpath", version = "0.1.0" }
+l2-pcap = { path = "../crates/l2-pcap", version = "0.1.0" }
+l2-segmentation = { path = "../crates/l2-segmentation", version = "0.1.0" }
+wifi-codecs = { path = "../crates/wifi-codecs", version = "0.1.0" }
+wifi-core = { path = "../crates/wifi-core", version = "0.1.0" }
+wifi-discovery = { path = "../crates/wifi-discovery", version = "0.1.0" }
+wifi-radiotap = { path = "../crates/wifi-radiotap", version = "0.1.0" }
+
+[dev-dependencies]
+tempfile = "3"
+
+[[bin]]
+name = "survey"
+path = "fuzz_targets/survey.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "tcp_range"
+path = "fuzz_targets/tcp_range.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "ethernet"
+path = "fuzz_targets/ethernet.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "lldp"
+path = "fuzz_targets/lldp.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "pcap"
+path = "fuzz_targets/pcap.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "stp"
+path = "fuzz_targets/stp.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "encode"
+path = "fuzz_targets/encode.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "engine"
+path = "fuzz_targets/engine.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "segmentation"
+path = "fuzz_targets/segmentation.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "pcapng_roundtrip"
+path = "fuzz_targets/pcapng_roundtrip.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "discovery"
+path = "fuzz_targets/discovery.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "canary"
+path = "fuzz_targets/canary.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "helper_protocol"
+path = "fuzz_targets/helper_protocol.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "wifi_core"
+path = "fuzz_targets/wifi_core.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "wifi_radiotap"
+path = "fuzz_targets/wifi_radiotap.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "wifi_codecs"
+path = "fuzz_targets/wifi_codecs.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "wifi_discovery"
+path = "fuzz_targets/wifi_discovery.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "onpath"
+path = "fuzz_targets/onpath.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "cli_arguments"
+path = "fuzz_targets/cli_arguments.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "workbench"
+path = "fuzz_targets/workbench.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "native_endpoints"
+path = "fuzz_targets/native_endpoints.rs"
+test = false
+doc = false
+bench = false

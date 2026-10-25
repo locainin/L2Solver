@@ -1,0 +1,16 @@
+[package]
+name = "l2-engine"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[lib]
+path = "src/lib.rs"
+
+[lints]
+workspace = true
+
+[dependencies]
+l2-capture = { version = "=0.1.0", path = "../l2-capture" }
+l2-io = { version = "=0.1.0", path = "../l2-io" }
+l2-codecs = { version = "=0.1.0", path = "../l2-codecs" }

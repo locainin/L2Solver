@@ -1,0 +1,15 @@
+[package]
+name = "l2-segmentation"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[lints]
+workspace = true
+
+[dependencies]
+l2-capture = { version = "=0.1.0", path = "../l2-capture" }
+l2-canary = { version = "=0.1.0", path = "../l2-canary" }
+l2-core = { version = "=0.1.0", path = "../l2-core" }
+l2-helper-protocol = { version = "=0.1.0", path = "../l2-helper-protocol" }
+sha2 = "0.10.9"

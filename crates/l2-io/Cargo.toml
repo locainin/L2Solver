@@ -1,0 +1,12 @@
+[package]
+name = "l2-io"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[lints]
+workspace = true
+
+[dependencies]
+l2-capture = { version = "=0.1.0", path = "../l2-capture" }
+l2-pcap = { version = "=0.1.0", path = "../l2-pcap" }
