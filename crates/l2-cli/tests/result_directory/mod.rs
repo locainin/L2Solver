@@ -92,6 +92,52 @@ impl Fixture {
         )?;
         Ok(())
     }
+
+    fn publish_with_gzip_evidence(&self) -> TestResult {
+        let destination = ResultDirectory::inspect(&self.output, ResultKind::Extract)?;
+        destination.publish(&self.identity, &Job::new("extract"), |staging| {
+            self.write_gzip_output(staging, "artifact.bin", b"artifact-content", b"summary")
+        })?;
+        Ok(())
+    }
+
+    fn write_gzip_output(
+        &self,
+        staging: &std::path::Path,
+        artifact_file: &str,
+        artifact_bytes: &[u8],
+        summary: &[u8],
+    ) -> TestResult {
+        let sidecar_file = "evidence.jsonl.gz";
+        if artifact_file != sidecar_file {
+            fs::write(staging.join(artifact_file), artifact_bytes)?;
+        }
+        fs::write(staging.join("summary.txt"), summary)?;
+        fs::write(staging.join(sidecar_file), b"gzip-sidecar")?;
+        let source_sha256 = match &self.identity.source {
+            SourceIdentity::Sha256(digest) => digest,
+            SourceIdentity::Fast(_) => return Err(io::Error::other("fixture needs SHA-256").into()),
+            _ => return Err(io::Error::other("unsupported fixture identity").into()),
+        };
+        let manifest = json!({
+            "schema_version": 1,
+            "export_status": "complete",
+            "full_source_coverage": {
+                "source": {"source_id": format!("sha256:{source_sha256}")}
+            },
+            "evidence": {"file": sidecar_file},
+            "artifacts": [{
+                "file": artifact_file,
+                "byte_length": artifact_bytes.len(),
+                "provenance": []
+            }]
+        });
+        fs::write(
+            staging.join("manifest.json"),
+            serde_json::to_vec(&manifest)?,
+        )?;
+        Ok(())
+    }
 }
 
 #[test]
@@ -607,6 +653,80 @@ fn legacy_extract_requires_explicit_refresh() -> TestResult {
         .reuse(&fixture.identity, Some(&fixture.input), false)
         .expect_err("legacy extraction must not be treated as a cache hit");
     assert!(error.to_string().contains("--refresh"));
+    Ok(())
+}
+
+#[test]
+fn gzip_evidence_sidecar_is_owned_and_reused_from_its_manifest_name() -> TestResult {
+    let fixture = Fixture::new()?;
+    fixture.publish_with_gzip_evidence()?;
+
+    let existing = ResultDirectory::inspect(&fixture.output, ResultKind::Extract)?;
+    let reused = existing
+        .reuse(&fixture.identity, Some(&fixture.input), true)?
+        .ok_or("a result with its declared gzip sidecar should be reusable")?;
+
+    assert!(reused.complete);
+    assert_eq!(reused.artifacts.len(), 1);
+    assert_eq!(reused.artifacts[0].file, "artifact.bin");
+    Ok(())
+}
+
+#[test]
+fn legacy_evidence_sidecar_can_be_refreshed_to_the_declared_gzip_sidecar() -> TestResult {
+    let fixture = Fixture::new()?;
+    fs::create_dir(&fixture.output)?;
+    fixture.write_output(&fixture.output, "complete", b"legacy-artifact")?;
+
+    let legacy = ResultDirectory::inspect(&fixture.output, ResultKind::Extract)?;
+    assert!(
+        legacy
+            .reuse(&fixture.identity, Some(&fixture.input), false)
+            .is_err()
+    );
+
+    legacy.publish(&fixture.identity, &Job::new("refresh"), |staging| {
+        fixture.write_gzip_output(
+            staging,
+            "artifact.bin",
+            b"refreshed-artifact",
+            b"refreshed summary",
+        )
+    })?;
+
+    let refreshed = ResultDirectory::inspect(&fixture.output, ResultKind::Extract)?;
+    let reused = refreshed
+        .reuse(&fixture.identity, Some(&fixture.input), true)?
+        .ok_or("the refreshed gzip-sidecar result should be reusable")?;
+    assert!(reused.complete);
+    assert!(fixture.output.join("evidence.jsonl.gz").is_file());
+    assert!(!fixture.output.join("evidence.jsonl").exists());
+    Ok(())
+}
+
+#[test]
+fn undeclared_legacy_evidence_sidecar_is_rejected_beside_a_gzip_sidecar() -> TestResult {
+    let fixture = Fixture::new()?;
+    fixture.publish_with_gzip_evidence()?;
+    fs::write(
+        fixture.output.join("evidence.jsonl"),
+        b"undeclared legacy sidecar",
+    )?;
+
+    assert!(ResultDirectory::inspect(&fixture.output, ResultKind::Extract).is_err());
+    Ok(())
+}
+
+#[test]
+fn gzip_evidence_sidecar_cannot_be_declared_as_an_artifact() -> TestResult {
+    let fixture = Fixture::new()?;
+    let destination = ResultDirectory::inspect(&fixture.output, ResultKind::Extract)?;
+    let result = destination.publish(&fixture.identity, &Job::new("invalid sidecar"), |staging| {
+        fixture.write_gzip_output(staging, "evidence.jsonl.gz", b"gzip-sidecar", b"summary")
+    });
+
+    assert!(result.is_err());
+    assert!(!fixture.output.exists());
     Ok(())
 }
 

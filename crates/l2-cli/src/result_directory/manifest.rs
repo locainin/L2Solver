@@ -15,6 +15,7 @@ use super::stamp::OutputFileStamp;
 const MANIFEST_FILE: &str = "manifest.json";
 const SUMMARY_FILE: &str = "summary.txt";
 const EVIDENCE_FILE: &str = "evidence.jsonl";
+const GZIP_EVIDENCE_FILE: &str = "evidence.jsonl.gz";
 const LIMITATIONS_FILE: &str = "limitations.txt";
 const MAX_DIRECTORY_ENTRIES: usize = 100_000;
 const MAX_MANIFEST_BYTES: u64 = 512 * 1024 * 1024;
@@ -51,6 +52,8 @@ pub(super) struct OwnedManifest {
     pub complete: bool,
     /// Safe flat output artifacts declared by the manifest
     pub artifacts: Vec<ManifestArtifact>,
+    /// Sidecar selected by the extract manifest, or absent for refinement results
+    pub evidence_file: Option<String>,
     /// Strong source SHA-256 values recorded by the generating workflow
     pub source_sha256s: Vec<String>,
     /// Strong identity for the complete ordered source set
@@ -103,6 +106,8 @@ struct RawManifest {
     #[serde(default)]
     complete: Option<bool>,
     #[serde(default)]
+    evidence: Option<RawEvidence>,
+    #[serde(default)]
     full_source_coverage: Option<RawFullSourceCoverage>,
     #[serde(default)]
     #[serde(deserialize_with = "bounded::deserialize_optional_sources")]
@@ -112,6 +117,12 @@ struct RawManifest {
     artifacts: Vec<ManifestArtifact>,
     #[serde(default)]
     l2solver_result: Option<ResultReceipt>,
+}
+
+#[derive(Deserialize)]
+struct RawEvidence {
+    #[serde(deserialize_with = "bounded::deserialize_file_name")]
+    file: String,
 }
 
 #[derive(Deserialize)]
@@ -190,6 +201,7 @@ fn inspect_prepared(
     let (complete, source_sha256s, source_identity_sha256) = manifest_identity_facts(&raw, kind)?;
     let manifest = OwnedManifest {
         complete,
+        evidence_file: evidence_file(&raw, kind)?,
         artifacts: validate_artifacts(raw.artifacts)?,
         source_sha256s,
         source_identity_sha256,
@@ -233,6 +245,7 @@ pub(super) fn parse_staged_manifest(
     let (complete, source_sha256s, source_identity_sha256) = manifest_identity_facts(&raw, kind)?;
     let manifest = OwnedManifest {
         complete,
+        evidence_file: evidence_file(&raw, kind)?,
         artifacts: validate_artifacts(raw.artifacts)?,
         source_sha256s,
         source_identity_sha256,
@@ -245,6 +258,7 @@ pub(super) fn validate_staged_receipt(path: &Path, kind: ResultKind) -> Result<(
     let (complete, source_sha256s, source_identity_sha256) = manifest_identity_facts(&raw, kind)?;
     let manifest = OwnedManifest {
         complete,
+        evidence_file: evidence_file(&raw, kind)?,
         artifacts: validate_artifacts(raw.artifacts)?,
         source_sha256s,
         source_identity_sha256,
@@ -474,7 +488,11 @@ fn validate_artifacts(
         if !is_safe_flat_file_name(&artifact.file)
             || matches!(
                 artifact.file.as_str(),
-                MANIFEST_FILE | SUMMARY_FILE | EVIDENCE_FILE | LIMITATIONS_FILE
+                MANIFEST_FILE
+                    | SUMMARY_FILE
+                    | EVIDENCE_FILE
+                    | GZIP_EVIDENCE_FILE
+                    | LIMITATIONS_FILE
             )
             || !names.insert(artifact.file.clone())
         {
@@ -493,6 +511,29 @@ fn validate_artifacts(
         }
     }
     Ok(artifacts)
+}
+
+fn evidence_file(raw: &RawManifest, kind: ResultKind) -> Result<Option<String>, Box<dyn Error>> {
+    if kind == ResultKind::Refine {
+        if raw.evidence.is_some() {
+            return Err(
+                invalid_result("refine manifest declares an extraction evidence sidecar").into(),
+            );
+        }
+        return Ok(None);
+    }
+
+    let file = raw
+        .evidence
+        .as_ref()
+        .map(|evidence| evidence.file.as_str())
+        .unwrap_or(EVIDENCE_FILE);
+    if !matches!(file, EVIDENCE_FILE | GZIP_EVIDENCE_FILE) {
+        return Err(
+            invalid_result("extract manifest declares an unsupported evidence sidecar").into(),
+        );
+    }
+    Ok(Some(file.to_owned()))
 }
 
 fn validate_receipt(
@@ -806,7 +847,9 @@ fn validate_staged_entries(
 fn expected_names(kind: ResultKind, manifest: &OwnedManifest) -> BTreeSet<&str> {
     let mut expected = BTreeSet::from([MANIFEST_FILE, SUMMARY_FILE]);
     if kind == ResultKind::Extract {
-        expected.insert(EVIDENCE_FILE);
+        if let Some(file) = manifest.evidence_file.as_deref() {
+            expected.insert(file);
+        }
     }
     expected.insert(LIMITATIONS_FILE);
     expected.extend(
