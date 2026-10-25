@@ -768,3 +768,54 @@ fn assert_aggregate_origin_totals(resources: &serde_json::Value) {
         Some(&144.into())
     );
 }
+
+#[test]
+fn merges_deserialized_recovery_coverage_and_budget_ranges() -> Result<(), Box<dyn Error>> {
+    let mut first_value = serde_json::to_value(RecoveryCoverage::default())?;
+    first_value["flow_cases"] = 1.into();
+    first_value["candidates"] = 3.into();
+    first_value["resources"]["recovery_cases"] = 1.into();
+    first_value["resources"]["input_bytes_per_item_by_case"] =
+        serde_json::json!({"minimum": 128, "maximum": 256});
+    first_value["resources"]["work_bytes_charged_total"] = 10.into();
+
+    let mut second_value = serde_json::to_value(RecoveryCoverage::default())?;
+    second_value["cohort_cases"] = 1.into();
+    second_value["candidates"] = 4.into();
+    second_value["resources"]["recovery_cases"] = 1.into();
+    second_value["resources"]["input_bytes_per_item_by_case"] =
+        serde_json::json!({"minimum": 64, "maximum": 512});
+    second_value["resources"]["work_bytes_charged_total"] = 20.into();
+
+    let mut first: RecoveryCoverage = serde_json::from_value(first_value)?;
+    let second: RecoveryCoverage = serde_json::from_value(second_value)?;
+
+    first.merge(&second)?;
+
+    assert_eq!((first.flow_cases, first.cohort_cases), (1, 1));
+    assert_eq!(first.candidates, 7);
+    assert_eq!(first.resources.recovery_cases, 2);
+    assert_eq!(first.resources.work_bytes_charged_total, 30);
+    assert_eq!(
+        serde_json::to_value(first)?["resources"]["input_bytes_per_item_by_case"],
+        serde_json::json!({"minimum": 64, "maximum": 512})
+    );
+    Ok(())
+}
+
+#[test]
+fn coverage_merge_overflow_keeps_existing_aggregate_unchanged() -> Result<(), Box<dyn Error>> {
+    let mut first_value = serde_json::to_value(RecoveryCoverage::default())?;
+    first_value["flow_cases"] = 7.into();
+    first_value["candidates"] = u64::MAX.into();
+    let mut second_value = serde_json::to_value(RecoveryCoverage::default())?;
+    second_value["flow_cases"] = 1.into();
+    second_value["candidates"] = 1.into();
+    let mut first: RecoveryCoverage = serde_json::from_value(first_value)?;
+    let second: RecoveryCoverage = serde_json::from_value(second_value)?;
+    let before = serde_json::to_value(first)?;
+
+    assert!(first.merge(&second).is_err());
+    assert_eq!(serde_json::to_value(first)?, before);
+    Ok(())
+}

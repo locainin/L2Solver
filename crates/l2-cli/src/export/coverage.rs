@@ -7,8 +7,16 @@ use super::{
     tshark_objects,
 };
 use crate::workbench;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use std::{error::Error, io};
+
+macro_rules! merge_coverage_counts {
+    ($target:ident, $source:ident; $($field:ident),+ $(,)?) => {
+        $(
+            $target.$field = coverage_add($target.$field, $source.$field)?;
+        )+
+    };
+}
 
 pub(super) struct ExportCompletion {
     pub(super) complete: bool,
@@ -33,7 +41,8 @@ pub(super) struct DiscoveryCoverage {
     pub(super) evidence: EvidenceCoverage,
 }
 
-#[derive(Clone, Copy, Debug, Default, Serialize)]
+#[derive(Clone, Copy, Debug, Default, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 pub(super) struct RecoveryCoverage {
     pub(super) flow_cases: u64,
     pub(super) cohort_cases: u64,
@@ -56,6 +65,34 @@ pub(super) struct RecoveryCoverage {
 }
 
 impl RecoveryCoverage {
+    pub(super) fn merge(&mut self, other: &Self) -> Result<(), Box<dyn Error>> {
+        let mut merged = *self;
+        merge_coverage_counts!(
+            merged,
+            other;
+            flow_cases,
+            cohort_cases,
+            flow_cases_with_incomplete_case_evidence_collection,
+            cohort_cases_with_incomplete_case_evidence_collection,
+            flow_cases_with_incomplete_discovery_input_coverage,
+            cohort_cases_with_incomplete_discovery_input_coverage,
+            flow_cases_with_non_exhaustive_search,
+            cohort_cases_with_non_exhaustive_search,
+            flow_cases_with_incomplete_report_details,
+            cohort_cases_with_incomplete_report_details,
+            omitted_framing_input_runs,
+            omitted_record_input_frames,
+            candidates,
+            complete_negative_transform_searches,
+            validated_artifacts,
+            omissions,
+            cycle_skips,
+        );
+        merged.resources.merge(&other.resources)?;
+        *self = merged;
+        Ok(())
+    }
+
     pub(super) fn record(
         &mut self,
         outcome: &workbench::RecoveryRunSummary,
@@ -162,7 +199,8 @@ pub(super) enum RecoveryCaseKind {
 }
 
 /// Exact resource budgets and work totals summed across analyzed Cases
-#[derive(Clone, Copy, Debug, Default, Serialize)]
+#[derive(Clone, Copy, Debug, Default, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 pub(super) struct RecoveryResourceCoverage {
     pub(super) recovery_cases: u64,
     pub(super) input_bytes_per_item_by_case: PerCaseBudgetRange,
@@ -200,13 +238,120 @@ pub(super) struct RecoveryResourceCoverage {
     pub(super) depth_limit_per_case: PerCaseBudgetRange,
 }
 
-#[derive(Clone, Copy, Debug, Default, Serialize)]
+impl RecoveryResourceCoverage {
+    pub(super) fn has_single_case_ranges(&self) -> bool {
+        self.recovery_cases == 1
+            && [
+                &self.input_bytes_per_item_by_case,
+                &self.output_bytes_per_candidate_by_case,
+                &self.work_bytes_per_case,
+                &self.case_index_work_units_per_case,
+                &self.record_phase_work_per_case,
+                &self.candidate_task_identity_bytes_per_case,
+                &self.transform_proposal_identity_bytes_per_case,
+                &self.transform_proposal_associations_per_case,
+                &self.parent_links_per_case,
+                &self.lineage_work_per_case,
+                &self.context_aliases_per_case,
+                &self.pending_origin_links_per_case,
+                &self.depth_limit_per_case,
+            ]
+            .into_iter()
+            .all(PerCaseBudgetRange::is_single_case)
+    }
+
+    fn merge(&mut self, other: &Self) -> Result<(), Box<dyn Error>> {
+        let mut merged = *self;
+        merge_coverage_counts!(
+            merged,
+            other;
+            recovery_cases,
+            work_bytes_charged_total,
+            work_bytes_remaining_total,
+            case_index_work_units_charged_total,
+            case_index_work_units_remaining_total,
+            record_phase_work_charged_total,
+            record_phase_work_remaining_total,
+            candidate_task_identity_bytes_charged_total,
+            candidate_task_identity_bytes_remaining_total,
+            transform_proposal_identity_bytes_charged_total,
+            transform_proposal_identity_bytes_remaining_total,
+            transform_proposal_associations_charged_total,
+            transform_proposal_associations_remaining_total,
+            parent_links_retained_total,
+            parent_links_remaining_total,
+            lineage_work_charged_total,
+            lineage_work_remaining_total,
+            context_aliases_retained_total,
+            context_aliases_remaining_total,
+            pending_origin_links_retained_total,
+            pending_origin_links_remaining_total,
+        );
+        merged
+            .input_bytes_per_item_by_case
+            .merge(&other.input_bytes_per_item_by_case);
+        merged
+            .output_bytes_per_candidate_by_case
+            .merge(&other.output_bytes_per_candidate_by_case);
+        merged.work_bytes_per_case.merge(&other.work_bytes_per_case);
+        merged
+            .case_index_work_units_per_case
+            .merge(&other.case_index_work_units_per_case);
+        merged
+            .record_phase_work_per_case
+            .merge(&other.record_phase_work_per_case);
+        merged
+            .candidate_task_identity_bytes_per_case
+            .merge(&other.candidate_task_identity_bytes_per_case);
+        merged
+            .transform_proposal_identity_bytes_per_case
+            .merge(&other.transform_proposal_identity_bytes_per_case);
+        merged
+            .transform_proposal_associations_per_case
+            .merge(&other.transform_proposal_associations_per_case);
+        merged
+            .parent_links_per_case
+            .merge(&other.parent_links_per_case);
+        merged
+            .lineage_work_per_case
+            .merge(&other.lineage_work_per_case);
+        merged
+            .context_aliases_per_case
+            .merge(&other.context_aliases_per_case);
+        merged
+            .pending_origin_links_per_case
+            .merge(&other.pending_origin_links_per_case);
+        merged
+            .depth_limit_per_case
+            .merge(&other.depth_limit_per_case);
+        *self = merged;
+        Ok(())
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 pub(super) struct PerCaseBudgetRange {
     pub(super) minimum: Option<u64>,
     pub(super) maximum: Option<u64>,
 }
 
 impl PerCaseBudgetRange {
+    const fn is_single_case(&self) -> bool {
+        matches!((self.minimum, self.maximum), (Some(minimum), Some(maximum)) if minimum <= maximum)
+    }
+
+    fn merge(&mut self, other: &Self) {
+        self.minimum = match (self.minimum, other.minimum) {
+            (Some(left), Some(right)) => Some(left.min(right)),
+            (left, right) => left.or(right),
+        };
+        self.maximum = match (self.maximum, other.maximum) {
+            (Some(left), Some(right)) => Some(left.max(right)),
+            (left, right) => left.or(right),
+        };
+    }
+
     fn record(&mut self, value: u64) {
         self.minimum = Some(self.minimum.map_or(value, |current| current.min(value)));
         self.maximum = Some(self.maximum.map_or(value, |current| current.max(value)));

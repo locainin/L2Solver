@@ -2,6 +2,7 @@ use super::WorkbenchCommand;
 use clap::{Args, Subcommand, ValueEnum};
 use l2_audit::{AssessmentProfile, SourceLabelMap, SourceLabelMapError};
 use l2_capture::InterfaceId;
+use serde::{Deserialize, Serialize};
 use std::{path::PathBuf, time::Duration};
 
 pub use l2_audit::MAX_SOURCE_LABEL_BYTES;
@@ -238,7 +239,8 @@ pub struct ExportOptions {
 }
 
 /// Recovery search effort, ordered from quickest to most thorough
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, ValueEnum)]
+#[derive(Clone, Copy, Debug, Default, Deserialize, PartialEq, Eq, Serialize, ValueEnum)]
+#[serde(rename_all = "snake_case")]
 pub enum RecoveryProfile {
     Fast,
     #[default]

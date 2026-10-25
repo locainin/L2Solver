@@ -163,3 +163,12 @@ fn completion_shell_names_are_typed() -> Result<(), Box<dyn std::error::Error>> 
     }
     Ok(())
 }
+
+#[test]
+fn recovery_profiles_use_stable_snake_case_serialization() -> Result<(), Box<dyn std::error::Error>>
+{
+    assert_eq!(serde_json::to_value(RecoveryProfile::Fast)?, "fast");
+    assert_eq!(serde_json::to_value(RecoveryProfile::Normal)?, "normal");
+    assert_eq!(serde_json::to_value(RecoveryProfile::Deep)?, "deep");
+    Ok(())
+}
