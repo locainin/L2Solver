@@ -478,7 +478,7 @@ fn open_cached_winner(
 ) -> Result<IndexedSource> {
     let alias_entry = work.alias_lease.commit(
         StageStatus::Complete,
-        alias_metadata_value(&work.fingerprint, receipt)?,
+        alias_metadata_value(&work.fingerprint, &receipt)?,
     )?;
     drop(alias_entry);
     let indexed = indexed_from_cache(entry, receipt)?;
@@ -499,7 +499,7 @@ fn commit_content_index(
     let entry = lease.commit(StageStatus::Complete, json!({"receipt": receipt}))?;
     let alias_entry = work.alias_lease.commit(
         StageStatus::Complete,
-        alias_metadata_value(&work.fingerprint, &receipt)?,
+        alias_metadata_value(&work.fingerprint, receipt)?,
     )?;
     drop(alias_entry);
     let receipt = receipt_from_index_entry(&entry, &receipt.source_id)?;
