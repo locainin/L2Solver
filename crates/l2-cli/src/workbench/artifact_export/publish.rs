@@ -16,22 +16,30 @@ pub fn publish_artifact_directory(
     write_companion_files: impl FnOnce(&Path) -> Result<(), Box<dyn Error>>,
 ) -> Result<(), Box<dyn Error>> {
     publish::create_directory(directory, |staging| {
-        for artifact in artifacts {
-            validate_flat_file_name(artifact.file_name())?;
-            let mut file = File::options()
-                .write(true)
-                .create_new(true)
-                .open(staging.join(artifact.file_name()))?;
-            file.write_all(artifact.bytes())?;
-            file.sync_all()?;
-        }
-
+        write_artifacts_into(staging, artifacts)?;
         write_companion_files(staging)?;
 
         // Flush staged entries before the publisher makes the directory visible
         File::open(staging)?.sync_all()?;
         Ok(())
     })?;
+    Ok(())
+}
+
+/// Write selected immutable artifact files into a caller-managed staging directory
+pub fn write_artifacts_into(
+    staging: &Path,
+    artifacts: &[SelectedArtifact<'_>],
+) -> Result<(), Box<dyn Error>> {
+    for artifact in artifacts {
+        validate_flat_file_name(artifact.file_name())?;
+        let mut file = File::options()
+            .write(true)
+            .create_new(true)
+            .open(staging.join(artifact.file_name()))?;
+        file.write_all(artifact.bytes())?;
+        file.sync_all()?;
+    }
     Ok(())
 }
 

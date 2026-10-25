@@ -1,6 +1,6 @@
 use core::fmt;
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 /// Default maximum compressed ZIP artifact size
 pub const MAX_ZIP_ARCHIVE_BYTES: usize = 64 * 1024 * 1024;
@@ -41,7 +41,7 @@ impl Default for ZipArtifactLimits {
 }
 
 /// Why a ZIP entry was recorded without expanded bytes
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ZipArtifactOmissionReason {
     /// The entry uses encryption and no decryption key was supplied
@@ -138,7 +138,7 @@ pub struct ZipArtifactReport {
 }
 
 /// Why ZIP member bytes failed validation
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ZipEntryDataFailure {
     /// The local header or member data could not be read

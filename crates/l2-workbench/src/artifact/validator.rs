@@ -9,7 +9,7 @@ use super::{
     scan_file_signatures,
     zip::{
         ZipArtifactError, ZipArtifactLimits, ZipArtifactOmissionReason, ZipArtifactReport,
-        inspect_zip_with_limits,
+        inspect_zip_at_depth_with_operation_budget, inspect_zip_with_limits,
     },
 };
 
@@ -222,6 +222,27 @@ impl ArtifactValidator {
     /// ```
     #[must_use]
     pub fn validate<'a>(&self, bytes: &'a [u8]) -> ArtifactValidationOutcome<'a> {
+        self.validate_internal(bytes, None)
+    }
+
+    /// Select a validator and consume a caller-shared ZIP expansion budget
+    ///
+    /// The ZIP parser deducts each member's declared expanded size before extraction.
+    /// A zero budget therefore validates the archive directory without expanding members
+    #[must_use]
+    pub fn validate_with_zip_budget<'a>(
+        &self,
+        bytes: &'a [u8],
+        zip_budget_remaining: &mut usize,
+    ) -> ArtifactValidationOutcome<'a> {
+        self.validate_internal(bytes, Some(zip_budget_remaining))
+    }
+
+    fn validate_internal<'a>(
+        &self,
+        bytes: &'a [u8],
+        mut zip_budget_remaining: Option<&mut usize>,
+    ) -> ArtifactValidationOutcome<'a> {
         let input_range = complete_range(bytes);
         if bytes.len() > self.policy.max_input_bytes {
             return omitted_input(None, input_range, bytes.len(), self.policy.max_input_bytes);
@@ -241,7 +262,15 @@ impl ArtifactValidator {
         let mut first_rejection = None;
 
         for format in candidates.into_iter().flatten() {
-            match self.validate_as(format, bytes) {
+            let outcome = if format == ArtifactValidationFormat::Zip {
+                zip_budget_remaining.as_deref_mut().map_or_else(
+                    || self.validate_as_with_zip_budget(format, bytes, None),
+                    |remaining| self.validate_as_with_zip_budget(format, bytes, Some(remaining)),
+                )
+            } else {
+                self.validate_as_with_zip_budget(format, bytes, None)
+            };
+            match outcome {
                 outcome @ ArtifactValidationOutcome::Validated { .. } => return outcome,
                 outcome @ ArtifactValidationOutcome::BoundaryUnproven { .. } => {
                     if first_unproven.is_none() {
@@ -279,6 +308,15 @@ impl ArtifactValidator {
         format: ArtifactValidationFormat,
         bytes: &'a [u8],
     ) -> ArtifactValidationOutcome<'a> {
+        self.validate_as_with_zip_budget(format, bytes, None)
+    }
+
+    fn validate_as_with_zip_budget<'a>(
+        &self,
+        format: ArtifactValidationFormat,
+        bytes: &'a [u8],
+        zip_budget_remaining: Option<&mut usize>,
+    ) -> ArtifactValidationOutcome<'a> {
         let input_range = complete_range(bytes);
         if bytes.len() > self.policy.max_input_bytes {
             return omitted_input(
@@ -306,7 +344,18 @@ impl ArtifactValidator {
                 Err(error) => classify_png_error(format, input_range, error),
             },
             ArtifactValidationFormat::Zip => {
-                match inspect_zip_with_limits(bytes, self.policy.zip_limits) {
+                let result = zip_budget_remaining.map_or_else(
+                    || inspect_zip_with_limits(bytes, self.policy.zip_limits),
+                    |remaining| {
+                        inspect_zip_at_depth_with_operation_budget(
+                            bytes,
+                            self.policy.zip_limits,
+                            0,
+                            remaining,
+                        )
+                    },
+                );
+                match result {
                     Ok(report) => zip_result(format, input_range, self.policy.zip_limits, report),
                     Err(error) => classify_zip_error(format, input_range, error),
                 }

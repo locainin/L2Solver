@@ -1,0 +1,327 @@
+use std::error::Error;
+
+use l2_workbench::artifact::{
+    AnalysisFormat, AnalysisStatus, AnalyzerLimits, ArtifactAnalysisOptions, ArtifactOrigin,
+    ArtifactValidationFormat, ArtifactValidationState, ArtifactValidator, RecoveryMode,
+    analyze_artifacts, analyze_artifacts_with_source_sha256,
+    zip::{ZipArtifactLimits, inspect_zip_with_limits},
+};
+
+use super::{image_support::structural_png, zip_support};
+
+#[test]
+fn standalone_png_keeps_the_same_structural_boundary_as_capture_bytes() -> Result<(), Box<dyn Error>>
+{
+    let png = structural_png(&[])?;
+    let standalone = ArtifactValidator::default().validate(&png);
+    let report = analyze_artifacts(&png, ArtifactAnalysisOptions::default())?;
+    let artifact = report
+        .artifacts
+        .first()
+        .ok_or("source artifact is missing")?;
+
+    assert!(matches!(
+        standalone,
+        l2_workbench::artifact::ArtifactValidationOutcome::Validated {
+            format: ArtifactValidationFormat::Png,
+            range,
+            ..
+        } if range.length == png.len()
+    ));
+    assert_eq!(
+        artifact.validation.state,
+        ArtifactValidationState::Validated
+    );
+    assert_eq!(artifact.validation.format, Some(AnalysisFormat::Png));
+    assert_eq!(artifact.validation.structure_count, 2);
+    assert_eq!(artifact.bytes, png);
+    Ok(())
+}
+
+#[test]
+fn standalone_zip_uses_the_existing_zip_parser_and_retains_its_member() -> Result<(), Box<dyn Error>>
+{
+    let content = b"member payload";
+    let archive =
+        zip_support::build_zip(&[zip_support::FixtureEntry::stored(b"member.bin", content)])?;
+    let structural = inspect_zip_with_limits(&archive, ZipArtifactLimits::default())?;
+    let report = analyze_artifacts(&archive, ArtifactAnalysisOptions::default())?;
+
+    assert_eq!(
+        report.artifacts[0].validation.format,
+        Some(AnalysisFormat::Zip)
+    );
+    assert_eq!(
+        report.artifacts[0].validation.structure_count,
+        structural.entry_count
+    );
+    assert!(report.artifacts.iter().any(|artifact| {
+        artifact.bytes == content
+            && artifact.origins.iter().any(|origin| {
+                matches!(origin, ArtifactOrigin::ArchiveMember { entry_index: 0, .. })
+            })
+    }));
+    Ok(())
+}
+
+#[test]
+fn encoded_input_can_yield_a_valid_object_inside_unrelated_bytes() -> Result<(), Box<dyn Error>> {
+    let png = structural_png(&[])?;
+    let decoded = [b"unrelated prefix".as_slice(), &png, b"unrelated suffix"].concat();
+    let encoded = base64::Engine::encode(&base64::engine::general_purpose::STANDARD, &decoded);
+    let report = analyze_artifacts(encoded.as_bytes(), ArtifactAnalysisOptions::default())?;
+
+    let transformed = report
+        .artifacts
+        .iter()
+        .position(|artifact| artifact.bytes == decoded)
+        .ok_or("decoded bytes were not retained")?;
+    let carved = report
+        .artifacts
+        .iter()
+        .find(|artifact| artifact.bytes == png)
+        .ok_or("interior PNG was not carved")?;
+    assert!(
+        report.artifacts[transformed]
+            .origins
+            .iter()
+            .any(|origin| matches!(origin, ArtifactOrigin::Transformation { .. }))
+    );
+    assert!(carved.origins.iter().any(|origin| matches!(
+        origin,
+        ArtifactOrigin::EmbeddedObject { range, .. } if range.length == png.len()
+    )));
+    Ok(())
+}
+
+#[test]
+fn magic_bytes_alone_do_not_promote_an_invalid_object() -> Result<(), Box<dyn Error>> {
+    let invalid = b"prefix\x89PNG\r\n\x1a\ntruncated";
+    let report = analyze_artifacts(invalid, ArtifactAnalysisOptions::default())?;
+
+    assert_eq!(report.artifacts.len(), 1);
+    assert_ne!(
+        report.artifacts[0].validation.state,
+        ArtifactValidationState::Validated
+    );
+    assert!(
+        report.artifacts[0]
+            .origins
+            .iter()
+            .any(|origin| matches!(origin, ArtifactOrigin::Source))
+    );
+    Ok(())
+}
+
+#[test]
+fn nested_archives_are_expanded_with_parent_lineage() -> Result<(), Box<dyn Error>> {
+    let deepest = b"nested member bytes";
+    let inner = zip_support::build_zip(&[zip_support::FixtureEntry::stored(b"deep.bin", deepest)])?;
+    let outer =
+        zip_support::build_zip(&[zip_support::FixtureEntry::stored(b"nested.zip", &inner)])?;
+    let report = analyze_artifacts(&outer, ArtifactAnalysisOptions::default())?;
+    let member = report
+        .artifacts
+        .iter()
+        .find(|artifact| artifact.bytes == inner)
+        .ok_or("inner archive was not retained")?;
+    let nested_member = report
+        .artifacts
+        .iter()
+        .find(|artifact| artifact.bytes == deepest)
+        .ok_or("nested archive member was not retained")?;
+
+    assert!(member.origins.iter().any(|origin| matches!(
+        origin,
+        ArtifactOrigin::ArchiveMember {
+            parent_index: 0,
+            ..
+        }
+    )));
+    assert!(nested_member.origins.iter().any(|origin| matches!(
+        origin,
+        ArtifactOrigin::ArchiveMember { parent_index, .. }
+            if *parent_index == member.index
+    )));
+    Ok(())
+}
+
+#[test]
+fn identical_runs_have_the_same_logical_result() -> Result<(), Box<dyn Error>> {
+    let png = structural_png(&[])?;
+    let first = analyze_artifacts(&png, ArtifactAnalysisOptions::default())?;
+    let second = analyze_artifacts(&png, ArtifactAnalysisOptions::default())?;
+
+    assert_eq!(first, second);
+    Ok(())
+}
+
+#[test]
+fn analysis_metadata_round_trips_without_embedding_artifact_bytes() -> Result<(), Box<dyn Error>> {
+    let png = structural_png(&[])?;
+    let decoded = [b"unrelated prefix".as_slice(), &png, b"unrelated suffix"].concat();
+    let encoded = base64::Engine::encode(&base64::engine::general_purpose::STANDARD, &decoded);
+    let report = analyze_artifacts(encoded.as_bytes(), ArtifactAnalysisOptions::default())?;
+
+    let encoded = serde_json::to_vec(&report)?;
+    let metadata: l2_workbench::artifact::ArtifactAnalysis = serde_json::from_slice(&encoded)?;
+
+    assert_eq!(metadata.source_sha256, report.source_sha256);
+    assert_eq!(metadata.artifacts.len(), report.artifacts.len());
+    assert!(metadata.artifacts[0].bytes.is_empty());
+    for (cached, original) in metadata.artifacts.iter().zip(&report.artifacts) {
+        assert_eq!(cached.index, original.index);
+        assert_eq!(cached.sha256, original.sha256);
+        assert_eq!(cached.origins, original.origins);
+        assert_eq!(cached.validation, original.validation);
+        assert!(cached.bytes.is_empty());
+    }
+    assert_eq!(metadata.status, report.status);
+    Ok(())
+}
+
+#[test]
+fn analysis_accepts_an_already_verified_source_digest() -> Result<(), Box<dyn Error>> {
+    let png = structural_png(&[])?;
+    let digest = l2_workbench::sha256(&png);
+    let report =
+        analyze_artifacts_with_source_sha256(&png, &digest, ArtifactAnalysisOptions::default())?;
+
+    assert_eq!(report.source_sha256, digest);
+    Ok(())
+}
+
+#[test]
+fn analysis_rejects_an_unformatted_source_digest() {
+    let result = analyze_artifacts_with_source_sha256(
+        b"source",
+        "not-a-sha256",
+        ArtifactAnalysisOptions::default(),
+    );
+
+    assert!(matches!(
+        result,
+        Err(l2_workbench::artifact::AnalyzerError::InvalidSourceHash)
+    ));
+}
+
+#[test]
+fn artifact_and_work_limits_return_a_partial_report() -> Result<(), Box<dyn Error>> {
+    let archive = zip_support::build_zip(&[zip_support::FixtureEntry::stored(
+        b"member.bin",
+        b"member data",
+    )])?;
+    let options = ArtifactAnalysisOptions {
+        limits: AnalyzerLimits {
+            max_artifacts: 1,
+            max_total_work_bytes: 0,
+            ..AnalyzerLimits::default()
+        },
+        recovery: RecoveryMode::Conservative,
+    };
+    let report = analyze_artifacts(&archive, options)?;
+
+    assert_eq!(report.artifacts.len(), 1);
+    assert_eq!(report.status, AnalysisStatus::Partial);
+    assert!(!report.omissions.is_empty());
+    Ok(())
+}
+
+#[test]
+fn zero_archive_expansion_budget_does_not_extract_even_one_byte() -> Result<(), Box<dyn Error>> {
+    let archive =
+        zip_support::build_zip(&[zip_support::FixtureEntry::stored(b"member.bin", b"x")])?;
+    let options = ArtifactAnalysisOptions {
+        limits: AnalyzerLimits {
+            max_zip_expanded_bytes: 0,
+            ..AnalyzerLimits::default()
+        },
+        recovery: RecoveryMode::Conservative,
+    };
+
+    let report = analyze_artifacts(&archive, options)?;
+
+    assert!(
+        !report
+            .artifacts
+            .iter()
+            .any(|artifact| artifact.bytes == b"x")
+    );
+    assert!(report.omissions.iter().any(|omission| matches!(
+        omission,
+        l2_workbench::artifact::AnalysisOmission::ZipMember {
+            reason:
+                l2_workbench::artifact::zip::ZipArtifactOmissionReason::OperationExpandedByteLimit,
+            ..
+        }
+    )));
+    Ok(())
+}
+
+#[test]
+fn salvage_mode_reports_unsupported_repair_without_changing_source() -> Result<(), Box<dyn Error>> {
+    let input = b"damaged section with no complete object";
+    let report = analyze_artifacts(
+        input,
+        ArtifactAnalysisOptions {
+            recovery: RecoveryMode::Salvage,
+            ..ArtifactAnalysisOptions::default()
+        },
+    )?;
+
+    assert_eq!(report.artifacts.len(), 1);
+    assert_eq!(report.artifacts[0].bytes, input);
+    assert_eq!(report.status, AnalysisStatus::Partial);
+    assert!(
+        report
+            .omissions
+            .iter()
+            .any(|omission| omission.is_salvage_unsupported())
+    );
+    Ok(())
+}
+
+#[test]
+fn salvage_mode_keeps_a_complete_object_complete_when_no_repair_is_needed()
+-> Result<(), Box<dyn Error>> {
+    let png = structural_png(&[])?;
+    let report = analyze_artifacts(
+        &png,
+        ArtifactAnalysisOptions {
+            recovery: RecoveryMode::Salvage,
+            ..ArtifactAnalysisOptions::default()
+        },
+    )?;
+
+    assert_eq!(report.status, AnalysisStatus::Complete);
+    assert!(report.omissions.is_empty());
+    assert_eq!(report.artifacts[0].bytes, png);
+    Ok(())
+}
+
+#[test]
+fn input_limit_preserves_original_hash_and_length() -> Result<(), Box<dyn Error>> {
+    let input = b"plain bytes";
+    let report = analyze_artifacts(
+        input,
+        ArtifactAnalysisOptions {
+            limits: AnalyzerLimits {
+                max_input_bytes: input.len() - 1,
+                ..AnalyzerLimits::default()
+            },
+            ..ArtifactAnalysisOptions::default()
+        },
+    )?;
+
+    assert!(report.artifacts.is_empty());
+    assert_eq!(report.source_sha256, l2_workbench::sha256(input));
+    assert_eq!(report.source_length, input.len());
+    assert_eq!(report.status, AnalysisStatus::Partial);
+    assert!(
+        report
+            .omissions
+            .iter()
+            .any(|omission| omission.is_input_limit())
+    );
+    Ok(())
+}

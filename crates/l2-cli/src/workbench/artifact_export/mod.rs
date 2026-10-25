@@ -11,7 +11,7 @@ mod validation;
 pub use provenance::ArtifactProvenance;
 #[cfg(test)]
 pub use provenance::ReconstructionStatus;
-pub use publish::{artifact_node_count, publish_artifact_directory};
+pub use publish::{artifact_node_count, publish_artifact_directory, write_artifacts_into};
 pub use selection::{SelectedArtifact, select_artifacts};
 pub use validation::validated_extension;
 #[cfg(test)]

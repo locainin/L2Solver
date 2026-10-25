@@ -13,7 +13,7 @@ pub enum ArtifactFormat {
 }
 
 /// Exact file range used to support a parsed value
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct FileRange {
     /// Zero-based offset in the supplied artifact
     pub offset: usize,

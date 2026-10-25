@@ -1,5 +1,7 @@
 use core::fmt;
 
+use serde::{Deserialize, Serialize};
+
 use super::zip::{ZipArtifactError, ZipArtifactLimits, inspect_zip_at_depth_with_operation_budget};
 use super::{FileRange, PngError, PngLimits, PngReport, parse_png};
 
@@ -27,7 +29,8 @@ pub struct EmbeddedDiscoveryLimits {
 }
 
 /// Format selected by an embedded marker
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
 pub enum EmbeddedFormat {
     /// Portable Network Graphics
     Png,

@@ -1,5 +1,6 @@
 //! Bounded PE/ELF inspection and source-bound static analysis receipts
 
+mod analyzer;
 mod bytes;
 mod code_links;
 mod color_reachability;
@@ -16,6 +17,12 @@ mod signatures;
 mod validator;
 pub mod zip;
 
+pub use analyzer::{
+    AnalysisBoundary, AnalysisFormat, AnalysisOmission, AnalysisStage, AnalysisStatus,
+    AnalyzedArtifact, AnalyzerError, AnalyzerLimits, ArtifactAnalysis, ArtifactAnalysisOptions,
+    ArtifactOrigin, ArtifactValidationState, RecoveryMode, ValidationSummary, analyze_artifacts,
+    analyze_artifacts_with_source_sha256,
+};
 pub use code_links::{
     CodeLink, CodeLinkError, CodeLinkLimits, CodeLinkReport, CodeLinkSourceChecks,
     CodeLinkSourceVerification, CodeLinkStatus, MAX_CODE_LINKS, MAX_RUNTIME_MODULE_MAPPINGS,

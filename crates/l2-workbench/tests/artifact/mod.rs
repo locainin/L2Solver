@@ -1,3 +1,4 @@
+mod analyzer;
 mod code_links;
 mod der;
 mod embedded;
