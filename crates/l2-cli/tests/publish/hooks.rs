@@ -1,10 +1,12 @@
 use std::{
-    cell::Cell,
+    cell::{Cell, RefCell},
     io,
     path::PathBuf,
     thread,
     time::{Duration, Instant},
 };
+
+type BeforeDirectoryExchangeHook = Box<dyn FnOnce() -> io::Result<()>>;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum TestFault {
@@ -13,11 +15,14 @@ pub enum TestFault {
     FileSync,
     Link,
     DirectorySync,
+    UnsupportedDirectoryExchange,
 }
 
 // Only the publication harness arms faults; every caller uses the same per-thread slot
 thread_local! {
     pub(crate) static TEST_FAULT: Cell<Option<TestFault>> = const { Cell::new(None) };
+    static BEFORE_DIRECTORY_EXCHANGE: RefCell<Option<BeforeDirectoryExchangeHook>> =
+        const { RefCell::new(None) };
 }
 
 pub fn take_fault(fault: TestFault) -> bool {
@@ -29,6 +34,19 @@ pub fn take_fault(fault: TestFault) -> bool {
             false
         }
     })
+}
+
+pub fn set_before_directory_exchange(hook: impl FnOnce() -> io::Result<()> + 'static) {
+    BEFORE_DIRECTORY_EXCHANGE.with(|slot| *slot.borrow_mut() = Some(Box::new(hook)));
+}
+
+pub fn before_directory_exchange() -> io::Result<()> {
+    let hook = BEFORE_DIRECTORY_EXCHANGE.with(|slot| slot.borrow_mut().take());
+    if let Some(hook) = hook {
+        hook()
+    } else {
+        Ok(())
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

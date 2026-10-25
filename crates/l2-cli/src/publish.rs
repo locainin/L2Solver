@@ -1,9 +1,18 @@
 //! Publish complete files and directories without replacing existing destinations
 
-use std::{error::Error, fmt, fs::File, io, path::Path};
+use std::{
+    error::Error,
+    fmt,
+    fs::File,
+    io,
+    path::{Path, PathBuf},
+};
 #[path = "publish/directory.rs"]
 mod directory;
-pub use directory::create_directory;
+pub use directory::{
+    DirectoryEntry, DirectoryEntryKind, PreparedDirectoryReplacement, create_directory,
+    prepare_directory_replacement, replace_directory,
+};
 
 /// A directory publication failure with its commit status
 #[derive(Debug)]
@@ -12,6 +21,13 @@ pub enum DirectoryPublishError {
     BeforePublication(Box<dyn Error>),
     /// The rename committed, but syncing the parent directory failed
     PublishedDurabilityUncertain(io::Error),
+    /// An exchange committed, but another destination change made cleanup unsafe
+    PublishedReplacementUncertain {
+        /// The operation that made the final state uncertain
+        source: io::Error,
+        /// The displaced directory entry retained for recovery
+        retained_path: PathBuf,
+    },
 }
 
 impl fmt::Display for DirectoryPublishError {
@@ -27,6 +43,14 @@ impl fmt::Display for DirectoryPublishError {
                 formatter,
                 "directory was published but its durability is uncertain; it may already be published and blind retry is unsafe: {error}"
             ),
+            Self::PublishedReplacementUncertain {
+                source,
+                retained_path,
+            } => write!(
+                formatter,
+                "directory replacement is uncertain; displaced content was retained at {} and blind retry is unsafe: {source}",
+                retained_path.display()
+            ),
         }
     }
 }
@@ -36,6 +60,7 @@ impl Error for DirectoryPublishError {
         match self {
             Self::BeforePublication(error) => Some(error.as_ref()),
             Self::PublishedDurabilityUncertain(error) => Some(error),
+            Self::PublishedReplacementUncertain { source, .. } => Some(source),
         }
     }
 }
