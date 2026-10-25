@@ -227,7 +227,7 @@ fn replace_directory_linux<T>(
         }
     })?;
 
-    let retained_path = retained_display_path(path, &staging_name);
+    let retained_path = retained_display_path(&prepared.parent_fd, path, &staging_name);
     // From this point TempDir must not clean a name whose inode may have changed
     let _retained_path = staging.keep();
     let identities = stat_identity_at(&prepared.parent_fd, &staging_name).and_then(|displaced| {
@@ -281,12 +281,23 @@ fn staging_name(path: &Path) -> io::Result<&OsStr> {
 }
 
 #[cfg(target_os = "linux")]
-fn retained_display_path(path: &Path, staging_name: &OsStr) -> PathBuf {
-    let parent = path
+fn retained_display_path(
+    parent_fd: &rustix::fd::OwnedFd,
+    path: &Path,
+    staging_name: &OsStr,
+) -> PathBuf {
+    use std::os::fd::AsRawFd;
+
+    let original_parent = path
         .parent()
         .filter(|parent| !parent.as_os_str().is_empty())
         .unwrap_or_else(|| Path::new("."));
-    parent.join(staging_name)
+    let held_parent = PathBuf::from(format!("/proc/self/fd/{}", parent_fd.as_raw_fd()));
+    std::fs::read_link(held_parent)
+        .ok()
+        .filter(|parent| parent.exists())
+        .unwrap_or_else(|| original_parent.to_owned())
+        .join(staging_name)
 }
 
 #[cfg(target_os = "linux")]

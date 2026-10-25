@@ -297,6 +297,61 @@ fn refresh_race_keeps_foreign_symlink_at_reported_path() -> Result<(), Box<dyn E
 }
 
 #[test]
+fn retained_race_path_tracks_a_renamed_held_parent() -> Result<(), Box<dyn Error>> {
+    let root = tempfile::tempdir()?;
+    let parent = root.path().join("parent");
+    let moved_parent = root.path().join("moved-parent");
+    let destination = parent.join("bundle");
+    let moved_destination = moved_parent.join("bundle");
+    let moved_old = moved_parent.join("checked-old-output");
+    let foreign = root.path().join("foreign.txt");
+    fs::create_dir(&parent)?;
+    fs::write(&foreign, b"foreign target")?;
+    publish::create_directory(&destination, |staging| {
+        fs::write(staging.join("page.json"), b"old output")?;
+        Ok(())
+    })?;
+    let prepared = publish::prepare_directory_replacement(&destination)?;
+    let raced_parent = parent.clone();
+    let raced_moved_parent = moved_parent.clone();
+    let raced_destination = moved_destination.clone();
+    let raced_old = moved_old.clone();
+    let raced_foreign = foreign.clone();
+    test_hooks::set_before_directory_exchange(move || {
+        fs::rename(&raced_parent, &raced_moved_parent)?;
+        fs::create_dir(&raced_parent)?;
+        fs::rename(&raced_destination, &raced_old)?;
+        symlink(&raced_foreign, &raced_destination)
+    });
+
+    let result = publish::replace_directory(prepared, |staging| {
+        fs::write(staging.join("page.json"), b"new output")?;
+        Ok(())
+    });
+
+    let Err(publish::DirectoryPublishError::PublishedReplacementUncertain {
+        retained_path, ..
+    }) = result
+    else {
+        return Err("racing parent rename did not report retained publication state".into());
+    };
+    assert!(retained_path.starts_with(&moved_parent));
+    assert!(
+        fs::symlink_metadata(&retained_path)?
+            .file_type()
+            .is_symlink()
+    );
+    assert_eq!(
+        fs::read(moved_destination.join("page.json"))?,
+        b"new output"
+    );
+    assert_eq!(fs::read(moved_old.join("page.json"))?, b"old output");
+    assert_eq!(fs::read(&foreign)?, b"foreign target");
+    assert_eq!(fs::read_dir(parent)?.count(), 0);
+    Ok(())
+}
+
+#[test]
 fn concurrent_new_directory_publication_never_replaces_the_winner() -> Result<(), Box<dyn Error>> {
     let root = tempfile::tempdir()?;
     let destination = root.path().join("bundle");
