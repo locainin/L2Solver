@@ -14,6 +14,7 @@ pub mod experiment;
 pub mod hypothesis;
 pub mod identity;
 pub mod investigation;
+pub mod job;
 pub mod journal;
 pub mod measurement;
 pub mod protocol;
