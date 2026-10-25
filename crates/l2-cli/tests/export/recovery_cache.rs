@@ -30,6 +30,7 @@ fn warm_cache_restores_the_case_and_local_coverage() -> Result<(), Box<dyn Error
     let expected_case = first_case.to_json()?;
 
     let job = Job::new("cached flow recovery");
+    job.increment(Counter::CandidatesExamined, 7)?;
     let (mut second_case, second_scope) = case_and_scope(b"4142", 7)?;
     let second = recover(
         &mut second_case,
@@ -58,9 +59,11 @@ fn warm_cache_restores_the_case_and_local_coverage() -> Result<(), Box<dyn Error
             .unwrap_or(0),
         0
     );
+    assert!(first.coverage.candidates > 0);
     assert_eq!(
         snapshot.counters.get(&Counter::CandidatesExamined),
-        Some(&second.coverage.candidates)
+        Some(&7),
+        "a cache hit must not count cached candidates as newly examined"
     );
     Ok(())
 }

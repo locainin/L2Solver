@@ -75,7 +75,7 @@ pub(super) fn recover(
             match cache.lookup(&key, CacheReadPolicy::AllowPartial) {
                 Ok(Some(entry)) => match cached_result(&entry, &source_id, kind) {
                     Ok((cached_case, result)) => {
-                        count_cache_hit(context.job, &result.coverage)?;
+                        count_cache_hit(context.job)?;
                         *case = cached_case;
                         return Ok(result);
                     }
@@ -277,12 +277,11 @@ impl<W: Write> Write for LimitedWriter<W> {
     }
 }
 
-fn count_cache_hit(job: Option<&Job>, coverage: &RecoveryCoverage) -> Result<()> {
+fn count_cache_hit(job: Option<&Job>) -> Result<()> {
     let Some(job) = job else {
         return Ok(());
     };
     job.increment(Counter::CacheHits, 1)?;
-    job.increment(Counter::CandidatesExamined, coverage.candidates)?;
     set_current_for(job, "reused cached Case recovery")?;
     Ok(())
 }
