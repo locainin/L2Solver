@@ -1,6 +1,7 @@
 //! Explicit bounded parsing and assembly for repeated binary records
 
 mod assemble;
+mod assembly_plan;
 mod discovery;
 mod error;
 mod header;
@@ -9,6 +10,11 @@ mod parse;
 mod proposal;
 
 pub use assemble::{assemble_record_groups, assemble_record_groups_from_inputs};
+pub use assembly_plan::{
+    BoundRecordAssemblyPlan, RecordAssemblyBindStats, RecordAssemblyHeaderModel,
+    RecordAssemblyMaterializedLayout, RecordAssemblyModelStatus, RecordAssemblyPlan,
+    RecordAssemblyPlanStats,
+};
 pub use discovery::{
     RecordDiscoveryError, RecordDiscoveryLimits, RecordDiscoveryPartition,
     RecordDiscoveryValidationBasis, RecordSchemaDiscoveryReport, RecordSchemaDiscoverySpace,

@@ -112,6 +112,24 @@ impl HeaderParseTemplate {
             .saturating_add(self.preserved_header.len())
             .saturating_add(parsed_record_metadata_bytes(&self.records))
     }
+
+    pub(super) fn into_parts(self) -> HeaderParseTemplateParts {
+        HeaderParseTemplateParts {
+            schema: self.schema,
+            input_length: self.input_length,
+            preserved_header: self.preserved_header,
+            limits: self.limits,
+            records: self.records,
+        }
+    }
+}
+
+pub(super) struct HeaderParseTemplateParts {
+    pub(super) schema: RecordSchema,
+    pub(super) input_length: usize,
+    pub(super) preserved_header: Vec<u8>,
+    pub(super) limits: RecordLimits,
+    pub(super) records: Vec<ParsedRecord>,
 }
 
 impl fmt::Debug for HeaderParseTemplate {

@@ -1,7 +1,7 @@
 use super::{
     ParsedRecord, RecordAssemblyInput, RecordAssemblyOutcome, RecordAssemblyPart, RecordError,
-    RecordGroupOutcome, RecordGroupReceipt, RecordLimits, RecordParseReport,
-    parse::validate_assembly_limits,
+    RecordGroupOutcome, RecordGroupReceipt, RecordInput, RecordLimits, RecordParseReport,
+    model::parsed_record_metadata_bytes, parse::validate_assembly_limits,
 };
 use crate::sha256;
 use std::collections::{BTreeMap, btree_map::Entry};
@@ -33,21 +33,191 @@ pub fn assemble_record_groups_from_inputs(
     limits: RecordLimits,
 ) -> Result<RecordAssemblyOutcome, RecordError> {
     validate_assembly_limits(limits)?;
-    let (input_length, sequence_base, terminal_sequence, mut report_bytes) =
+    let (input_length, sequence_base, terminal_sequence, report_bytes) =
         validate_inputs(inputs, limits)?;
-    let grouped = group_inputs(inputs, limits)?;
-    let (groups, total_output) = assemble_groups(
+    let mut metadata_inputs = Vec::new();
+    metadata_inputs
+        .try_reserve_exact(inputs.len())
+        .map_err(|_| RecordError::AllocationFailed)?;
+    metadata_inputs.extend(inputs.iter().enumerate().map(|(input_index, input)| {
+        RecordMetadataInput {
+            input_index,
+            input_length: input.bytes.len(),
+            records: &input.report.records,
+        }
+    }));
+    let prepared = prepare_record_groups_from_validated(
+        &metadata_inputs,
+        input_length,
+        report_bytes,
+        sequence_base,
+        terminal_sequence,
+        limits,
+        None,
+    )?;
+    let mut groups = Vec::new();
+    groups
+        .try_reserve_exact(prepared.groups.len())
+        .map_err(|_| RecordError::AllocationFailed)?;
+    for group in prepared.groups {
+        let bytes = materialize_layout(inputs, &group.layout, group.output_length)?;
+        let mut receipt = group.receipt;
+        finish_receipt(&mut receipt, &bytes);
+        groups.push(RecordGroupOutcome {
+            receipt,
+            candidate_bytes: bytes,
+        });
+    }
+    Ok(RecordAssemblyOutcome {
+        input_count: inputs.len(),
+        input_length: prepared.input_length,
+        output_bytes: prepared.output_bytes,
+        terminal_sequence,
+        report_bytes: prepared.report_bytes,
+        groups,
+    })
+}
+
+/// Parse metadata needed to prepare one shared physical assembly layout
+pub(super) struct RecordMetadataInput<'a> {
+    pub(super) input_index: usize,
+    pub(super) input_length: usize,
+    pub(super) records: &'a [ParsedRecord],
+}
+
+/// One payload range in an ordered physical assembly layout
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub(super) struct PhysicalPart {
+    pub(super) input_index: usize,
+    pub(super) start: usize,
+    pub(super) end: usize,
+}
+
+/// Semantic receipt and byte ranges for one prepared identifier group
+pub(super) struct PreparedGroup {
+    pub(super) receipt: RecordGroupReceipt,
+    pub(super) layout: Vec<PhysicalPart>,
+    pub(super) output_length: usize,
+}
+
+/// All group layouts and report accounting prepared without copying payload bytes
+pub(super) struct PreparedRecordGroups {
+    pub(super) input_length: usize,
+    pub(super) output_bytes: usize,
+    pub(super) report_bytes: usize,
+    pub(super) groups: Vec<PreparedGroup>,
+}
+
+/// Bounds plan-specific workspaces while reusing canonical record preparation
+pub(super) struct AssemblyPlanBudget {
+    retained: usize,
+    workspace: usize,
+    maximum: usize,
+}
+
+impl AssemblyPlanBudget {
+    pub(super) fn new(retained_bytes: usize, maximum_bytes: usize) -> Result<Self, RecordError> {
+        let budget = Self {
+            retained: retained_bytes,
+            workspace: 0,
+            maximum: maximum_bytes,
+        };
+        budget.check_additional(0)?;
+        Ok(budget)
+    }
+
+    pub(super) fn charge_workspace(&mut self, bytes: usize) -> Result<(), RecordError> {
+        self.check_additional(bytes)?;
+        self.workspace = self.workspace.saturating_add(bytes);
+        Ok(())
+    }
+
+    pub(super) fn retain(&mut self, bytes: usize) -> Result<(), RecordError> {
+        self.check_additional(bytes)?;
+        self.retained = self.retained.saturating_add(bytes);
+        Ok(())
+    }
+
+    pub(super) const fn release_workspace(&mut self, bytes: usize) {
+        self.workspace = self.workspace.saturating_sub(bytes);
+    }
+
+    pub(super) const fn overflow_error(&self) -> RecordError {
+        RecordError::PlanTooLarge {
+            bytes: usize::MAX,
+            maximum: self.maximum,
+        }
+    }
+
+    fn check_additional(&self, bytes: usize) -> Result<(), RecordError> {
+        let Some(projected) = self
+            .retained
+            .checked_add(self.workspace)
+            .and_then(|total| total.checked_add(bytes))
+        else {
+            return Err(RecordError::PlanTooLarge {
+                bytes: usize::MAX,
+                maximum: self.maximum,
+            });
+        };
+        if projected > self.maximum {
+            return Err(RecordError::PlanTooLarge {
+                bytes: projected,
+                maximum: self.maximum,
+            });
+        }
+        Ok(())
+    }
+}
+
+/// Build canonical sequence ordering, semantic receipts, and physical payload layouts
+pub(super) fn prepare_record_groups(
+    inputs: &[RecordMetadataInput<'_>],
+    sequence_base: u64,
+    terminal_sequence: Option<u64>,
+    limits: RecordLimits,
+    budget: &mut AssemblyPlanBudget,
+) -> Result<PreparedRecordGroups, RecordError> {
+    let (input_length, report_bytes) = validate_metadata_inputs(inputs, limits, Some(budget))?;
+    prepare_record_groups_from_validated(
+        inputs,
+        input_length,
+        report_bytes,
+        sequence_base,
+        terminal_sequence,
+        limits,
+        Some(budget),
+    )
+}
+
+fn prepare_record_groups_from_validated(
+    inputs: &[RecordMetadataInput<'_>],
+    input_length: usize,
+    mut report_bytes: usize,
+    sequence_base: u64,
+    terminal_sequence: Option<u64>,
+    limits: RecordLimits,
+    mut plan_budget: Option<&mut AssemblyPlanBudget>,
+) -> Result<PreparedRecordGroups, RecordError> {
+    let GroupedMetadataInputs {
+        groups: grouped,
+        workspace_bytes: grouping_workspace,
+    } = group_metadata_inputs(inputs, limits, &mut plan_budget)?;
+    let prepared_groups = prepare_groups(
         grouped,
         sequence_base,
         terminal_sequence,
         limits,
         &mut report_bytes,
-    )?;
-    Ok(RecordAssemblyOutcome {
-        input_count: inputs.len(),
+        &mut plan_budget,
+    );
+    if let Some(budget) = plan_budget {
+        budget.release_workspace(grouping_workspace);
+    }
+    let (groups, output_bytes) = prepared_groups?;
+    Ok(PreparedRecordGroups {
         input_length,
-        output_bytes: total_output,
-        terminal_sequence,
+        output_bytes,
         report_bytes,
         groups,
     })
@@ -100,7 +270,6 @@ fn validate_inputs(
                 maximum: limits.max_report_bytes,
             });
         }
-
         // Count sources may differ, but every record field must use one common layout
         if let Some(expected_schema) = common_schema {
             if !same_record_layout(expected_schema, &input.report.schema) {
@@ -115,17 +284,125 @@ fn validate_inputs(
     Ok((input_length, sequence_base, terminal_sequence, report_bytes))
 }
 
-fn group_inputs<'a>(
-    inputs: &'a [RecordAssemblyInput<'a>],
+fn validate_metadata_inputs(
+    inputs: &[RecordMetadataInput<'_>],
     limits: RecordLimits,
-) -> Result<BTreeMap<&'a [u8], Vec<SourcedRecord<'a>>>, RecordError> {
+    mut plan_budget: Option<&mut AssemblyPlanBudget>,
+) -> Result<(usize, usize), RecordError> {
+    let mut input_length = 0_usize;
+    let mut record_count = 0_usize;
+    let mut report_bytes = 0_usize;
+    for (expected_input_index, input) in inputs.iter().enumerate() {
+        if input.input_index != expected_input_index {
+            return Err(RecordError::InvalidReport);
+        }
+        if input.input_length > limits.max_input_bytes {
+            return Err(RecordError::InputTooLarge {
+                length: input.input_length,
+                maximum: limits.max_input_bytes,
+            });
+        }
+        input_length =
+            input_length
+                .checked_add(input.input_length)
+                .ok_or(RecordError::InputTooLarge {
+                    length: usize::MAX,
+                    maximum: limits.max_input_bytes,
+                })?;
+        if input_length > limits.max_input_bytes {
+            return Err(RecordError::InputTooLarge {
+                length: input_length,
+                maximum: limits.max_input_bytes,
+            });
+        }
+        record_count =
+            record_count
+                .checked_add(input.records.len())
+                .ok_or(RecordError::TooManyRecords {
+                    count: u64::MAX,
+                    maximum: limits.max_records,
+                })?;
+        if record_count > limits.max_records {
+            return Err(RecordError::TooManyRecords {
+                count: u64::try_from(record_count).unwrap_or(u64::MAX),
+                maximum: limits.max_records,
+            });
+        }
+        let metadata_bytes = parsed_record_metadata_bytes(input.records);
+        if let Some(budget) = plan_budget.as_deref_mut() {
+            budget.charge_workspace(metadata_bytes)?;
+        }
+        report_bytes =
+            report_bytes
+                .checked_add(metadata_bytes)
+                .ok_or(RecordError::ReportTooLarge {
+                    bytes: usize::MAX,
+                    maximum: limits.max_report_bytes,
+                })?;
+        if report_bytes > limits.max_report_bytes {
+            return Err(RecordError::ReportTooLarge {
+                bytes: report_bytes,
+                maximum: limits.max_report_bytes,
+            });
+        }
+        validate_record_ranges(input.input_length, input.records, limits)?;
+    }
+    Ok((input_length, report_bytes))
+}
+
+fn validate_record_ranges(
+    input_length: usize,
+    records: &[ParsedRecord],
+    limits: RecordLimits,
+) -> Result<(), RecordError> {
+    for (expected_index, record) in records.iter().enumerate() {
+        let record_valid = record.index == expected_index
+            && record.record.start <= record.payload.start
+            && record.payload.start <= record.payload.end
+            && record.payload.end == record.record.end
+            && record.record.end <= input_length
+            && !record.identifier.is_empty()
+            && record.identifier.len() <= limits.max_identifier_bytes;
+        if !record_valid {
+            return Err(RecordError::InvalidReport);
+        }
+    }
+    Ok(())
+}
+
+struct GroupedMetadataInputs<'a> {
+    groups: BTreeMap<&'a [u8], Vec<RecordReference<'a>>>,
+    workspace_bytes: usize,
+}
+
+fn group_metadata_inputs<'a>(
+    inputs: &'a [RecordMetadataInput<'a>],
+    limits: RecordLimits,
+    plan_budget: &mut Option<&mut AssemblyPlanBudget>,
+) -> Result<GroupedMetadataInputs<'a>, RecordError> {
     // Borrow identifier keys so grouping does not make another copy per record
-    let mut grouped = BTreeMap::<&'a [u8], Vec<SourcedRecord<'a>>>::new();
-    for (input_index, input) in inputs.iter().enumerate() {
-        for record in &input.report.records {
+    let mut grouped = BTreeMap::<&'a [u8], Vec<RecordReference<'a>>>::new();
+    let mut workspace_bytes = 0_usize;
+    for input in inputs {
+        for record in input.records {
+            let identifier = record.identifier.as_slice();
             let group_count = grouped.len();
-            let group = match grouped.entry(record.identifier.as_slice()) {
-                Entry::Occupied(entry) => entry.into_mut(),
+            let reference_bytes = std::mem::size_of::<RecordReference<'_>>();
+            match grouped.entry(identifier) {
+                Entry::Occupied(entry) => {
+                    if let Some(budget) = plan_budget.as_deref_mut() {
+                        budget.charge_workspace(reference_bytes)?;
+                    }
+                    workspace_bytes = workspace_bytes.saturating_add(reference_bytes);
+                    let group = entry.into_mut();
+                    group
+                        .try_reserve(1)
+                        .map_err(|_| RecordError::AllocationFailed)?;
+                    group.push(RecordReference {
+                        input_index: input.input_index,
+                        record,
+                    });
+                }
                 Entry::Vacant(entry) => {
                     if group_count >= limits.max_groups {
                         return Err(RecordError::TooManyGroups {
@@ -133,42 +410,71 @@ fn group_inputs<'a>(
                             maximum: limits.max_groups,
                         });
                     }
-                    entry.insert(Vec::new())
+                    let entry_bytes = std::mem::size_of::<&[u8]>()
+                        .saturating_add(std::mem::size_of::<Vec<RecordReference<'_>>>())
+                        .saturating_add(4_usize.saturating_mul(std::mem::size_of::<usize>()));
+                    if let Some(budget) = plan_budget.as_deref_mut() {
+                        let new_workspace = entry_bytes
+                            .checked_add(reference_bytes)
+                            .ok_or_else(|| budget.overflow_error())?;
+                        budget.charge_workspace(new_workspace)?;
+                    }
+                    workspace_bytes = workspace_bytes
+                        .saturating_add(entry_bytes)
+                        .saturating_add(reference_bytes);
+                    let mut references = Vec::new();
+                    references
+                        .try_reserve_exact(1)
+                        .map_err(|_| RecordError::AllocationFailed)?;
+                    references.push(RecordReference {
+                        input_index: input.input_index,
+                        record,
+                    });
+                    entry.insert(references);
                 }
-            };
-            group
-                .try_reserve(1)
-                .map_err(|_| RecordError::AllocationFailed)?;
-            group.push(SourcedRecord {
-                input_index,
-                bytes: input.bytes,
-                record,
-            });
+            }
         }
     }
-    Ok(grouped)
+    Ok(GroupedMetadataInputs {
+        groups: grouped,
+        workspace_bytes,
+    })
 }
 
-fn assemble_groups(
-    grouped: BTreeMap<&[u8], Vec<SourcedRecord<'_>>>,
+fn prepare_groups(
+    grouped: BTreeMap<&[u8], Vec<RecordReference<'_>>>,
     sequence_base: u64,
     terminal_sequence: Option<u64>,
     limits: RecordLimits,
     report_bytes: &mut usize,
-) -> Result<(Vec<RecordGroupOutcome>, usize), RecordError> {
+    plan_budget: &mut Option<&mut AssemblyPlanBudget>,
+) -> Result<(Vec<PreparedGroup>, usize), RecordError> {
     let group_storage = std::mem::size_of::<RecordGroupOutcome>()
         .checked_mul(grouped.len())
         .ok_or(RecordError::ReportTooLarge {
             bytes: usize::MAX,
             maximum: limits.max_report_bytes,
         })?;
-    charge_report_bytes(report_bytes, group_storage, limits)?;
+    charge_report_bytes(report_bytes, group_storage, limits, plan_budget)?;
+    if let Some(budget) = plan_budget.as_deref_mut() {
+        let prepared_group_bytes = std::mem::size_of::<PreparedGroup>()
+            .checked_mul(grouped.len())
+            .ok_or(RecordError::PlanTooLarge {
+                bytes: usize::MAX,
+                maximum: budget.maximum,
+            })?;
+        budget.charge_workspace(prepared_group_bytes)?;
+    }
 
     let mut groups = Vec::new();
     groups
         .try_reserve_exact(grouped.len())
         .map_err(|_| RecordError::AllocationFailed)?;
     let mut total_output = 0_usize;
+    let completion = SequenceCompletion {
+        sequence_base,
+        terminal_sequence,
+    };
     for (identifier, mut records) in grouped {
         // Explicit source order makes equal sequence handling reproducible
         records.sort_unstable_by_key(|record| {
@@ -178,30 +484,30 @@ fn assemble_groups(
                 record.record.index,
             )
         });
-        let outcome = assemble_group(
+        let group = prepare_group(
             identifier,
             &records,
-            sequence_base,
-            terminal_sequence,
+            completion,
             limits,
             total_output,
             report_bytes,
+            plan_budget,
         )?;
-        total_output = total_output
-            .checked_add(outcome.candidate_bytes.len())
-            .ok_or(RecordError::OutputTooLarge {
-                length: usize::MAX,
-                maximum: limits.max_output_bytes,
-            })?;
-        groups.push(outcome);
+        total_output =
+            total_output
+                .checked_add(group.output_length)
+                .ok_or(RecordError::OutputTooLarge {
+                    length: usize::MAX,
+                    maximum: limits.max_output_bytes,
+                })?;
+        groups.push(group);
     }
     Ok((groups, total_output))
 }
 
 #[derive(Clone, Copy)]
-struct SourcedRecord<'a> {
+struct RecordReference<'a> {
     input_index: usize,
-    bytes: &'a [u8],
     record: &'a ParsedRecord,
 }
 
@@ -263,6 +569,7 @@ fn charge_report_bytes(
     used: &mut usize,
     additional: usize,
     limits: RecordLimits,
+    plan_budget: &mut Option<&mut AssemblyPlanBudget>,
 ) -> Result<(), RecordError> {
     let total = used
         .checked_add(additional)
@@ -276,11 +583,14 @@ fn charge_report_bytes(
             maximum: limits.max_report_bytes,
         });
     }
+    if let Some(budget) = plan_budget.as_deref_mut() {
+        budget.charge_workspace(additional)?;
+    }
     *used = total;
     Ok(())
 }
 
-fn sequence_bounds(records: &[SourcedRecord<'_>]) -> Result<(u64, u64), RecordError> {
+fn sequence_bounds(records: &[RecordReference<'_>]) -> Result<(u64, u64), RecordError> {
     let minimum = records
         .first()
         .map(|record| record.record.sequence)
@@ -292,34 +602,37 @@ fn sequence_bounds(records: &[SourcedRecord<'_>]) -> Result<(u64, u64), RecordEr
     Ok((minimum, maximum))
 }
 
-fn assemble_group(
+fn prepare_group(
     identifier: &[u8],
-    records: &[SourcedRecord<'_>],
-    sequence_base: u64,
-    terminal_sequence: Option<u64>,
+    records: &[RecordReference<'_>],
+    completion: SequenceCompletion,
     limits: RecordLimits,
     prior_output: usize,
     report_bytes: &mut usize,
-) -> Result<RecordGroupOutcome, RecordError> {
-    charge_report_bytes(report_bytes, identifier.len(), limits)?;
-    let completion = SequenceCompletion {
-        sequence_base,
-        terminal_sequence,
-    };
-    let diagnostics = sequence_diagnostics(records, completion, limits, report_bytes)?;
+    plan_budget: &mut Option<&mut AssemblyPlanBudget>,
+) -> Result<PreparedGroup, RecordError> {
+    charge_report_bytes(report_bytes, identifier.len(), limits, plan_budget)?;
+    let diagnostics = sequence_diagnostics(records, completion, limits, report_bytes, plan_budget)?;
     let mapping_bytes = std::mem::size_of::<RecordAssemblyPart>()
         .checked_mul(records.len())
         .ok_or(RecordError::ReportTooLarge {
             bytes: usize::MAX,
             maximum: limits.max_report_bytes,
         })?;
-    charge_report_bytes(report_bytes, mapping_bytes, limits)?;
-    charge_report_bytes(report_bytes, std::mem::size_of::<[u8; 32]>() * 2, limits)?;
-    let (candidate_bytes, parts) = materialize(records, limits, prior_output)?;
-    let receipt = build_group_receipt(identifier, diagnostics, &candidate_bytes, parts)?;
-    Ok(RecordGroupOutcome {
+    charge_report_bytes(report_bytes, mapping_bytes, limits, plan_budget)?;
+    charge_report_bytes(
+        report_bytes,
+        std::mem::size_of::<[u8; 32]>() * 2,
+        limits,
+        plan_budget,
+    )?;
+    let (layout, parts, output_length) =
+        prepare_layout(records, limits, prior_output, plan_budget)?;
+    let receipt = build_group_receipt(identifier, diagnostics, output_length, parts)?;
+    Ok(PreparedGroup {
         receipt,
-        candidate_bytes,
+        layout,
+        output_length,
     })
 }
 
@@ -335,19 +648,26 @@ struct GroupDiagnostics {
 }
 
 fn sequence_diagnostics(
-    records: &[SourcedRecord<'_>],
+    records: &[RecordReference<'_>],
     completion: SequenceCompletion,
     limits: RecordLimits,
     report_bytes: &mut usize,
+    plan_budget: &mut Option<&mut AssemblyPlanBudget>,
 ) -> Result<GroupDiagnostics, RecordError> {
     let (minimum_sequence, maximum_sequence) = sequence_bounds(records)?;
-    let issues = sequence_issues(records, completion, limits, report_bytes)?;
+    let issues = sequence_issues(records, completion, limits, report_bytes, plan_budget)?;
     let counts = MissingSequenceCounts {
         maximum_observed_sequence: maximum_sequence,
         unique_in_expected_range: issues.unique_in_expected_range,
     };
-    let (missing_sequence_count, missing_sequences) =
-        missing_sequences(records, completion, counts, report_bytes, limits)?;
+    let (missing_sequence_count, missing_sequences) = missing_sequences(
+        records,
+        completion,
+        counts,
+        report_bytes,
+        limits,
+        plan_budget,
+    )?;
     let complete = completion.terminal_sequence.is_some()
         && issues.before_base_count == 0
         && issues.duplicate_count == 0
@@ -368,7 +688,7 @@ fn sequence_diagnostics(
 fn build_group_receipt(
     identifier: &[u8],
     diagnostics: GroupDiagnostics,
-    candidate_bytes: &[u8],
+    output_length: usize,
     parts: Vec<RecordAssemblyPart>,
 ) -> Result<RecordGroupReceipt, RecordError> {
     let mut identifier_copy = Vec::new();
@@ -401,8 +721,8 @@ fn build_group_receipt(
             .after_terminal_count
             .saturating_sub(issues.after_terminal.len()),
         sequences_after_terminal: issues.after_terminal,
-        output_length: Some(candidate_bytes.len()),
-        output_sha256: Some(sha256(candidate_bytes)),
+        output_length: Some(output_length),
+        output_sha256: None,
         parts,
     })
 }
@@ -424,10 +744,11 @@ struct SequenceIssues {
 }
 
 fn sequence_issues(
-    records: &[SourcedRecord<'_>],
+    records: &[RecordReference<'_>],
     completion: SequenceCompletion,
     limits: RecordLimits,
     report_bytes: &mut usize,
+    plan_budget: &mut Option<&mut AssemblyPlanBudget>,
 ) -> Result<SequenceIssues, RecordError> {
     let mut unique_in_expected_range = 0_u128;
     let mut duplicates = Vec::new();
@@ -451,6 +772,7 @@ fn sequence_issues(
                     limits.max_issue_examples,
                     report_bytes,
                     limits,
+                    plan_budget,
                 )?;
                 last_duplicate = Some(sequence);
             }
@@ -462,6 +784,7 @@ fn sequence_issues(
                 limits.max_issue_examples,
                 report_bytes,
                 limits,
+                plan_budget,
             )?;
         } else if completion
             .terminal_sequence
@@ -474,6 +797,7 @@ fn sequence_issues(
                 limits.max_issue_examples,
                 report_bytes,
                 limits,
+                plan_budget,
             )?;
         } else {
             unique_in_expected_range = unique_in_expected_range.saturating_add(1);
@@ -499,11 +823,12 @@ struct MissingSequenceCounts {
 }
 
 fn missing_sequences(
-    records: &[SourcedRecord<'_>],
+    records: &[RecordReference<'_>],
     completion: SequenceCompletion,
     counts: MissingSequenceCounts,
     report_bytes: &mut usize,
     limits: RecordLimits,
+    plan_budget: &mut Option<&mut AssemblyPlanBudget>,
 ) -> Result<(u128, Vec<u64>), RecordError> {
     let expected_terminal = completion
         .terminal_sequence
@@ -523,7 +848,7 @@ fn missing_sequences(
             bytes: usize::MAX,
             maximum: limits.max_report_bytes,
         })?;
-    charge_report_bytes(report_bytes, example_bytes, limits)?;
+    charge_report_bytes(report_bytes, example_bytes, limits, plan_budget)?;
     let mut examples = Vec::new();
     examples
         .try_reserve_exact(reserve_count)
@@ -570,9 +895,15 @@ fn retain_example(
     maximum: usize,
     report_bytes: &mut usize,
     limits: RecordLimits,
+    plan_budget: &mut Option<&mut AssemblyPlanBudget>,
 ) -> Result<(), RecordError> {
     if examples.len() < maximum {
-        charge_report_bytes(report_bytes, std::mem::size_of::<u64>(), limits)?;
+        charge_report_bytes(
+            report_bytes,
+            std::mem::size_of::<u64>(),
+            limits,
+            plan_budget,
+        )?;
         examples
             .try_reserve(1)
             .map_err(|_| RecordError::AllocationFailed)?;
@@ -602,11 +933,12 @@ fn append_gap_examples(
     }
 }
 
-fn materialize(
-    records: &[SourcedRecord<'_>],
+fn prepare_layout(
+    records: &[RecordReference<'_>],
     limits: RecordLimits,
     prior_output: usize,
-) -> Result<(Vec<u8>, Vec<RecordAssemblyPart>), RecordError> {
+    plan_budget: &mut Option<&mut AssemblyPlanBudget>,
+) -> Result<(Vec<PhysicalPart>, Vec<RecordAssemblyPart>, usize), RecordError> {
     let mut length = 0_usize;
     for record in records {
         let payload_length = record
@@ -635,31 +967,104 @@ fn materialize(
         });
     }
 
-    let mut output = Vec::new();
-    output
-        .try_reserve_exact(length)
+    if let Some(budget) = plan_budget.as_deref_mut() {
+        let layout_bytes = std::mem::size_of::<PhysicalPart>()
+            .checked_mul(records.len())
+            .ok_or(RecordError::PlanTooLarge {
+                bytes: usize::MAX,
+                maximum: budget.maximum,
+            })?;
+        budget.charge_workspace(layout_bytes)?;
+    }
+    let mut layout = Vec::new();
+    layout
+        .try_reserve_exact(records.len())
         .map_err(|_| RecordError::AllocationFailed)?;
     let mut parts = Vec::new();
     parts
         .try_reserve_exact(records.len())
         .map_err(|_| RecordError::AllocationFailed)?;
+    let mut output_offset = 0_usize;
     for record in records {
-        let payload = record
-            .bytes
-            .get(record.record.payload.start..record.record.payload.end)
-            .ok_or(RecordError::InvalidReport)?;
-        let output_start = output.len();
-        output.extend_from_slice(payload);
+        let payload_length = record.record.payload.end - record.record.payload.start;
+        let output_end =
+            output_offset
+                .checked_add(payload_length)
+                .ok_or(RecordError::OutputTooLarge {
+                    length: usize::MAX,
+                    maximum: limits.max_output_bytes,
+                })?;
+        layout.push(PhysicalPart {
+            input_index: record.input_index,
+            start: record.record.payload.start,
+            end: record.record.payload.end,
+        });
         parts.push(RecordAssemblyPart {
             input_index: record.input_index,
             record_index: record.record.index,
             sequence: record.record.sequence,
             input: record.record.payload,
             output: crate::protocol::ByteRange {
-                start: output_start,
-                end: output.len(),
+                start: output_offset,
+                end: output_end,
             },
         });
+        output_offset = output_end;
     }
-    Ok((output, parts))
+    Ok((layout, parts, length))
+}
+
+/// Materialize one prepared layout through the same byte-range path used by the public assembler
+pub(super) trait LayoutInputs {
+    fn source_bytes(&self, input_index: usize) -> Option<&[u8]>;
+}
+
+impl LayoutInputs for [RecordAssemblyInput<'_>] {
+    fn source_bytes(&self, input_index: usize) -> Option<&[u8]> {
+        self.get(input_index).map(|input| input.bytes)
+    }
+}
+
+impl LayoutInputs for [RecordInput<'_>] {
+    fn source_bytes(&self, input_index: usize) -> Option<&[u8]> {
+        self.get(input_index).map(|input| input.bytes)
+    }
+}
+
+pub(super) fn materialize_layout<I: LayoutInputs + ?Sized>(
+    inputs: &I,
+    layout: &[PhysicalPart],
+    output_length: usize,
+) -> Result<Vec<u8>, RecordError> {
+    let mut output = Vec::new();
+    output
+        .try_reserve_exact(output_length)
+        .map_err(|_| RecordError::AllocationFailed)?;
+    for part in layout {
+        let input = inputs
+            .source_bytes(part.input_index)
+            .ok_or(RecordError::InvalidReport)?;
+        let payload = input
+            .get(part.start..part.end)
+            .ok_or(RecordError::InvalidReport)?;
+        output.extend_from_slice(payload);
+    }
+    if output.len() != output_length {
+        return Err(RecordError::InvalidReport);
+    }
+    Ok(output)
+}
+
+pub(super) fn finish_receipt(receipt: &mut RecordGroupReceipt, output: &[u8]) {
+    receipt.output_length = Some(output.len());
+    receipt.output_sha256 = Some(sha256(output));
+}
+
+pub(super) fn finish_receipt_identity(
+    receipt: &mut RecordGroupReceipt,
+    output_length: usize,
+    output_sha256: &str,
+) {
+    receipt.output_length = Some(output_length);
+    receipt.output_sha256 = Some(output_sha256.to_owned());
 }

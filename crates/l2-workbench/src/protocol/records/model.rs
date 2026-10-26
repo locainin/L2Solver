@@ -442,6 +442,8 @@ pub enum RecordError {
     TooManyGroups { count: usize, maximum: usize },
     /// Materialized group candidate bytes exceed the aggregate output ceiling
     OutputTooLarge { length: usize, maximum: usize },
+    /// Compiled assembly metadata exceeds its caller-provided retention ceiling
+    PlanTooLarge { bytes: usize, maximum: usize },
     /// A bounded allocation failed
     AllocationFailed,
 }

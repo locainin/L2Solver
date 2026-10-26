@@ -62,6 +62,10 @@ impl fmt::Display for RecordError {
                 formatter,
                 "record candidate output needs {length} bytes; maximum is {maximum}"
             ),
+            Self::PlanTooLarge { bytes, maximum } => write!(
+                formatter,
+                "compiled record plan needs {bytes} bytes; maximum is {maximum}"
+            ),
             Self::AllocationFailed => formatter.write_str("record operation allocation failed"),
         }
     }

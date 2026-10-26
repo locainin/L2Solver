@@ -1,3 +1,4 @@
+mod assembly_plan;
 mod bootstrap;
 mod boundaries;
 mod cohorts;
