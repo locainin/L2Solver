@@ -1,6 +1,11 @@
 use super::*;
 use sha2::{Digest, Sha256};
 
+#[path = "relational/anchored.rs"]
+mod anchored;
+
+type SessionEncoder = fn(usize, &[u8]) -> Result<Vec<u8>, Box<dyn Error>>;
+
 #[test]
 fn extract_recovers_a_novel_transformed_protocol_from_synthetic_capture_packets()
 -> Result<(), Box<dyn Error>> {
@@ -66,7 +71,15 @@ fn synthetic_protocol_capture(
     artifact: &[u8],
     close_sessions: bool,
 ) -> Result<Vec<u8>, Box<dyn Error>> {
-    let chunks = artifact_chunks(artifact)?;
+    let chunks = artifact_chunks(artifact, &[3, 5, 7, 4, 6])?;
+    capture_from_protocol_chunks(&chunks, close_sessions, session_wire_bytes)
+}
+
+fn capture_from_protocol_chunks(
+    chunks: &[&[u8]],
+    close_sessions: bool,
+    encode_session: SessionEncoder,
+) -> Result<Vec<u8>, Box<dyn Error>> {
     let mut frames = Vec::new();
     // Session order differs from artifact order, including reversed records within a session
     for (session, group) in [1_usize, 3, 0, 2].into_iter().enumerate() {
@@ -79,7 +92,7 @@ fn synthetic_protocol_capture(
         if session % 2 == 1 {
             records.reverse();
         }
-        let wire = session_wire_bytes(session, &records.concat())?;
+        let wire = encode_session(session, &records.concat())?;
         let port = 42_400_u16 + u16::try_from(session)?;
         let sequence = 10_000_u32 + 1_000 * u32::try_from(session)?;
         frames.extend(tcp_session_frames(port, sequence, &wire, close_sessions)?);
@@ -191,15 +204,17 @@ fn internet_checksum(bytes: &[u8]) -> u16 {
     !sum
 }
 
-fn artifact_chunks(artifact: &[u8]) -> Result<Vec<&[u8]>, Box<dyn Error>> {
+fn artifact_chunks<'a>(
+    artifact: &'a [u8],
+    widths: &[usize],
+) -> Result<Vec<&'a [u8]>, Box<dyn Error>> {
+    if widths.is_empty() || widths.contains(&0) {
+        return Err("fixture chunk widths must be positive".into());
+    }
     let mut chunks = Vec::new();
     let mut start = 0;
     // Positive widths consume bytes; the take bound also caps the fixture loop
-    for width in [3_usize, 5, 7, 4, 6]
-        .into_iter()
-        .cycle()
-        .take(artifact.len())
-    {
+    for width in widths.iter().copied().cycle().take(artifact.len()) {
         if start == artifact.len() {
             break;
         }
@@ -226,20 +241,24 @@ fn protocol_record(sequence: usize, payload: &[u8]) -> Result<Vec<u8>, Box<dyn E
 }
 
 fn session_wire_bytes(session: usize, records: &[u8]) -> Result<Vec<u8>, Box<dyn Error>> {
-    let session = u8::try_from(session)?;
-    let seed = (0..12_u8)
-        .map(|index| {
-            0x1d_u8
-                .wrapping_add(session.wrapping_mul(17))
-                .wrapping_add(index.wrapping_mul(9))
-        })
-        .collect::<Vec<_>>();
+    let seed = session_seed(session)?;
     let encoded = reference_counter_stream(records, &seed)?;
     let mut wire = vec![0xa7, 0x51, u8::try_from(seed.len())?];
     wire.extend_from_slice(&seed);
     wire.push(0xc9);
     wire.extend_from_slice(&encoded);
     Ok(wire)
+}
+
+fn session_seed(session: usize) -> Result<Vec<u8>, Box<dyn Error>> {
+    let session = u8::try_from(session)?;
+    Ok((0..12_u8)
+        .map(|index| {
+            0x1d_u8
+                .wrapping_add(session.wrapping_mul(17))
+                .wrapping_add(index.wrapping_mul(9))
+        })
+        .collect())
 }
 
 #[test]

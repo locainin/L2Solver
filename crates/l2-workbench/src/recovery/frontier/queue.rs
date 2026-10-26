@@ -286,7 +286,130 @@ impl RecoveryCoordinator {
         }
     }
 
-    /// Move the oldest queued candidate into its task stage
+    /// Return the next queued candidate without changing its state
+    #[must_use]
+    pub fn peek_next_id(&self) -> Option<RecoveryCandidateId> {
+        self.frontier.front().copied()
+    }
+
+    /// Move a newly queued tail candidate to the front of the FIFO
+    ///
+    /// Merged and rejected outcomes leave queue order unchanged
+    ///
+    /// # Errors
+    /// Returns an invariant error if the queued candidate is not the current tail
+    pub fn prioritize_newly_queued(
+        &mut self,
+        outcome: &EnqueueOutcome,
+    ) -> Result<(), RecoveryError> {
+        let EnqueueOutcome::Queued(id) = outcome else {
+            return Ok(());
+        };
+        let is_tail = self.frontier.back().copied() == Some(*id);
+        let is_queued = self
+            .candidate(*id)
+            .is_some_and(|candidate| candidate.state() == &RecoveryCandidateState::Queued);
+        if !is_tail || !is_queued {
+            return Err(RecoveryError::InvariantFailure);
+        }
+
+        self.mark_completion_priority(*id)?;
+
+        self.frontier
+            .pop_back()
+            .ok_or(RecoveryError::InvariantFailure)?;
+        self.frontier.push_front(*id);
+        Ok(())
+    }
+
+    /// Prioritize queued child work only when its parent is on a completion path
+    ///
+    /// Newly queued candidates move in constant time. A queued merge is scanned and moved only
+    /// within the shared lineage-work allowance; exhaustion keeps its queue position and marker
+    /// Running and terminal merges remain unchanged
+    ///
+    /// # Errors
+    /// Returns an error if the parent is unknown or a queued merge is absent from the frontier
+    pub fn prioritize_queued_from_parent(
+        &mut self,
+        outcome: &EnqueueOutcome,
+        parent_id: RecoveryCandidateId,
+    ) -> Result<(), RecoveryError> {
+        let parent = self
+            .candidate(parent_id)
+            .ok_or(RecoveryError::UnknownCandidate { id: parent_id })?;
+        if parent.completion_priority() {
+            match outcome {
+                EnqueueOutcome::Queued(_) => self.prioritize_newly_queued(outcome)?,
+                EnqueueOutcome::Merged(id) => self.prioritize_merged_queued(*id)?,
+                EnqueueOutcome::MergedNeedsContext(_)
+                | EnqueueOutcome::CycleSkipped { .. }
+                | EnqueueOutcome::ResourceExhausted { .. } => {}
+            }
+        }
+        Ok(())
+    }
+
+    fn prioritize_merged_queued(
+        &mut self,
+        candidate_id: RecoveryCandidateId,
+    ) -> Result<(), RecoveryError> {
+        let candidate = self
+            .candidate(candidate_id)
+            .ok_or(RecoveryError::InvariantFailure)?;
+        if candidate.state() != &RecoveryCandidateState::Queued || candidate.completion_priority() {
+            return Ok(());
+        }
+        if self.frontier.front().copied() == Some(candidate_id) {
+            self.mark_completion_priority(candidate_id)?;
+            return Ok(());
+        }
+
+        let frontier_len = self.frontier.len();
+        // Charge each inspected entry before reading it, so a partial scan stays within budget
+        for index in 0..frontier_len {
+            if !self.try_charge_lineage_work(1) {
+                self.mark_completion_priority(candidate_id)?;
+                return Ok(());
+            }
+            if self.frontier.get(index).copied() != Some(candidate_id) {
+                continue;
+            }
+
+            // VecDeque::remove shifts at most the nearer side of the queue
+            let shifted_entries = index.min(frontier_len - index - 1);
+            if !self.try_charge_lineage_work(shifted_entries) {
+                self.mark_completion_priority(candidate_id)?;
+                return Ok(());
+            }
+            let removed = self
+                .frontier
+                .remove(index)
+                .ok_or(RecoveryError::InvariantFailure)?;
+            if removed != candidate_id {
+                return Err(RecoveryError::InvariantFailure);
+            }
+            self.frontier.push_front(removed);
+            self.mark_completion_priority(candidate_id)?;
+            return Ok(());
+        }
+
+        // A queued candidate must remain represented in the frontier
+        Err(RecoveryError::InvariantFailure)
+    }
+
+    fn mark_completion_priority(
+        &mut self,
+        candidate_id: RecoveryCandidateId,
+    ) -> Result<(), RecoveryError> {
+        self.candidates
+            .get_mut(candidate_id.index())
+            .ok_or(RecoveryError::InvariantFailure)?
+            .completion_priority = true;
+        Ok(())
+    }
+
+    /// Move the next queued candidate into its task stage
     ///
     /// # Errors
     /// Returns an error if the queued handle or its state violates an invariant

@@ -29,7 +29,7 @@ pub struct RecoveryResourcePolicy {
     pub max_transform_proposal_associations: usize,
     /// Maximum distinct parent links retained across all candidates
     pub max_parent_links: usize,
-    /// Maximum candidate visits and parent-edge examinations during cycle analysis
+    /// Maximum cycle-analysis visits plus inspected or shifted entries during bounded queue promotion
     pub max_lineage_work: usize,
     /// Maximum retained input-position and origin-node references across candidates
     pub max_context_aliases: usize,

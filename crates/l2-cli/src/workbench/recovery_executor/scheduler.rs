@@ -66,6 +66,17 @@ const fn transform_input_limit(
 }
 
 impl Executor<'_> {
+    /// Whether the queued task should run before another deferred assembly
+    pub(super) fn next_candidate_precedes_deferred_assembly(&self) -> bool {
+        self.coordinator
+            .peek_next_id()
+            .and_then(|candidate_id| self.coordinator.candidate(candidate_id))
+            .is_some_and(|candidate| {
+                candidate.completion_priority()
+                    || candidate.task() == &RecoveryTask::RecordDiscovery
+            })
+    }
+
     pub(super) fn enqueue_root(
         &mut self,
         node_id: u64,
@@ -314,7 +325,7 @@ impl Executor<'_> {
             self.coordinator
                 .enqueue_validated(parent_id, self.case, &[child_id], task.clone())?;
         let candidate_id = enqueue_candidate_id(&result);
-        self.record_enqueue(result, task, &[child_id])?;
+        self.record_completion_enqueue_from_parent(result, parent_id, task, &[child_id])?;
         Ok(candidate_id)
     }
 
@@ -336,7 +347,7 @@ impl Executor<'_> {
             }
             EnqueueOutcome::ResourceExhausted { .. } => DerivedTaskEnqueue::ResourceExhausted,
         };
-        self.record_enqueue(result, task, &[child_id])?;
+        self.record_completion_enqueue_from_parent(result, parent_id, task, &[child_id])?;
         if let (RecoveryTask::TransformDiscovery, DerivedTaskEnqueue::Candidate(candidate)) =
             (task, &outcome)
         {
@@ -403,7 +414,7 @@ impl Executor<'_> {
                 ..
             }
         );
-        self.record_enqueue(result, &task, &node_ids)?;
+        self.record_completion_enqueue(result, &task, &node_ids)?;
         if retry_as_singletons {
             let mut scheduled = HashSet::new();
             scheduled
@@ -559,7 +570,7 @@ impl Executor<'_> {
         let result = self
             .coordinator
             .enqueue_nodes(self.case, node_ids, task.clone())?;
-        self.record_enqueue(result, &task, node_ids)
+        self.record_completion_enqueue(result, &task, node_ids)
     }
 
     #[cfg(test)]
@@ -609,7 +620,7 @@ impl Executor<'_> {
             .coordinator
             .enqueue_nodes(self.case, node_ids, task.clone())?;
         let candidate_id = enqueue_candidate_id(&result);
-        self.record_enqueue(result, &task, node_ids)?;
+        self.record_completion_enqueue(result, &task, node_ids)?;
         let Some(candidate_id) = candidate_id else {
             return Ok(());
         };
@@ -819,6 +830,32 @@ impl Executor<'_> {
                 self.cycle_skips = self.cycle_skips.saturating_add(1);
                 self.refresh_late_context(candidate_id)?;
             }
+        }
+        Ok(())
+    }
+
+    fn record_completion_enqueue(
+        &mut self,
+        result: EnqueueOutcome,
+        task: &RecoveryTask,
+        node_ids: &[u64],
+    ) -> Result<(), RecoveryExecutionError> {
+        self.record_enqueue(result, task, node_ids)?;
+        self.coordinator.prioritize_newly_queued(&result)?;
+        Ok(())
+    }
+
+    fn record_completion_enqueue_from_parent(
+        &mut self,
+        result: EnqueueOutcome,
+        parent_id: RecoveryCandidateId,
+        task: &RecoveryTask,
+        node_ids: &[u64],
+    ) -> Result<(), RecoveryExecutionError> {
+        self.record_enqueue(result, task, node_ids)?;
+        if is_record_completion_task(task) {
+            self.coordinator
+                .prioritize_queued_from_parent(&result, parent_id)?;
         }
         Ok(())
     }
@@ -1157,6 +1194,15 @@ impl Executor<'_> {
             requested,
         });
     }
+}
+
+const fn is_record_completion_task(task: &RecoveryTask) -> bool {
+    matches!(
+        task,
+        RecoveryTask::AssembleRecords(_)
+            | RecoveryTask::StructuralValidation
+            | RecoveryTask::RecursiveExpansion
+    )
 }
 
 pub(super) const fn enqueue_candidate_id(outcome: &EnqueueOutcome) -> Option<RecoveryCandidateId> {

@@ -1,5 +1,7 @@
 use super::super::framing_materialize::FramingSelectionBasis;
-use super::{RecoveryPlan, execute, normal_policy, recover_case, recover_case_with_job};
+use super::{
+    RecoveryOmission, RecoveryPlan, execute, normal_policy, recover_case, recover_case_with_job,
+};
 use crate::arguments::RecoveryProfile;
 use l2_workbench::{
     evidence::{ByteMapping, Case, Edge, EvidenceStatus, SourceRange},
@@ -7,7 +9,7 @@ use l2_workbench::{
         ByteField, ByteOrder, FramingKind, IntegerField, LengthMeaning, RecordCount,
         RecordLengthMeaning, RecordSchema,
     },
-    recovery::{RecoveryCandidateState, RecoveryResult, RecoveryTask},
+    recovery::{RecoveryCandidateState, RecoveryResource, RecoveryResult, RecoveryTask},
 };
 use serde_json::{Value, json};
 use std::error::Error;
@@ -734,7 +736,11 @@ fn report_schemas(report: &Value) -> TestResult<Vec<RecordSchema>> {
         .map_err(Into::into)
 }
 
-fn assert_synthetic_schema_survives_default_search(case: &Case) -> TestResult<()> {
+fn assert_synthetic_schema_survives_default_search(
+    case: &Case,
+    artifacts: &[SyntheticArtifact],
+    summary: &super::RecoveryRunSummary,
+) -> TestResult<()> {
     let expected_schema = synthetic_schema();
     let expected_framing = serde_json::to_value(FramingKind::LengthPrefix {
         offset: 0,
@@ -752,6 +758,15 @@ fn assert_synthetic_schema_survives_default_search(case: &Case) -> TestResult<()
         .iter()
         .filter(|report| report.pointer("/cohort/framing_rule") == Some(&expected_framing))
         .collect::<Vec<_>>();
+    if matching_reports.len() != 2 {
+        save_synthetic_schema_failure_snapshot(
+            case,
+            &reports,
+            matching_reports.len(),
+            artifacts,
+            summary,
+        )?;
+    }
     assert_eq!(matching_reports.len(), 2);
     for report in matching_reports {
         let schemas = report_schemas(report)?;
@@ -761,6 +776,100 @@ fn assert_synthetic_schema_survives_default_search(case: &Case) -> TestResult<()
         );
     }
     Ok(())
+}
+
+fn save_synthetic_schema_failure_snapshot(
+    case: &Case,
+    reports: &[Value],
+    matching_report_count: usize,
+    artifacts: &[SyntheticArtifact],
+    summary: &super::RecoveryRunSummary,
+) -> TestResult<()> {
+    let details = serde_json::to_string_pretty(&json!({
+        "expected_matching_reports": 2,
+        "actual_matching_reports": matching_report_count,
+        "total_record_reports": reports.len(),
+        "artifact_count": artifacts.len(),
+        "recovered_artifacts": recovered_artifact_summaries(case, artifacts),
+        "reports": record_report_summaries(reports),
+        "recovery": recovery_failure_summary(summary),
+    }))?;
+    let snapshot = save_case_snapshot(case, "l2-unrelated-record-schema-failure-", Some(&details))?;
+    eprintln!(
+        "unexpected matching record-report count; snapshot={}; {details}",
+        snapshot.display()
+    );
+    Ok(())
+}
+
+fn recovered_artifact_summaries(case: &Case, artifacts: &[SyntheticArtifact]) -> Vec<Value> {
+    artifacts
+        .iter()
+        .filter(|artifact| case.blobs().iter().any(|blob| blob.bytes == artifact.bytes))
+        .map(|artifact| {
+            json!({
+                "session_index": artifact.session_index,
+                "direction_index": artifact.direction_index,
+                "identifier": artifact.identifier,
+            })
+        })
+        .collect()
+}
+
+fn record_report_summaries(reports: &[Value]) -> Vec<Value> {
+    reports
+        .iter()
+        .take(16)
+        .map(|report| {
+            json!({
+                "cohort": report.get("cohort"),
+                "result": report.get("result"),
+                "partition": report.get("partition"),
+                "input_frame_ref_count": report
+                    .get("input_frame_refs")
+                    .and_then(Value::as_array)
+                    .map(Vec::len),
+                "surviving_schema_count": report
+                    .pointer("/schema_discovery/surviving")
+                    .and_then(Value::as_array)
+                    .map(Vec::len),
+            })
+        })
+        .collect()
+}
+
+fn recovery_failure_summary(summary: &super::RecoveryRunSummary) -> Value {
+    let omissions = summary
+        .omissions
+        .iter()
+        .take(16)
+        .map(|omission| format!("{omission:?}"))
+        .collect::<Vec<_>>();
+    let evidence_edge_omissions = summary
+        .omissions
+        .iter()
+        .filter(|omission| {
+            matches!(
+                omission,
+                RecoveryOmission::ResourceExhausted {
+                    resource: RecoveryResource::EvidenceEdges,
+                    ..
+                }
+            )
+        })
+        .take(16)
+        .map(|omission| format!("{omission:?}"))
+        .collect::<Vec<_>>();
+    json!({
+        "candidate_count": summary.candidate_count,
+        "validated_artifact_count": summary.validated_artifact_count,
+        "case_evidence_collection_complete": summary.case_evidence_collection_complete,
+        "discovery": format!("{:?}", summary.discovery),
+        "resources": format!("{:?}", summary.resources),
+        "omission_count": summary.omissions.len(),
+        "omissions": omissions,
+        "evidence_edge_omissions": evidence_edge_omissions,
+    })
 }
 
 fn record_candidate<'a>(
@@ -3587,7 +3696,7 @@ fn default_recovery_retains_the_unrelated_length_prefixed_record_schema() -> Tes
         }
     };
     assert!(summary.candidate_count > 0);
-    assert_synthetic_schema_survives_default_search(&case)?;
+    assert_synthetic_schema_survives_default_search(&case, &artifacts, &summary)?;
     let recovered_artifacts = artifacts
         .iter()
         .filter(|artifact| case.blobs().iter().any(|blob| blob.bytes == artifact.bytes))

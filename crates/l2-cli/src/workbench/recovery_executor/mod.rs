@@ -292,53 +292,7 @@ fn execute_executor(executor: &mut Executor<'_>) -> Result<(), RecoveryExecution
     let mut evidence_stop = None;
     let mut evidence_stop_reported = false;
     loop {
-        while let Some(candidate_id) = executor.coordinator.pop_next()? {
-            if evidence_stop.is_none() {
-                let task = executor
-                    .coordinator
-                    .candidate(candidate_id)
-                    .ok_or(RecoveryError::UnknownCandidate { id: candidate_id })?
-                    .task();
-                evidence_stop = evidence::saturated_case_evidence(executor.case, task);
-            }
-            if let Some(stop) = evidence_stop {
-                executor.stop_candidate_for_case_evidence(
-                    candidate_id,
-                    stop,
-                    !evidence_stop_reported,
-                )?;
-                evidence_stop_reported = true;
-                continue;
-            }
-
-            let omission_start = executor.omissions.len();
-            let candidate_task = executor
-                .coordinator
-                .candidate(candidate_id)
-                .ok_or(RecoveryError::UnknownCandidate { id: candidate_id })?
-                .task()
-                .clone();
-            if let Some(progress) = &executor.job {
-                progress.begin_candidate(&candidate_task)?;
-            }
-            if let Err(error) = executor.execute_candidate(candidate_id) {
-                evidence_stop = Some(executor.stop_after_case_evidence_error(candidate_id, error)?);
-                evidence_stop_reported = true;
-                continue;
-            }
-            if let Some(progress) = &executor.job {
-                progress.finish_candidate(candidate_id, &executor.coordinator)?;
-            }
-            if let Some(stop) = evidence::recent_case_evidence_stop(
-                executor
-                    .omissions
-                    .get(omission_start..)
-                    .ok_or(RecoveryError::InvariantFailure)?,
-            ) {
-                evidence_stop = Some(stop);
-                evidence_stop_reported = true;
-            }
-        }
+        drain_candidate_frontier(executor, &mut evidence_stop, &mut evidence_stop_reported)?;
         if evidence_stop.is_some() {
             break;
         }
@@ -351,6 +305,9 @@ fn execute_executor(executor: &mut Executor<'_>) -> Result<(), RecoveryExecution
         if !record_discovery_barrier_reached && executor.plan.discover_records {
             record_discovery_barrier_reached = true;
             executor.enqueue_record_discovery_if_enabled()?;
+            if executor.coordinator.peek_next_id().is_some() {
+                continue;
+            }
         }
         if executor.flush_relational_cohorts()? {
             continue;
@@ -364,6 +321,70 @@ fn execute_executor(executor: &mut Executor<'_>) -> Result<(), RecoveryExecution
         break;
     }
 
+    Ok(())
+}
+
+fn drain_candidate_frontier(
+    executor: &mut Executor<'_>,
+    evidence_stop: &mut Option<evidence::CaseEvidenceStop>,
+    evidence_stop_reported: &mut bool,
+) -> Result<(), RecoveryExecutionError> {
+    loop {
+        if evidence_stop.is_none()
+            && !executor.pending_record_assemblies.is_empty()
+            && !executor.next_candidate_precedes_deferred_assembly()
+        {
+            executor.flush_pending_record_assemblies()?;
+        }
+        let Some(candidate_id) = executor.coordinator.pop_next()? else {
+            break;
+        };
+        if evidence_stop.is_none() {
+            let task = executor
+                .coordinator
+                .candidate(candidate_id)
+                .ok_or(RecoveryError::UnknownCandidate { id: candidate_id })?
+                .task();
+            *evidence_stop = evidence::saturated_case_evidence(executor.case, task);
+        }
+        if let Some(stop) = *evidence_stop {
+            executor.stop_candidate_for_case_evidence(
+                candidate_id,
+                stop,
+                !*evidence_stop_reported,
+            )?;
+            *evidence_stop_reported = true;
+            continue;
+        }
+
+        let omission_start = executor.omissions.len();
+        let candidate_task = executor
+            .coordinator
+            .candidate(candidate_id)
+            .ok_or(RecoveryError::UnknownCandidate { id: candidate_id })?
+            .task()
+            .clone();
+        if let Some(progress) = &executor.job {
+            progress.begin_candidate(&candidate_task)?;
+        }
+        if let Err(error) = executor.execute_candidate(candidate_id) {
+            *evidence_stop = Some(executor.stop_after_case_evidence_error(candidate_id, error)?);
+            *evidence_stop_reported = true;
+            continue;
+        }
+        if let Some(progress) = &executor.job {
+            progress.finish_candidate(candidate_id, &executor.coordinator)?;
+        }
+        if let Some(stop) = evidence::recent_case_evidence_stop(
+            executor
+                .omissions
+                .get(omission_start..)
+                .ok_or(RecoveryError::InvariantFailure)?,
+        ) {
+            *evidence_stop = Some(stop);
+            *evidence_stop_reported = true;
+        }
+    }
     Ok(())
 }
 
@@ -1027,6 +1048,9 @@ mod record_discovery_tests;
 #[cfg(test)]
 #[path = "../../../tests/workbench/recovery_record_work_budget.rs"]
 mod record_work_budget_tests;
+#[cfg(test)]
+#[path = "../../../tests/workbench/recovery_executor_scheduler_priority.rs"]
+mod scheduler_priority_tests;
 #[cfg(test)]
 #[path = "../../../tests/workbench/recovery_executor_support.rs"]
 mod test_support;

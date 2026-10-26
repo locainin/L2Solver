@@ -358,8 +358,16 @@ impl RecoveryCoordinator {
         Ok(())
     }
 
+    pub(super) const fn try_charge_lineage_work(&mut self, requested: usize) -> bool {
+        if requested > self.remaining_lineage_work() {
+            return false;
+        }
+        self.lineage_work += requested;
+        true
+    }
+
     const fn charge_lineage_work(&mut self) -> Option<EnqueueOutcome> {
-        if self.lineage_work >= self.resources.max_lineage_work {
+        if !self.try_charge_lineage_work(1) {
             return Some(EnqueueOutcome::ResourceExhausted {
                 resource: RecoveryResource::LineageWork,
                 limit: self.resources.max_lineage_work,
@@ -367,7 +375,6 @@ impl RecoveryCoordinator {
                 requested: 1,
             });
         }
-        self.lineage_work += 1;
         None
     }
 }

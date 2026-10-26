@@ -659,7 +659,7 @@ const fn resource_label(resource: RecoveryResource) -> &'static str {
         RecoveryResource::EvidenceSourceRanges => "evidence source range",
         RecoveryResource::EvidenceLimitations => "evidence limitation",
         RecoveryResource::ParentLinks => "parent link",
-        RecoveryResource::LineageWork => "lineage operation",
+        RecoveryResource::LineageWork => "lineage and queue-entry work unit",
         RecoveryResource::RecursionDepth => "recursion depth",
         RecoveryResource::ContextAliases => "context alias",
         RecoveryResource::PendingOriginLinks => "pending origin link",
@@ -754,8 +754,11 @@ pub struct RecoveryResourceSummary {
     pub max_parent_links: usize,
     pub parent_links_retained: usize,
     pub parent_links_remaining: usize,
+    /// Maximum cycle-analysis visits and queue entries inspected or shifted
     pub max_lineage_work: usize,
+    /// Cycle-analysis visits and queue entries inspected or shifted
     pub lineage_work_charged: usize,
+    /// Unspent cycle-analysis and queue-entry work units
     pub lineage_work_remaining: usize,
     pub max_context_aliases: usize,
     pub context_aliases_retained: usize,

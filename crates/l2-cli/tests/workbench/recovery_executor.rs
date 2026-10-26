@@ -4343,7 +4343,7 @@ fn source(case: &mut Case, kind: &str, bytes: &[u8]) -> Result<u64, Box<dyn Erro
     Ok(case.add_bytes_node(kind, bytes, Vec::new(), json!({}))?)
 }
 
-fn mapped_tcp_run(
+pub(super) fn mapped_tcp_run(
     case: &mut Case,
     bytes: &[u8],
     capture_fingerprint: &[u8],

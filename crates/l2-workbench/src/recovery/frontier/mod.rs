@@ -207,13 +207,13 @@ impl RecoveryCoordinator {
         self.pending_origin_links_retained
     }
 
-    /// Return candidate visits and parent-edge examinations charged globally
+    /// Return cycle-analysis visits and bounded queued-promotion entries charged globally
     #[must_use]
     pub const fn lineage_work_charged(&self) -> usize {
         self.lineage_work
     }
 
-    /// Return the unspent portion of the shared lineage-work budget
+    /// Return the unspent cycle-analysis and queued-promotion entry allowance
     #[must_use]
     pub const fn remaining_lineage_work(&self) -> usize {
         self.resources.max_lineage_work - self.lineage_work

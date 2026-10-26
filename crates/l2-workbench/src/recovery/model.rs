@@ -159,7 +159,7 @@ pub enum RecoveryResource {
     ContextAliases,
     /// Pending direct result links retained for late candidate origins
     PendingOriginLinks,
-    /// Candidate visits and parent-edge examinations during cycle analysis
+    /// Candidate and parent-edge visits plus inspected or shifted entries during bounded promotion
     LineageWork,
     /// Maximum allowed expansion depth
     RecursionDepth,
@@ -265,6 +265,7 @@ pub struct RecoveryCandidate {
     pub(super) parent_id_set: HashSet<RecoveryCandidateId>,
     pub(super) origin_node_ids: HashSet<u64>,
     pub(super) pending_origin_node_ids: Vec<u64>,
+    pub(super) completion_priority: bool,
     pub(super) state: RecoveryCandidateState,
 }
 
@@ -297,6 +298,12 @@ impl RecoveryCandidate {
     #[must_use]
     pub fn pending_origin_node_ids(&self) -> &[u64] {
         &self.pending_origin_node_ids
+    }
+
+    /// Return whether this candidate continues a prioritized record-completion path
+    #[must_use]
+    pub const fn completion_priority(&self) -> bool {
+        self.completion_priority
     }
 
     /// Return the current queue or terminal state

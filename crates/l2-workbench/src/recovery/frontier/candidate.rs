@@ -235,6 +235,7 @@ fn prepare_candidate(
         parent_id_set,
         origin_node_ids,
         pending_origin_node_ids: Vec::new(),
+        completion_priority: false,
         state: RecoveryCandidateState::Queued,
     })
 }
