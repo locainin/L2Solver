@@ -70,6 +70,8 @@ struct PreparedSearch {
     locators_complete: bool,
 }
 
+const RETAINED_LOCATOR_PAIR_TARGET: usize = 8;
+
 /// Learn session-relative seed and payload ranges, then apply frozen rules to whole held-out sessions
 ///
 /// Marker bytes and offsets are proposed from discovery sessions only. Each discovered rule reads
@@ -271,7 +273,11 @@ impl SearchContext<'_, '_> {
     ) -> Result<bool, RelationalTransformError> {
         if search.candidates_examined == self.plan.limits.max_candidates {
             search.stop(RelationalSearchLimit::CandidateCount);
-            search.omitted_candidates = 1;
+            search.omitted_candidates = search.omitted_candidates.checked_add(1).ok_or(
+                RelationalTransformError::InvalidPlan(
+                    "omitted relational candidate count overflowed",
+                ),
+            )?;
             search.omitted_candidates_exact = false;
             return Ok(false);
         }
@@ -338,7 +344,7 @@ fn evaluate_candidate(
             job.increment(Counter::CandidatesRejected, 1)?;
         }
         if search.work_bytes == plan.limits.max_work_bytes {
-            stop_for_work_limit(search, true);
+            stop_for_work_limit(search, true)?;
             return Ok(false);
         }
         return Ok(true);
@@ -357,7 +363,7 @@ fn evaluate_candidate(
         },
     )?;
     if search.work_bytes >= plan.limits.max_work_bytes {
-        stop_for_work_limit(search, false);
+        stop_for_work_limit(search, false)?;
         return Ok(false);
     }
     Ok(true)
@@ -411,28 +417,56 @@ fn retain_candidate(
     limits: RelationalTransformLimits,
     candidate: RelationalTransformCandidate,
 ) -> Result<(), RelationalTransformError> {
-    if search.candidates.len() < limits.max_retained_candidates {
+    let per_pair_limit = limits
+        .max_retained_candidates
+        .div_ceil(RETAINED_LOCATOR_PAIR_TARGET);
+    let retained_for_pair = search
+        .candidates
+        .iter()
+        .filter(|retained| {
+            retained.rule.seed_locator == candidate.rule.seed_locator
+                && retained.rule.payload_locator == candidate.rule.payload_locator
+        })
+        .count();
+    if search.candidates.len() < limits.max_retained_candidates
+        && retained_for_pair < per_pair_limit
+    {
         search
             .candidates
             .try_reserve(1)
             .map_err(|_| RelationalTransformError::AllocationFailed)?;
         search.candidates.push(candidate);
     } else {
-        search.omitted_candidates = search.omitted_candidates.checked_add(1).ok_or(
-            RelationalTransformError::InvalidPlan("omitted relational candidate count overflowed"),
-        )?;
-        search.omitted_candidates_exact = true;
-        search.record_limit(RelationalSearchLimit::RetainedCandidates);
+        omit_retained_candidate(search)?;
     }
     Ok(())
 }
 
-fn stop_for_work_limit(search: &mut SearchState, one_candidate_omitted: bool) {
+fn omit_retained_candidate(search: &mut SearchState) -> Result<(), RelationalTransformError> {
+    search.omitted_candidates =
+        search
+            .omitted_candidates
+            .checked_add(1)
+            .ok_or(RelationalTransformError::InvalidPlan(
+                "omitted relational candidate count overflowed",
+            ))?;
+    search.omitted_candidates_exact = true;
+    search.record_limit(RelationalSearchLimit::RetainedCandidates);
+    Ok(())
+}
+
+fn stop_for_work_limit(
+    search: &mut SearchState,
+    one_candidate_omitted: bool,
+) -> Result<(), RelationalTransformError> {
     search.stop(RelationalSearchLimit::WorkBytes);
     if one_candidate_omitted {
-        search.omitted_candidates = 1;
+        search.omitted_candidates = search.omitted_candidates.checked_add(1).ok_or(
+            RelationalTransformError::InvalidPlan("omitted relational candidate count overflowed"),
+        )?;
     }
     search.omitted_candidates_exact = false;
+    Ok(())
 }
 
 fn build_report(

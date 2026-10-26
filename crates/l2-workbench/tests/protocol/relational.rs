@@ -1,4 +1,5 @@
 use l2_workbench::{
+    artifact::{ArtifactValidationFormat, ArtifactValidationOutcome, ArtifactValidator},
     derivation::{CounterByteOrder, CounterWidth, SeedCounterOrder},
     protocol::{
         ByteOrder, Direction, MessageContext, RelationalCounterReset, RelationalFalsification,
@@ -414,6 +415,114 @@ fn recognizes_length_fields_across_supported_widths_and_byte_orders() -> TestRes
 }
 
 #[test]
+fn retention_keeps_later_structural_rule_across_payload_starts_and_configurations() -> TestResult<()>
+{
+    let records = relational_retention_sessions()?;
+    let samples = borrow_samples(&records)?;
+    let plan = relational_retention_plan();
+    let report = infer_relational_transform_candidates(&samples, &plan)?;
+
+    assert!(report.search_exhaustive_within_plan);
+    assert!(report.omitted_candidates_exact);
+    assert!(report.omitted_candidates > 0);
+    assert_eq!(report.candidates.len(), plan.limits.max_retained_candidates);
+    assert_eq!(
+        report.candidate_limit_remaining,
+        plan.limits.max_candidates - report.candidates_examined
+    );
+    assert!(
+        report
+            .search_limits
+            .contains(&l2_workbench::protocol::RelationalSearchLimit::RetainedCandidates)
+    );
+
+    let mut locator_pairs = Vec::new();
+    for candidate in &report.candidates {
+        if !locator_pairs.iter().any(|(seed, payload)| {
+            *seed == candidate.rule.seed_locator && *payload == candidate.rule.payload_locator
+        }) {
+            locator_pairs.push((
+                candidate.rule.seed_locator.clone(),
+                candidate.rule.payload_locator.clone(),
+            ));
+        }
+    }
+    assert_eq!(locator_pairs.len(), 8);
+    for (seed, payload) in &locator_pairs {
+        let pair_candidates = report
+            .candidates
+            .iter()
+            .filter(|candidate| {
+                candidate.rule.seed_locator == *seed && candidate.rule.payload_locator == *payload
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(pair_candidates.len(), 2);
+        let first = pair_candidates
+            .first()
+            .ok_or("the retained locator pair has no first configuration")?;
+        let second = pair_candidates
+            .get(1)
+            .ok_or("the retained locator pair has no second configuration")?;
+        assert!(
+            first.rule.operation != second.rule.operation
+                || first.rule.counter_reset != second.rule.counter_reset
+        );
+    }
+
+    let target = report
+        .candidates
+        .iter()
+        .find(|candidate| is_target_retention_rule(candidate, 10))
+        .ok_or("the later structurally valid payload rule was omitted")?;
+    let earlier_wrong_start = report
+        .candidates
+        .iter()
+        .find(|candidate| is_target_retention_rule(candidate, 9))
+        .ok_or("the earlier deferred-transform rule was not retained")?;
+    assert_eq!(
+        target.status,
+        RelationalTransformStatus::TransformSupportedAcrossSessions
+    );
+    assert_eq!(
+        earlier_wrong_start.status,
+        RelationalTransformStatus::TransformSupportedAcrossSessions
+    );
+
+    let target_output = aggregate_rule_output(&samples, &target.rule, plan.limits)?;
+    let wrong_output = aggregate_rule_output(&samples, &earlier_wrong_start.rule, plan.limits)?;
+    assert!(validates_exact_der(&target_output));
+    assert!(!validates_exact_der(&wrong_output));
+    Ok(())
+}
+
+#[test]
+fn candidate_limit_preserves_known_retention_omissions() -> TestResult<()> {
+    let records = relational_retention_sessions()?;
+    let samples = borrow_samples(&records)?;
+    let mut plan = relational_retention_plan();
+    plan.limits.max_candidates = 4;
+    plan.limits.max_retained_candidates = 1;
+    let report = infer_relational_transform_candidates(&samples, &plan)?;
+
+    assert_eq!(report.candidates_examined, 4);
+    assert_eq!(report.candidates.len(), 1);
+    assert_eq!(report.candidate_limit_remaining, 0);
+    assert!(!report.search_exhaustive_within_plan);
+    assert!(!report.omitted_candidates_exact);
+    assert_eq!(report.omitted_candidates, 4);
+    assert_eq!(
+        report.search_limit,
+        Some(l2_workbench::protocol::RelationalSearchLimit::RetainedCandidates)
+    );
+    assert!(
+        report
+            .search_limits
+            .contains(&l2_workbench::protocol::RelationalSearchLimit::CandidateCount)
+    );
+    Ok(())
+}
+
+#[test]
 fn does_not_retain_a_same_message_rule_with_overlapping_seed_and_payload_ranges()
 -> Result<(), Box<dyn Error>> {
     let records = overlapping_same_message_sessions();
@@ -515,6 +624,123 @@ fn length_prefixed_seed_plan() -> RelationalTransformPlan {
         initial_counters: vec![0],
         counter_resets: vec![RelationalCounterReset::Continuous],
     }
+}
+
+fn relational_retention_plan() -> RelationalTransformPlan {
+    RelationalTransformPlan {
+        limits: RelationalTransformLimits {
+            max_cohorts: 4,
+            max_sessions: 4,
+            max_records_per_session: 1,
+            max_record_bytes: 128,
+            max_total_bytes: 1024,
+            max_marker_bytes: 1,
+            max_marker_offset: 0,
+            max_seed_bytes: SEED_LENGTH,
+            max_locator_offset: 10,
+            max_locator_candidates: 2048,
+            max_candidates: 30_000,
+            max_retained_candidates: 16,
+            max_work_bytes: 32 * 1024 * 1024,
+        },
+        parser_scope: RelationalParserScope::AcrossSessions,
+        parser_formats: vec![ArtifactValidationFormat::Der],
+        counter_widths: vec![CounterWidth::OneByte, CounterWidth::TwoBytes],
+        counter_byte_orders: vec![CounterByteOrder::BigEndian, CounterByteOrder::LittleEndian],
+        seed_orders: vec![
+            SeedCounterOrder::SeedThenCounter,
+            SeedCounterOrder::CounterThenSeed,
+        ],
+        initial_counters: vec![0],
+        counter_resets: vec![
+            RelationalCounterReset::Continuous,
+            RelationalCounterReset::PerRecord,
+        ],
+    }
+}
+
+fn relational_retention_sessions() -> TestResult<Vec<OwnedRecord>> {
+    let plaintext = der_sample(1);
+    let chunk_boundaries = [15_usize, 30, 45, plaintext.len()];
+    let mut records = Vec::new();
+    let mut chunk_start = 0_usize;
+    for session_number in 1_u8..=4 {
+        let chunk_end = chunk_boundaries
+            .get(usize::from(session_number - 1))
+            .copied()
+            .ok_or("the synthetic session chunk boundary is missing")?;
+        let chunk = plaintext
+            .get(chunk_start..chunk_end)
+            .ok_or("the synthetic session chunk range is invalid")?;
+        chunk_start = chunk_end;
+
+        let seed = (0_u8..u8::try_from(SEED_LENGTH)?)
+            .map(|index| {
+                session_number
+                    .wrapping_mul(31)
+                    .wrapping_add(index.wrapping_mul(23))
+            })
+            .collect::<Vec<_>>();
+        let ciphertext = encrypt_continuous(chunk, &seed)?;
+        let mut message = vec![u8::try_from(SEED_LENGTH)?];
+        message.extend_from_slice(&seed);
+        message.push(DECOY_MARKER);
+        message.extend_from_slice(&ciphertext);
+        records.push((u32::from(session_number), Direction::FirstToSecond, message));
+    }
+    Ok(records)
+}
+
+fn is_target_retention_rule(
+    candidate: &l2_workbench::protocol::RelationalTransformCandidate,
+    payload_offset: usize,
+) -> bool {
+    let RelationalOperationTemplate::Sha256CounterXor(operation) = candidate.rule.operation;
+    candidate.rule.seed_locator.value_offset == 1
+        && candidate.rule.seed_locator.value_length == Some(SEED_LENGTH)
+        && candidate.rule.seed_locator.declared_length.is_some()
+        && candidate.rule.payload_locator.value_offset == payload_offset
+        && candidate.rule.counter_reset == RelationalCounterReset::Continuous
+        && operation.initial_counter == 0
+        && operation.counter_width == CounterWidth::OneByte
+        && operation.counter_byte_order == CounterByteOrder::BigEndian
+        && operation.seed_order == SeedCounterOrder::SeedThenCounter
+}
+
+fn aggregate_rule_output(
+    samples: &[RelationalRecordSample<'_>],
+    rule: &l2_workbench::protocol::RelationalTransformRule,
+    limits: RelationalTransformLimits,
+) -> TestResult<Vec<u8>> {
+    let mut outputs = Vec::new();
+    for session in 1..=4 {
+        let session_samples = samples
+            .iter()
+            .filter(|sample| sample.context.session == session)
+            .cloned()
+            .collect::<Vec<_>>();
+        let output =
+            apply_relational_transform_rule(&session_samples, rule, limits, limits.max_work_bytes)?;
+        outputs.push((output.session_order, output.bytes));
+    }
+    outputs.sort_unstable_by_key(|(session_order, _)| *session_order);
+    let output_length = outputs
+        .iter()
+        .try_fold(0_usize, |total, (_, bytes)| total.checked_add(bytes.len()))
+        .ok_or("the synthetic aggregate output length overflowed")?;
+    let mut aggregate = Vec::with_capacity(output_length);
+    for (_, bytes) in outputs {
+        aggregate.extend_from_slice(&bytes);
+    }
+    Ok(aggregate)
+}
+
+fn validates_exact_der(bytes: &[u8]) -> bool {
+    matches!(
+        ArtifactValidator::default().validate_as(ArtifactValidationFormat::Der, bytes),
+        ArtifactValidationOutcome::Validated { range, .. }
+            if range.offset == 0 && range.length == bytes.len()
+    )
 }
 
 fn length_prefixed_seed_sessions(

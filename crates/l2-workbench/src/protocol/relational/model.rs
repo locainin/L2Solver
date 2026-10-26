@@ -45,7 +45,7 @@ pub struct RelationalTransformLimits {
     pub max_locator_candidates: usize,
     /// Maximum transform configurations attempted
     pub max_candidates: usize,
-    /// Maximum successful or falsified rule reports retained
+    /// Maximum retained rules; the limit is shared across locator pairs and their configurations
     pub max_retained_candidates: usize,
     /// Maximum canonical derivation work charged across discovery and holdout
     pub max_work_bytes: usize,
@@ -374,7 +374,7 @@ pub enum RelationalSearchLimit {
     WorkBytes,
     /// A seed or payload locator domain reached its independent bound
     LocatorCount,
-    /// The maximum number of passing or falsified rule reports was reached
+    /// The total or per-pair retained rule bound omitted one or more reports
     RetainedCandidates,
 }
 
