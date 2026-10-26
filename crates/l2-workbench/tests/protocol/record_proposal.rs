@@ -1,8 +1,9 @@
 use l2_workbench::protocol::{
-    ByteField, ByteOrder, IntegerField, RecordCount, RecordDiscoveryError, RecordDiscoveryLimits,
-    RecordDiscoveryPartition, RecordLengthMeaning, RecordLimits, RecordSchema,
-    RecordSchemaDiscoverySpace, RecordSchemaProposalLimits, RecordSchemaProposalValidationBasis,
-    analyze_record_schemas, analyze_record_schemas_with_repeated_boundaries,
+    ByteField, ByteOrder, IntegerField, RecordBoundaryCue, RecordCount, RecordDiscoveryError,
+    RecordDiscoveryLimits, RecordDiscoveryPartition, RecordLengthMeaning, RecordLimits,
+    RecordSchema, RecordSchemaDiscoverySpace, RecordSchemaProposalLimits,
+    RecordSchemaProposalValidationBasis, analyze_record_schemas,
+    analyze_record_schemas_with_repeated_boundaries,
     analyze_record_schemas_with_repeated_boundaries_and_offsets, discover_record_schemas,
     propose_record_schema_space,
 };
@@ -35,6 +36,77 @@ fn record(identifier: &[u8], sequence: u16, payload: &[u8]) -> Vec<u8> {
     );
     bytes.extend_from_slice(payload);
     bytes
+}
+
+fn gap_record(identifier: [u8; 2], sequence: u16, payload: &[u8]) -> Vec<u8> {
+    let mut bytes = Vec::with_capacity(7 + payload.len());
+    bytes.extend_from_slice(&identifier);
+    bytes.extend_from_slice(&sequence.to_be_bytes());
+    bytes.extend_from_slice(
+        &u16::try_from(payload.len())
+            .unwrap_or(u16::MAX)
+            .to_le_bytes(),
+    );
+    bytes.push(0x5a);
+    bytes.extend_from_slice(payload);
+    bytes
+}
+
+type RepeatedTrainingRecords = [[Vec<u8>; 2]; 4];
+
+fn repeated_training_records() -> RepeatedTrainingRecords {
+    [
+        [record(b"OB", 0, b"a"), record(b"OB", 4, b"bc")],
+        [record(b"OB", 6, b"def"), record(b"OB", 2, b"ghij")],
+        [record(b"OB", 1, b"klmno"), record(b"OB", 7, b"p")],
+        [record(b"OB", 3, b"qr"), record(b"OB", 5, b"stuv")],
+    ]
+}
+
+const fn repeated_expected_schema() -> RecordSchema {
+    RecordSchema {
+        records_offset: 0,
+        count: RecordCount::UntilEnd,
+        identifier: ByteField {
+            offset: 0,
+            width: 2,
+        },
+        sequence: IntegerField {
+            offset: 2,
+            width: 2,
+            byte_order: ByteOrder::LittleEndian,
+        },
+        length: IntegerField {
+            offset: 4,
+            width: 4,
+            byte_order: ByteOrder::BigEndian,
+        },
+        data_offset: 8,
+        length_meaning: RecordLengthMeaning::PayloadBytes,
+        sequence_base: 0,
+        terminal_sequence: None,
+    }
+}
+
+fn assert_repeated_boundary_cues(
+    cues: &[RecordBoundaryCue],
+    training_records: &RepeatedTrainingRecords,
+) {
+    for (message_index, records) in training_records.iter().enumerate() {
+        let mut start = 0;
+        for record in records {
+            let end = start + record.len();
+            assert!(
+                cues.iter().any(|cue| {
+                    cue.message_index == message_index
+                        && cue.range.start == start
+                        && cue.range.end == end
+                }),
+                "canonical record boundary should be reported for training message {message_index}"
+            );
+            start = end;
+        }
+    }
 }
 
 const fn expected_schema() -> RecordSchema {
@@ -218,40 +290,14 @@ fn shuffled_sequence_values_still_propose_and_validate_the_record_layout()
 #[test]
 fn repeated_records_in_each_message_propose_and_validate_the_record_layout()
 -> Result<(), Box<dyn Error>> {
-    let training_records = [
-        [record(b"OB", 0, b"a"), record(b"OB", 4, b"bc")],
-        [record(b"OB", 6, b"def"), record(b"OB", 2, b"ghij")],
-        [record(b"OB", 1, b"klmno"), record(b"OB", 7, b"p")],
-        [record(b"OB", 3, b"qr"), record(b"OB", 5, b"stuv")],
-    ];
+    let training_records = repeated_training_records();
     let training = training_records
         .iter()
         .map(|records| records.concat())
         .collect::<Vec<_>>();
     let held_out = [record(b"OB", 8, b"wxyz"), record(b"OB", 9, b"012")].concat();
     let training_messages = training.iter().map(Vec::as_slice).collect::<Vec<_>>();
-    let expected = RecordSchema {
-        records_offset: 0,
-        count: RecordCount::UntilEnd,
-        identifier: ByteField {
-            offset: 0,
-            width: 2,
-        },
-        sequence: IntegerField {
-            offset: 2,
-            width: 2,
-            byte_order: ByteOrder::LittleEndian,
-        },
-        length: IntegerField {
-            offset: 4,
-            width: 4,
-            byte_order: ByteOrder::BigEndian,
-        },
-        data_offset: 8,
-        length_meaning: RecordLengthMeaning::PayloadBytes,
-        sequence_base: 0,
-        terminal_sequence: None,
-    };
+    let expected = repeated_expected_schema();
 
     let analysis = analyze_record_schemas_with_repeated_boundaries(
         &training_messages,
@@ -293,21 +339,87 @@ fn repeated_records_in_each_message_propose_and_validate_the_record_layout()
             .any(|hypothesis| hypothesis.schema == expected),
         "the same learned layout should parse the held-out concatenated message"
     );
-    for (message_index, records) in training_records.iter().enumerate() {
-        let mut start = 0;
-        for record in records {
-            let end = start + record.len();
-            assert!(
-                repeated.proposal.repeated_boundary_cues.iter().any(|cue| {
-                    cue.message_index == message_index
-                        && cue.range.start == start
-                        && cue.range.end == end
-                }),
-                "canonical record boundary should be reported for training message {message_index}"
-            );
-            start = end;
-        }
-    }
+    assert_repeated_boundary_cues(&repeated.proposal.repeated_boundary_cues, &training_records);
+    Ok(())
+}
+
+#[test]
+fn repeated_boundary_search_reaches_compact_headers_with_a_small_payload_gap()
+-> Result<(), Box<dyn Error>> {
+    let training = [
+        [gap_record(*b"A1", 6, b"a"), gap_record(*b"A1", 2, b"bc")].concat(),
+        [
+            gap_record(*b"A1", 1, b"def"),
+            gap_record(*b"A1", 5, b"ghij"),
+        ]
+        .concat(),
+        [gap_record(*b"A1", 4, b"klmno"), gap_record(*b"A1", 0, b"p")].concat(),
+        [gap_record(*b"A1", 7, b"qr"), gap_record(*b"A1", 3, b"stuv")].concat(),
+    ];
+    let held_out = [
+        gap_record(*b"A1", 8, b"wxyz"),
+        gap_record(*b"A1", 9, b"012"),
+    ]
+    .concat();
+    let training_messages = training.iter().map(Vec::as_slice).collect::<Vec<_>>();
+    let expected = RecordSchema {
+        records_offset: 0,
+        count: RecordCount::UntilEnd,
+        identifier: ByteField {
+            offset: 0,
+            width: 2,
+        },
+        sequence: IntegerField {
+            offset: 2,
+            width: 2,
+            byte_order: ByteOrder::BigEndian,
+        },
+        length: IntegerField {
+            offset: 4,
+            width: 2,
+            byte_order: ByteOrder::LittleEndian,
+        },
+        data_offset: 7,
+        length_meaning: RecordLengthMeaning::PayloadBytes,
+        sequence_base: 0,
+        terminal_sequence: None,
+    };
+    let mut limits = proposal_limits(100_000);
+    limits.max_field_offset = 15;
+    limits.max_length_checks = 512;
+    limits.max_field_checks_per_domain = 512;
+
+    let analysis = analyze_record_schemas_with_repeated_boundaries(
+        &training_messages,
+        &[held_out.as_slice()],
+        limits,
+    )?;
+    let repeated = analysis
+        .repeated_boundaries
+        .as_ref()
+        .ok_or("the repeated-boundary strategy should receive a shared budget")?;
+    let proposal = &repeated.proposal;
+    let space = proposal
+        .candidate_space
+        .as_ref()
+        .ok_or("repeated boundaries should produce bounded schema candidates")?;
+
+    assert!(space.length_fields.contains(&expected.length));
+    assert!(space.data_offsets.contains(&expected.data_offset));
+    assert!(space.length_meanings.contains(&expected.length_meaning));
+    assert_eq!(proposal.examined_length_checks, 256);
+    assert_eq!(proposal.omitted_length_checks, 1_418);
+    assert!(!proposal.search_exhaustive_within_plan);
+    assert!(
+        repeated
+            .discovery
+            .as_ref()
+            .is_some_and(|discovery| discovery
+                .surviving
+                .iter()
+                .any(|candidate| candidate.schema == expected)),
+        "the bounded repeated strategy should parse the frozen held-out layout"
+    );
     Ok(())
 }
 

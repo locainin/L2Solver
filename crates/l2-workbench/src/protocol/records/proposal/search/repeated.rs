@@ -115,29 +115,23 @@ fn length_candidates(
     maximum_checks: usize,
     record_limits: RecordLimits,
 ) -> Result<LengthFields, RecordDiscoveryError> {
-    let (total_checks, maximum_gap) = length_domain_stats(fields, maximum_data_offset)?;
+    let (total_checks, _) = length_domain_stats(fields, maximum_data_offset)?;
     let mut search = LengthCandidateSearch::new(messages, record_limits)?;
 
-    // Check compact length fields and payload boundaries before wider gaps
-    if let Some(maximum_gap) = maximum_gap {
-        'gaps: for gap in 0..=maximum_gap {
+    // Visit the shortest payload boundaries first so compact headers share the budget fairly
+    if maximum_data_offset > 0 {
+        'boundaries: for data_offset in 1..=maximum_data_offset {
             for field in fields {
                 let field_end = field
                     .offset
                     .checked_add(field.width)
                     .ok_or(RecordDiscoveryError::InvalidLimits)?;
-                let Some(remaining_gap) = maximum_data_offset.checked_sub(field_end) else {
-                    continue;
-                };
-                if gap > remaining_gap {
+                if field_end > data_offset {
                     continue;
                 }
-                let data_offset = field_end
-                    .checked_add(gap)
-                    .ok_or(RecordDiscoveryError::InvalidLimits)?;
                 for meaning in LENGTH_MEANINGS {
                     if search.result.examined_checks == maximum_checks {
-                        break 'gaps;
+                        break 'boundaries;
                     }
                     search.check_layout(*field, data_offset, meaning)?;
                 }
