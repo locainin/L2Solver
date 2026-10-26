@@ -169,22 +169,29 @@ impl Executor<'_> {
             .coordinator
             .candidate(candidate_id)
             .ok_or(RecoveryError::UnknownCandidate { id: candidate_id })?;
+        // Follow-up evidence writes can hit the Case quota after the primary task has finished
+        let has_committed_result = matches!(
+            candidate.state(),
+            RecoveryCandidateState::Finished { .. } | RecoveryCandidateState::ContextPending { .. }
+        );
         let task = candidate.task().clone();
         let origins = candidate
             .inputs()
             .iter()
             .flat_map(|input| input.origin_node_ids().iter().copied())
             .collect::<Vec<_>>();
-        self.coordinator.finish(
-            self.case,
-            candidate_id,
-            RecoveryResult::ResourceExhausted {
-                resource: stop.resource,
-                limit: stop.limit,
-                used: stop.used,
-                requested: stop.requested,
-            },
-        )?;
+        if !has_committed_result {
+            self.coordinator.finish(
+                self.case,
+                candidate_id,
+                RecoveryResult::ResourceExhausted {
+                    resource: stop.resource,
+                    limit: stop.limit,
+                    used: stop.used,
+                    requested: stop.requested,
+                },
+            )?;
+        }
         if record_omission {
             self.omissions.push(RecoveryOmission::ResourceExhausted {
                 task,
