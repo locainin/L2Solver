@@ -1,5 +1,5 @@
 use l2_workbench::job::{Job, Phase, PhaseState, cache::SourceFingerprint, cache::SourceIdentity};
-use serde_json::json;
+use serde_json::{Value, json};
 use std::{error::Error, fs, io, path::PathBuf};
 use tempfile::TempDir;
 
@@ -49,16 +49,18 @@ impl Fixture {
         let manifest: serde_json::Value =
             serde_json::from_slice(&fs::read(self.output.join("manifest.json"))?)?;
         assert_eq!(
-            manifest["l2solver_result"]["job"]["current_phase"],
-            "publication"
+            json_field(&manifest, "/l2solver_result/job/current_phase")?.as_str(),
+            Some("publication")
         );
-        assert!(
-            manifest["l2solver_result"]["job"]["phases"]
-                .as_array()
-                .is_some_and(|phases| phases.iter().any(|phase| {
-                    phase["phase"] == "publication" && phase["state"] == "in_progress"
-                }))
-        );
+        let publication_started = json_field(&manifest, "/l2solver_result/job/phases")?
+            .as_array()
+            .is_some_and(|phases| {
+                phases.iter().any(|phase| {
+                    phase.get("phase").and_then(Value::as_str) == Some("publication")
+                        && phase.get("state").and_then(Value::as_str) == Some("in_progress")
+                })
+            });
+        assert!(publication_started);
         Ok(())
     }
 
@@ -158,7 +160,13 @@ fn newly_published_complete_result_is_reused_with_declared_artifacts() -> TestRe
         .ok_or("an owned result should be available")?;
     assert!(reused.complete);
     assert_eq!(reused.artifacts.len(), 1);
-    assert_eq!(reused.artifacts[0].file, "artifact.bin");
+    assert_eq!(
+        reused
+            .artifacts
+            .first()
+            .map(|artifact| artifact.file.as_str()),
+        Some("artifact.bin")
+    );
     Ok(())
 }
 
@@ -176,7 +184,7 @@ fn bounded_identity_deserialization_accepts_fast_source_fingerprints() -> TestRe
     assert_eq!(parsed, identity);
 
     let mut value = serde_json::to_value(&identity)?;
-    value["source"]["value"]["sample_sha256"] = json!("invalid");
+    *json_field_mut(&mut value, "/source/value/sample_sha256")? = json!("invalid");
     assert!(serde_json::from_value::<ResultIdentity>(value).is_err());
     Ok(())
 }
@@ -202,9 +210,9 @@ fn changed_policy_returns_actionable_conflict() -> TestResult {
     changed.settings = json!({"flows": false, "limit": 7});
 
     let existing = ResultDirectory::inspect(&fixture.output, ResultKind::Extract)?;
-    let error = existing
-        .reuse(&changed, Some(&fixture.input), false)
-        .expect_err("different policy must not reuse an old result");
+    let Err(error) = existing.reuse(&changed, Some(&fixture.input), false) else {
+        return Err("different policy must not reuse an old result".into());
+    };
     let message = error.to_string();
     assert!(message.contains("--refresh") || message.contains("-o"));
     Ok(())
@@ -216,9 +224,8 @@ fn unrelated_existing_directory_is_rejected_during_inspection() -> TestResult {
     fs::create_dir(&fixture.output)?;
     fs::write(fixture.output.join("user-data.txt"), b"keep")?;
 
-    let error = match ResultDirectory::inspect(&fixture.output, ResultKind::Extract) {
-        Ok(_) => return Err("unowned output must be rejected before input processing".into()),
-        Err(error) => error,
+    let Err(error) = ResultDirectory::inspect(&fixture.output, ResultKind::Extract) else {
+        return Err("unowned output must be rejected before input processing".into());
     };
     let message = error.to_string();
     assert!(message.contains("output directory"), "{message}");
@@ -273,15 +280,19 @@ fn result_manifest_rejects_artifact_arrays_above_the_export_budget() -> TestResu
     let fixture = Fixture::new()?;
     fixture.publish("complete", b"artifact-content")?;
     let mut manifest = read_manifest(&fixture.output)?;
-    manifest["artifacts"] = json!(
-        (0..crate::result_directory::manifest::MAX_RESULT_ARTIFACTS + 1)
-            .map(|index| json!({
-                "file": format!("artifact-{index}.bin"),
-                "byte_length": 1,
-                "provenance": []
-            }))
-            .collect::<Vec<_>>()
-    );
+    set_json_field(
+        &mut manifest,
+        "/artifacts",
+        json!(
+            (0..=crate::result_directory::manifest::MAX_RESULT_ARTIFACTS)
+                .map(|index| json!({
+                    "file": format!("artifact-{index}.bin"),
+                    "byte_length": 1,
+                    "provenance": []
+                }))
+                .collect::<Vec<_>>()
+        ),
+    )?;
     write_manifest(&fixture.output, &manifest)?;
 
     assert_manifest_limit_error(&fixture.output, ResultKind::Extract)
@@ -292,7 +303,7 @@ fn result_manifest_rejects_oversized_artifact_names_during_deserialization() -> 
     let fixture = Fixture::new()?;
     fixture.publish("complete", b"artifact-content")?;
     let mut manifest = read_manifest(&fixture.output)?;
-    manifest["artifacts"][0]["file"] = json!("a".repeat(256));
+    *json_field_mut(&mut manifest, "/artifacts/0/file")? = json!("a".repeat(256));
     write_manifest(&fixture.output, &manifest)?;
 
     assert_manifest_limit_error(&fixture.output, ResultKind::Extract)
@@ -317,11 +328,15 @@ fn result_manifest_rejects_refine_source_arrays_above_the_input_budget() -> Test
     let output = root.path().join("refined");
     publish_refine_result(&output)?;
     let mut manifest = read_manifest(&output)?;
-    manifest["sources"] = json!(
-        (0..crate::result_directory::manifest::MAX_RESULT_SOURCES + 1)
-            .map(|_| json!({"byte_length": 1, "sha256": "a".repeat(64)}))
-            .collect::<Vec<_>>()
-    );
+    set_json_field(
+        &mut manifest,
+        "/sources",
+        json!(
+            (0..=crate::result_directory::manifest::MAX_RESULT_SOURCES)
+                .map(|_| json!({"byte_length": 1, "sha256": "a".repeat(64)}))
+                .collect::<Vec<_>>()
+        ),
+    )?;
     write_manifest(&output, &manifest)?;
 
     assert_manifest_limit_error(&output, ResultKind::Refine)
@@ -343,11 +358,15 @@ fn result_receipt_rejects_output_stamps_above_the_artifact_budget() -> TestResul
         "changed_seconds": null,
         "changed_nanoseconds": null
     });
-    manifest["l2solver_result"]["output_files"] = json!(vec![
-        stamp;
-        crate::result_directory::manifest::MAX_RESULT_OUTPUT_STAMPS
-            + 1
-    ]);
+    set_json_field(
+        &mut manifest,
+        "/l2solver_result/output_files",
+        json!(vec![
+            stamp;
+            crate::result_directory::manifest::MAX_RESULT_OUTPUT_STAMPS
+                + 1
+        ]),
+    )?;
     write_manifest(&fixture.output, &manifest)?;
 
     assert_manifest_limit_error(&fixture.output, ResultKind::Extract)
@@ -358,11 +377,15 @@ fn result_receipt_rejects_source_digest_arrays_above_the_input_budget() -> TestR
     let fixture = Fixture::new()?;
     fixture.publish("complete", b"artifact-content")?;
     let mut manifest = read_manifest(&fixture.output)?;
-    manifest["l2solver_result"]["source_sha256s"] = json!(vec![
-        "a".repeat(64);
-        crate::result_directory::manifest::MAX_RESULT_SOURCES
-            + 1
-    ]);
+    set_json_field(
+        &mut manifest,
+        "/l2solver_result/source_sha256s",
+        json!(vec![
+            "a".repeat(64);
+            crate::result_directory::manifest::MAX_RESULT_SOURCES
+                + 1
+        ]),
+    )?;
     write_manifest(&fixture.output, &manifest)?;
 
     assert_manifest_limit_error(&fixture.output, ResultKind::Extract)
@@ -374,7 +397,11 @@ fn result_receipt_rejects_settings_arrays_over_the_node_budget() -> TestResult {
     fixture.publish("complete", b"artifact-content")?;
     let mut manifest = read_manifest(&fixture.output)?;
     let values = vec![false; crate::result_directory::bounded::MAX_SETTINGS_ITEMS];
-    manifest["l2solver_result"]["identity"]["settings"] = json!(vec![values; 5]);
+    set_json_field(
+        &mut manifest,
+        "/l2solver_result/identity/settings",
+        json!(vec![values; 5]),
+    )?;
     write_manifest(&fixture.output, &manifest)?;
 
     assert_manifest_limit_error(&fixture.output, ResultKind::Extract)
@@ -385,11 +412,15 @@ fn result_receipt_rejects_settings_maps_over_the_entry_budget() -> TestResult {
     let fixture = Fixture::new()?;
     fixture.publish("complete", b"artifact-content")?;
     let mut manifest = read_manifest(&fixture.output)?;
-    manifest["l2solver_result"]["identity"]["settings"] = json!(
-        (0..crate::result_directory::bounded::MAX_SETTINGS_ITEMS + 1)
-            .map(|index| (format!("setting-{index}"), json!(true)))
-            .collect::<serde_json::Map<_, _>>()
-    );
+    set_json_field(
+        &mut manifest,
+        "/l2solver_result/identity/settings",
+        json!(
+            (0..=crate::result_directory::bounded::MAX_SETTINGS_ITEMS)
+                .map(|index| (format!("setting-{index}"), json!(true)))
+                .collect::<serde_json::Map<_, _>>()
+        ),
+    )?;
     write_manifest(&fixture.output, &manifest)?;
 
     assert_manifest_limit_error(&fixture.output, ResultKind::Extract)
@@ -400,7 +431,12 @@ fn result_receipt_rejects_individually_oversized_settings_strings() -> TestResul
     let fixture = Fixture::new()?;
     fixture.publish("complete", b"artifact-content")?;
     let mut manifest = read_manifest(&fixture.output)?;
-    manifest["l2solver_result"]["identity"]["settings"]["large"] = json!("s".repeat(64 * 1024 + 1));
+    insert_json_field(
+        &mut manifest,
+        "/l2solver_result/identity/settings",
+        "large",
+        json!("s".repeat(64 * 1024 + 1)),
+    )?;
     write_manifest(&fixture.output, &manifest)?;
 
     assert_manifest_limit_error(&fixture.output, ResultKind::Extract)
@@ -411,8 +447,12 @@ fn result_receipt_rejects_phase_arrays_over_the_snapshot_budget() -> TestResult 
     let fixture = Fixture::new()?;
     fixture.publish("complete", b"artifact-content")?;
     let mut manifest = read_manifest(&fixture.output)?;
-    let phase = manifest["l2solver_result"]["job"]["phases"][0].clone();
-    manifest["l2solver_result"]["job"]["phases"] = json!(vec![phase; 65]);
+    let phase = json_field(&manifest, "/l2solver_result/job/phases/0")?.clone();
+    set_json_field(
+        &mut manifest,
+        "/l2solver_result/job/phases",
+        json!(vec![phase; 65]),
+    )?;
     write_manifest(&fixture.output, &manifest)?;
 
     assert_manifest_limit_error(&fixture.output, ResultKind::Extract)
@@ -423,7 +463,12 @@ fn result_manifest_keeps_large_unrelated_report_fields_streamed() -> TestResult 
     let fixture = Fixture::new()?;
     fixture.publish("complete", b"artifact-content")?;
     let mut manifest = read_manifest(&fixture.output)?;
-    manifest["large_report_field"] = json!("r".repeat(2 * 1024 * 1024));
+    insert_json_field(
+        &mut manifest,
+        "",
+        "large_report_field",
+        json!("r".repeat(2 * 1024 * 1024)),
+    )?;
     write_manifest(&fixture.output, &manifest)?;
 
     ResultDirectory::inspect(&fixture.output, ResultKind::Extract)?;
@@ -439,7 +484,7 @@ fn result_manifest_reader_enforces_the_limit_after_open() -> TestResult {
     let mut exact_limit = fs::File::open(&path)?;
     let parsed: serde_json::Value =
         crate::result_directory::manifest::deserialize_manifest_value(&mut exact_limit, 7)?;
-    assert_eq!(parsed["a"], 1);
+    assert_eq!(json_field(&parsed, "/a")?.as_i64(), Some(1));
 
     let mut lower_limit = fs::File::open(&path)?;
     assert!(
@@ -490,9 +535,8 @@ fn write_manifest(directory: &std::path::Path, manifest: &serde_json::Value) -> 
 }
 
 fn assert_manifest_limit_error(path: &std::path::Path, kind: ResultKind) -> TestResult {
-    let error = match ResultDirectory::inspect(path, kind) {
-        Ok(_) => return Err("over-limit result manifest should be rejected during parsing".into()),
-        Err(error) => error,
+    let Err(error) = ResultDirectory::inspect(path, kind) else {
+        return Err("over-limit result manifest should be rejected during parsing".into());
     };
     let message = error.to_string();
     assert!(message.contains("limit"), "{message}");
@@ -527,6 +571,43 @@ fn publish_refine_result(output: &std::path::Path) -> TestResult<ResultIdentity>
         Ok(())
     })?;
     Ok(identity)
+}
+
+fn json_field<'a>(value: &'a Value, pointer: &str) -> TestResult<&'a Value> {
+    value
+        .pointer(pointer)
+        .ok_or_else(|| io::Error::other(format!("missing JSON field at {pointer}")))
+        .map_err(Into::into)
+}
+
+fn json_field_mut<'a>(value: &'a mut Value, pointer: &str) -> TestResult<&'a mut Value> {
+    value
+        .pointer_mut(pointer)
+        .ok_or_else(|| io::Error::other(format!("missing JSON field at {pointer}")))
+        .map_err(Into::into)
+}
+
+fn set_json_field(value: &mut Value, pointer: &str, replacement: Value) -> TestResult {
+    *json_field_mut(value, pointer)? = replacement;
+    Ok(())
+}
+
+fn insert_json_field(
+    value: &mut Value,
+    object_pointer: &str,
+    key: &str,
+    replacement: Value,
+) -> TestResult {
+    let object = if object_pointer.is_empty() {
+        value.as_object_mut()
+    } else {
+        value
+            .pointer_mut(object_pointer)
+            .and_then(Value::as_object_mut)
+    }
+    .ok_or_else(|| io::Error::other(format!("missing JSON object at {object_pointer}")))?;
+    let _previous_value = object.insert(key.to_owned(), replacement);
+    Ok(())
 }
 
 #[test]
@@ -649,9 +730,9 @@ fn legacy_extract_requires_explicit_refresh() -> TestResult {
     fs::write(fixture.output.join("evidence.jsonl"), b"")?;
 
     let existing = ResultDirectory::inspect(&fixture.output, ResultKind::Extract)?;
-    let error = existing
-        .reuse(&fixture.identity, Some(&fixture.input), false)
-        .expect_err("legacy extraction must not be treated as a cache hit");
+    let Err(error) = existing.reuse(&fixture.identity, Some(&fixture.input), false) else {
+        return Err("legacy extraction must not be treated as a cache hit".into());
+    };
     assert!(error.to_string().contains("--refresh"));
     Ok(())
 }
@@ -668,7 +749,13 @@ fn gzip_evidence_sidecar_is_owned_and_reused_from_its_manifest_name() -> TestRes
 
     assert!(reused.complete);
     assert_eq!(reused.artifacts.len(), 1);
-    assert_eq!(reused.artifacts[0].file, "artifact.bin");
+    assert_eq!(
+        reused
+            .artifacts
+            .first()
+            .map(|artifact| artifact.file.as_str()),
+        Some("artifact.bin")
+    );
     Ok(())
 }
 

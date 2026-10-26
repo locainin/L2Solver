@@ -526,8 +526,7 @@ fn evidence_file(raw: &RawManifest, kind: ResultKind) -> Result<Option<String>, 
     let file = raw
         .evidence
         .as_ref()
-        .map(|evidence| evidence.file.as_str())
-        .unwrap_or(EVIDENCE_FILE);
+        .map_or(EVIDENCE_FILE, |evidence| evidence.file.as_str());
     if !matches!(file, EVIDENCE_FILE | GZIP_EVIDENCE_FILE) {
         return Err(
             invalid_result("extract manifest declares an unsupported evidence sidecar").into(),
@@ -846,10 +845,10 @@ fn validate_staged_entries(
 
 fn expected_names(kind: ResultKind, manifest: &OwnedManifest) -> BTreeSet<&str> {
     let mut expected = BTreeSet::from([MANIFEST_FILE, SUMMARY_FILE]);
-    if kind == ResultKind::Extract {
-        if let Some(file) = manifest.evidence_file.as_deref() {
-            expected.insert(file);
-        }
+    if kind == ResultKind::Extract
+        && let Some(file) = manifest.evidence_file.as_deref()
+    {
+        expected.insert(file);
     }
     expected.insert(LIMITATIONS_FILE);
     expected.extend(
