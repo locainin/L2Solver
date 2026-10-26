@@ -242,13 +242,17 @@ pub(super) fn payload_locators(
     Ok((candidates, true))
 }
 
-pub(super) fn locator_selectors_overlap(
-    seed: &Selector,
-    payload: &Selector,
+pub(super) fn locator_ranges_overlap(
+    samples: &[RelationalRecordSample<'_>],
     indexes: &[SelectorIndex],
+    seed_selector: &Selector,
+    payload_selector: &Selector,
+    seed: &RelationalByteRangeLocator,
+    payload: &RelationalByteRangeLocator,
 ) -> bool {
     indexes.iter().any(|index| {
-        let (Some(seed_samples), Some(payload_samples)) = (index.get(seed), index.get(payload))
+        let (Some(seed_samples), Some(payload_samples)) =
+            (index.get(seed_selector), index.get(payload_selector))
         else {
             return false;
         };
@@ -257,6 +261,44 @@ pub(super) fn locator_selectors_overlap(
         } else {
             (payload_samples, seed_samples)
         };
-        smaller.iter().any(|sample| larger.contains(sample))
+        smaller.iter().any(|sample_index| {
+            larger.contains(sample_index)
+                && sample_value_ranges_overlap(samples, *sample_index, seed, payload)
+        })
     })
+}
+
+fn sample_value_ranges_overlap(
+    samples: &[RelationalRecordSample<'_>],
+    sample_index: usize,
+    seed: &RelationalByteRangeLocator,
+    payload: &RelationalByteRangeLocator,
+) -> bool {
+    let Some(sample) = samples.get(sample_index) else {
+        return true;
+    };
+    let Some(seed_length) = seed.value_length else {
+        return true;
+    };
+    let Some(seed_end) = seed.value_offset.checked_add(seed_length) else {
+        return true;
+    };
+    let payload_end = match payload.value_length {
+        Some(length) => {
+            let Some(end) = payload.value_offset.checked_add(length) else {
+                return true;
+            };
+            end
+        }
+        None => sample.bytes.len(),
+    };
+    if sample.bytes.get(seed.value_offset..seed_end).is_none()
+        || sample
+            .bytes
+            .get(payload.value_offset..payload_end)
+            .is_none()
+    {
+        return true;
+    }
+    seed.value_offset < payload_end && payload.value_offset < seed_end
 }

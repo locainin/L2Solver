@@ -9,11 +9,11 @@ use super::{
     input::{
         SessionGroup, build_selector_indexes, group_sessions, shared_selectors, validate_plan,
     },
-    locator::{LocatorCandidate, locator_selectors_overlap, payload_locators, seed_locators},
+    locator::{LocatorCandidate, locator_ranges_overlap, payload_locators, seed_locators},
     replay::{candidate_status, empty_fit, evaluate_split},
 };
 use crate::{
-    job::{Counter, Job},
+    job::{Counter, Job, Phase},
     protocol::{HoldoutBasis, RelationalSessionId},
 };
 
@@ -183,10 +183,13 @@ impl SearchContext<'_, '_> {
         }
         for seed_locator in &self.prepared.seed_locators {
             for payload_locator in &self.prepared.payload_locators {
-                if locator_selectors_overlap(
+                if locator_ranges_overlap(
+                    self.samples,
+                    &self.prepared.discovery_indexes,
                     &seed_locator.selector,
                     &payload_locator.selector,
-                    &self.prepared.discovery_indexes,
+                    &seed_locator.locator,
+                    &payload_locator.locator,
                 ) {
                     continue;
                 }
@@ -274,7 +277,7 @@ impl SearchContext<'_, '_> {
         }
         if let Some(job) = self.job {
             job.check_cancelled()?;
-            job.increment(Counter::CandidatesExamined, 1)?;
+            job.record_work(Phase::TransformDiscovery, Counter::CandidatesExamined, 1)?;
         }
         search.candidates_examined += 1;
         let rule = make_rule(
