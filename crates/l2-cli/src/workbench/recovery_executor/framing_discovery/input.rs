@@ -2,7 +2,7 @@ use super::super::RecoveryExecutionError;
 use super::super::tcp_ancestry::{TcpAncestry, TcpAncestryError, TcpAncestryIndex};
 use l2_workbench::{
     evidence::{Case, CaseIdentity, Edge, EvidenceStatus, Node},
-    protocol::{Direction, MessageContext, ProtocolLimits},
+    protocol::{ByteRange as StreamRange, Direction, MessageContext, ProtocolLimits},
 };
 use serde_json::Value;
 use std::collections::{BTreeMap, HashMap};
@@ -58,22 +58,22 @@ impl FramingInputOmissions {
 }
 
 #[derive(Clone)]
-pub(super) struct FramingInput {
-    pub(super) node_id: u64,
-    pub(super) blob_id: String,
-    pub(super) source_id: String,
-    pub(super) context: MessageContext,
-    pub(super) direction_node_id: u64,
-    pub(super) direction_contains_status: EvidenceStatus,
-    pub(super) episode_node_id: u64,
-    pub(super) episode_contains_status: EvidenceStatus,
+pub(in crate::workbench::recovery_executor) struct FramingInput {
+    pub(in crate::workbench::recovery_executor) node_id: u64,
+    pub(in crate::workbench::recovery_executor) blob_id: String,
+    pub(in crate::workbench::recovery_executor) source_id: String,
+    pub(in crate::workbench::recovery_executor) context: MessageContext,
+    pub(in crate::workbench::recovery_executor) direction_node_id: u64,
+    pub(in crate::workbench::recovery_executor) direction_contains_status: EvidenceStatus,
+    pub(in crate::workbench::recovery_executor) episode_node_id: u64,
+    pub(in crate::workbench::recovery_executor) episode_contains_status: EvidenceStatus,
     // Episode identity prevents unrelated conversations from sharing evidence
     // First-packet order keeps discovery partitions stable across insertion order
-    pub(super) session_order: u64,
-    pub(super) stream_offset: usize,
-    pub(super) byte_length: usize,
-    pub(super) start_known: bool,
-    pub(super) end_observed: bool,
+    pub(in crate::workbench::recovery_executor) session_order: u64,
+    pub(in crate::workbench::recovery_executor) stream_offset: usize,
+    pub(in crate::workbench::recovery_executor) byte_length: usize,
+    pub(in crate::workbench::recovery_executor) start_known: bool,
+    pub(in crate::workbench::recovery_executor) end_observed: bool,
 }
 
 #[derive(Default)]
@@ -81,6 +81,7 @@ pub(in crate::workbench::recovery_executor) struct FramingDiscoveryPlan {
     pub(super) cohorts: BTreeMap<FramingCohortKey, Vec<FramingInput>>,
     pub(super) omissions: BTreeMap<Option<String>, FramingInputOmissions>,
     pub(super) graph_work: usize,
+    native_http_coverage_by_run: HashMap<u64, NativeHttpCoverage>,
     case_identity: Option<CaseIdentity>,
     node_high_water_mark: usize,
     edge_high_water_mark: usize,
@@ -88,6 +89,14 @@ pub(in crate::workbench::recovery_executor) struct FramingDiscoveryPlan {
 }
 
 impl FramingDiscoveryPlan {
+    pub(in crate::workbench::recovery_executor) fn cohort_inputs(
+        &self,
+    ) -> impl Iterator<Item = (&FramingCohortKey, &FramingInput)> {
+        self.cohorts
+            .iter()
+            .flat_map(|(key, inputs)| inputs.iter().map(move |input| (key, input)))
+    }
+
     pub(super) fn matches_case(&self, case: &Case) -> bool {
         let has_same_case_identity = self
             .case_identity
@@ -112,38 +121,84 @@ impl FramingDiscoveryPlan {
         };
         !appended_edges
             .iter()
-            .any(|edge| appended_edge_changes_tcp_ancestry(case, edge, self.node_high_water_mark))
+            .any(|edge| appended_edge_changes_framing_inputs(case, edge, self.node_high_water_mark))
+    }
+
+    pub(in crate::workbench::recovery_executor) fn native_http_message_ranges(
+        &self,
+        run_node_id: u64,
+    ) -> Option<&[StreamRange]> {
+        self.native_http_coverage_by_run
+            .get(&run_node_id)
+            .map(|coverage| coverage.message_ranges.as_slice())
+    }
+
+    pub(in crate::workbench::recovery_executor) const fn native_http_coverage_by_run(
+        &self,
+    ) -> &HashMap<u64, NativeHttpCoverage> {
+        &self.native_http_coverage_by_run
+    }
+
+    pub(in crate::workbench::recovery_executor) fn source_eligibility_omissions(
+        &self,
+        source_id: &str,
+    ) -> usize {
+        for (source, omission) in &self.omissions {
+            if source.as_deref() == Some(source_id) {
+                return omission.total;
+            }
+        }
+        0
     }
 }
 
-fn appended_edge_changes_tcp_ancestry(
+#[derive(Clone, Debug)]
+pub(in crate::workbench::recovery_executor) struct NativeHttpCoverage {
+    pub(in crate::workbench::recovery_executor) application_checks_node_id: u64,
+    pub(in crate::workbench::recovery_executor) message_candidate_node_ids: Vec<u64>,
+    pub(in crate::workbench::recovery_executor) message_ranges: Vec<StreamRange>,
+}
+
+#[derive(Default)]
+struct NativeHttpEvidenceIndex {
+    application_checks_by_run: HashMap<u64, Vec<u64>>,
+    message_candidates_by_run: HashMap<u64, Vec<u64>>,
+}
+
+fn appended_edge_changes_framing_inputs(
     case: &Case,
     edge: &Edge,
     node_high_water_mark: usize,
 ) -> bool {
-    if edge.relation != "contains" {
-        return false;
-    }
-
     let nodes = case.nodes();
-    let child = nodes
-        .binary_search_by_key(&edge.to, |node| node.id)
-        .ok()
-        .and_then(|index| nodes.get(index).map(|node| (index, node)));
-    let Some((child_index, child)) = child else {
-        return false;
-    };
-    if child_index >= node_high_water_mark {
-        return false;
-    }
-
     let parent = nodes
         .binary_search_by_key(&edge.from, |node| node.id)
         .ok()
         .and_then(|index| nodes.get(index));
-    let Some(parent) = parent else {
+    let child = nodes
+        .binary_search_by_key(&edge.to, |node| node.id)
+        .ok()
+        .and_then(|index| nodes.get(index).map(|node| (index, node)));
+    let (Some(parent), Some((child_index, child))) = (parent, child) else {
         return false;
     };
+    if matches!(
+        (
+            edge.relation.as_str(),
+            parent.kind.as_str(),
+            child.kind.as_str()
+        ),
+        ("tested_by", "tcp_byte_run", "application_checks")
+            | ("parsed_as", "tcp_byte_run", "http_message_candidate")
+    ) {
+        return true;
+    }
+    if edge.relation != "contains" {
+        return false;
+    }
+    if child_index >= node_high_water_mark {
+        return false;
+    }
 
     matches!(
         (parent.kind.as_str(), child.kind.as_str()),
@@ -152,11 +207,11 @@ fn appended_edge_changes_tcp_ancestry(
 }
 
 #[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
-pub(super) struct FramingCohortKey {
-    pub(super) source_id: String,
-    pub(super) scope: String,
-    pub(super) endpoint_pair: String,
-    pub(super) direction: Direction,
+pub(in crate::workbench::recovery_executor) struct FramingCohortKey {
+    pub(in crate::workbench::recovery_executor) source_id: String,
+    pub(in crate::workbench::recovery_executor) scope: String,
+    pub(in crate::workbench::recovery_executor) endpoint_pair: String,
+    pub(in crate::workbench::recovery_executor) direction: Direction,
 }
 
 impl FramingDiscoveryPlan {
@@ -192,7 +247,7 @@ pub(in crate::workbench::recovery_executor) fn collect_plan(
             source: Box::new(source),
         }
     })?;
-    let graph_work = case_graph_work(case)?;
+    let (graph_work, native_http_evidence) = case_graph_work(case, &node_by_id)?;
     let mut plan = FramingDiscoveryPlan {
         graph_work,
         case_identity: Some(case.identity()),
@@ -214,7 +269,173 @@ pub(in crate::workbench::recovery_executor) fn collect_plan(
         }
     }
     sort_and_cap_cohorts(&mut plan, limits)?;
+    index_native_http_message_ranges(&blobs, &native_http_evidence, &node_by_id, &mut plan)?;
     Ok(plan)
+}
+
+fn index_native_http_message_ranges(
+    blobs: &HashMap<&str, &l2_workbench::evidence::Blob>,
+    evidence: &NativeHttpEvidenceIndex,
+    nodes: &HashMap<u64, &Node>,
+    plan: &mut FramingDiscoveryPlan,
+) -> Result<(), RecoveryExecutionError> {
+    let run_count = plan.cohorts.values().try_fold(0_usize, |count, inputs| {
+        count
+            .checked_add(inputs.len())
+            .ok_or_else(graph_work_overflow)
+    })?;
+    plan.native_http_coverage_by_run
+        .try_reserve(run_count)
+        .map_err(|source| RecoveryExecutionError::Operational {
+            stage: l2_workbench::recovery::RecoveryStage::FramingDiscovery,
+            source: Box::new(source),
+        })?;
+    for input in plan.cohorts.values().flatten() {
+        let blob = blobs
+            .get(input.blob_id.as_str())
+            .ok_or(l2_workbench::recovery::RecoveryError::InvariantFailure)?;
+        if let Some(coverage) = native_http_coverage_for_run(
+            input.node_id,
+            input.byte_length,
+            input.start_known,
+            blob.bytes.len(),
+            evidence,
+            nodes,
+        ) {
+            plan.native_http_coverage_by_run
+                .insert(input.node_id, coverage);
+        }
+    }
+    Ok(())
+}
+
+fn native_http_coverage_for_run(
+    run_node_id: u64,
+    expected_length: usize,
+    start_known: bool,
+    actual_length: usize,
+    evidence: &NativeHttpEvidenceIndex,
+    nodes: &HashMap<u64, &Node>,
+) -> Option<NativeHttpCoverage> {
+    if !start_known || expected_length == 0 || expected_length != actual_length {
+        return None;
+    }
+    let [application_checks_node_id] = evidence
+        .application_checks_by_run
+        .get(&run_node_id)?
+        .as_slice()
+    else {
+        return None;
+    };
+    let check_node = nodes.get(application_checks_node_id)?;
+    if check_node.kind != "application_checks"
+        || check_node.details.get("start_known") != Some(&Value::Bool(true))
+    {
+        return None;
+    }
+    let http = check_node.details.get("http")?.as_object()?;
+    let expected_messages = http.get("messages")?.as_u64()?;
+    let candidate_ids = evidence
+        .message_candidates_by_run
+        .get(&run_node_id)
+        .map_or(&[][..], Vec::as_slice);
+    if expected_messages != u64::try_from(candidate_ids.len()).ok()? {
+        return None;
+    }
+    let unparsed_ranges = parse_application_ranges(http.get("unparsed")?, actual_length)?;
+    let budget_omission_ranges =
+        parse_budget_omission_ranges(http.get("budget_omissions")?, actual_length)?;
+    let mut complete_messages = Vec::new();
+    for candidate_id in candidate_ids {
+        let candidate = nodes.get(candidate_id)?;
+        if candidate.kind != "http_message_candidate"
+            || candidate.details.get("status").and_then(Value::as_str) != Some("complete")
+        {
+            continue;
+        }
+        let framing_kind = candidate.details.get("framing")?.get("kind")?.as_str()?;
+        if !matches!(
+            framing_kind,
+            "no_body" | "content_length" | "chunked" | "close_delimited"
+        ) {
+            return None;
+        }
+        let range = parse_application_range(candidate.details.get("range")?, actual_length)?;
+        if overlaps_any(range, &unparsed_ranges) || overlaps_any(range, &budget_omission_ranges) {
+            continue;
+        }
+        complete_messages.push((range, *candidate_id));
+    }
+    complete_messages.sort_unstable_by_key(|(range, _)| *range);
+    if complete_messages
+        .iter()
+        .zip(complete_messages.iter().skip(1))
+        .any(|((left, _), (right, _))| left.end > right.start)
+    {
+        return None;
+    }
+    if complete_messages.is_empty() {
+        return None;
+    }
+    let (message_ranges, message_candidate_node_ids): (Vec<_>, Vec<_>) =
+        complete_messages.into_iter().unzip();
+    Some(NativeHttpCoverage {
+        application_checks_node_id: *application_checks_node_id,
+        message_candidate_node_ids,
+        message_ranges,
+    })
+}
+
+fn parse_application_ranges(value: &Value, input_length: usize) -> Option<Vec<StreamRange>> {
+    value
+        .as_array()?
+        .iter()
+        .map(|value| parse_application_range(value, input_length))
+        .collect()
+}
+
+fn parse_budget_omission_ranges(value: &Value, input_length: usize) -> Option<Vec<StreamRange>> {
+    value
+        .as_array()?
+        .iter()
+        .map(|value| parse_application_range(value.get("range")?, input_length))
+        .collect()
+}
+
+fn parse_application_range(value: &Value, input_length: usize) -> Option<StreamRange> {
+    let start = usize::try_from(value.get("offset")?.as_u64()?).ok()?;
+    let length = usize::try_from(value.get("length")?.as_u64()?).ok()?;
+    let end = start.checked_add(length)?;
+    (length > 0 && end <= input_length).then_some(StreamRange { start, end })
+}
+
+fn overlaps_any(range: StreamRange, others: &[StreamRange]) -> bool {
+    others
+        .iter()
+        .any(|other| range.start < other.end && other.start < range.end)
+}
+
+pub(in crate::workbench::recovery_executor) fn range_covered_by_native_messages(
+    range: StreamRange,
+    message_ranges: &[StreamRange],
+) -> bool {
+    if range.start >= range.end {
+        return false;
+    }
+    let mut covered_until = range.start;
+    for message in message_ranges {
+        if message.end <= covered_until {
+            continue;
+        }
+        if message.start > covered_until {
+            return false;
+        }
+        covered_until = message.end;
+        if covered_until >= range.end {
+            return true;
+        }
+    }
+    false
 }
 
 type RunMetadataError = (Option<String>, InputOmissionKind);
@@ -360,7 +581,10 @@ fn exact_source(node: &Node) -> Result<String, InputOmissionKind> {
     Ok(first.source.clone())
 }
 
-fn case_graph_work(case: &Case) -> Result<usize, RecoveryExecutionError> {
+fn case_graph_work(
+    case: &Case,
+    nodes: &HashMap<u64, &Node>,
+) -> Result<(usize, NativeHttpEvidenceIndex), RecoveryExecutionError> {
     let node_work = case.nodes().iter().try_fold(0_usize, |total, node| {
         let details = serde_json::to_vec(&node.details).map_err(|error| {
             RecoveryExecutionError::Operational {
@@ -385,23 +609,56 @@ fn case_graph_work(case: &Case) -> Result<usize, RecoveryExecutionError> {
             .and_then(|value| value.checked_add(std::mem::size_of::<u64>()))
             .ok_or_else(graph_work_overflow)
     })?;
-    let edge_work = case.edges().iter().try_fold(0_usize, |total, edge| {
-        total
+    let mut native_http_evidence = NativeHttpEvidenceIndex::default();
+    let mut edge_work = 0_usize;
+    for edge in case.edges() {
+        edge_work = edge_work
             .checked_add(edge.relation.len())
             .and_then(|value| value.checked_add(edge.reason.len()))
             .and_then(|value| value.checked_add(3 * std::mem::size_of::<u64>()))
-            .ok_or_else(graph_work_overflow)
-    })?;
+            .ok_or_else(graph_work_overflow)?;
+        let Some((target_kind, target)) = (match (edge.relation.as_str(), edge.status) {
+            ("tested_by", EvidenceStatus::Observed) => Some((
+                "application_checks",
+                &mut native_http_evidence.application_checks_by_run,
+            )),
+            ("parsed_as", EvidenceStatus::Hypothesis) => Some((
+                "http_message_candidate",
+                &mut native_http_evidence.message_candidates_by_run,
+            )),
+            _ => None,
+        }) else {
+            continue;
+        };
+        if nodes
+            .get(&edge.from)
+            .is_none_or(|parent| parent.kind != "tcp_byte_run")
+            || nodes
+                .get(&edge.to)
+                .is_none_or(|child| child.kind != target_kind)
+        {
+            continue;
+        }
+        let targets = target.entry(edge.from).or_default();
+        targets
+            .try_reserve(1)
+            .map_err(|source| RecoveryExecutionError::Operational {
+                stage: l2_workbench::recovery::RecoveryStage::FramingDiscovery,
+                source: Box::new(source),
+            })?;
+        targets.push(edge.to);
+    }
     let blob_work = case.blobs().iter().try_fold(0_usize, |total, blob| {
         total
             .checked_add(blob.id.len())
             .and_then(|value| value.checked_add(std::mem::size_of::<usize>()))
             .ok_or_else(graph_work_overflow)
     })?;
-    node_work
+    let work = node_work
         .checked_add(edge_work)
         .and_then(|value| value.checked_add(blob_work))
-        .ok_or_else(graph_work_overflow)
+        .ok_or_else(graph_work_overflow)?;
+    Ok((work, native_http_evidence))
 }
 
 fn graph_work_overflow() -> RecoveryExecutionError {

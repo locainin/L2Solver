@@ -38,6 +38,11 @@ pub(in crate::workbench) struct RecoveryRecordServiceOutcome {
     pub(in crate::workbench) rejected_inputs: Vec<analysis::RejectedInput>,
 }
 
+struct CommittedRecordService {
+    outcome: RecordServiceOutcome,
+    rejected_inputs: Vec<analysis::RejectedInput>,
+}
+
 /// Detached record parsing and assembly results before evidence nodes are written
 pub(in crate::workbench) struct PreparedRecordService {
     analysis: analysis::Analysis,
@@ -120,24 +125,24 @@ pub(in crate::workbench) fn commit(
     case: &mut Case,
     prepared: PreparedRecordService,
 ) -> Result<RecordServiceOutcome, Box<dyn Error>> {
-    commit_with_rejections(case, prepared).map(|(outcome, _)| outcome)
+    commit_with_rejections(case, prepared).map(|committed| committed.outcome)
 }
 
 pub(in crate::workbench) fn commit_recovery(
     case: &mut Case,
     prepared: PreparedRecordService,
 ) -> Result<RecoveryRecordServiceOutcome, Box<dyn Error>> {
-    let (outcome, rejected_inputs) = commit_with_rejections(case, prepared)?;
+    let committed = commit_with_rejections(case, prepared)?;
     Ok(RecoveryRecordServiceOutcome {
-        outcome,
-        rejected_inputs,
+        outcome: committed.outcome,
+        rejected_inputs: committed.rejected_inputs,
     })
 }
 
 fn commit_with_rejections(
     case: &mut Case,
     prepared: PreparedRecordService,
-) -> Result<(RecordServiceOutcome, Vec<analysis::RejectedInput>), Box<dyn Error>> {
+) -> Result<CommittedRecordService, Box<dyn Error>> {
     let PreparedRecordService {
         analysis,
         groups_complete,
@@ -150,7 +155,7 @@ fn commit_with_rejections(
         let group_nodes = evidence::record_groups(case, receipt_node_id, &analysis)?;
         case.add_limitation(RECORDS_LIMITATION)?;
 
-        Ok::<RecordServiceOutcome, Box<dyn Error>>(RecordServiceOutcome {
+        Ok::<_, Box<dyn Error>>(RecordServiceOutcome {
             receipt_node_id,
             group_node_ids: group_nodes.groups,
             issue_node_ids: group_nodes.issues,
@@ -158,8 +163,10 @@ fn commit_with_rejections(
             omissions,
         })
     })?;
-    let rejected_inputs = analysis.rejected_inputs;
-    Ok((outcome, rejected_inputs))
+    Ok(CommittedRecordService {
+        outcome,
+        rejected_inputs: analysis.rejected_inputs,
+    })
 }
 
 fn omissions(analysis: &analysis::Analysis) -> Result<RecordOmissions, RecordError> {

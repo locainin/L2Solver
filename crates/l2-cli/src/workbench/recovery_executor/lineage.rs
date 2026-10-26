@@ -1,10 +1,18 @@
+use super::evidence::case_evidence_quota;
 use super::policy::task_templates_for_node;
 use super::{
     Executor, RecoveryCandidateId, RecoveryExecutionError, RecoveryOmission, RecoveryStage,
     RecoveryTask,
 };
-use l2_workbench::recovery::{RecoveryCandidateState, RecoveryError, RecoveryResult};
+use l2_workbench::{
+    evidence::EvidenceError,
+    recovery::{RecoveryCandidateState, RecoveryError, RecoveryResource, RecoveryResult},
+};
 use std::collections::{HashMap, HashSet};
+
+#[cfg(test)]
+#[path = "../../../tests/workbench/recovery_lineage.rs"]
+mod tests;
 
 pub(super) struct TransformCohort {
     pub(super) task: RecoveryTask,
@@ -24,6 +32,7 @@ struct TransformCohortState {
     covered_inputs: HashMap<RecoveryCandidateId, HashSet<u64>>,
     successful_outputs: HashMap<RecoveryCandidateId, (u64, u64)>,
     successful_output_order: Vec<RecoveryCandidateId>,
+    contextual_view_admission_blocked: bool,
 }
 
 fn transform_slot_capacity(cohorts: &[TransformCohort]) -> Result<usize, RecoveryExecutionError> {
@@ -84,6 +93,7 @@ fn prepare_transform_cohort_state(
         covered_inputs,
         successful_outputs,
         successful_output_order,
+        contextual_view_admission_blocked: false,
     })
 }
 
@@ -181,14 +191,29 @@ impl Executor<'_> {
         let mut next_slots =
             reserve_next_transform_slots(cohort.slots.len(), transform_tasks.len())?;
         for slot in &cohort.slots {
-            self.process_transform_slot(
-                &cohort.task,
+            let result = self.process_transform_slot(
                 slot,
                 transform_tasks,
                 state,
                 &mut record_inputs,
                 &mut next_slots,
             )?;
+            // Rejected proposals finish a speculative search without omitting a required input
+            // Explicit record batches still account for every excluded sibling
+            if let Some(result) = result
+                && (!record_tasks.is_empty()
+                    || !matches!(
+                        result,
+                        RecoveryResult::Rejected { .. } | RecoveryResult::Unsupported
+                    ))
+            {
+                self.omissions
+                    .push(RecoveryOmission::SiblingTransformExcluded {
+                        input_node_id: slot.input_node,
+                        task: cohort.task.clone(),
+                        result,
+                    });
+            }
         }
         self.enqueue_cohort_records(record_tasks, &record_inputs)?;
         for (task, slots) in transform_tasks.iter().cloned().zip(next_slots) {
@@ -199,13 +224,12 @@ impl Executor<'_> {
 
     fn process_transform_slot(
         &mut self,
-        cohort_task: &RecoveryTask,
         slot: &TransformSlot,
         transform_tasks: &[RecoveryTask],
         state: &mut TransformCohortState,
         record_inputs: &mut Vec<(RecoveryCandidateId, u64)>,
         next_slots: &mut [Vec<TransformSlot>],
-    ) -> Result<(), RecoveryExecutionError> {
+    ) -> Result<Option<RecoveryResult>, RecoveryExecutionError> {
         let candidate = slot.candidate;
         state
             .covered_inputs
@@ -231,21 +255,18 @@ impl Executor<'_> {
             evidence_node_id: receipt_node,
         } = result
         else {
-            self.omissions
-                .push(RecoveryOmission::SiblingTransformExcluded {
-                    input_node_id: slot.input_node,
-                    task: cohort_task.clone(),
-                    result,
-                });
-            return Ok(());
+            return Ok(Some(result));
         };
-        let output_node = self.contextual_transform_output(
+        let Some(output_node) = self.contextual_transform_output(
             candidate,
             slot.input_node,
             receipt_node,
             output_is_shared,
             state,
-        )?;
+        )?
+        else {
+            return Ok(None);
+        };
         record_inputs.push((candidate, output_node));
         for (task, slots) in transform_tasks.iter().zip(next_slots) {
             match self.enqueue_transform_slot(candidate, output_node, task)? {
@@ -265,7 +286,7 @@ impl Executor<'_> {
                 DerivedTaskEnqueue::ResourceExhausted => {}
             }
         }
-        Ok(())
+        Ok(None)
     }
 
     fn enqueue_cohort_records(
@@ -288,7 +309,7 @@ impl Executor<'_> {
         receipt_node: u64,
         output_is_shared: bool,
         state: &mut TransformCohortState,
-    ) -> Result<u64, RecoveryExecutionError> {
+    ) -> Result<Option<u64>, RecoveryExecutionError> {
         self.refresh_case_index()?;
         let output_node = self
             .case_index
@@ -302,11 +323,31 @@ impl Executor<'_> {
             entry.insert((receipt_node, output_node));
             state.successful_output_order.push(candidate);
         }
-        if output_is_shared {
-            self.contextual_decoding_view(output_node, receipt_node, input_node)
+        let has_tcp_context = self.derived_discovery.has_context(input_node);
+        let contextual_node = if output_is_shared || has_tcp_context {
+            let Some(view_node) = self.try_contextual_decoding_view(
+                candidate,
+                output_node,
+                receipt_node,
+                input_node,
+                state,
+            )?
+            else {
+                return Ok(None);
+            };
+            view_node
         } else {
-            Ok(output_node)
+            output_node
+        };
+        if has_tcp_context {
+            self.register_derived_transform_output(
+                input_node,
+                contextual_node,
+                receipt_node,
+                candidate,
+            )?;
         }
+        Ok(Some(contextual_node))
     }
 
     fn enqueue_uncovered_transform_outputs(
@@ -315,7 +356,11 @@ impl Executor<'_> {
         transform_tasks: &[RecoveryTask],
         mut state: TransformCohortState,
     ) -> Result<(), RecoveryExecutionError> {
-        for candidate in state.successful_output_order {
+        for index in 0..state.successful_output_order.len() {
+            let candidate = *state
+                .successful_output_order
+                .get(index)
+                .ok_or(RecoveryError::InvariantFailure)?;
             let (receipt_node, output_node) = *state
                 .successful_outputs
                 .get(&candidate)
@@ -338,7 +383,24 @@ impl Executor<'_> {
                 if covered.contains(&origin) {
                     continue;
                 }
-                let view_node = self.contextual_decoding_view(output_node, receipt_node, origin)?;
+                let Some(view_node) = self.try_contextual_decoding_view(
+                    candidate,
+                    output_node,
+                    receipt_node,
+                    origin,
+                    &mut state,
+                )?
+                else {
+                    continue;
+                };
+                if self.derived_discovery.has_context(origin) {
+                    self.register_derived_transform_output(
+                        origin,
+                        view_node,
+                        receipt_node,
+                        candidate,
+                    )?;
+                }
                 for task in record_tasks {
                     self.enqueue_derived_task(candidate, view_node, task)?;
                 }
@@ -370,6 +432,51 @@ impl Executor<'_> {
         Ok(())
     }
 
+    fn try_contextual_decoding_view(
+        &mut self,
+        candidate: RecoveryCandidateId,
+        output_node: u64,
+        receipt_node: u64,
+        input_node: u64,
+        state: &mut TransformCohortState,
+    ) -> Result<Option<u64>, RecoveryExecutionError> {
+        if state.contextual_view_admission_blocked {
+            return Ok(None);
+        }
+
+        match self.contextual_decoding_view(output_node, receipt_node, input_node) {
+            Ok(view_node) => Ok(Some(view_node)),
+            Err(RecoveryExecutionError::Evidence(error)) => {
+                let Some((resource, limit, used)) = case_evidence_quota(self.case, &error) else {
+                    return Err(RecoveryExecutionError::Evidence(error));
+                };
+                let task = self
+                    .coordinator
+                    .candidate(candidate)
+                    .ok_or(RecoveryError::UnknownCandidate { id: candidate })?
+                    .task()
+                    .clone();
+                let requested = contextual_view_quota_request(resource, &error, used);
+                self.omissions.push(RecoveryOmission::ResourceExhausted {
+                    task,
+                    input_node_ids: vec![input_node],
+                    resource,
+                    limit,
+                    used,
+                    requested,
+                });
+                if matches!(
+                    resource,
+                    RecoveryResource::EvidenceEdges | RecoveryResource::EvidenceNodes
+                ) {
+                    state.contextual_view_admission_blocked = true;
+                }
+                Ok(None)
+            }
+            Err(error) => Err(error),
+        }
+    }
+
     pub(super) fn enqueue_transform_slot(
         &mut self,
         parent: RecoveryCandidateId,
@@ -384,4 +491,19 @@ pub(super) enum DerivedTaskEnqueue {
     Candidate(RecoveryCandidateId),
     CycleSkipped(RecoveryCandidateId),
     ResourceExhausted,
+}
+
+const fn contextual_view_quota_request(
+    resource: RecoveryResource,
+    error: &EvidenceError,
+    used: usize,
+) -> usize {
+    match resource {
+        RecoveryResource::EvidenceEdges => 3,
+        RecoveryResource::EvidenceTotalDetailsBytes => match error {
+            EvidenceError::TotalDetailsTooLarge { length, .. } => length.saturating_sub(used),
+            _ => 1,
+        },
+        _ => 1,
+    }
 }

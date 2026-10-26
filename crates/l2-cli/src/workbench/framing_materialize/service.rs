@@ -468,18 +468,26 @@ fn clip_mappings(
 }
 
 fn select_input(case: &Case, node_id: u64) -> Result<Selection, Box<dyn Error>> {
-    let mapped = mapped_node(case, node_id)?;
-    if mapped.node.kind != "tcp_byte_run" {
-        return Err("selected node must be a retained tcp_byte_run".into());
+    let node = case
+        .node(node_id)
+        .ok_or("selected framing node is missing")?;
+    if node.kind == "decoding_output" {
+        return select_contextual_output(case, node);
     }
+    if node.kind != "tcp_byte_run" {
+        return Err(
+            "selected node must be a retained TCP run or contextual transform output".into(),
+        );
+    }
+    let mapped = mapped_node(case, node_id)?;
     if mapped.bytes.is_empty() {
-        return Err("selected TCP byte run is empty".into());
+        return Err("selected framing input is empty".into());
     }
     let input_blob = mapped
         .node
         .blob
         .clone()
-        .ok_or("selected TCP byte run has no retained blob")?;
+        .ok_or("selected framing input has no retained blob")?;
     let mut input_bytes = Vec::new();
     input_bytes.try_reserve_exact(mapped.bytes.len())?;
     input_bytes.extend_from_slice(mapped.bytes);
@@ -492,6 +500,108 @@ fn select_input(case: &Case, node_id: u64) -> Result<Selection, Box<dyn Error>> 
         input_bytes,
         mappings,
     })
+}
+
+fn select_contextual_output(
+    case: &Case,
+    node: &l2_workbench::evidence::Node,
+) -> Result<Selection, Box<dyn Error>> {
+    let source_input_node = node
+        .details
+        .get("source_input_node")
+        .and_then(serde_json::Value::as_u64)
+        .filter(|node_id| *node_id != 0)
+        .ok_or("contextual transform output has no source input")?;
+    let receipt_node_id = node
+        .details
+        .get("shared_transform_receipt")
+        .and_then(serde_json::Value::as_u64)
+        .filter(|node_id| *node_id != 0)
+        .ok_or("contextual transform output has no decoder receipt")?;
+    if !node.ranges.is_empty() {
+        return Err("contextual transform output has invalid source provenance".into());
+    }
+    let receipt_node = case
+        .node(receipt_node_id)
+        .filter(|receipt| receipt.kind == "decoding_receipt")
+        .ok_or("contextual transform output has an invalid decoder receipt")?;
+    let (blob_id, bytes) =
+        validate_contextual_decoder_receipt(case, receipt_node, source_input_node, node)?;
+    if bytes.is_empty() {
+        return Err("selected framing input is empty".into());
+    }
+    let mut input_bytes = Vec::new();
+    input_bytes.try_reserve_exact(bytes.len())?;
+    input_bytes.extend_from_slice(bytes);
+    Ok(Selection {
+        input_kind: node.kind.clone(),
+        input_blob: blob_id.to_owned(),
+        input_bytes,
+        mappings: Vec::new(),
+    })
+}
+
+fn validate_contextual_decoder_receipt<'a>(
+    case: &'a Case,
+    receipt_node: &'a l2_workbench::evidence::Node,
+    source_input_node_id: u64,
+    output_node: &'a l2_workbench::evidence::Node,
+) -> Result<(&'a str, &'a [u8]), Box<dyn Error>> {
+    let source_input = case
+        .node(source_input_node_id)
+        .ok_or("contextual transform source input is missing")?;
+    if receipt_node.details.get("operation_completed") != Some(&serde_json::Value::Bool(true))
+        || receipt_node.details.get("constraints_satisfied") != Some(&serde_json::Value::Bool(true))
+    {
+        return Err("contextual transform output does not have a completed decoder receipt".into());
+    }
+
+    let receipt_blob_id = receipt_node
+        .blob
+        .as_deref()
+        .ok_or("decoder receipt has no retained bytes")?;
+    let receipt_blob = case
+        .blob(receipt_blob_id)
+        .ok_or("decoder receipt bytes are missing")?;
+    let receipt: serde_json::Value = serde_json::from_slice(&receipt_blob.bytes)?;
+    let source_blob_id = source_input
+        .blob
+        .as_deref()
+        .ok_or("contextual transform source input has no retained blob")?;
+    let source_blob = case
+        .blob(source_blob_id)
+        .ok_or("contextual transform source input bytes are missing")?;
+    let output_blob_id = output_node
+        .blob
+        .as_deref()
+        .ok_or("contextual transform output has no retained blob")?;
+    let output_blob = case
+        .blob(output_blob_id)
+        .ok_or("contextual transform output bytes are missing")?;
+
+    // Blob IDs already carry the digest checked by Case, so reuse them for receipt matching
+    let input_length = receipt
+        .get("input_length")
+        .and_then(serde_json::Value::as_u64)
+        .and_then(|length| usize::try_from(length).ok());
+    let input_sha256 = receipt
+        .get("input_sha256")
+        .and_then(serde_json::Value::as_str);
+    let output_length = receipt
+        .get("output_length")
+        .and_then(serde_json::Value::as_u64)
+        .and_then(|length| usize::try_from(length).ok());
+    let output_sha256 = receipt
+        .get("output_sha256")
+        .and_then(serde_json::Value::as_str);
+    if input_length != Some(source_blob.bytes.len())
+        || input_sha256 != source_blob_id.strip_prefix("sha256:")
+        || output_length != Some(output_blob.bytes.len())
+        || output_sha256 != output_blob_id.strip_prefix("sha256:")
+    {
+        return Err("decoder receipt does not match the contextual output bytes".into());
+    }
+    Ok((output_blob_id, output_blob.bytes.as_slice()))
 }
 
 fn to_mapping(mapping: DiscoveryMapping) -> ByteMapping {

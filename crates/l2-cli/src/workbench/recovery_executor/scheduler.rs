@@ -123,6 +123,31 @@ impl Executor<'_> {
         Ok(())
     }
 
+    pub(super) fn enqueue_discovered_framing_derived(
+        &mut self,
+        parent_id: RecoveryCandidateId,
+        input_node: u64,
+        rule: &FramingKind,
+        report_node: u64,
+    ) -> Result<(), RecoveryExecutionError> {
+        let task = RecoveryTask::MaterializeFraming(rule.clone());
+        let result =
+            self.coordinator
+                .enqueue_derived(parent_id, self.case, &[input_node], task.clone())?;
+        let scheduled_candidate = match &result {
+            EnqueueOutcome::Queued(id) => Some((*id, false)),
+            EnqueueOutcome::Merged(id) | EnqueueOutcome::MergedNeedsContext(id) => {
+                Some((*id, true))
+            }
+            EnqueueOutcome::CycleSkipped { .. } | EnqueueOutcome::ResourceExhausted { .. } => None,
+        };
+        self.record_enqueue(result, &task, &[input_node])?;
+        if let Some((candidate_id, merged)) = scheduled_candidate {
+            self.remember_discovered_framing_basis(candidate_id, report_node, merged)?;
+        }
+        Ok(())
+    }
+
     fn remember_caller_framing_basis(&mut self, candidate_id: RecoveryCandidateId) {
         match self.framing_selection_bases.entry(candidate_id) {
             std::collections::hash_map::Entry::Vacant(entry) => {
@@ -921,6 +946,9 @@ impl Executor<'_> {
         if task == RecoveryTask::RecordDiscovery {
             return self.run_record_discovery(candidate_id);
         }
+        if task == RecoveryTask::RelationalTransformDiscovery {
+            return self.run_relational_transform_discovery(candidate_id);
+        }
         if let RecoveryTask::AssembleRecords(schema) = &task {
             return self.execute_record_candidate(candidate_id, &candidate, schema);
         }
@@ -1045,7 +1073,13 @@ impl Executor<'_> {
                     .get(&candidate_id)
                     .copied()
                     .unwrap_or(FramingSelectionBasis::CallerSupplied {});
-                self.run_framing(candidate_id, &inputs.origins, rule, basis)
+                self.run_framing(
+                    candidate_id,
+                    inputs.input_node,
+                    &inputs.origins,
+                    rule,
+                    basis,
+                )
             }
             RecoveryTask::EmbeddedDiscovery => self.run_embedded(candidate_id, &inputs.origins),
             RecoveryTask::StructuralValidation => {
@@ -1058,6 +1092,9 @@ impl Executor<'_> {
                 self.execute_record_candidate(candidate_id, candidate, schema)
             }
             RecoveryTask::RecordDiscovery => self.run_record_discovery(candidate_id),
+            RecoveryTask::RelationalTransformDiscovery => {
+                self.run_relational_transform_discovery(candidate_id)
+            }
         }
     }
 

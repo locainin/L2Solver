@@ -101,7 +101,7 @@ fn default_recovery_discovers_a_two_stage_chain_without_promoting_neutral_bytes(
             .then_some(index)
         })
         .collect::<Vec<_>>();
-    assert_eq!(base64_ids.len(), 2);
+    assert_eq!(base64_ids.len(), 1);
     assert_eq!(
         hexadecimal
             .parent_ids()
@@ -385,6 +385,14 @@ fn equivalent_transform_keeps_proposal_receipts_for_each_origin() -> Result<(), 
         .copied()
         .collect::<BTreeSet<_>>();
     assert_eq!(transform_origins, BTreeSet::from([http, udp]));
+    assert!(case.nodes().iter().all(|node| {
+        node.kind != "decoding_output"
+            || node
+                .details
+                .get("shared_transform_receipt")
+                .and_then(Value::as_u64)
+                != Some(*transform_receipt)
+    }));
     Ok(())
 }
 
@@ -392,7 +400,8 @@ fn equivalent_transform_keeps_proposal_receipts_for_each_origin() -> Result<(), 
 fn base64_aliases_do_not_consume_association_budget_or_trigger_omissions()
 -> Result<(), Box<dyn Error>> {
     let mut case = Case::new();
-    let input_node = source(&mut case, "http_body", BASE64_HEX_INPUT)?;
+    let input = b"AA==";
+    let input_node = source(&mut case, "http_body", input)?;
     let mut bounded = policy();
     bounded.resources.max_transform_proposal_associations = 1;
 
@@ -434,7 +443,7 @@ fn base64_aliases_do_not_consume_association_budget_or_trigger_omissions()
                 && candidate
                     .inputs()
                     .first()
-                    .is_some_and(|input| input.blob_id() == blob_id(BASE64_HEX_INPUT))
+                    .is_some_and(|source| source.blob_id() == blob_id(input))
         })
         .collect::<Vec<_>>();
     assert_eq!(input_transforms.len(), 1);
@@ -834,7 +843,10 @@ fn edge_quota_does_not_leave_an_unlinked_discovery_report() -> Result<(), Box<dy
         }
     )));
     assert!(!outcome.complete);
-    assert_eq!(outcome.resources.work_charged_bytes, 70);
+    assert_eq!(
+        outcome.resources.work_charged_bytes,
+        expected_source_discovery_work(BASE64_HEX_INPUT)?
+    );
     Ok(())
 }
 
@@ -891,7 +903,10 @@ fn node_quota_does_not_leave_an_unpublished_discovery_report() -> Result<(), Box
         } if input_node_ids == &[input_node]
     )));
     assert!(!outcome.complete);
-    assert_eq!(outcome.resources.work_charged_bytes, 70);
+    assert_eq!(
+        outcome.resources.work_charged_bytes,
+        expected_source_discovery_work(BASE64_HEX_INPUT)?
+    );
     Ok(())
 }
 
@@ -1123,4 +1138,13 @@ fn discovery_report_node_for_input(
         return Err("proposal report node is missing".into());
     }
     Ok(*node_id)
+}
+
+fn expected_source_discovery_work(input: &[u8]) -> Result<usize, Box<dyn Error>> {
+    let scan_bound =
+        l2_workbench::recovery::regions::transform_discovery_scan_work_bound(input.len())
+            .ok_or("transform discovery work bound is not representable")?;
+    scan_bound
+        .checked_add(input.len())
+        .ok_or_else(|| "source validation work bound is not representable".into())
 }

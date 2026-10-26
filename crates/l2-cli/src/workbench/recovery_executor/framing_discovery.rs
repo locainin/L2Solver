@@ -4,7 +4,10 @@ mod input;
 mod report;
 mod work;
 
-pub(in crate::workbench::recovery_executor) use input::{FramingDiscoveryPlan, collect_plan};
+pub(in crate::workbench::recovery_executor) use input::{
+    FramingCohortKey, FramingDiscoveryPlan, FramingInput, NativeHttpCoverage, collect_plan,
+    range_covered_by_native_messages,
+};
 pub(in crate::workbench::recovery_executor) use report::FramingDiscoveryContext;
 #[cfg(test)]
 pub(in crate::workbench::recovery_executor) use report::bounded_report_bytes;

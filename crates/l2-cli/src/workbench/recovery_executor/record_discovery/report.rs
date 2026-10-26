@@ -5,19 +5,23 @@ use super::super::{
     Executor, RecoveryCandidateId, RecoveryExecutionError, RecoveryOmission, RecoveryStage,
     RecoveryTask,
 };
+use super::analysis::{analyze_strategies, has_survivors, reports as strategy_reports};
+use super::collect_input_plan_excluding;
 use super::input::{
-    RecordCohortKey, RecordDiscoveryPlan, RecordFrameInput, apply_input_limits, collect_input_plan,
+    RecordCohortKey, RecordCohortOrigin, RecordDiscoveryInputOmissions, RecordDiscoveryPlan,
+    RecordFrameInput, apply_input_limits,
 };
 use super::work::cohort_work_bound;
 use l2_workbench::{
     evidence::Case,
     protocol::{
-        RecordDiscoveryPartition, RecordSchemaDiscoveryReport, RecordSchemaProposalReport,
-        analyze_record_schemas,
+        RecordDiscoveryPartition, RecordSchema, RecordSchemaDiscoveryReport,
+        RecordSchemaMultiStrategyAnalysisReport, RecordSchemaProposalReport,
     },
     recovery::{EnqueueOutcome, RecoveryCandidate, RecoveryError, RecoveryResult},
 };
 use serde_json::{Value, json};
+use std::collections::HashMap;
 
 const REPORT_KIND: &str = "recovery_record_discovery_report";
 const REPORT_VERSION: u16 = 2;
@@ -28,7 +32,9 @@ const STATUS_HYPOTHESES_FOUND: &str = "hypotheses_found";
 pub(in crate::workbench::recovery_executor) struct RecordDiscoveryContext {
     key: RecordCohortKey,
     inputs: Vec<RecordFrameInput>,
+    application_inputs: Vec<RecordFrameInput>,
     omitted_frames: usize,
+    eligibility_omissions: RecordDiscoveryInputOmissions,
 }
 
 #[derive(Default)]
@@ -80,6 +86,7 @@ impl RecordDiscoveryContext {
         &self,
         key: &RecordCohortKey,
         inputs: &[RecordFrameInput],
+        application_inputs: &[RecordFrameInput],
         omitted_frames: usize,
     ) -> bool {
         self.key == *key
@@ -89,6 +96,12 @@ impl RecordDiscoveryContext {
                 .inputs
                 .iter()
                 .zip(inputs)
+                .all(|(stored, incoming)| stored.node_id == incoming.node_id)
+            && self.application_inputs.len() == application_inputs.len()
+            && self
+                .application_inputs
+                .iter()
+                .zip(application_inputs)
                 .all(|(stored, incoming)| stored.node_id == incoming.node_id)
     }
 }
@@ -106,9 +119,10 @@ struct RecordAnalysis {
     search_exhaustive_within_plan: bool,
     report_details_complete: bool,
     no_candidate_reason: Option<&'static str>,
+    strategy_omission: Option<&'static str>,
+    strategy_not_run_reason: Option<&'static str>,
     partition: SessionPartition,
-    proposal: Option<RecordSchemaProposalReport>,
-    discovery: Option<RecordSchemaDiscoveryReport>,
+    strategies: Option<RecordSchemaMultiStrategyAnalysisReport>,
 }
 
 struct RecordReportOutput {
@@ -202,8 +216,11 @@ impl Executor<'_> {
 
         let scan_bound = case_scan_work_bounds(self.case)?.record;
         let remaining = self.record_case_scan_remaining()?;
+        let derived_discovery = &self.derived_discovery;
         let admission = preflight_scan(scan_bound, remaining, || {
-            let plan = collect_input_plan(self.case)?;
+            let plan = collect_input_plan_excluding(self.case, |node_id| {
+                derived_discovery.has_context(node_id)
+            })?;
             let work = plan.graph_work;
             Ok((std::sync::Arc::new(plan), work))
         })?;
@@ -247,6 +264,61 @@ impl Executor<'_> {
         let Some(plan) = self.record_discovery_snapshot()? else {
             return Ok(());
         };
+        self.enqueue_record_discovery_plan((*plan).clone(), None)
+    }
+
+    pub(in crate::workbench::recovery_executor) fn enqueue_relational_record_discovery(
+        &mut self,
+        key: RecordCohortKey,
+        frames: Vec<RecordFrameInput>,
+    ) -> Result<(), RecoveryExecutionError> {
+        if !self.plan.discover_records || frames.is_empty() {
+            return Ok(());
+        }
+        let mut plan = RecordDiscoveryPlan::default();
+        plan.application_cohorts.insert(key.clone(), frames.clone());
+        plan.cohorts.insert(key, frames);
+        let plan = apply_input_limits(plan, self.policy.record_schema_proposal_limits)?;
+        self.enqueue_record_discovery_plan(plan, None)
+    }
+
+    pub(in crate::workbench::recovery_executor) fn enqueue_derived_record_discovery(
+        &mut self,
+        key: RecordCohortKey,
+        frames: Vec<(RecoveryCandidateId, RecordFrameInput)>,
+    ) -> Result<(), RecoveryExecutionError> {
+        if !self.plan.discover_records || frames.is_empty() {
+            return Ok(());
+        }
+        if !matches!(&key.origin, RecordCohortOrigin::Transformed { .. }) {
+            return Err(RecoveryError::InvariantFailure.into());
+        }
+        let mut parent_by_frame = HashMap::new();
+        parent_by_frame
+            .try_reserve(frames.len())
+            .map_err(|source| operational("derived record parent allocation failed", source))?;
+        let mut inputs = Vec::new();
+        inputs
+            .try_reserve_exact(frames.len())
+            .map_err(|source| operational("derived record input allocation failed", source))?;
+        for (parent, frame) in frames {
+            if parent_by_frame.insert(frame.node_id, parent).is_some() {
+                return Err(RecoveryError::InvariantFailure.into());
+            }
+            inputs.push(frame);
+        }
+        let mut plan = RecordDiscoveryPlan::default();
+        plan.application_cohorts.insert(key.clone(), inputs.clone());
+        plan.cohorts.insert(key, inputs);
+        let plan = apply_input_limits(plan, self.policy.record_schema_proposal_limits)?;
+        self.enqueue_record_discovery_plan(plan, Some(&parent_by_frame))
+    }
+
+    fn enqueue_record_discovery_plan(
+        &mut self,
+        plan: RecordDiscoveryPlan,
+        derived_parents: Option<&HashMap<u64, RecoveryCandidateId>>,
+    ) -> Result<(), RecoveryExecutionError> {
         for (source_id, omission) in &plan.omissions {
             if omission.total > 0 {
                 self.omissions
@@ -258,6 +330,54 @@ impl Executor<'_> {
                     });
             }
         }
+        for (key, frames) in &plan.application_cohorts {
+            if matches!(&key.origin, RecordCohortOrigin::Relational { .. }) {
+                continue;
+            }
+            let source_eligibility_omissions = plan
+                .omissions
+                .get(&Some(key.source_id.clone()))
+                .map_or(0, |omission| omission.total);
+            self.collect_relational_frame_samples(
+                key,
+                frames,
+                source_eligibility_omissions == 0,
+                source_eligibility_omissions,
+            )?;
+        }
+        let contains_tcp_cohorts = plan
+            .cohorts
+            .keys()
+            .any(|key| matches!(&key.origin, RecordCohortOrigin::TcpMaterialized));
+        if contains_tcp_cohorts {
+            let contains_immediate_cohorts = plan
+                .cohorts
+                .keys()
+                .any(|key| !matches!(&key.origin, RecordCohortOrigin::TcpMaterialized));
+            if contains_immediate_cohorts || self.deferred_record_discovery_plan.is_some() {
+                return Err(RecoveryError::InvariantFailure.into());
+            }
+            self.deferred_record_discovery_plan = Some(plan);
+            return Ok(());
+        }
+        self.enqueue_record_discovery_cohorts(&plan, derived_parents)
+    }
+
+    pub(in crate::workbench::recovery_executor) fn enqueue_deferred_record_discovery(
+        &mut self,
+    ) -> Result<bool, RecoveryExecutionError> {
+        let Some(plan) = self.deferred_record_discovery_plan.take() else {
+            return Ok(false);
+        };
+        self.enqueue_record_discovery_cohorts(&plan, None)?;
+        Ok(true)
+    }
+
+    fn enqueue_record_discovery_cohorts(
+        &mut self,
+        plan: &RecordDiscoveryPlan,
+        derived_parents: Option<&HashMap<u64, RecoveryCandidateId>>,
+    ) -> Result<(), RecoveryExecutionError> {
         let task = RecoveryTask::RecordDiscovery;
         for (key, inputs) in &plan.cohorts {
             if inputs.is_empty() {
@@ -268,9 +388,29 @@ impl Executor<'_> {
                 operational("record discovery input allocation failed", source)
             })?;
             node_ids.extend(inputs.iter().map(|input| input.node_id));
-            let result = self
-                .coordinator
-                .enqueue_nodes(self.case, &node_ids, task.clone())?;
+            let result = if let Some(parents) = derived_parents {
+                let mut parent_child_pairs = Vec::new();
+                parent_child_pairs
+                    .try_reserve_exact(inputs.len())
+                    .map_err(|source| {
+                        operational("derived record pair allocation failed", source)
+                    })?;
+                for input in inputs {
+                    let parent = parents
+                        .get(&input.node_id)
+                        .copied()
+                        .ok_or(RecoveryError::InvariantFailure)?;
+                    parent_child_pairs.push((parent, input.node_id));
+                }
+                self.coordinator.enqueue_derived_many(
+                    self.case,
+                    &parent_child_pairs,
+                    task.clone(),
+                )?
+            } else {
+                self.coordinator
+                    .enqueue_nodes(self.case, &node_ids, task.clone())?
+            };
             let candidate_id = match &result {
                 EnqueueOutcome::Queued(id)
                 | EnqueueOutcome::Merged(id)
@@ -285,10 +425,19 @@ impl Executor<'_> {
                     .get(key)
                     .copied()
                     .unwrap_or_default();
+                let application_inputs = plan
+                    .application_cohorts
+                    .get(key)
+                    .ok_or(RecoveryError::InvariantFailure)?;
+                let eligibility_omissions = plan
+                    .omissions
+                    .get(&Some(key.source_id.clone()))
+                    .cloned()
+                    .unwrap_or_default();
                 let contexts = self.record_discoveries.entry(candidate_id).or_default();
                 if !contexts
                     .iter()
-                    .any(|context| context.matches(key, inputs, omitted_frames))
+                    .any(|context| context.matches(key, inputs, application_inputs, omitted_frames))
                 {
                     contexts.try_reserve(1).map_err(|source| {
                         operational("record discovery context allocation failed", source)
@@ -296,7 +445,9 @@ impl Executor<'_> {
                     contexts.push(RecordDiscoveryContext {
                         key: key.clone(),
                         inputs: inputs.clone(),
+                        application_inputs: application_inputs.clone(),
                         omitted_frames,
+                        eligibility_omissions,
                     });
                 }
             }
@@ -449,11 +600,14 @@ impl Executor<'_> {
             .map_err(|source| operational("record discovery report allocation failed", source))?;
         for (context, work_bound_bytes) in contexts {
             let partition = partition_inputs(&context.inputs)?;
+            let include_repeated_boundaries =
+                !matches!(&context.key.origin, RecordCohortOrigin::TcpMaterialized);
             let analysis = self.analyze_record_cohort(
                 &context.inputs,
                 partition,
                 proposal_limits,
                 context.omitted_frames > 0,
+                include_repeated_boundaries,
             )?;
             let full_report = build_report(&context, &analysis, work_bound_bytes)?;
             let bytes = serde_json::to_vec(&full_report).map_err(|source| {
@@ -519,27 +673,54 @@ impl Executor<'_> {
         if reports.len() != report_nodes.len() {
             return Err(RecoveryError::InvariantFailure.into());
         }
-        let schema_count = reports
+        let mut schemas_by_report = Vec::new();
+        schemas_by_report
+            .try_reserve_exact(reports.len())
+            .map_err(|source| operational("record schema selection allocation failed", source))?;
+        for report in reports {
+            let mut schemas = Vec::<RecordSchema>::new();
+            if let Some(strategies) = report.analysis.strategies.as_ref() {
+                for strategy in strategy_reports(strategies) {
+                    let Some(discovery) = strategy.discovery.as_ref() else {
+                        continue;
+                    };
+                    schemas
+                        .try_reserve(discovery.surviving.len())
+                        .map_err(|source| {
+                            operational("record schema selection allocation failed", source)
+                        })?;
+                    for hypothesis in &discovery.surviving {
+                        if !schemas.contains(&hypothesis.schema) {
+                            schemas.push(hypothesis.schema.clone());
+                        }
+                    }
+                }
+            }
+            schemas_by_report.push(schemas);
+        }
+        let schema_count = schemas_by_report
             .iter()
-            .filter_map(|report| report.analysis.discovery.as_ref())
-            .map(|discovery| discovery.surviving.len())
+            .map(Vec::len)
             .max()
             .unwrap_or_default();
         let mut requests = Vec::new();
+        let requested_schemas = schema_count.checked_mul(reports.len()).ok_or_else(|| {
+            RecoveryExecutionError::InvalidPolicy("record schema queue size overflowed".to_owned())
+        })?;
+        requests
+            .try_reserve(requested_schemas)
+            .map_err(|source| operational("record schema queue allocation failed", source))?;
         for schema_index in 0..schema_count {
-            for (report, report_node) in reports.iter().zip(report_nodes) {
-                let Some(hypothesis) = report
-                    .analysis
-                    .discovery
-                    .as_ref()
-                    .and_then(|discovery| discovery.surviving.get(schema_index))
-                else {
+            for ((report, report_node), schemas) in
+                reports.iter().zip(report_nodes).zip(&schemas_by_report)
+            {
+                let Some(schema) = schemas.get(schema_index) else {
                     continue;
                 };
                 Self::append_discovered_record_schema(
                     &report.context,
                     *report_node,
-                    hypothesis,
+                    schema,
                     &mut requests,
                 )?;
             }
@@ -553,7 +734,12 @@ impl Executor<'_> {
         origins: &[u64],
         reports: &[RecordReportOutput],
     ) -> Result<Vec<u64>, RecoveryExecutionError> {
-        self.case_transaction_and_finish(candidate_id, |case, identities| {
+        self.record_discovery_context_by_report
+            .try_reserve(reports.len())
+            .map_err(|source| {
+                operational("record discovery report-context allocation failed", source)
+            })?;
+        let node_ids = self.case_transaction_and_finish(candidate_id, |case, identities| {
             let mut node_ids = Vec::new();
             node_ids
                 .try_reserve_exact(reports.len())
@@ -593,7 +779,15 @@ impl Executor<'_> {
                     node_id: result_node,
                 },
             ))
-        })
+        })?;
+        if node_ids.len() != reports.len() {
+            return Err(RecoveryError::InvariantFailure.into());
+        }
+        for (node_id, report) in node_ids.iter().copied().zip(reports) {
+            self.record_discovery_context_by_report
+                .insert(node_id, report.context.clone());
+        }
+        Ok(node_ids)
     }
 
     fn finish_record_report_quota(
@@ -627,11 +821,25 @@ impl Executor<'_> {
     fn append_discovered_record_schema(
         context: &RecordDiscoveryContext,
         report_node: u64,
-        hypothesis: &l2_workbench::protocol::RecordSchemaHypothesis,
+        schema: &RecordSchema,
         requests: &mut Vec<(Vec<u64>, l2_workbench::protocol::RecordSchema, u64)>,
     ) -> Result<(), RecoveryExecutionError> {
+        if matches!(&context.key.origin, RecordCohortOrigin::Relational { .. }) {
+            let mut node_ids = Vec::new();
+            node_ids
+                .try_reserve_exact(context.application_inputs.len())
+                .map_err(|source| {
+                    operational("relational record session allocation failed", source)
+                })?;
+            node_ids.extend(context.application_inputs.iter().map(|input| input.node_id));
+            requests
+                .try_reserve(1)
+                .map_err(|source| operational("record schema queue allocation failed", source))?;
+            requests.push((node_ids, schema.clone(), report_node));
+            return Ok(());
+        }
         for session in context
-            .inputs
+            .application_inputs
             .chunk_by(|left, right| left.session_node_id == right.session_node_id)
         {
             let mut node_ids = Vec::new();
@@ -642,7 +850,7 @@ impl Executor<'_> {
             requests
                 .try_reserve(1)
                 .map_err(|source| operational("record schema queue allocation failed", source))?;
-            requests.push((node_ids, hypothesis.schema.clone(), report_node));
+            requests.push((node_ids, schema.clone(), report_node));
         }
         Ok(())
     }
@@ -653,6 +861,7 @@ impl Executor<'_> {
         partition: SessionPartition,
         proposal_limits: l2_workbench::protocol::RecordSchemaProposalLimits,
         input_budget_partial: bool,
+        include_repeated_boundaries: bool,
     ) -> Result<RecordAnalysis, RecoveryExecutionError> {
         let training_inputs = inputs
             .get(..partition.training_count)
@@ -662,39 +871,53 @@ impl Executor<'_> {
             .ok_or(RecoveryError::InvariantFailure)?;
         let training = message_refs(self.case, training_inputs)?;
         let held_out = message_refs(self.case, held_out_inputs)?;
-        if training.len() < 2 {
+        if training.is_empty() {
             return Ok(RecordAnalysis {
                 result: STATUS_NO_CANDIDATES,
                 search_exhaustive_within_plan: !input_budget_partial,
                 report_details_complete: true,
                 no_candidate_reason: Some("insufficient_training_messages"),
+                strategy_omission: None,
+                strategy_not_run_reason: None,
                 partition,
-                proposal: None,
-                discovery: None,
+                strategies: None,
             });
         }
-        let schema_analysis = analyze_record_schemas(&training, &held_out, proposal_limits)
-            .map_err(invalid_discovery_policy)?;
-        let proposal = schema_analysis.proposal;
-        let discovery = schema_analysis.discovery;
+        let strategies = analyze_strategies(
+            &training,
+            &held_out,
+            proposal_limits,
+            include_repeated_boundaries,
+        )
+        .map_err(invalid_discovery_policy)?;
+        let strategy_omission = (include_repeated_boundaries
+            && strategies.repeated_boundaries.is_none())
+        .then_some("repeated_boundaries_not_run_due_to_shared_limits");
+        let strategy_not_run_reason = (!include_repeated_boundaries)
+            .then_some("repeated_boundaries_not_requested_for_tcp_materialized_frames");
         let search_exhaustive_within_plan = !input_budget_partial
-            && proposal.search_exhaustive_within_plan
-            && discovery
-                .as_ref()
-                .is_none_or(|report| report.search_exhaustive_within_plan);
-        let result = if discovery
-            .as_ref()
-            .is_some_and(|report| !report.surviving.is_empty())
-        {
+            && strategy_omission.is_none()
+            && strategy_reports(&strategies).all(|report| {
+                report.proposal.search_exhaustive_within_plan
+                    && report
+                        .discovery
+                        .as_ref()
+                        .is_none_or(|discovery| discovery.search_exhaustive_within_plan)
+            });
+        let result = if has_survivors(&strategies) {
             STATUS_HYPOTHESES_FOUND
         } else {
             STATUS_NO_CANDIDATES
         };
-        let report_details_complete = discovery
-            .as_ref()
-            .is_none_or(|report| report.report_details_complete);
+        let report_details_complete = strategy_reports(&strategies).all(|report| {
+            report
+                .discovery
+                .as_ref()
+                .is_none_or(|item| item.report_details_complete)
+        });
         let no_candidate_reason = if result == STATUS_NO_CANDIDATES {
-            if proposal.candidate_space.is_none() {
+            if strategy_reports(&strategies).all(|report| report.proposal.candidate_space.is_none())
+            {
                 Some("no_structural_candidate_space")
             } else {
                 Some("no_schema_survived_strict_parsing")
@@ -707,9 +930,10 @@ impl Executor<'_> {
             search_exhaustive_within_plan,
             report_details_complete,
             no_candidate_reason,
+            strategy_omission,
+            strategy_not_run_reason,
             partition,
-            proposal: Some(proposal),
-            discovery,
+            strategies: Some(strategies),
         })
     }
 
@@ -718,20 +942,55 @@ impl Executor<'_> {
         context: &RecordDiscoveryContext,
         analysis: &RecordAnalysis,
     ) {
-        let proposal = analysis.proposal.as_ref();
-        let discovery = analysis.discovery.as_ref();
         if analysis.search_exhaustive_within_plan && analysis.report_details_complete {
             return;
         }
-        let omitted_candidates = discovery
-            .and_then(|report| report.unexamined_combinations)
-            .or_else(|| proposal.and_then(|report| report.omitted_schema_combinations));
-        let omitted_field_checks = proposal.map_or(0, |report| report.omitted_field_checks);
-        let omitted_pair_checks = proposal.map_or(0, |report| report.omitted_pair_checks);
-        let omitted_length_checks = proposal.map_or(0, |report| report.omitted_length_checks);
-        let omitted_survivors = discovery.map_or(0, |report| report.omitted_survivors);
-        let omitted_falsification_examples =
-            discovery.map_or(0, |report| report.omitted_falsification_examples);
+        let omitted_candidates = analysis.strategies.as_ref().and_then(|strategies| {
+            let mut total = 0_usize;
+            let mut had_count = false;
+            for report in strategy_reports(strategies) {
+                let count = report
+                    .discovery
+                    .as_ref()
+                    .and_then(|item| item.unexamined_combinations)
+                    .or(report.proposal.omitted_schema_combinations);
+                if let Some(count) = count {
+                    total = total.checked_add(count)?;
+                    had_count = true;
+                }
+            }
+            had_count.then_some(total)
+        });
+        let (omitted_field_checks, omitted_pair_checks, omitted_length_checks) = analysis
+            .strategies
+            .as_ref()
+            .map_or((0, 0, 0), |strategies| {
+                strategy_reports(strategies).fold((0_usize, 0_usize, 0_usize), |totals, report| {
+                    (
+                        totals
+                            .0
+                            .saturating_add(report.proposal.omitted_field_checks),
+                        totals.1.saturating_add(report.proposal.omitted_pair_checks),
+                        totals
+                            .2
+                            .saturating_add(report.proposal.omitted_length_checks),
+                    )
+                })
+            });
+        let (omitted_survivors, omitted_falsification_examples) =
+            analysis.strategies.as_ref().map_or((0, 0), |strategies| {
+                strategy_reports(strategies).fold((0_usize, 0_usize), |totals, report| {
+                    let discovery = report.discovery.as_ref();
+                    (
+                        totals
+                            .0
+                            .saturating_add(discovery.map_or(0, |item| item.omitted_survivors)),
+                        totals.1.saturating_add(
+                            discovery.map_or(0, |item| item.omitted_falsification_examples),
+                        ),
+                    )
+                })
+            });
         self.omissions
             .push(RecoveryOmission::RecordDiscoveryAnalysis {
                 source_id: context.key.source_id.clone(),
@@ -773,6 +1032,8 @@ fn build_compact_report(
         "search_exhaustive_within_plan":analysis.search_exhaustive_within_plan,
         "report_details_complete":false,
         "no_candidate_reason":analysis.no_candidate_reason,
+        "strategy_omission":analysis.strategy_omission,
+        "strategy_not_run_reason":analysis.strategy_not_run_reason,
         "cohort":{
             "source_id":context.key.source_id,
             "scope":scope,
@@ -788,7 +1049,16 @@ fn build_compact_report(
             "held_out_message_count":context.inputs.len().saturating_sub(analysis.partition.training_count),
         },
         "input_frame_refs":input_frame_refs,
-        "input_omissions":{"omitted_frame_count":context.omitted_frames},
+        "input_omissions":{
+            "learning_budget_omitted_frame_count":context.omitted_frames,
+            "eligibility_omitted_frame_count":context.eligibility_omissions.total,
+            "eligibility_reason_counts":context.eligibility_omissions.reason_counts,
+            "eligibility_examples":context.eligibility_omissions.examples,
+        },
+        "application":{
+            "validated_frame_count":context.application_inputs.len(),
+            "session_count":application_session_count(&context.application_inputs),
+        },
         "report_detail_omissions":{
             "input_frame_descriptors":omitted_input_frame_descriptors,
             "schema_proposal_details":omitted_schema_proposals,
@@ -803,17 +1073,33 @@ fn report_detail_counts(
     analysis: &RecordAnalysis,
     context: &RecordDiscoveryContext,
 ) -> (usize, usize, usize, usize) {
+    let (proposal_count, survivor_count, falsification_count) = analysis
+        .strategies
+        .as_ref()
+        .map_or((0_usize, 0_usize, 0_usize), |strategies| {
+            strategy_reports(strategies).fold((0_usize, 0_usize, 0_usize), |counts, report| {
+                (
+                    counts.0.saturating_add(1),
+                    counts.1.saturating_add(
+                        report
+                            .discovery
+                            .as_ref()
+                            .map_or(0, |item| item.surviving.len()),
+                    ),
+                    counts.2.saturating_add(
+                        report
+                            .discovery
+                            .as_ref()
+                            .map_or(0, |item| item.falsifications.len()),
+                    ),
+                )
+            })
+        });
     (
         context.inputs.len(),
-        usize::from(analysis.proposal.is_some()),
-        analysis
-            .discovery
-            .as_ref()
-            .map_or(0, |report| report.surviving.len()),
-        analysis
-            .discovery
-            .as_ref()
-            .map_or(0, |report| report.falsifications.len()),
+        proposal_count,
+        survivor_count,
+        falsification_count,
     )
 }
 
@@ -921,8 +1207,24 @@ fn build_report(
         .map_err(|source| operational("record discovery rule could not be decoded", source))?;
     let input_frame_refs =
         report_input_frame_refs(&context.inputs, analysis.partition.training_count);
-    let schema_proposal = analysis.proposal.as_ref().map(proposal_json);
-    let schema_discovery = analysis.discovery.as_ref().map(discovery_json);
+    let fixed_layout = analysis
+        .strategies
+        .as_ref()
+        .map(|strategies| &strategies.fixed_layout);
+    let schema_proposal = fixed_layout.map(|report| proposal_json(&report.proposal));
+    let schema_discovery = fixed_layout
+        .and_then(|report| report.discovery.as_ref())
+        .map(discovery_json);
+    let repeated_boundary_analysis = analysis
+        .strategies
+        .as_ref()
+        .and_then(|strategies| strategies.repeated_boundaries.as_ref())
+        .map(|report| {
+            json!({
+                "proposal":proposal_json(&report.proposal),
+                "discovery":report.discovery.as_ref().map(discovery_json),
+            })
+        });
     Ok(json!({
         "version":REPORT_VERSION,
         "case_scope":"current_case",
@@ -930,6 +1232,8 @@ fn build_report(
         "search_exhaustive_within_plan":analysis.search_exhaustive_within_plan,
         "report_details_complete":analysis.report_details_complete,
         "no_candidate_reason":analysis.no_candidate_reason,
+        "strategy_omission":analysis.strategy_omission,
+        "strategy_not_run_reason":analysis.strategy_not_run_reason,
         "cohort":{
             "source_id":context.key.source_id,
             "scope":scope,
@@ -946,10 +1250,18 @@ fn build_report(
         },
         "input_frame_refs":input_frame_refs,
         "input_omissions":{
-            "omitted_frame_count":context.omitted_frames,
+            "learning_budget_omitted_frame_count":context.omitted_frames,
+            "eligibility_omitted_frame_count":context.eligibility_omissions.total,
+            "eligibility_reason_counts":context.eligibility_omissions.reason_counts,
+            "eligibility_examples":context.eligibility_omissions.examples,
+        },
+        "application":{
+            "validated_frame_count":context.application_inputs.len(),
+            "session_count":application_session_count(&context.application_inputs),
         },
         "schema_proposal":schema_proposal,
         "schema_discovery":schema_discovery,
+        "repeated_boundary_analysis":repeated_boundary_analysis,
         "work_bound_bytes":requested_work,
     }))
 }
@@ -967,6 +1279,12 @@ fn report_input_frame_refs(inputs: &[RecordFrameInput], training_count: usize) -
             json!([input.node_id, partition.as_str()])
         })
         .collect()
+}
+
+fn application_session_count(inputs: &[RecordFrameInput]) -> usize {
+    inputs
+        .chunk_by(|left, right| left.session_node_id == right.session_node_id)
+        .count()
 }
 
 fn proposal_json(report: &RecordSchemaProposalReport) -> Value {
@@ -994,6 +1312,10 @@ fn proposal_json(report: &RecordSchemaProposalReport) -> Value {
         "omitted_pair_checks":report.omitted_pair_checks,
         "examined_length_checks":report.examined_length_checks,
         "omitted_length_checks":report.omitted_length_checks,
+        "omitted_record_views":report.omitted_record_views,
+        "repeated_boundary_cues":report.repeated_boundary_cues.iter().map(|cue| {
+            json!({"message_index":cue.message_index,"range":cue.range})
+        }).collect::<Vec<_>>(),
         "omitted_schema_combinations":report.omitted_schema_combinations,
         "search_exhaustive_within_plan":report.search_exhaustive_within_plan,
         "limitations":report.limitations,

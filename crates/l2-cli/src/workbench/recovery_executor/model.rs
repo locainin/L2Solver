@@ -71,6 +71,8 @@ pub(super) struct RecoveryExecutionPolicy {
     pub(super) record_discovery_snapshot: Option<Arc<RecordDiscoverySnapshot>>,
     /// Bounds for automatic record-field proposal and strict candidate validation
     pub(super) record_schema_proposal_limits: RecordSchemaProposalLimits,
+    /// Bounded session-relative transform family tested after record assembly
+    pub(super) relational_transform_plan: l2_workbench::protocol::RelationalTransformPlan,
     /// Immutable work reservation for the post-framing record phase
     pub(super) record_phase_work_limit: usize,
 }
@@ -145,6 +147,21 @@ pub enum RecoveryOmission {
         omitted_pair_checks: usize,
         omitted_length_checks: usize,
     },
+    /// Relational transform work or report details were bounded or lacked eligible sessions
+    RelationalTransformAnalysis {
+        source_id: String,
+        sessions_available: usize,
+        omitted_sessions: usize,
+        omitted_samples: usize,
+        omitted_rules: usize,
+        candidate_limit_remaining: usize,
+        locator_candidate_limit_remaining: usize,
+        work_bytes_remaining: usize,
+        input_coverage_complete: bool,
+        search_exhaustive_within_plan: bool,
+        report_details_complete: bool,
+        reason: Option<&'static str>,
+    },
     /// Full record discovery frame descriptors and schema details were omitted from the compact summary
     RecordDiscoveryReportDetails {
         source_id: String,
@@ -208,7 +225,9 @@ impl fmt::Display for RecoveryOmission {
             | Self::FramingDiscoveryAnalysis { .. }
             | Self::FramingDiscoveryReportDetails { .. }
             | Self::RecordDiscoveryInputs { .. }
-            | Self::RecordDiscoveryAnalysis { .. } => format_framing_omission(formatter, self),
+            | Self::RecordDiscoveryAnalysis { .. }
+            | Self::RecordDiscoveryReportDetails { .. } => format_framing_omission(formatter, self),
+            Self::RelationalTransformAnalysis { .. } => format_relational_analysis(formatter, self),
             Self::TransformDiscoveryAnalysis { .. } => {
                 format_transform_discovery_analysis(formatter, self)
             }
@@ -445,6 +464,49 @@ fn format_content_omission(
     }
 }
 
+fn format_relational_analysis(
+    formatter: &mut fmt::Formatter<'_>,
+    omission: &RecoveryOmission,
+) -> fmt::Result {
+    let RecoveryOmission::RelationalTransformAnalysis {
+        source_id,
+        sessions_available,
+        omitted_sessions,
+        omitted_samples,
+        omitted_rules,
+        candidate_limit_remaining,
+        locator_candidate_limit_remaining,
+        work_bytes_remaining,
+        input_coverage_complete,
+        search_exhaustive_within_plan,
+        report_details_complete,
+        reason,
+    } = omission
+    else {
+        return Err(fmt::Error);
+    };
+    write!(
+        formatter,
+        "relational analysis for source {source_id} checked {sessions_available} sessions; remaining budgets: {candidate_limit_remaining} candidates, {locator_candidate_limit_remaining} locators, {work_bytes_remaining} work bytes; omitted {omitted_sessions} sessions, {omitted_samples} samples, and {omitted_rules} supported rules from output application; coverage {}, search {}, report details {}{}",
+        if *input_coverage_complete {
+            "complete"
+        } else {
+            "partial"
+        },
+        if *search_exhaustive_within_plan {
+            "exhaustive within plan"
+        } else {
+            "bounded or incomplete"
+        },
+        if *report_details_complete {
+            "complete"
+        } else {
+            "compact"
+        },
+        reason.map_or_else(String::new, |reason| format!(" ({reason})")),
+    )
+}
+
 fn format_framing_inputs(
     formatter: &mut fmt::Formatter<'_>,
     source_id: Option<&str>,
@@ -572,6 +634,7 @@ const fn task_label(task: &RecoveryTask) -> &'static str {
         RecoveryTask::StructuralValidation => "structural validation",
         RecoveryTask::FramingDiscovery => "framing discovery",
         RecoveryTask::RecordDiscovery => "record discovery",
+        RecoveryTask::RelationalTransformDiscovery => "relational transform discovery",
     }
 }
 
@@ -710,6 +773,10 @@ pub enum RecoveryExecutionError {
     InvalidPolicy(String),
     /// The coordinator rejected an invalid evidence or queue transition
     Coordinator(RecoveryError),
+    /// A shared recovery job could not continue or record progress
+    Job(l2_workbench::job::JobError),
+    /// A relational discovery or exact rule replay failed
+    Relational(l2_workbench::protocol::RelationalTransformError),
     /// A checked case evidence write failed
     Evidence(EvidenceError),
     /// A reusable operation failed outside speculative format rejection
@@ -724,6 +791,8 @@ impl fmt::Display for RecoveryExecutionError {
         match self {
             Self::InvalidPolicy(reason) => write!(formatter, "invalid recovery policy: {reason}"),
             Self::Coordinator(error) => write!(formatter, "recovery coordinator failed: {error}"),
+            Self::Job(error) => write!(formatter, "recovery job failed: {error}"),
+            Self::Relational(error) => write!(formatter, "relational recovery failed: {error}"),
             Self::Evidence(error) => write!(formatter, "recovery evidence write failed: {error}"),
             Self::Operational { stage, source } => {
                 write!(formatter, "{stage:?} operation failed: {source}")
@@ -737,6 +806,8 @@ impl Error for RecoveryExecutionError {
         match self {
             Self::InvalidPolicy(_) => None,
             Self::Coordinator(error) => Some(error),
+            Self::Job(error) => Some(error),
+            Self::Relational(error) => Some(error),
             Self::Evidence(error) => Some(error),
             Self::Operational { source, .. } => Some(source.as_ref()),
         }
@@ -746,6 +817,18 @@ impl Error for RecoveryExecutionError {
 impl From<RecoveryError> for RecoveryExecutionError {
     fn from(error: RecoveryError) -> Self {
         Self::Coordinator(error)
+    }
+}
+
+impl From<l2_workbench::job::JobError> for RecoveryExecutionError {
+    fn from(error: l2_workbench::job::JobError) -> Self {
+        Self::Job(error)
+    }
+}
+
+impl From<l2_workbench::protocol::RelationalTransformError> for RecoveryExecutionError {
+    fn from(error: l2_workbench::protocol::RelationalTransformError) -> Self {
+        Self::Relational(error)
     }
 }
 

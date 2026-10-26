@@ -171,6 +171,50 @@ fn appended_contains_edge_for_a_retained_direction_invalidates_the_plan()
 }
 
 #[test]
+fn appended_native_application_receipt_invalidates_the_coverage_plan() -> Result<(), Box<dyn Error>>
+{
+    let (mut case, _, run) = framing_case()?;
+    let plan = collect_plan(&case, ProtocolLimits::default())?;
+    let checks = case.add_node(
+        "application_checks",
+        None,
+        Vec::new(),
+        json!({
+            "http":{"status":"incomplete","messages":1,"unparsed":[],"budget_omissions":[]},
+            "start_known":true,
+            "end_observed":false
+        }),
+    )?;
+    let message = case.add_node(
+        "http_message_candidate",
+        None,
+        Vec::new(),
+        json!({
+            "range":{"offset":0,"length":8},
+            "status":"complete",
+            "framing":{"kind":"content_length","expected":0}
+        }),
+    )?;
+    case.add_edge(Edge {
+        from: run,
+        to: checks,
+        relation: "tested_by".to_owned(),
+        status: EvidenceStatus::Observed,
+        reason: "Native application coverage was recorded".to_owned(),
+    })?;
+    case.add_edge(Edge {
+        from: run,
+        to: message,
+        relation: "parsed_as".to_owned(),
+        status: EvidenceStatus::Hypothesis,
+        reason: "A complete native message was recorded".to_owned(),
+    })?;
+
+    assert!(!plan.matches_case(&case));
+    Ok(())
+}
+
+#[test]
 fn a_rewound_case_does_not_match_a_plan_from_after_the_rewind() -> Result<(), Box<dyn Error>> {
     let (mut case, _, _) = framing_case()?;
     let mut plan_after_append = None;

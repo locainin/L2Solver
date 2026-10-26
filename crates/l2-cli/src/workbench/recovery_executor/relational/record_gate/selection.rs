@@ -6,7 +6,6 @@ use std::collections::{BTreeMap, BTreeSet};
 pub(super) struct LearningSelection {
     pub(super) indices: Vec<usize>,
     pub(super) omitted_messages: usize,
-    pub(super) session_count: usize,
 }
 
 pub(super) fn select_learning_frames(
@@ -34,7 +33,6 @@ pub(super) fn select_learning_frames(
         return Ok(LearningSelection {
             indices: Vec::new(),
             omitted_messages: frames.len(),
-            session_count: by_session.len(),
         });
     }
     let total_messages = by_session
@@ -71,6 +69,5 @@ pub(super) fn select_learning_frames(
     Ok(LearningSelection {
         indices,
         omitted_messages: total_messages.saturating_sub(selection_limit),
-        session_count: sessions.len(),
     })
 }

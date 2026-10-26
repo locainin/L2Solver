@@ -15,6 +15,7 @@ use super::{
         case_work_bound as record_case_work_bound, collect_input_plan as collect_record_plan,
     },
 };
+use crate::arguments::RecoveryProfile;
 use l2_workbench::artifact::zip::{
     MAX_ZIP_DEPTH, MAX_ZIP_ENTRIES, MAX_ZIP_ENTRY_EXPANDED_BYTES, MAX_ZIP_TOTAL_EXPANDED_BYTES,
 };
@@ -26,6 +27,7 @@ use l2_workbench::{
     protocol::{
         ByteField, ByteOrder, FramingKind, IntegerField, ProtocolLimits, RecordCount,
         RecordLengthMeaning, RecordLimits, RecordSchema, RecordSchemaProposalLimits,
+        RelationalParserScope, RelationalTransformPlan,
     },
     recovery::{
         RecoveryError, RecoveryResourcePolicy, RecoveryTask,
@@ -38,6 +40,17 @@ use l2_workbench::{
 };
 use std::collections::HashMap;
 use std::sync::Arc;
+
+#[cfg(test)]
+pub(super) const DEFAULT_MEMORY_LIMIT_BYTES: usize = 512 * 1024 * 1024;
+const FAST_RECORD_MESSAGES: usize = 512;
+const FAST_RECORD_CANDIDATES: usize = 256;
+const FAST_RELATIONAL_CANDIDATES: usize = 8_192;
+const FAST_RELATIONAL_LOCATORS: usize = 1_024;
+const FAST_RELATIONAL_RETAINED: usize = 32;
+const DEEP_RELATIONAL_CANDIDATES: usize = 262_144;
+const DEEP_RELATIONAL_LOCATORS: usize = 32_768;
+const DEEP_RELATIONAL_RETAINED: usize = 128;
 
 const BYTE_SOURCE_KINDS: &[&str] = &[
     "tcp_byte_run",
@@ -109,7 +122,195 @@ pub(super) fn normal_policy(
         framing_discovery_plan,
         record_discovery_snapshot,
         record_schema_proposal_limits,
+        RelationalTransformPlan::default(),
     )
+}
+
+pub(super) fn policy_for_profile(
+    case: &Case,
+    profile: RecoveryProfile,
+    memory_limit_bytes: u64,
+) -> Result<RecoveryExecutionPolicy, RecoveryExecutionError> {
+    let memory_limit = usize::try_from(memory_limit_bytes).unwrap_or(usize::MAX);
+    if memory_limit == 0 {
+        return Err(RecoveryExecutionError::InvalidPolicy(
+            "recovery memory limit must be positive".to_owned(),
+        ));
+    }
+
+    let mut policy = normal_policy(case)?;
+    policy.relational_transform_plan =
+        relational_plan_for_profile(profile, &mut policy.record_schema_proposal_limits);
+    apply_memory_limit(&mut policy, memory_limit);
+    Ok(policy)
+}
+
+fn relational_plan_for_profile(
+    profile: RecoveryProfile,
+    record_limits: &mut RecordSchemaProposalLimits,
+) -> RelationalTransformPlan {
+    let mut relational = RelationalTransformPlan {
+        parser_scope: RelationalParserScope::AcrossSessions,
+        ..RelationalTransformPlan::default()
+    };
+    match profile {
+        RecoveryProfile::Fast => {
+            relational.limits.max_cohorts = 16;
+            relational.limits.max_sessions = 8;
+            relational.limits.max_records_per_session = 64;
+            relational.limits.max_marker_bytes = 1;
+            relational.limits.max_marker_offset = 4;
+            relational.limits.max_seed_bytes = 16;
+            relational.limits.max_locator_offset = 8;
+            relational.limits.max_locator_candidates = FAST_RELATIONAL_LOCATORS;
+            relational.limits.max_candidates = FAST_RELATIONAL_CANDIDATES;
+            relational.limits.max_retained_candidates = FAST_RELATIONAL_RETAINED;
+            relational.limits.max_work_bytes = 16 * 1024 * 1024;
+
+            record_limits.discovery.max_messages = record_limits
+                .discovery
+                .max_messages
+                .min(FAST_RECORD_MESSAGES);
+            record_limits.discovery.max_candidates = record_limits
+                .discovery
+                .max_candidates
+                .min(FAST_RECORD_CANDIDATES);
+            record_limits.discovery.max_survivors = record_limits
+                .discovery
+                .max_survivors
+                .min(FAST_RECORD_CANDIDATES);
+            record_limits.max_field_checks_per_domain = record_limits
+                .max_field_checks_per_domain
+                .min(FAST_RECORD_CANDIDATES);
+            record_limits.max_pair_checks =
+                record_limits.max_pair_checks.min(FAST_RECORD_CANDIDATES);
+            record_limits.max_length_checks =
+                record_limits.max_length_checks.min(FAST_RECORD_CANDIDATES);
+        }
+        RecoveryProfile::Normal => {
+            relational.limits.max_retained_candidates = 64;
+        }
+        RecoveryProfile::Deep => {
+            relational.limits.max_cohorts = 512;
+            relational.limits.max_sessions = 64;
+            relational.limits.max_records_per_session = 512;
+            relational.limits.max_marker_bytes = 4;
+            relational.limits.max_marker_offset = 16;
+            relational.limits.max_seed_bytes = 64;
+            relational.limits.max_locator_offset = 32;
+            relational.limits.max_locator_candidates = DEEP_RELATIONAL_LOCATORS;
+            relational.limits.max_candidates = DEEP_RELATIONAL_CANDIDATES;
+            relational.limits.max_retained_candidates = DEEP_RELATIONAL_RETAINED;
+            relational.limits.max_work_bytes = 256 * 1024 * 1024;
+        }
+    }
+
+    relational
+}
+
+fn apply_memory_limit(policy: &mut RecoveryExecutionPolicy, memory_limit: usize) {
+    limit_relational_plan(&mut policy.relational_transform_plan, memory_limit);
+    limit_artifact_validation(policy, memory_limit);
+    limit_recovery_work(policy, memory_limit);
+}
+
+fn limit_relational_plan(plan: &mut RelationalTransformPlan, memory_limit: usize) {
+    // The memory allowance bounds retained transform samples and materialized outputs
+    plan.limits.max_cohorts = plan
+        .limits
+        .max_cohorts
+        .min((memory_limit / (128 * 1024)).max(1));
+    plan.limits.max_record_bytes = plan.limits.max_record_bytes.min(memory_limit);
+    plan.limits.max_total_bytes = plan.limits.max_total_bytes.min((memory_limit / 4).max(1));
+    plan.limits.max_locator_candidates = plan
+        .limits
+        .max_locator_candidates
+        .min((memory_limit / 128).max(1));
+    plan.limits.max_retained_candidates = plan
+        .limits
+        .max_retained_candidates
+        .min((memory_limit / 8_192).max(1));
+    plan.limits.max_work_bytes = plan
+        .limits
+        .max_work_bytes
+        .min(memory_limit.saturating_mul(8).max(1));
+}
+
+fn limit_artifact_validation(policy: &mut RecoveryExecutionPolicy, memory_limit: usize) {
+    policy.resources.max_output_bytes = policy.resources.max_output_bytes.min(memory_limit);
+    policy.artifact_validation_policy.max_input_bytes = policy
+        .artifact_validation_policy
+        .max_input_bytes
+        .min(memory_limit);
+    policy.artifact_validation_policy.png_limits.max_input_bytes = policy
+        .artifact_validation_policy
+        .png_limits
+        .max_input_bytes
+        .min(memory_limit);
+    policy
+        .artifact_validation_policy
+        .zip_limits
+        .max_archive_bytes = policy
+        .artifact_validation_policy
+        .zip_limits
+        .max_archive_bytes
+        .min(memory_limit);
+    policy
+        .artifact_validation_policy
+        .zip_limits
+        .max_entry_expanded_bytes = policy
+        .artifact_validation_policy
+        .zip_limits
+        .max_entry_expanded_bytes
+        .min(memory_limit);
+    policy
+        .artifact_validation_policy
+        .zip_limits
+        .max_total_expanded_bytes = policy
+        .artifact_validation_policy
+        .zip_limits
+        .max_total_expanded_bytes
+        .min(memory_limit);
+}
+
+fn limit_recovery_work(policy: &mut RecoveryExecutionPolicy, memory_limit: usize) {
+    policy.derivation_limits.max_input_bytes =
+        policy.derivation_limits.max_input_bytes.min(memory_limit);
+    policy.derivation_limits.max_output_bytes =
+        policy.derivation_limits.max_output_bytes.min(memory_limit);
+    policy.decode_batch_limits.total_input_bytes = policy
+        .decode_batch_limits
+        .total_input_bytes
+        .min(memory_limit);
+    policy.decode_batch_limits.total_output_bytes = policy
+        .decode_batch_limits
+        .total_output_bytes
+        .min(memory_limit);
+    policy.record_limits.max_input_bytes = policy.record_limits.max_input_bytes.min(memory_limit);
+    policy.record_limits.max_output_bytes = policy.record_limits.max_output_bytes.min(memory_limit);
+    policy
+        .record_schema_proposal_limits
+        .discovery
+        .record_limits
+        .max_input_bytes = policy
+        .record_schema_proposal_limits
+        .discovery
+        .record_limits
+        .max_input_bytes
+        .min(memory_limit);
+    policy
+        .record_schema_proposal_limits
+        .discovery
+        .record_limits
+        .max_output_bytes = policy
+        .record_schema_proposal_limits
+        .discovery
+        .record_limits
+        .max_output_bytes
+        .min(memory_limit);
+    policy.embedded_limits.max_scan_bytes = policy.embedded_limits.max_scan_bytes.min(memory_limit);
+    policy.expansion_limits.retained_bytes =
+        policy.expansion_limits.retained_bytes.min(memory_limit);
 }
 
 fn build_execution_policy(
@@ -119,6 +320,7 @@ fn build_execution_policy(
     framing_discovery_plan: Arc<FramingDiscoveryPlan>,
     record_discovery_snapshot: Arc<RecordDiscoverySnapshot>,
     record_schema_proposal_limits: RecordSchemaProposalLimits,
+    relational_transform_plan: RelationalTransformPlan,
 ) -> Result<RecoveryExecutionPolicy, RecoveryExecutionError> {
     let max_output_bytes = MAX_ZIP_TOTAL_EXPANDED_BYTES;
     let default_plan = RecoveryPlan {
@@ -193,11 +395,12 @@ fn build_execution_policy(
         framing_discovery_plan: Some(framing_discovery_plan),
         record_discovery_snapshot: Some(record_discovery_snapshot),
         record_schema_proposal_limits,
+        relational_transform_plan,
         record_phase_work_limit: source_work.record_phase_work,
     })
 }
 
-fn transform_proposal_capacity() -> Result<usize, RecoveryExecutionError> {
+pub(super) fn transform_proposal_capacity() -> Result<usize, RecoveryExecutionError> {
     DEFAULT_MAX_TRANSFORM_REGIONS_PER_INPUT
         .checked_add(1)
         .and_then(|region_count| region_count.checked_mul(TRANSFORM_PROPOSAL_OPERATION_COUNT))

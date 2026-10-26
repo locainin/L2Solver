@@ -8,6 +8,9 @@ use l2_workbench::{
 use serde_json::{Value, json};
 use std::collections::{BTreeMap, HashMap, HashSet};
 
+mod cap;
+use cap::cap_cohorts;
+
 const MAX_OMISSION_EXAMPLES: usize = 32;
 
 #[derive(Clone, Default)]
@@ -24,18 +27,30 @@ impl RecordDiscoveryInputOmissions {
         reason: &'static str,
         source_id: Option<&str>,
     ) -> Result<(), RecoveryExecutionError> {
+        self.record_many(reason, 1, source_id, &[node_id])
+    }
+
+    fn record_many(
+        &mut self,
+        reason: &'static str,
+        count: usize,
+        source_id: Option<&str>,
+        example_node_ids: &[u64],
+    ) -> Result<(), RecoveryExecutionError> {
         self.total = self
             .total
-            .checked_add(1)
+            .checked_add(count)
             .ok_or_else(|| invalid_work("record discovery omission count overflowed"))?;
-        let count = self.reason_counts.entry(reason).or_default();
-        *count = count
-            .checked_add(1)
+        let reason_count = self.reason_counts.entry(reason).or_default();
+        *reason_count = reason_count
+            .checked_add(count)
             .ok_or_else(|| invalid_work("record discovery omission reason count overflowed"))?;
-        if self.examples.len() < MAX_OMISSION_EXAMPLES {
-            self.examples.try_reserve(1).map_err(|error| {
-                operational("record discovery omission allocation failed", error)
-            })?;
+        let remaining = MAX_OMISSION_EXAMPLES.saturating_sub(self.examples.len());
+        let examples_to_add = example_node_ids.len().min(remaining);
+        self.examples
+            .try_reserve(examples_to_add)
+            .map_err(|error| operational("record discovery omission allocation failed", error))?;
+        for node_id in example_node_ids.iter().take(examples_to_add) {
             self.examples.push(json!({
                 "frame_node_id": node_id,
                 "reason": reason,
@@ -47,29 +62,46 @@ impl RecordDiscoveryInputOmissions {
 }
 
 #[derive(Clone)]
-pub(super) struct RecordFrameInput {
-    pub(super) node_id: u64,
-    pub(super) blob_id: String,
-    pub(super) receipt_node_id: u64,
-    pub(super) session_node_id: u64,
-    pub(super) session_id: u64,
-    pub(super) frame_index: usize,
-    pub(super) stream_range: ByteRange,
-    pub(super) stream_offset: usize,
-    pub(super) byte_length: usize,
+pub(in crate::workbench::recovery_executor) struct RecordFrameInput {
+    pub(in crate::workbench::recovery_executor) node_id: u64,
+    pub(in crate::workbench::recovery_executor) blob_id: String,
+    pub(in crate::workbench::recovery_executor) receipt_node_id: u64,
+    pub(in crate::workbench::recovery_executor) session_node_id: u64,
+    pub(in crate::workbench::recovery_executor) direction_node_id: u64,
+    pub(in crate::workbench::recovery_executor) episode_node_id: u64,
+    pub(in crate::workbench::recovery_executor) session_id: u64,
+    pub(in crate::workbench::recovery_executor) frame_index: usize,
+    pub(in crate::workbench::recovery_executor) stream_range: ByteRange,
+    pub(in crate::workbench::recovery_executor) stream_offset: usize,
+    pub(in crate::workbench::recovery_executor) byte_length: usize,
 }
 
 #[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
-pub(super) struct RecordCohortKey {
-    pub(super) source_id: String,
-    pub(super) scope_json: String,
-    pub(super) endpoints_json: String,
-    pub(super) direction: Direction,
-    pub(super) framing_rule_json: String,
+pub(in crate::workbench::recovery_executor) enum RecordCohortOrigin {
+    TcpMaterialized,
+    Relational {
+        report_node: u64,
+        candidate_index: usize,
+    },
+    Transformed {
+        ancestry_id: String,
+    },
+}
+
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
+pub(in crate::workbench::recovery_executor) struct RecordCohortKey {
+    pub(in crate::workbench::recovery_executor) source_id: String,
+    pub(in crate::workbench::recovery_executor) scope_json: String,
+    pub(in crate::workbench::recovery_executor) endpoints_json: String,
+    pub(in crate::workbench::recovery_executor) direction: Direction,
+    pub(in crate::workbench::recovery_executor) origin: RecordCohortOrigin,
+    pub(in crate::workbench::recovery_executor) framing_rule_json: String,
 }
 
 #[derive(Clone, Default)]
 pub(in crate::workbench::recovery_executor) struct RecordDiscoveryPlan {
+    /// Full validated frame cohorts used to apply learned schemas after bounded learning
+    pub(super) application_cohorts: BTreeMap<RecordCohortKey, Vec<RecordFrameInput>>,
     pub(super) cohorts: BTreeMap<RecordCohortKey, Vec<RecordFrameInput>>,
     pub(super) cohort_omitted_frames: BTreeMap<RecordCohortKey, usize>,
     pub(super) omissions: BTreeMap<Option<String>, RecordDiscoveryInputOmissions>,
@@ -84,7 +116,7 @@ pub(in crate::workbench::recovery_executor) fn collect_plan(
     apply_input_limits(collect_input_plan(case)?, limits)
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Eq, PartialEq)]
 enum OmissionKind {
     MissingSource,
     MixedSource,
@@ -103,9 +135,9 @@ enum OmissionKind {
     AmbiguousContext,
     InvalidContext,
     DuplicateFrameIndex,
-    SessionMessageCountLimit,
-    SessionAggregateByteLimit,
-    SessionMessageCountAndAggregateByteLimits,
+    LearningPrefixMessageCountLimit,
+    LearningPrefixAggregateByteLimit,
+    LearningPrefixMessageCountAndAggregateByteLimits,
 }
 
 impl OmissionKind {
@@ -128,10 +160,10 @@ impl OmissionKind {
             Self::AmbiguousContext => "ambiguous_conversation_context",
             Self::InvalidContext => "invalid_conversation_context",
             Self::DuplicateFrameIndex => "duplicate_receipt_frame_index",
-            Self::SessionMessageCountLimit => "whole_session_exceeds_message_count_limit",
-            Self::SessionAggregateByteLimit => "whole_session_exceeds_aggregate_byte_limit",
-            Self::SessionMessageCountAndAggregateByteLimits => {
-                "whole_session_exceeds_message_count_and_aggregate_byte_limits"
+            Self::LearningPrefixMessageCountLimit => "learning_prefix_message_count_limit",
+            Self::LearningPrefixAggregateByteLimit => "learning_prefix_aggregate_byte_limit",
+            Self::LearningPrefixMessageCountAndAggregateByteLimits => {
+                "learning_prefix_message_and_byte_limits"
             }
         }
     }
@@ -146,6 +178,7 @@ struct ResolvedFrame {
 
 struct FrameDescriptor<'a> {
     source_id: String,
+    logical_source_id: String,
     blob_id: &'a str,
     bytes: &'a [u8],
     input_node_id: u64,
@@ -163,6 +196,8 @@ struct MaterializationEvidence {
 
 struct ResolvedConversation {
     session_node_id: u64,
+    direction_node_id: u64,
+    episode_node_id: u64,
     session_id: u64,
     scope: Value,
     endpoints: Value,
@@ -179,6 +214,13 @@ struct EdgeIndex {
 
 pub(in crate::workbench::recovery_executor) fn collect_input_plan(
     case: &Case,
+) -> Result<RecordDiscoveryPlan, RecoveryExecutionError> {
+    collect_input_plan_excluding(case, |_| false)
+}
+
+pub(in crate::workbench::recovery_executor) fn collect_input_plan_excluding(
+    case: &Case,
+    mut is_registered_derived_frame: impl FnMut(u64) -> bool,
 ) -> Result<RecordDiscoveryPlan, RecoveryExecutionError> {
     let node_by_id = index_nodes(case)?;
     let blobs = index_blobs(case)?;
@@ -214,11 +256,9 @@ pub(in crate::workbench::recovery_executor) fn collect_input_plan(
         .try_reserve(case.blobs().len())
         .map_err(|error| operational("record discovery receipt cache allocation failed", error))?;
 
-    for frame in case
-        .nodes()
-        .iter()
-        .filter(|node| node.kind == "custom_protocol_frame")
-    {
+    for frame in case.nodes().iter().filter(|node| {
+        node.kind == "custom_protocol_frame" && !is_registered_derived_frame(node.id)
+    }) {
         match collect_frame(
             frame,
             &node_by_id,
@@ -274,6 +314,19 @@ impl RecordDiscoveryPlan {
             .entry(source_id.map(str::to_owned))
             .or_default()
             .record(node_id, reason.name(), source_id)
+    }
+
+    fn record_omissions(
+        &mut self,
+        source_id: &str,
+        reason: OmissionKind,
+        count: usize,
+        example_node_ids: &[u64],
+    ) -> Result<(), RecoveryExecutionError> {
+        self.omissions
+            .entry(Some(source_id.to_owned()))
+            .or_default()
+            .record_many(reason.name(), count, Some(source_id), example_node_ids)
     }
 }
 
@@ -435,6 +488,70 @@ fn collect_frame<'a>(
         digest_cache,
         receipt_cache,
     )?;
+    let conversation = resolve_frame_conversation(&descriptor, nodes, edges)?;
+    let (scope_json, mut endpoints_json) =
+        serialize_conversation_key(&conversation, &descriptor.source_id)?;
+    let input_node = nodes.get(&descriptor.input_node_id).ok_or_else(|| {
+        (
+            Some(descriptor.logical_source_id.clone()),
+            OmissionKind::MissingContext,
+        )
+    })?;
+    let relational_hypothesis = relational_hypothesis(input_node, &descriptor.logical_source_id)?;
+    let mut direction = conversation.direction;
+    if relational_hypothesis.is_some() {
+        let invalid_context = || {
+            (
+                Some(descriptor.logical_source_id.clone()),
+                OmissionKind::InvalidContext,
+            )
+        };
+        let episode = nodes
+            .get(&conversation.episode_node_id)
+            .ok_or_else(invalid_context)?;
+        let peer = super::super::peer_cohort::for_episode(episode, direction)
+            .map_err(|_| invalid_context())?;
+        // Derived frames must use the same frozen peer grouping as their transform cohort
+        endpoints_json = peer.endpoints_json;
+        direction = peer.direction;
+    }
+    let key = RecordCohortKey {
+        source_id: descriptor.logical_source_id,
+        scope_json,
+        endpoints_json,
+        direction,
+        origin: match relational_hypothesis {
+            Some((report_node, candidate_index)) => RecordCohortOrigin::Relational {
+                report_node,
+                candidate_index,
+            },
+            None => RecordCohortOrigin::TcpMaterialized,
+        },
+        framing_rule_json: descriptor.normalized_rule,
+    };
+    Ok(ResolvedFrame {
+        key,
+        input: RecordFrameInput {
+            node_id: frame.id,
+            blob_id: descriptor.blob_id.to_owned(),
+            receipt_node_id: materialization.receipt_node_id,
+            session_node_id: conversation.session_node_id,
+            direction_node_id: conversation.direction_node_id,
+            episode_node_id: conversation.episode_node_id,
+            session_id: conversation.session_id,
+            frame_index: descriptor.frame_index,
+            stream_range: descriptor.stream_range,
+            stream_offset: materialization.stream_offset,
+            byte_length: descriptor.bytes.len(),
+        },
+    })
+}
+
+fn resolve_frame_conversation(
+    descriptor: &FrameDescriptor<'_>,
+    nodes: &HashMap<u64, &Node>,
+    edges: &EdgeIndex,
+) -> Result<ResolvedConversation, Omission> {
     let ancestry = edges
         .tcp_ancestry
         .resolve_run(descriptor.input_node_id)
@@ -446,45 +563,45 @@ fn collect_frame<'a>(
             };
             (Some(descriptor.source_id.clone()), reason)
         })?;
-    let conversation = resolve_conversation(nodes, ancestry).ok_or_else(|| {
+    resolve_conversation(nodes, ancestry).ok_or_else(|| {
         (
             Some(descriptor.source_id.clone()),
             OmissionKind::InvalidContext,
         )
-    })?;
-    let scope_json = serde_json::to_string(&conversation.scope).map_err(|_| {
-        (
-            Some(descriptor.source_id.clone()),
-            OmissionKind::InvalidContext,
-        )
-    })?;
-    let endpoints_json = serde_json::to_string(&conversation.endpoints).map_err(|_| {
-        (
-            Some(descriptor.source_id.clone()),
-            OmissionKind::InvalidContext,
-        )
-    })?;
-    let key = RecordCohortKey {
-        source_id: descriptor.source_id,
-        scope_json,
-        endpoints_json,
-        direction: conversation.direction,
-        framing_rule_json: descriptor.normalized_rule,
-    };
-    Ok(ResolvedFrame {
-        key,
-        input: RecordFrameInput {
-            node_id: frame.id,
-            blob_id: descriptor.blob_id.to_owned(),
-            receipt_node_id: materialization.receipt_node_id,
-            session_node_id: conversation.session_node_id,
-            session_id: conversation.session_id,
-            frame_index: descriptor.frame_index,
-            stream_range: descriptor.stream_range,
-            stream_offset: materialization.stream_offset,
-            byte_length: descriptor.bytes.len(),
-        },
     })
+}
+
+fn serialize_conversation_key(
+    conversation: &ResolvedConversation,
+    source_id: &str,
+) -> Result<(String, String), Omission> {
+    let invalid_context = || (Some(source_id.to_owned()), OmissionKind::InvalidContext);
+    let scope_json = serde_json::to_string(&conversation.scope).map_err(|_| invalid_context())?;
+    let endpoints_json =
+        serde_json::to_string(&conversation.endpoints).map_err(|_| invalid_context())?;
+    Ok((scope_json, endpoints_json))
+}
+
+fn relational_hypothesis(
+    input_node: &Node,
+    source_id: &str,
+) -> Result<Option<(u64, usize)>, Omission> {
+    if input_node.details.get("relational_decoded_frame") != Some(&Value::Bool(true)) {
+        return Ok(None);
+    }
+    let invalid_context = || (Some(source_id.to_owned()), OmissionKind::InvalidContext);
+    let report_node_id = input_node
+        .details
+        .get("relational_report_node_id")
+        .and_then(Value::as_u64)
+        .ok_or_else(invalid_context)?;
+    let candidate_index = input_node
+        .details
+        .get("relational_candidate_index")
+        .and_then(Value::as_u64)
+        .and_then(|index| usize::try_from(index).ok())
+        .ok_or_else(invalid_context)?;
+    Ok(Some((report_node_id, candidate_index)))
 }
 
 fn inspect_frame<'a>(
@@ -496,6 +613,15 @@ fn inspect_frame<'a>(
     let source_id = exact_source(frame).map_err(|reason| (None, reason))?;
     let reject = |reason| (Some(source_id.clone()), reason);
     if !sources.contains(source_id.as_str()) {
+        return Err(reject(OmissionKind::MissingSource));
+    }
+    let logical_source_id = frame
+        .details
+        .get("logical_source_id")
+        .and_then(Value::as_str)
+        .unwrap_or(&source_id)
+        .to_owned();
+    if !sources.contains(logical_source_id.as_str()) {
         return Err(reject(OmissionKind::MissingSource));
     }
     let frame_blob_id = frame
@@ -550,6 +676,7 @@ fn inspect_frame<'a>(
 
     Ok(FrameDescriptor {
         source_id,
+        logical_source_id,
         blob_id: frame_blob_id,
         bytes: &frame_blob.bytes,
         input_node_id,
@@ -846,6 +973,8 @@ fn resolve_conversation(
     // Episode node identity keeps repeated first-packet labels in separate conversations
     Some(ResolvedConversation {
         session_node_id: ancestry.episode_node_id,
+        direction_node_id: ancestry.direction_node_id,
+        episode_node_id: ancestry.episode_node_id,
         session_id,
         scope,
         endpoints,
@@ -924,90 +1053,6 @@ fn remove_duplicate_frames(
     Ok(())
 }
 
-fn cap_cohorts(
-    plan: &mut RecordDiscoveryPlan,
-    limits: RecordSchemaProposalLimits,
-) -> Result<(), RecoveryExecutionError> {
-    let mut omitted_inputs = Vec::new();
-    let input_count = plan
-        .cohorts
-        .values()
-        .try_fold(0_usize, |total, inputs| total.checked_add(inputs.len()))
-        .ok_or_else(|| invalid_work("record discovery input count overflowed"))?;
-    omitted_inputs
-        .try_reserve(input_count)
-        .map_err(|error| operational("record discovery capped-input allocation failed", error))?;
-    for (key, inputs) in &mut plan.cohorts {
-        inputs.sort_by_key(|input| {
-            (
-                input.session_id,
-                input.session_node_id,
-                input.stream_offset,
-                input.stream_range.start,
-                input.frame_index,
-                input.node_id,
-            )
-        });
-        let maximum_messages = limits
-            .discovery
-            .max_messages
-            .min(limits.discovery.record_limits.max_records);
-        let maximum_bytes = limits.discovery.record_limits.max_input_bytes;
-        let mut kept = Vec::new();
-        kept.try_reserve_exact(inputs.len())
-            .map_err(|error| operational("record discovery input allocation failed", error))?;
-        let mut retained_messages = 0_usize;
-        let mut retained_bytes = 0_usize;
-        let mut omitted = 0_usize;
-        for session in inputs.chunk_by(|left, right| left.session_node_id == right.session_node_id)
-        {
-            let session_messages = session.len();
-            let session_bytes = session
-                .iter()
-                .try_fold(0_usize, |total, input| total.checked_add(input.byte_length))
-                .ok_or_else(|| invalid_work("record discovery session byte count overflowed"))?;
-            let next_messages =
-                retained_messages
-                    .checked_add(session_messages)
-                    .ok_or_else(|| {
-                        invalid_work("record discovery retained message count overflowed")
-                    })?;
-            let next_bytes = retained_bytes
-                .checked_add(session_bytes)
-                .ok_or_else(|| invalid_work("record discovery retained byte count overflowed"))?;
-            let fits_messages = next_messages <= maximum_messages;
-            let fits_bytes = next_bytes <= maximum_bytes;
-            if fits_messages && fits_bytes {
-                retained_messages = next_messages;
-                retained_bytes = next_bytes;
-                kept.extend(session.iter().cloned());
-            } else {
-                let reason = if !fits_messages && !fits_bytes {
-                    OmissionKind::SessionMessageCountAndAggregateByteLimits
-                } else if !fits_messages {
-                    OmissionKind::SessionMessageCountLimit
-                } else {
-                    OmissionKind::SessionAggregateByteLimit
-                };
-                omitted = omitted.checked_add(session_messages).ok_or_else(|| {
-                    invalid_work("record discovery omitted-frame count overflowed")
-                })?;
-                for input in session {
-                    omitted_inputs.push((key.source_id.clone(), input.node_id, reason));
-                }
-            }
-        }
-        *inputs = kept;
-        if omitted > 0 {
-            plan.cohort_omitted_frames.insert(key.clone(), omitted);
-        }
-    }
-    for (source_id, node_id, reason) in omitted_inputs {
-        plan.record_omission(Some(&source_id), node_id, reason)?;
-    }
-    Ok(())
-}
-
 fn sort_cohorts(plan: &mut RecordDiscoveryPlan) {
     for inputs in plan.cohorts.values_mut() {
         inputs.sort_by_key(|input| {
@@ -1036,6 +1081,10 @@ fn operational(
         }),
     }
 }
+
+#[cfg(test)]
+#[path = "../../../../tests/workbench/recovery_record_discovery_input.rs"]
+mod tests;
 
 fn invalid_work(message: &'static str) -> RecoveryExecutionError {
     RecoveryExecutionError::InvalidPolicy(message.to_owned())

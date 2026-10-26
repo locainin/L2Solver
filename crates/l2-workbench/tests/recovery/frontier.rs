@@ -272,6 +272,10 @@ fn fifo_preserves_task_order() -> Result<(), Box<dyn Error>> {
             RecoveryStage::RecordDiscovery,
         ),
         (
+            RecoveryTask::RelationalTransformDiscovery,
+            RecoveryStage::TransformDiscovery,
+        ),
+        (
             RecoveryTask::AssembleRecords(record_schema(1)),
             RecoveryStage::AssembleRecords,
         ),
@@ -1215,41 +1219,24 @@ fn discovery_contexts_stay_distinct() -> Result<(), Box<dyn Error>> {
     let second = node(&mut case, b"same sample")?;
     let mut coordinator = RecoveryCoordinator::new(policy());
 
-    let framing_first = queue(
-        &mut coordinator,
-        &case,
-        first,
+    for task in [
         RecoveryTask::FramingDiscovery,
-    )?;
-    let framing_second = queue(
-        &mut coordinator,
-        &case,
-        second,
-        RecoveryTask::FramingDiscovery,
-    )?;
-    let records_first = queue(
-        &mut coordinator,
-        &case,
-        first,
         RecoveryTask::RecordDiscovery,
-    )?;
-    let records_second = queue(
-        &mut coordinator,
-        &case,
-        second,
-        RecoveryTask::RecordDiscovery,
-    )?;
+        RecoveryTask::RelationalTransformDiscovery,
+    ] {
+        let first_id = queue(&mut coordinator, &case, first, task.clone())?;
+        let second_id = queue(&mut coordinator, &case, second, task.clone())?;
 
-    assert_ne!(framing_first, framing_second);
-    assert_ne!(records_first, records_second);
-    assert_eq!(
-        coordinator.enqueue(&case, first, RecoveryTask::FramingDiscovery)?,
-        EnqueueOutcome::Merged(framing_first)
-    );
-    assert_eq!(
-        coordinator.enqueue(&case, second, RecoveryTask::RecordDiscovery)?,
-        EnqueueOutcome::Merged(records_second)
-    );
+        assert_ne!(first_id, second_id);
+        assert_eq!(
+            coordinator.enqueue(&case, first, task.clone())?,
+            EnqueueOutcome::Merged(first_id)
+        );
+        assert_eq!(
+            coordinator.enqueue(&case, second, task)?,
+            EnqueueOutcome::Merged(second_id)
+        );
+    }
     let transform_first = queue(
         &mut coordinator,
         &case,
@@ -1260,7 +1247,7 @@ fn discovery_contexts_stay_distinct() -> Result<(), Box<dyn Error>> {
         coordinator.enqueue(&case, second, transform(Operation::Reverse {}))?,
         EnqueueOutcome::Merged(transform_first)
     );
-    assert_eq!(coordinator.candidate_count(), 5);
+    assert_eq!(coordinator.candidate_count(), 7);
 
     Ok(())
 }

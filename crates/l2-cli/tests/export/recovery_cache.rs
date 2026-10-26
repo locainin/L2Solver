@@ -241,8 +241,8 @@ fn cache_key_does_not_reuse_the_previous_transform_proposal_policy() -> Result<(
 
 #[test]
 fn changed_recovery_algorithm_rejects_a_stale_partial_result() -> Result<(), Box<dyn Error>> {
-    // Older stages predate record search, native admission, or decoded-view scheduling fixes
-    for version in [4, 5, 6, 7] {
+    // Older stages predate record search, decoded-view scheduling, or frozen schema handoff
+    for version in [4, 5, 6, 7, 8] {
         assert_previous_recovery_recomputed(version)?;
     }
     Ok(())

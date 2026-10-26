@@ -269,23 +269,8 @@ fn assert_materialized_context(case: &Case, episode_id: u64, run_id: u64) -> Tes
 }
 
 fn assert_record_report_context(case: &Case, run_id: u64) -> TestResult<()> {
-    let report = report_json(case, "recovery_record_discovery_report")?;
+    let (report, frame_node_id) = record_report_frame_for_run(case, run_id)?;
     assert_eq!(report.get("version"), Some(&json!(2)));
-    let frame_node_id = report
-        .get("input_frame_refs")
-        .and_then(serde_json::Value::as_array)
-        .into_iter()
-        .flatten()
-        .filter_map(serde_json::Value::as_array)
-        .filter_map(|reference| reference.first().and_then(serde_json::Value::as_u64))
-        .find(|frame_id| {
-            case.nodes().iter().any(|node| {
-                node.id == *frame_id
-                    && node.kind == "custom_protocol_frame"
-                    && node.details.get("input_node") == Some(&json!(run_id))
-            })
-        })
-        .ok_or("compact record report omitted its materialized frame reference")?;
     let frame = case
         .nodes()
         .iter()
@@ -319,6 +304,40 @@ fn assert_record_report_context(case: &Case, run_id: u64) -> TestResult<()> {
     assert_eq!(episode_edge.status, EvidenceStatus::Hypothesis);
     assert_eq!(frame.details.get("input_node"), Some(&json!(run_id)));
     Ok(())
+}
+
+fn record_report_frame_for_run(case: &Case, run_id: u64) -> TestResult<(serde_json::Value, u64)> {
+    for report_node in case
+        .nodes()
+        .iter()
+        .filter(|node| node.kind == "recovery_record_discovery_report")
+    {
+        let report_blob_id = report_node
+            .blob
+            .as_deref()
+            .ok_or("record discovery report has no blob")?;
+        let report_blob = case
+            .blob(report_blob_id)
+            .ok_or("record discovery report blob is missing")?;
+        let report: serde_json::Value = serde_json::from_slice(&report_blob.bytes)?;
+        let frame_node_id = report
+            .get("input_frame_refs")
+            .and_then(serde_json::Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter_map(serde_json::Value::as_array)
+            .filter_map(|reference| reference.first().and_then(serde_json::Value::as_u64))
+            .find(|frame_id| {
+                case.node(*frame_id).is_some_and(|node| {
+                    node.kind == "custom_protocol_frame"
+                        && node.details.get("input_node") == Some(&json!(run_id))
+                })
+            });
+        if let Some(frame_node_id) = frame_node_id {
+            return Ok((report, frame_node_id));
+        }
+    }
+    Err(format!("standard recovery omitted a record report referencing TCP run {run_id}").into())
 }
 
 fn direction_parent(case: &Case, run_id: u64) -> Option<u64> {

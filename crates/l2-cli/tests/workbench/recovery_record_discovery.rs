@@ -1,5 +1,6 @@
 use super::super::framing_materialize::FramingSelectionBasis;
-use super::{RecoveryPlan, execute, normal_policy, recover_case};
+use super::{RecoveryPlan, execute, normal_policy, recover_case, recover_case_with_job};
+use crate::arguments::RecoveryProfile;
 use l2_workbench::{
     evidence::{ByteMapping, Case, Edge, EvidenceStatus, SourceRange},
     protocol::{
@@ -10,6 +11,9 @@ use l2_workbench::{
 };
 use serde_json::{Value, json};
 use std::error::Error;
+
+#[path = "recovery_record_handoff.rs"]
+mod record_handoff;
 
 const REPORT_KIND: &str = "recovery_record_discovery_report";
 type TestResult<T> = Result<T, Box<dyn Error>>;
@@ -48,6 +52,18 @@ struct SyntheticRun {
     session_index: usize,
     direction_index: usize,
     node_id: u64,
+}
+
+struct RawDirectionalFixture {
+    case: Case,
+    plaintext: Vec<u8>,
+    run_nodes: Vec<u64>,
+}
+
+pub(super) struct SessionRelativeFixture {
+    pub(super) case: Case,
+    pub(super) plaintext: Vec<u8>,
+    pub(super) episode_nodes: Vec<u64>,
 }
 
 #[derive(Clone, Copy)]
@@ -927,23 +943,37 @@ fn run_record_discovery_only(
         candidate_ids: Vec::new(),
         candidate_index: std::collections::HashSet::new(),
         snapshot_candidates: true,
+        job: None,
         validated_artifacts: std::collections::HashSet::new(),
         transform_cohorts: Vec::new(),
+        derived_discovery: super::derived_discovery::DerivedDiscovery::default(),
         transform_discoveries: std::collections::HashMap::new(),
         framing_selection_bases: std::collections::HashMap::new(),
         framing_discoveries: std::collections::HashMap::new(),
         record_discoveries: std::collections::HashMap::new(),
+        record_discovery_context_by_report: std::collections::HashMap::new(),
+        deferred_record_discovery_plan: None,
         record_schema_report_links: std::collections::HashMap::new(),
         record_schema_associations_charged: 0,
         record_phase_work_charged: 0,
         pending_record_assemblies: std::collections::VecDeque::new(),
         pending_record_assembly_count: 0,
+        relational_samples: super::RelationalSampleCollections::default(),
+        relational_discoveries: std::collections::HashMap::new(),
         transform_proposal_receipts: std::collections::HashMap::new(),
         omissions: Vec::new(),
         complete_negative_transform_searches: 0,
         cycle_skips: 0,
     };
     executor.enqueue_record_discovery_if_enabled()?;
+    assert!(
+        executor.coordinator.pop_next()?.is_none(),
+        "raw record discovery waits behind the relational barrier"
+    );
+    assert!(
+        executor.enqueue_deferred_record_discovery()?,
+        "deferred raw record discovery should be admitted after the barrier"
+    );
     let candidate_id = executor
         .coordinator
         .pop_next()?
@@ -1310,6 +1340,1125 @@ fn automatic_framing_materialization_reaches_the_record_discovery_barrier() -> T
 }
 
 #[test]
+fn single_session_relational_cohort_is_informational_and_does_not_block_recovery() -> TestResult<()>
+{
+    let mut case = Case::new();
+    let source = capture(&mut case, "single-session-relational-input")?;
+    let wire = b"GET / HTTP/1.1\r\nHost: example.test\r\n\r\nPK\x03\x04";
+    let context = add_session_context(&mut case, "single-session-http", 1, 0, wire.len())?;
+    add_tcp_run_in_context(&mut case, &source, context.direction_node, 1, wire)?;
+
+    let summary =
+        recover_case_with_job(&mut case, RecoveryProfile::Normal, 64 * 1024 * 1024, None)?;
+    let relational_reports = case
+        .nodes()
+        .iter()
+        .filter(|node| node.kind == "recovery_relational_transform_report")
+        .filter_map(|node| node.blob.as_deref())
+        .filter_map(|blob_id| case.blob(blob_id))
+        .filter_map(|blob| serde_json::from_slice::<Value>(&blob.bytes).ok())
+        .collect::<Vec<_>>();
+
+    assert!(
+        !relational_reports.is_empty(),
+        "the observed one-session cohort should have an informational relational report"
+    );
+    assert!(
+        relational_reports
+            .iter()
+            .all(|report| report.get("sessions_available").and_then(Value::as_u64) == Some(1)),
+        "the report should describe the available single-session evidence"
+    );
+    assert!(
+        relational_reports.iter().all(|report| {
+            report.get("result").and_then(Value::as_str)
+                == Some("not_eligible_for_independent_session_checks")
+        }),
+        "single-session cohorts should be reported as ineligible without implying a search ran"
+    );
+    assert!(
+        !summary.omissions.iter().any(|omission| matches!(
+            omission,
+            super::RecoveryOmission::RelationalTransformAnalysis { .. }
+        )),
+        "lack of an independent held-out session is informational and must not block recovery"
+    );
+    Ok(())
+}
+
+#[test]
+fn default_recovery_learns_and_applies_session_relative_record_transform() -> TestResult<()> {
+    let fixture = build_session_relative_fixture()?;
+    let mut case = fixture.case;
+    let plaintext = fixture.plaintext;
+    let episode_nodes = fixture.episode_nodes;
+    let summary =
+        match recover_case_with_job(&mut case, RecoveryProfile::Normal, 64 * 1024 * 1024, None) {
+            Ok(summary) => summary,
+            Err(error) => {
+                let details = format!("recovery failed before report assertions: {error}");
+                let snapshot = save_case_snapshot(
+                    &case,
+                    "l2-session-relative-recovery-error-",
+                    Some(&details),
+                )?;
+                return Err(format!("{details}; snapshot={snapshot:?}").into());
+            }
+        };
+
+    if !summary.discovery.input_coverage_complete {
+        let omissions = summary.omissions.iter().take(8).collect::<Vec<_>>();
+        let record_reports = session_relative_record_diagnostics(&case);
+        let details = format!(
+            "input_coverage_complete=false\nomissions={omissions:#?}\nrecord_reports={:#?}",
+            record_reports.iter().take(8).collect::<Vec<_>>()
+        );
+        let snapshot = save_case_snapshot(&case, "l2-session-relative-coverage-", Some(&details))?;
+        return Err(format!("{details}; snapshot={snapshot:?}").into());
+    }
+    assert_session_relative_recovery(&case, &plaintext, &episode_nodes, &summary)
+}
+
+fn assert_session_relative_recovery(
+    case: &Case,
+    plaintext: &[u8],
+    episode_nodes: &[u64],
+    summary: &super::RecoveryRunSummary,
+) -> TestResult<()> {
+    let relational_reports = load_relational_reports(case);
+    let record_diagnostics = session_relative_record_diagnostics(case);
+    let report_failure_snapshot = if relational_reports.is_empty() {
+        let omissions = summary.omissions.iter().take(8).collect::<Vec<_>>();
+        let details = format!(
+            "input_coverage_complete={}\nomissions={omissions:#?}\nrecord_reports={record_diagnostics:#?}\n",
+            summary.discovery.input_coverage_complete
+        );
+        Some(save_case_snapshot(
+            case,
+            "l2-relational-synthetic-failure-",
+            Some(&details),
+        )?)
+    } else {
+        None
+    };
+    assert!(
+        !relational_reports.is_empty(),
+        "relational analysis was not scheduled; omissions={:?}; record_reports={record_diagnostics:#?}; snapshot={report_failure_snapshot:?}",
+        summary.omissions.iter().take(8).collect::<Vec<_>>(),
+    );
+
+    let Some((relational_report_node_id, relational_report)) = select_session_relative_report(case)
+    else {
+        return Err("relational report bytes are unavailable after scheduling".into());
+    };
+    let first_record_receipt_id = case
+        .nodes()
+        .iter()
+        .find(|node| node.kind == "record_parse_receipt")
+        .map(|node| node.id)
+        .ok_or("no record parse receipt was retained")?;
+    assert!(
+        relational_report_node_id < first_record_receipt_id,
+        "session-relative transform evidence should be tried before raw schema assemblies"
+    );
+
+    let report_summary =
+        session_relative_report_summary(relational_report_node_id, &relational_report);
+    assert_session_relative_output(
+        case,
+        plaintext,
+        summary,
+        &report_summary,
+        &record_diagnostics,
+    )?;
+    assert_session_relative_report(&relational_report, episode_nodes, &report_summary)?;
+    assert_relational_schema_handoff(
+        case,
+        relational_report_node_id,
+        &relational_report,
+        plaintext,
+    )?;
+    assert_decoded_frames_feed_record_parser(case, &record_diagnostics);
+    Ok(())
+}
+
+fn assert_session_relative_output(
+    case: &Case,
+    plaintext: &[u8],
+    summary: &super::RecoveryRunSummary,
+    report_summary: &Value,
+    record_diagnostics: &[Value],
+) -> TestResult<()> {
+    let exact_output_recovered = case
+        .nodes()
+        .iter()
+        .filter(|node| node.kind == "relational_transform_output")
+        .filter_map(|node| node.blob.as_deref())
+        .filter_map(|blob_id| case.blob(blob_id))
+        .any(|blob| blob.bytes.as_slice() == plaintext);
+    let failure_snapshot = if exact_output_recovered {
+        None
+    } else {
+        let omissions = summary.omissions.iter().take(8).collect::<Vec<_>>();
+        let candidate_parents = session_relative_candidate_parents(case);
+        let failure_details = format!(
+            "input_coverage_complete={}\nomissions={omissions:#?}\nreport={report_summary:#?}\ntransform_reports={:#?}\nrecord_reports={record_diagnostics:#?}\ncandidate_parents={candidate_parents:#?}\n",
+            summary.discovery.input_coverage_complete,
+            session_relative_transform_diagnostics(case)
+        );
+        Some(save_case_snapshot(
+            case,
+            "l2-relational-synthetic-failure-",
+            Some(&failure_details),
+        )?)
+    };
+    assert!(
+        exact_output_recovered,
+        "the exact PNG should be assembled across the four independently seeded sessions; report={report_summary:#?}; snapshot={failure_snapshot:?}"
+    );
+    Ok(())
+}
+
+fn assert_session_relative_report(
+    report: &Value,
+    episode_nodes: &[u64],
+    report_summary: &Value,
+) -> TestResult<()> {
+    let heldout_sessions = report
+        .get("heldout_sessions")
+        .and_then(Value::as_array)
+        .ok_or("relational report omitted its frozen held-out sessions")?;
+    assert!(
+        heldout_sessions
+            .iter()
+            .any(|session| session.as_u64() == episode_nodes.get(2).copied()),
+        "the artifact prefix belongs to a held-out session"
+    );
+    assert!(
+        report
+            .get("application_evidence_checks")
+            .and_then(Value::as_array)
+            .is_some_and(|checks| checks
+                .iter()
+                .any(|check| { check.get("artifact_validated") == Some(&Value::Bool(true)) })),
+        "the selected cohort report should retain evidence for the exact cross-session artifact; report={report_summary:#?}"
+    );
+    Ok(())
+}
+
+fn assert_relational_schema_handoff(
+    case: &Case,
+    report_node_id: u64,
+    report: &Value,
+    expected_artifact: &[u8],
+) -> TestResult<()> {
+    let checks = report
+        .get("application_evidence_checks")
+        .and_then(Value::as_array)
+        .ok_or("relational report omitted application evidence")?;
+    let accepted_check = checks
+        .iter()
+        .find(|check| {
+            check.get("artifact_validated") == Some(&Value::Bool(true))
+                && check
+                    .get("accepted_record_schema")
+                    .is_some_and(Value::is_object)
+        })
+        .ok_or("relational report has no exact artifact acceptance")?;
+    let accepted = accepted_check
+        .get("accepted_record_schema")
+        .ok_or("exact artifact acceptance omitted its frozen record schema")?;
+    let schema = accepted
+        .get("schema")
+        .ok_or("accepted record schema is missing")?;
+    let strategy = accepted
+        .get("strategy")
+        .and_then(Value::as_str)
+        .ok_or("accepted record schema omitted its discovery strategy")?;
+    assert!(matches!(strategy, "fixed_layout" | "repeated_boundaries"));
+    let frame_indices = accepted
+        .get("frame_indices")
+        .and_then(Value::as_array)
+        .ok_or("accepted record schema omitted full frame membership")?;
+    let frame_identities = accepted
+        .get("frame_identities")
+        .and_then(Value::as_array)
+        .ok_or("accepted record schema omitted frame identities")?;
+    assert!(!frame_indices.is_empty());
+    assert_eq!(frame_indices.len(), frame_identities.len());
+    for (position, (index, identity)) in frame_indices.iter().zip(frame_identities).enumerate() {
+        assert_eq!(index.as_u64(), u64::try_from(position).ok());
+        assert_eq!(
+            identity.get("frame_index").and_then(Value::as_u64),
+            u64::try_from(position).ok()
+        );
+        assert!(
+            identity
+                .get("frame_byte_length")
+                .and_then(Value::as_u64)
+                .is_some_and(|length| length > 0)
+        );
+        assert!(
+            identity
+                .get("frame_bytes_sha256")
+                .and_then(Value::as_str)
+                .is_some_and(|digest| digest.len() == 64)
+        );
+    }
+
+    let expected_sha256 = l2_workbench::sha256(expected_artifact);
+    let artifact_receipt = accepted
+        .get("artifact_receipt")
+        .ok_or("accepted schema omitted the exact assembled group receipt")?;
+    assert_eq!(
+        artifact_receipt
+            .get("output_sha256")
+            .and_then(Value::as_str),
+        Some(expected_sha256.as_str())
+    );
+    assert_eq!(
+        artifact_receipt
+            .get("output_length")
+            .and_then(Value::as_u64),
+        u64::try_from(expected_artifact.len()).ok()
+    );
+
+    let selected_receipts = case
+        .edges()
+        .iter()
+        .filter(|edge| {
+            edge.from == report_node_id && edge.relation == "record_schema_selected_from"
+        })
+        .filter_map(|edge| case.node(edge.to))
+        .filter(|node| node.kind == "record_parse_receipt")
+        .collect::<Vec<_>>();
+    assert!(
+        !selected_receipts.is_empty(),
+        "the frozen relational schema was not scheduled for final assembly"
+    );
+    let expected_members = frame_identities
+        .iter()
+        .map(|identity| {
+            Ok((
+                identity
+                    .get("input_node_id")
+                    .and_then(Value::as_u64)
+                    .ok_or("accepted frame omitted its input identity")?,
+                identity
+                    .pointer("/context/session")
+                    .and_then(Value::as_u64)
+                    .ok_or("accepted frame omitted its session identity")?,
+                identity
+                    .get("session_order")
+                    .and_then(Value::as_u64)
+                    .ok_or("accepted frame omitted its session order")?,
+                identity
+                    .get("stream_offset")
+                    .and_then(Value::as_u64)
+                    .ok_or("accepted frame omitted its stream offset")?,
+                identity
+                    .get("frame_byte_length")
+                    .and_then(Value::as_u64)
+                    .ok_or("accepted frame omitted its exact byte length")?,
+                identity
+                    .get("frame_bytes_sha256")
+                    .and_then(Value::as_str)
+                    .ok_or("accepted frame omitted its exact byte digest")?
+                    .to_owned(),
+            ))
+        })
+        .collect::<TestResult<std::collections::BTreeSet<_>>>()?;
+
+    for receipt_node in selected_receipts {
+        let receipt_blob_id = receipt_node
+            .blob
+            .as_deref()
+            .ok_or("selected record receipt has no serialized evidence")?;
+        let receipt_blob = case
+            .blob(receipt_blob_id)
+            .ok_or("selected record receipt bytes are missing")?;
+        let receipt: Value = serde_json::from_slice(&receipt_blob.bytes)?;
+        let inputs = receipt
+            .get("inputs")
+            .and_then(Value::as_array)
+            .ok_or("record receipt omitted its full input list")?;
+        assert_eq!(inputs.len(), expected_members.len());
+        for input in inputs {
+            let frame_node_id = input
+                .get("input_node")
+                .and_then(Value::as_u64)
+                .ok_or("record receipt input omitted its frame node")?;
+            let frame_node = case
+                .node(frame_node_id)
+                .filter(|node| node.kind == "relational_decoded_frame")
+                .ok_or("record receipt did not retain a relational decoded frame")?;
+            let actual_member = (
+                frame_node
+                    .details
+                    .get("input_frame_node_id")
+                    .and_then(Value::as_u64)
+                    .ok_or("decoded frame omitted its source input identity")?,
+                frame_node
+                    .details
+                    .get("session_node_id")
+                    .and_then(Value::as_u64)
+                    .ok_or("decoded frame omitted its session identity")?,
+                frame_node
+                    .details
+                    .get("session_order")
+                    .and_then(Value::as_u64)
+                    .ok_or("decoded frame omitted its session order")?,
+                frame_node
+                    .details
+                    .get("stream_offset")
+                    .and_then(Value::as_u64)
+                    .ok_or("decoded frame omitted its stream offset")?,
+                u64::try_from(
+                    frame_node
+                        .blob
+                        .as_deref()
+                        .and_then(|blob_id| case.blob(blob_id))
+                        .ok_or("decoded frame bytes are missing")?
+                        .bytes
+                        .len(),
+                )?,
+                frame_node
+                    .blob
+                    .as_deref()
+                    .and_then(|blob_id| blob_id.strip_prefix("sha256:"))
+                    .ok_or("decoded frame blob digest is missing")?
+                    .to_owned(),
+            );
+            assert!(expected_members.contains(&actual_member));
+            let parse_schema = input
+                .pointer("/parse/schema")
+                .ok_or("final record parse did not retain its schema")?;
+            assert_eq!(parse_schema, schema);
+        }
+        let receipt_members = inputs
+            .iter()
+            .filter_map(|input| input.get("input_node").and_then(Value::as_u64))
+            .collect::<std::collections::BTreeSet<_>>();
+        let expected_frame_nodes = inputs
+            .iter()
+            .filter_map(|input| input.get("input_node").and_then(Value::as_u64))
+            .count();
+        assert_eq!(receipt_members.len(), expected_frame_nodes);
+
+        let groups = receipt
+            .pointer("/assembly/groups")
+            .and_then(Value::as_array)
+            .ok_or("final assembly receipt omitted its group mappings")?;
+        assert!(groups.iter().any(|group| {
+            group.get("output_sha256").and_then(Value::as_str) == Some(expected_sha256.as_str())
+                && group.get("output_length").and_then(Value::as_u64)
+                    == u64::try_from(expected_artifact.len()).ok()
+        }));
+    }
+    Ok(())
+}
+
+fn assert_decoded_frames_feed_record_parser(case: &Case, record_diagnostics: &[Value]) {
+    let decoded_frames = case
+        .nodes()
+        .iter()
+        .filter(|node| node.kind == "relational_decoded_frame")
+        .map(|node| node.id)
+        .collect::<std::collections::BTreeSet<_>>();
+    assert!(
+        !decoded_frames.is_empty(),
+        "supported relational rules should preserve decoded payloads inside their original frames; relational={:#?}",
+        session_relative_transform_diagnostics(case)
+    );
+    assert!(
+        case.nodes().iter().any(|node| {
+            matches!(node.kind.as_str(), "record_candidate" | "record_object")
+                && case
+                    .edges()
+                    .iter()
+                    .any(|edge| edge.to == node.id && decoded_frames.contains(&edge.from))
+        }),
+        "decoded frames should feed the strict record parser and assembly path; record_reports={record_diagnostics:#?}; candidate_parents={:#?}",
+        session_relative_candidate_parents(case)
+    );
+}
+
+pub(super) fn build_session_relative_fixture() -> TestResult<SessionRelativeFixture> {
+    const SPLIT_NUMERATORS: [usize; 4] = [1, 3, 1, 2];
+    const ARTIFACT_PART_BY_SESSION: [usize; 4] = [2, 3, 0, 1];
+
+    let mut case = Case::new();
+    let source = capture(&mut case, "independent-relational-recovery")?;
+    let plaintext = synthetic_png([31, 83, 137])?;
+    let part_boundaries = [
+        0,
+        plaintext.len() / 5,
+        plaintext.len() * 2 / 5,
+        plaintext.len() * 3 / 5,
+        plaintext.len(),
+    ];
+    let mut episode_nodes = Vec::new();
+    episode_nodes
+        .try_reserve_exact(ARTIFACT_PART_BY_SESSION.len())
+        .map_err(|_| "synthetic session list allocation failed")?;
+
+    // Each session carries one shuffled section and a different stream seed
+    for (session_index, artifact_part) in ARTIFACT_PART_BY_SESSION.iter().copied().enumerate() {
+        let split_numerator = *SPLIT_NUMERATORS
+            .get(session_index)
+            .ok_or("synthetic split ratio is unavailable")?;
+        let wire = session_relative_session_wire(
+            &plaintext,
+            &part_boundaries,
+            session_index,
+            artifact_part,
+            split_numerator,
+        )?;
+        let session_offset = u64::try_from(session_index)?
+            .checked_mul(10)
+            .ok_or("synthetic packet number overflow")?;
+        let packet = 10_u64
+            .checked_add(session_offset)
+            .ok_or("synthetic packet number overflow")?;
+        let context = add_session_context(
+            &mut case,
+            "independent-relational-scope",
+            packet,
+            0,
+            wire.len(),
+        )?;
+        episode_nodes.push(context.episode_node);
+        add_tcp_run_in_context(&mut case, &source, context.direction_node, packet, &wire)?;
+    }
+
+    Ok(SessionRelativeFixture {
+        case,
+        plaintext,
+        episode_nodes,
+    })
+}
+
+fn session_relative_session_wire(
+    plaintext: &[u8],
+    part_boundaries: &[usize],
+    session_index: usize,
+    artifact_part: usize,
+    split_numerator: usize,
+) -> TestResult<Vec<u8>> {
+    use l2_workbench::derivation::{
+        CounterByteOrder, CounterWidth, OperandRef, Operation, Recipe, SeedCounterOrder, run,
+    };
+
+    let session_byte = u8::try_from(session_index)?;
+    let seed = (0..8_u8)
+        .map(|byte| byte.wrapping_add(session_byte.wrapping_mul(19)))
+        .collect::<Vec<_>>();
+    let part_start = *part_boundaries
+        .get(artifact_part)
+        .ok_or("synthetic artifact start is unavailable")?;
+    let part_end = *part_boundaries
+        .get(
+            artifact_part
+                .checked_add(1)
+                .ok_or("artifact part overflow")?,
+        )
+        .ok_or("synthetic artifact end is unavailable")?;
+    let session_part = plaintext
+        .get(part_start..part_end)
+        .ok_or("synthetic artifact split is invalid")?;
+    let scaled_split = session_part
+        .len()
+        .checked_mul(split_numerator)
+        .ok_or("synthetic payload split overflow")?
+        / 4;
+    let split = scaled_split.clamp(1, session_part.len().saturating_sub(1));
+    let fragment_ranges = [0..split, split..session_part.len()];
+    let mut wire = Vec::new();
+
+    // Seed and payload markers preserve the fixture's independent record grammar
+    let mut seed_payload = vec![0x6b];
+    seed_payload.extend_from_slice(&seed);
+    wire.extend_from_slice(&synthetic_protocol_record([0x1a, 0x73], 0, &seed_payload)?);
+
+    let mut payload_records = Vec::with_capacity(fragment_ranges.len());
+    for (fragment_index, range) in fragment_ranges.into_iter().enumerate() {
+        let chunk = session_part
+            .get(range)
+            .ok_or("synthetic plaintext split is invalid")?;
+        let encrypted = run(
+            chunk,
+            &Recipe {
+                steps: vec![Operation::Sha256CounterXor {
+                    seed: OperandRef::from(seed.clone()),
+                    initial_counter: 0,
+                    counter_width: CounterWidth::OneByte,
+                    counter_byte_order: CounterByteOrder::BigEndian,
+                    seed_order: SeedCounterOrder::SeedThenCounter,
+                }],
+                constraints: Vec::new(),
+            },
+        )?;
+        let mut payload = vec![0x4d];
+        payload.extend_from_slice(&encrypted.output);
+        let sequence = u16::try_from(artifact_part * 2 + fragment_index)?;
+        payload_records.push(synthetic_protocol_record([0xb2, 0x39], sequence, &payload)?);
+    }
+    if session_index.is_multiple_of(2) {
+        for payload_record in payload_records {
+            wire.extend_from_slice(&payload_record);
+        }
+    } else {
+        for payload_record in payload_records.into_iter().rev() {
+            wire.extend_from_slice(&payload_record);
+        }
+    }
+
+    Ok(wire)
+}
+
+fn session_relative_record_diagnostics(case: &Case) -> Vec<Value> {
+    case.nodes()
+        .iter()
+        .filter(|node| node.kind == "recovery_record_discovery_report")
+        .filter_map(|node| node.blob.as_deref())
+        .filter_map(|blob_id| case.blob(blob_id))
+        .filter_map(|blob| serde_json::from_slice::<Value>(&blob.bytes).ok())
+        .take(8)
+        .map(|report| {
+            let surviving = report
+                .pointer("/schema_discovery/surviving")
+                .and_then(Value::as_array)
+                .map(|items| {
+                    items
+                        .iter()
+                        .take(1)
+                        .map(|item| {
+                            json!({
+                                "data_offset":item.pointer("/schema/data_offset"),
+                                "identifier":item.pointer("/schema/identifier"),
+                                "sequence":item.pointer("/schema/sequence"),
+                                "length":item.pointer("/schema/length"),
+                            })
+                        })
+                        .collect::<Vec<_>>()
+                });
+            json!({
+                "result":report.get("result"),
+                "no_candidate_reason":report.get("no_candidate_reason"),
+                "partition":report.get("partition"),
+                "application":report.get("application"),
+                "surviving":surviving,
+            })
+        })
+        .collect()
+}
+
+fn session_relative_candidate_parents(case: &Case) -> Vec<Value> {
+    case.nodes()
+        .iter()
+        .filter(|node| matches!(node.kind.as_str(), "record_candidate" | "record_object"))
+        .filter_map(|node| {
+            let parents = case
+                .edges()
+                .iter()
+                .filter(|edge| edge.to == node.id)
+                .filter_map(|edge| {
+                    case.node(edge.from)
+                        .map(|parent| (parent.id, parent.kind.as_str()))
+                })
+                .collect::<Vec<_>>();
+            let decoded_parent_count = parents
+                .iter()
+                .filter(|(_, kind)| *kind == "relational_decoded_frame")
+                .count();
+            (decoded_parent_count > 0).then(|| {
+                json!({
+                    "node":node.id,
+                    "parents":parents.iter().take(4).collect::<Vec<_>>(),
+                    "decoded_parent_count":decoded_parent_count,
+                    "has_relational_hypothesis":node.details.get("relational_hypothesis").is_some(),
+                })
+            })
+        })
+        .take(8)
+        .collect()
+}
+
+fn select_session_relative_report(case: &Case) -> Option<(u64, Value)> {
+    case.nodes()
+        .iter()
+        .filter(|node| node.kind == "recovery_relational_transform_report")
+        .filter_map(|node| {
+            node.blob
+                .as_deref()
+                .and_then(|blob_id| case.blob(blob_id))
+                .and_then(|blob| serde_json::from_slice::<Value>(&blob.bytes).ok())
+                .map(|report| (node.id, report))
+        })
+        .max_by_key(|(node_id, report)| {
+            (
+                report
+                    .get("application_evidence_checks")
+                    .and_then(Value::as_array)
+                    .is_some_and(|checks| {
+                        checks.iter().any(|check| {
+                            check.get("artifact_validated") == Some(&Value::Bool(true))
+                        })
+                    }),
+                report
+                    .pointer("/output_application/applied_rules")
+                    .and_then(Value::as_u64)
+                    .unwrap_or_default(),
+                report
+                    .get("input_sample_node_ids")
+                    .and_then(Value::as_array)
+                    .map_or(0, Vec::len),
+                report
+                    .get("candidate_count_examined")
+                    .and_then(Value::as_u64)
+                    .unwrap_or_default(),
+                report
+                    .get("application_evidence_checks")
+                    .and_then(Value::as_array)
+                    .map_or(0, Vec::len),
+                *node_id,
+            )
+        })
+}
+
+fn session_relative_transform_diagnostics(case: &Case) -> Vec<Value> {
+    load_relational_reports(case)
+        .into_iter()
+        .take(4)
+        .map(|report| {
+            json!({
+                "sessions_available":report.get("sessions_available"),
+                "candidate_count_examined":report.get("candidate_count_examined"),
+                "candidate_count_omitted":report.get("candidate_count_omitted"),
+                "candidate_limit_remaining":report.get("candidate_limit_remaining"),
+                "locator_candidates_examined":report.get("locator_candidates_examined"),
+                "rules":report.get("retained_rules").and_then(Value::as_array).map(|rules| {
+                    rules.iter().take(8).map(|rule| json!({
+                        "status":rule.get("status"),
+                        "seed_locator":rule.pointer("/rule/seed_locator"),
+                        "payload_locator":rule.pointer("/rule/payload_locator"),
+                        "operation":rule.pointer("/rule/operation/family"),
+                    })).collect::<Vec<_>>()
+                }),
+                "aggregate_parser_checks":report.get("aggregate_parser_checks").and_then(Value::as_array).map(|checks| {
+                    checks.iter().take(5).map(|check| json!({
+                        "candidate_index":check.get("candidate_index"),
+                        "status":check.get("status"),
+                        "parser_format":check.get("parser_format"),
+                    })).collect::<Vec<_>>()
+                }),
+            })
+        })
+        .collect()
+}
+
+fn session_relative_report_summary(node_id: u64, report: &Value) -> Value {
+    let output_application = report.get("output_application").map(|application| {
+        json!({
+            "applied_rules":application.get("applied_rules"),
+            "supported_rules":application.get("supported_rules"),
+            "terminal_sequence":application.get("terminal_sequence"),
+            "uniqueness_established":application.get("uniqueness_established"),
+        })
+    });
+    let candidate_preview = report
+        .get("retained_rules")
+        .and_then(Value::as_array)
+        .map(|rules| {
+            rules
+                .iter()
+                .take(4)
+                .map(|rule| {
+                    json!({
+                        "status":rule.get("status"),
+                        "seed_locator":rule.pointer("/rule/seed_locator"),
+                        "payload_locator":rule.pointer("/rule/payload_locator"),
+                        "operation":rule.pointer("/rule/operation/family"),
+                        "parser_format":rule.pointer("/rule/parser_format"),
+                    })
+                })
+                .collect::<Vec<_>>()
+        });
+    let application_checks = report
+        .get("application_evidence_checks")
+        .and_then(Value::as_array)
+        .map(|checks| {
+            checks
+                .iter()
+                .take(8)
+                .map(|check| {
+                    json!({
+                        "candidate_index":check.get("candidate_index"),
+                        "status":check.get("status"),
+                        "artifact_validated":check.get("artifact_validated"),
+                        "structurally_supported":check.get("structurally_supported"),
+                    })
+                })
+                .collect::<Vec<_>>()
+        });
+    let parser_checks = report
+        .get("aggregate_parser_checks")
+        .and_then(Value::as_array)
+        .map(|checks| {
+            checks
+                .iter()
+                .take(5)
+                .map(|check| {
+                    json!({
+                        "candidate_index":check.get("candidate_index"),
+                        "status":check.get("status"),
+                        "parser_format":check.get("parser_format"),
+                        "length":check.get("length"),
+                    })
+                })
+                .collect::<Vec<_>>()
+        });
+
+    json!({
+        "node":node_id,
+        "input_sample_count":report.get("input_sample_node_ids").and_then(Value::as_array).map_or(0, Vec::len),
+        "candidate_count_examined":report.get("candidate_count_examined"),
+        "candidate_count_omitted":report.get("candidate_count_omitted"),
+        "output_application":output_application,
+        "candidate_preview":candidate_preview,
+        "application_evidence_checks":application_checks,
+        "aggregate_parser_checks":parser_checks,
+    })
+}
+
+#[test]
+fn default_recovery_decodes_raw_directional_runs_before_record_discovery() -> TestResult<()> {
+    let RawDirectionalFixture {
+        mut case,
+        plaintext,
+        run_nodes,
+    } = build_raw_directional_fixture()?;
+    let summary =
+        recover_case_with_job(&mut case, RecoveryProfile::Normal, 64 * 1024 * 1024, None)?;
+    let relational_reports = load_relational_reports(&case);
+    assert!(summary.discovery.input_coverage_complete);
+    assert!(
+        reports_omit_observed_markers(&relational_reports),
+        "relational reports should describe locator shapes without storing observed marker bytes"
+    );
+    if let Err(error) = record_handoff::assert_exact_raw_handoff(&case, &plaintext, &run_nodes) {
+        let details = raw_gate_failure_summary(&relational_reports);
+        let snapshot = save_case_snapshot(&case, "l2-raw-handoff-failure-", Some(&details))?;
+        return Err(format!("{error}; {details}; snapshot={snapshot:?}").into());
+    }
+    Ok(())
+}
+
+fn raw_gate_failure_summary(reports: &[Value]) -> String {
+    let reports = reports
+        .iter()
+        .take(4)
+        .map(|report| {
+            let checks = report
+                .get("application_evidence_checks")
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+                .take(12)
+                .map(|check| {
+                    let alternatives = check
+                        .pointer("/details/schema_alternatives")
+                        .and_then(Value::as_array)
+                        .into_iter()
+                        .flatten()
+                        .take(8)
+                        .map(|alternative| {
+                            json!({
+                                "label":alternative.get("label"),
+                                "status":alternative.get("status"),
+                                "schemas_checked":alternative.get("schemas_checked"),
+                                "schemas_structurally_supported":alternative.get("schemas_structurally_supported"),
+                                "underdetermined_schemas":alternative.get("underdetermined_schemas"),
+                                "variable_length_schemas":alternative.get("variable_length_schemas"),
+                                "coherent_sequence_schemas":alternative.get("coherent_sequence_schemas"),
+                                "sequence_conflict_schemas":alternative.get("sequence_conflict_schemas"),
+                            })
+                        })
+                        .collect::<Vec<_>>();
+                    json!({
+                        "candidate_index":check.get("candidate_index"),
+                        "status":check.get("status"),
+                        "reason":check.get("reason"),
+                        "details_reason":check.pointer("/details/reason"),
+                        "schema_alternatives":alternatives,
+                    })
+                })
+                .collect::<Vec<_>>();
+            json!({
+                "retained_rule_count":report.get("retained_rules").and_then(Value::as_array).map(Vec::len),
+                "application_checks":checks,
+            })
+        })
+        .collect::<Vec<_>>();
+    serde_json::to_string_pretty(&reports).unwrap_or_else(|_| "report summary unavailable".into())
+}
+
+fn build_raw_directional_fixture() -> TestResult<RawDirectionalFixture> {
+    let mut case = Case::new();
+    let source = capture(&mut case, "raw-relational-recovery")?;
+    let plaintext = synthetic_png([53, 109, 173])?;
+    let chunk_weights = [1_usize, 2, 3, 1, 4, 2, 3, 4];
+    let weight_total = chunk_weights.iter().sum::<usize>();
+    let mut boundaries = Vec::with_capacity(chunk_weights.len() + 1);
+    boundaries.push(0_usize);
+    let mut cumulative_weight = 0_usize;
+    for weight in chunk_weights {
+        cumulative_weight = cumulative_weight
+            .checked_add(weight)
+            .ok_or("synthetic chunk weight overflow")?;
+        boundaries.push(plaintext.len() * cumulative_weight / weight_total);
+    }
+
+    // Each raw direction contains two adjacent shuffled chunks from one PNG
+    let artifact_part_by_session = [2_usize, 3, 0, 1];
+    let mut run_nodes = Vec::with_capacity(artifact_part_by_session.len());
+    for (session_index, artifact_part) in artifact_part_by_session.into_iter().enumerate() {
+        let wire =
+            raw_directional_session_wire(&plaintext, &boundaries, artifact_part, session_index)?;
+        let packet = 50 + u64::try_from(session_index)? * 10;
+        let context =
+            add_session_context(&mut case, "raw-relational-direction", packet, 0, wire.len())?;
+        let run_node =
+            add_tcp_run_in_context(&mut case, &source, context.direction_node, packet, &wire)?;
+        run_nodes.push(run_node);
+    }
+
+    Ok(RawDirectionalFixture {
+        case,
+        plaintext,
+        run_nodes,
+    })
+}
+
+fn raw_directional_session_wire(
+    plaintext: &[u8],
+    boundaries: &[usize],
+    artifact_part: usize,
+    session_index: usize,
+) -> TestResult<Vec<u8>> {
+    use l2_workbench::derivation::{
+        CounterByteOrder, CounterWidth, OperandRef, Operation, Recipe, SeedCounterOrder, run,
+    };
+
+    let mut records = Vec::with_capacity(2);
+    for fragment_index in 0..2_usize {
+        let sequence_index = artifact_part * 2 + fragment_index;
+        let start = *boundaries
+            .get(sequence_index)
+            .ok_or("synthetic chunk start is unavailable")?;
+        let end = *boundaries
+            .get(sequence_index + 1)
+            .ok_or("synthetic chunk end is unavailable")?;
+        let payload = plaintext
+            .get(start..end)
+            .ok_or("synthetic artifact chunk is invalid")?;
+        records.push(record(b"\x35\xa1", u16::try_from(sequence_index)?, payload));
+    }
+    if session_index % 2 == 1 {
+        records.reverse();
+    }
+
+    // Distinct seeds make each session require an independent learned transform
+    let session_byte = u8::try_from(session_index)?;
+    let seed = (0..8_u8)
+        .map(|byte| byte.wrapping_add(session_byte.wrapping_mul(23)))
+        .collect::<Vec<_>>();
+    let clear_records = records.concat();
+    let encrypted = run(
+        &clear_records,
+        &Recipe {
+            steps: vec![Operation::Sha256CounterXor {
+                seed: OperandRef::from(seed.clone()),
+                initial_counter: 0,
+                counter_width: CounterWidth::OneByte,
+                counter_byte_order: CounterByteOrder::BigEndian,
+                seed_order: SeedCounterOrder::SeedThenCounter,
+            }],
+            constraints: Vec::new(),
+        },
+    )?;
+    let mut wire = vec![u8::try_from(seed.len())?];
+    wire.extend_from_slice(&seed);
+    wire.push(0x4d);
+    wire.extend_from_slice(&encrypted.output);
+    Ok(wire)
+}
+
+fn load_relational_reports(case: &Case) -> Vec<Value> {
+    case.nodes()
+        .iter()
+        .filter(|node| node.kind == "recovery_relational_transform_report")
+        .filter_map(|node| node.blob.as_deref())
+        .filter_map(|blob_id| case.blob(blob_id))
+        .filter_map(|blob| serde_json::from_slice::<Value>(&blob.bytes).ok())
+        .collect()
+}
+
+fn reports_omit_observed_markers(reports: &[Value]) -> bool {
+    reports.iter().all(|report| {
+        report
+            .get("retained_rules")
+            .and_then(Value::as_array)
+            .is_none_or(|rules| {
+                rules.iter().all(|rule| {
+                    rule.pointer("/rule/seed_locator/marker").is_none()
+                        && rule.pointer("/rule/payload_locator/marker").is_none()
+                })
+            })
+    })
+}
+
+fn save_case_snapshot(
+    case: &Case,
+    prefix: &str,
+    details: Option<&str>,
+) -> TestResult<std::path::PathBuf> {
+    let snapshot_root = tempfile::Builder::new().prefix(prefix).tempdir()?.keep();
+    let mut snapshot = std::fs::File::create(snapshot_root.join("case.json"))?;
+    case.write_json(&mut snapshot)?;
+    if let Some(details) = details {
+        std::fs::write(snapshot_root.join("summary.txt"), details)?;
+    }
+    Ok(snapshot_root)
+}
+
+#[test]
+fn clear_record_headers_do_not_admit_randomly_decoded_payloads() -> TestResult<()> {
+    use l2_workbench::derivation::{
+        CounterByteOrder, CounterWidth, OperandRef, Operation, Recipe, SeedCounterOrder, run,
+    };
+
+    let mut case = Case::new();
+    let source = capture(&mut case, "clear-header-random-payload")?;
+    for session_index in 0..4_u64 {
+        let session_byte = u8::try_from(session_index)?;
+        let seed = (0..8_u8)
+            .map(|byte| byte.wrapping_add(session_byte * 29))
+            .collect::<Vec<_>>();
+        let random_payload = (0..24_u8)
+            .map(|byte| 0x31_u8.wrapping_add(byte.wrapping_add(session_byte * 3) % 47))
+            .collect::<Vec<_>>();
+        let encrypted = run(
+            &random_payload,
+            &Recipe {
+                steps: vec![Operation::Sha256CounterXor {
+                    seed: OperandRef::from(seed.clone()),
+                    initial_counter: 0,
+                    counter_width: CounterWidth::OneByte,
+                    counter_byte_order: CounterByteOrder::BigEndian,
+                    seed_order: SeedCounterOrder::SeedThenCounter,
+                }],
+                constraints: Vec::new(),
+            },
+        )?;
+
+        let mut seed_body = vec![0x6b];
+        seed_body.extend_from_slice(&seed);
+        let seed_message = synthetic_protocol_record([0x23, 0x71], 0, &seed_body)?;
+        let mut payload_body = vec![0x4d];
+        payload_body.extend_from_slice(&encrypted.output);
+        let payload_message = synthetic_protocol_record([0xa4, 0x19], 0, &payload_body)?;
+        let mut wire = seed_message;
+        wire.extend_from_slice(&payload_message);
+
+        let packet = 8 + session_index * 10;
+        let context = add_session_context(
+            &mut case,
+            "clear-header-random-payload-scope",
+            packet,
+            0,
+            wire.len(),
+        )?;
+        add_tcp_run_in_context(&mut case, &source, context.direction_node, packet, &wire)?;
+    }
+
+    let _summary =
+        recover_case_with_job(&mut case, RecoveryProfile::Normal, 64 * 1024 * 1024, None)?;
+    let reports = case
+        .nodes()
+        .iter()
+        .filter(|node| node.kind == "recovery_relational_transform_report")
+        .filter_map(|node| node.blob.as_deref())
+        .filter_map(|blob_id| case.blob(blob_id))
+        .filter_map(|blob| serde_json::from_slice::<Value>(&blob.bytes).ok())
+        .collect::<Vec<_>>();
+    assert!(
+        reports.iter().any(|report| {
+            report
+                .get("application_evidence_checks")
+                .and_then(Value::as_array)
+                .is_some_and(|checks| {
+                    checks.iter().any(|check| {
+                        check.get("status").and_then(Value::as_str) == Some("pending")
+                            && check.pointer("/details/schema_only_constraints")
+                                == Some(&Value::Bool(true))
+                    })
+                })
+        }),
+        "clear record headers should report schema support as unresolved without output"
+    );
+    let unexpected_outputs = case
+        .nodes()
+        .iter()
+        .filter(|node| {
+            matches!(
+                node.kind.as_str(),
+                "relational_decoded_frame" | "relational_transform_output"
+            )
+        })
+        .take(12)
+        .map(|node| (node.id, node.kind.as_str(), &node.details))
+        .collect::<Vec<_>>();
+    let unexpected_candidates = unexpected_outputs
+        .iter()
+        .filter_map(|(_, _, details)| {
+            details
+                .get("relational_candidate_index")
+                .and_then(Value::as_u64)
+        })
+        .collect::<Vec<_>>();
+    let matching_gate_checks = reports
+        .iter()
+        .filter_map(|report| report.get("application_evidence_checks"))
+        .filter_map(Value::as_array)
+        .flatten()
+        .filter(|check| {
+            check
+                .get("candidate_index")
+                .and_then(Value::as_u64)
+                .is_some_and(|candidate| unexpected_candidates.contains(&candidate))
+        })
+        .take(12)
+        .cloned()
+        .collect::<Vec<_>>();
+    let failure_snapshot = if unexpected_outputs.is_empty() {
+        None
+    } else {
+        let details = serde_json::to_string_pretty(&matching_gate_checks)?;
+        Some(save_case_snapshot(
+            &case,
+            "l2-clear-header-gate-",
+            Some(&details),
+        )?)
+    };
+    assert!(
+        unexpected_outputs.is_empty(),
+        "valid unchanged headers must not materialize random transformed payloads: outputs={unexpected_outputs:#?}; gate_checks={matching_gate_checks:#?}; snapshot={failure_snapshot:?}"
+    );
+    Ok(())
+}
+
+#[test]
 fn compact_record_reports_do_not_hide_typed_schema_scheduling() -> TestResult<()> {
     let mut case = Case::new();
     let source = capture(&mut case, "compact-record-report")?;
@@ -1497,7 +2646,7 @@ fn record_input_omissions_survive_case_scan_work_exhaustion() -> TestResult<()> 
 
     policy.resources.max_work_bytes = available_work;
     let admitted_outcome = execute(&mut case, &plan, &policy)?;
-    assert_record_input_omissions(&admitted_outcome, &source, 8, 2, 1, 2)
+    assert_record_input_omissions(&admitted_outcome, &source, 6, 1, 1, 1)
 }
 
 fn record_input_omission_fixture() -> TestResult<(Case, String, super::RecoveryExecutionPolicy)> {
@@ -1605,27 +2754,25 @@ fn assert_record_input_omissions(
     assert_eq!(reasons.get("missing_materialization_receipt"), Some(&1));
     assert_eq!(reasons.get("duplicate_receipt_frame_index"), Some(&2));
     assert_eq!(
-        reasons.get("whole_session_exceeds_message_count_limit"),
+        reasons.get("learning_prefix_message_count_limit"),
         (expected_message_limit > 0).then_some(&expected_message_limit)
     );
     assert_eq!(
-        reasons.get("whole_session_exceeds_aggregate_byte_limit"),
+        reasons.get("learning_prefix_aggregate_byte_limit"),
         (expected_byte_limit > 0).then_some(&expected_byte_limit)
     );
     assert_eq!(
-        reasons.get("whole_session_exceeds_message_count_and_aggregate_byte_limits"),
+        reasons.get("learning_prefix_message_and_byte_limits"),
         (expected_combined_limit > 0).then_some(&expected_combined_limit)
     );
     if expected_message_limit > 0 {
-        assert!(formatted.contains("whole_session_exceeds_message_count_limit"));
+        assert!(formatted.contains("learning_prefix_message_count_limit"));
     }
     if expected_byte_limit > 0 {
-        assert!(formatted.contains("whole_session_exceeds_aggregate_byte_limit"));
+        assert!(formatted.contains("learning_prefix_aggregate_byte_limit"));
     }
     if expected_combined_limit > 0 {
-        assert!(
-            formatted.contains("whole_session_exceeds_message_count_and_aggregate_byte_limits")
-        );
+        assert!(formatted.contains("learning_prefix_message_and_byte_limits"));
     }
     Ok(())
 }
@@ -2333,7 +3480,35 @@ fn default_recovery_retains_the_unrelated_length_prefixed_record_schema() -> Tes
         4
     );
 
-    let summary = recover_case(&mut case)?;
+    let summary = match recover_case(&mut case) {
+        Ok(summary) => summary,
+        Err(error) => {
+            let mut counts = std::collections::BTreeMap::<String, usize>::new();
+            for node in case.nodes() {
+                *counts.entry(node.kind.clone()).or_default() += 1;
+            }
+            let last_nodes = case
+                .nodes()
+                .iter()
+                .rev()
+                .take(12)
+                .map(|node| (node.id, node.kind.as_str(), node.blob.as_deref()))
+                .collect::<Vec<_>>();
+            let last_edges = case
+                .edges()
+                .iter()
+                .rev()
+                .take(12)
+                .map(|edge| (edge.from, edge.to, edge.relation.as_str()))
+                .collect::<Vec<_>>();
+            eprintln!(
+                "recovery error={error:?}; nodes={} edges={}; node_counts={counts:?}; last_nodes={last_nodes:?}; last_edges={last_edges:?}",
+                case.nodes().len(),
+                case.edges().len()
+            );
+            return Err(error.into());
+        }
+    };
     assert!(summary.candidate_count > 0);
     assert_synthetic_schema_survives_default_search(&case)?;
     let recovered_artifacts = artifacts

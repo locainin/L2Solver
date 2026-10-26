@@ -1,5 +1,6 @@
 //! Bounded record-schema hypotheses over already materialized frame evidence
 
+mod analysis;
 mod input;
 mod report;
 mod work;
@@ -7,7 +8,8 @@ mod work;
 #[cfg(test)]
 pub(in crate::workbench::recovery_executor) use input::collect_plan;
 pub(in crate::workbench::recovery_executor) use input::{
-    RecordDiscoveryPlan, apply_input_limits, collect_input_plan,
+    RecordCohortKey, RecordCohortOrigin, RecordDiscoveryPlan, RecordFrameInput, apply_input_limits,
+    collect_input_plan, collect_input_plan_excluding,
 };
 pub(in crate::workbench::recovery_executor) use report::{
     RecordDiscoveryContext, RecordSchemaReportLinks,

@@ -13,6 +13,7 @@ use l2_workbench::{
     recovery::{RecoveryError, RecoveryResult, RecoveryStage},
 };
 use serde_json::{Value, json};
+use std::collections::BTreeSet;
 
 pub(super) enum ValidationDecision {
     Validated {
@@ -63,6 +64,33 @@ struct ValidationReceipt {
 struct RetainedArtifactBytes {
     exact_bytes: Option<Vec<u8>>,
     blob_id: String,
+}
+
+struct RelationalRecordArtifact {
+    report_node_id: u64,
+    candidate_index: usize,
+    parser_format: String,
+    expected_session_orders: Vec<u64>,
+    input_frame_node_ids: Vec<u64>,
+    record_group_identifier_sha256: Option<String>,
+}
+
+struct RelationalFrameMetadata {
+    report_node_id: u64,
+    candidate_index: usize,
+    parser_format: String,
+    expected_session_orders: Vec<u64>,
+    session_order: u64,
+}
+
+struct ValidatedEvidenceCommit<'a> {
+    candidate_id: RecoveryCandidateId,
+    origins: &'a [u64],
+    input_node: u64,
+    artifact: ValidatedArtifact,
+    receipt: ValidationReceipt,
+    exact_bytes: Option<Vec<u8>>,
+    relational_record_artifact: Option<RelationalRecordArtifact>,
 }
 
 pub(super) fn classify_validation(
@@ -147,6 +175,112 @@ fn zip_limited_request(
     Ok(limited.then_some(requested))
 }
 
+fn relational_record_artifact(
+    case: &Case,
+    input_node_id: u64,
+    format: ArtifactValidationFormat,
+) -> Option<RelationalRecordArtifact> {
+    let input = case.node(input_node_id)?;
+    if !matches!(input.kind.as_str(), "record_candidate" | "record_object") {
+        return None;
+    }
+    let frame_node_ids = relational_frame_node_ids(case, input_node_id)?;
+    let first_id = *frame_node_ids.first()?;
+    let first = relational_frame_metadata(case, first_id, format)?;
+    let expected_set = unique_session_orders(&first.expected_session_orders)?;
+    let mut observed_session_orders = BTreeSet::new();
+    for frame_node_id in &frame_node_ids {
+        let frame = relational_frame_metadata(case, *frame_node_id, format)?;
+        if frame.report_node_id != first.report_node_id
+            || frame.candidate_index != first.candidate_index
+            || frame.parser_format != first.parser_format
+            || frame.expected_session_orders != first.expected_session_orders
+        {
+            return None;
+        }
+        observed_session_orders.insert(frame.session_order);
+    }
+    if observed_session_orders != expected_set {
+        return None;
+    }
+    Some(RelationalRecordArtifact {
+        report_node_id: first.report_node_id,
+        candidate_index: first.candidate_index,
+        parser_format: first.parser_format,
+        expected_session_orders: first.expected_session_orders,
+        input_frame_node_ids: frame_node_ids,
+        record_group_identifier_sha256: input
+            .details
+            .get("identifier_sha256")
+            .and_then(Value::as_str)
+            .map(str::to_owned),
+    })
+}
+
+fn relational_frame_node_ids(case: &Case, input_node_id: u64) -> Option<Vec<u64>> {
+    let mut frame_node_ids = case
+        .edges()
+        .iter()
+        .filter(|edge| {
+            edge.to == input_node_id
+                && matches!(edge.relation.as_str(), "candidate_from" | "assembled_from")
+        })
+        .map(|edge| edge.from)
+        .collect::<Vec<_>>();
+    frame_node_ids.sort_unstable();
+    frame_node_ids.dedup();
+    (!frame_node_ids.is_empty()).then_some(frame_node_ids)
+}
+
+fn relational_frame_metadata(
+    case: &Case,
+    frame_node_id: u64,
+    format: ArtifactValidationFormat,
+) -> Option<RelationalFrameMetadata> {
+    let frame = case.node(frame_node_id)?;
+    if frame.kind != "relational_decoded_frame"
+        || frame.details.get("relational_decoded_frame") != Some(&Value::Bool(true))
+    {
+        return None;
+    }
+    let parser_format = frame
+        .details
+        .get("relational_parser_format")
+        .and_then(Value::as_str)?
+        .to_owned();
+    if parser_format != format!("{format:?}") {
+        return None;
+    }
+    let expected_session_orders = frame
+        .details
+        .get("expected_session_orders")
+        .and_then(Value::as_array)?
+        .iter()
+        .map(Value::as_u64)
+        .collect::<Option<Vec<_>>>()?;
+    Some(RelationalFrameMetadata {
+        report_node_id: frame
+            .details
+            .get("relational_report_node_id")
+            .and_then(Value::as_u64)?,
+        candidate_index: usize::try_from(
+            frame
+                .details
+                .get("relational_candidate_index")
+                .and_then(Value::as_u64)?,
+        )
+        .ok()?,
+        parser_format,
+        expected_session_orders,
+        session_order: frame.details.get("session_order").and_then(Value::as_u64)?,
+    })
+}
+
+fn unique_session_orders(orders: &[u64]) -> Option<BTreeSet<u64>> {
+    let unique = orders.iter().copied().collect::<BTreeSet<_>>();
+    (unique.len() == orders.len() && !unique.is_empty()).then_some(unique)
+}
+
 impl Executor<'_> {
     pub(super) fn run_validation(
         &mut self,
@@ -214,20 +348,39 @@ impl Executor<'_> {
         input_node: u64,
         artifact: ValidatedArtifact,
     ) -> Result<(), RecoveryExecutionError> {
+        let relational_record_artifact = if self.case_index.has_relational_frames
+            && artifact.range.offset == 0
+            && artifact.range.length == artifact.input_length
+        {
+            relational_record_artifact(self.case, input_node, artifact.format)
+        } else {
+            None
+        };
+        if relational_record_artifact.is_some()
+            && !self.check_output(
+                candidate_id,
+                &RecoveryTask::StructuralValidation,
+                origins,
+                artifact.input_length,
+            )?
+        {
+            return Ok(());
+        }
         let receipt = ValidationReceipt::new(input_node, artifact)?;
         let Some(retained) =
             self.retain_validated_artifact(candidate_id, origins, input_node, artifact)?
         else {
             return Ok(());
         };
-        let expansion_node = self.commit_validated_evidence(
+        let expansion_node = self.commit_validated_evidence(ValidatedEvidenceCommit {
             candidate_id,
             origins,
             input_node,
             artifact,
             receipt,
-            retained.exact_bytes,
-        )?;
+            exact_bytes: retained.exact_bytes,
+            relational_record_artifact,
+        })?;
         self.validated_artifacts.insert(retained.blob_id);
         self.enqueue_validation_expansion(candidate_id, artifact.format, expansion_node)?;
         Ok(())
@@ -257,13 +410,17 @@ impl Executor<'_> {
 
     fn commit_validated_evidence(
         &mut self,
-        candidate_id: RecoveryCandidateId,
-        origins: &[u64],
-        input_node: u64,
-        artifact: ValidatedArtifact,
-        receipt: ValidationReceipt,
-        exact_bytes: Option<Vec<u8>>,
+        commit: ValidatedEvidenceCommit<'_>,
     ) -> Result<u64, RecoveryExecutionError> {
+        let ValidatedEvidenceCommit {
+            candidate_id,
+            origins,
+            input_node,
+            artifact,
+            receipt,
+            exact_bytes,
+            relational_record_artifact,
+        } = commit;
         self.case_transaction_and_finish(candidate_id, |case, identities| {
             // The full input gets a validated-range edge below, so omit its reciprocal link
             let validated_input = exact_bytes.is_none().then_some(input_node);
@@ -277,6 +434,59 @@ impl Executor<'_> {
                 artifact,
                 exact_bytes,
             )?;
+            if let Some(relational_artifact) = relational_record_artifact {
+                let input_blob = case
+                    .node(input_node)
+                    .and_then(|node| node.blob.as_deref())
+                    .and_then(|blob_id| case.blob(blob_id))
+                    .ok_or(RecoveryError::InvariantFailure)?;
+                let input_digest = input_blob
+                    .id
+                    .strip_prefix("sha256:")
+                    .ok_or(RecoveryError::InvariantFailure)?;
+                let details = json!({
+                    "representation":"raw_bytes",
+                    "report_node_id":relational_artifact.report_node_id,
+                    "candidate_index":relational_artifact.candidate_index,
+                    "parser_format":relational_artifact.parser_format,
+                    "parser_scope":"after_cross_session_record_assembly",
+                    "record_group_identifier_sha256":relational_artifact.record_group_identifier_sha256,
+                    "input_record_candidate":input_node,
+                    "input_frame_node_ids":relational_artifact.input_frame_node_ids,
+                    "session_orders":relational_artifact.expected_session_orders,
+                    "length":input_blob.bytes.len(),
+                    "sha256":input_digest,
+                    "terminal_sequence":"unknown",
+                });
+                // Validation adds an interpretation of these retained bytes, so reuse their identity
+                let input_blob_id = input_blob.id.clone();
+                let output_node = case.add_node(
+                    "relational_transform_output",
+                    Some(&input_blob_id),
+                    Vec::new(),
+                    details,
+                )?;
+                add_transaction_links(
+                    case,
+                    identities,
+                    output_node,
+                    &[input_node],
+                    "validated_record_assembly",
+                    EvidenceStatus::Observed,
+                    "This exact parser-validated artifact is the output of cross-session record assembly",
+                )?;
+                add_transaction_edge(
+                    case,
+                    identities,
+                    Edge {
+                        from: relational_artifact.report_node_id,
+                        to: output_node,
+                        relation: "supports_relational_output".to_owned(),
+                        status: EvidenceStatus::Hypothesis,
+                        reason: "The frozen relational rule contributed decoded frame payloads to this parser-validated record assembly".to_owned(),
+                    },
+                )?;
+            }
             Ok((
                 expansion_node,
                 RecoveryResult::ObservedValidation {

@@ -101,6 +101,7 @@ pub(super) fn saturated_case_evidence(
         RecoveryTask::FramingDiscovery
             | RecoveryTask::TransformDiscovery
             | RecoveryTask::RecordDiscovery
+            | RecoveryTask::RelationalTransformDiscovery
     ) {
         return None;
     }

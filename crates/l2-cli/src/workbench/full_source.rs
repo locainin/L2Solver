@@ -22,7 +22,7 @@ use l2_workbench::store::Options;
 const FLOW_PAGE_SIZE: usize = 256;
 
 /// Return the bounded basename associated with the current capture request
-pub(crate) fn source_label(path: &Path) -> &str {
+pub fn source_label(path: &Path) -> &str {
     label(path, "capture")
 }
 

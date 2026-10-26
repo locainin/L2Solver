@@ -1,4 +1,5 @@
 use super::super::framing_materialize::{self, FramingSelectionBasis, PreparedFraming};
+use super::derived_discovery::MaterializedFrameRegistration;
 use super::evidence::{add_transaction_edge, add_transaction_links};
 use super::{
     DERIVED_REASON, Executor, RecoveryCandidateId, RecoveryExecutionError, RecoveryOmission,
@@ -15,16 +16,17 @@ impl Executor<'_> {
     pub(super) fn run_framing(
         &mut self,
         candidate_id: RecoveryCandidateId,
+        input_node: u64,
         origins: &[u64],
         rule: &FramingKind,
         basis: FramingSelectionBasis,
     ) -> Result<(), RecoveryExecutionError> {
-        let Some(input_node) = origins.iter().copied().find(|node_id| {
-            self.node_kind(*node_id)
-                .is_ok_and(|kind| kind == "tcp_byte_run")
-        }) else {
+        let input_kind = self.node_kind(input_node)?.to_owned();
+        let derived_input =
+            input_kind == "decoding_output" && self.derived_discovery.has_context(input_node);
+        if input_kind != "tcp_byte_run" && !derived_input {
             return self.finish(candidate_id, RecoveryResult::Unsupported);
-        };
+        }
         let Some(prepared) =
             self.prepare_framing(candidate_id, input_node, origins, rule, basis)?
         else {
@@ -38,6 +40,22 @@ impl Executor<'_> {
             })) => return self.finish_framing_quota(candidate_id, origins, rule, field, maximum),
             Err(error) => return Err(error),
         };
+        if derived_input {
+            self.derived_discovery.register_materialized_frames(
+                self.case,
+                MaterializedFrameRegistration {
+                    input_node,
+                    receipt_node: materialized.2,
+                    frame_node_ids: &materialized.0,
+                    rule,
+                    parent: candidate_id,
+                    discover_records: self.plan.discover_records,
+                    maximum_contexts: self.policy.resources.max_context_aliases,
+                },
+            )?;
+            self.omissions
+                .extend(self.derived_discovery.take_omissions()?);
+        }
         self.enqueue_framed_children(candidate_id, &materialized.0, materialized.1)
     }
 
@@ -71,7 +89,7 @@ impl Executor<'_> {
         candidate_id: RecoveryCandidateId,
         origins: &[u64],
         prepared: PreparedFraming,
-    ) -> Result<(Vec<u64>, Option<u64>), RecoveryExecutionError> {
+    ) -> Result<(Vec<u64>, Option<u64>, u64), RecoveryExecutionError> {
         self.case_transaction_and_finish(candidate_id, |case, identities| {
             let outcome = framing_materialize::commit_recovery(case, prepared)
                 .map_err(framing_materialization_error)?;
@@ -101,7 +119,7 @@ impl Executor<'_> {
             }
             let receipt_node = outcome.receipt_node;
             Ok((
-                (outcome.frame_nodes, outcome.tail_node),
+                (outcome.frame_nodes, outcome.tail_node, receipt_node),
                 RecoveryResult::Derived {
                     evidence_node_id: receipt_node,
                 },

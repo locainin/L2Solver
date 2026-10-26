@@ -2,7 +2,7 @@ use super::evidence::{TransactionEdges, add_transaction_edge, case_evidence_quot
 use super::scheduler::enqueue_candidate_id;
 use super::{
     Executor, PROPOSED_BY_REASON, RecoveryCandidateId, RecoveryExecutionError, RecoveryOmission,
-    RecoveryStage, RecoveryTask, edge_identity,
+    RecoveryStage, RecoveryTask, TransformSlot, edge_identity,
 };
 use l2_workbench::{
     derivation::Recipe,
@@ -16,8 +16,9 @@ use l2_workbench::{
             transform_proposal_scan_work_bound,
         },
         regions::{
-            TransformRegionLimits, TransformRegionReport, propose_region_transforms,
-            transform_discovery_scan_work_bound, transform_region_scan_work_bound,
+            RegionCueOrigin, TransformRegionLimits, TransformRegionReport,
+            propose_region_transforms, transform_discovery_scan_work_bound,
+            transform_region_scan_work_bound,
         },
     },
 };
@@ -229,7 +230,7 @@ impl Executor<'_> {
                 .map(|report_node| (report_node, state.recipes.clone()))
         };
         if let Some((report_node, recipes)) = completed {
-            self.enqueue_proposals_for_context(context, report_node, &recipes)?;
+            self.enqueue_proposals_for_context(candidate_id, context, report_node, &recipes)?;
         }
         Ok(())
     }
@@ -357,7 +358,7 @@ impl Executor<'_> {
             state.contexts.as_slice().to_vec()
         };
         for context in contexts {
-            self.enqueue_proposals_for_context(context, report_node, &recipes)?;
+            self.enqueue_proposals_for_context(candidate_id, context, report_node, &recipes)?;
         }
         Ok(())
     }
@@ -388,16 +389,22 @@ impl Executor<'_> {
             .iter()
             .any(|region| !region.proposal_report.proposals.is_empty());
         let region_is_incomplete = !region_report.coverage.complete
-            || region_report.regions.iter().any(|region| {
-                region.proposal_report.omissions.candidates != 0
-                    || region.proposal_report.omissions.reports != 0
-            });
+            || region_report
+                .regions
+                .iter()
+                .any(|region| region.proposal_report.omissions.candidates != 0);
+        // Preserve assessments selected by structural or delimiter cues for review
+        let has_reportable_region = region_report.regions.iter().any(|region| {
+            region
+                .cue_origins
+                .iter()
+                .any(|origin| !matches!(origin, RegionCueOrigin::EncodingRun))
+        });
         if !proposal_report.proposals.is_empty()
             || proposal_report.omissions.candidates != 0
-            || proposal_report.omissions.reports != 0
             || region_has_proposals
             || region_is_incomplete
-            || !region_report.regions.is_empty()
+            || has_reportable_region
         {
             return Ok(false);
         }
@@ -646,6 +653,7 @@ impl Executor<'_> {
 
     fn enqueue_proposals_for_context(
         &mut self,
+        discovery_candidate: RecoveryCandidateId,
         context: TransformDiscoveryContext,
         report_node: u64,
         recipes: &[Recipe],
@@ -692,6 +700,17 @@ impl Executor<'_> {
             self.record_enqueue(result, &task, &[context.input_node])?;
             if let Some(candidate_id) = candidate_id {
                 self.associate_proposal(candidate_id, report_node)?;
+                if self.derived_discovery.has_context(context.input_node) {
+                    // Keep per-origin lineage when a derived TCP consumer needs the view
+                    self.enqueue_transform_cohort(
+                        task,
+                        vec![TransformSlot {
+                            parent: context.byte_parent.unwrap_or(discovery_candidate),
+                            input_node: context.input_node,
+                            candidate: candidate_id,
+                        }],
+                    );
+                }
             }
         }
         Ok(())

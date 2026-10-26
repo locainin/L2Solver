@@ -10,6 +10,8 @@ use std::{
 const BODY: &[u8] = b"object bytes";
 const FTP_BODY: &[u8] = b"example FTP transfer bytes\r\n";
 
+#[path = "export/relational.rs"]
+mod relational;
 #[path = "export/repeated.rs"]
 mod repeated;
 
@@ -454,6 +456,9 @@ fn deduplicates_shared_case_limitations_across_flows_and_cohorts() -> Result<(),
     )?;
 
     let output = export_with_tshark(&capture, &destination, &executable)?;
+    if should_retain_export_fixture(&destination, &output) {
+        retain_failed_export_fixture(temporary, &destination, &output);
+    }
 
     assert!(
         output.status.success(),
@@ -1176,6 +1181,9 @@ fn late_artifact_exports() -> Result<(), Box<dyn Error>> {
     fs::write(&capture, capture_bytes)?;
 
     let output = export_with_tshark(&capture, &destination, &executable)?;
+    if should_retain_export_fixture(&destination, &output) {
+        retain_failed_export_fixture(temporary, &destination, &output);
+    }
 
     assert_eq!(
         output.status.code(),
@@ -1250,6 +1258,9 @@ fn late_artifact_after_former_record_limit_exports_with_full_source_coverage()
     fs::write(&capture, &capture_bytes)?;
 
     let output = export_with_tshark(&capture, &destination, &executable)?;
+    if should_retain_export_fixture(&destination, &output) {
+        retain_failed_export_fixture(temporary, &destination, &output);
+    }
 
     assert_eq!(
         output.status.code(),
@@ -1495,6 +1506,9 @@ fn duplicate_flows_merge() -> Result<(), Box<dyn Error>> {
     )?;
 
     let output = export_with_tshark(&capture, &destination, &executable)?;
+    if should_retain_export_fixture(&destination, &output) {
+        retain_failed_export_fixture(temporary, &destination, &output);
+    }
 
     assert_eq!(
         output.status.code(),
@@ -2050,8 +2064,47 @@ fn run_with_private_xdg_directories(mut command: Command) -> Result<Output, std:
     fs::create_dir(&state_home)?;
     command
         .env("XDG_CACHE_HOME", cache_home)
-        .env("XDG_STATE_HOME", state_home)
-        .output()
+        .env("XDG_STATE_HOME", state_home);
+    command.output()
+}
+
+fn should_retain_export_fixture(destination: &Path, output: &Output) -> bool {
+    output.status.code() != Some(0) || !destination.is_dir()
+}
+
+fn retain_failed_export_fixture(temporary: tempfile::TempDir, destination: &Path, output: &Output) {
+    let fixture = temporary.keep();
+    eprintln!("failed export fixture retained at {}", fixture.display());
+    eprintln!("destination: {}", destination.display());
+    for report_name in ["summary.txt", "limitations.txt"] {
+        let Ok(report) = fs::read_to_string(destination.join(report_name)) else {
+            continue;
+        };
+        eprintln!("{report_name} excerpt:");
+        let summary = report_name == "summary.txt";
+        for line in report
+            .lines()
+            .filter(|line| summary || line.starts_with("- "))
+            .take(6)
+        {
+            let excerpt = line.chars().take(360).collect::<String>();
+            eprintln!("  {excerpt}");
+        }
+    }
+    eprintln!(
+        "stdout excerpt: {}",
+        String::from_utf8_lossy(&output.stdout)
+            .chars()
+            .take(800)
+            .collect::<String>()
+    );
+    eprintln!(
+        "stderr excerpt: {}",
+        String::from_utf8_lossy(&output.stderr)
+            .chars()
+            .take(800)
+            .collect::<String>()
+    );
 }
 
 fn is_report(path: &Path) -> bool {

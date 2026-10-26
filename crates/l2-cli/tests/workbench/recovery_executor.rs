@@ -939,7 +939,25 @@ fn large_source_reaches_discovery() -> Result<(), Box<dyn Error>> {
     let policy = normal_policy(&case)?;
     assert!(policy.resources.max_input_bytes_per_item >= bytes.len());
     assert_eq!(policy.resources.max_inputs_per_candidate, MAX_NODES);
-    assert_eq!(policy.resources.max_parent_links, MAX_EDGES * 11);
+    let default_plan = RecoveryPlan {
+        discover_transforms: true,
+        discover_framing: true,
+        discover_records: true,
+        ..RecoveryPlan::default()
+    };
+    let embedded_child_tasks =
+        super::policy::task_templates_for_node(&default_plan, "embedded_artifact", true);
+    let expanded_child_tasks =
+        super::policy::task_templates_for_node(&default_plan, "archive_member", true);
+    let parent_task_multiplicity = embedded_child_tasks
+        .len()
+        .max(expanded_child_tasks.len())
+        .checked_add(super::policy::transform_proposal_capacity()?)
+        .ok_or("parent task multiplicity is not representable")?;
+    assert_eq!(
+        policy.resources.max_parent_links,
+        MAX_EDGES * parent_task_multiplicity
+    );
     assert_eq!(
         policy.resources.max_lineage_work,
         (3 * MAX_NODES + 2 * policy.resources.max_parent_links) * (policy.resources.max_depth + 1)
@@ -1210,7 +1228,7 @@ fn assert_retained_zip_validation(
     case: &Case,
     outcome: &super::RecoveryExecutionOutcome,
 ) -> Result<(), Box<dyn Error>> {
-    assert_eq!(outcome.validated_artifact_count, 1);
+    assert_eq!(outcome.validated_artifact_count, 1, "{outcome:?}");
     let validation_receipt = case
         .nodes()
         .iter()
@@ -3808,6 +3826,7 @@ fn framing_edge_quota_is_recorded_as_a_typed_omission() -> Result<(), Box<dyn Er
 
     let result = executor.run_framing(
         candidate_id,
+        input_node,
         &[input_node],
         &rule,
         FramingSelectionBasis::CallerSupplied {},
@@ -3874,6 +3893,7 @@ fn framing_node_quota_is_recorded_as_a_typed_omission() -> Result<(), Box<dyn Er
 
     let result = executor.run_framing(
         candidate_id,
+        input_node,
         &[input_node],
         &rule,
         FramingSelectionBasis::CallerSupplied {},
@@ -4635,6 +4655,7 @@ fn policy() -> RecoveryExecutionPolicy {
         artifact_validation_policy: l2_workbench::artifact::ArtifactValidationPolicy::default(),
         record_schema_proposal_limits: l2_workbench::protocol::RecordSchemaProposalLimits::default(
         ),
+        relational_transform_plan: l2_workbench::protocol::RelationalTransformPlan::default(),
         transform_exploration: TransformExplorationBudget {
             proposal_budget: TransformProposalBudget {
                 max_candidates: 7,
@@ -4744,18 +4765,24 @@ fn running_executor<'a>(
         candidate_ids: Vec::new(),
         candidate_index: HashSet::new(),
         snapshot_candidates: false,
+        job: None,
         validated_artifacts: HashSet::new(),
         transform_cohorts: Vec::new(),
+        derived_discovery: super::derived_discovery::DerivedDiscovery::default(),
         transform_discoveries: HashMap::new(),
         framing_selection_bases: HashMap::new(),
         transform_proposal_receipts: HashMap::new(),
         framing_discoveries: HashMap::new(),
         record_discoveries: HashMap::new(),
+        record_discovery_context_by_report: HashMap::new(),
+        deferred_record_discovery_plan: None,
         record_schema_report_links: HashMap::new(),
         record_schema_associations_charged: 0,
         record_phase_work_charged: 0,
         pending_record_assemblies: std::collections::VecDeque::new(),
         pending_record_assembly_count: 0,
+        relational_samples: super::RelationalSampleCollections::default(),
+        relational_discoveries: HashMap::new(),
         omissions: Vec::new(),
         complete_negative_transform_searches: 0,
         cycle_skips: 0,
@@ -4885,3 +4912,6 @@ mod transform_discovery;
 
 #[path = "recovery_case_quota.rs"]
 mod case_quota;
+
+#[path = "recovery_derived_discovery.rs"]
+mod derived_discovery;
