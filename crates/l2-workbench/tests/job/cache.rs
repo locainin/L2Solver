@@ -21,7 +21,7 @@ fn cache_at(directory: &Path, max_bytes: u64) -> Result<Cache, CacheError> {
 }
 
 fn source_identity() -> Result<SourceIdentity, CacheError> {
-    SourceIdentity::from_sha256(&"a".repeat(64))
+    SourceIdentity::from_sha256("a".repeat(64))
 }
 
 fn stage_key(stage: &str) -> Result<StageKey, CacheError> {
@@ -129,14 +129,13 @@ fn stage_keys_include_algorithm_policy_and_dependencies() -> Result<(), Box<dyn 
 }
 
 #[test]
-fn stage_keys_reject_malformed_source_digests() -> Result<(), Box<dyn Error>> {
+fn stage_keys_reject_malformed_source_digests() {
     let source = SourceIdentity::Sha256("not-a-digest".to_owned());
 
     assert!(matches!(
         StageKey::new("stage", 1, "algorithm", &json!({}), &source, &[]),
         Err(CacheError::InvalidInput(_))
     ));
-    Ok(())
 }
 
 #[test]
@@ -307,8 +306,9 @@ fn version_zero_database_with_existing_tables_is_rejected_without_rewriting_it()
     database.execute("CREATE TABLE unrecognized_data (value TEXT)", [])?;
     drop(database);
 
-    let error = Cache::open_at(&cache_root, &state_root, 1024)
-        .expect_err("unversioned user tables must not be treated as a new cache");
+    let Err(error) = Cache::open_at(&cache_root, &state_root, 1024) else {
+        return Err("unversioned user tables must not be treated as a new cache".into());
+    };
     assert!(matches!(&error, CacheError::IncompatibleDatabase));
     assert!(error.to_string().contains("unrecognized or incomplete"));
     let database = rusqlite::Connection::open(&database_path)?;
@@ -585,7 +585,7 @@ fn symlinked_roots_and_replaced_roots_are_rejected() -> Result<(), Box<dyn Error
     let cache_link = temporary.path().join("cache-link");
     symlink(&actual_cache, &cache_link)?;
     assert!(matches!(
-        Cache::open_at(cache_link, actual_state.clone(), 1024),
+        Cache::open_at(cache_link, actual_state, 1024),
         Err(CacheError::UnsafePath(_))
     ));
 
