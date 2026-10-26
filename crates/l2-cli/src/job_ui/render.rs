@@ -115,12 +115,12 @@ fn append_phase_detail(line: &mut String, phase: &PhaseSnapshot) {
     }
 
     if let Some(rate_per_second) = phase.rate_per_second {
-        let _ = write!(line, " · rate {rate_per_second} items/s");
+        let _ = write!(line, " · rate {rate_per_second} {}", rate_unit(phase.phase));
     } else if phase.state == PhaseState::InProgress {
         line.push_str(" · rate unknown");
     }
 
-    if let Some(eta_seconds) = phase.eta_seconds {
+    if let Some(eta_seconds) = phase.eta_seconds.filter(|_| phase.total.is_some()) {
         let _ = write!(line, " · about {eta_seconds}s remaining");
     } else if phase.state == PhaseState::InProgress {
         line.push_str(" · ETA unknown");
@@ -131,6 +131,14 @@ fn append_phase_detail(line: &mut String, phase: &PhaseSnapshot) {
     }
     if phase.state != PhaseState::InProgress {
         let _ = write!(line, " · {}", phase_state_label(phase.state));
+    }
+}
+
+const fn rate_unit(phase: Phase) -> &'static str {
+    match phase {
+        Phase::Ingestion => "bytes/s",
+        Phase::FramingRecordDiscovery | Phase::TransformDiscovery => "work units/s",
+        _ => "items/s",
     }
 }
 

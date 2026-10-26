@@ -54,17 +54,106 @@ fn discovery_with_unknown_work_has_no_percentage_or_eta() -> TestResult {
 }
 
 #[test]
-fn known_work_and_measured_pace_produce_an_eta() -> TestResult {
+fn known_work_produces_an_eta_only_after_a_measured_interval() -> TestResult {
     let job = Job::new("bounded work");
     job.start(Phase::Ingestion, Some(10))?;
     job.advance(Phase::Ingestion, 1)?;
-    thread::sleep(Duration::from_millis(10));
+
+    let early_snapshot = job.snapshot()?;
+    let early_ingestion = phase(&early_snapshot, Phase::Ingestion)?;
+    assert_eq!(early_ingestion.eta_seconds, None);
+
+    let mut checkpoint = early_snapshot;
+    let checkpoint_ingestion = checkpoint
+        .phases
+        .iter_mut()
+        .find(|phase| phase.phase == Phase::Ingestion)
+        .ok_or_else(|| io::Error::other("ingestion phase should be in the checkpoint"))?;
+    checkpoint_ingestion.elapsed_ms = 1_000;
+
+    let resumed = Job::new("bounded work");
+    resumed.restore(checkpoint)?;
+    resumed.start(Phase::Ingestion, Some(10))?;
+    let measured_snapshot = resumed.snapshot()?;
+    let measured_ingestion = phase(&measured_snapshot, Phase::Ingestion)?;
+
+    assert!(measured_ingestion.rate_per_second.is_some());
+    assert_eq!(measured_ingestion.eta_seconds, Some(9));
+    Ok(())
+}
+
+#[test]
+fn record_work_updates_the_global_counter_and_active_phase_together() -> TestResult {
+    let job = Job::new("counted candidate search");
+    job.start(Phase::TransformDiscovery, None)?;
+    job.start(Phase::Expansion, None)?;
+    job.record_work(Phase::TransformDiscovery, Counter::CandidatesExamined, 7)?;
 
     let snapshot = job.snapshot()?;
-    let ingestion = phase(&snapshot, Phase::Ingestion)?;
+    let discovery = phase(&snapshot, Phase::TransformDiscovery)?;
+    assert_eq!(discovery.completed, 7);
+    assert_eq!(snapshot.current_phase, Some(Phase::TransformDiscovery));
+    assert_eq!(
+        snapshot.counters.get(&Counter::CandidatesExamined),
+        Some(&7)
+    );
+    Ok(())
+}
 
-    assert!(ingestion.rate_per_second.is_some());
-    assert!(ingestion.eta_seconds.is_some());
+#[test]
+fn record_work_counts_standalone_work_without_starting_an_inactive_phase() -> TestResult {
+    let job = Job::new("inactive candidate search");
+
+    job.record_work(Phase::TransformDiscovery, Counter::CandidatesExamined, 3)?;
+
+    let snapshot = job.snapshot()?;
+    let discovery = phase(&snapshot, Phase::TransformDiscovery)?;
+    assert_eq!(discovery.state, PhaseState::Pending);
+    assert_eq!(discovery.completed, 0);
+    assert_eq!(snapshot.current_phase, None);
+    assert_eq!(
+        snapshot.counters.get(&Counter::CandidatesExamined),
+        Some(&3)
+    );
+    Ok(())
+}
+
+#[test]
+fn record_work_overflow_does_not_partially_update_either_measurement() -> TestResult {
+    let counter_overflow_job = Job::new("candidate counter overflow");
+    counter_overflow_job.start(Phase::TransformDiscovery, None)?;
+    counter_overflow_job.advance(Phase::TransformDiscovery, 5)?;
+    counter_overflow_job.increment(Counter::CandidatesExamined, u64::MAX)?;
+    assert_eq!(
+        counter_overflow_job.record_work(Phase::TransformDiscovery, Counter::CandidatesExamined, 1),
+        Err(JobError::CounterOverflow(Counter::CandidatesExamined))
+    );
+    let counter_overflow = counter_overflow_job.snapshot()?;
+    assert_eq!(
+        phase(&counter_overflow, Phase::TransformDiscovery)?.completed,
+        5
+    );
+    assert_eq!(
+        counter_overflow.counters.get(&Counter::CandidatesExamined),
+        Some(&u64::MAX)
+    );
+
+    let phase_overflow_job = Job::new("phase count overflow");
+    phase_overflow_job.start(Phase::TransformDiscovery, None)?;
+    phase_overflow_job.advance(Phase::TransformDiscovery, u64::MAX)?;
+    assert_eq!(
+        phase_overflow_job.record_work(Phase::TransformDiscovery, Counter::CandidatesExamined, 1),
+        Err(JobError::PhaseOverflow(Phase::TransformDiscovery))
+    );
+    let phase_overflow = phase_overflow_job.snapshot()?;
+    assert_eq!(
+        phase(&phase_overflow, Phase::TransformDiscovery)?.completed,
+        u64::MAX
+    );
+    assert_eq!(
+        phase_overflow.counters.get(&Counter::CandidatesExamined),
+        Some(&0)
+    );
     Ok(())
 }
 

@@ -6,6 +6,9 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
 
+// Short samples swing too much to support a useful ETA
+const MINIMUM_ETA_SAMPLE_MS: u64 = 1_000;
+
 /// One named stage in the recovery pipeline
 #[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
 #[non_exhaustive]
@@ -194,7 +197,7 @@ pub struct PhaseSnapshot {
     pub progress_percent: Option<u8>,
     /// Measured work rate in units per second
     pub rate_per_second: Option<u64>,
-    /// Estimated remaining time when a known total and measured rate exist
+    /// Estimated remaining time for bounded work after one second of measurement
     pub eta_seconds: Option<u64>,
 }
 
@@ -248,8 +251,8 @@ impl PhaseSnapshot {
         let total = self.total?;
         let remaining = total.saturating_sub(self.completed);
 
-        // No completed work or elapsed time means there is no measured pace to extrapolate
-        if remaining == 0 || self.completed == 0 || self.elapsed_ms == 0 {
+        // An ETA needs remaining work and a full second of measured progress
+        if remaining == 0 || self.completed == 0 || self.elapsed_ms < MINIMUM_ETA_SAMPLE_MS {
             return None;
         }
 
@@ -430,10 +433,7 @@ impl Job {
             return Err(JobError::PhaseNotInProgress(phase));
         }
 
-        phase_snapshot.completed = phase_snapshot
-            .completed
-            .checked_add(amount)
-            .ok_or(JobError::PhaseOverflow(phase))?;
+        phase_snapshot.completed = next_phase_value(phase_snapshot.completed, phase, amount)?;
         phase_snapshot.refresh_measurements();
         drop(state);
         Ok(())
@@ -491,10 +491,52 @@ impl Job {
     /// cannot be recorded
     pub fn increment(&self, counter: Counter, amount: u64) -> Result<(), JobError> {
         let mut state = self.lock_state()?;
-        let value = state.snapshot.counters.entry(counter).or_insert(0);
-        *value = value
-            .checked_add(amount)
-            .ok_or(JobError::CounterOverflow(counter))?;
+        let current = state
+            .snapshot
+            .counters
+            .get(&counter)
+            .copied()
+            .unwrap_or_default();
+        let next = next_counter_value(current, counter, amount)?;
+        state.snapshot.counters.insert(counter, next);
+        drop(state);
+        Ok(())
+    }
+
+    /// Records a typed cumulative counter and active phase work as one update
+    ///
+    /// The global counter always advances, while phase work changes only if the phase is active
+    /// Standalone library work does not start or finish a phase
+    ///
+    /// # Errors
+    /// Returns [`JobError::LockPoisoned`], [`JobError::CounterOverflow`], or
+    /// [`JobError::PhaseOverflow`] when the update cannot be recorded without partial changes
+    pub fn record_work(&self, phase: Phase, counter: Counter, amount: u64) -> Result<(), JobError> {
+        let mut state = self.lock_state()?;
+        let JobSnapshot {
+            counters,
+            current_phase,
+            phases,
+            ..
+        } = &mut state.snapshot;
+        let phase_snapshot = find_phase_mut(phases, phase);
+        let next_completed = phase_snapshot
+            .as_deref()
+            .filter(|snapshot| snapshot.state == PhaseState::InProgress)
+            .map(|snapshot| next_phase_value(snapshot.completed, phase, amount))
+            .transpose()?;
+        let current_counter = counters.get(&counter).copied().unwrap_or_default();
+        let next_counter = next_counter_value(current_counter, counter, amount)?;
+
+        // Validate both totals before mutating so overflow cannot split the measurements
+        counters.insert(counter, next_counter);
+        if let (Some(phase_snapshot), Some(next_completed)) = (phase_snapshot, next_completed) {
+            phase_snapshot.completed = next_completed;
+            phase_snapshot.refresh_measurements();
+
+            // Overlapping work can make this the most recently visible phase
+            *current_phase = Some(phase);
+        }
         drop(state);
         Ok(())
     }
@@ -641,6 +683,18 @@ impl Job {
 
 fn find_phase_mut(phases: &mut [PhaseSnapshot], phase: Phase) -> Option<&mut PhaseSnapshot> {
     phases.iter_mut().find(|snapshot| snapshot.phase == phase)
+}
+
+fn next_phase_value(current: u64, phase: Phase, amount: u64) -> Result<u64, JobError> {
+    current
+        .checked_add(amount)
+        .ok_or(JobError::PhaseOverflow(phase))
+}
+
+fn next_counter_value(current: u64, counter: Counter, amount: u64) -> Result<u64, JobError> {
+    current
+        .checked_add(amount)
+        .ok_or(JobError::CounterOverflow(counter))
 }
 
 fn duration_millis(duration: Duration) -> u64 {

@@ -82,8 +82,45 @@ fn normal_human_status_shows_candidates_rate_and_unknown_eta() -> Result<(), Box
     let line = render_human_line(&snapshot, RenderVerbosity::Normal);
 
     assert!(line.contains("candidates 12 examined, 3 rejected"));
-    assert!(line.contains("rate ") && line.contains("items/s"));
+    assert!(line.contains("rate ") && line.contains("work units/s"));
     assert!(line.contains("ETA unknown"));
+    Ok(())
+}
+
+#[test]
+fn ingestion_status_uses_byte_rate_and_waits_for_a_measured_eta() -> Result<(), Box<dyn Error>> {
+    let job = Job::new("bounded ingestion");
+    job.start(Phase::Ingestion, Some(10))?;
+    job.advance(Phase::Ingestion, 1)?;
+    let mut snapshot = job.snapshot()?;
+    {
+        let ingestion = snapshot
+            .phases
+            .iter_mut()
+            .find(|phase| phase.phase == Phase::Ingestion)
+            .ok_or_else(|| std::io::Error::other("ingestion phase should be in the snapshot"))?;
+        ingestion.elapsed_ms = 999;
+        ingestion.rate_per_second = Some(4);
+    }
+
+    let early_line = render_human_line(&snapshot, RenderVerbosity::Normal);
+    assert!(early_line.contains("rate 4 bytes/s"));
+    assert!(early_line.contains("ETA unknown"));
+
+    snapshot
+        .phases
+        .iter_mut()
+        .find(|phase| phase.phase == Phase::Ingestion)
+        .ok_or_else(|| std::io::Error::other("ingestion phase should remain in the snapshot"))?
+        .elapsed_ms = 1_000;
+    snapshot
+        .phases
+        .iter_mut()
+        .find(|phase| phase.phase == Phase::Ingestion)
+        .ok_or_else(|| std::io::Error::other("ingestion phase should remain in the snapshot"))?
+        .eta_seconds = Some(3);
+    let measured_line = render_human_line(&snapshot, RenderVerbosity::Normal);
+    assert!(measured_line.contains("about 3s remaining"));
     Ok(())
 }
 
