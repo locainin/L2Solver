@@ -46,15 +46,13 @@ fn standalone_zip_uses_the_existing_zip_parser_and_retains_its_member() -> Resul
         zip_support::build_zip(&[zip_support::FixtureEntry::stored(b"member.bin", content)])?;
     let structural = inspect_zip_with_limits(&archive, ZipArtifactLimits::default())?;
     let report = analyze_artifacts(&archive, ArtifactAnalysisOptions::default())?;
+    let source = report
+        .artifacts
+        .first()
+        .ok_or("source archive artifact is missing")?;
 
-    assert_eq!(
-        report.artifacts[0].validation.format,
-        Some(AnalysisFormat::Zip)
-    );
-    assert_eq!(
-        report.artifacts[0].validation.structure_count,
-        structural.entry_count
-    );
+    assert_eq!(source.validation.format, Some(AnalysisFormat::Zip));
+    assert_eq!(source.validation.structure_count, structural.entry_count);
     assert!(report.artifacts.iter().any(|artifact| {
         artifact.bytes == content
             && artifact.origins.iter().any(|origin| {
@@ -82,7 +80,10 @@ fn encoded_input_can_yield_a_valid_object_inside_unrelated_bytes() -> Result<(),
         .find(|artifact| artifact.bytes == png)
         .ok_or("interior PNG was not carved")?;
     assert!(
-        report.artifacts[transformed]
+        report
+            .artifacts
+            .get(transformed)
+            .ok_or("decoded artifact disappeared")?
             .origins
             .iter()
             .any(|origin| matches!(origin, ArtifactOrigin::Transformation { .. }))
@@ -95,17 +96,116 @@ fn encoded_input_can_yield_a_valid_object_inside_unrelated_bytes() -> Result<(),
 }
 
 #[test]
+fn encoded_region_between_binary_headers_and_trailers_keeps_exact_transform_range()
+-> Result<(), Box<dyn Error>> {
+    let png = structural_png(&[])?;
+    let encoded = base64::Engine::encode(&base64::engine::general_purpose::STANDARD, &png);
+    let mut input = b"\x01\x02|".to_vec();
+    let payload_start = input.len();
+    input.extend_from_slice(encoded.as_bytes());
+    let payload_length = encoded.len();
+    input.extend_from_slice(b"|\xfe\x03");
+    let original = input.clone();
+
+    let report = analyze_artifacts(&input, ArtifactAnalysisOptions::default())?;
+    let transformed = report
+        .artifacts
+        .iter()
+        .find(|artifact| artifact.bytes == png)
+        .ok_or("encoded payload was not derived into the PNG")?;
+    let source_artifact = report
+        .artifacts
+        .first()
+        .ok_or("source artifact is missing")?;
+    let source_regions = report
+        .region_transform_reports
+        .iter()
+        .find(|entry| entry.artifact_index == 0)
+        .ok_or("source region report is missing")?;
+    let payload_region = source_regions
+        .report
+        .regions
+        .iter()
+        .find(|region| {
+            region.range.start == payload_start
+                && region.range.end == payload_start + payload_length
+        })
+        .ok_or("payload region did not retain its exact assessment range")?;
+
+    assert_eq!(source_artifact.bytes, original);
+    assert!(source_regions.report.coverage.complete);
+    assert_eq!(payload_region.proposal_report.assessments.len(), 7);
+    assert!(transformed.origins.iter().any(|origin| matches!(
+        origin,
+        ArtifactOrigin::Transformation {
+            input_range,
+            operation: l2_workbench::derivation::Operation::Base64Decode { .. },
+            cue_origins,
+            ..
+        } if input_range.offset == payload_start
+            && input_range.length == payload_length
+            && cue_origins.iter().any(|origin| matches!(
+                origin,
+                l2_workbench::recovery::regions::RegionCueOrigin::EncodingRun
+            ))
+    )));
+    Ok(())
+}
+
+#[test]
+fn invalid_region_syntax_remains_a_complete_negative_for_its_exact_range()
+-> Result<(), Box<dyn Error>> {
+    let input = b"\x01\x02|SGVsbG8=bad|\xfe";
+    let start = 3;
+    let end = start + b"SGVsbG8=bad".len();
+    let report = analyze_artifacts(input, ArtifactAnalysisOptions::default())?;
+    let source_regions = report
+        .region_transform_reports
+        .iter()
+        .find(|entry| entry.artifact_index == 0)
+        .ok_or("source region report is missing")?;
+    let region = source_regions
+        .report
+        .regions
+        .iter()
+        .find(|region| region.range.start == start && region.range.end == end)
+        .ok_or("invalid encoded text range is missing")?;
+
+    assert!(source_regions.report.coverage.complete);
+    assert!(region.proposal_report.proposals.is_empty());
+    assert!(
+        region
+            .proposal_report
+            .assessments
+            .iter()
+            .filter(|assessment| {
+                matches!(
+                    assessment.operation,
+                    l2_workbench::derivation::Operation::Base64Decode { .. }
+                )
+            })
+            .all(|assessment| matches!(
+                assessment.result,
+                l2_workbench::recovery::proposals::TransformAssessmentResult::Ineligible { .. }
+            ))
+    );
+    assert_eq!(report.artifacts.len(), 1);
+    Ok(())
+}
+
+#[test]
 fn magic_bytes_alone_do_not_promote_an_invalid_object() -> Result<(), Box<dyn Error>> {
     let invalid = b"prefix\x89PNG\r\n\x1a\ntruncated";
     let report = analyze_artifacts(invalid, ArtifactAnalysisOptions::default())?;
+    let source = report
+        .artifacts
+        .first()
+        .ok_or("source artifact is missing")?;
 
     assert_eq!(report.artifacts.len(), 1);
-    assert_ne!(
-        report.artifacts[0].validation.state,
-        ArtifactValidationState::Validated
-    );
+    assert_ne!(source.validation.state, ArtifactValidationState::Validated);
     assert!(
-        report.artifacts[0]
+        source
             .origins
             .iter()
             .any(|origin| matches!(origin, ArtifactOrigin::Source))
@@ -165,10 +265,14 @@ fn analysis_metadata_round_trips_without_embedding_artifact_bytes() -> Result<()
 
     let encoded = serde_json::to_vec(&report)?;
     let metadata: l2_workbench::artifact::ArtifactAnalysis = serde_json::from_slice(&encoded)?;
+    let first_metadata_artifact = metadata
+        .artifacts
+        .first()
+        .ok_or("first metadata artifact is missing")?;
 
     assert_eq!(metadata.source_sha256, report.source_sha256);
     assert_eq!(metadata.artifacts.len(), report.artifacts.len());
-    assert!(metadata.artifacts[0].bytes.is_empty());
+    assert!(first_metadata_artifact.bytes.is_empty());
     for (cached, original) in metadata.artifacts.iter().zip(&report.artifacts) {
         assert_eq!(cached.index, original.index);
         assert_eq!(cached.sha256, original.sha256);
@@ -269,14 +373,20 @@ fn salvage_mode_reports_unsupported_repair_without_changing_source() -> Result<(
         },
     )?;
 
-    assert_eq!(report.artifacts.len(), 1);
-    assert_eq!(report.artifacts[0].bytes, input);
+    assert_eq!(
+        report
+            .artifacts
+            .first()
+            .ok_or("source artifact is missing")?
+            .bytes,
+        input
+    );
     assert_eq!(report.status, AnalysisStatus::Partial);
     assert!(
         report
             .omissions
             .iter()
-            .any(|omission| omission.is_salvage_unsupported())
+            .any(l2_workbench::artifact::AnalysisOmission::is_salvage_unsupported)
     );
     Ok(())
 }
@@ -295,7 +405,14 @@ fn salvage_mode_keeps_a_complete_object_complete_when_no_repair_is_needed()
 
     assert_eq!(report.status, AnalysisStatus::Complete);
     assert!(report.omissions.is_empty());
-    assert_eq!(report.artifacts[0].bytes, png);
+    assert_eq!(
+        report
+            .artifacts
+            .first()
+            .ok_or("PNG artifact is missing")?
+            .bytes,
+        png
+    );
     Ok(())
 }
 
@@ -321,7 +438,7 @@ fn input_limit_preserves_original_hash_and_length() -> Result<(), Box<dyn Error>
         report
             .omissions
             .iter()
-            .any(|omission| omission.is_input_limit())
+            .any(l2_workbench::artifact::AnalysisOmission::is_input_limit)
     );
     Ok(())
 }

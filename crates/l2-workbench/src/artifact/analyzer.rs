@@ -9,8 +9,12 @@ use super::{
 use crate::{
     derivation::{self, DerivationLimits, DerivationStatus, Operation},
     recovery::proposals::{
-        TransformEvidence, TransformProposalBudget, propose_transforms,
+        TransformEvidence, TransformProposal, TransformProposalBudget, propose_transforms,
         transform_proposal_scan_work_bound,
+    },
+    recovery::regions::{
+        RegionCueOrigin, TransformRegionLimits, TransformRegionReport, propose_region_transforms,
+        transform_region_scan_work_bound,
     },
     sha256,
 };
@@ -203,7 +207,20 @@ pub enum ArtifactOrigin {
         operation: Operation,
         /// Syntax or header evidence supporting the proposal
         evidence: TransformEvidence,
+        /// Exact observations that selected a subrange, empty for a whole-input proposal
+        #[serde(default)]
+        cue_origins: Vec<RegionCueOrigin>,
     },
+}
+
+/// Region-specific transform results retained for one analyzed artifact
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ArtifactRegionTransformReport {
+    /// Index of the original artifact whose bytes were scanned
+    pub artifact_index: usize,
+    /// Exact region proposals and their independent negative scopes
+    pub report: TransformRegionReport,
 }
 
 /// One unique byte object and every independent origin that produced it
@@ -336,6 +353,9 @@ pub struct ArtifactAnalysis {
     pub status: AnalysisStatus,
     /// Work and output limits that left analysis incomplete
     pub omissions: Vec<AnalysisOmission>,
+    /// Syntax assessments scoped to each selected byte region
+    #[serde(default)]
+    pub region_transform_reports: Vec<ArtifactRegionTransformReport>,
     /// Accounted byte work consumed by this analysis
     pub work_bytes: usize,
 }
@@ -432,6 +452,14 @@ struct ArtifactContext<'a> {
     depth: usize,
     input_bytes: &'a [u8],
     limits: AnalyzerLimits,
+}
+
+struct TransformExecutionCandidate {
+    recipe: crate::derivation::Recipe,
+    evidence: TransformEvidence,
+    operation: Operation,
+    input_range: FileRange,
+    cue_origins: Vec<RegionCueOrigin>,
 }
 
 fn inspect_artifact(
@@ -670,15 +698,105 @@ fn derive_candidates(
             max_reports: 7,
         },
     );
-    execute_transform_proposals(context, budget, report, found, proposals.proposals)
+    let complete_range = complete_range(context.input_bytes.len());
+    let whole_input_candidates = proposals
+        .proposals
+        .into_iter()
+        .map(|proposal| execution_candidate(proposal, complete_range, Vec::new()))
+        .collect::<Result<Vec<_>, _>>()?;
+    execute_transform_candidates(context, budget, report, found, whole_input_candidates)?;
+    derive_region_candidates(context, budget, report, found)
 }
 
-fn execute_transform_proposals(
+fn derive_region_candidates(
     context: &ArtifactContext<'_>,
     budget: &mut AnalysisBudget,
     report: &mut ArtifactAnalysis,
     found: &mut Vec<PendingArtifact>,
-    proposals: Vec<crate::recovery::proposals::TransformProposal>,
+) -> Result<(), AnalyzerError> {
+    let input_length = context.input_bytes.len();
+    let region_limits = TransformRegionLimits::for_input(input_length);
+    let Some(proposal_charge) = transform_region_scan_work_bound(region_limits) else {
+        report.omissions.push(AnalysisOmission::WorkLimit {
+            artifact_index: context.index,
+            stage: AnalysisStage::TransformProposal,
+            requested: usize::MAX,
+            remaining: budget.work.remaining,
+        });
+        return Ok(());
+    };
+    if !budget.work.charge(proposal_charge) {
+        report.omissions.push(AnalysisOmission::WorkLimit {
+            artifact_index: context.index,
+            stage: AnalysisStage::TransformProposal,
+            requested: proposal_charge,
+            remaining: budget.work.remaining,
+        });
+        return Ok(());
+    }
+
+    let region_report = propose_region_transforms(
+        context.input_bytes,
+        &[],
+        region_limits,
+        TransformProposalBudget {
+            max_candidates: 7,
+            max_reports: 7,
+        },
+    );
+    let mut candidates = Vec::new();
+    for region in &region_report.regions {
+        let input_range = FileRange {
+            offset: region.range.start,
+            length: region.range.end - region.range.start,
+        };
+        for proposal in region.proposal_report.proposals.iter().cloned() {
+            candidates.push(execution_candidate(
+                proposal,
+                input_range,
+                region.cue_origins.clone(),
+            )?);
+        }
+    }
+    report
+        .region_transform_reports
+        .try_reserve(1)
+        .map_err(|_| AnalyzerError::AllocationFailure)?;
+    report
+        .region_transform_reports
+        .push(ArtifactRegionTransformReport {
+            artifact_index: context.index,
+            report: region_report,
+        });
+    execute_transform_candidates(context, budget, report, found, candidates)
+}
+
+fn execution_candidate(
+    proposal: TransformProposal,
+    input_range: FileRange,
+    cue_origins: Vec<RegionCueOrigin>,
+) -> Result<TransformExecutionCandidate, AnalyzerError> {
+    let operation = proposal
+        .recipe
+        .steps
+        .last()
+        .cloned()
+        .ok_or(AnalyzerError::AllocationFailure)?;
+    Ok(TransformExecutionCandidate {
+        recipe: proposal.recipe,
+        evidence: proposal.evidence,
+        operation,
+        input_range,
+        cue_origins,
+    })
+}
+
+fn execute_transform_candidates(
+    context: &ArtifactContext<'_>,
+    budget: &mut AnalysisBudget,
+    report: &mut ArtifactAnalysis,
+    found: &mut Vec<PendingArtifact>,
+    proposals: Vec<TransformExecutionCandidate>,
 ) -> Result<(), AnalyzerError> {
     for proposal in proposals {
         if budget.work.remaining == 0 {
@@ -690,12 +808,6 @@ fn execute_transform_proposals(
             });
             break;
         }
-        let operation = proposal
-            .recipe
-            .steps
-            .first()
-            .cloned()
-            .ok_or(AnalyzerError::AllocationFailure)?;
         let derivation_limits = derivation_limits(context.limits, budget.work.remaining);
         let result =
             derivation::run_with_limits(context.input_bytes, &proposal.recipe, derivation_limits);
@@ -710,18 +822,11 @@ fn execute_transform_proposals(
                     });
                     continue;
                 }
-                record_transform_result(
-                    context,
-                    proposal.evidence,
-                    operation,
-                    derivation,
-                    report,
-                    found,
-                )?;
+                record_transform_result(context, proposal, derivation, report, found)?;
             }
             Err(error) => report.omissions.push(AnalysisOmission::TransformFailed {
                 artifact_index: context.index,
-                operation,
+                operation: proposal.operation,
                 message: error.to_string(),
             }),
         }
@@ -731,8 +836,7 @@ fn execute_transform_proposals(
 
 fn record_transform_result(
     context: &ArtifactContext<'_>,
-    evidence: TransformEvidence,
-    operation: Operation,
+    proposal: TransformExecutionCandidate,
     result: derivation::DerivationReport,
     report: &mut ArtifactAnalysis,
     found: &mut Vec<PendingArtifact>,
@@ -740,7 +844,7 @@ fn record_transform_result(
     if result.status != DerivationStatus::Completed {
         report.omissions.push(AnalysisOmission::TransformFailed {
             artifact_index: context.index,
-            operation,
+            operation: proposal.operation,
             message: format!("canonical operation stopped at step {:?}", result.status),
         });
     } else if !result.output.is_empty() && result.output != context.input_bytes {
@@ -750,9 +854,10 @@ fn record_transform_result(
                 bytes: result.output,
                 origin: ArtifactOrigin::Transformation {
                     parent_index: context.index,
-                    input_range: complete_range(context.input_bytes.len()),
-                    operation,
-                    evidence,
+                    input_range: proposal.input_range,
+                    operation: proposal.operation,
+                    evidence: proposal.evidence,
+                    cue_origins: proposal.cue_origins,
                 },
                 depth: context.depth.saturating_add(1),
             },
@@ -803,9 +908,11 @@ pub fn analyze_artifacts_with_source_sha256(
         return Ok(report);
     }
     report.work_bytes = analyze_queue(bytes, options, &mut report)?;
-    if options.recovery == RecoveryMode::Salvage
-        && analysis_status(&report) == AnalysisStatus::Unsupported
-    {
+    let has_validated_object = report
+        .artifacts
+        .iter()
+        .any(|artifact| artifact.validation.state == ArtifactValidationState::Validated);
+    if options.recovery == RecoveryMode::Salvage && !has_validated_object {
         // No current partial-repair parser can safely rebuild unsupported bytes
         report.omissions.push(AnalysisOmission::SalvageUnsupported);
     }
@@ -820,6 +927,7 @@ fn empty_analysis_report(source_length: usize, source_sha256: &str) -> ArtifactA
         artifacts: Vec::new(),
         status: AnalysisStatus::Unsupported,
         omissions: Vec::new(),
+        region_transform_reports: Vec::new(),
         work_bytes: 0,
     }
 }
@@ -963,7 +1071,14 @@ fn restore_inspected_artifact(
 }
 
 fn analysis_status(report: &ArtifactAnalysis) -> AnalysisStatus {
-    if !report.omissions.is_empty() {
+    let incomplete_regions = report.region_transform_reports.iter().any(|entry| {
+        !entry.report.coverage.complete
+            || entry.report.regions.iter().any(|region| {
+                region.proposal_report.omissions
+                    != crate::recovery::proposals::TransformProposalOmissions::default()
+            })
+    });
+    if !report.omissions.is_empty() || incomplete_regions {
         AnalysisStatus::Partial
     } else if report.artifacts.iter().any(|artifact| {
         artifact.validation.state == ArtifactValidationState::Validated

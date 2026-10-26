@@ -7,6 +7,7 @@ mod model;
 mod resources;
 
 pub mod proposals;
+pub mod regions;
 
 pub use evidence_quota::classify_case_evidence_quota;
 pub use frontier::{RecoveryCoordinator, RecoveryError};

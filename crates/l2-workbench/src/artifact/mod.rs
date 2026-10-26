@@ -20,8 +20,8 @@ pub mod zip;
 pub use analyzer::{
     AnalysisBoundary, AnalysisFormat, AnalysisOmission, AnalysisStage, AnalysisStatus,
     AnalyzedArtifact, AnalyzerError, AnalyzerLimits, ArtifactAnalysis, ArtifactAnalysisOptions,
-    ArtifactOrigin, ArtifactValidationState, RecoveryMode, ValidationSummary, analyze_artifacts,
-    analyze_artifacts_with_source_sha256,
+    ArtifactOrigin, ArtifactRegionTransformReport, ArtifactValidationState, RecoveryMode,
+    ValidationSummary, analyze_artifacts, analyze_artifacts_with_source_sha256,
 };
 pub use code_links::{
     CodeLink, CodeLinkError, CodeLinkLimits, CodeLinkReport, CodeLinkSourceChecks,

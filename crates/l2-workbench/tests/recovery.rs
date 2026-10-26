@@ -4,3 +4,5 @@ mod frontier;
 mod proposal_associations;
 #[path = "recovery/proposals.rs"]
 mod proposals;
+#[path = "recovery/regions.rs"]
+mod regions;
