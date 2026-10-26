@@ -30,6 +30,70 @@ fn identical_extraction_reuses_the_published_result() -> Result<(), Box<dyn Erro
 }
 
 #[test]
+fn warm_cached_extraction_matches_cold_and_uncached_outputs() -> Result<(), Box<dyn Error>> {
+    let temporary = tempfile::tempdir()?;
+    let root = temporary.path();
+    let capture = root.join("capture.pcap");
+    let cold_destination = root.join("cold");
+    let warm_destination = root.join("warm");
+    let uncached_destination = root.join("uncached");
+    fs::write(&capture, capture_with_http_body(BODY)?)?;
+
+    let cold = extraction_command(root, &capture, &cold_destination)
+        .args(["--progress", "json"])
+        .output()?;
+    let warm = extraction_command(root, &capture, &warm_destination)
+        .args(["--progress", "json"])
+        .output()?;
+    let uncached = extraction_command(root, &capture, &uncached_destination)
+        .args(["--no-cache", "--progress", "json"])
+        .output()?;
+
+    for result in [&cold, &warm, &uncached] {
+        assert_eq!(
+            result.status.code(),
+            Some(0),
+            "extract failed: {}\n{}",
+            String::from_utf8_lossy(&result.stdout),
+            String::from_utf8_lossy(&result.stderr)
+        );
+    }
+    assert_eq!(warm.status.code(), cold.status.code());
+    assert_eq!(uncached.status.code(), cold.status.code());
+
+    assert_export_outputs_match(&cold_destination, &warm_destination)?;
+    assert_export_outputs_match(&cold_destination, &uncached_destination)?;
+
+    let cold_counters = result_counters(&cold_destination)?;
+    let warm_counters = result_counters(&warm_destination)?;
+    let uncached_counters = result_counters(&uncached_destination)?;
+    assert_eq!(cold_counters.ingestion_state, "completed");
+    assert_eq!(warm_counters.ingestion_state, "skipped");
+    assert_eq!(uncached_counters.ingestion_state, "completed");
+    assert!(
+        cold_counters.cache_misses > 0,
+        "cold run did not write cache work"
+    );
+    assert!(
+        cold_counters.candidates_examined > 0,
+        "cold run did no recovery work"
+    );
+    assert!(warm_counters.cache_hits > cold_counters.cache_hits);
+    assert!(
+        warm_counters.candidates_examined < cold_counters.candidates_examined,
+        "warm run did not skip completed recovery work"
+    );
+    assert_eq!(uncached_counters.cache_hits, 0);
+    assert_eq!(uncached_counters.cache_misses, 0);
+    assert_eq!(
+        uncached_counters.candidates_examined, cold_counters.candidates_examined,
+        "no-cache run should recompute the same recovery candidates"
+    );
+    assert_eq!(fs::read(&capture)?, capture_with_http_body(BODY)?);
+    Ok(())
+}
+
+#[test]
 fn unrelated_destination_is_rejected_before_reading_a_capture() -> Result<(), Box<dyn Error>> {
     let temporary = tempfile::tempdir()?;
     let root = temporary.path();
@@ -104,4 +168,161 @@ fn deeper_profile_reuses_the_index_and_keeps_progress_as_json() -> Result<(), Bo
     }
     assert!(index_reused, "deep run did not report a reused index");
     Ok(())
+}
+
+fn assert_export_outputs_match(expected: &Path, actual: &Path) -> Result<(), Box<dyn Error>> {
+    assert_eq!(artifact_contents(expected)?, artifact_contents(actual)?);
+    // Decompressed JSONL bytes keep the complete evidence records byte-identical
+    assert_eq!(evidence_jsonl(expected)?, evidence_jsonl(actual)?);
+    assert_eq!(semantic_manifest(expected)?, semantic_manifest(actual)?);
+    assert_eq!(
+        fs::read(expected.join("summary.txt"))?,
+        fs::read(actual.join("summary.txt"))?
+    );
+    assert_eq!(
+        optional_file(expected.join("limitations.txt"))?,
+        optional_file(actual.join("limitations.txt"))?
+    );
+    Ok(())
+}
+
+type ArtifactContents = Vec<(std::ffi::OsString, Vec<u8>)>;
+
+fn artifact_contents(directory: &Path) -> Result<ArtifactContents, Box<dyn Error>> {
+    let mut paths = artifact_paths(directory)?;
+    paths.sort_by(|left, right| left.file_name().cmp(&right.file_name()));
+    paths
+        .into_iter()
+        .map(|path| {
+            let name = path
+                .file_name()
+                .ok_or("artifact path has no filename")?
+                .to_os_string();
+            Ok((name, fs::read(path)?))
+        })
+        .collect()
+}
+
+fn evidence_jsonl(directory: &Path) -> Result<Vec<u8>, Box<dyn Error>> {
+    let file = fs::File::open(directory.join("evidence.jsonl.gz"))?;
+    let mut decoder = flate2::read::MultiGzDecoder::new(file);
+    let mut bytes = Vec::new();
+    decoder.read_to_end(&mut bytes)?;
+    Ok(bytes)
+}
+
+fn optional_file(path: PathBuf) -> Result<Option<Vec<u8>>, Box<dyn Error>> {
+    match fs::read(path) {
+        Ok(bytes) => Ok(Some(bytes)),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error.into()),
+    }
+}
+
+fn semantic_manifest(directory: &Path) -> Result<serde_json::Value, Box<dyn Error>> {
+    let mut manifest: serde_json::Value =
+        serde_json::from_slice(&fs::read(directory.join("manifest.json"))?)?;
+    let receipt = manifest
+        .as_object_mut()
+        .and_then(|fields| fields.get_mut("l2solver_result"))
+        .and_then(serde_json::Value::as_object_mut)
+        .ok_or("result receipt is missing")?;
+    normalize_job_snapshot(
+        receipt
+            .get_mut("job")
+            .ok_or("result receipt job snapshot is missing")?,
+    )?;
+    normalize_output_stamps(
+        receipt
+            .get_mut("output_files")
+            .ok_or("result receipt output stamps are missing")?,
+    )?;
+    Ok(manifest)
+}
+
+fn normalize_job_snapshot(snapshot: &mut serde_json::Value) -> Result<(), Box<dyn Error>> {
+    let fields = snapshot
+        .as_object_mut()
+        .ok_or("result job snapshot is invalid")?;
+    // Work counters and timings change when a cached stage skips computation
+    fields.remove("created_at_unix_ms");
+    fields.remove("elapsed_ms");
+    fields.remove("counters");
+    let phases = fields
+        .get_mut("phases")
+        .and_then(serde_json::Value::as_array_mut)
+        .ok_or("result job phases are missing")?;
+    for phase in phases {
+        let fields = phase.as_object_mut().ok_or("result job phase is invalid")?;
+        if fields.get("phase").and_then(serde_json::Value::as_str) == Some("ingestion") {
+            fields.insert(
+                "state".to_owned(),
+                serde_json::Value::String("cache_dependent".to_owned()),
+            );
+        }
+        fields.remove("completed");
+        fields.remove("total");
+        fields.remove("elapsed_ms");
+        fields.remove("progress_percent");
+        fields.remove("rate_per_second");
+        fields.remove("eta_seconds");
+        fields.remove("message");
+    }
+    Ok(())
+}
+
+fn normalize_output_stamps(stamps: &mut serde_json::Value) -> Result<(), Box<dyn Error>> {
+    let stamps = stamps
+        .as_array_mut()
+        .ok_or("result output stamps are invalid")?;
+    for stamp in stamps {
+        let fields = stamp
+            .as_object_mut()
+            .ok_or("result output stamp is invalid")?;
+        // Destination inode and timestamps vary while file bytes and digests remain stable
+        fields.remove("device_id");
+        fields.remove("file_id");
+        fields.remove("modified_seconds");
+        fields.remove("modified_nanoseconds");
+        fields.remove("changed_seconds");
+        fields.remove("changed_nanoseconds");
+    }
+    Ok(())
+}
+
+struct ResultCounters {
+    cache_hits: u64,
+    cache_misses: u64,
+    candidates_examined: u64,
+    ingestion_state: String,
+}
+
+fn result_counters(directory: &Path) -> Result<ResultCounters, Box<dyn Error>> {
+    let manifest: serde_json::Value =
+        serde_json::from_slice(&fs::read(directory.join("manifest.json"))?)?;
+    let counters = manifest
+        .pointer("/l2solver_result/job/counters")
+        .ok_or("result job counters are missing")?;
+    let ingestion_state = manifest
+        .pointer("/l2solver_result/job/phases")
+        .and_then(serde_json::Value::as_array)
+        .into_iter()
+        .flatten()
+        .find(|phase| phase.get("phase").and_then(serde_json::Value::as_str) == Some("ingestion"))
+        .and_then(|phase| phase.get("state"))
+        .and_then(serde_json::Value::as_str)
+        .ok_or("result ingestion phase is missing")?
+        .to_owned();
+    let counter = |name| {
+        counters
+            .get(name)
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or(0)
+    };
+    Ok(ResultCounters {
+        cache_hits: counter("cache_hits"),
+        cache_misses: counter("cache_misses"),
+        candidates_examined: counter("candidates_examined"),
+        ingestion_state,
+    })
 }
