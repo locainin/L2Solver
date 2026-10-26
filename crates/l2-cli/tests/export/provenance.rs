@@ -551,31 +551,7 @@ fn cohort_artifact_context_uses_single_flow_context_for_one_supported_flow()
 
 #[test]
 fn cohort_context_follows_plural_frame_node_references() -> Result<(), Box<dyn Error>> {
-    let mut case = Case::new();
-    add_source(&mut case)?;
-    let first_input = case.add_bytes_node(
-        "relational_decoded_frame",
-        b"first frame",
-        vec![source_range(7, 0, 11)],
-        json!({}),
-    )?;
-    let second_input = case.add_bytes_node(
-        "relational_decoded_frame",
-        b"second frame",
-        vec![source_range(8, 0, 12)],
-        json!({}),
-    )?;
-    let output_node = case.add_bytes_node(
-        "relational_transform_output",
-        b"relational output",
-        Vec::new(),
-        json!({"input_frame_node_ids": [first_input, second_input]}),
-    )?;
-    let cohort = cohort_analysis(
-        case,
-        vec![flow(10), flow(20), flow(30)],
-        vec![(7, 10), (8, 20), (9, 30)],
-    );
+    let (cohort, output_node) = plural_frame_reference_cohort()?;
     let candidate_node = cohort
         .result
         .case
@@ -622,20 +598,45 @@ fn cohort_context_follows_plural_frame_node_references() -> Result<(), Box<dyn E
         .pointer("/node/details/input_frame_node_ids")
         .and_then(Value::as_array)
         .ok_or("canonical plural input references are missing")?;
-    assert_eq!(canonical_inputs.len(), 2);
+    let [first_input, second_input] = canonical_inputs.as_slice() else {
+        return Err("canonical origin must contain exactly two frame references".into());
+    };
     assert_eq!(
-        canonical_inputs[0].get("kind"),
+        first_input.get("kind"),
         Some(&json!("relational_decoded_frame"))
     );
-    assert_eq!(
-        canonical_inputs[0].pointer("/ranges/0/packet"),
-        Some(&json!(7))
-    );
-    assert_eq!(
-        canonical_inputs[1].pointer("/ranges/0/packet"),
-        Some(&json!(8))
-    );
+    assert_eq!(first_input.pointer("/ranges/0/packet"), Some(&json!(7)));
+    assert_eq!(second_input.pointer("/ranges/0/packet"), Some(&json!(8)));
     Ok(())
+}
+
+fn plural_frame_reference_cohort() -> Result<(CohortAnalysis, u64), Box<dyn Error>> {
+    let mut case = Case::new();
+    add_source(&mut case)?;
+    let first_input = case.add_bytes_node(
+        "relational_decoded_frame",
+        b"first frame",
+        vec![source_range(7, 0, 11)],
+        json!({}),
+    )?;
+    let second_input = case.add_bytes_node(
+        "relational_decoded_frame",
+        b"second frame",
+        vec![source_range(8, 0, 12)],
+        json!({}),
+    )?;
+    let output = case.add_bytes_node(
+        "relational_transform_output",
+        b"relational output",
+        Vec::new(),
+        json!({"input_frame_node_ids": [first_input, second_input]}),
+    )?;
+    let cohort = cohort_analysis(
+        case,
+        vec![flow(10), flow(20), flow(30)],
+        vec![(7, 10), (8, 20), (9, 30)],
+    );
+    Ok((cohort, output))
 }
 
 #[test]
@@ -731,9 +732,8 @@ fn assert_node_reference_error(
     add_source(&mut case)?;
     let output = case.add_bytes_node(node_kind, b"reference test", Vec::new(), details)?;
 
-    let error = match cohort_context_for_node(case, output, Vec::new()) {
-        Ok(_) => return Err("invalid node reference was accepted".into()),
-        Err(error) => error,
+    let Err(error) = cohort_context_for_node(case, output, Vec::new()) else {
+        return Err("invalid node reference was accepted".into());
     };
 
     assert!(error.to_string().contains(expected_key));
@@ -776,12 +776,12 @@ fn cohort_context_for_node(
         .map(|node| (node.id, node))
         .collect();
     let context_index = CohortArtifactContextIndex::new(&cohort)?;
-    Ok(context_index.for_node(
+    context_index.for_node(
         node,
         &nodes_by_id,
         Some("cohort-case"),
         &json!({"kind": "cohort"}),
-    )?)
+    )
 }
 
 fn flow(id: i64) -> Flow {
