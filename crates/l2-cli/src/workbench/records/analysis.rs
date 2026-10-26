@@ -6,7 +6,6 @@ use l2_workbench::{
         self, ByteOrder, ByteRange, RecordAssemblyInput, RecordAssemblyOutcome, RecordCount,
         RecordError, RecordLimits, RecordParseReport, RecordSchema,
     },
-    sha256,
 };
 use serde::Serialize;
 use std::{error::Error, io};
@@ -73,6 +72,12 @@ pub(super) struct Analysis {
     pub(super) rejected_inputs: Vec<RejectedInput>,
 }
 
+struct SelectedInput<'a> {
+    node: u64,
+    bytes: &'a [u8],
+    input_sha256: &'a str,
+}
+
 pub(super) fn analyze(
     case: &Case,
     selected_node_ids: &[u64],
@@ -81,17 +86,14 @@ pub(super) fn analyze(
     limits: RecordLimits,
 ) -> Result<Analysis, Box<dyn Error>> {
     validate_count_source_cardinality(selected_node_ids, count_source_options)?;
-    let selected_inputs = selected_node_ids
-        .iter()
-        .map(|node| selected::bytes(case, *node).map(|(_, bytes)| (*node, bytes)))
-        .collect::<Result<Vec<_>, _>>()?;
+    let selected_inputs = load_selected_inputs(case, selected_node_ids)?;
     enforce_aggregate_input_limit(&selected_inputs, limits)?;
     let count_sources = decode_count_sources(case, count_source_options)?;
     let parses = parse_inputs(&selected_inputs, &count_sources, schema, limits)?;
     let assembly_inputs = selected_inputs
         .iter()
         .zip(&parses)
-        .map(|((_, bytes), parse)| RecordAssemblyInput::new(bytes, parse))
+        .map(|(input, parse)| RecordAssemblyInput::new(input.bytes, parse))
         .collect::<Vec<_>>();
     let assembly_input_indexes = (0..selected_inputs.len()).collect::<Vec<_>>();
     let assembly = protocol::assemble_record_groups_from_inputs(&assembly_inputs, limits)?;
@@ -122,10 +124,7 @@ pub(super) fn analyze_recovery(
     limits: RecordLimits,
 ) -> Result<Analysis, Box<dyn Error>> {
     validate_count_source_cardinality(selected_node_ids, count_source_options)?;
-    let selected_inputs = selected_node_ids
-        .iter()
-        .map(|node| selected::bytes(case, *node).map(|(_, bytes)| (*node, bytes)))
-        .collect::<Result<Vec<_>, _>>()?;
+    let selected_inputs = load_selected_inputs(case, selected_node_ids)?;
     enforce_aggregate_input_limit(&selected_inputs, limits)?;
     let count_sources = decode_count_sources(case, count_source_options)?;
     let (parses, rejected_inputs) =
@@ -138,9 +137,9 @@ pub(super) fn analyze_recovery(
     assembly_input_indexes
         .try_reserve_exact(parses.len())
         .map_err(|_| RecordError::AllocationFailed)?;
-    for (input_index, ((_, bytes), parse)) in selected_inputs.iter().zip(&parses).enumerate() {
+    for (input_index, (input, parse)) in selected_inputs.iter().zip(&parses).enumerate() {
         if let Some(parse) = parse {
-            assembly_inputs.push(RecordAssemblyInput::new(bytes, parse));
+            assembly_inputs.push(RecordAssemblyInput::new(input.bytes, parse));
             assembly_input_indexes.push(input_index);
         }
     }
@@ -164,7 +163,7 @@ pub(super) fn analyze_recovery(
 }
 
 fn parse_inputs(
-    inputs: &[(u64, &[u8])],
+    inputs: &[SelectedInput<'_>],
     count_sources: &[CountSourceReceipt],
     schema: &RecordSchema,
     limits: RecordLimits,
@@ -177,7 +176,7 @@ fn parse_inputs(
 }
 
 fn parse_input_slots(
-    inputs: &[(u64, &[u8])],
+    inputs: &[SelectedInput<'_>],
     count_sources: &[CountSourceReceipt],
     schema: &RecordSchema,
     limits: RecordLimits,
@@ -191,7 +190,8 @@ fn parse_input_slots(
     let mut rejected_inputs = Vec::new();
     let mut records_used = 0_usize;
     let mut report_bytes_used = 0_usize;
-    for (input_index, (_, bytes)) in inputs.iter().enumerate() {
+    for (input_index, input) in inputs.iter().enumerate() {
+        let bytes = input.bytes;
         let has_records = part_has_records(bytes, schema, count_sources.get(input_index));
         if records_used >= limits.max_records && has_records != Some(false) {
             return Err(RecordError::TooManyRecords {
@@ -223,13 +223,9 @@ fn parse_input_slots(
                 rejected_inputs
                     .try_reserve(1)
                     .map_err(|_| RecordError::AllocationFailed)?;
-                let input_node_id = inputs
-                    .get(input_index)
-                    .map(|(node_id, _)| *node_id)
-                    .ok_or(RecordError::InvalidReport)?;
                 rejected_inputs.push(RejectedInput {
                     input_index,
-                    input_node_id,
+                    input_node_id: input.node,
                     error,
                 });
                 parses.push(None);
@@ -300,18 +296,41 @@ fn part_has_records(
     }
 }
 
+fn load_selected_inputs<'a>(
+    case: &'a Case,
+    selected_node_ids: &[u64],
+) -> Result<Vec<SelectedInput<'a>>, Box<dyn Error>> {
+    selected_node_ids
+        .iter()
+        .map(|node_id| {
+            let (node, bytes) = selected::bytes(case, *node_id)?;
+            // The retained blob ID already carries its validated content digest
+            let input_sha256 = node
+                .blob
+                .as_deref()
+                .and_then(|blob_id| blob_id.strip_prefix("sha256:"))
+                .ok_or("selected input has no canonical SHA-256 blob identifier")?;
+            Ok(SelectedInput {
+                node: *node_id,
+                bytes,
+                input_sha256,
+            })
+        })
+        .collect()
+}
+
 fn describe_inputs(
-    selected_inputs: &[(u64, &[u8])],
+    selected_inputs: &[SelectedInput<'_>],
     count_sources: Vec<CountSourceReceipt>,
 ) -> Vec<InputDescriptor> {
     let mut count_sources = count_sources.into_iter();
     selected_inputs
         .iter()
-        .map(|(node, bytes)| InputDescriptor {
-            node: *node,
+        .map(|input| InputDescriptor {
+            node: input.node,
             count_source: count_sources.next(),
-            input_length: bytes.len(),
-            input_sha256: sha256(bytes),
+            input_length: input.bytes.len(),
+            input_sha256: input.input_sha256.to_owned(),
         })
         .collect()
 }
@@ -482,12 +501,12 @@ fn validate_count_source_cardinality(
 }
 
 fn enforce_aggregate_input_limit(
-    inputs: &[(u64, &[u8])],
+    inputs: &[SelectedInput<'_>],
     limits: RecordLimits,
 ) -> Result<(), RecordError> {
-    let length = inputs.iter().try_fold(0_usize, |total, (_, bytes)| {
+    let length = inputs.iter().try_fold(0_usize, |total, input| {
         total
-            .checked_add(bytes.len())
+            .checked_add(input.bytes.len())
             .ok_or(RecordError::InputTooLarge {
                 length: usize::MAX,
                 maximum: limits.max_input_bytes,

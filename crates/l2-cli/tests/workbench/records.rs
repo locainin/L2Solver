@@ -66,6 +66,61 @@ fn record_receipt(case: &Case) -> Result<(u64, Value), Box<dyn Error>> {
 }
 
 #[test]
+fn record_receipt_input_digest_matches_the_canonical_blob_digest() -> Result<(), Box<dyn Error>> {
+    let directory = tempfile::tempdir()?;
+    let schema = directory.path().join("schema.json");
+    fs::write(&schema, schema_json())?;
+    let mut bytes = vec![1];
+    push_record(&mut bytes, b"D1", 0, b"payload");
+    let mut case = Case::new();
+    let input = case.add_bytes_node(
+        "candidate_stream",
+        &bytes,
+        Vec::new(),
+        serde_json::json!({}),
+    )?;
+    let expected_digest = case
+        .blobs()
+        .first()
+        .and_then(|blob| blob.id.strip_prefix("sha256:"))
+        .ok_or("input blob does not have its canonical SHA-256 identity")?
+        .to_owned();
+
+    let output = run(
+        &[
+            "records",
+            "-",
+            "--node",
+            &input.to_string(),
+            "--schema",
+            path_arg(&schema)?,
+        ],
+        &case.to_json()?,
+    )?;
+
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let result = Case::from_json(&output.stdout)?;
+    let (_, receipt) = record_receipt(&result)?;
+    assert_eq!(
+        receipt.pointer("/inputs/0/input_sha256"),
+        Some(&Value::from(expected_digest.clone()))
+    );
+    assert_eq!(
+        receipt.pointer("/input_sha256"),
+        Some(&Value::from(expected_digest))
+    );
+    assert_eq!(
+        receipt.pointer("/inputs/0/input_length"),
+        Some(&Value::from(bytes.len()))
+    );
+    Ok(())
+}
+
+#[test]
 fn command_complete_objects_explains_incomplete() -> Result<(), Box<dyn Error>> {
     let directory = tempfile::tempdir()?;
     let schema = directory.path().join("schema.json");
@@ -599,12 +654,20 @@ fn command_uses_sources_per_part() -> Result<(), Box<dyn Error>> {
         Some(&serde_json::json!(1))
     );
     assert_eq!(
+        receipt.pointer("/inputs/0/count_source/range_sha256"),
+        Some(&serde_json::json!(l2_workbench::sha256(&[1])))
+    );
+    assert_eq!(
         receipt.pointer("/inputs/1/count_source/range/end"),
         Some(&serde_json::json!(3))
     );
     assert_eq!(
         receipt.pointer("/inputs/1/count_source/byte_order"),
         Some(&serde_json::json!("little_endian"))
+    );
+    assert_eq!(
+        receipt.pointer("/inputs/1/count_source/range_sha256"),
+        Some(&serde_json::json!(l2_workbench::sha256(&[1, 0])))
     );
     for source in [first_count, second_count] {
         assert!(result.edges().iter().any(|edge| {
