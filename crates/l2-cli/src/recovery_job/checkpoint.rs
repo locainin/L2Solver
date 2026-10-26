@@ -43,8 +43,11 @@ impl CheckpointWriter {
             && saved.status == CheckpointStatus::Active
         {
             let mut snapshot = saved.snapshot;
-            // Committed stages replay from cache entries during this pipeline pass
+            // Every stage replays from cache or starts a fresh bounded pass
             for phase in &mut snapshot.phases {
+                // Cumulative job counters retain prior work, including evicted stages
+                phase.completed = 0;
+                phase.elapsed_ms = 0;
                 phase.state = PhaseState::Pending;
             }
             snapshot.current_phase = None;
@@ -119,3 +122,7 @@ impl Drop for CheckpointWriter {
 #[cfg(test)]
 #[path = "../../tests/recovery_job/checkpoint.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "../../tests/recovery_job/progress.rs"]
+mod progress_tests;
