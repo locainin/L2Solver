@@ -549,6 +549,198 @@ fn cohort_artifact_context_uses_single_flow_context_for_one_supported_flow()
     Ok(())
 }
 
+#[test]
+fn cohort_context_follows_plural_frame_node_references() -> Result<(), Box<dyn Error>> {
+    let mut case = Case::new();
+    add_source(&mut case)?;
+    let first_input = case.add_bytes_node(
+        "relational_decoded_frame",
+        b"first frame",
+        vec![source_range(7, 0, 11)],
+        json!({}),
+    )?;
+    let second_input = case.add_bytes_node(
+        "relational_decoded_frame",
+        b"second frame",
+        vec![source_range(8, 0, 12)],
+        json!({}),
+    )?;
+    let output_node = case.add_bytes_node(
+        "relational_transform_output",
+        b"relational output",
+        Vec::new(),
+        json!({"input_frame_node_ids": [first_input, second_input]}),
+    )?;
+    let cohort = cohort_analysis(
+        case,
+        vec![flow(10), flow(20), flow(30)],
+        vec![(7, 10), (8, 20), (9, 30)],
+    );
+    let candidate_node = cohort
+        .result
+        .case
+        .node(output_node)
+        .cloned()
+        .ok_or("relational output node is missing")?;
+    let nodes_by_id = cohort
+        .result
+        .case
+        .nodes()
+        .iter()
+        .map(|node| (node.id, node))
+        .collect();
+    let context_index = CohortArtifactContextIndex::new(&cohort)?;
+    let context = context_index.for_node(
+        &candidate_node,
+        &nodes_by_id,
+        Some("cohort-case"),
+        &json!({"kind": "cohort"}),
+    )?;
+
+    assert!(context.flow.is_none());
+    assert_eq!(
+        context
+            .supporting_flows
+            .iter()
+            .filter_map(|flow| flow.get("id").and_then(Value::as_i64))
+            .collect::<Vec<_>>(),
+        [10, 20]
+    );
+    assert!(context.cohort_scope.is_some());
+
+    let provenance = artifact_provenance(
+        "recovered_artifact",
+        &context,
+        Some(candidate_node),
+        None,
+        None,
+        Vec::new(),
+        &nodes_by_id,
+    )?;
+    let canonical_inputs = provenance
+        .canonical_origin
+        .pointer("/node/details/input_frame_node_ids")
+        .and_then(Value::as_array)
+        .ok_or("canonical plural input references are missing")?;
+    assert_eq!(canonical_inputs.len(), 2);
+    assert_eq!(
+        canonical_inputs[0].get("kind"),
+        Some(&json!("relational_decoded_frame"))
+    );
+    assert_eq!(
+        canonical_inputs[0].pointer("/ranges/0/packet"),
+        Some(&json!(7))
+    );
+    assert_eq!(
+        canonical_inputs[1].pointer("/ranges/0/packet"),
+        Some(&json!(8))
+    );
+    Ok(())
+}
+
+#[test]
+fn cohort_context_skips_null_optional_multi_input_references() -> Result<(), Box<dyn Error>> {
+    let mut case = Case::new();
+    add_source(&mut case)?;
+    let receipt = case.add_bytes_node(
+        "record_parse_receipt",
+        b"{}",
+        Vec::new(),
+        json!({"input_node": null, "input_count": 2}),
+    )?;
+    let candidate = case.add_bytes_node(
+        "record_candidate",
+        b"record candidate",
+        Vec::new(),
+        json!({"input_node": null, "input_count": 2, "receipt_node": receipt}),
+    )?;
+
+    let context = cohort_context_for_node(case, candidate, vec![(7, 10), (8, 20), (9, 30)])?;
+
+    assert!(context.flow.is_none());
+    assert_eq!(
+        context
+            .supporting_flows
+            .iter()
+            .filter_map(|flow| flow.get("id").and_then(Value::as_i64))
+            .collect::<Vec<_>>(),
+        [10, 20, 30]
+    );
+    assert!(context.cohort_scope.is_some());
+    Ok(())
+}
+
+#[test]
+fn cohort_context_rejects_malformed_non_null_node_references() -> Result<(), Box<dyn Error>> {
+    assert_node_reference_error(
+        "record_candidate",
+        json!({"input_node": "not-an-id"}),
+        "input_node",
+        "string",
+    )
+}
+
+#[test]
+fn cohort_context_rejects_node_references_missing_from_the_case() -> Result<(), Box<dyn Error>> {
+    assert_node_reference_error(
+        "record_candidate",
+        json!({"input_node": u64::MAX}),
+        "input_node",
+        "number",
+    )
+}
+
+#[test]
+fn cohort_context_rejects_malformed_plural_node_references() -> Result<(), Box<dyn Error>> {
+    assert_node_reference_error(
+        "relational_transform_output",
+        json!({"input_frame_node_ids": ["not-an-id"]}),
+        "input_frame_node_ids",
+        "string",
+    )
+}
+
+#[test]
+fn cohort_context_rejects_non_array_plural_node_references() -> Result<(), Box<dyn Error>> {
+    assert_node_reference_error(
+        "relational_transform_output",
+        json!({"input_frame_node_ids": "not-an-array"}),
+        "input_frame_node_ids",
+        "string",
+    )
+}
+
+#[test]
+fn cohort_context_rejects_plural_node_references_missing_from_the_case()
+-> Result<(), Box<dyn Error>> {
+    assert_node_reference_error(
+        "relational_transform_output",
+        json!({"input_frame_node_ids": [u64::MAX]}),
+        "input_frame_node_ids",
+        "number",
+    )
+}
+
+fn assert_node_reference_error(
+    node_kind: &str,
+    details: Value,
+    expected_key: &str,
+    expected_type: &str,
+) -> Result<(), Box<dyn Error>> {
+    let mut case = Case::new();
+    add_source(&mut case)?;
+    let output = case.add_bytes_node(node_kind, b"reference test", Vec::new(), details)?;
+
+    let error = match cohort_context_for_node(case, output, Vec::new()) {
+        Ok(_) => return Err("invalid node reference was accepted".into()),
+        Err(error) => error,
+    };
+
+    assert!(error.to_string().contains(expected_key));
+    assert!(error.to_string().contains(expected_type));
+    Ok(())
+}
+
 fn cohort_analysis(
     case: Case,
     member_flows: Vec<Flow>,
@@ -563,6 +755,33 @@ fn cohort_analysis(
         },
         split: false,
     }
+}
+
+fn cohort_context_for_node(
+    case: Case,
+    node_id: u64,
+    packet_flow_ids: Vec<(u32, i64)>,
+) -> Result<super::ArtifactSourceContext, Box<dyn Error>> {
+    let cohort = cohort_analysis(case, vec![flow(10), flow(20), flow(30)], packet_flow_ids);
+    let node = cohort
+        .result
+        .case
+        .node(node_id)
+        .ok_or("artifact node is missing")?;
+    let nodes_by_id = cohort
+        .result
+        .case
+        .nodes()
+        .iter()
+        .map(|node| (node.id, node))
+        .collect();
+    let context_index = CohortArtifactContextIndex::new(&cohort)?;
+    Ok(context_index.for_node(
+        node,
+        &nodes_by_id,
+        Some("cohort-case"),
+        &json!({"kind": "cohort"}),
+    )?)
 }
 
 fn flow(id: i64) -> Flow {

@@ -116,14 +116,23 @@ fn collect_node_references(
     match value {
         serde_json::Value::Object(fields) => {
             for (key, value) in fields {
-                if is_node_reference(key) {
-                    let node_id = value
-                        .as_u64()
-                        .ok_or("artifact node reference is not an unsigned node ID")?;
-                    let referenced = nodes_by_id
-                        .get(&node_id)
-                        .ok_or("artifact node reference is missing from its Case")?;
-                    collect_node_packets(referenced, nodes_by_id, visited, packets)?;
+                if is_node_reference_list(key) {
+                    let references = value.as_array().ok_or_else(|| {
+                        node_reference_error(
+                            key,
+                            "expected an array of unsigned node IDs",
+                            json_type(value),
+                        )
+                    })?;
+                    for reference in references {
+                        collect_referenced_node(key, reference, nodes_by_id, visited, packets)?;
+                    }
+                } else if is_node_reference(key) {
+                    // Multi-input record evidence has no single input node
+                    if is_optional_node_reference(key) && value.is_null() {
+                        continue;
+                    }
+                    collect_referenced_node(key, value, nodes_by_id, visited, packets)?;
                 } else {
                     collect_node_references(value, nodes_by_id, visited, packets)?;
                 }
@@ -137,6 +146,43 @@ fn collect_node_references(
         _ => {}
     }
     Ok(())
+}
+
+fn collect_referenced_node(
+    key: &str,
+    value: &serde_json::Value,
+    nodes_by_id: &HashMap<u64, &Node>,
+    visited: &mut HashSet<u64>,
+    packets: &mut BTreeSet<u64>,
+) -> Result<(), Box<dyn Error>> {
+    let node_id = value.as_u64().ok_or_else(|| {
+        node_reference_error(key, "expected an unsigned node ID", json_type(value))
+    })?;
+    let referenced = nodes_by_id
+        .get(&node_id)
+        .ok_or_else(|| missing_node_reference_error(key, json_type(value)))?;
+    collect_node_packets(referenced, nodes_by_id, visited, packets)
+}
+
+fn node_reference_error(key: &str, expected: &str, value_type: &str) -> String {
+    format!("artifact node reference `{key}` has JSON type `{value_type}`; {expected}")
+}
+
+fn missing_node_reference_error(key: &str, value_type: &str) -> String {
+    format!(
+        "artifact node reference `{key}` has JSON type `{value_type}`; referenced Case node is missing"
+    )
+}
+
+const fn json_type(value: &serde_json::Value) -> &'static str {
+    match value {
+        serde_json::Value::Null => "null",
+        serde_json::Value::Bool(_) => "boolean",
+        serde_json::Value::Number(_) => "number",
+        serde_json::Value::String(_) => "string",
+        serde_json::Value::Array(_) => "array",
+        serde_json::Value::Object(_) => "object",
+    }
 }
 
 pub(super) fn cohort_scope(
@@ -568,10 +614,39 @@ fn canonicalize_node_references(
     match value {
         serde_json::Value::Object(fields) => {
             for (key, value) in fields.iter_mut() {
-                if is_node_reference(key)
-                    && let Some(node_id) = value.as_u64()
-                    && let Some(node) = nodes_by_id.get(&node_id)
-                {
+                if is_node_reference_list(key) {
+                    let value_type = json_type(value);
+                    let references = value.as_array_mut().ok_or_else(|| {
+                        node_reference_error(
+                            key,
+                            "expected an array of unsigned node IDs",
+                            value_type,
+                        )
+                    })?;
+                    for reference in references {
+                        let node_id = reference.as_u64().ok_or_else(|| {
+                            node_reference_error(
+                                key,
+                                "expected an unsigned node ID",
+                                json_type(reference),
+                            )
+                        })?;
+                        let node = nodes_by_id.get(&node_id).ok_or_else(|| {
+                            missing_node_reference_error(key, json_type(reference))
+                        })?;
+                        *reference = canonical_node_reference(node);
+                    }
+                } else if is_node_reference(key) {
+                    // Null input_node is the documented multi-input form
+                    if is_optional_node_reference(key) && value.is_null() {
+                        continue;
+                    }
+                    let node_id = value.as_u64().ok_or_else(|| {
+                        node_reference_error(key, "expected an unsigned node ID", json_type(value))
+                    })?;
+                    let node = nodes_by_id
+                        .get(&node_id)
+                        .ok_or_else(|| missing_node_reference_error(key, json_type(value)))?;
                     *value = canonical_node_reference(node);
                 } else {
                     canonicalize_node_references(value, nodes_by_id)?;
@@ -590,6 +665,14 @@ fn canonicalize_node_references(
 
 fn is_node_reference(key: &str) -> bool {
     key == "node_id" || key.ends_with("_node") || key.ends_with("_node_id")
+}
+
+fn is_node_reference_list(key: &str) -> bool {
+    key == "node_ids" || key.ends_with("_node_ids")
+}
+
+fn is_optional_node_reference(key: &str) -> bool {
+    key == "input_node"
 }
 
 fn canonical_node_reference(node: &Node) -> serde_json::Value {
