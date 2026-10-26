@@ -2039,7 +2039,19 @@ fn export(capture: &Path, destination: Option<&Path>) -> Result<Output, std::io:
     if let Some(destination) = destination {
         command.arg("--output").arg(destination);
     }
-    command.output()
+    run_with_private_xdg_directories(command)
+}
+
+fn run_with_private_xdg_directories(mut command: Command) -> Result<Output, std::io::Error> {
+    let directories = tempfile::tempdir()?;
+    let cache_home = directories.path().join("cache");
+    let state_home = directories.path().join("state");
+    fs::create_dir(&cache_home)?;
+    fs::create_dir(&state_home)?;
+    command
+        .env("XDG_CACHE_HOME", cache_home)
+        .env("XDG_STATE_HOME", state_home)
+        .output()
 }
 
 fn is_report(path: &Path) -> bool {
@@ -2082,14 +2094,15 @@ fn export_with_tshark_flags(
     executable_directory: &Path,
     flags: &[&str],
 ) -> Result<Output, std::io::Error> {
-    Command::new(env!("CARGO_BIN_EXE_l2solver"))
+    let mut command = Command::new(env!("CARGO_BIN_EXE_l2solver"));
+    command
         .arg("export")
         .arg(capture)
         .arg("--output")
         .arg(destination)
         .args(flags)
-        .env("PATH", executable_directory)
-        .output()
+        .env("PATH", executable_directory);
+    run_with_private_xdg_directories(command)
 }
 
 #[cfg(unix)]
