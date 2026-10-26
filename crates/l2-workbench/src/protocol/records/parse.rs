@@ -1,10 +1,9 @@
 use super::{
-    ByteField, IntegerField, ParsedRecord, RecordCount, RecordError, RecordLengthMeaning,
-    RecordLimits, RecordParseReport, RecordSchema,
+    ByteField, IntegerField, ParsedRecord, RecordCount, RecordError, RecordInput,
+    RecordLengthMeaning, RecordLimits, RecordParseReport, RecordSchema,
 };
 use crate::integer::decode_unsigned;
 use crate::protocol::{ByteOrder, ByteRange};
-use crate::sha256;
 
 /// Parse repeated records using a complete explicit schema and default safety limits
 ///
@@ -29,6 +28,15 @@ pub fn parse_records_with_limits(
     schema: &RecordSchema,
     limits: RecordLimits,
 ) -> Result<RecordParseReport, RecordError> {
+    RecordInput::new(bytes).parse(schema, limits)
+}
+
+pub(super) fn parse_with_input(
+    input: &RecordInput<'_>,
+    schema: &RecordSchema,
+    limits: RecordLimits,
+) -> Result<RecordParseReport, RecordError> {
+    let bytes = input.bytes;
     validate_limits(limits)?;
     validate_schema(schema, limits)?;
     if bytes.len() > limits.max_input_bytes {
@@ -102,7 +110,7 @@ pub fn parse_records_with_limits(
     Ok(RecordParseReport {
         schema: schema.clone(),
         input_length: bytes.len(),
-        input_sha256: sha256(bytes),
+        input_sha256: input.input_sha256().to_owned(),
         declared_count,
         records,
     })
@@ -131,7 +139,7 @@ fn initial_record_capacity(
     Ok(count.min(possible_records))
 }
 
-const fn validate_limits(limits: RecordLimits) -> Result<(), RecordError> {
+pub(super) const fn validate_limits(limits: RecordLimits) -> Result<(), RecordError> {
     if limits.max_input_bytes == 0
         || limits.max_records == 0
         || limits.max_identifier_bytes == 0
@@ -149,7 +157,10 @@ pub(super) const fn validate_assembly_limits(limits: RecordLimits) -> Result<(),
     validate_limits(limits)
 }
 
-fn validate_schema(schema: &RecordSchema, limits: RecordLimits) -> Result<(), RecordError> {
+pub(super) fn validate_schema(
+    schema: &RecordSchema,
+    limits: RecordLimits,
+) -> Result<(), RecordError> {
     validate_byte_field(schema.identifier, schema.data_offset, "identifier")?;
     if schema.identifier.width > limits.max_identifier_bytes {
         return Err(RecordError::IdentifierTooLarge {

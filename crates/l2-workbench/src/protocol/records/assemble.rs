@@ -62,7 +62,7 @@ fn validate_inputs(
     let mut report_bytes = 0_usize;
     let mut common_schema = None;
     for input in inputs {
-        validate_report(input.bytes, input.report, limits)?;
+        validate_report(input.bytes, input.report, input.input_sha256, limits)?;
         input_length =
             input_length
                 .checked_add(input.bytes.len())
@@ -219,6 +219,7 @@ fn same_record_layout(left: &super::RecordSchema, right: &super::RecordSchema) -
 fn validate_report(
     bytes: &[u8],
     parsed: &RecordParseReport,
+    trusted_input_sha256: Option<&str>,
     limits: RecordLimits,
 ) -> Result<(), RecordError> {
     if bytes.len() > limits.max_input_bytes {
@@ -227,7 +228,14 @@ fn validate_report(
             maximum: limits.max_input_bytes,
         });
     }
-    if bytes.len() != parsed.input_length || sha256(bytes) != parsed.input_sha256 {
+    if bytes.len() != parsed.input_length {
+        return Err(RecordError::InvalidReport);
+    }
+    let digest_matches = trusted_input_sha256.map_or_else(
+        || sha256(bytes) == parsed.input_sha256,
+        |trusted_digest| trusted_digest == parsed.input_sha256,
+    );
+    if !digest_matches {
         return Err(RecordError::InvalidReport);
     }
     if parsed.records.len() > limits.max_records {

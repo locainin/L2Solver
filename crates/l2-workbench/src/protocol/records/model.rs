@@ -166,13 +166,18 @@ pub struct RecordParseReport {
 pub struct RecordAssemblyInput<'a> {
     pub(super) bytes: &'a [u8],
     pub(super) report: &'a RecordParseReport,
+    pub(super) input_sha256: Option<&'a str>,
 }
 
 impl<'a> RecordAssemblyInput<'a> {
     /// Bind a parse report to the exact source bytes used to create it
     #[must_use]
     pub const fn new(bytes: &'a [u8], report: &'a RecordParseReport) -> Self {
-        Self { bytes, report }
+        Self {
+            bytes,
+            report,
+            input_sha256: None,
+        }
     }
 }
 
@@ -210,12 +215,16 @@ impl RecordParseReport {
     /// Return the logical allocation charged to parsed record metadata
     #[must_use]
     pub fn metadata_bytes(&self) -> usize {
-        self.records.iter().fold(0_usize, |total, record| {
-            total.saturating_add(
-                std::mem::size_of::<ParsedRecord>().saturating_add(record.identifier.len()),
-            )
-        })
+        parsed_record_metadata_bytes(&self.records)
     }
+}
+
+pub(super) fn parsed_record_metadata_bytes(records: &[ParsedRecord]) -> usize {
+    records.iter().fold(0_usize, |total, record| {
+        total.saturating_add(
+            std::mem::size_of::<ParsedRecord>().saturating_add(record.identifier.len()),
+        )
+    })
 }
 
 /// Exact payload mapping into one materialized group candidate

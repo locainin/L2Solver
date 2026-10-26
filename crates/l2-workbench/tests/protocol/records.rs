@@ -1,7 +1,8 @@
 use l2_workbench::protocol::{
-    ByteField, ByteOrder, IntegerField, RecordAssemblyInput, RecordCount, RecordError,
-    RecordLengthMeaning, RecordLimits, RecordSchema, assemble_record_groups,
-    assemble_record_groups_from_inputs, parse_records, parse_records_with_limits,
+    ByteField, ByteOrder, HeaderParseTemplate, IntegerField, RecordAssemblyInput, RecordCount,
+    RecordError, RecordInput, RecordLengthMeaning, RecordLimits, RecordSchema,
+    assemble_record_groups, assemble_record_groups_from_inputs, parse_records,
+    parse_records_with_limits,
 };
 use std::error::Error;
 
@@ -65,6 +66,207 @@ fn explicit_record_case() -> Result<(Vec<u8>, RecordSchema), Box<dyn Error>> {
     push_counted_record(&mut bytes, b"A1", 1, b"second");
     let schema = schema_with_terminal_sequence(&counted_payload_schema(), 1)?;
     Ok((bytes, schema))
+}
+
+const fn one_record_header_schema() -> RecordSchema {
+    RecordSchema {
+        records_offset: 1,
+        count: RecordCount::Field {
+            field: IntegerField {
+                offset: 0,
+                width: 1,
+                byte_order: ByteOrder::BigEndian,
+            },
+        },
+        identifier: ByteField {
+            offset: 0,
+            width: 1,
+        },
+        sequence: IntegerField {
+            offset: 1,
+            width: 1,
+            byte_order: ByteOrder::BigEndian,
+        },
+        length: IntegerField {
+            offset: 2,
+            width: 1,
+            byte_order: ByteOrder::BigEndian,
+        },
+        data_offset: 3,
+        length_meaning: RecordLengthMeaning::PayloadBytes,
+        sequence_base: 0,
+        terminal_sequence: None,
+    }
+}
+
+fn one_record_frame(
+    identifier: u8,
+    sequence: u8,
+    payload: &[u8],
+) -> Result<Vec<u8>, Box<dyn Error>> {
+    let payload_length = u8::try_from(payload.len())?;
+    let mut bytes = Vec::with_capacity(4_usize.saturating_add(payload.len()));
+    bytes.extend_from_slice(&[1, identifier, sequence, payload_length]);
+    bytes.extend_from_slice(payload);
+    Ok(bytes)
+}
+
+fn template_for(bytes: &[u8], header_end: usize) -> Result<HeaderParseTemplate, Box<dyn Error>> {
+    let limits = RecordLimits::default();
+    let input = RecordInput::new(bytes);
+    let parsed = input.parse(&one_record_header_schema(), limits)?;
+    Ok(parsed
+        .header_only_template(&input, header_end, limits)?
+        .ok_or("canonical one-record report did not produce a header template")?)
+}
+
+#[test]
+fn header_template_rebinds_changed_payload_and_assembly_uses_fresh_identity()
+-> Result<(), Box<dyn Error>> {
+    let limits = RecordLimits::default();
+    let schema = one_record_header_schema();
+    let original_bytes = one_record_frame(b'X', 0, b"old")?;
+    let changed_bytes = one_record_frame(b'X', 0, b"new")?;
+    let original_input = RecordInput::new(&original_bytes);
+    let original_report = original_input.parse(&schema, limits)?;
+    let template = original_report
+        .header_only_template(&original_input, 4, limits)?
+        .ok_or("header-only schema was not admitted")?;
+    let changed_input = RecordInput::new(&changed_bytes);
+
+    let rebound = template.rebind(&changed_input, limits)?;
+
+    assert_eq!(rebound.schema(), &schema);
+    assert_eq!(rebound.records(), original_report.records());
+    assert_eq!(rebound.input_length(), changed_bytes.len());
+    assert_eq!(rebound.input_sha256(), l2_workbench::sha256(&changed_bytes));
+    assert_ne!(rebound.input_sha256(), original_report.input_sha256());
+
+    let assembly_input = RecordAssemblyInput::from_input(&changed_input, &rebound)?;
+    let assembled = assemble_record_groups_from_inputs(&[assembly_input], limits)?;
+    let group = assembled
+        .group(b"X")
+        .ok_or("rebound record group is missing")?;
+    assert_eq!(group.candidate_bytes(), b"new");
+    Ok(())
+}
+
+#[test]
+fn header_template_rejects_changed_header_and_encoded_fields() -> Result<(), Box<dyn Error>> {
+    let limits = RecordLimits::default();
+    let original_bytes = one_record_frame(b'X', 0, b"old")?;
+    let template = template_for(&original_bytes, 4)?;
+    let changed_identifier = one_record_frame(b'Y', 0, b"old")?;
+    let changed_sequence = one_record_frame(b'X', 1, b"old")?;
+    let changed_length = one_record_frame(b'X', 0, b"long")?;
+
+    for changed_bytes in [changed_identifier, changed_sequence, changed_length] {
+        let input = RecordInput::new(&changed_bytes);
+        assert!(template.rebind(&input, limits).is_err());
+    }
+    Ok(())
+}
+
+#[test]
+fn header_template_rejects_changed_count_and_limits() -> Result<(), Box<dyn Error>> {
+    let limits = RecordLimits::default();
+    let original_bytes = one_record_frame(b'X', 0, b"old")?;
+    let template = template_for(&original_bytes, 4)?;
+    let mut changed_count = original_bytes.clone();
+    *changed_count.get_mut(0).ok_or("count field is missing")? = 2;
+    let changed_count_input = RecordInput::new(&changed_count);
+    assert!(template.rebind(&changed_count_input, limits).is_err());
+
+    let unchanged_input = RecordInput::new(&original_bytes);
+    let changed_limits = RecordLimits {
+        max_issue_examples: limits.max_issue_examples.saturating_sub(1),
+        ..limits
+    };
+    assert!(template.rebind(&unchanged_input, changed_limits).is_err());
+    Ok(())
+}
+
+#[test]
+fn header_template_creation_enforces_all_canonical_record_limits() -> Result<(), Box<dyn Error>> {
+    let limits = RecordLimits::default();
+    let bytes = one_record_frame(b'X', 0, b"old")?;
+    let input = RecordInput::new(&bytes);
+    let report = input.parse(&one_record_header_schema(), limits)?;
+
+    let zero_group_limit = RecordLimits {
+        max_groups: 0,
+        ..limits
+    };
+    assert!(matches!(
+        report.header_only_template(&input, 4, zero_group_limit),
+        Err(l2_workbench::protocol::RecordError::InvalidLimits)
+    ));
+
+    let tight_input_limit = RecordLimits {
+        max_input_bytes: bytes.len().saturating_sub(1),
+        ..limits
+    };
+    assert!(matches!(
+        report.header_only_template(&input, 4, tight_input_limit),
+        Err(l2_workbench::protocol::RecordError::InputTooLarge { .. })
+    ));
+
+    let tight_metadata_limit = RecordLimits {
+        max_report_bytes: report.metadata_bytes().saturating_sub(1),
+        ..limits
+    };
+    assert!(matches!(
+        report.header_only_template(&input, 4, tight_metadata_limit),
+        Err(l2_workbench::protocol::RecordError::ReportTooLarge { .. })
+    ));
+
+    let wide_bytes = [1, b'X', b'Y', 0, 2, b'a', b'b'];
+    let mut wide_schema = one_record_header_schema();
+    wide_schema.identifier.width = 2;
+    wide_schema.sequence.offset = 2;
+    wide_schema.length.offset = 3;
+    wide_schema.data_offset = 4;
+    let wide_input = RecordInput::new(&wide_bytes);
+    let wide_report = wide_input.parse(&wide_schema, limits)?;
+    let tight_identifier_limit = RecordLimits {
+        max_identifier_bytes: 1,
+        ..limits
+    };
+    assert!(matches!(
+        wide_report.header_only_template(&wide_input, 5, tight_identifier_limit),
+        Err(l2_workbench::protocol::RecordError::IdentifierTooLarge {
+            width: 2,
+            maximum: 1
+        })
+    ));
+    Ok(())
+}
+
+#[test]
+fn header_template_is_not_created_for_multiple_records_or_body_fields() -> Result<(), Box<dyn Error>>
+{
+    let limits = RecordLimits::default();
+    let first = one_record_frame(b'X', 0, b"a")?;
+    let second = one_record_frame(b'X', 1, b"b")?;
+    let mut multi_record_bytes = vec![2];
+    multi_record_bytes.extend_from_slice(first.get(1..).ok_or("first count field is missing")?);
+    multi_record_bytes.extend_from_slice(second.get(1..).ok_or("second count field is missing")?);
+    let multi_record_schema = one_record_header_schema();
+    let multi_record_input = RecordInput::new(&multi_record_bytes);
+    let multi_record_report = multi_record_input.parse(&multi_record_schema, limits)?;
+    assert!(
+        multi_record_report
+            .header_only_template(&multi_record_input, 4, limits)?
+            .is_none()
+    );
+
+    let bytes = [1, b'X', 0, 2, 0, b'a', b'b'];
+    let mut body_schema = one_record_header_schema();
+    body_schema.data_offset = 4;
+    let input = RecordInput::new(&bytes);
+    let report = input.parse(&body_schema, limits)?;
+    assert!(report.header_only_template(&input, 4, limits)?.is_none());
+    Ok(())
 }
 
 #[test]

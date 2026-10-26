@@ -3,6 +3,7 @@
 mod assemble;
 mod discovery;
 mod error;
+mod header;
 mod model;
 mod parse;
 mod proposal;
@@ -13,6 +14,7 @@ pub use discovery::{
     RecordDiscoveryValidationBasis, RecordSchemaDiscoveryReport, RecordSchemaDiscoverySpace,
     RecordSchemaFalsification, RecordSchemaHypothesis, discover_record_schemas,
 };
+pub use header::{HeaderParseTemplate, RecordInput};
 pub use model::{
     ByteField, DEFAULT_MAX_IDENTIFIER_BYTES, DEFAULT_MAX_RECORD_GROUPS,
     DEFAULT_MAX_RECORD_INPUT_BYTES, DEFAULT_MAX_RECORD_ISSUE_EXAMPLES,
