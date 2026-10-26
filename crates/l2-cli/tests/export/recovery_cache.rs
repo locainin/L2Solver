@@ -216,7 +216,7 @@ fn cache_key_does_not_reuse_the_previous_transform_proposal_policy() -> Result<(
 
     let (_, scope) = case_and_scope(b"4142", 19)?;
     let options = RecoveryOptions::default();
-    let source = SourceIdentity::from_sha256(&sha256(b"4142"))?;
+    let source = SourceIdentity::from_sha256(sha256(b"4142"))?;
     let previous_policy = json!({
         "native_case_version": crate::workbench::full_source::NATIVE_CASE_VERSION,
         "kind": "flow",
