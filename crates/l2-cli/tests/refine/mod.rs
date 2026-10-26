@@ -223,7 +223,6 @@ fn per_input_cache_reuses_the_complete_analysis_and_restores_artifact_bytes()
     let recovery = RecoveryOptions::default();
     let options = analyzer_options(&recovery, false, 4096, 8192);
     let job = l2_workbench::job::Job::new("cache test");
-    let mut warnings = Vec::new();
     let identity = l2_workbench::job::cache::SourceIdentity::from_sha256(source.sha256.clone())?;
     let previous_policy = json!({
         "schema_version": 1,
@@ -244,22 +243,8 @@ fn per_input_cache_reuses_the_complete_analysis_and_restores_artifact_bytes()
             .commit(l2_workbench::job::cache::StageStatus::Complete, json!({}))?,
     );
 
-    let first = analyze_source_cached(
-        &source,
-        options,
-        &recovery,
-        Some(&cache),
-        &mut warnings,
-        &job,
-    )?;
-    let second = analyze_source_cached(
-        &source,
-        options,
-        &recovery,
-        Some(&cache),
-        &mut warnings,
-        &job,
-    )?;
+    let first = analyze_source_cached(&source, options, &recovery, Some(&cache), &job)?;
+    let second = analyze_source_cached(&source, options, &recovery, Some(&cache), &job)?;
     let snapshot = job.snapshot()?;
 
     assert_eq!(first, second);
@@ -283,7 +268,7 @@ fn per_input_cache_reuses_the_complete_analysis_and_restores_artifact_bytes()
             .get(&l2_workbench::job::Counter::CacheHits),
         Some(&1)
     );
-    assert!(warnings.is_empty());
+    assert!(snapshot.cache_fallbacks.records().is_empty());
     Ok(())
 }
 
@@ -517,28 +502,6 @@ fn quiet_mode_suppresses_fresh_and_reused_completion_messages() -> Result<(), Bo
 
     assert!(fresh_output.is_empty());
     assert!(reused_output.is_empty());
-    Ok(())
-}
-
-#[test]
-fn cache_warning_cap_emits_one_suppression_marker() -> Result<(), Box<dyn Error>> {
-    let mut warnings = Vec::new();
-    for index in 0..12 {
-        super::analysis::record_cache_warning(&mut warnings, format!("warning {index}"));
-    }
-    let mut output = Vec::new();
-
-    super::output::write_cache_warnings(&mut output, &warnings)?;
-
-    let output = String::from_utf8(output)?;
-    assert_eq!(warnings.len(), 9);
-    assert_eq!(output.lines().count(), 9);
-    assert!(
-        output
-            .lines()
-            .last()
-            .is_some_and(|line| { line == "Warning: additional cache warnings suppressed" })
-    );
     Ok(())
 }
 

@@ -21,7 +21,9 @@ use crate::{
     result_directory::{ResultDirectory, ResultKind},
     workbench::artifact_export,
 };
-use l2_workbench::job::{Counter, Job, Phase, PhaseOutcome, cache::Cache};
+use l2_workbench::job::{
+    CacheFallbackKind, CacheStage, Counter, Job, Phase, PhaseOutcome, cache::Cache,
+};
 use policy::RefinePolicy;
 use std::{
     error::Error,
@@ -74,8 +76,7 @@ pub fn run_with_job(
         return Ok(reused.complete);
     }
 
-    let mut cache_warnings = Vec::new();
-    let cache = open_cache(options, &mut cache_warnings)?;
+    let cache = open_cache(options, job)?;
     // A restored checkpoint must precede every phase transition in this run
     let checkpoint = cache
         .as_ref()
@@ -108,7 +109,6 @@ pub fn run_with_job(
         policy: &policy,
         sources: &sources,
         cache: cache.as_ref(),
-        cache_warnings: &mut cache_warnings,
     });
     if let Some(checkpoint) = checkpoint {
         checkpoint.finish(result.is_ok() && !job.is_cancelled())?;
@@ -116,21 +116,19 @@ pub fn run_with_job(
     result
 }
 
-fn open_cache(
-    options: &RefineOptions,
-    warnings: &mut Vec<String>,
-) -> Result<Option<Cache>, Box<dyn Error>> {
+fn open_cache(options: &RefineOptions, job: &Job) -> Result<Option<Cache>, Box<dyn Error>> {
     if options.dry_run || options.recovery.no_cache {
         return Ok(None);
     }
     match Cache::from_environment(options.recovery.cache_max_bytes) {
         Ok(cache) => Ok(Some(cache)),
         Err(error) if options.recovery.strict_cache => Err(error.into()),
-        Err(error) => {
-            analysis::record_cache_warning(
-                warnings,
-                format!("persistent cache unavailable: {error}"),
-            );
+        Err(_) => {
+            job.record_cache_fallback(
+                CacheStage::ArtifactAnalysis,
+                CacheFallbackKind::CacheUnavailable,
+                format_args!("persistent cache could not be opened"),
+            )?;
             Ok(None)
         }
     }
@@ -146,7 +144,6 @@ struct AnalysisPublishContext<'a, W: Write> {
     policy: &'a RefinePolicy,
     sources: &'a [LoadedSource],
     cache: Option<&'a Cache>,
-    cache_warnings: &'a mut Vec<String>,
 }
 
 fn analyze_and_publish<W: Write>(
@@ -162,17 +159,9 @@ fn analyze_and_publish<W: Write>(
         policy,
         sources,
         cache,
-        cache_warnings,
     } = context;
     job.check_cancelled()?;
-    let analyzed = analysis::analyze_sources(
-        sources,
-        policy,
-        &options.recovery,
-        cache,
-        cache_warnings,
-        job,
-    )?;
+    let analyzed = analysis::analyze_sources(sources, policy, &options.recovery, cache, job)?;
     job.finish(Phase::TransformDiscovery, PhaseOutcome::Completed)?;
     job.finish(Phase::Expansion, PhaseOutcome::Completed)?;
 
@@ -204,7 +193,6 @@ fn analyze_and_publish<W: Write>(
                 analyzed.complete,
                 true,
             )?;
-            output::write_cache_warnings(output, cache_warnings)?;
         }
         return Ok(analyzed.complete);
     }
@@ -225,7 +213,6 @@ fn analyze_and_publish<W: Write>(
             analyzed.complete,
             false,
         )?;
-        output::write_cache_warnings(output, cache_warnings)?;
     }
     Ok(analyzed.complete)
 }

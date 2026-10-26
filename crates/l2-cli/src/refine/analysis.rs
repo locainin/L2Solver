@@ -14,7 +14,7 @@ use l2_workbench::{
     },
     evidence::{Case, MAX_NODES},
     job::{
-        Counter, Job, Phase,
+        CacheFallbackKind, CacheStage, Counter, Job, Phase,
         cache::{Cache, CacheEntry, CacheReadPolicy, Lease, SourceIdentity, StageKey, StageStatus},
     },
     recovery::proposals::TRANSFORM_PROPOSAL_FORMAT_VERSION,
@@ -23,6 +23,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::{
     error::Error,
+    fmt,
     fs::File,
     io::{self, Write},
 };
@@ -36,7 +37,6 @@ pub(super) fn analyze_sources(
     policy: &RefinePolicy,
     recovery: &RecoveryOptions,
     cache: Option<&Cache>,
-    cache_warnings: &mut Vec<String>,
     job: &Job,
 ) -> Result<AnalyzedSources, Box<dyn Error>> {
     let mut analysis = AnalyzedSources::new(policy.case_blob_limit, sources.len())?;
@@ -46,14 +46,7 @@ pub(super) fn analyze_sources(
             Phase::TransformDiscovery,
             format!("analyzing {}", source.label.escape_debug()),
         )?;
-        let report = analyze_source_cached(
-            source,
-            policy.analyzer,
-            recovery,
-            cache,
-            cache_warnings,
-            job,
-        )?;
+        let report = analyze_source_cached(source, policy.analyzer, recovery, cache, job)?;
         analysis.append_source(source_index, source, report, job)?;
     }
     Ok(analysis)
@@ -179,7 +172,6 @@ pub(super) fn analyze_source_cached(
     options: ArtifactAnalysisOptions,
     recovery: &RecoveryOptions,
     cache: Option<&Cache>,
-    cache_warnings: &mut Vec<String>,
     job: &Job,
 ) -> Result<l2_workbench::artifact::ArtifactAnalysis, Box<dyn Error>> {
     let Some(cache) = cache else {
@@ -214,17 +206,19 @@ pub(super) fn analyze_source_cached(
                     return Ok(report);
                 }
                 Err(error) if recovery.strict_cache => return Err(error),
-                Err(error) => record_cache_warning(
-                    cache_warnings,
-                    format!("cached file analysis was rejected: {error}"),
-                ),
+                Err(_) => note_cache_fallback(
+                    job,
+                    CacheFallbackKind::InvalidEntry,
+                    format_args!("cached file analysis was rejected"),
+                )?,
             },
             Ok(None) => {}
             Err(error) if recovery.strict_cache => return Err(error.into()),
-            Err(error) => record_cache_warning(
-                cache_warnings,
-                format!("file analysis cache lookup failed: {error}"),
-            ),
+            Err(_) => note_cache_fallback(
+                job,
+                CacheFallbackKind::LookupFailed,
+                format_args!("file analysis cache lookup failed"),
+            )?,
         }
     }
     job.increment(Counter::CacheMisses, 1)?;
@@ -232,11 +226,12 @@ pub(super) fn analyze_source_cached(
     let lease = match cache.lease(&key) {
         Ok(lease) => Some(lease),
         Err(error) if recovery.strict_cache => return Err(error.into()),
-        Err(error) => {
-            record_cache_warning(
-                cache_warnings,
-                format!("file analysis cache write lease unavailable: {error}"),
-            );
+        Err(_) => {
+            note_cache_fallback(
+                job,
+                CacheFallbackKind::LeaseUnavailable,
+                format_args!("file analysis cache write lease unavailable"),
+            )?;
             None
         }
     };
@@ -248,10 +243,11 @@ pub(super) fn analyze_source_cached(
         if recovery.strict_cache {
             return Err(error);
         }
-        record_cache_warning(
-            cache_warnings,
-            format!("file analysis cache commit failed: {error}"),
-        );
+        note_cache_fallback(
+            job,
+            CacheFallbackKind::CommitFailed,
+            format_args!("file analysis cache commit failed"),
+        )?;
     }
     Ok(report)
 }
@@ -264,13 +260,13 @@ pub(super) const fn recovery_profile_name(profile: RecoveryProfile) -> &'static 
     }
 }
 
-pub(super) fn record_cache_warning(warnings: &mut Vec<String>, warning: String) {
-    const MAX_WARNINGS: usize = 8;
-    if warnings.len() < MAX_WARNINGS {
-        warnings.push(warning);
-    } else if warnings.len() == MAX_WARNINGS {
-        warnings.push(String::from("additional cache warnings suppressed"));
-    }
+fn note_cache_fallback(
+    job: &Job,
+    kind: CacheFallbackKind,
+    detail: fmt::Arguments<'_>,
+) -> Result<(), Box<dyn Error>> {
+    job.record_cache_fallback(CacheStage::ArtifactAnalysis, kind, detail)?;
+    Ok(())
 }
 
 #[derive(Serialize)]

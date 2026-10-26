@@ -8,7 +8,7 @@ use crate::{
 use l2_workbench::{
     evidence::{Case, MAX_CASE_JSON_BYTES},
     job::{
-        Counter, Job, PhaseState,
+        CacheFallbackKind, CacheStage, Counter, Job, PhaseState,
         cache::{Cache, CacheEntry, CacheReadPolicy, Lease, SourceIdentity, StageKey, StageStatus},
     },
     recovery::proposals::TRANSFORM_PROPOSAL_FORMAT_VERSION,
@@ -17,6 +17,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::{
     error::Error,
+    fmt,
     fs::OpenOptions,
     io::{self, BufWriter, Read, Write},
 };
@@ -84,10 +85,19 @@ pub(super) fn recover(
                         return Ok(result);
                     }
                     Err(error) if context.options.strict_cache => return Err(error),
-                    Err(_) => {}
+                    Err(_) => note_cache_fallback(
+                        context.job,
+                        CacheFallbackKind::InvalidEntry,
+                        format_args!("cached Case could not be restored"),
+                    )?,
                 },
                 Err(error) if context.options.strict_cache => return Err(error.into()),
-                Ok(None) | Err(_) => {}
+                Err(_) => note_cache_fallback(
+                    context.job,
+                    CacheFallbackKind::LookupFailed,
+                    format_args!("recovery cache lookup failed"),
+                )?,
+                Ok(None) => {}
             }
         }
         count_cache_miss(context.job, kind)?;
@@ -97,7 +107,14 @@ pub(super) fn recover(
         Some(cache) => match cache.lease(&key) {
             Ok(lease) => Some(lease),
             Err(error) if context.options.strict_cache => return Err(error.into()),
-            Err(_) => None,
+            Err(_) => {
+                note_cache_fallback(
+                    context.job,
+                    CacheFallbackKind::LeaseUnavailable,
+                    format_args!("recovery cache write lease unavailable"),
+                )?;
+                None
+            }
         },
         None => None,
     };
@@ -122,10 +139,26 @@ pub(super) fn recover(
     if let Some(lease) = lease {
         match store_result(lease, case, &result) {
             Err(error) if context.options.strict_cache => return Err(error),
-            Ok(()) | Err(_) => {}
+            Ok(()) => {}
+            Err(_) => note_cache_fallback(
+                context.job,
+                CacheFallbackKind::CommitFailed,
+                format_args!("recovery cache write failed"),
+            )?,
         }
     }
     Ok(result)
+}
+
+fn note_cache_fallback(
+    job: Option<&Job>,
+    kind: CacheFallbackKind,
+    detail: fmt::Arguments<'_>,
+) -> Result<()> {
+    if let Some(job) = job {
+        job.record_cache_fallback(CacheStage::CaseRecovery, kind, detail)?;
+    }
+    Ok(())
 }
 
 fn recovery_key(

@@ -315,13 +315,3 @@ pub(super) fn default_output_path(input: &Path) -> PathBuf {
     output.push(".refined");
     PathBuf::from(output)
 }
-
-pub(super) fn write_cache_warnings(
-    output: &mut impl Write,
-    warnings: &[String],
-) -> Result<(), Box<dyn Error>> {
-    for warning in warnings {
-        writeln!(output, "Warning: {warning}")?;
-    }
-    Ok(())
-}

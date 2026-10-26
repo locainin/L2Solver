@@ -6,6 +6,10 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
 
+use super::cache_fallback::{
+    CacheFallbackKind, CacheFallbackSummary, CacheStage, bounded_escaped_sample,
+};
+
 // Short samples swing too much to support a useful ETA
 const MINIMUM_ETA_SAMPLE_MS: u64 = 1_000;
 
@@ -280,6 +284,9 @@ pub struct JobSnapshot {
     pub phases: Vec<PhaseSnapshot>,
     /// Cumulative measurements collected by workers
     pub counters: BTreeMap<Counter, u64>,
+    /// Bounded reasons cache-backed work continued without reusing an entry
+    #[serde(default)]
+    pub cache_fallbacks: CacheFallbackSummary,
     /// Whether a cooperative cancellation request has been sent
     pub cancel_requested: bool,
 }
@@ -373,6 +380,7 @@ impl Job {
                 .into_iter()
                 .map(|counter| (counter, 0))
                 .collect(),
+            cache_fallbacks: CacheFallbackSummary::default(),
             cancel_requested: false,
         };
 
@@ -541,6 +549,32 @@ impl Job {
         Ok(())
     }
 
+    /// Records a bounded cache fallback without retaining cache keys or recovered bytes
+    ///
+    /// The detail describes the failure without source names, cache keys, or recovered data
+    ///
+    /// The sample is escaped and truncated before the shared job lock is acquired. Repeated
+    /// events are grouped by stage and kind, and the lexicographically smallest sample is kept
+    /// so concurrent updates produce stable snapshots
+    ///
+    /// # Errors
+    /// Returns [`JobError::LockPoisoned`] when a worker panicked while holding the job state
+    pub fn record_cache_fallback(
+        &self,
+        cache_stage: CacheStage,
+        kind: CacheFallbackKind,
+        sample_detail: fmt::Arguments<'_>,
+    ) -> Result<(), JobError> {
+        let sample_detail = bounded_escaped_sample(sample_detail);
+        let mut state = self.lock_state()?;
+        state
+            .snapshot
+            .cache_fallbacks
+            .record(cache_stage, kind, sample_detail);
+        drop(state);
+        Ok(())
+    }
+
     /// Records the final outcome for a stage
     ///
     /// A skipped stage may finish while pending; other outcomes require a running stage
@@ -637,6 +671,10 @@ impl Job {
                 .checked_add(*value)
                 .ok_or(JobError::CounterOverflow(*counter))?;
         }
+
+        // Cache fallback counts are cumulative, just like the counters above
+        let current_cache_fallbacks = std::mem::take(&mut state.snapshot.cache_fallbacks);
+        snapshot.cache_fallbacks.merge(current_cache_fallbacks);
 
         // A prior process cancellation does not cancel this run, but a signal during lookup does
         snapshot.cancel_requested = self.is_cancelled();

@@ -7,7 +7,7 @@ pub(super) use cases::investigate_flow;
 use super::{IngestReceipt, input, invalid, label, validate_indexed_receipt};
 use l2_workbench::{
     job::{
-        Counter, Job, Phase, PhaseOutcome,
+        CacheFallbackKind, CacheStage, Counter, Job, Phase, PhaseOutcome,
         cache::{
             Cache, CacheEntry, CacheError, CacheReadPolicy, Lease, SourceFingerprint,
             SourceIdentity, StageKey, StageStatus, Value,
@@ -255,6 +255,7 @@ fn acquire_cached_index(
                         options.job,
                     );
                 }
+                record_capture_contention_fallback(options.job)?;
                 return acquire_temporary_index(
                     path,
                     temporary_parent,
@@ -303,7 +304,7 @@ fn inspect_cached_alias(
         WaitedCacheLookup::Ready(entry) => entry,
         WaitedCacheLookup::Busy => return Ok(AliasDecision::Busy),
     };
-    let source_id = trusted_source_id(path, fingerprint, strict_cache, entry.as_ref())?;
+    let source_id = trusted_source_id(path, fingerprint, strict_cache, entry.as_ref(), job)?;
     let Some(source_id) = source_id else {
         return Ok(AliasDecision::Build {
             entry,
@@ -351,6 +352,7 @@ fn temporary_cache_fallback(
     fingerprint: &SourceFingerprint,
     job: Option<&Job>,
 ) -> Result<IndexedSource> {
+    record_capture_contention_fallback(job)?;
     count_cache_miss(job)?;
     acquire_temporary_index(
         path,
@@ -359,6 +361,17 @@ fn temporary_cache_fallback(
         job,
         Some(CACHE_BUSY_FALLBACK_MESSAGE),
     )
+}
+
+fn record_capture_contention_fallback(job: Option<&Job>) -> Result<()> {
+    if let Some(job) = job {
+        job.record_cache_fallback(
+            CacheStage::CaptureIndex,
+            CacheFallbackKind::ContentionFallback,
+            format_args!("{CACHE_BUSY_FALLBACK_MESSAGE}"),
+        )?;
+    }
+    Ok(())
 }
 
 fn ingest_capture_then<T>(
@@ -667,8 +680,25 @@ fn trusted_source_id(
     fingerprint: &SourceFingerprint,
     strict_cache: bool,
     alias_entry: Option<&CacheEntry>,
+    job: Option<&Job>,
 ) -> Result<Option<String>> {
-    let alias_metadata = alias_entry.and_then(|entry| decode_alias_metadata(entry.metadata()).ok());
+    let alias_metadata = match alias_entry {
+        Some(entry) => {
+            if let Ok(metadata) = decode_alias_metadata(entry.metadata()) {
+                Some(metadata)
+            } else {
+                if let Some(job) = job {
+                    job.record_cache_fallback(
+                        CacheStage::CaptureIndex,
+                        CacheFallbackKind::InvalidEntry,
+                        format_args!("capture source alias metadata was rejected"),
+                    )?;
+                }
+                None
+            }
+        }
+        None => None,
+    };
     let alias_is_current = alias_metadata
         .as_ref()
         .is_some_and(|metadata| metadata.fingerprint == *fingerprint);
@@ -725,6 +755,7 @@ fn indexed_from_uncached_lease(
     job: Option<&Job>,
 ) -> Result<IndexedSource> {
     if let Some(job) = job {
+        record_capture_contention_fallback(Some(job))?;
         job.set_current(Phase::Ingestion, CACHE_BUSY_FALLBACK_MESSAGE)?;
     }
     let store = Store::open(index_directory, Options::default())?;

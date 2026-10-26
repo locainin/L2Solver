@@ -3,13 +3,16 @@ use crate::arguments::{ProgressMode, RecoveryOptions, RecoveryProfile};
 use l2_workbench::{
     evidence::Case,
     job::{
-        Counter, Job,
+        CacheFallbackKind, CacheStage, Counter, Job,
         cache::{Cache, CacheReadPolicy, StageStatus},
     },
     sha256,
 };
 use serde_json::{Value, json};
 use std::{error::Error, fs};
+
+#[path = "recovery_cache/failures.rs"]
+mod failures;
 
 #[test]
 fn warm_cache_restores_the_case_and_local_coverage() -> Result<(), Box<dyn Error>> {
@@ -111,7 +114,59 @@ fn refresh_recomputes_and_atomically_replaces_the_cached_recovery() -> Result<()
         0
     );
     assert_eq!(snapshot.counters.get(&Counter::CacheMisses), Some(&1));
+    assert!(snapshot.cache_fallbacks.records().is_empty());
     assert_eq!(cache.stats()?.entries, 1);
+    Ok(())
+}
+
+#[test]
+fn valid_cache_miss_and_no_cache_do_not_record_fallback_diagnostics() -> Result<(), Box<dyn Error>>
+{
+    let temporary = tempfile::tempdir()?;
+    let cache = open_cache(temporary.path())?;
+    let options = RecoveryOptions::default();
+    let job = Job::new("cold cache recovery");
+    let (mut case, scope) = case_and_scope(b"4142", 41)?;
+    recover(
+        &mut case,
+        RecoveryCaseKind::Flow,
+        &scope,
+        &RecoveryContext {
+            cache: Some(&cache),
+            job: Some(&job),
+            options: &options,
+        },
+    )?;
+
+    let cold_snapshot = job.snapshot()?;
+    assert!(cold_snapshot.cache_fallbacks.records().is_empty());
+    assert_eq!(cold_snapshot.counters.get(&Counter::CacheMisses), Some(&1));
+
+    let mut no_cache = options.clone();
+    no_cache.no_cache = true;
+    let no_cache_job = Job::new("cache disabled recovery");
+    let (mut uncached_case, uncached_scope) = case_and_scope(b"4142", 41)?;
+    recover(
+        &mut uncached_case,
+        RecoveryCaseKind::Flow,
+        &uncached_scope,
+        &RecoveryContext {
+            cache: Some(&cache),
+            job: Some(&no_cache_job),
+            options: &no_cache,
+        },
+    )?;
+
+    let no_cache_snapshot = no_cache_job.snapshot()?;
+    assert!(no_cache_snapshot.cache_fallbacks.records().is_empty());
+    assert_eq!(
+        no_cache_snapshot.counters.get(&Counter::CacheHits),
+        Some(&0)
+    );
+    assert_eq!(
+        no_cache_snapshot.counters.get(&Counter::CacheMisses),
+        Some(&0)
+    );
     Ok(())
 }
 
@@ -355,25 +410,12 @@ fn corrupt_cached_case_is_rejected_in_strict_mode_and_recomputed_otherwise()
     )?;
 
     let key = recovery_key(RecoveryCaseKind::Flow, &scope, &options)?;
-    let lease = cache.lease(&key)?;
-    fs::write(
-        lease.directory().join("case.json"),
-        b"not a valid cached Case",
-    )?;
-    let metadata = serde_json::to_value(super::RecoveryMetadataRef {
-        coverage: &first.coverage,
-        omissions: &first.omissions,
-    })?;
-    let status = if first.coverage.is_complete() {
-        StageStatus::Complete
-    } else {
-        StageStatus::Partial
-    };
-    drop(lease.commit(status, metadata)?);
+    store_unparseable_case(&cache, &key, &first)?;
 
     let mut strict = options.clone();
     strict.strict_cache = true;
     let (mut strict_case, strict_scope) = case_and_scope(b"4142", 19)?;
+    let strict_job = Job::new("strict corrupt cache check");
     assert!(
         recover(
             &mut strict_case,
@@ -381,12 +423,13 @@ fn corrupt_cached_case_is_rejected_in_strict_mode_and_recomputed_otherwise()
             &strict_scope,
             &RecoveryContext {
                 cache: Some(&cache),
-                job: None,
+                job: Some(&strict_job),
                 options: &strict,
             },
         )
         .is_err()
     );
+    assert!(strict_job.snapshot()?.cache_fallbacks.records().is_empty());
 
     let job = Job::new("repair corrupt cache entry");
     let (mut fresh_case, fresh_scope) = case_and_scope(b"4142", 19)?;
@@ -406,8 +449,47 @@ fn corrupt_cached_case_is_rejected_in_strict_mode_and_recomputed_otherwise()
         job.snapshot()?.counters.get(&Counter::CacheMisses),
         Some(&1)
     );
+    let snapshot = job.snapshot()?;
+    let fallback = snapshot
+        .cache_fallbacks
+        .records()
+        .iter()
+        .find(|record| {
+            record.stage() == CacheStage::CaseRecovery
+                && record.kind() == CacheFallbackKind::InvalidEntry
+        })
+        .ok_or("normal mode did not record the rejected cached Case")?;
+    assert_eq!(fallback.count(), 1);
+    assert_eq!(
+        fallback.sample_detail(),
+        Some("cached Case could not be restored")
+    );
     assert_eq!(cache.stats()?.entries, 1);
     assert!(cache.lookup(&key, CacheReadPolicy::AllowPartial)?.is_some());
+    Ok(())
+}
+
+fn store_unparseable_case(
+    cache: &Cache,
+    key: &l2_workbench::job::cache::StageKey,
+    result: &super::CachedRecovery,
+) -> Result<(), Box<dyn Error>> {
+    let lease = cache.lease(key)?;
+    fs::write(
+        lease.directory().join("case.json"),
+        b"not a valid cached Case",
+    )?;
+    // Keep the cache receipt valid so recovery reaches the Case parser
+    let metadata = serde_json::to_value(super::RecoveryMetadataRef {
+        coverage: &result.coverage,
+        omissions: &result.omissions,
+    })?;
+    let status = if result.coverage.is_complete() {
+        StageStatus::Complete
+    } else {
+        StageStatus::Partial
+    };
+    drop(lease.commit(status, metadata)?);
     Ok(())
 }
 

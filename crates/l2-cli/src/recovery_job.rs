@@ -3,9 +3,12 @@
 mod checkpoint;
 pub use checkpoint::CheckpointWriter;
 
-use crate::{arguments::RecoveryOptions, outcome::RunOutcome};
+use crate::{
+    arguments::{ProgressMode, RecoveryOptions},
+    outcome::RunOutcome,
+};
 use l2_cli::job_ui::{CancellationHandler, Renderer, RendererOptions};
-use l2_workbench::job::Job;
+use l2_workbench::job::{Job, JobSnapshot};
 use std::{
     error::Error,
     io::{self, Write},
@@ -44,6 +47,9 @@ pub fn run(
     }
     rendering?;
     unregistering?;
+    if !options.quiet && options.progress != ProgressMode::Json {
+        write_cache_fallback_summary(&mut io::stderr().lock(), &job.snapshot()?, options)?;
+    }
     result.map(|complete| {
         if complete {
             RunOutcome::Completed
@@ -52,3 +58,40 @@ pub fn run(
         }
     })
 }
+
+fn write_cache_fallback_summary(
+    output: &mut impl Write,
+    snapshot: &JobSnapshot,
+    options: &RecoveryOptions,
+) -> io::Result<()> {
+    if options.quiet || options.progress == ProgressMode::Json {
+        return Ok(());
+    }
+    let records = snapshot.cache_fallbacks.records();
+    if records.is_empty() {
+        return Ok(());
+    }
+
+    // Keep human diagnostics on one line; JSON progress carries the structured snapshot
+    write!(output, "Cache fallback summary:")?;
+    let mut separator = " ";
+    for record in records {
+        write!(
+            output,
+            "{separator}{} {} x{}",
+            record.stage().label(),
+            record.kind().label(),
+            record.count()
+        )?;
+        separator = "; ";
+        // The shared job model has already escaped and capped this sample
+        if let Some(detail) = record.sample_detail() {
+            write!(output, " ({detail})")?;
+        }
+    }
+    writeln!(output)
+}
+
+#[cfg(test)]
+#[path = "../tests/recovery_job/observability.rs"]
+mod observability_tests;

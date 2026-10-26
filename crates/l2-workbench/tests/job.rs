@@ -350,3 +350,6 @@ fn cloned_job_handles_share_counter_updates_across_threads() -> TestResult {
 
 #[path = "job/cache.rs"]
 mod cache;
+
+#[path = "job/cache_fallback.rs"]
+mod cache_fallback;
