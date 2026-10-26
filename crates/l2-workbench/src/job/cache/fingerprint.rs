@@ -197,21 +197,24 @@ fn sample_digest(mut file: File, size_bytes: u64) -> Result<String> {
         vec![0_u8; usize::try_from(SAMPLE_BYTES).map_err(|_| CacheError::SizeOverflow)?];
     for (offset, length) in ranges {
         file.seek(SeekFrom::Start(offset))?;
-        let length = usize::try_from(length).map_err(|_| CacheError::SizeOverflow)?;
-        let sample = buffer.get_mut(..length).ok_or(CacheError::SizeOverflow)?;
-        if let Err(error) = file.read_exact(sample) {
-            if error.kind() == std::io::ErrorKind::UnexpectedEof {
-                return Err(CacheError::SourceChanged);
-            }
-            return Err(error.into());
-        }
         hasher.update(offset.to_be_bytes());
-        hasher.update(
-            u64::try_from(length)
-                .map_err(|_| CacheError::SizeOverflow)?
-                .to_be_bytes(),
-        );
-        hasher.update(buffer.get(..length).ok_or(CacheError::SizeOverflow)?);
+        hasher.update(length.to_be_bytes());
+
+        // Whole-file samples can span three read buffers without changing their identity
+        let mut remaining = length;
+        while remaining > 0 {
+            let read_length = remaining.min(SAMPLE_BYTES);
+            let count = usize::try_from(read_length).map_err(|_| CacheError::SizeOverflow)?;
+            let sample = buffer.get_mut(..count).ok_or(CacheError::SizeOverflow)?;
+            if let Err(error) = file.read_exact(sample) {
+                if error.kind() == std::io::ErrorKind::UnexpectedEof {
+                    return Err(CacheError::SourceChanged);
+                }
+                return Err(error.into());
+            }
+            hasher.update(sample);
+            remaining -= read_length;
+        }
     }
     Ok(format!("{:x}", hasher.finalize()))
 }

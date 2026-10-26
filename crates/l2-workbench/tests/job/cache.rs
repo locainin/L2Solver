@@ -16,6 +16,9 @@ use l2_workbench::job::{
 };
 use serde_json::{Value, json};
 
+#[path = "cache/fingerprint.rs"]
+mod fingerprint;
+
 fn cache_at(directory: &Path, max_bytes: u64) -> Result<Cache, CacheError> {
     Cache::open_at(directory.join("cache"), directory.join("state"), max_bytes)
 }
