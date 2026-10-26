@@ -24,6 +24,9 @@ _CACHE_STAT_LINES = {
     "Cached stage bytes": "entry_bytes",
     "Job checkpoints": "checkpoints",
 }
+_CACHE_BYTES_VALUE = re.compile(
+    r"([0-9]+)(?: \([0-9]+(?:\.[0-9]+)? (?:B|KiB|MiB|GiB|TiB|PiB|EiB)\))?"
+)
 
 
 def build_extract_command(
@@ -67,9 +70,18 @@ def parse_cache_stats(output):
         key = _CACHE_STAT_LINES.get(label)
         if key is None:
             continue
-        if not separator or key in values or not re.fullmatch(r"[0-9]+", value.strip()):
+        if not separator or key in values:
             raise ValueError(f"invalid cache stats line for {label}")
-        values[key] = int(value.strip())
+        value = value.strip()
+        if key == "entry_bytes":
+            byte_count = _CACHE_BYTES_VALUE.fullmatch(value)
+            if byte_count is None:
+                raise ValueError(f"invalid cache stats line for {label}")
+            values[key] = int(byte_count.group(1))
+        elif re.fullmatch(r"[0-9]+", value):
+            values[key] = int(value)
+        else:
+            raise ValueError(f"invalid cache stats line for {label}")
 
     missing = set(_CACHE_STAT_LINES.values()) - values.keys()
     if missing:
@@ -120,14 +132,18 @@ def read_progress_log(path, maximum_bytes=DEFAULT_MAX_LOG_BYTES):
     cache_hits = []
     cache_misses = []
     phases = set()
-    job_identities = set()
+    job_identity_transitions = []
     index_cache_hit = False
     for event in events:
         created_at = event.get("created_at_unix_ms")
         if created_at is not None:
             if type(created_at) is not int or created_at < 0:
                 raise ValueError("progress log contains an invalid job identity")
-            job_identities.add(created_at)
+            if (
+                not job_identity_transitions
+                or job_identity_transitions[-1] != created_at
+            ):
+                job_identity_transitions.append(created_at)
         for field, values in (
             ("cache_hits", cache_hits),
             ("cache_misses", cache_misses),
@@ -149,8 +165,34 @@ def read_progress_log(path, maximum_bytes=DEFAULT_MAX_LOG_BYTES):
         if ingestion_skipped and type(event_cache_hits) is int and event_cache_hits > 0:
             index_cache_hit = True
 
-    if len(job_identities) > 1:
-        raise ValueError("progress log contains multiple job identities")
+    pending_initial_job = None
+    if len(job_identity_transitions) > 1:
+        # Resume emits one unstarted placeholder before restoring the checkpoint id
+        initial = events[0] if events else None
+        pending_start = (
+            len(job_identity_transitions) == 2
+            and initial is not None
+            and initial.get("created_at_unix_ms") == job_identity_transitions[0]
+            and type(initial.get("elapsed_ms")) is int
+            and initial["elapsed_ms"] == 0
+            and initial.get("current_phase") is None
+            and bool(initial["phases"])
+            and all(
+                isinstance(phase, dict)
+                and phase.get("state") == "pending"
+                and type(phase.get("completed")) is int
+                and phase["completed"] == 0
+                for phase in initial["phases"]
+            )
+            and bool(initial["counters"])
+            and all(
+                type(value) is int and value == 0
+                for value in initial["counters"].values()
+            )
+        )
+        if not pending_start:
+            raise ValueError("progress log contains multiple job identities")
+        pending_initial_job = job_identity_transitions[0]
 
     return {
         "events": len(events),
@@ -158,16 +200,24 @@ def read_progress_log(path, maximum_bytes=DEFAULT_MAX_LOG_BYTES):
         "cache_hits": max(cache_hits, default=0),
         "cache_misses": max(cache_misses, default=0),
         "index_cache_hit": index_cache_hit,
-        "job_created_at_unix_ms": next(iter(job_identities), None),
+        "job_created_at_unix_ms": (
+            job_identity_transitions[-1] if job_identity_transitions else None
+        ),
+        "pending_initial_job_created_at_unix_ms": pending_initial_job,
         "phases_seen": sorted(phases),
     }
 
 
 class ProgressWatcher:
-    """Interrupt only after JSON progress records completed work in a search stage."""
+    """Interrupt after active search progress reports completed or examined work."""
 
     def __init__(
-        self, phase, *, minimum_completed=1, maximum_bytes=DEFAULT_MAX_LOG_BYTES
+        self,
+        phase,
+        *,
+        minimum_completed=1,
+        minimum_candidates_examined=None,
+        maximum_bytes=DEFAULT_MAX_LOG_BYTES,
     ):
         if phase not in SEARCH_PHASES:
             raise ValueError(
@@ -175,10 +225,16 @@ class ProgressWatcher:
             )
         if type(minimum_completed) is not int or minimum_completed <= 0:
             raise ValueError("minimum completed work must be a positive integer")
+        if minimum_candidates_examined is not None and (
+            type(minimum_candidates_examined) is not int
+            or minimum_candidates_examined <= 0
+        ):
+            raise ValueError("minimum candidates examined must be a positive integer")
         if type(maximum_bytes) is not int or maximum_bytes <= 0:
             raise ValueError("progress log budget must be a positive integer")
         self.phase = phase
         self.minimum_completed = minimum_completed
+        self.minimum_candidates_examined = minimum_candidates_examined
         self.maximum_bytes = maximum_bytes
         self.offset = 0
         self.pending = b""
@@ -209,14 +265,30 @@ class ProgressWatcher:
             )
             if event is None or event.get("current_phase") != self.phase:
                 continue
-            if any(
-                isinstance(phase, dict)
-                and phase.get("phase") == self.phase
-                and phase.get("state") == "in_progress"
-                and type(phase.get("completed")) is int
-                and phase["completed"] >= self.minimum_completed
-                for phase in event["phases"]
-            ):
+            active_phase = next(
+                (
+                    phase
+                    for phase in event["phases"]
+                    if isinstance(phase, dict)
+                    and phase.get("phase") == self.phase
+                    and phase.get("state") == "in_progress"
+                ),
+                None,
+            )
+            if active_phase is None:
+                continue
+            completed = active_phase.get("completed")
+            completed_work = (
+                type(completed) is int and completed >= self.minimum_completed
+            )
+            candidates_examined = event["counters"].get("candidates_examined")
+            # Search work can advance while the phase completed count stays at zero
+            candidate_work = (
+                self.minimum_candidates_examined is not None
+                and type(candidates_examined) is int
+                and candidates_examined >= self.minimum_candidates_examined
+            )
+            if completed_work or candidate_work:
                 self.trigger_event = event
                 return True
         return False

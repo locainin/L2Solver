@@ -1,4 +1,4 @@
-"""Run isolated cold, warm, deep-cache, and interrupted recovery experiments."""
+"""Measure cold, reused, recomputed, deep, interrupted, and resumed recovery."""
 
 import argparse
 import json
@@ -125,20 +125,20 @@ def _phase_record(
         environment,
         interrupt_watcher.should_interrupt if interrupt_watcher is not None else None,
     )
-    progress = read_progress_log(process_directory / "stderr.log", max_log_bytes)
     record = {
         "name": name,
         "profile": profile,
         "jobs": jobs,
         "strict_cache": strict_cache,
         "output_path": str(output),
+        "raw_run_receipt": str(process_directory / "raw-run.json"),
         "command": command,
         "exit_code": process["exit_code"],
         "status": process["status"],
         "error": process["error"],
         "elapsed_seconds": process["elapsed_seconds"],
         "metrics": process["metrics"],
-        "progress": progress,
+        "progress": None,
         "interrupt_event": (
             interrupt_watcher.trigger_event if interrupt_watcher is not None else None
         ),
@@ -148,6 +148,32 @@ def _phase_record(
         },
         "cache_before": cache_before,
     }
+    # Keep child metrics even when a later log parser rejects the process output
+    raw_receipt = {
+        "schema_version": 1,
+        "record": record,
+        "process": process,
+        "postprocessing": {
+            "progress_log": "pending",
+            "output_validation": "pending",
+            "cache_stats": "pending",
+        },
+    }
+    raw_receipt_path = process_directory / "raw-run.json"
+    _write_report(raw_receipt_path, raw_receipt)
+
+    try:
+        record["progress"] = read_progress_log(
+            process_directory / "stderr.log", max_log_bytes
+        )
+    except (OSError, TypeError, ValueError) as error:
+        raw_receipt["postprocessing"]["progress_log"] = "failed"
+        raw_receipt["postprocessing"]["progress_log_error"] = str(error)[:2048]
+        _write_report(raw_receipt_path, raw_receipt)
+        raise
+    raw_receipt["record"] = record
+    raw_receipt["postprocessing"]["progress_log"] = "passed"
+    _write_report(raw_receipt_path, raw_receipt)
 
     if process["status"] in ("complete", "partial"):
         record["output"] = validate_export_output(
@@ -156,13 +182,21 @@ def _phase_record(
             max_output_bytes=max_output_bytes,
             max_manifest_bytes=max_manifest_bytes,
         )
+        raw_receipt["postprocessing"]["output_validation"] = "passed"
     elif output.exists():
         raise ValueError("interrupted or failed export unexpectedly published output")
+    else:
+        raw_receipt["postprocessing"]["output_validation"] = "not_applicable"
+    raw_receipt["record"] = record
+    _write_report(raw_receipt_path, raw_receipt)
 
     stats_directory = process_directory.parent / f"{name}-cache-stats"
     stats = _cache_stats(binary, stats_directory, timeout, max_log_bytes, environment)
     record["cache_after"] = cache_snapshot(cache_home, state_home, stats["counts"])
     record["cache_stats"] = stats
+    raw_receipt["record"] = record
+    raw_receipt["postprocessing"]["cache_stats"] = "passed"
+    _write_report(raw_receipt_path, raw_receipt)
     return record
 
 
@@ -259,6 +293,7 @@ def run_recovery_benchmark(
     max_manifest_bytes=DEFAULT_MAX_MANIFEST_BYTES,
     interrupt_phase="transform_discovery",
     minimum_phase_items=1,
+    minimum_candidates_examined=100_000,
 ):
     check_run_id(run_id)
     validate_timeout(timeout)
@@ -281,6 +316,8 @@ def run_recovery_benchmark(
         raise ValueError("interrupt phase must name an active recovery search stage")
     if type(minimum_phase_items) is not int or minimum_phase_items <= 0:
         raise ValueError("minimum completed work must be a positive integer")
+    if type(minimum_candidates_examined) is not int or minimum_candidates_examined <= 0:
+        raise ValueError("minimum candidates examined must be a positive integer")
 
     binary = Path(binary).resolve()
     if not binary.is_file() or not os.access(binary, os.X_OK):
@@ -345,6 +382,7 @@ def run_recovery_benchmark(
             "progress": "json",
             "interrupt_phase": interrupt_phase,
             "minimum_phase_items": minimum_phase_items,
+            "minimum_candidates_examined": minimum_candidates_examined,
             "cache_snapshot_scope": "relative paths and filesystem metadata; file contents excluded",
             "process_metrics_scope": "see each analyzer process receipt",
         },
@@ -379,14 +417,6 @@ def run_recovery_benchmark(
         if cold["progress"]["cache_hits"] != 0:
             raise RuntimeError("cold run unexpectedly reused cached recovery work")
 
-        if shared_output.is_symlink() or not shared_output.is_dir():
-            raise ValueError("cold output is not a driver-owned directory")
-        retained_cold_output = outputs / "cold-retained"
-        if retained_cold_output.exists() or retained_cold_output.is_symlink():
-            raise FileExistsError("cold output retention path already exists")
-        os.rename(shared_output, retained_cold_output)
-        cold["output_retained_at"] = str(retained_cold_output)
-        _write_report(report_path, report)
         warm = _phase_record(
             "warm",
             binary,
@@ -410,10 +440,40 @@ def run_recovery_benchmark(
             raise RuntimeError(f"warm recovery failed with status {warm['status']}")
         if warm["progress"]["cache_hits"] <= 0:
             raise RuntimeError("warm run did not report a cache hit")
-        if not warm["progress"]["index_cache_hit"]:
-            raise RuntimeError("warm run did not reuse the capture index")
         warm["same_output_identity_as_cold"] = (
             cold["output"]["files"] == warm["output"]["files"]
+        )
+        if not warm["same_output_identity_as_cold"]:
+            raise RuntimeError("warm reuse changed the existing output identity")
+        _write_report(report_path, report)
+
+        warm_recompute = _phase_record(
+            "warm_recompute",
+            binary,
+            sample,
+            outputs / "warm-recompute-output",
+            processes / "warm_recompute",
+            shared_cache,
+            shared_state,
+            profile=profile,
+            jobs=jobs,
+            strict_cache=strict_cache,
+            timeout=timeout,
+            max_log_bytes=max_log_bytes,
+            max_output_bytes=max_output_bytes,
+            max_manifest_bytes=max_manifest_bytes,
+            before_stats=warm["cache_after"]["stats"],
+        )
+        report["runs"]["warm_recompute"] = warm_recompute
+        _write_report(report_path, report)
+        if warm_recompute["status"] not in ("complete", "partial"):
+            raise RuntimeError(
+                f"warm recomputation failed with status {warm_recompute['status']}"
+            )
+        if not warm_recompute["progress"]["index_cache_hit"]:
+            raise RuntimeError("warm recomputation did not reuse the capture index")
+        warm_recompute["same_artifact_identity_as_cold"] = (
+            cold["output"]["artifacts"] == warm_recompute["output"]["artifacts"]
         )
         _write_report(report_path, report)
 
@@ -432,7 +492,7 @@ def run_recovery_benchmark(
             max_log_bytes=max_log_bytes,
             max_output_bytes=max_output_bytes,
             max_manifest_bytes=max_manifest_bytes,
-            before_stats=warm["cache_after"]["stats"],
+            before_stats=warm_recompute["cache_after"]["stats"],
         )
         report["runs"]["deep"] = deep
         _write_report(report_path, report)
@@ -444,6 +504,7 @@ def run_recovery_benchmark(
         watcher = ProgressWatcher(
             interrupt_phase,
             minimum_completed=minimum_phase_items,
+            minimum_candidates_examined=minimum_candidates_examined,
             maximum_bytes=max_log_bytes,
         )
         interrupted_output = outputs / "resume-output"
@@ -554,6 +615,7 @@ def parse_arguments(arguments=None):
         "--interrupt-phase", choices=SEARCH_PHASES, default="transform_discovery"
     )
     parser.add_argument("--minimum-phase-items", type=int, default=1)
+    parser.add_argument("--minimum-candidates-examined", type=int, default=100_000)
     add_catalogue_arguments(parser)
     return parser.parse_args(arguments)
 
@@ -591,6 +653,7 @@ def main(arguments=None):
             max_manifest_bytes=options.max_manifest_bytes,
             interrupt_phase=options.interrupt_phase,
             minimum_phase_items=options.minimum_phase_items,
+            minimum_candidates_examined=options.minimum_candidates_examined,
         )
         print(f"Saved {report_directory / 'recovery.json'} ({report['status']})")
         return {"complete": 0, "interrupt_not_observed": 3}.get(report["status"], 1)
