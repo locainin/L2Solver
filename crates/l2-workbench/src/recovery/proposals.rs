@@ -1,4 +1,15 @@
-//! Syntax-gated proposals for canonical byte recipes
+//! Suggest decoding steps from encoding syntax and compression headers
+//!
+//! The recovery scheduler uses these checks to choose plausible decoders for a byte source
+//! One pass checks hexadecimal, four Base64 alphabet/padding combinations, gzip, and zlib
+//! It returns recipes for the shared derivation engine, evidence for each decision, and exact
+//! counts for candidates or assessment details omitted by the caller's retention budgets
+//!
+//! All seven checks run even when the returned lists are full, so a budget-limited report keeps
+//! its omission counts accurate. The caller reserves scan work before requesting a pass
+//! Recipe execution and structural artifact validation happen later in the recovery pipeline
+//! A valid encoding or compression header supports an attempt; the decoded result still needs
+//! its own integrity and format checks
 
 use crate::derivation::{Base64Alphabet, Base64Padding, Operation, Recipe};
 use serde::Serialize;
