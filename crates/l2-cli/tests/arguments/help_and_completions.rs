@@ -87,21 +87,23 @@ fn refine_help_describes_supported_inputs_and_owned_results()
 }
 
 #[test]
-fn each_completion_shell_receives_a_script_with_public_commands() {
+fn each_completion_shell_receives_a_script_with_public_commands()
+-> Result<(), Box<dyn std::error::Error>> {
     for shell in [
         CompletionShell::Bash,
         CompletionShell::Zsh,
         CompletionShell::Fish,
     ] {
         let mut output = Vec::new();
-        arguments::generate_completions(shell, &mut output).expect("script generation succeeds");
-        let script = String::from_utf8(output).expect("completion scripts are UTF-8");
+        arguments::generate_completions(shell, &mut output)?;
+        let script = String::from_utf8(output)?;
 
         assert!(!script.is_empty(), "{shell:?}");
         assert!(script.contains("extract"), "{shell:?}");
         assert!(script.contains("refine"), "{shell:?}");
         assert!(script.contains("cache"), "{shell:?}");
     }
+    Ok(())
 }
 
 #[test]
