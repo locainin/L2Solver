@@ -3,6 +3,7 @@ mod boundaries;
 mod cohorts;
 mod correlation;
 mod framing;
+mod observation;
 mod proposal_length_budget;
 mod reconstructed_framing;
 mod record_discovery;

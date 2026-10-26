@@ -7,6 +7,7 @@ mod correlation_candidates;
 mod error;
 mod framing;
 mod model;
+pub mod observation;
 mod reconstructed_framing;
 mod records;
 mod relational;
