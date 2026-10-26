@@ -17,15 +17,15 @@ use std::{
     time::Duration,
 };
 
-const LONG_HELP: &str = r"Examples:
+const ROOT_EXAMPLES: &str = r"Examples:
   l2solver extract traffic.pcapng -o recovered/
   l2solver refine unknown.bin --dry-run
   l2solver cache stats
   l2solver completions bash
   l2solver inspect traffic.pcapng
-  l2solver workbench --help
+  l2solver workbench --help";
 
-Exit status:
+const LONG_HELP_DETAILS: &str = r"Exit status:
   0  Command completed within its declared scope
   1  Runtime, I/O, or internal failure
   2  Usage error
@@ -52,8 +52,8 @@ Examples:
     version,
     about = "Network forensics and artifact recovery",
     long_about = None,
-    after_help = LONG_HELP,
-    after_long_help = LONG_HELP,
+    after_help = ROOT_EXAMPLES,
+    after_long_help = format!("{ROOT_EXAMPLES}\n\n{LONG_HELP_DETAILS}"),
     arg_required_else_help = true
 )]
 struct Cli {
