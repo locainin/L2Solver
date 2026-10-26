@@ -2,7 +2,7 @@ use super::super::RecordLengthMeaning;
 use super::super::discovery::{
     RecordDiscoveryLimits, RecordSchemaDiscoveryReport, RecordSchemaDiscoverySpace,
 };
-use crate::protocol::ByteOrder;
+use crate::protocol::{ByteOrder, ByteRange};
 use crate::protocol::{
     MAX_COUNTEREXAMPLES, MAX_FRAMING_CANDIDATES, MAX_PROTOCOL_PREFIX_OFFSET, MAX_PROTOCOL_SAMPLES,
 };
@@ -170,12 +170,25 @@ pub struct RecordSchemaProposalReport {
     pub examined_length_checks: usize,
     /// Length field, meaning, and payload boundary combinations skipped at the length-check limit
     pub omitted_length_checks: usize,
+    /// Parsed record-boundary views excluded by the configured sample-memory budget
+    pub omitted_record_views: usize,
+    /// Bounded record spans selected by repeated-boundary analysis in training-message order
+    pub repeated_boundary_cues: Vec<RecordBoundaryCue>,
     /// Compatible combinations beyond the configured canonical parser candidate budget
     pub omitted_schema_combinations: Option<usize>,
     /// Whether all bounded candidate-generation checks and schema combinations were examined
     pub search_exhaustive_within_plan: bool,
     /// Limits of the structural evidence used to build the candidate domains
     pub limitations: [&'static str; 2],
+}
+
+/// One canonical-parser record span selected from a training message
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct RecordBoundaryCue {
+    /// Zero-based position in the training-message list
+    pub message_index: usize,
+    /// Half-open byte interval relative to that training message
+    pub range: ByteRange,
 }
 
 /// Proposal and strict-parser results from one relation-preserving automatic analysis
@@ -187,8 +200,21 @@ pub struct RecordSchemaAnalysisReport {
     pub discovery: Option<RecordSchemaDiscoveryReport>,
 }
 
+/// Independent fixed-layout and repeated-boundary analyses with shared search budgets
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RecordSchemaMultiStrategyAnalysisReport {
+    /// Results from the established one-record-per-message strategy
+    pub fixed_layout: RecordSchemaAnalysisReport,
+    /// Limits assigned to fixed-layout search
+    pub fixed_layout_limits: RecordSchemaProposalLimits,
+    /// Results from length-derived boundaries and bounded record-header views
+    pub repeated_boundaries: Option<RecordSchemaAnalysisReport>,
+    /// Limits assigned to repeated-boundary search, absent when the input caps cannot be split
+    pub repeated_boundary_limits: Option<RecordSchemaProposalLimits>,
+}
+
 pub(super) const LIMITATIONS: [&str; 2] = [
-    "Field relations assume one complete record begins each materialized message; the strict parser must still validate every proposal",
+    "Field relations follow the message or repeated-boundary views named by the selected strategy; the strict parser must still validate every proposal",
     "Sequence base is zero for gap diagnostics and no terminal sequence is inferred",
 ];
 

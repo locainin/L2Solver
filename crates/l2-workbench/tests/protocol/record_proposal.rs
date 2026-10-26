@@ -2,7 +2,9 @@ use l2_workbench::protocol::{
     ByteField, ByteOrder, IntegerField, RecordCount, RecordDiscoveryError, RecordDiscoveryLimits,
     RecordDiscoveryPartition, RecordLengthMeaning, RecordLimits, RecordSchema,
     RecordSchemaDiscoverySpace, RecordSchemaProposalLimits, RecordSchemaProposalValidationBasis,
-    analyze_record_schemas, discover_record_schemas, propose_record_schema_space,
+    analyze_record_schemas, analyze_record_schemas_with_repeated_boundaries,
+    analyze_record_schemas_with_repeated_boundaries_and_offsets, discover_record_schemas,
+    propose_record_schema_space,
 };
 use std::error::Error;
 
@@ -169,6 +171,221 @@ fn proposes_unseen_record_layout_and_validates_each_message_without_assembly()
     assert_eq!(hypothesis.held_out_message_count, 1);
     assert_eq!(hypothesis.training_record_count, 4);
     assert_eq!(hypothesis.held_out_record_count, 1);
+    Ok(())
+}
+
+#[test]
+fn shuffled_sequence_values_still_propose_and_validate_the_record_layout()
+-> Result<(), Box<dyn Error>> {
+    let first = record(b"OBJ", 0, b"first");
+    let second = record(b"OBJ", 3, b"third");
+    let third = record(b"OBJ", 1, b"second");
+    let fourth = record(b"OBJ", 2, b"fourth");
+    let held_out = record(b"OBJ", 4, b"fifth");
+    let training = [
+        first.as_slice(),
+        second.as_slice(),
+        third.as_slice(),
+        fourth.as_slice(),
+    ];
+    let analysis =
+        analyze_record_schemas(&training, &[held_out.as_slice()], proposal_limits(100_000))?;
+    let expected = expected_schema();
+    let space = analysis
+        .proposal
+        .candidate_space
+        .as_ref()
+        .ok_or("shuffled sequence values should retain a candidate space")?;
+
+    assert!(space.identifier_fields.contains(&expected.identifier));
+    assert!(space.sequence_fields.contains(&expected.sequence));
+    assert!(space.length_fields.contains(&expected.length));
+    assert!(space.data_offsets.contains(&expected.data_offset));
+    let discovery = analysis
+        .discovery
+        .as_ref()
+        .ok_or("a candidate space should be strictly validated")?;
+    assert!(
+        discovery
+            .surviving
+            .iter()
+            .any(|hypothesis| hypothesis.schema == expected),
+        "the exact held-out record layout should survive shuffled capture order"
+    );
+    Ok(())
+}
+
+#[test]
+fn repeated_records_in_each_message_propose_and_validate_the_record_layout()
+-> Result<(), Box<dyn Error>> {
+    let training_records = [
+        [record(b"OB", 0, b"a"), record(b"OB", 4, b"bc")],
+        [record(b"OB", 6, b"def"), record(b"OB", 2, b"ghij")],
+        [record(b"OB", 1, b"klmno"), record(b"OB", 7, b"p")],
+        [record(b"OB", 3, b"qr"), record(b"OB", 5, b"stuv")],
+    ];
+    let training = training_records
+        .iter()
+        .map(|records| records.concat())
+        .collect::<Vec<_>>();
+    let held_out = [record(b"OB", 8, b"wxyz"), record(b"OB", 9, b"012")].concat();
+    let training_messages = training.iter().map(Vec::as_slice).collect::<Vec<_>>();
+    let expected = RecordSchema {
+        records_offset: 0,
+        count: RecordCount::UntilEnd,
+        identifier: ByteField {
+            offset: 0,
+            width: 2,
+        },
+        sequence: IntegerField {
+            offset: 2,
+            width: 2,
+            byte_order: ByteOrder::LittleEndian,
+        },
+        length: IntegerField {
+            offset: 4,
+            width: 4,
+            byte_order: ByteOrder::BigEndian,
+        },
+        data_offset: 8,
+        length_meaning: RecordLengthMeaning::PayloadBytes,
+        sequence_base: 0,
+        terminal_sequence: None,
+    };
+
+    let analysis = analyze_record_schemas_with_repeated_boundaries(
+        &training_messages,
+        &[held_out.as_slice()],
+        proposal_limits(100_000),
+    )?;
+    let repeated = analysis
+        .repeated_boundaries
+        .as_ref()
+        .ok_or("the repeated-boundary strategy should receive a shared budget")?;
+    assert_eq!(
+        analysis.fixed_layout_limits.max_length_checks
+            + analysis
+                .repeated_boundary_limits
+                .ok_or("repeated-boundary limits should be retained")?
+                .max_length_checks,
+        proposal_limits(100_000).max_length_checks,
+        "the two strategies should share the configured length-check budget"
+    );
+    let space = repeated
+        .proposal
+        .candidate_space
+        .as_ref()
+        .ok_or("repeated records should yield a bounded candidate space")?;
+    assert!(space.identifier_fields.contains(&expected.identifier));
+    assert!(space.sequence_fields.contains(&expected.sequence));
+    assert!(space.length_fields.contains(&expected.length));
+    assert!(space.data_offsets.contains(&expected.data_offset));
+    assert!(space.length_meanings.contains(&expected.length_meaning));
+
+    let discovery = repeated
+        .discovery
+        .as_ref()
+        .ok_or("the proposed layout should be strictly parsed")?;
+    assert!(
+        discovery
+            .surviving
+            .iter()
+            .any(|hypothesis| hypothesis.schema == expected),
+        "the same learned layout should parse the held-out concatenated message"
+    );
+    for (message_index, records) in training_records.iter().enumerate() {
+        let mut start = 0;
+        for record in records {
+            let end = start + record.len();
+            assert!(
+                repeated.proposal.repeated_boundary_cues.iter().any(|cue| {
+                    cue.message_index == message_index
+                        && cue.range.start == start
+                        && cue.range.end == end
+                }),
+                "canonical record boundary should be reported for training message {message_index}"
+            );
+            start = end;
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn repeated_boundary_strategy_keeps_discovery_only_evidence_from_one_message()
+-> Result<(), Box<dyn Error>> {
+    let message = [record(b"OB", 0, b"first"), record(b"OB", 1, b"second")].concat();
+    let analysis = analyze_record_schemas_with_repeated_boundaries(
+        &[message.as_slice()],
+        &[],
+        proposal_limits(20_000),
+    )?;
+    let repeated = analysis
+        .repeated_boundaries
+        .ok_or("a single training message can carry repeated records")?;
+    let space = repeated
+        .proposal
+        .candidate_space
+        .as_ref()
+        .ok_or("repeated records should provide an independent schema hypothesis")?;
+    assert!(space.counts.contains(&RecordCount::UntilEnd));
+    assert_eq!(
+        repeated.proposal.validation_basis,
+        RecordSchemaProposalValidationBasis::DiscoveryOnly
+    );
+    assert_eq!(repeated.proposal.held_out_message_count, 0);
+    assert!(repeated.discovery.is_some());
+    Ok(())
+}
+
+#[test]
+fn repeated_boundary_view_limit_reports_omissions_without_claiming_exhaustive_search()
+-> Result<(), Box<dyn Error>> {
+    let messages = [
+        [record(b"OB", 0, b"a"), record(b"OB", 4, b"bc")].concat(),
+        [record(b"OB", 6, b"def"), record(b"OB", 2, b"ghij")].concat(),
+        [record(b"OB", 1, b"klmno"), record(b"OB", 7, b"p")].concat(),
+        [record(b"OB", 3, b"qr"), record(b"OB", 5, b"stuv")].concat(),
+    ];
+    let training = messages.iter().map(Vec::as_slice).collect::<Vec<_>>();
+    let mut limits = proposal_limits(10_000);
+    limits.max_field_offset = 8;
+    limits.max_length_checks = 2_000;
+    limits.discovery.record_limits.max_records = messages.len();
+
+    let analysis = analyze_record_schemas_with_repeated_boundaries(&training, &[], limits)?;
+    let repeated = analysis
+        .repeated_boundaries
+        .ok_or("the repeated strategy should receive a shared budget")?;
+
+    assert!(repeated.proposal.omitted_record_views > 0);
+    assert!(repeated.proposal.repeated_boundary_cues.len() <= messages.len());
+    assert!(!repeated.proposal.search_exhaustive_within_plan);
+    assert!(repeated.discovery.is_none());
+    Ok(())
+}
+
+#[test]
+fn explicit_training_header_offsets_are_included_in_the_fixed_schema_search()
+-> Result<(), Box<dyn Error>> {
+    let first = record(b"OBJ", 1, b"first");
+    let second = record(b"OBJ", 2, b"second");
+    let third = record(b"OBJ", 3, b"third");
+    let training = [first.as_slice(), second.as_slice(), third.as_slice()];
+    let analysis = analyze_record_schemas_with_repeated_boundaries_and_offsets(
+        &training,
+        &[],
+        proposal_limits(10_000),
+        &[14],
+    )?;
+    let space = analysis
+        .fixed_layout
+        .proposal
+        .candidate_space
+        .as_ref()
+        .ok_or("expected the fixed-layout field evidence to yield a candidate space")?;
+
+    assert!(space.data_offsets.contains(&14));
     Ok(())
 }
 
@@ -478,17 +695,15 @@ fn length_search_reports_exact_and_omitted_checks_at_its_budget_boundary()
 }
 
 #[test]
-fn skips_length_search_when_no_sequence_pair_can_form_a_schema() -> Result<(), Box<dyn Error>> {
+fn fixed_layout_path_skips_length_search_without_sequence_evidence() -> Result<(), Box<dyn Error>> {
     let message = [0_u8; 24];
-    let report = propose_record_schema_space(
-        &[message.as_slice()],
-        &[],
-        RecordSchemaProposalLimits::default(),
-    )?;
+    let limits = RecordSchemaProposalLimits::default();
+    let report = propose_record_schema_space(&[message.as_slice()], &[], limits)?;
 
     assert!(report.candidate_space.is_none());
     assert_eq!(report.examined_pair_checks, 0);
     assert_eq!(report.examined_length_checks, 0);
+    assert!(report.examined_length_checks <= limits.max_length_checks);
     assert_eq!(report.omitted_length_checks, 0);
     assert!(report.search_exhaustive_within_plan);
     Ok(())

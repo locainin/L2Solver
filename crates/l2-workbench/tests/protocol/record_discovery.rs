@@ -127,6 +127,51 @@ fn parses_individual_messages_with_interleaved_identifiers() -> Result<(), Box<d
 }
 
 #[test]
+fn one_message_with_repeated_records_can_produce_training_only_schema_evidence()
+-> Result<(), Box<dyn Error>> {
+    let mut message = Vec::new();
+    push_record(&mut message, b"A1", 0, b"first");
+    push_record(&mut message, b"A1", 1, b"second");
+    let space = RecordSchemaDiscoverySpace {
+        identifier_fields: vec![ByteField {
+            offset: 0,
+            width: 2,
+        }],
+        sequence_fields: vec![IntegerField {
+            offset: 2,
+            width: 1,
+            byte_order: ByteOrder::BigEndian,
+        }],
+        length_fields: vec![IntegerField {
+            offset: 3,
+            width: 1,
+            byte_order: ByteOrder::BigEndian,
+        }],
+        records_offsets: vec![0],
+        counts: vec![RecordCount::UntilEnd],
+        data_offsets: vec![4],
+        length_meanings: vec![RecordLengthMeaning::PayloadBytes],
+        sequence_base: 0,
+    };
+
+    let report = discover_record_schemas(&[message.as_slice()], &[], &space, discovery_limits(8))?;
+
+    assert_eq!(
+        report.validation_basis,
+        RecordDiscoveryValidationBasis::TrainingOnly
+    );
+    assert_eq!(report.surviving.len(), 1);
+    let hypothesis = report
+        .surviving
+        .first()
+        .ok_or("expected one schema hypothesis")?;
+    assert_eq!(hypothesis.training_message_count, 1);
+    assert_eq!(hypothesis.training_record_count, 2);
+    assert_eq!(hypothesis.held_out_message_count, 0);
+    Ok(())
+}
+
+#[test]
 fn retains_ambiguous_fields() -> Result<(), Box<dyn Error>> {
     let mut first = Vec::new();
     push_record(&mut first, b"A1", 0, b"one");

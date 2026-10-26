@@ -17,7 +17,7 @@ use std::collections::HashSet;
 /// Empty holdout input selects training-only validation, which the report identifies explicitly
 ///
 /// # Errors
-/// Rejects empty domains, insufficient messages, invalid limits, and aggregate resource excess
+/// Rejects empty domains or training input, invalid limits, and aggregate resource excess
 pub fn discover_record_schemas(
     training_messages: &[&[u8]],
     held_out_messages: &[&[u8]],
@@ -79,10 +79,9 @@ fn validate_messages(
     held_out_messages: &[&[u8]],
     limits: RecordDiscoveryLimits,
 ) -> Result<(), RecordDiscoveryError> {
-    // Training needs multiple examples; held-out evidence is optional
-    if training_messages.len() < 2 {
-        return Err(RecordDiscoveryError::InsufficientMessages {
-            training: training_messages.len(),
+    // One training message can support structural parsing; additional messages add corroboration
+    if training_messages.is_empty() {
+        return Err(RecordDiscoveryError::NoTrainingMessages {
             held_out: held_out_messages.len(),
         });
     }

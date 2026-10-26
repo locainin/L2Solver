@@ -23,6 +23,8 @@ pub use model::{
 };
 pub use parse::{parse_records, parse_records_with_limits};
 pub use proposal::{
-    RecordSchemaAnalysisReport, RecordSchemaProposalLimits, RecordSchemaProposalReport,
-    RecordSchemaProposalValidationBasis, analyze_record_schemas, propose_record_schema_space,
+    RecordBoundaryCue, RecordSchemaAnalysisReport, RecordSchemaMultiStrategyAnalysisReport,
+    RecordSchemaProposalLimits, RecordSchemaProposalReport, RecordSchemaProposalValidationBasis,
+    analyze_record_schemas, analyze_record_schemas_with_repeated_boundaries,
+    analyze_record_schemas_with_repeated_boundaries_and_offsets, propose_record_schema_space,
 };
