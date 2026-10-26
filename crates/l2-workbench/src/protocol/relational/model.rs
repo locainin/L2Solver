@@ -235,12 +235,129 @@ pub struct RelationalAppliedOutput {
     pub seed_sample: u64,
     /// Payload samples used in their retained capture order
     pub payload_samples: Vec<u64>,
+    /// Half-open ranges aligned with payload samples in the concatenated decoded bytes
+    pub payload_ranges: Vec<crate::protocol::ByteRange>,
     /// Complete transformed bytes for this session
     pub bytes: Vec<u8>,
     /// True when the rule's parser scope was validated during this session replay
     pub parser_validation_deferred: bool,
     /// Canonical derivation work consumed while replaying the rule
     pub work_bytes: usize,
+}
+
+/// Read-only context supplied to an evaluator before candidate retention
+#[derive(Clone, Copy, Debug)]
+pub struct RelationalTransformEvaluationContext<'a> {
+    /// Complete sessions used to learn the frozen rule
+    pub discovery_sessions: &'a [RelationalSessionId],
+    /// Complete sessions used to falsify the frozen rule
+    pub heldout_sessions: &'a [RelationalSessionId],
+    /// Remaining shared search and structural-evaluation work allowance
+    pub work_bytes_remaining: usize,
+}
+
+/// Output and assessment bounds for evaluated candidate retention
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct RelationalTransformEvaluationOptions {
+    /// Maximum combined decoded output bytes retained for selected candidates
+    ///
+    /// This is validated against the plan's aggregate byte limit
+    /// A zero value disables output capture
+    pub max_retained_output_bytes: usize,
+}
+
+/// Deterministic priority and caller-owned evidence produced by a candidate evaluator
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RelationalCandidateEvaluation<T> {
+    /// Higher values replace lower-priority retained candidates; ties keep earlier candidates
+    pub priority: u8,
+    /// Structural-evaluation work charged to the shared plan budget
+    pub work_bytes: usize,
+    /// Compact structural result or caller-specific evidence for the retained candidate
+    pub assessment: T,
+}
+
+/// Decoded outputs captured for one retained candidate
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RelationalCandidateOutputs {
+    /// Successful same-pass outputs from discovery sessions
+    pub discovery: Vec<RelationalAppliedOutput>,
+    /// Successful same-pass outputs from held-out sessions
+    pub heldout: Vec<RelationalAppliedOutput>,
+}
+
+/// Caller assessment aligned with one candidate in the evaluated report
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RelationalRetainedEvaluation<T> {
+    /// Caller assessment made before candidate retention
+    pub assessment: T,
+    /// Captured outputs, absent when capture was disabled or the byte bound was reached
+    pub outputs: Option<RelationalCandidateOutputs>,
+}
+
+/// Search report and bounded evaluator results for retained candidates
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RelationalCandidateEvaluationReport<T> {
+    /// Search accounting and retained frozen rules
+    pub report: RelationalTransformReport,
+    /// Evaluations aligned by index with `report.candidates`
+    pub evaluations: Vec<RelationalRetainedEvaluation<T>>,
+    /// Decoded output bytes retained across all candidate evaluations
+    pub output_bytes_retained: usize,
+    /// Retained candidates whose output bytes could not fit the configured byte bound
+    pub output_capture_omissions: usize,
+    /// Whether every retained candidate output set requested by the byte bound was captured
+    pub output_capture_complete: bool,
+}
+
+/// Search or evaluator failure from callback-based candidate retention
+#[derive(Debug)]
+#[non_exhaustive]
+pub enum RelationalEvaluationError<E> {
+    /// Candidate discovery or canonical replay failed
+    Search(RelationalTransformError),
+    /// The caller-provided evaluator failed
+    Evaluator(E),
+    /// The evaluator reported more work than remained in the shared search budget
+    EvaluatorWorkLimit { requested: usize, remaining: usize },
+}
+
+impl<E> fmt::Display for RelationalEvaluationError<E>
+where
+    E: fmt::Display,
+{
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Search(error) => write!(formatter, "relational search: {error}"),
+            Self::Evaluator(error) => write!(formatter, "relational candidate evaluation: {error}"),
+            Self::EvaluatorWorkLimit {
+                requested,
+                remaining,
+            } => write!(
+                formatter,
+                "relational candidate evaluator used {requested} work bytes; {remaining} remained"
+            ),
+        }
+    }
+}
+
+impl<E> Error for RelationalEvaluationError<E>
+where
+    E: Error + 'static,
+{
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        match self {
+            Self::Search(error) => Some(error),
+            Self::Evaluator(error) => Some(error),
+            Self::EvaluatorWorkLimit { .. } => None,
+        }
+    }
+}
+
+impl<E> From<RelationalTransformError> for RelationalEvaluationError<E> {
+    fn from(error: RelationalTransformError) -> Self {
+        Self::Search(error)
+    }
 }
 
 /// Explicit family and finite parameters for a relational transformation
@@ -399,8 +516,8 @@ pub enum RelationalTransformStatus {
     DiscoveryOnlyHypothesis,
     /// The frozen rule passed the exact parser checks for every held-out session
     HeldoutConstraintsSatisfied,
-    /// Frozen rule passed per-session checks and awaits its across-session parser gate
-    TransformSupportedAcrossSessions,
+    /// Frozen locator and transform checks passed; the across-session parser gate is pending
+    AwaitingAcrossSessionValidation,
     /// At least one held-out session contradicted the frozen rule
     ContradictedByHeldoutSession,
     /// Discovery support was incomplete, so held-out application was not justified

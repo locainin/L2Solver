@@ -6,6 +6,7 @@ mod locator;
 mod replay;
 
 pub use discovery::{
-    infer_relational_transform_candidates, infer_relational_transform_candidates_with_job,
+    infer_relational_transform_candidates, infer_relational_transform_candidates_with_evaluator,
+    infer_relational_transform_candidates_with_job,
 };
 pub use replay::apply_relational_transform_rule;

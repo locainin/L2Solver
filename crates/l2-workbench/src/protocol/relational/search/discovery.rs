@@ -1,24 +1,27 @@
 use super::super::model::{
-    RelationalCounterReset, RelationalFit, RelationalFitStatus, RelationalOperationTemplate,
-    RelationalRecordSample, RelationalSearchLimit, RelationalSha256CounterXor,
-    RelationalTransformCandidate, RelationalTransformError, RelationalTransformLimits,
-    RelationalTransformPlan, RelationalTransformReport, RelationalTransformRule,
-    RelationalTransformStatus,
+    RelationalAppliedOutput, RelationalCandidateEvaluation, RelationalCandidateEvaluationReport,
+    RelationalCandidateOutputs, RelationalCounterReset, RelationalEvaluationError, RelationalFit,
+    RelationalFitStatus, RelationalOperationTemplate, RelationalRecordSample,
+    RelationalRetainedEvaluation, RelationalSearchLimit, RelationalSha256CounterXor,
+    RelationalTransformCandidate, RelationalTransformError, RelationalTransformEvaluationContext,
+    RelationalTransformEvaluationOptions, RelationalTransformLimits, RelationalTransformPlan,
+    RelationalTransformReport, RelationalTransformRule, RelationalTransformStatus,
 };
 use super::{
     input::{
         SessionGroup, build_selector_indexes, group_sessions, shared_selectors, validate_plan,
     },
     locator::{LocatorCandidate, locator_ranges_overlap, payload_locators, seed_locators},
-    replay::{candidate_status, empty_fit, evaluate_split},
+    replay::{EvaluatedSplit, candidate_status, empty_fit, evaluate_split},
 };
 use crate::{
     job::{Counter, Job, Phase},
     protocol::{HoldoutBasis, RelationalSessionId},
 };
+use std::convert::Infallible;
 
-struct SearchState {
-    candidates: Vec<RelationalTransformCandidate>,
+struct SearchState<T> {
+    candidates: Vec<RetainedCandidate<T>>,
     candidates_examined: usize,
     omitted_candidates: usize,
     omitted_candidates_exact: bool,
@@ -27,9 +30,49 @@ struct SearchState {
     search_limit: Option<RelationalSearchLimit>,
     search_limits: Vec<RelationalSearchLimit>,
     locator_candidates_examined: usize,
+    output_bytes_retained: usize,
+    output_capture_omissions: usize,
 }
 
-impl SearchState {
+struct RetainedCandidate<T> {
+    candidate: RelationalTransformCandidate,
+    priority: u8,
+    assessment: T,
+    outputs: Option<RelationalCandidateOutputs>,
+    captured_output_bytes: usize,
+    output_capture_omitted: bool,
+    search_order: usize,
+}
+
+struct CandidateRetention<T> {
+    candidate: RelationalTransformCandidate,
+    evaluation: RelationalCandidateEvaluation<T>,
+    discovery_outputs: Vec<RelationalAppliedOutput>,
+    heldout_outputs: Vec<RelationalAppliedOutput>,
+    search_order: usize,
+}
+
+#[derive(Clone, Copy)]
+enum RetentionMode {
+    PerLocatorPair,
+    EvaluatorPriority,
+}
+
+#[derive(Clone, Copy)]
+struct SearchSettings {
+    retention_mode: RetentionMode,
+    max_retained_output_bytes: usize,
+    capture_outputs_for_evaluator: bool,
+}
+
+#[derive(Clone, Copy)]
+struct CandidateParameters {
+    operation: RelationalSha256CounterXor,
+    counter_reset: RelationalCounterReset,
+    parser_format: crate::artifact::ArtifactValidationFormat,
+}
+
+impl<T> SearchState<T> {
     const fn new() -> Self {
         Self {
             candidates: Vec::new(),
@@ -41,6 +84,8 @@ impl SearchState {
             search_limit: None,
             search_limits: Vec::new(),
             locator_candidates_examined: 0,
+            output_bytes_retained: 0,
+            output_capture_omissions: 0,
         }
     }
 
@@ -99,13 +144,119 @@ pub fn infer_relational_transform_candidates_with_job(
     plan: &RelationalTransformPlan,
     job: Option<&Job>,
 ) -> Result<RelationalTransformReport, RelationalTransformError> {
+    let mut evaluator =
+        |_: &RelationalTransformEvaluationContext<'_>,
+         _: &RelationalTransformCandidate,
+         _: &[RelationalAppliedOutput],
+         _: &[RelationalAppliedOutput]| { Ok::<_, Infallible>(no_candidate_evaluation()) };
+    match infer_with_evaluator(
+        samples,
+        plan,
+        job,
+        RelationalTransformEvaluationOptions::default(),
+        RetentionMode::PerLocatorPair,
+        false,
+        &mut evaluator,
+    ) {
+        Ok(evaluated) => Ok(evaluated.report),
+        Err(RelationalEvaluationError::Search(error)) => Err(error),
+        Err(RelationalEvaluationError::Evaluator(never)) => match never {},
+        Err(RelationalEvaluationError::EvaluatorWorkLimit { .. }) => {
+            Err(RelationalTransformError::InvalidPlan(
+                "default candidate evaluator exceeded its work allowance",
+            ))
+        }
+    }
+}
+
+const fn no_candidate_evaluation() -> RelationalCandidateEvaluation<()> {
+    RelationalCandidateEvaluation {
+        priority: 0,
+        work_bytes: 0,
+        assessment: (),
+    }
+}
+
+/// Evaluate frozen candidates before a bounded priority-based retention step
+///
+/// The callback sees successful decoded outputs from the same discovery and held-out replay
+/// passes. Candidate fit checks preserve each session's pass, contradiction, or unresolved state
+/// Reported callback work is charged to the shared limit before retention. Its assessment is stored
+/// only for retained candidates, while optional output capture stays within the explicit global
+/// byte allowance. Higher priorities replace lower priorities; ties preserve earlier search results
+/// Assessment size is caller controlled, so assessments should remain compact
+///
+/// # Errors
+/// Returns search, callback, or evaluator-budget errors
+pub fn infer_relational_transform_candidates_with_evaluator<T, E, F>(
+    samples: &[RelationalRecordSample<'_>],
+    plan: &RelationalTransformPlan,
+    job: Option<&Job>,
+    options: RelationalTransformEvaluationOptions,
+    mut evaluator: F,
+) -> Result<RelationalCandidateEvaluationReport<T>, RelationalEvaluationError<E>>
+where
+    F: FnMut(
+        &RelationalTransformEvaluationContext<'_>,
+        &RelationalTransformCandidate,
+        &[RelationalAppliedOutput],
+        &[RelationalAppliedOutput],
+    ) -> Result<RelationalCandidateEvaluation<T>, E>,
+{
+    infer_with_evaluator(
+        samples,
+        plan,
+        job,
+        options,
+        RetentionMode::EvaluatorPriority,
+        true,
+        &mut evaluator,
+    )
+}
+
+fn infer_with_evaluator<T, E, F>(
+    samples: &[RelationalRecordSample<'_>],
+    plan: &RelationalTransformPlan,
+    job: Option<&Job>,
+    options: RelationalTransformEvaluationOptions,
+    retention_mode: RetentionMode,
+    capture_outputs_for_evaluator: bool,
+    evaluator: &mut F,
+) -> Result<RelationalCandidateEvaluationReport<T>, RelationalEvaluationError<E>>
+where
+    F: FnMut(
+        &RelationalTransformEvaluationContext<'_>,
+        &RelationalTransformCandidate,
+        &[RelationalAppliedOutput],
+        &[RelationalAppliedOutput],
+    ) -> Result<RelationalCandidateEvaluation<T>, E>,
+{
     if let Some(job) = job {
-        job.check_cancelled()?;
+        job.check_cancelled()
+            .map_err(RelationalTransformError::from)?;
     }
     validate_plan(plan)?;
+    if options.max_retained_output_bytes > plan.limits.max_total_bytes {
+        return Err(RelationalEvaluationError::Search(
+            RelationalTransformError::InvalidPlan(
+                "retained evaluator outputs exceed the aggregate byte limit",
+            ),
+        ));
+    }
     let prepared = prepare_search(samples, plan)?;
-    let search = search_candidates(samples, plan, job, &prepared)?;
-    Ok(build_report(search, prepared, plan.limits))
+    let search = search_candidates(
+        samples,
+        plan,
+        job,
+        &prepared,
+        SearchSettings {
+            retention_mode,
+            max_retained_output_bytes: options.max_retained_output_bytes,
+            capture_outputs_for_evaluator,
+        },
+        evaluator,
+    )?;
+    Ok(build_report(search, prepared, plan.limits)?)
 }
 
 fn prepare_search(
@@ -151,12 +302,22 @@ fn prepare_search(
     })
 }
 
-fn search_candidates(
+fn search_candidates<T, E, F>(
     samples: &[RelationalRecordSample<'_>],
     plan: &RelationalTransformPlan,
     job: Option<&Job>,
     prepared: &PreparedSearch,
-) -> Result<SearchState, RelationalTransformError> {
+    settings: SearchSettings,
+    evaluator: &mut F,
+) -> Result<SearchState<T>, RelationalEvaluationError<E>>
+where
+    F: FnMut(
+        &RelationalTransformEvaluationContext<'_>,
+        &RelationalTransformCandidate,
+        &[RelationalAppliedOutput],
+        &[RelationalAppliedOutput],
+    ) -> Result<RelationalCandidateEvaluation<T>, E>,
+{
     let mut search = SearchState::new();
     search.locator_candidates_examined =
         prepared.seed_locators.len() + prepared.payload_locators.len();
@@ -165,8 +326,9 @@ fn search_candidates(
         plan,
         job,
         prepared,
+        settings,
     }
-    .search_all(&mut search)?;
+    .search_all(&mut search, evaluator)?;
     Ok(search)
 }
 
@@ -175,10 +337,23 @@ struct SearchContext<'a, 'bytes> {
     plan: &'a RelationalTransformPlan,
     job: Option<&'a Job>,
     prepared: &'a PreparedSearch,
+    settings: SearchSettings,
 }
 
 impl SearchContext<'_, '_> {
-    fn search_all(&self, search: &mut SearchState) -> Result<(), RelationalTransformError> {
+    fn search_all<T, E, F>(
+        &self,
+        search: &mut SearchState<T>,
+        evaluator: &mut F,
+    ) -> Result<(), RelationalEvaluationError<E>>
+    where
+        F: FnMut(
+            &RelationalTransformEvaluationContext<'_>,
+            &RelationalTransformCandidate,
+            &[RelationalAppliedOutput],
+            &[RelationalAppliedOutput],
+        ) -> Result<RelationalCandidateEvaluation<T>, E>,
+    {
         if !self.prepared.locators_complete {
             search.stop(RelationalSearchLimit::LocatorCount);
             search.omitted_candidates_exact = false;
@@ -195,7 +370,7 @@ impl SearchContext<'_, '_> {
                 ) {
                     continue;
                 }
-                if !self.search_locator_pair(search, seed_locator, payload_locator)? {
+                if !self.search_locator_pair(search, seed_locator, payload_locator, evaluator)? {
                     return Ok(());
                 }
             }
@@ -203,12 +378,21 @@ impl SearchContext<'_, '_> {
         Ok(())
     }
 
-    fn search_locator_pair(
+    fn search_locator_pair<T, E, F>(
         &self,
-        search: &mut SearchState,
+        search: &mut SearchState<T>,
         seed_locator: &LocatorCandidate,
         payload_locator: &LocatorCandidate,
-    ) -> Result<bool, RelationalTransformError> {
+        evaluator: &mut F,
+    ) -> Result<bool, RelationalEvaluationError<E>>
+    where
+        F: FnMut(
+            &RelationalTransformEvaluationContext<'_>,
+            &RelationalTransformCandidate,
+            &[RelationalAppliedOutput],
+            &[RelationalAppliedOutput],
+        ) -> Result<RelationalCandidateEvaluation<T>, E>,
+    {
         for counter_width in &self.plan.counter_widths {
             for initial_counter in &self.plan.initial_counters {
                 if *initial_counter > counter_width.maximum_counter() {
@@ -220,6 +404,7 @@ impl SearchContext<'_, '_> {
                     payload_locator,
                     *counter_width,
                     *initial_counter,
+                    evaluator,
                 )? {
                     return Ok(false);
                 }
@@ -228,14 +413,23 @@ impl SearchContext<'_, '_> {
         Ok(true)
     }
 
-    fn search_counter_options(
+    fn search_counter_options<T, E, F>(
         &self,
-        search: &mut SearchState,
+        search: &mut SearchState<T>,
         seed_locator: &LocatorCandidate,
         payload_locator: &LocatorCandidate,
         counter_width: crate::derivation::CounterWidth,
         initial_counter: u64,
-    ) -> Result<bool, RelationalTransformError> {
+        evaluator: &mut F,
+    ) -> Result<bool, RelationalEvaluationError<E>>
+    where
+        F: FnMut(
+            &RelationalTransformEvaluationContext<'_>,
+            &RelationalTransformCandidate,
+            &[RelationalAppliedOutput],
+            &[RelationalAppliedOutput],
+        ) -> Result<RelationalCandidateEvaluation<T>, E>,
+    {
         for counter_byte_order in &self.plan.counter_byte_orders {
             for seed_order in &self.plan.seed_orders {
                 for counter_reset in &self.plan.counter_resets {
@@ -244,14 +438,17 @@ impl SearchContext<'_, '_> {
                             search,
                             seed_locator,
                             payload_locator,
-                            RelationalSha256CounterXor {
-                                initial_counter,
-                                counter_width,
-                                counter_byte_order: *counter_byte_order,
-                                seed_order: *seed_order,
+                            CandidateParameters {
+                                operation: RelationalSha256CounterXor {
+                                    initial_counter,
+                                    counter_width,
+                                    counter_byte_order: *counter_byte_order,
+                                    seed_order: *seed_order,
+                                },
+                                counter_reset: *counter_reset,
+                                parser_format: *parser_format,
                             },
-                            *counter_reset,
-                            *parser_format,
+                            evaluator,
                         )? {
                             return Ok(false);
                         }
@@ -262,15 +459,22 @@ impl SearchContext<'_, '_> {
         Ok(true)
     }
 
-    fn try_candidate(
+    fn try_candidate<T, E, F>(
         &self,
-        search: &mut SearchState,
+        search: &mut SearchState<T>,
         seed_locator: &LocatorCandidate,
         payload_locator: &LocatorCandidate,
-        operation: RelationalSha256CounterXor,
-        counter_reset: RelationalCounterReset,
-        parser_format: crate::artifact::ArtifactValidationFormat,
-    ) -> Result<bool, RelationalTransformError> {
+        parameters: CandidateParameters,
+        evaluator: &mut F,
+    ) -> Result<bool, RelationalEvaluationError<E>>
+    where
+        F: FnMut(
+            &RelationalTransformEvaluationContext<'_>,
+            &RelationalTransformCandidate,
+            &[RelationalAppliedOutput],
+            &[RelationalAppliedOutput],
+        ) -> Result<RelationalCandidateEvaluation<T>, E>,
+    {
         if search.candidates_examined == self.plan.limits.max_candidates {
             search.stop(RelationalSearchLimit::CandidateCount);
             search.omitted_candidates = search.omitted_candidates.checked_add(1).ok_or(
@@ -282,110 +486,181 @@ impl SearchContext<'_, '_> {
             return Ok(false);
         }
         if let Some(job) = self.job {
-            job.check_cancelled()?;
-            job.record_work(Phase::TransformDiscovery, Counter::CandidatesExamined, 1)?;
+            job.check_cancelled()
+                .map_err(RelationalTransformError::from)?;
+            job.record_work(Phase::TransformDiscovery, Counter::CandidatesExamined, 1)
+                .map_err(RelationalTransformError::from)?;
         }
         search.candidates_examined += 1;
-        let rule = make_rule(
-            seed_locator,
-            payload_locator,
-            operation,
-            counter_reset,
-            parser_format,
-            self.plan,
-        );
-        evaluate_candidate(
-            self.samples,
-            self.plan,
-            self.job,
-            self.prepared,
-            search,
-            rule,
-        )
+        let rule = make_rule(seed_locator, payload_locator, parameters, self.plan);
+        self.evaluate_candidate(search, rule, evaluator)
     }
 }
 
 fn make_rule(
     seed_locator: &LocatorCandidate,
     payload_locator: &LocatorCandidate,
-    operation: RelationalSha256CounterXor,
-    counter_reset: RelationalCounterReset,
-    parser_format: crate::artifact::ArtifactValidationFormat,
+    parameters: CandidateParameters,
     plan: &RelationalTransformPlan,
 ) -> RelationalTransformRule {
     RelationalTransformRule {
         seed_locator: seed_locator.locator.clone(),
         payload_locator: payload_locator.locator.clone(),
-        operation: RelationalOperationTemplate::Sha256CounterXor(operation),
-        counter_reset,
-        parser_format,
+        operation: RelationalOperationTemplate::Sha256CounterXor(parameters.operation),
+        counter_reset: parameters.counter_reset,
+        parser_format: parameters.parser_format,
         parser_scope: plan.parser_scope,
     }
 }
 
-fn evaluate_candidate(
-    samples: &[RelationalRecordSample<'_>],
-    plan: &RelationalTransformPlan,
-    job: Option<&Job>,
-    prepared: &PreparedSearch,
-    search: &mut SearchState,
-    rule: RelationalTransformRule,
-) -> Result<bool, RelationalTransformError> {
-    let discovery = evaluate_split(
-        samples,
-        &prepared.discovery_groups,
-        Some(&prepared.discovery_indexes),
-        &rule,
-        plan.limits,
-        &mut search.work_bytes,
-    )?;
-    if discovery.supported_sessions.is_empty() {
-        if let Some(job) = job {
-            job.increment(Counter::CandidatesRejected, 1)?;
+impl SearchContext<'_, '_> {
+    fn evaluate_candidate<T, E, F>(
+        &self,
+        search: &mut SearchState<T>,
+        rule: RelationalTransformRule,
+        evaluator: &mut F,
+    ) -> Result<bool, RelationalEvaluationError<E>>
+    where
+        F: FnMut(
+            &RelationalTransformEvaluationContext<'_>,
+            &RelationalTransformCandidate,
+            &[RelationalAppliedOutput],
+            &[RelationalAppliedOutput],
+        ) -> Result<RelationalCandidateEvaluation<T>, E>,
+    {
+        let discovery_evaluation = evaluate_split(
+            self.samples,
+            &self.prepared.discovery_groups,
+            Some(&self.prepared.discovery_indexes),
+            &rule,
+            self.plan.limits,
+            &mut search.work_bytes,
+            self.settings.capture_outputs_for_evaluator,
+        )?;
+        if discovery_evaluation.fit.supported_sessions.is_empty() {
+            if let Some(job) = self.job {
+                job.increment(Counter::CandidatesRejected, 1)
+                    .map_err(RelationalTransformError::from)?;
+            }
+            if search.work_bytes == self.plan.limits.max_work_bytes {
+                stop_for_work_limit(search, true)?;
+                return Ok(false);
+            }
+            return Ok(true);
         }
-        if search.work_bytes == plan.limits.max_work_bytes {
-            stop_for_work_limit(search, true)?;
-            return Ok(false);
-        }
-        return Ok(true);
+        self.evaluate_supported_candidate(search, rule, discovery_evaluation, evaluator)
     }
-    let heldout = evaluate_heldout(samples, plan, prepared, search, &rule, &discovery)?;
-    let status = candidate_status(&discovery, &heldout, plan.parser_scope);
-    count_rejected_candidate(job, status)?;
-    retain_candidate(
-        search,
-        plan.limits,
-        RelationalTransformCandidate {
+
+    fn evaluate_supported_candidate<T, E, F>(
+        &self,
+        search: &mut SearchState<T>,
+        rule: RelationalTransformRule,
+        discovery_evaluation: EvaluatedSplit,
+        evaluator: &mut F,
+    ) -> Result<bool, RelationalEvaluationError<E>>
+    where
+        F: FnMut(
+            &RelationalTransformEvaluationContext<'_>,
+            &RelationalTransformCandidate,
+            &[RelationalAppliedOutput],
+            &[RelationalAppliedOutput],
+        ) -> Result<RelationalCandidateEvaluation<T>, E>,
+    {
+        let EvaluatedSplit {
+            fit: discovery,
+            outputs: discovery_outputs,
+        } = discovery_evaluation;
+        let heldout_evaluation = evaluate_heldout(
+            self.samples,
+            self.plan,
+            self.prepared,
+            search,
+            &rule,
+            &discovery,
+            self.settings.capture_outputs_for_evaluator,
+        )?;
+        let heldout = heldout_evaluation.fit;
+        let status = candidate_status(&discovery, &heldout, self.plan.parser_scope);
+        count_rejected_candidate(self.job, status)?;
+        let candidate = RelationalTransformCandidate {
             rule,
             discovery,
             heldout,
             status,
-        },
-    )?;
-    if search.work_bytes >= plan.limits.max_work_bytes {
-        stop_for_work_limit(search, false)?;
-        return Ok(false);
+        };
+        let evaluation_context = RelationalTransformEvaluationContext {
+            discovery_sessions: &self.prepared.discovery_sessions,
+            heldout_sessions: &self.prepared.heldout_sessions,
+            work_bytes_remaining: self
+                .plan
+                .limits
+                .max_work_bytes
+                .saturating_sub(search.work_bytes),
+        };
+        // The callback inspects outputs already produced by this frozen replay
+        let evaluation = evaluator(
+            &evaluation_context,
+            &candidate,
+            &discovery_outputs,
+            &heldout_evaluation.outputs,
+        )
+        .map_err(RelationalEvaluationError::Evaluator)?;
+        if evaluation.work_bytes > evaluation_context.work_bytes_remaining {
+            return Err(RelationalEvaluationError::EvaluatorWorkLimit {
+                requested: evaluation.work_bytes,
+                remaining: evaluation_context.work_bytes_remaining,
+            });
+        }
+        // Charge caller-reported screening work before the retention decision
+        search.work_bytes = search.work_bytes.checked_add(evaluation.work_bytes).ok_or(
+            RelationalTransformError::InvalidPlan(
+                "relational evaluator work accounting overflowed",
+            ),
+        )?;
+        retain_candidate(
+            search,
+            CandidateRetention {
+                candidate,
+                evaluation,
+                discovery_outputs,
+                heldout_outputs: heldout_evaluation.outputs,
+                search_order: search.candidates_examined,
+            },
+            self.plan.limits,
+            self.settings,
+        )?;
+        if search.work_bytes >= self.plan.limits.max_work_bytes {
+            stop_for_work_limit(search, false)?;
+            return Ok(false);
+        }
+        Ok(true)
     }
-    Ok(true)
 }
 
-fn evaluate_heldout(
+fn evaluate_heldout<T>(
     samples: &[RelationalRecordSample<'_>],
     plan: &RelationalTransformPlan,
     prepared: &PreparedSearch,
-    search: &mut SearchState,
+    search: &mut SearchState<T>,
     rule: &RelationalTransformRule,
     discovery: &RelationalFit,
-) -> Result<RelationalFit, RelationalTransformError> {
+    capture_outputs: bool,
+) -> Result<EvaluatedSplit, RelationalTransformError> {
     if prepared.heldout_groups.is_empty() {
-        return Ok(empty_fit(RelationalFitStatus::NotEvaluated));
+        return Ok(EvaluatedSplit {
+            fit: empty_fit(RelationalFitStatus::NotEvaluated),
+            outputs: Vec::new(),
+        });
     }
     if !matches!(
         discovery.status,
         RelationalFitStatus::ConstraintsSatisfied
             | RelationalFitStatus::TransformConstraintsSatisfied
     ) {
-        return Ok(empty_fit(RelationalFitStatus::NotEvaluated));
+        return Ok(EvaluatedSplit {
+            fit: empty_fit(RelationalFitStatus::NotEvaluated),
+            outputs: Vec::new(),
+        });
     }
     evaluate_split(
         samples,
@@ -394,6 +669,7 @@ fn evaluate_heldout(
         rule,
         plan.limits,
         &mut search.work_bytes,
+        capture_outputs,
     )
 }
 
@@ -404,7 +680,7 @@ fn count_rejected_candidate(
     if !matches!(
         status,
         RelationalTransformStatus::HeldoutConstraintsSatisfied
-            | RelationalTransformStatus::TransformSupportedAcrossSessions
+            | RelationalTransformStatus::AwaitingAcrossSessionValidation
     ) && let Some(job) = job
     {
         job.increment(Counter::CandidatesRejected, 1)?;
@@ -412,37 +688,198 @@ fn count_rejected_candidate(
     Ok(())
 }
 
-fn retain_candidate(
-    search: &mut SearchState,
+fn retain_candidate<T>(
+    search: &mut SearchState<T>,
+    retained: CandidateRetention<T>,
     limits: RelationalTransformLimits,
-    candidate: RelationalTransformCandidate,
+    settings: SearchSettings,
 ) -> Result<(), RelationalTransformError> {
-    let per_pair_limit = limits
-        .max_retained_candidates
-        .div_ceil(RETAINED_LOCATOR_PAIR_TARGET);
-    let retained_for_pair = search
-        .candidates
-        .iter()
-        .filter(|retained| {
-            retained.rule.seed_locator == candidate.rule.seed_locator
-                && retained.rule.payload_locator == candidate.rule.payload_locator
-        })
-        .count();
-    if search.candidates.len() < limits.max_retained_candidates
-        && retained_for_pair < per_pair_limit
-    {
-        search
+    let decision = retention_decision(
+        search,
+        &retained.candidate,
+        retained.evaluation.priority,
+        limits,
+        settings.retention_mode,
+    )?;
+    match decision {
+        RetentionDecision::Omit => {
+            omit_retained_candidate(search)?;
+            return Ok(());
+        }
+        RetentionDecision::Append => search
             .candidates
             .try_reserve(1)
-            .map_err(|_| RelationalTransformError::AllocationFailed)?;
-        search.candidates.push(candidate);
-    } else {
-        omit_retained_candidate(search)?;
+            .map_err(|_| RelationalTransformError::AllocationFailed)?,
+        RetentionDecision::Replace(index) => {
+            evict_retained_candidate(search, index)?;
+            omit_retained_candidate(search)?;
+        }
+    }
+    let output_capture = capture_candidate_outputs(
+        search,
+        retained.discovery_outputs,
+        retained.heldout_outputs,
+        settings.max_retained_output_bytes,
+    )?;
+    search.candidates.push(RetainedCandidate {
+        candidate: retained.candidate,
+        priority: retained.evaluation.priority,
+        assessment: retained.evaluation.assessment,
+        outputs: output_capture.outputs,
+        captured_output_bytes: output_capture.captured_bytes,
+        output_capture_omitted: output_capture.omitted,
+        search_order: retained.search_order,
+    });
+    if output_capture.omitted {
+        search.output_capture_omissions = search.output_capture_omissions.checked_add(1).ok_or(
+            RelationalTransformError::InvalidPlan("retained evaluator omission count overflowed"),
+        )?;
     }
     Ok(())
 }
 
-fn omit_retained_candidate(search: &mut SearchState) -> Result<(), RelationalTransformError> {
+enum RetentionDecision {
+    Append,
+    Replace(usize),
+    Omit,
+}
+
+fn retention_decision<T>(
+    search: &SearchState<T>,
+    candidate: &RelationalTransformCandidate,
+    priority: u8,
+    limits: RelationalTransformLimits,
+    retention_mode: RetentionMode,
+) -> Result<RetentionDecision, RelationalTransformError> {
+    match retention_mode {
+        RetentionMode::PerLocatorPair => {
+            let per_pair_limit = limits
+                .max_retained_candidates
+                .div_ceil(RETAINED_LOCATOR_PAIR_TARGET);
+            let retained_for_pair = search
+                .candidates
+                .iter()
+                .filter(|retained| {
+                    retained.candidate.rule.seed_locator == candidate.rule.seed_locator
+                        && retained.candidate.rule.payload_locator == candidate.rule.payload_locator
+                })
+                .count();
+            if search.candidates.len() < limits.max_retained_candidates
+                && retained_for_pair < per_pair_limit
+            {
+                Ok(RetentionDecision::Append)
+            } else {
+                Ok(RetentionDecision::Omit)
+            }
+        }
+        RetentionMode::EvaluatorPriority => {
+            if search.candidates.len() < limits.max_retained_candidates {
+                Ok(RetentionDecision::Append)
+            } else {
+                // Equal-priority ties choose the newest entry so earlier candidates remain stable
+                let Some((lowest_index, lowest_priority)) = search
+                    .candidates
+                    .iter()
+                    .enumerate()
+                    .fold(None, |lowest, (index, retained)| match lowest {
+                        Some((_, priority)) if priority < retained.priority => lowest,
+                        Some((_, priority)) if priority > retained.priority => {
+                            Some((index, retained.priority))
+                        }
+                        _ => Some((index, retained.priority)),
+                    })
+                else {
+                    return Err(RelationalTransformError::InvalidPlan(
+                        "retained candidate cap is full without retained candidates",
+                    ));
+                };
+                if priority <= lowest_priority {
+                    Ok(RetentionDecision::Omit)
+                } else {
+                    Ok(RetentionDecision::Replace(lowest_index))
+                }
+            }
+        }
+    }
+}
+
+fn evict_retained_candidate<T>(
+    search: &mut SearchState<T>,
+    index: usize,
+) -> Result<(), RelationalTransformError> {
+    let removed = search
+        .candidates
+        .get(index)
+        .ok_or(RelationalTransformError::InvalidPlan(
+            "retained replacement index is unavailable",
+        ))?;
+    let captured_output_bytes = removed.captured_output_bytes;
+    let output_capture_omitted = removed.output_capture_omitted;
+    search.candidates.remove(index);
+    search.output_bytes_retained = search
+        .output_bytes_retained
+        .checked_sub(captured_output_bytes)
+        .ok_or(RelationalTransformError::InvalidPlan(
+            "retained evaluator output accounting underflowed",
+        ))?;
+    if output_capture_omitted {
+        search.output_capture_omissions = search.output_capture_omissions.checked_sub(1).ok_or(
+            RelationalTransformError::InvalidPlan(
+                "retained evaluator omission accounting underflowed",
+            ),
+        )?;
+    }
+    Ok(())
+}
+
+struct OutputCapture {
+    outputs: Option<RelationalCandidateOutputs>,
+    captured_bytes: usize,
+    omitted: bool,
+}
+
+fn capture_candidate_outputs<T>(
+    search: &mut SearchState<T>,
+    discovery_outputs: Vec<RelationalAppliedOutput>,
+    heldout_outputs: Vec<RelationalAppliedOutput>,
+    max_retained_output_bytes: usize,
+) -> Result<OutputCapture, RelationalTransformError> {
+    let output_bytes = discovery_outputs
+        .iter()
+        .chain(&heldout_outputs)
+        .try_fold(0_usize, |total, output| {
+            total.checked_add(output.bytes.len())
+        })
+        .ok_or(RelationalTransformError::InvalidPlan(
+            "retained evaluator output length overflowed",
+        ))?;
+    let remaining_output_bytes =
+        max_retained_output_bytes.saturating_sub(search.output_bytes_retained);
+    if max_retained_output_bytes == 0 || output_bytes > remaining_output_bytes {
+        return Ok(OutputCapture {
+            outputs: None,
+            captured_bytes: 0,
+            omitted: max_retained_output_bytes > 0,
+        });
+    }
+    // Only selected candidates own captured bytes after this point
+    search.output_bytes_retained = search
+        .output_bytes_retained
+        .checked_add(output_bytes)
+        .ok_or(RelationalTransformError::InvalidPlan(
+            "retained evaluator output accounting overflowed",
+        ))?;
+    Ok(OutputCapture {
+        outputs: Some(RelationalCandidateOutputs {
+            discovery: discovery_outputs,
+            heldout: heldout_outputs,
+        }),
+        captured_bytes: output_bytes,
+        omitted: false,
+    })
+}
+
+fn omit_retained_candidate<T>(search: &mut SearchState<T>) -> Result<(), RelationalTransformError> {
     search.omitted_candidates =
         search
             .omitted_candidates
@@ -450,13 +887,12 @@ fn omit_retained_candidate(search: &mut SearchState) -> Result<(), RelationalTra
             .ok_or(RelationalTransformError::InvalidPlan(
                 "omitted relational candidate count overflowed",
             ))?;
-    search.omitted_candidates_exact = true;
     search.record_limit(RelationalSearchLimit::RetainedCandidates);
     Ok(())
 }
 
-fn stop_for_work_limit(
-    search: &mut SearchState,
+fn stop_for_work_limit<T>(
+    search: &mut SearchState<T>,
     one_candidate_omitted: bool,
 ) -> Result<(), RelationalTransformError> {
     search.stop(RelationalSearchLimit::WorkBytes);
@@ -469,31 +905,56 @@ fn stop_for_work_limit(
     Ok(())
 }
 
-fn build_report(
-    search: SearchState,
+fn build_report<T>(
+    mut search: SearchState<T>,
     prepared: PreparedSearch,
     limits: RelationalTransformLimits,
-) -> RelationalTransformReport {
-    RelationalTransformReport {
-        split_basis: HoldoutBasis::CompleteSessions,
-        discovery_sessions: prepared.discovery_sessions,
-        heldout_sessions: prepared.heldout_sessions,
-        candidates: search.candidates,
-        candidates_examined: search.candidates_examined,
-        omitted_candidates: search.omitted_candidates,
-        omitted_candidates_exact: search.omitted_candidates_exact,
-        candidate_limit_remaining: limits
-            .max_candidates
-            .saturating_sub(search.candidates_examined),
-        locator_candidates_examined: search.locator_candidates_examined,
-        locator_candidate_limit_remaining: limits
-            .max_locator_candidates
-            .saturating_mul(2)
-            .saturating_sub(search.locator_candidates_examined),
-        work_bytes: search.work_bytes,
-        work_bytes_remaining: limits.max_work_bytes.saturating_sub(search.work_bytes),
-        search_exhaustive_within_plan: search.search_exhaustive,
-        search_limits: search.search_limits,
-        search_limit: search.search_limit,
+) -> Result<RelationalCandidateEvaluationReport<T>, RelationalTransformError> {
+    // Replacement appends newer candidates, so restore search order once for the final report
+    search
+        .candidates
+        .sort_unstable_by_key(|retained| retained.search_order);
+    let mut candidates = Vec::new();
+    candidates
+        .try_reserve_exact(search.candidates.len())
+        .map_err(|_| RelationalTransformError::AllocationFailed)?;
+    let mut evaluations = Vec::new();
+    evaluations
+        .try_reserve_exact(search.candidates.len())
+        .map_err(|_| RelationalTransformError::AllocationFailed)?;
+    for retained in search.candidates {
+        candidates.push(retained.candidate);
+        evaluations.push(RelationalRetainedEvaluation {
+            assessment: retained.assessment,
+            outputs: retained.outputs,
+        });
     }
+    Ok(RelationalCandidateEvaluationReport {
+        report: RelationalTransformReport {
+            split_basis: HoldoutBasis::CompleteSessions,
+            discovery_sessions: prepared.discovery_sessions,
+            heldout_sessions: prepared.heldout_sessions,
+            candidates,
+            candidates_examined: search.candidates_examined,
+            omitted_candidates: search.omitted_candidates,
+            omitted_candidates_exact: search.omitted_candidates_exact,
+            candidate_limit_remaining: limits
+                .max_candidates
+                .saturating_sub(search.candidates_examined),
+            locator_candidates_examined: search.locator_candidates_examined,
+            locator_candidate_limit_remaining: limits
+                .max_locator_candidates
+                .saturating_mul(2)
+                .saturating_sub(search.locator_candidates_examined),
+            work_bytes: search.work_bytes,
+            work_bytes_remaining: limits.max_work_bytes.saturating_sub(search.work_bytes),
+            search_exhaustive_within_plan: search.search_exhaustive,
+            search_limits: search.search_limits,
+            search_limit: search.search_limit,
+        },
+        evaluations,
+        output_bytes_retained: search.output_bytes_retained,
+        output_capture_omissions: search.output_capture_omissions,
+        output_capture_complete: search.output_capture_omissions == 0,
+    })
 }

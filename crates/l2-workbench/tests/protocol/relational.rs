@@ -2,11 +2,13 @@ use l2_workbench::{
     artifact::{ArtifactValidationFormat, ArtifactValidationOutcome, ArtifactValidator},
     derivation::{CounterByteOrder, CounterWidth, SeedCounterOrder},
     protocol::{
-        ByteOrder, Direction, MessageContext, RelationalCounterReset, RelationalFalsification,
-        RelationalFitStatus, RelationalLengthField, RelationalOperationTemplate,
-        RelationalParserScope, RelationalRecordSample, RelationalTransformLimits,
+        ByteOrder, ByteRange, Direction, MessageContext, RelationalCandidateEvaluation,
+        RelationalCounterReset, RelationalFalsification, RelationalFitStatus,
+        RelationalLengthField, RelationalOperationTemplate, RelationalParserScope,
+        RelationalRecordSample, RelationalTransformEvaluationOptions, RelationalTransformLimits,
         RelationalTransformPlan, RelationalTransformStatus, apply_relational_transform_rule,
         infer_relational_transform_candidates,
+        infer_relational_transform_candidates_with_evaluator,
     },
 };
 use std::error::Error;
@@ -249,6 +251,13 @@ fn discovers_disjoint_seed_and_payload_ranges_in_one_message() -> Result<(), Box
     )?;
     assert_eq!(applied.bytes, der_sample(1));
     assert_eq!(applied.session.session, 1);
+    assert_eq!(
+        applied.payload_ranges,
+        [ByteRange {
+            start: 0,
+            end: applied.bytes.len(),
+        }]
+    );
     Ok(())
 }
 
@@ -481,11 +490,11 @@ fn retention_keeps_later_structural_rule_across_payload_starts_and_configuration
         .ok_or("the earlier deferred-transform rule was not retained")?;
     assert_eq!(
         target.status,
-        RelationalTransformStatus::TransformSupportedAcrossSessions
+        RelationalTransformStatus::AwaitingAcrossSessionValidation
     );
     assert_eq!(
         earlier_wrong_start.status,
-        RelationalTransformStatus::TransformSupportedAcrossSessions
+        RelationalTransformStatus::AwaitingAcrossSessionValidation
     );
 
     let target_output = aggregate_rule_output(&samples, &target.rule, plan.limits)?;
@@ -493,6 +502,245 @@ fn retention_keeps_later_structural_rule_across_payload_starts_and_configuration
     assert!(validates_exact_der(&target_output));
     assert!(!validates_exact_der(&wrong_output));
     Ok(())
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum RetentionGateAssessment {
+    ArtifactValidated,
+    Unresolved,
+}
+
+#[test]
+fn evaluator_priority_retains_later_valid_rule_and_keeps_deferred_rules_unresolved()
+-> TestResult<()> {
+    let records = relational_retention_sessions()?;
+    let samples = borrow_samples(&records)?;
+    let mut plan = relational_retention_plan();
+    plan.limits.max_retained_candidates = 3;
+    plan.counter_resets = vec![RelationalCounterReset::Continuous];
+    plan.counter_byte_orders = vec![CounterByteOrder::BigEndian];
+    let options = RelationalTransformEvaluationOptions {
+        max_retained_output_bytes: plan.limits.max_total_bytes,
+    };
+    let mut first_unresolved_rule = None;
+    let mut validated_after_unresolved = false;
+    let evaluated = infer_relational_transform_candidates_with_evaluator(
+        &samples,
+        &plan,
+        None,
+        options,
+        |context, candidate, discovery_outputs, heldout_outputs| {
+            let all_outputs = ordered_outputs(discovery_outputs, heldout_outputs);
+            assert!(
+                all_outputs
+                    .iter()
+                    .all(|output| payload_output_ranges_are_valid(output))
+            );
+            let expected_sessions =
+                context.discovery_sessions.len() + context.heldout_sessions.len();
+            let is_complete = all_outputs.len() == expected_sessions
+                && matches!(
+                    candidate.status,
+                    RelationalTransformStatus::AwaitingAcrossSessionValidation
+                );
+            let output_valid = aggregate_outputs(&all_outputs)
+                .map(|bytes| validates_exact_der(&bytes))
+                .map_err(|error| std::io::Error::other(error.to_string()))?;
+            let assessment = if is_complete && output_valid {
+                validated_after_unresolved |= first_unresolved_rule.is_some();
+                RetentionGateAssessment::ArtifactValidated
+            } else {
+                if first_unresolved_rule.is_none() && is_target_retention_rule(candidate, 9) {
+                    first_unresolved_rule = Some(candidate.rule.clone());
+                }
+                RetentionGateAssessment::Unresolved
+            };
+            Ok::<_, std::io::Error>(RelationalCandidateEvaluation {
+                priority: match assessment {
+                    RetentionGateAssessment::ArtifactValidated => 3,
+                    RetentionGateAssessment::Unresolved => 1,
+                },
+                work_bytes: 0,
+                assessment,
+            })
+        },
+    )?;
+
+    let report = &evaluated.report;
+    assert!(report.search_exhaustive_within_plan);
+    assert!(report.omitted_candidates_exact);
+    assert!(report.omitted_candidates > 0);
+    assert_eq!(report.candidates.len(), plan.limits.max_retained_candidates);
+    assert_eq!(evaluated.evaluations.len(), report.candidates.len());
+    assert!(validated_after_unresolved);
+    assert!(evaluated.output_capture_complete);
+    assert!(evaluated.output_bytes_retained <= options.max_retained_output_bytes);
+
+    let target_index = report
+        .candidates
+        .iter()
+        .position(|candidate| is_target_retention_rule(candidate, 10))
+        .ok_or("the later exact artifact rule was omitted")?;
+    let target = report
+        .candidates
+        .get(target_index)
+        .ok_or("the retained exact artifact rule disappeared")?;
+    let target_evaluation = evaluated
+        .evaluations
+        .get(target_index)
+        .ok_or("the exact artifact rule has no aligned evaluation")?;
+    assert_eq!(
+        target_evaluation.assessment,
+        RetentionGateAssessment::ArtifactValidated
+    );
+    assert_eq!(
+        target.status,
+        RelationalTransformStatus::AwaitingAcrossSessionValidation
+    );
+    let captured = target_evaluation
+        .outputs
+        .as_ref()
+        .ok_or("the bounded retained-output capture omitted the winning rule")?;
+    let captured_outputs = ordered_outputs(&captured.discovery, &captured.heldout);
+    assert!(validates_exact_der(&aggregate_outputs(&captured_outputs)?));
+
+    let unresolved_rule = first_unresolved_rule
+        .as_ref()
+        .ok_or("the evaluator never observed a deferred rule")?;
+    let unresolved_index = report
+        .candidates
+        .iter()
+        .position(|candidate| candidate.rule == *unresolved_rule)
+        .ok_or("the earlier deferred rule was not retained")?;
+    let unresolved = report
+        .candidates
+        .get(unresolved_index)
+        .ok_or("the earlier deferred rule disappeared")?;
+    let unresolved_evaluation = evaluated
+        .evaluations
+        .get(unresolved_index)
+        .ok_or("the earlier deferred rule has no aligned evaluation")?;
+    assert_eq!(
+        unresolved.status,
+        RelationalTransformStatus::AwaitingAcrossSessionValidation
+    );
+    assert_eq!(
+        unresolved_evaluation.assessment,
+        RetentionGateAssessment::Unresolved
+    );
+    Ok(())
+}
+
+#[test]
+fn evaluator_output_capture_respects_its_global_byte_budget() -> TestResult<()> {
+    let records = relational_retention_sessions()?;
+    let samples = borrow_samples(&records)?;
+    let mut plan = relational_retention_plan();
+    plan.limits.max_retained_candidates = 2;
+    let evaluated = infer_relational_transform_candidates_with_evaluator(
+        &samples,
+        &plan,
+        None,
+        RelationalTransformEvaluationOptions {
+            max_retained_output_bytes: 1,
+        },
+        |_, _, _, _| {
+            Ok::<_, std::io::Error>(RelationalCandidateEvaluation {
+                priority: 1,
+                work_bytes: 0,
+                assessment: RetentionGateAssessment::Unresolved,
+            })
+        },
+    )?;
+
+    assert_eq!(evaluated.report.candidates.len(), 2);
+    assert_eq!(evaluated.evaluations.len(), 2);
+    assert!(evaluated.output_bytes_retained <= 1);
+    assert!(!evaluated.output_capture_complete);
+    assert!(evaluated.output_capture_omissions > 0);
+    assert!(
+        evaluated
+            .evaluations
+            .iter()
+            .all(|evaluation| evaluation.outputs.is_none())
+    );
+    Ok(())
+}
+
+#[test]
+fn evaluator_work_must_fit_the_remaining_shared_search_budget() -> TestResult<()> {
+    let records = relational_retention_sessions()?;
+    let samples = borrow_samples(&records)?;
+    let plan = relational_retention_plan();
+    let mut callback_seen = false;
+    let result = infer_relational_transform_candidates_with_evaluator(
+        &samples,
+        &plan,
+        None,
+        RelationalTransformEvaluationOptions::default(),
+        |context, _, _, _| {
+            callback_seen = true;
+            Ok::<_, std::io::Error>(RelationalCandidateEvaluation {
+                priority: 0,
+                work_bytes: context.work_bytes_remaining.saturating_add(1),
+                assessment: (),
+            })
+        },
+    );
+
+    assert!(callback_seen);
+    assert!(matches!(
+        result,
+        Err(l2_workbench::protocol::RelationalEvaluationError::EvaluatorWorkLimit {
+            requested,
+            remaining,
+        }) if requested == remaining.saturating_add(1)
+    ));
+    Ok(())
+}
+
+fn ordered_outputs<'a>(
+    discovery: &'a [l2_workbench::protocol::RelationalAppliedOutput],
+    heldout: &'a [l2_workbench::protocol::RelationalAppliedOutput],
+) -> Vec<&'a l2_workbench::protocol::RelationalAppliedOutput> {
+    let mut outputs = discovery.iter().chain(heldout).collect::<Vec<_>>();
+    outputs.sort_unstable_by_key(|output| output.session_order);
+    outputs
+}
+
+fn aggregate_outputs(
+    outputs: &[&l2_workbench::protocol::RelationalAppliedOutput],
+) -> TestResult<Vec<u8>> {
+    let length = outputs
+        .iter()
+        .try_fold(0_usize, |total, output| {
+            total.checked_add(output.bytes.len())
+        })
+        .ok_or("evaluated output length overflowed")?;
+    let mut aggregate = Vec::with_capacity(length);
+    for output in outputs {
+        aggregate.extend_from_slice(&output.bytes);
+    }
+    Ok(aggregate)
+}
+
+fn payload_output_ranges_are_valid(
+    output: &l2_workbench::protocol::RelationalAppliedOutput,
+) -> bool {
+    if output.payload_samples.len() != output.payload_ranges.len() {
+        return false;
+    }
+    let mut expected_start = 0_usize;
+    for range in &output.payload_ranges {
+        if range.start != expected_start
+            || range.end < range.start
+            || output.bytes.get(range.start..range.end).is_none()
+        {
+            return false;
+        }
+        expected_start = range.end;
+    }
+    expected_start == output.bytes.len()
 }
 
 #[test]
@@ -518,6 +766,31 @@ fn candidate_limit_preserves_known_retention_omissions() -> TestResult<()> {
         report
             .search_limits
             .contains(&l2_workbench::protocol::RelationalSearchLimit::CandidateCount)
+    );
+    Ok(())
+}
+
+#[test]
+fn incomplete_locator_search_does_not_become_exact_after_retention_omissions() -> TestResult<()> {
+    let records = relational_retention_sessions()?;
+    let samples = borrow_samples(&records)?;
+    let mut plan = relational_retention_plan();
+    plan.limits.max_locator_candidates = 2;
+    plan.limits.max_candidates = 128;
+    plan.limits.max_retained_candidates = 1;
+    let report = infer_relational_transform_candidates(&samples, &plan)?;
+
+    assert!(!report.search_exhaustive_within_plan);
+    assert!(!report.omitted_candidates_exact);
+    assert!(
+        report
+            .search_limits
+            .contains(&l2_workbench::protocol::RelationalSearchLimit::LocatorCount)
+    );
+    assert!(
+        report
+            .search_limits
+            .contains(&l2_workbench::protocol::RelationalSearchLimit::RetainedCandidates)
     );
     Ok(())
 }

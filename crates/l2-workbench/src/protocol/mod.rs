@@ -9,6 +9,7 @@ mod framing;
 mod model;
 mod reconstructed_framing;
 mod records;
+mod relational;
 pub(crate) mod report_size;
 mod sampling;
 mod stream;
@@ -53,6 +54,20 @@ pub use records::{
     RecordSchemaProposalReport, RecordSchemaProposalValidationBasis, analyze_record_schemas,
     assemble_record_groups, assemble_record_groups_from_inputs, discover_record_schemas,
     parse_records, parse_records_with_limits, propose_record_schema_space,
+};
+pub use relational::{
+    RelationalAppliedOutput, RelationalByteRangeLocator, RelationalCandidateEvaluation,
+    RelationalCandidateEvaluationReport, RelationalCandidateOutputs, RelationalCounterReset,
+    RelationalEvaluationError, RelationalFalsification, RelationalFit, RelationalFitStatus,
+    RelationalLengthField, RelationalOperationTemplate, RelationalParserScope,
+    RelationalRecordSample, RelationalRetainedEvaluation, RelationalSearchLimit,
+    RelationalSessionCheck, RelationalSessionId, RelationalSha256CounterXor,
+    RelationalTransformCandidate, RelationalTransformError, RelationalTransformEvaluationContext,
+    RelationalTransformEvaluationOptions, RelationalTransformLimits, RelationalTransformPlan,
+    RelationalTransformReport, RelationalTransformRule, RelationalTransformStatus,
+    apply_relational_transform_rule, infer_relational_transform_candidates,
+    infer_relational_transform_candidates_with_evaluator,
+    infer_relational_transform_candidates_with_job,
 };
 pub(crate) use stream::validate_stream_framings;
 pub use stream::{

@@ -59,7 +59,15 @@ pub fn apply_relational_transform_rule(
         work_limit,
     )?;
     let (bytes, work_bytes) = transformed_bytes(transformed)?;
-    applied_output(group, seed_sample, payload_samples, bytes, rule, work_bytes)
+    applied_output(
+        group,
+        seed_sample,
+        payload_samples,
+        &payload_ranges,
+        bytes,
+        rule,
+        work_bytes,
+    )
 }
 
 const fn validate_replay_limits(
@@ -229,17 +237,20 @@ fn applied_output(
     group: SessionGroup,
     seed_sample: u64,
     payload_samples: Vec<u64>,
+    payload_ranges: &[&[u8]],
     bytes: Vec<u8>,
     rule: &RelationalTransformRule,
     work_bytes: usize,
 ) -> Result<RelationalAppliedOutput, RelationalTransformError> {
     let session_order = group.session_order;
+    let payload_output_ranges = payload_output_ranges(payload_ranges)?;
     if rule.parser_scope == RelationalParserScope::AcrossSessions {
         return Ok(RelationalAppliedOutput {
             session: group.id,
             session_order,
             seed_sample,
             payload_samples,
+            payload_ranges: payload_output_ranges,
             bytes,
             parser_validation_deferred: true,
             work_bytes,
@@ -254,6 +265,7 @@ fn applied_output(
                 session_order,
                 seed_sample,
                 payload_samples,
+                payload_ranges: payload_output_ranges,
                 bytes,
                 parser_validation_deferred: false,
                 work_bytes,
@@ -265,6 +277,27 @@ fn applied_output(
     }
 }
 
+fn payload_output_ranges(
+    payload_ranges: &[&[u8]],
+) -> Result<Vec<crate::protocol::ByteRange>, RelationalTransformError> {
+    let mut outputs = Vec::new();
+    outputs
+        .try_reserve_exact(payload_ranges.len())
+        .map_err(|_| RelationalTransformError::AllocationFailed)?;
+    let mut start = 0_usize;
+    for payload in payload_ranges {
+        let end =
+            start
+                .checked_add(payload.len())
+                .ok_or(RelationalTransformError::InvalidInput(
+                    "transformed payload range overflowed",
+                ))?;
+        outputs.push(crate::protocol::ByteRange { start, end });
+        start = end;
+    }
+    Ok(outputs)
+}
+
 pub(super) fn evaluate_split(
     samples: &[RelationalRecordSample<'_>],
     groups: &[SessionGroup],
@@ -272,73 +305,126 @@ pub(super) fn evaluate_split(
     rule: &RelationalTransformRule,
     limits: RelationalTransformLimits,
     work_bytes: &mut usize,
-) -> Result<RelationalFit, RelationalTransformError> {
+    capture_outputs: bool,
+) -> Result<EvaluatedSplit, RelationalTransformError> {
     let mut checks = Vec::new();
     checks
         .try_reserve_exact(groups.len())
         .map_err(|_| RelationalTransformError::AllocationFailed)?;
+    let mut outputs = Vec::new();
+    if capture_outputs {
+        outputs
+            .try_reserve_exact(groups.len())
+            .map_err(|_| RelationalTransformError::AllocationFailed)?;
+    }
     for (group_index, group) in groups.iter().enumerate() {
-        let check = check_session(
+        let context = SessionCheckContext {
             samples,
-            group,
-            indexes.and_then(|items| items.get(group_index)),
+            index: indexes.and_then(|items| items.get(group_index)),
             rule,
             limits,
-            limits.max_work_bytes.saturating_sub(*work_bytes),
-            work_bytes,
-        )?;
-        checks.push(check);
+            work_remaining: limits.max_work_bytes.saturating_sub(*work_bytes),
+            capture_output: capture_outputs,
+        };
+        let evaluated = check_session(group, context, work_bytes)?;
+        checks.push(evaluated.check);
+        if let Some(output) = evaluated.output {
+            outputs.push(output);
+        }
     }
-    Ok(fit_from_checks(checks))
+    Ok(EvaluatedSplit {
+        fit: fit_from_checks(checks),
+        outputs,
+    })
+}
+
+pub(super) struct EvaluatedSplit {
+    pub(super) fit: RelationalFit,
+    pub(super) outputs: Vec<RelationalAppliedOutput>,
+}
+
+struct EvaluatedSessionCheck {
+    check: RelationalSessionCheck,
+    output: Option<RelationalAppliedOutput>,
+}
+
+#[derive(Clone, Copy)]
+struct SessionCheckContext<'a, 'bytes> {
+    samples: &'a [RelationalRecordSample<'bytes>],
+    index: Option<&'a SelectorIndex>,
+    rule: &'a RelationalTransformRule,
+    limits: RelationalTransformLimits,
+    work_remaining: usize,
+    capture_output: bool,
 }
 
 fn check_session(
-    samples: &[RelationalRecordSample<'_>],
     group: &SessionGroup,
-    index: Option<&SelectorIndex>,
-    rule: &RelationalTransformRule,
-    limits: RelationalTransformLimits,
-    work_remaining: usize,
+    context: SessionCheckContext<'_, '_>,
     work_bytes: &mut usize,
-) -> Result<RelationalSessionCheck, RelationalTransformError> {
-    let inputs = match prepare_session_inputs(samples, group, index, rule, limits)? {
+) -> Result<EvaluatedSessionCheck, RelationalTransformError> {
+    let inputs = match prepare_session_inputs(
+        context.samples,
+        group,
+        context.index,
+        context.rule,
+        context.limits,
+    )? {
         Ok(inputs) => inputs,
-        Err(failure) => return Ok(failure),
+        Err(check) => {
+            return Ok(EvaluatedSessionCheck {
+                check,
+                output: None,
+            });
+        }
     };
     let Some(estimate) = transform_work_estimate(
         &inputs.payload_ranges,
         inputs.seed.len(),
-        rule.operation.sha256_counter_xor().counter_width,
-        rule.counter_reset,
+        context.rule.operation.sha256_counter_xor().counter_width,
+        context.rule.counter_reset,
     ) else {
-        return Ok(failed_check(
-            group,
-            Some(inputs.seed_sample),
-            inputs.payload_samples,
-            RelationalFalsification::TransformFailed {
-                reason: "transform work estimate overflowed".to_owned(),
-            },
-        ));
+        return Ok(EvaluatedSessionCheck {
+            check: failed_check(
+                group,
+                Some(inputs.seed_sample),
+                inputs.payload_samples,
+                RelationalFalsification::TransformFailed {
+                    reason: "transform work estimate overflowed".to_owned(),
+                },
+            ),
+            output: None,
+        });
     };
-    if estimate > work_remaining {
-        return Ok(unresolved_check(
-            group,
-            Some(inputs.seed_sample),
-            inputs.payload_samples,
-        ));
+    if estimate > context.work_remaining {
+        return Ok(EvaluatedSessionCheck {
+            check: unresolved_check(group, Some(inputs.seed_sample), inputs.payload_samples),
+            output: None,
+        });
     }
     let transformed = apply_transform(
         &inputs.payload_ranges,
         inputs.seed,
-        rule.operation,
-        rule.counter_reset,
-        limits.max_total_bytes,
-        work_remaining,
+        context.rule.operation,
+        context.rule.counter_reset,
+        context.limits.max_total_bytes,
+        context.work_remaining,
     )?;
     *work_bytes = work_bytes.checked_add(transformed.work_bytes).ok_or(
         RelationalTransformError::InvalidPlan("relational work accounting overflowed"),
     )?;
-    Ok(check_transformed_session(group, inputs, rule, transformed))
+    let output_ranges = if context.capture_output {
+        Some(payload_output_ranges(&inputs.payload_ranges)?)
+    } else {
+        None
+    };
+    Ok(check_transformed_session(
+        group,
+        inputs,
+        context.rule,
+        transformed,
+        output_ranges,
+    ))
 }
 
 struct SessionTransformInputs<'a> {
@@ -522,17 +608,90 @@ fn check_transformed_session(
     inputs: SessionTransformInputs<'_>,
     rule: &RelationalTransformRule,
     transformed: TransformOutput,
-) -> RelationalSessionCheck {
+    output_ranges: Option<Vec<crate::protocol::ByteRange>>,
+) -> EvaluatedSessionCheck {
     let SessionTransformInputs {
         seed_sample,
         payload_samples,
         ..
     } = inputs;
     let Some(output) = transformed.output else {
-        if transformed.unresolved_on_budget {
-            return unresolved_check(group, Some(seed_sample), payload_samples);
-        }
-        return failed_check_with_output(
+        return check_missing_transform_output(group, seed_sample, payload_samples, transformed);
+    };
+    let output_sha256 = sha256(&output);
+    let capture_output = output_ranges.is_some();
+    if rule.parser_scope == RelationalParserScope::AcrossSessions {
+        let (check_payloads, output_payloads) = if capture_output {
+            (payload_samples.clone(), Some(payload_samples))
+        } else {
+            (payload_samples, None)
+        };
+        return EvaluatedSessionCheck {
+            check: RelationalSessionCheck {
+                session: group.id.clone(),
+                seed_sample: Some(seed_sample),
+                payload_samples: check_payloads,
+                status: RelationalFitStatus::TransformConstraintsSatisfied,
+                output_length: Some(output.len()),
+                output_sha256: Some(output_sha256),
+                falsification: None,
+            },
+            output: output_payloads.zip(output_ranges).map(|(samples, ranges)| {
+                captured_session_output(
+                    group,
+                    seed_sample,
+                    samples,
+                    ranges,
+                    output,
+                    transformed.work_bytes,
+                    true,
+                )
+            }),
+        };
+    }
+    let (check_payloads, output_payloads) = if capture_output {
+        (payload_samples.clone(), Some(payload_samples))
+    } else {
+        (payload_samples, None)
+    };
+    let check = validate_session_output(
+        group,
+        seed_sample,
+        check_payloads,
+        rule,
+        &output,
+        output_sha256,
+    );
+    let retained_output = (check.status == RelationalFitStatus::ConstraintsSatisfied)
+        .then(|| output_payloads.zip(output_ranges))
+        .flatten()
+        .map(|(samples, ranges)| {
+            captured_session_output(
+                group,
+                seed_sample,
+                samples,
+                ranges,
+                output,
+                transformed.work_bytes,
+                false,
+            )
+        });
+    EvaluatedSessionCheck {
+        check,
+        output: retained_output,
+    }
+}
+
+fn check_missing_transform_output(
+    group: &SessionGroup,
+    seed_sample: u64,
+    payload_samples: Vec<u64>,
+    transformed: TransformOutput,
+) -> EvaluatedSessionCheck {
+    let check = if transformed.unresolved_on_budget {
+        unresolved_check(group, Some(seed_sample), payload_samples)
+    } else {
+        failed_check_with_output(
             group,
             Some(seed_sample),
             payload_samples,
@@ -543,28 +702,33 @@ fn check_transformed_session(
                     .failure
                     .unwrap_or_else(|| "transform failed".to_owned()),
             },
-        );
+        )
     };
-    let output_sha256 = sha256(&output);
-    if rule.parser_scope == RelationalParserScope::AcrossSessions {
-        return RelationalSessionCheck {
-            session: group.id.clone(),
-            seed_sample: Some(seed_sample),
-            payload_samples,
-            status: RelationalFitStatus::TransformConstraintsSatisfied,
-            output_length: Some(output.len()),
-            output_sha256: Some(output_sha256),
-            falsification: None,
-        };
+    EvaluatedSessionCheck {
+        check,
+        output: None,
     }
-    validate_session_output(
-        group,
+}
+
+fn captured_session_output(
+    group: &SessionGroup,
+    seed_sample: u64,
+    payload_samples: Vec<u64>,
+    payload_ranges: Vec<crate::protocol::ByteRange>,
+    bytes: Vec<u8>,
+    work_bytes: usize,
+    parser_validation_deferred: bool,
+) -> RelationalAppliedOutput {
+    RelationalAppliedOutput {
+        session: group.id.clone(),
+        session_order: group.session_order,
         seed_sample,
         payload_samples,
-        rule,
-        &output,
-        output_sha256,
-    )
+        payload_ranges,
+        bytes,
+        parser_validation_deferred,
+        work_bytes,
+    }
 }
 
 fn validate_session_output(
@@ -987,13 +1151,13 @@ pub(super) fn candidate_status(
         | RelationalFitStatus::TransformConstraintsSatisfied => match heldout.status {
             RelationalFitStatus::ConstraintsSatisfied => {
                 if parser_scope == RelationalParserScope::AcrossSessions {
-                    RelationalTransformStatus::TransformSupportedAcrossSessions
+                    RelationalTransformStatus::AwaitingAcrossSessionValidation
                 } else {
                     RelationalTransformStatus::HeldoutConstraintsSatisfied
                 }
             }
             RelationalFitStatus::TransformConstraintsSatisfied => {
-                RelationalTransformStatus::TransformSupportedAcrossSessions
+                RelationalTransformStatus::AwaitingAcrossSessionValidation
             }
             RelationalFitStatus::Contradicted => {
                 RelationalTransformStatus::ContradictedByHeldoutSession
