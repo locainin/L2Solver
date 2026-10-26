@@ -42,11 +42,7 @@ pub fn set_before_directory_exchange(hook: impl FnOnce() -> io::Result<()> + 'st
 
 pub fn before_directory_exchange() -> io::Result<()> {
     let hook = BEFORE_DIRECTORY_EXCHANGE.with(|slot| slot.borrow_mut().take());
-    if let Some(hook) = hook {
-        hook()
-    } else {
-        Ok(())
-    }
+    hook.map_or(Ok(()), |hook| hook())
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

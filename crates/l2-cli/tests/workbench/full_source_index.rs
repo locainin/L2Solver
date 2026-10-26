@@ -346,17 +346,15 @@ fn concurrent_capture_acquisition_waits_for_alias_writer_and_reuses_its_index()
     let writer_lease = cache.lease(&alias_key)?;
     let job = Job::new("concurrent capture acquisition");
     let (sender, receiver) = mpsc::channel();
-    let worker_cache = cache.clone();
-    let worker_path = capture_path.clone();
     let worker_parent = directory.path().to_path_buf();
     let worker_job = job.clone();
     let worker = thread::spawn(move || {
         let options = AcquisitionOptions {
-            cache: Some(&worker_cache),
+            cache: Some(&cache),
             job: Some(&worker_job),
             ..AcquisitionOptions::default()
         };
-        let result = acquire_indexed_source(&worker_path, &worker_parent, &options)
+        let result = acquire_indexed_source(&capture_path, &worker_parent, &options)
             .map(|indexed| indexed.receipt.source_id)
             .map_err(|error| error.to_string());
         let _ = sender.send(result);
@@ -370,7 +368,7 @@ fn concurrent_capture_acquisition_waits_for_alias_writer_and_reuses_its_index()
     );
     worker
         .join()
-        .expect("capture acquisition worker must finish");
+        .map_err(|_| "capture acquisition worker panicked")?;
 
     let snapshot = job.snapshot()?;
     assert_eq!(
@@ -407,11 +405,10 @@ fn persistently_busy_alias_falls_back_to_temporary_index_with_progress_message()
 
     let indexed = acquire_indexed_source(&capture_path, directory.path(), &options)?;
     assert!(indexed.receipt.source_id.starts_with("sha256:"));
-    let phase = job
-        .snapshot()?
+    let snapshot = job.snapshot()?;
+    let phase = snapshot
         .phase(Phase::Ingestion)
-        .cloned()
-        .expect("capture acquisition records ingestion progress");
+        .ok_or("capture acquisition records ingestion progress")?;
     assert_eq!(phase.state, PhaseState::Completed);
     assert!(phase.message.as_deref().is_some_and(|message| {
         let message = message.to_ascii_lowercase();
@@ -442,17 +439,15 @@ fn busy_content_index_lease_does_not_restart_completed_ingestion() -> Result<(),
     let writer_lease = cache.lease(&source_key)?;
     let job = Job::new("contended content index");
     let (sender, receiver) = mpsc::channel();
-    let worker_cache = cache.clone();
-    let worker_path = capture_path.clone();
     let worker_parent = directory.path().to_path_buf();
     let worker_job = job.clone();
     let worker = thread::spawn(move || {
         let options = AcquisitionOptions {
-            cache: Some(&worker_cache),
+            cache: Some(&cache),
             job: Some(&worker_job),
             ..AcquisitionOptions::default()
         };
-        let result = acquire_indexed_source(&worker_path, &worker_parent, &options)
+        let result = acquire_indexed_source(&capture_path, &worker_parent, &options)
             .map(|indexed| indexed.receipt.source_id)
             .map_err(|error| error.to_string());
         let _ = sender.send(result);
@@ -486,7 +481,7 @@ fn busy_content_index_lease_does_not_restart_completed_ingestion() -> Result<(),
     );
     worker
         .join()
-        .expect("capture acquisition worker must finish");
+        .map_err(|_| "capture acquisition worker panicked")?;
     assert_eq!(
         job.snapshot()?
             .phase(Phase::Ingestion)
@@ -586,19 +581,15 @@ fn single_flow_capture() -> Vec<u8> {
     capture.extend_from_slice(&65_535_u32.to_le_bytes());
     capture.extend_from_slice(&1_u32.to_le_bytes());
 
-    let mut frame = vec![0_u8; 54];
-    frame[12..14].copy_from_slice(&0x0800_u16.to_be_bytes());
-    frame[14] = 0x45;
-    frame[16..18].copy_from_slice(&40_u16.to_be_bytes());
-    frame[22] = 64;
-    frame[23] = 6;
-    frame[26..30].copy_from_slice(&[192, 0, 2, 10]);
-    frame[30..34].copy_from_slice(&[192, 0, 2, 20]);
-    frame[34..36].copy_from_slice(&40_000_u16.to_be_bytes());
-    frame[36..38].copy_from_slice(&80_u16.to_be_bytes());
-    frame[46..48].copy_from_slice(&0x5002_u16.to_be_bytes());
-    frame[48..50].copy_from_slice(&1024_u16.to_be_bytes());
-
+    // Keep the fixture as explicit Ethernet, IPv4, and TCP header bytes
+    let mut frame = vec![0_u8; 12];
+    frame.extend_from_slice(&0x0800_u16.to_be_bytes());
+    frame.extend_from_slice(&[
+        0x45, 0, 0, 40, 0, 0, 0, 0, 64, 6, 0, 0, 192, 0, 2, 10, 192, 0, 2, 20,
+    ]);
+    frame.extend_from_slice(&[
+        0x9c, 0x40, 0, 80, 0, 0, 0, 0, 0, 0, 0, 0, 0x50, 2, 0x04, 0, 0, 0, 0, 0,
+    ]);
     capture.extend_from_slice(&1_u32.to_le_bytes());
     capture.extend_from_slice(&0_u32.to_le_bytes());
     capture.extend_from_slice(&54_u32.to_le_bytes());

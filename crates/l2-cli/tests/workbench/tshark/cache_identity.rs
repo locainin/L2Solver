@@ -30,10 +30,7 @@ fn selected_path(identity: &Value) -> Result<PathBuf, Box<dyn Error>> {
     {
         let mut digits = encoded.bytes();
         let mut bytes = Vec::new();
-        loop {
-            let Some(high) = digits.next() else {
-                break;
-            };
+        while let Some(high) = digits.next() {
             let low = digits
                 .next()
                 .ok_or("selected executable path hex is incomplete")?;

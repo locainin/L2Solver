@@ -5,7 +5,7 @@ use std::{
     io::Read,
     os::unix::fs::symlink,
     sync::{
-        Arc,
+        Arc, Mutex,
         atomic::{AtomicBool, Ordering},
     },
     thread,
@@ -22,6 +22,13 @@ fn replace_directory<T>(
     write: impl FnOnce(&std::path::Path) -> Result<T, Box<dyn Error>>,
 ) -> Result<T, publish::DirectoryPublishError> {
     publish::replace_directory_with_precommit(prepared, write, || Ok(()))
+}
+
+fn remember_reader_error(errors: &Mutex<Vec<String>>, message: String) {
+    errors
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .push(message);
 }
 
 #[test]
@@ -213,7 +220,7 @@ fn refresh_exposes_only_complete_old_or_new_directory_contents() -> Result<(), B
     })?;
     let prepared = publish::prepare_directory_replacement(&destination)?;
     let running = Arc::new(AtomicBool::new(true));
-    let read_errors = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let read_errors = Arc::new(Mutex::new(Vec::new()));
     let reader_running = Arc::clone(&running);
     let reader_errors = Arc::clone(&read_errors);
     let reader_path = destination.join("payload");
@@ -223,14 +230,10 @@ fn refresh_exposes_only_complete_old_or_new_directory_contents() -> Result<(), B
                 Ok(payload)
                     if payload == b"old complete payload" || payload == b"new complete payload" => {
                 }
-                Ok(payload) => reader_errors
-                    .lock()
-                    .expect("reader error lock is available")
-                    .push(format!("partial payload: {payload:?}")),
-                Err(error) => reader_errors
-                    .lock()
-                    .expect("reader error lock is available")
-                    .push(error.to_string()),
+                Ok(payload) => {
+                    remember_reader_error(&reader_errors, format!("partial payload: {payload:?}"));
+                }
+                Err(error) => remember_reader_error(&reader_errors, error.to_string()),
             }
         }
     });
@@ -242,11 +245,14 @@ fn refresh_exposes_only_complete_old_or_new_directory_contents() -> Result<(), B
     running.store(false, Ordering::Release);
     reader.join().map_err(|_| "directory reader panicked")?;
 
-    assert!(
-        read_errors
+    let no_reader_errors = {
+        let errors = read_errors
             .lock()
-            .expect("reader error lock is available")
-            .is_empty(),
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        errors.is_empty()
+    };
+    assert!(
+        no_reader_errors,
         "refresh readers observed an incomplete output"
     );
     assert_eq!(
