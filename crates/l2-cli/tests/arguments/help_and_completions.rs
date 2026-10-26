@@ -19,6 +19,7 @@ fn empty_invocation_shows_full_help_and_succeeds() -> Result<(), Box<dyn std::er
     ] {
         assert!(help.contains(detail), "missing {detail} from help:\n{help}");
     }
+    assert!(!help.contains("Developer:"));
     Ok(())
 }
 

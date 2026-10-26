@@ -17,23 +17,23 @@ use std::{
     time::Duration,
 };
 
-const ROOT_EXAMPLES: &str = r"Examples:
+const ROOT_HELP: &str = r"Examples:
   l2solver extract traffic.pcapng -o recovered/
   l2solver refine unknown.bin --dry-run
   l2solver cache stats
   l2solver completions bash
   l2solver inspect traffic.pcapng
-  l2solver workbench --help";
+  l2solver workbench --help
 
-const LONG_HELP_DETAILS: &str = r"Exit status:
+Exit status:
   0  Command completed within its declared scope
   1  Runtime, I/O, or internal failure
   2  Usage error
   3  Assessment, collection, export, or workbench result is incomplete
-  4  Findings found with --fail-on-findings/--ci, or baseline changes with --fail-on-change
+  4  Findings found with --fail-on-findings/--ci, or baseline changes with --fail-on-change";
 
-Developer:
-  l2solver dev --help       Internal diagnostics and fixture tooling";
+const DEV_HELP: &str =
+    "Developer:\n  l2solver dev --help       Internal diagnostics and fixture tooling";
 
 const EXTRACT_HELP: &str = r"The default is CAPTURE.export. Matching owned output is reused; --refresh replaces it atomically. Unrelated destinations are refused. Standard input requires --output and skips TShark.
 
@@ -52,8 +52,8 @@ Examples:
     version,
     about = "Network forensics and artifact recovery",
     long_about = None,
-    after_help = ROOT_EXAMPLES,
-    after_long_help = format!("{ROOT_EXAMPLES}\n\n{LONG_HELP_DETAILS}"),
+    after_help = ROOT_HELP,
+    after_long_help = format!("{ROOT_HELP}\n\n{DEV_HELP}"),
     arg_required_else_help = true
 )]
 struct Cli {
