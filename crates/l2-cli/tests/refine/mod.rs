@@ -410,6 +410,28 @@ fn quiet_mode_suppresses_fresh_and_reused_completion_messages() -> Result<(), Bo
 }
 
 #[test]
+fn cache_warning_cap_emits_one_suppression_marker() -> Result<(), Box<dyn Error>> {
+    let mut warnings = Vec::new();
+    for index in 0..12 {
+        super::analysis::record_cache_warning(&mut warnings, format!("warning {index}"));
+    }
+    let mut output = Vec::new();
+
+    super::output::write_cache_warnings(&mut output, &warnings)?;
+
+    let output = String::from_utf8(output)?;
+    assert_eq!(warnings.len(), 9);
+    assert_eq!(output.lines().count(), 9);
+    assert!(
+        output
+            .lines()
+            .last()
+            .is_some_and(|line| { line == "Warning: additional cache warnings suppressed" })
+    );
+    Ok(())
+}
+
+#[test]
 fn unrelated_result_path_is_rejected_before_input_admission() -> Result<(), Box<dyn Error>> {
     let directory = tempfile::tempdir()?;
     let output_file = directory.path().join("occupied.refined");

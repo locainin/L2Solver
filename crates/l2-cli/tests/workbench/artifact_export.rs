@@ -72,6 +72,32 @@ fn shared_large_record_blob_is_classified_once_and_keeps_every_origin()
 }
 
 #[test]
+fn selected_artifact_identity_matches_its_canonical_case_blob_digest()
+-> Result<(), Box<dyn std::error::Error>> {
+    let bytes = b"selected content with a stable identity";
+    let mut case = Case::new();
+    let node_id = case.add_bytes_node("record_object", bytes, Vec::new(), json!({}))?;
+    let blob_id = case
+        .nodes()
+        .iter()
+        .find(|node| node.id == node_id)
+        .and_then(|node| node.blob.as_deref())
+        .ok_or("selected object blob is missing")?;
+    let selected = super::select_artifacts(&case)?;
+    let artifact = selected.first().ok_or("selected artifact is missing")?;
+
+    assert_eq!(artifact.bytes(), bytes);
+    assert_eq!(
+        artifact.sha256(),
+        blob_id
+            .strip_prefix("sha256:")
+            .ok_or("blob ID is not canonical")?
+    );
+    assert_eq!(artifact.sha256(), l2_workbench::sha256(bytes));
+    Ok(())
+}
+
+#[test]
 fn repeated_validation_is_cached_once_per_blob_and_format() -> Result<(), Box<dyn std::error::Error>>
 {
     let validator = ArtifactValidator::default();

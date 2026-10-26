@@ -198,7 +198,7 @@ pub(super) fn make_manifest<'a>(
         published.push(PublishedArtifactRecord {
             file: selected_artifact.file_name(),
             byte_length: selected_artifact.bytes().len(),
-            sha256: sha256(selected_artifact.bytes()),
+            sha256: selected_artifact.sha256().to_owned(),
             origins,
             nodes: provenance,
         });
@@ -311,10 +311,7 @@ pub(super) fn write_cache_warnings(
     output: &mut impl Write,
     warnings: &[String],
 ) -> Result<(), Box<dyn Error>> {
-    for warning in warnings.iter().take(8) {
-        writeln!(output, "Warning: {warning}")?;
-    }
-    if let Some(warning) = warnings.get(8) {
+    for warning in warnings {
         writeln!(output, "Warning: {warning}")?;
     }
     Ok(())

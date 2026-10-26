@@ -19,6 +19,7 @@ use std::{
 /// One exact byte object selected for export, with every retained source reference
 pub struct SelectedArtifact<'a> {
     bytes: &'a [u8],
+    content_sha256: &'a str,
     file_name: String,
     provenance: Vec<ArtifactProvenance>,
 }
@@ -26,6 +27,10 @@ pub struct SelectedArtifact<'a> {
 impl SelectedArtifact<'_> {
     pub const fn bytes(&self) -> &[u8] {
         self.bytes
+    }
+
+    pub(crate) const fn sha256(&self) -> &str {
+        self.content_sha256
     }
 
     pub fn file_name(&self) -> &str {
@@ -91,6 +96,9 @@ pub(super) fn select_artifacts_with_cache<'a>(
             .blob
             .as_deref()
             .ok_or("recovered artifact node has no retained bytes")?;
+        let content_sha256 = blob_id
+            .strip_prefix("sha256:")
+            .ok_or("recovered artifact blob ID is not a SHA-256 identity")?;
         let bytes = bytes_by_id
             .get(blob_id)
             .copied()
@@ -123,6 +131,7 @@ pub(super) fn select_artifacts_with_cache<'a>(
         artifact_by_blob.insert(blob_id, index);
         artifacts.push(SelectedArtifact {
             bytes,
+            content_sha256,
             file_name: spec.file_name.clone(),
             provenance: vec![provenance],
         });
