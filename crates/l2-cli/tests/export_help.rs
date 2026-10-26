@@ -61,7 +61,12 @@ fn extract_help_describes_recovery_and_optional_enrichment()
         "help is too long: {text}"
     );
     assert!(!text.contains("must not already exist"));
+    Ok(())
+}
 
+#[test]
+fn root_help_lists_extract_and_keeps_export_alias_hidden() -> Result<(), Box<dyn std::error::Error>>
+{
     let root = Command::new(env!("CARGO_BIN_EXE_l2solver"))
         .arg("--help")
         .output()?;
