@@ -330,7 +330,7 @@ impl Executor<'_> {
                 output_node,
                 receipt_node,
                 input_node,
-                state,
+                &mut state.contextual_view_admission_blocked,
             )?
             else {
                 return Ok(None);
@@ -388,7 +388,7 @@ impl Executor<'_> {
                     output_node,
                     receipt_node,
                     origin,
-                    &mut state,
+                    &mut state.contextual_view_admission_blocked,
                 )?
                 else {
                     continue;
@@ -432,15 +432,15 @@ impl Executor<'_> {
         Ok(())
     }
 
-    fn try_contextual_decoding_view(
+    pub(super) fn try_contextual_decoding_view(
         &mut self,
         candidate: RecoveryCandidateId,
         output_node: u64,
         receipt_node: u64,
         input_node: u64,
-        state: &mut TransformCohortState,
+        admission_blocked: &mut bool,
     ) -> Result<Option<u64>, RecoveryExecutionError> {
-        if state.contextual_view_admission_blocked {
+        if *admission_blocked {
             return Ok(None);
         }
 
@@ -469,7 +469,7 @@ impl Executor<'_> {
                     resource,
                     RecoveryResource::EvidenceEdges | RecoveryResource::EvidenceNodes
                 ) {
-                    state.contextual_view_admission_blocked = true;
+                    *admission_blocked = true;
                 }
                 Ok(None)
             }

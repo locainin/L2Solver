@@ -683,7 +683,9 @@ impl Executor<'_> {
         &mut self,
         plan: &FramingDiscoveryPlan,
     ) -> Result<(), RecoveryExecutionError> {
-        if self.plan.discover_transforms {
+        let transform_candidates_enabled = self.plan.discover_transforms
+            || (self.plan.discover_framing && !self.plan.recipes.is_empty());
+        if transform_candidates_enabled {
             self.derived_discovery
                 .seed_tcp_contexts(plan, self.policy.resources.max_context_aliases)?;
             self.omissions

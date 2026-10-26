@@ -229,11 +229,55 @@ impl Executor<'_> {
                     .iter()
                     .any(|slot| slot.candidate == candidate_id)
             });
+            self.register_direct_derived_contexts(
+                candidate_id,
+                output_node,
+                commit.result_node,
+                &origins,
+                is_cohort_slot,
+            )?;
             self.enqueue_derived_children_filtered(
                 candidate_id,
                 &[output_node],
                 false,
                 is_cohort_slot,
+            )?;
+        }
+        Ok(())
+    }
+
+    fn register_direct_derived_contexts(
+        &mut self,
+        candidate_id: RecoveryCandidateId,
+        output_node: u64,
+        receipt_node: u64,
+        origins: &[u64],
+        is_cohort_slot: bool,
+    ) -> Result<(), RecoveryExecutionError> {
+        if !self.plan.discover_framing || is_cohort_slot {
+            return Ok(());
+        }
+
+        let mut contextual_view_admission_blocked = false;
+        for origin in origins.iter().copied() {
+            if !self.derived_discovery.has_context(origin) {
+                continue;
+            }
+            let Some(contextual_node) = self.try_contextual_decoding_view(
+                candidate_id,
+                output_node,
+                receipt_node,
+                origin,
+                &mut contextual_view_admission_blocked,
+            )?
+            else {
+                continue;
+            };
+            self.register_derived_transform_output(
+                origin,
+                contextual_node,
+                receipt_node,
+                candidate_id,
             )?;
         }
         Ok(())

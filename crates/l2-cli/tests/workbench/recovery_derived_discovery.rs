@@ -2,7 +2,7 @@ use super::{RecoveryPlan, execute, policy, source};
 use crate::workbench::recovery_executor::RecoveryExecutionOutcome;
 use l2_workbench::{
     derivation::{Base64Alphabet, Base64Padding, Operation, Recipe},
-    evidence::{ByteMapping, Case, Edge, EvidenceStatus, Node, SourceRange},
+    evidence::{ByteMapping, Case, Edge, EvidenceStatus, MAX_EDGES, Node, SourceRange},
     protocol::FramingKind,
     recovery::{RecoveryCandidate, RecoveryCandidateState, RecoveryResult, RecoveryTask},
 };
@@ -43,6 +43,17 @@ struct MergedContextFixture {
     capture_sources: [String; 2],
     contexts: [TcpContext; 4],
     encoded_streams: [Vec<u8>; 2],
+}
+
+struct ExplicitRecipeFixture {
+    case: Case,
+    outcome: RecoveryExecutionOutcome,
+    imported_input: u64,
+    capture_source: String,
+    first_context_run: u64,
+    contexts: [TcpContext; 2],
+    encoded_streams: [Vec<u8>; 2],
+    max_depth: usize,
 }
 
 struct DecodedContextViews<'a> {
@@ -409,16 +420,9 @@ fn disabled_framing_discovery_does_not_schedule_transformed_views() -> TestResul
     let mut case = Case::new();
     let source_id = add_capture(&mut case, "disabled-framing")?;
     let context = add_tcp_context(&mut case, &source_id, 1, &encoded, &plaintext, &records)?;
-    let recipe = Recipe {
-        steps: vec![Operation::Base64Decode {
-            alphabet: Base64Alphabet::Standard,
-            padding: Base64Padding::Required,
-        }],
-        constraints: Vec::new(),
-    };
     let selected_framing = FramingKind::Delimiter { byte: 0xff };
     let plan = RecoveryPlan {
-        recipes: vec![recipe],
+        recipes: vec![base64_decode_recipe()],
         framings: vec![selected_framing.clone()],
         discover_transforms: true,
         discover_framing: false,
@@ -660,6 +664,16 @@ fn base64_encode(bytes: &[u8]) -> Vec<u8> {
     base64::engine::general_purpose::STANDARD
         .encode(bytes)
         .into_bytes()
+}
+
+fn base64_decode_recipe() -> Recipe {
+    Recipe {
+        steps: vec![Operation::Base64Decode {
+            alphabet: Base64Alphabet::Standard,
+            padding: Base64Padding::Required,
+        }],
+        constraints: Vec::new(),
+    }
 }
 
 fn add_capture(case: &mut Case, label: &str) -> TestResult<String> {
@@ -1332,4 +1346,289 @@ fn has_ancestor(
         }
     }
     false
+}
+
+#[test]
+fn explicit_recipe_outputs_reenter_derived_framing_and_record_discovery() -> TestResult<()> {
+    let fixture = execute_explicit_recipe_fixture()?;
+    let (transform_indexes, views) = assert_explicit_recipe_views(&fixture)?;
+    assert_explicit_recipe_frames_and_records(&fixture, &transform_indexes, &views)
+}
+
+fn execute_explicit_recipe_fixture() -> TestResult<ExplicitRecipeFixture> {
+    let (first_plaintext, first_records) = delimited_records([0xa5, 0xb6]);
+    let (second_plaintext, second_records) = delimited_records([0xc7, 0xd8]);
+    let first_encoded = base64_encode(&first_plaintext);
+    let second_encoded = base64_encode(&second_plaintext);
+    let mut case = Case::new();
+    let imported_input = source(&mut case, "imported_source", &first_encoded)?;
+    let capture_source = add_capture(&mut case, "explicit-derived")?;
+    let first_context = add_tcp_context(
+        &mut case,
+        &capture_source,
+        1,
+        &first_encoded,
+        &first_plaintext,
+        &first_records,
+    )?;
+    let first_context_run = first_context.run;
+    let second_context = add_tcp_context(
+        &mut case,
+        &capture_source,
+        2,
+        &second_encoded,
+        &second_plaintext,
+        &second_records,
+    )?;
+    let contexts = [first_context, second_context];
+    let plan = RecoveryPlan {
+        recipes: vec![base64_decode_recipe()],
+        discover_transforms: false,
+        discover_framing: true,
+        discover_records: true,
+        ..RecoveryPlan::default()
+    };
+    let execution_policy = merged_context_policy();
+    let outcome = execute(&mut case, &plan, &execution_policy)?;
+    assert!(outcome.candidate_count <= execution_policy.resources.max_candidates);
+    assert!(outcome.resources.work_charged_bytes <= execution_policy.resources.max_work_bytes);
+    Ok(ExplicitRecipeFixture {
+        case,
+        outcome,
+        imported_input,
+        capture_source,
+        first_context_run,
+        contexts,
+        encoded_streams: [first_encoded, second_encoded],
+        max_depth: execution_policy.resources.max_depth,
+    })
+}
+
+fn assert_explicit_recipe_views(
+    fixture: &ExplicitRecipeFixture,
+) -> TestResult<(Vec<usize>, Vec<&Node>)> {
+    assert!(
+        fixture
+            .outcome
+            .candidates
+            .iter()
+            .all(|candidate| { candidate.task() != &RecoveryTask::TransformDiscovery })
+    );
+    let mut transform_indexes = Vec::with_capacity(fixture.contexts.len());
+    let mut views = Vec::with_capacity(fixture.contexts.len());
+    for (context, encoded) in fixture.contexts.iter().zip(&fixture.encoded_streams) {
+        let expected_origins = if context.run == fixture.first_context_run {
+            BTreeSet::from([fixture.imported_input, context.run])
+        } else {
+            BTreeSet::from([context.run])
+        };
+        let (transform_index, receipt_node) = merged_base64_transform(
+            &fixture.case,
+            &fixture.outcome.candidates,
+            encoded,
+            &context.plaintext,
+            &expected_origins,
+        )?;
+        transform_indexes.push(transform_index);
+        let expected_contexts = BTreeSet::from([context.run]);
+        let contextual = contextual_outputs(
+            &fixture.case,
+            receipt_node,
+            &context.plaintext,
+            &expected_contexts,
+        )?;
+        let view = contextual
+            .first()
+            .copied()
+            .ok_or("explicit transform context view is missing")?;
+        assert!(view.ranges.is_empty());
+        views.push(view);
+    }
+    assert!(fixture.case.nodes().iter().all(|node| {
+        node.kind != "decoding_output" || source_input(node) != Some(fixture.imported_input)
+    }));
+    Ok((transform_indexes, views))
+}
+
+fn assert_explicit_recipe_frames_and_records(
+    fixture: &ExplicitRecipeFixture,
+    transform_indexes: &[usize],
+    views: &[&Node],
+) -> TestResult<()> {
+    let ancestry_ids = assert_transport_completeness_survives_decode(
+        &fixture.case,
+        &fixture.contexts,
+        views,
+        &fixture.outcome.candidates,
+        &fixture.outcome.omissions,
+    )?;
+    assert_eq!(ancestry_ids.len(), 1);
+    assert_eq!(
+        fixture
+            .case
+            .nodes()
+            .iter()
+            .filter(|node| node.kind == "tcp_byte_run")
+            .count(),
+        fixture.contexts.len(),
+        "decoded views must keep their original TCP inputs"
+    );
+
+    let expected_records = fixture
+        .contexts
+        .iter()
+        .map(|context| (context.run, context.records.as_slice()))
+        .collect::<std::collections::HashMap<_, _>>();
+    let derived_frames = frames_for_views(&fixture.case, views, &expected_records)?;
+    assert_eq!(
+        derived_frames.len(),
+        fixture
+            .contexts
+            .iter()
+            .map(|context| context.records.len())
+            .sum::<usize>()
+    );
+    assert_derived_frames_are_not_reported_as_missing_source(
+        &fixture.outcome.omissions,
+        &derived_frames,
+    );
+    assert!(derived_frames.iter().all(|frame| frame.ranges.is_empty()));
+
+    let record_candidates =
+        scoped_record_candidates(&fixture.case, &fixture.outcome.candidates, &derived_frames)?;
+    assert_source_record_candidate(
+        &fixture.case,
+        &fixture.outcome.candidates,
+        &record_candidates,
+        &derived_frames,
+        &SourceRecordExpectation {
+            source_id: &fixture.capture_source,
+            sessions: &fixture.contexts,
+            transform_indexes,
+            max_depth: fixture.max_depth,
+        },
+    )?;
+    Ok(())
+}
+
+#[test]
+fn explicit_recipe_does_not_register_context_when_discovery_is_disabled() -> TestResult<()> {
+    let (plaintext, records) = delimited_records([0xa5, 0xb6]);
+    let encoded = base64_encode(&plaintext);
+    let mut case = Case::new();
+    let source_id = add_capture(&mut case, "explicit-no-discovery")?;
+    add_tcp_context(&mut case, &source_id, 1, &encoded, &plaintext, &records)?;
+    let plan = RecoveryPlan {
+        recipes: vec![base64_decode_recipe()],
+        discover_transforms: false,
+        discover_framing: false,
+        discover_records: false,
+        ..RecoveryPlan::default()
+    };
+
+    let outcome = execute(&mut case, &plan, &policy())?;
+
+    assert!(outcome.candidates.iter().any(|candidate| {
+        matches!(candidate.task(), RecoveryTask::Transform(_))
+            && matches!(
+                candidate.state(),
+                RecoveryCandidateState::Finished {
+                    result: RecoveryResult::Derived { .. },
+                    ..
+                }
+            )
+    }));
+    assert!(case.nodes().iter().all(|node| {
+        node.kind != "decoding_output"
+            || node.details.get("shared_transform_receipt").is_none()
+            || node.details.get("source_input_node").is_none()
+    }));
+    Ok(())
+}
+
+#[test]
+fn explicit_recipe_context_quota_keeps_transform_and_records_partial_omission() -> TestResult<()> {
+    let (plaintext, records) = delimited_records([0xa5, 0xb6]);
+    let encoded = base64_encode(&plaintext);
+    let mut case = Case::new();
+    let source_id = add_capture(&mut case, "explicit-context-quota")?;
+    let context = add_tcp_context(&mut case, &source_id, 1, &encoded, &plaintext, &records)?;
+    // Leave room for transform evidence but less than the contextual view's three edges
+    super::fill_edges_to_quota(&mut case, context.run, MAX_EDGES - 9)?;
+    let recipe = base64_decode_recipe();
+    let plan = RecoveryPlan {
+        recipes: vec![recipe.clone()],
+        discover_transforms: false,
+        discover_framing: true,
+        discover_records: false,
+        ..RecoveryPlan::default()
+    };
+    let execution_policy = policy();
+    let mut executor =
+        super::super::test_support::build_executor(&mut case, &plan, &execution_policy)?;
+    let framing_plan = super::super::framing_discovery::collect_plan(
+        executor.case,
+        l2_workbench::protocol::ProtocolLimits::default(),
+    )?;
+    executor.seed_derived_tcp_contexts(&framing_plan)?;
+    let candidate_id = super::queued(executor.coordinator.enqueue(
+        executor.case,
+        context.run,
+        RecoveryTask::Transform(recipe.clone()),
+    )?)?;
+    assert_eq!(executor.coordinator.pop_next()?, Some(candidate_id));
+
+    executor.run_transform(candidate_id, context.run, &recipe)?;
+
+    let candidate = executor
+        .coordinator
+        .candidate(candidate_id)
+        .ok_or("explicit transform candidate is missing")?;
+    let receipt_node = match candidate.state() {
+        RecoveryCandidateState::Finished {
+            stage: super::RecoveryStage::Transform,
+            result: RecoveryResult::Derived { evidence_node_id },
+        } => *evidence_node_id,
+        state => return Err(format!("explicit transform did not finish: {state:?}").into()),
+    };
+    assert!(executor.case.nodes().iter().any(|node| {
+        node.kind == "decoding_output"
+            && node_blob(executor.case, node) == Some(plaintext.as_slice())
+            && executor.case.edges().iter().any(|edge| {
+                edge.from == node.id && edge.to == receipt_node && edge.relation == "derived_from"
+            })
+    }));
+    assert!(executor.case.nodes().iter().all(|node| {
+        node.kind != "decoding_output"
+            || node
+                .details
+                .get("shared_transform_receipt")
+                .and_then(Value::as_u64)
+                != Some(receipt_node)
+            || node
+                .details
+                .get("source_input_node")
+                .and_then(Value::as_u64)
+                != Some(context.run)
+    }));
+
+    let case_edges_after_transform = executor.case.edges().len();
+    assert!(executor.omissions.iter().any(|omission| {
+        matches!(
+            omission,
+            super::RecoveryOmission::ResourceExhausted {
+                task: RecoveryTask::Transform(omitted_recipe),
+                input_node_ids,
+                resource: l2_workbench::recovery::RecoveryResource::EvidenceEdges,
+                limit,
+                used,
+                requested,
+            } if omitted_recipe == &recipe
+                && input_node_ids.as_slice() == std::slice::from_ref(&context.run)
+                && *limit == MAX_EDGES
+                && *used == case_edges_after_transform
+                && (*used).checked_add(*requested).is_some_and(|attempted| attempted > *limit)
+        )
+    }));
+    Ok(())
 }
