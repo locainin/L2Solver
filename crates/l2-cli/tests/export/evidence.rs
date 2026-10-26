@@ -1,11 +1,13 @@
+use super::evidence::{ENCODING_VERSION, SIDECAR_FILE_NAME};
 use super::{
     ArtifactCollection, ArtifactLimits, ArtifactProvenance, ArtifactSourceContext, EvidenceSidecar,
     artifact_collection::AddOutcome, collect_case_artifacts_with_context,
 };
+use flate2::read::MultiGzDecoder;
 use l2_workbench::evidence::{Case, Edge, EvidenceStatus, SourceRange};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
-use std::{error::Error, fs};
+use std::{error::Error, fs, io::Read, path::Path};
 
 #[test]
 fn shared_artifact_keeps_resolvable_origins_from_distinct_cases() -> Result<(), Box<dyn Error>> {
@@ -37,7 +39,7 @@ fn shared_artifact_keeps_resolvable_origins_from_distinct_cases() -> Result<(), 
     let origins = artifact_origins(&manifest)?;
     assert_eq!(origins.len(), 2);
 
-    let records = read_sidecar(&temporary.path().join("evidence.jsonl"))?;
+    let records = read_sidecar(&temporary.path().join(SIDECAR_FILE_NAME))?;
     for (case_id, node_id) in expected {
         let origin = origins
             .iter()
@@ -116,7 +118,7 @@ fn identical_exportable_nodes_keep_case_qualified_provenance_once_each()
         }));
     }
 
-    let records = read_sidecar(&temporary.path().join("evidence.jsonl"))?;
+    let records = read_sidecar(&temporary.path().join(SIDECAR_FILE_NAME))?;
     assert!(records.iter().any(|record| {
         record.get("case_id").and_then(Value::as_str) == Some(case_id.as_str())
             && record
@@ -217,14 +219,16 @@ fn receipt_payload_edges_and_local_node_ids_are_retained_per_case() -> Result<()
     let second = case_with_receipt(b"private artifact payload")?;
     let first_result = sidecar.record_case(&first, &json!({"kind": "flow", "flow_id": 1}))?;
     let second_result = sidecar.record_case(&second, &json!({"kind": "flow", "flow_id": 2}))?;
-    let records = read_sidecar(&temporary.path().join("evidence.jsonl"))?;
+    let records = read_sidecar(&temporary.path().join(SIDECAR_FILE_NAME))?;
 
     assert_ne!(first_result.case_id, second_result.case_id);
     assert_eq!(records.len(), 2);
     for record in &records {
         assert_receipt_case(record)?;
     }
-    let encoded = fs::read_to_string(temporary.path().join("evidence.jsonl"))?;
+    let encoded = String::from_utf8(read_sidecar_bytes(
+        &temporary.path().join(SIDECAR_FILE_NAME),
+    )?)?;
     assert!(!encoded.contains("private artifact payload"));
     assert!(!encoded.contains("cHJpdmF0ZSBhcnRpZmFjdCBwYXlsb2Fk"));
     Ok(())
@@ -258,7 +262,7 @@ fn case_id_matches_the_digest_of_its_persisted_record() -> Result<(), Box<dyn Er
     assert!(record.retained);
     sidecar.finish()?;
 
-    let mut encoded = fs::read(temporary.path().join("evidence.jsonl"))?;
+    let mut encoded = read_sidecar_bytes(&temporary.path().join(SIDECAR_FILE_NAME))?;
     assert!(encoded.ends_with(b"\n"));
     let placeholder = format!("case-{}", "0".repeat(64));
     assert_eq!(record.case_id.len(), placeholder.len());
@@ -278,6 +282,126 @@ fn case_id_matches_the_digest_of_its_persisted_record() -> Result<(), Box<dyn Er
     let recomputed_id = format!("case-{:x}", digest.finalize());
 
     assert_eq!(record.case_id, recomputed_id);
+    Ok(())
+}
+
+#[test]
+fn gzip_sidecar_appends_valid_members_and_checks_each_member_crc() -> Result<(), Box<dyn Error>> {
+    let temporary = tempfile::tempdir()?;
+    let mut sidecar = EvidenceSidecar::new(temporary.path(), 1_000_000)?;
+    let empty_member_bytes = sidecar.coverage().retained_bytes;
+    assert!(empty_member_bytes > 0);
+    let first = case_with_receipt(b"first compressed case")?;
+    let second = case_with_receipt(b"second compressed case")?;
+    let first_record = sidecar.record_case(&first, &json!({"kind": "flow", "flow_id": 21}))?;
+    let second_record = sidecar.record_case(&second, &json!({"kind": "flow", "flow_id": 22}))?;
+    assert!(first_record.retained);
+    assert!(second_record.retained);
+    sidecar.finish()?;
+
+    let sidecar_path = temporary.path().join(SIDECAR_FILE_NAME);
+    let mut encoded = fs::read(&sidecar_path)?;
+    assert!(encoded.starts_with(&[0x1f, 0x8b]));
+    assert_eq!(
+        u64::try_from(encoded.len())?,
+        empty_member_bytes + first_record.compressed_bytes + second_record.compressed_bytes
+    );
+    assert_eq!(
+        sidecar.coverage().retained_bytes,
+        u64::try_from(encoded.len())?
+    );
+    let records = read_sidecar(&sidecar_path)?;
+    assert_eq!(records.len(), 2);
+    assert_eq!(
+        records[0].get("case_id").and_then(Value::as_str),
+        Some(first_record.case_id.as_str())
+    );
+    assert_eq!(
+        records[1].get("case_id").and_then(Value::as_str),
+        Some(second_record.case_id.as_str())
+    );
+
+    let crc_offset = encoded
+        .len()
+        .checked_sub(8)
+        .ok_or("gzip sidecar is missing its trailer")?;
+    let crc = encoded
+        .get_mut(crc_offset)
+        .ok_or("gzip CRC byte is missing")?;
+    *crc ^= 1;
+    let corrupted_path = temporary.path().join("corrupted-evidence.jsonl.gz");
+    fs::write(&corrupted_path, encoded)?;
+    let mut decoder = MultiGzDecoder::new(fs::File::open(corrupted_path)?);
+    let mut decoded = Vec::new();
+    assert!(decoder.read_to_end(&mut decoded).is_err());
+    Ok(())
+}
+
+#[test]
+fn empty_sidecar_is_valid_gzip_when_its_physical_member_fits() -> Result<(), Box<dyn Error>> {
+    let temporary = tempfile::tempdir()?;
+    let mut sidecar = EvidenceSidecar::new(temporary.path(), 1_000_000)?;
+    let coverage = sidecar.coverage();
+    assert_eq!(coverage.selected_cases, 0);
+    assert_eq!(coverage.retained_cases, 0);
+    assert_eq!(coverage.raw_retained_bytes, 0);
+    assert!(coverage.retained_bytes > 0);
+    sidecar.finish()?;
+
+    let path = temporary.path().join(SIDECAR_FILE_NAME);
+    let encoded = fs::read(&path)?;
+    assert_eq!(u64::try_from(encoded.len())?, coverage.retained_bytes);
+    assert!(read_sidecar_bytes(&path)?.is_empty());
+
+    let zero_budget_directory = tempfile::tempdir()?;
+    let mut zero_budget = EvidenceSidecar::new(zero_budget_directory.path(), 0)?;
+    assert_eq!(zero_budget.coverage().retained_bytes, 0);
+    zero_budget.finish()?;
+    assert!(fs::read(zero_budget_directory.path().join(SIDECAR_FILE_NAME))?.is_empty());
+    Ok(())
+}
+
+#[test]
+fn evidence_budget_uses_physical_gzip_bytes_and_tracks_raw_bytes() -> Result<(), Box<dyn Error>> {
+    let case = case_with_receipt(b"budgeted compressed record")?;
+    let scope = json!({"kind": "flow", "flow_id": 31});
+    let sizing_directory = tempfile::tempdir()?;
+    let mut sizing_sidecar = EvidenceSidecar::new(sizing_directory.path(), u64::MAX)?;
+    let sized_record = sizing_sidecar.record_case(&case, &scope)?;
+    assert!(sized_record.retained);
+    let compressed_bytes = sized_record.compressed_bytes;
+    let empty_member_bytes = sizing_sidecar
+        .coverage()
+        .retained_bytes
+        .checked_sub(compressed_bytes)
+        .ok_or("empty gzip member bytes exceed the retained total")?;
+    let physical_bytes = sizing_sidecar.coverage().retained_bytes;
+    let raw_bytes = sized_record.encoded_bytes;
+    let sizing_coverage = sizing_sidecar.coverage();
+    assert_eq!(sizing_coverage.encoding_version, ENCODING_VERSION);
+    assert_eq!(sizing_coverage.retained_bytes, physical_bytes);
+    assert_eq!(sizing_coverage.raw_retained_bytes, raw_bytes);
+
+    let exact_directory = tempfile::tempdir()?;
+    let mut exact_sidecar = EvidenceSidecar::new(exact_directory.path(), physical_bytes)?;
+    let exact_record = exact_sidecar.record_case(&case, &scope)?;
+    assert!(exact_record.retained);
+    assert_eq!(exact_sidecar.coverage().retained_bytes, physical_bytes);
+
+    let below_budget = physical_bytes
+        .checked_sub(1)
+        .ok_or("a gzip member must have a non-zero encoded length")?;
+    let omitted_directory = tempfile::tempdir()?;
+    let mut omitted_sidecar = EvidenceSidecar::new(omitted_directory.path(), below_budget)?;
+    let omitted_record = omitted_sidecar.record_case(&case, &scope)?;
+    let omitted_coverage = omitted_sidecar.coverage();
+    assert!(!omitted_record.retained);
+    assert_eq!(omitted_coverage.retained_bytes, empty_member_bytes);
+    assert_eq!(omitted_coverage.omitted_bytes, compressed_bytes);
+    assert_eq!(omitted_coverage.raw_omitted_bytes, raw_bytes);
+    let omitted_path = omitted_directory.path().join(SIDECAR_FILE_NAME);
+    assert_eq!(fs::metadata(&omitted_path)?.len(), empty_member_bytes);
+    assert!(read_sidecar(&omitted_path)?.is_empty());
     Ok(())
 }
 
@@ -307,7 +431,7 @@ fn evidence_budget_omits_a_whole_case_and_leaves_no_artifact_node_reference()
     assert_eq!(coverage.omitted_cases, 1);
     assert_eq!(coverage.retained_bytes, 0);
     assert!(coverage.omitted_bytes > 0);
-    assert!(fs::read_to_string(temporary.path().join("evidence.jsonl"))?.is_empty());
+    assert!(fs::read(temporary.path().join(SIDECAR_FILE_NAME))?.is_empty());
     assert_eq!(artifacts.coverage().unique_artifacts_retained, 1);
 
     let mut encoded = Vec::new();
@@ -487,8 +611,15 @@ fn slice_item<'a>(
         .ok_or_else(|| format!("{context} is missing").into())
 }
 
-fn read_sidecar(path: &std::path::Path) -> Result<Vec<Value>, Box<dyn Error>> {
-    Ok(fs::read_to_string(path)?
+fn read_sidecar_bytes(path: &Path) -> Result<Vec<u8>, Box<dyn Error>> {
+    let mut decoder = MultiGzDecoder::new(fs::File::open(path)?);
+    let mut decoded = Vec::new();
+    decoder.read_to_end(&mut decoded)?;
+    Ok(decoded)
+}
+
+fn read_sidecar(path: &Path) -> Result<Vec<Value>, Box<dyn Error>> {
+    Ok(String::from_utf8(read_sidecar_bytes(path)?)?
         .lines()
         .map(serde_json::from_str)
         .collect::<Result<Vec<_>, _>>()?)
