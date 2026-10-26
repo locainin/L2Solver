@@ -248,7 +248,7 @@ fn collect_with_jobs(
 
     Ok(CollectionSnapshot {
         source_coverage: serde_json::to_value(&collected.coverage.source)?,
-        recovery_coverage: serde_json::to_value(&collected.recovery)?,
+        recovery_coverage: serde_json::to_value(collected.recovery)?,
         artifact_manifest,
         artifact_files,
     })

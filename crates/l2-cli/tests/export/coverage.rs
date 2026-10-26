@@ -771,24 +771,26 @@ fn assert_aggregate_origin_totals(resources: &serde_json::Value) {
 
 #[test]
 fn merges_deserialized_recovery_coverage_and_budget_ranges() -> Result<(), Box<dyn Error>> {
-    let mut first_value = serde_json::to_value(RecoveryCoverage::default())?;
-    first_value["flow_cases"] = 1.into();
-    first_value["candidates"] = 3.into();
-    first_value["resources"]["recovery_cases"] = 1.into();
-    first_value["resources"]["input_bytes_per_item_by_case"] =
-        serde_json::json!({"minimum": 128, "maximum": 256});
-    first_value["resources"]["work_bytes_charged_total"] = 10.into();
-
-    let mut second_value = serde_json::to_value(RecoveryCoverage::default())?;
-    second_value["cohort_cases"] = 1.into();
-    second_value["candidates"] = 4.into();
-    second_value["resources"]["recovery_cases"] = 1.into();
-    second_value["resources"]["input_bytes_per_item_by_case"] =
-        serde_json::json!({"minimum": 64, "maximum": 512});
-    second_value["resources"]["work_bytes_charged_total"] = 20.into();
-
-    let mut first: RecoveryCoverage = serde_json::from_value(first_value)?;
-    let second: RecoveryCoverage = serde_json::from_value(second_value)?;
+    let mut first = deserialize_coverage([
+        ("/flow_cases", 1.into()),
+        ("/candidates", 3.into()),
+        ("/resources/recovery_cases", 1.into()),
+        (
+            "/resources/input_bytes_per_item_by_case",
+            serde_json::json!({"minimum": 128, "maximum": 256}),
+        ),
+        ("/resources/work_bytes_charged_total", 10.into()),
+    ])?;
+    let second = deserialize_coverage([
+        ("/cohort_cases", 1.into()),
+        ("/candidates", 4.into()),
+        ("/resources/recovery_cases", 1.into()),
+        (
+            "/resources/input_bytes_per_item_by_case",
+            serde_json::json!({"minimum": 64, "maximum": 512}),
+        ),
+        ("/resources/work_bytes_charged_total", 20.into()),
+    ])?;
 
     first.merge(&second)?;
 
@@ -797,25 +799,32 @@ fn merges_deserialized_recovery_coverage_and_budget_ranges() -> Result<(), Box<d
     assert_eq!(first.resources.recovery_cases, 2);
     assert_eq!(first.resources.work_bytes_charged_total, 30);
     assert_eq!(
-        serde_json::to_value(first)?["resources"]["input_bytes_per_item_by_case"],
-        serde_json::json!({"minimum": 64, "maximum": 512})
+        serde_json::to_value(first)?.pointer("/resources/input_bytes_per_item_by_case"),
+        Some(&serde_json::json!({"minimum": 64, "maximum": 512}))
     );
     Ok(())
 }
 
 #[test]
 fn coverage_merge_overflow_keeps_existing_aggregate_unchanged() -> Result<(), Box<dyn Error>> {
-    let mut first_value = serde_json::to_value(RecoveryCoverage::default())?;
-    first_value["flow_cases"] = 7.into();
-    first_value["candidates"] = u64::MAX.into();
-    let mut second_value = serde_json::to_value(RecoveryCoverage::default())?;
-    second_value["flow_cases"] = 1.into();
-    second_value["candidates"] = 1.into();
-    let mut first: RecoveryCoverage = serde_json::from_value(first_value)?;
-    let second: RecoveryCoverage = serde_json::from_value(second_value)?;
+    let mut first =
+        deserialize_coverage([("/flow_cases", 7.into()), ("/candidates", u64::MAX.into())])?;
+    let second = deserialize_coverage([("/flow_cases", 1.into()), ("/candidates", 1.into())])?;
     let before = serde_json::to_value(first)?;
 
     assert!(first.merge(&second).is_err());
     assert_eq!(serde_json::to_value(first)?, before);
     Ok(())
+}
+
+fn deserialize_coverage(
+    fields: impl IntoIterator<Item = (&'static str, serde_json::Value)>,
+) -> Result<RecoveryCoverage, Box<dyn Error>> {
+    let mut document = serde_json::to_value(RecoveryCoverage::default())?;
+    for (path, value) in fields {
+        *document
+            .pointer_mut(path)
+            .ok_or_else(|| format!("coverage fixture field is missing: {path}"))? = value;
+    }
+    Ok(serde_json::from_value(document)?)
 }

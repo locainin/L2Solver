@@ -305,36 +305,50 @@ fn published_export_contains_one_evidence_sidecar_without_artifact_payloads()
             .and_then(serde_json::Value::as_str),
         Some("gzip")
     );
-    let evidence_records = String::from_utf8(evidence)?
+    assert_artifact_case_references(&manifest, &evidence)?;
+    let summary = fs::read_to_string(destination.join("summary.txt"))?;
+    assert!(summary.contains("Evidence sidecar: evidence.jsonl.gz"));
+    assert!(summary.contains("Cases retained ("));
+    Ok(())
+}
+
+fn assert_artifact_case_references(
+    manifest: &serde_json::Value,
+    evidence: &[u8],
+) -> Result<(), Box<dyn Error>> {
+    let evidence_records = std::str::from_utf8(evidence)?
         .lines()
         .map(serde_json::from_str::<serde_json::Value>)
         .collect::<Result<Vec<_>, _>>()?;
     let provenance = manifest
         .pointer("/artifacts/0/provenance/0")
         .ok_or("artifact provenance is missing")?;
-    let case_id = provenance["case_id"]
-        .as_str()
+    let case_id = provenance
+        .get("case_id")
+        .and_then(serde_json::Value::as_str)
         .ok_or("artifact Case reference is missing")?;
     let case_record = evidence_records
         .iter()
-        .find(|record| record["case_id"] == case_id)
+        .find(|record| record.get("case_id").and_then(serde_json::Value::as_str) == Some(case_id))
         .ok_or("artifact Case reference does not resolve in the sidecar")?;
     for field in [
         "selected_node_id",
         "validation_node_id",
         "extension_node_id",
     ] {
-        if let Some(node_id) = provenance[field].as_u64() {
+        if let Some(node_id) = provenance.get(field).and_then(serde_json::Value::as_u64) {
             assert!(
-                case_record["nodes"]
-                    .as_array()
-                    .is_some_and(|nodes| { nodes.iter().any(|node| node["id"] == node_id) })
+                case_record
+                    .get("nodes")
+                    .and_then(serde_json::Value::as_array)
+                    .is_some_and(|nodes| {
+                        nodes.iter().any(|node| {
+                            node.get("id").and_then(serde_json::Value::as_u64) == Some(node_id)
+                        })
+                    })
             );
         }
     }
-    let summary = fs::read_to_string(destination.join("summary.txt"))?;
-    assert!(summary.contains("Evidence sidecar: evidence.jsonl.gz"));
-    assert!(summary.contains("Cases retained ("));
     Ok(())
 }
 

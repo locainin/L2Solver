@@ -194,7 +194,7 @@ fn cache_key_tracks_scope_profile_and_memory_policy_only() -> Result<(), Box<dyn
     let other_source_key = recovery_key(RecoveryCaseKind::Flow, &other_source_scope, &normal)?;
     assert_ne!(normal_key, other_source_key);
 
-    let mut presentation_change = normal.clone();
+    let mut presentation_change = normal;
     presentation_change.refresh = true;
     presentation_change.no_cache = true;
     presentation_change.strict_cache = true;
@@ -288,7 +288,9 @@ fn corrupt_cached_case_is_rejected_in_strict_mode_and_recomputed_otherwise()
 #[test]
 fn cache_keys_require_a_strong_source_identity() -> Result<(), Box<dyn Error>> {
     let (_, mut scope) = case_and_scope(b"4142", 23)?;
-    scope["source_id"] = Value::String(String::from("not-a-sha256-id"));
+    *scope
+        .get_mut("source_id")
+        .ok_or("fixture source is missing")? = Value::String(String::from("not-a-sha256-id"));
 
     assert!(recovery_key(RecoveryCaseKind::Flow, &scope, &RecoveryOptions::default()).is_err());
     Ok(())
@@ -297,7 +299,10 @@ fn cache_keys_require_a_strong_source_identity() -> Result<(), Box<dyn Error>> {
 #[test]
 fn recovery_rejects_a_valid_digest_outside_the_case_sources() -> Result<(), Box<dyn Error>> {
     let (mut case, mut scope) = case_and_scope(b"4142", 29)?;
-    scope["source_id"] = json!(format!("sha256:{}", sha256(b"different source")));
+    *scope
+        .get_mut("source_id")
+        .ok_or("fixture source is missing")? =
+        json!(format!("sha256:{}", sha256(b"different source")));
     let options = RecoveryOptions::default();
 
     assert!(
@@ -338,7 +343,7 @@ fn case_and_scope(bytes: &[u8], flow_id: u64) -> Result<(Case, Value), Box<dyn E
         "imported_source",
         bytes,
         Vec::new(),
-        json!({"source_id": source_id.clone()}),
+        json!({"source_id": source_id}),
     )?;
     let scope = json!({
         "kind": "flow",
