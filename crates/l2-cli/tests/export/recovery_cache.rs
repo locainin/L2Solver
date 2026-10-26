@@ -241,6 +241,14 @@ fn cache_key_does_not_reuse_the_previous_transform_proposal_policy() -> Result<(
 
 #[test]
 fn changed_recovery_algorithm_rejects_a_stale_partial_result() -> Result<(), Box<dyn Error>> {
+    // Version 4 predates record-search changes; version 5 predates native-message exclusions
+    for version in [4, 5] {
+        assert_previous_recovery_recomputed(version)?;
+    }
+    Ok(())
+}
+
+fn assert_previous_recovery_recomputed(version: u32) -> Result<(), Box<dyn Error>> {
     let temporary = tempfile::tempdir()?;
     let cache = open_cache(temporary.path())?;
     let options = RecoveryOptions::default();
@@ -262,7 +270,7 @@ fn changed_recovery_algorithm_rejects_a_stale_partial_result() -> Result<(), Box
         .push("previous algorithm omitted 720 length checks".into());
     previous.coverage.omissions = u64::try_from(previous.omissions.len())?;
     old_case.add_node("previous_algorithm_marker", None, Vec::new(), json!({}))?;
-    let previous_key = version_four_key(&scope, &options)?;
+    let previous_key = previous_recovery_key(&scope, &options, version)?;
     super::store_result(cache.lease(&previous_key)?, &old_case, &previous)?;
 
     let job = Job::new("recovery algorithm invalidation");
@@ -302,9 +310,10 @@ fn changed_recovery_algorithm_rejects_a_stale_partial_result() -> Result<(), Box
     Ok(())
 }
 
-fn version_four_key(
+fn previous_recovery_key(
     scope: &Value,
     options: &RecoveryOptions,
+    version: u32,
 ) -> Result<l2_workbench::job::cache::StageKey, Box<dyn Error>> {
     use l2_workbench::job::cache::{SourceIdentity, StageKey};
 
@@ -319,7 +328,7 @@ fn version_four_key(
     });
     Ok(StageKey::new(
         super::RECOVERY_STAGE,
-        4,
+        version,
         super::RECOVERY_ALGORITHM,
         &policy,
         &SourceIdentity::from_sha256(sha256(b"4142"))?,
