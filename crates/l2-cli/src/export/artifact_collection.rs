@@ -430,6 +430,15 @@ impl ArtifactCollection {
             first = false;
             output.write_all(b"{\"file\":")?;
             serde_json::to_writer(&mut *output, &indexed.file_name)?;
+            // The byte index already stores the digest used when this artifact was staged
+            let digest = indexed
+                .bucket_name
+                .split_once('-')
+                .map(|(_, digest)| digest)
+                .filter(|digest| valid_sha256(digest))
+                .ok_or_else(|| invalid("artifact index has no valid content digest"))?;
+            output.write_all(b",\"sha256\":")?;
+            serde_json::to_writer(&mut *output, digest)?;
             write!(
                 output,
                 ",\"byte_length\":{},\"provenance\":[",

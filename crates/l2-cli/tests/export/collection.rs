@@ -384,7 +384,7 @@ fn exact_limit_keeps_source_complete() -> Result<(), Box<dyn Error>> {
 }
 
 #[test]
-fn manifest_order_is_stable() -> Result<(), Box<dyn Error>> {
+fn manifest_preserves_artifact_order_and_content_hashes() -> Result<(), Box<dyn Error>> {
     let temporary = tempfile::tempdir()?;
     let mut collection = ArtifactCollection::new(temporary.path(), ArtifactLimits::default())?;
     collection.add_bytes(b"first", "one.bin", &provenance())?;
@@ -410,6 +410,13 @@ fn manifest_order_is_stable() -> Result<(), Box<dyn Error>> {
         second.get("file"),
         Some(&Value::String(String::from("two.bin")))
     );
+    for (entry, bytes) in [(first, b"first".as_slice()), (second, b"second".as_slice())] {
+        assert_eq!(
+            entry.get("sha256").and_then(Value::as_str),
+            Some(l2_workbench::sha256(bytes).as_str()),
+            "the manifest must retain the digest of each published artifact"
+        );
+    }
     assert_eq!(
         first
             .get("provenance")
