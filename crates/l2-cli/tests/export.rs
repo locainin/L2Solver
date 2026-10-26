@@ -14,6 +14,8 @@ const FTP_BODY: &[u8] = b"example FTP transfer bytes\r\n";
 mod relational;
 #[path = "export/repeated.rs"]
 mod repeated;
+#[path = "export/tshark_identity.rs"]
+mod tshark_identity;
 
 #[test]
 fn exports_named_artifact() -> Result<(), Box<dyn Error>> {

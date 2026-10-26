@@ -492,7 +492,8 @@ fn busy_content_index_lease_does_not_restart_completed_ingestion() -> Result<(),
 }
 
 #[test]
-fn indexed_flow_analysis_reuses_a_validated_native_case() -> Result<(), Box<dyn Error>> {
+fn indexed_flow_analysis_cache_requires_matching_reconstruction_limits()
+-> Result<(), Box<dyn Error>> {
     let directory = tempfile::tempdir()?;
     let capture_path = directory.path().join("flow.pcap");
     fs::write(&capture_path, single_flow_capture())?;
@@ -539,6 +540,36 @@ fn indexed_flow_analysis_reuses_a_validated_native_case() -> Result<(), Box<dyn 
             .copied()
             .unwrap_or(0)
             > 0
+    );
+
+    let changed_limits = Limits {
+        frames: 1,
+        ..Limits::default()
+    };
+    let changed_job = Job::new("native flow analysis with changed limits");
+    let changed = analyze_indexed_source_with_context(
+        &indexed.store,
+        &indexed.receipt,
+        IndexedAnalysisOptions {
+            limits: changed_limits,
+            include_cohorts: false,
+        },
+        IndexedAnalysisContext {
+            cache: Some(&cache),
+            job: Some(&changed_job),
+        },
+        |_| Ok(()),
+    )?;
+    assert_eq!(changed.analysis.flows, 1);
+    assert!(
+        changed_job
+            .snapshot()?
+            .counters
+            .get(&Counter::CacheMisses)
+            .copied()
+            .unwrap_or(0)
+            > 0,
+        "changing reconstruction limits must not reuse a native flow Case"
     );
     Ok(())
 }

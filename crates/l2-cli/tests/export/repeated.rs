@@ -1,6 +1,6 @@
 use super::*;
 
-fn extraction_command(root: &Path, capture: &Path, destination: &Path) -> Command {
+pub fn extraction_command(root: &Path, capture: &Path, destination: &Path) -> Command {
     let mut command = Command::new(env!("CARGO_BIN_EXE_l2solver"));
     command
         .arg("extract")
@@ -312,9 +312,9 @@ fn assert_export_outputs_match(expected: &Path, actual: &Path) -> Result<(), Box
     Ok(())
 }
 
-type ArtifactContents = Vec<(std::ffi::OsString, Vec<u8>)>;
+pub type ArtifactContents = Vec<(std::ffi::OsString, Vec<u8>)>;
 
-fn artifact_contents(directory: &Path) -> Result<ArtifactContents, Box<dyn Error>> {
+pub fn artifact_contents(directory: &Path) -> Result<ArtifactContents, Box<dyn Error>> {
     let mut paths = artifact_paths(directory)?;
     paths.sort_by(|left, right| left.file_name().cmp(&right.file_name()));
     paths
@@ -424,14 +424,14 @@ fn normalize_output_stamps(stamps: &mut serde_json::Value) -> Result<(), Box<dyn
     Ok(())
 }
 
-struct ResultCounters {
-    cache_hits: u64,
-    cache_misses: u64,
-    candidates_examined: u64,
-    ingestion_state: String,
+pub struct ResultCounters {
+    pub(super) cache_hits: u64,
+    pub(super) cache_misses: u64,
+    pub(super) candidates_examined: u64,
+    pub(super) ingestion_state: String,
 }
 
-fn result_counters(directory: &Path) -> Result<ResultCounters, Box<dyn Error>> {
+pub fn result_counters(directory: &Path) -> Result<ResultCounters, Box<dyn Error>> {
     let manifest: serde_json::Value =
         serde_json::from_slice(&fs::read(directory.join("manifest.json"))?)?;
     let counters = manifest
