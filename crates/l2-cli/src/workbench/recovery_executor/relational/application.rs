@@ -221,29 +221,24 @@ impl<'a> CandidateApplication<'a> {
             job.check_cancelled()?;
         }
         let candidate_outputs = self.replay_candidate_outputs(candidate, evaluation.outputs)?;
-        let GateAssessment {
-            status,
-            details,
-            accepted_schema,
-            assessment_scope,
-        } = evaluation.assessment;
+        let assessment = evaluation.assessment;
         match candidate.rule.parser_scope {
             RelationalParserScope::EachSession => {
-                if accepted_schema.is_some() {
+                if assessment.accepted_schema.is_some() {
                     return Err(RecoveryError::InvariantFailure.into());
                 }
-                self.apply_each_session(candidate_index, candidate, candidate_outputs, &details)
+                self.apply_each_session(
+                    candidate_index,
+                    candidate,
+                    candidate_outputs,
+                    &assessment.details,
+                )
             }
             RelationalParserScope::AcrossSessions => self.apply_across_sessions(
                 candidate_index,
                 candidate,
                 candidate_outputs,
-                GateAssessment {
-                    status,
-                    details,
-                    accepted_schema,
-                    assessment_scope,
-                },
+                assessment,
                 report,
                 gate,
             ),
@@ -420,13 +415,13 @@ impl<'a> CandidateApplication<'a> {
         )?;
         let exact_aggregate_output =
             self.validate_aggregate(candidate_index, candidate, &candidate_outputs)?;
-        let fallback_required = gate_assessment.needs_full_inference();
+        let fallback_required = gate_assessment.needs_full_inference(self.replay_work_remaining);
         if exact_aggregate_output.is_some() {
             gate_assessment.status = GateStatus::ArtifactValidated;
             gate_assessment.assessment_scope = Some(SchemaOffsetScope::CompleteInput);
             if fallback_required {
                 gate_assessment.details = json!({
-                    "primary_header_assessment":gate_assessment.details,
+                    "primary_assessment":gate_assessment.details,
                     "full_inference_fallback":{
                         "attempted":false,
                         "reason":"aggregate_artifact_validated",
@@ -472,13 +467,14 @@ impl<'a> CandidateApplication<'a> {
         assessment: &mut GateAssessment,
         gate: &CandidateGate<'_>,
     ) -> Result<(), super::RecoveryExecutionError> {
-        if !assessment.needs_full_inference() {
+        if !assessment.needs_full_inference(self.replay_work_remaining) {
             return Ok(());
         }
-        let primary_details = assessment.details.clone();
+        let previous_work_limit = assessment.work_limited_at;
+        let primary_details = std::mem::take(&mut assessment.details);
         if self.replay_work_remaining == 0 {
             assessment.details = json!({
-                "primary_header_assessment":primary_details,
+                "primary_assessment":primary_details,
                 "full_inference_fallback":{
                     "attempted":false,
                     "reason":"application_work_limit",
@@ -487,6 +483,7 @@ impl<'a> CandidateApplication<'a> {
             });
             return Ok(());
         }
+        let admitted_work = self.replay_work_remaining;
         let fallback = gate.screen_full_inference(
             candidate_frames,
             report,
@@ -502,10 +499,13 @@ impl<'a> CandidateApplication<'a> {
         assessment.status = fallback.status;
         assessment.accepted_schema = fallback.accepted_schema;
         assessment.assessment_scope = Some(SchemaOffsetScope::CompleteInput);
+        assessment.work_limited_at = fallback.work_limited_at;
         assessment.details = json!({
-            "primary_header_assessment":primary_details,
+            "primary_assessment":primary_details,
             "full_inference_fallback":{
                 "attempted":true,
+                "previous_work_limit":previous_work_limit,
+                "admitted_work_bytes":admitted_work,
                 "work_bytes":fallback.work_bytes,
                 "assessment":fallback.details,
             }

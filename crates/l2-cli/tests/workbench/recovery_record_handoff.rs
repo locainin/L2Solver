@@ -50,14 +50,17 @@ pub(super) fn assert_exact_raw_handoff(
     let receipt = required_node(case, receipt_node_id, "record_parse_receipt")?;
     let receipt_json = json_blob(case, receipt)?;
     let schema = assert_parse_receipt(case, &receipt_json, &frame_ids)?;
-    assert_schema_selected_from_discovery(
+    assert_application_gate_matches_assembly(
         case,
-        receipt_node_id,
-        source_id,
+        &report,
+        candidate_index,
         &schema,
         &frame_ids,
-        &report,
+        &expected_blob_id,
+        expected_bytes.len(),
     )?;
+    assert_schema_selected_from_gate(case, receipt_node_id, report_node_id)?;
+    assert_gate_input_partition(case, &report, &frame_ids)?;
     assert_candidate_and_validation(
         case,
         output,
@@ -103,20 +106,7 @@ fn assert_aggregate_rejection_is_retained(
 ) -> TestResult<()> {
     let candidate_index = u64::try_from(candidate_index)
         .map_err(|source| evidence_error(format!("candidate index is out of range: {source}")))?;
-    let application_check = report
-        .get("application_evidence_checks")
-        .and_then(Value::as_array)
-        .and_then(|checks| {
-            checks.iter().find(|check| {
-                check.get("candidate_index").and_then(Value::as_u64) == Some(candidate_index)
-            })
-        })
-        .ok_or_else(|| evidence_error("relational application check is missing"))?;
-    require(
-        application_check.get("artifact_validated") == Some(&Value::Bool(false)),
-        "pre-assembly aggregate status was changed by later record assembly",
-    )?;
-
+    // Joining raw sessions is a different claim from assembling their records
     let aggregate_rejected = report
         .get("aggregate_parser_checks")
         .and_then(Value::as_array)
@@ -131,6 +121,115 @@ fn assert_aggregate_rejection_is_retained(
     require(
         aggregate_rejected,
         "the original pre-assembly aggregate rejection was not preserved",
+    )
+}
+
+fn assert_application_gate_matches_assembly(
+    case: &Case,
+    report: &Value,
+    candidate_index: usize,
+    schema: &Value,
+    frame_ids: &[u64],
+    expected_blob_id: &str,
+    expected_length: usize,
+) -> TestResult<()> {
+    let candidate_index = u64::try_from(candidate_index)
+        .map_err(|source| evidence_error(format!("candidate index is out of range: {source}")))?;
+    let check = report
+        .get("application_evidence_checks")
+        .and_then(Value::as_array)
+        .and_then(|checks| {
+            checks.iter().find(|check| {
+                check.get("candidate_index").and_then(Value::as_u64) == Some(candidate_index)
+            })
+        })
+        .ok_or_else(|| evidence_error("relational application check is missing"))?;
+    require(
+        check.get("artifact_validated") == Some(&Value::Bool(true))
+            && check.get("status").and_then(Value::as_str) == Some("artifact_validated"),
+        "record gate did not independently validate the assembled artifact",
+    )?;
+    let accepted = check
+        .get("accepted_record_schema")
+        .ok_or_else(|| evidence_error("record gate omitted its accepted schema"))?;
+    require(
+        accepted.get("schema") == Some(schema)
+            && accepted.get("artifact_format").and_then(Value::as_str) == Some("Png")
+            && accepted
+                .pointer("/artifact_receipt/output_sha256")
+                .and_then(Value::as_str)
+                == expected_blob_id.strip_prefix("sha256:")
+            && accepted
+                .pointer("/artifact_receipt/output_length")
+                .and_then(Value::as_u64)
+                == u64::try_from(expected_length).ok()
+            && accepted.pointer("/artifact_receipt/complete") == Some(&Value::Bool(false)),
+        "assembly differs from the exact schema and artifact accepted by the record gate",
+    )?;
+
+    // Materialized frame nodes keep the identities frozen before publication
+    let identities = accepted
+        .get("frame_identities")
+        .and_then(Value::as_array)
+        .ok_or_else(|| evidence_error("record gate omitted its decoded frame identities"))?;
+    require(
+        identities.len() == frame_ids.len(),
+        "record gate and assembly name different numbers of decoded frames",
+    )?;
+    for (index, (identity, frame_id)) in identities.iter().zip(frame_ids).enumerate() {
+        let frame = required_node(case, *frame_id, "relational_decoded_frame")?;
+        require(
+            identity.get("frame_index").and_then(Value::as_u64) == u64::try_from(index).ok(),
+            "record gate frame ordering differs from assembly",
+        )?;
+        for (identity_field, frame_field) in [
+            ("input_node_id", "input_frame_node_id"),
+            ("session_order", "session_order"),
+            ("stream_offset", "stream_offset"),
+            ("frame_byte_length", "length"),
+            ("frame_bytes_sha256", "sha256"),
+        ] {
+            require(
+                identity.get(identity_field) == frame.details.get(frame_field),
+                "assembly changed a decoded frame identity accepted by the record gate",
+            )?;
+        }
+        assert_gate_message_context(case, identity, frame)?;
+    }
+    Ok(())
+}
+
+fn assert_gate_message_context(case: &Case, identity: &Value, frame: &Node) -> TestResult<()> {
+    let episode = required_node(
+        case,
+        required_u64(&frame.details, "episode_node_id")?,
+        "tcp_episode",
+    )?;
+    let direction = required_node(
+        case,
+        required_u64(&frame.details, "direction_node_id")?,
+        "tcp_direction",
+    )?;
+    let scope = identity
+        .pointer("/context/scope")
+        .and_then(Value::as_str)
+        .ok_or_else(|| evidence_error("record gate omitted its source scope"))?;
+    let scope: Value = serde_json::from_str(scope)?;
+    require(
+        identity.pointer("/context/source") == frame.details.get("logical_source_id")
+            && identity.pointer("/context/session") == frame.details.get("session_node_id")
+            && episode.details.get("scope") == Some(&scope),
+        "assembly changed the source, session, or scope accepted by the record gate",
+    )?;
+    // This fixture sends every raw run from the first endpoint to the second
+    require(
+        identity
+            .pointer("/context/direction")
+            .and_then(Value::as_str)
+            == Some("first_to_second")
+            && direction.details.get("source") == episode.details.pointer("/endpoints/0")
+            && direction.details.get("destination") == episode.details.pointer("/endpoints/1"),
+        "assembly changed the direction accepted by the record gate",
     )
 }
 
@@ -314,105 +413,59 @@ fn assert_parse_receipt(case: &Case, receipt: &Value, frame_ids: &[u64]) -> Test
     selected_schema.ok_or_else(|| evidence_error("record parse receipt has no selected schema"))
 }
 
-fn assert_schema_selected_from_discovery(
+fn assert_schema_selected_from_gate(
     case: &Case,
     receipt_node_id: u64,
-    source_id: &str,
-    schema: &Value,
-    frame_ids: &[u64],
-    relational_report: &Value,
+    report_node_id: u64,
 ) -> TestResult<()> {
-    let selected_reports = case
+    let selected_report_ids = case
         .edges()
         .iter()
         .filter(|edge| edge.to == receipt_node_id && edge.relation == "record_schema_selected_from")
-        .filter_map(|edge| case.node(edge.from))
-        .filter(|node| node.kind == "recovery_record_discovery_report")
-        .collect::<Vec<_>>();
+        .map(|edge| edge.from)
+        .collect::<BTreeSet<_>>();
+    // The accepted gate already froze the schema, so assembly must use that receipt
     require(
-        !selected_reports.is_empty(),
-        "record parse receipt has no discovery report selection edge",
-    )?;
-    for report_node in selected_reports {
-        require(
-            report_node.details.get("source_id").and_then(Value::as_str) == Some(source_id),
-            "record schema discovery report belongs to a different source",
-        )?;
-        let report = json_blob(case, report_node)?;
-        if !contains_survivor_schema(&report, schema) {
-            continue;
-        }
-        assert_discovery_report_inputs(case, &report, frame_ids, relational_report)?;
-        return Ok(());
-    }
-    Err(evidence_error(
-        "selected record schema is not among its discovery report survivors",
-    ))
+        selected_report_ids == BTreeSet::from([report_node_id]),
+        "record parse receipt does not select its exact accepted relational schema report",
+    )
 }
 
-fn assert_discovery_report_inputs(
-    case: &Case,
-    report: &Value,
-    frame_ids: &[u64],
-    relational_report: &Value,
-) -> TestResult<()> {
+fn assert_gate_input_partition(case: &Case, report: &Value, frame_ids: &[u64]) -> TestResult<()> {
     let discovery_sessions = required_u64_set(
-        relational_report.get("discovery_sessions"),
+        report.get("discovery_sessions"),
         "relational discovery sessions",
     )?;
     let heldout_sessions = required_u64_set(
-        relational_report.get("heldout_sessions"),
+        report.get("heldout_sessions"),
         "relational held-out sessions",
     )?;
     require(
-        discovery_sessions.is_disjoint(&heldout_sessions),
-        "relational discovery and held-out sessions overlap",
-    )?;
-
-    let partition = report
-        .get("partition")
-        .ok_or_else(|| evidence_error("record discovery report omitted its session partition"))?;
-    let training_sessions = required_u64_set(
-        partition.get("training_session_nodes"),
-        "record discovery training sessions",
-    )?;
-    let report_heldout_sessions = required_u64_set(
-        partition.get("held_out_session_nodes"),
-        "record discovery held-out sessions",
-    )?;
-    require(
-        training_sessions == discovery_sessions && report_heldout_sessions == heldout_sessions,
-        "record discovery partition differs from the frozen relational session split",
+        !discovery_sessions.is_empty()
+            && !heldout_sessions.is_empty()
+            && discovery_sessions.is_disjoint(&heldout_sessions),
+        "relational discovery and held-out sessions are empty or overlap",
     )?;
 
     let mut frame_sessions = BTreeSet::new();
-    let mut expected_refs = Vec::new();
+    let mut original_input_ids = BTreeSet::new();
     for frame_id in frame_ids {
         let frame = required_node(case, *frame_id, "relational_decoded_frame")?;
         let session_id = required_u64(&frame.details, "session_node_id")?;
         frame_sessions.insert(session_id);
-        let partition_name = if discovery_sessions.contains(&session_id) {
-            "training"
-        } else if heldout_sessions.contains(&session_id) {
-            "held_out"
-        } else {
-            return Err(evidence_error(
-                "decoded frame session is absent from the relational session split",
-            ));
-        };
-        expected_refs.push(serde_json::json!([frame_id, partition_name]));
+        original_input_ids.insert(required_u64(&frame.details, "input_frame_node_id")?);
     }
     let all_relational_sessions = discovery_sessions
         .union(&heldout_sessions)
         .copied()
         .collect::<BTreeSet<_>>();
-    let input_refs = report
-        .get("input_frame_refs")
-        .and_then(Value::as_array)
-        .ok_or_else(|| evidence_error("record discovery report omitted its frame references"))?;
+    let report_input_ids = required_u64_set(
+        report.get("input_sample_node_ids"),
+        "relational gate input samples",
+    )?;
     require(
-        frame_sessions == all_relational_sessions && input_refs == &expected_refs,
-        "record discovery report inputs differ from the parsed frames or session split",
+        frame_sessions == all_relational_sessions && original_input_ids == report_input_ids,
+        "assembly inputs differ from the frozen gate inputs or training and held-out sessions",
     )
 }
 
@@ -555,20 +608,6 @@ fn assert_candidate_has_exact_validation(
             == Some("unknown"),
         "relational output did not preserve the unknown terminal sequence",
     )
-}
-
-fn contains_survivor_schema(value: &Value, schema: &Value) -> bool {
-    [
-        "/schema_discovery/surviving",
-        "/repeated_boundary_analysis/discovery/surviving",
-    ]
-    .iter()
-    .filter_map(|path| value.pointer(path).and_then(Value::as_array))
-    .any(|survivors| {
-        survivors
-            .iter()
-            .any(|candidate| candidate.get("schema") == Some(schema))
-    })
 }
 
 fn json_blob(case: &Case, node: &Node) -> TestResult<Value> {

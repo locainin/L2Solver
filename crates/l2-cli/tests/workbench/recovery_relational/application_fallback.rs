@@ -38,12 +38,70 @@ struct InputFrame {
 fn cold_body_dependent_candidate_runs_deferred_application_and_charges_work() -> TestResult {
     let fixture =
         crate::workbench::recovery_executor::record_discovery_tests::build_session_relative_fixture()?;
-    let (applied, report_work) = apply_body_dependent_candidate(&fixture.plaintext)?;
+    let (applied, report_work) = apply_body_dependent_candidate(
+        &fixture.plaintext,
+        SchemaOffsetScope::PreservedHeader,
+        APPLICATION_WORK_LIMIT,
+        APPLICATION_WORK_LIMIT,
+    )?;
 
     assert_application_fallback(&applied, report_work, &fixture.plaintext)
 }
 
-fn apply_body_dependent_candidate(plaintext: &[u8]) -> TestResult<(AppliedCandidates, usize)> {
+#[test]
+fn work_limited_full_input_candidate_uses_reserved_application_work() -> TestResult {
+    let fixture =
+        crate::workbench::recovery_executor::record_discovery_tests::build_session_relative_fixture()?;
+    let (applied, report_work) = apply_body_dependent_candidate(
+        &fixture.plaintext,
+        SchemaOffsetScope::CompleteInput,
+        0,
+        APPLICATION_WORK_LIMIT,
+    )?;
+
+    assert_application_fallback(&applied, report_work, &fixture.plaintext)
+}
+
+#[test]
+fn work_limited_candidate_without_additional_allowance_stays_pending() -> TestResult {
+    let fixture =
+        crate::workbench::recovery_executor::record_discovery_tests::build_session_relative_fixture()?;
+    for work_limit in [0, 16] {
+        let (applied, report_work) = apply_body_dependent_candidate(
+            &fixture.plaintext,
+            SchemaOffsetScope::CompleteInput,
+            work_limit,
+            work_limit,
+        )?;
+
+        assert!(report_work <= work_limit);
+        assert_eq!(applied.used_work, report_work);
+        assert_eq!(applied.applied_rules, 0);
+        assert!(applied.accepted_schemas.is_empty());
+        let assessment = applied
+            .application_evidence_checks
+            .first()
+            .ok_or("pending application evidence was not retained")?;
+        assert_eq!(
+            assessment.get("status").and_then(Value::as_str),
+            Some("pending")
+        );
+        assert_ne!(
+            assessment
+                .pointer("/details/full_inference_fallback/attempted")
+                .and_then(Value::as_bool),
+            Some(true)
+        );
+    }
+    Ok(())
+}
+
+fn apply_body_dependent_candidate(
+    plaintext: &[u8],
+    primary_scope: SchemaOffsetScope,
+    primary_work_limit: usize,
+    application_work_limit: usize,
+) -> TestResult<(AppliedCandidates, usize)> {
     let input_frames = input_frames(plaintext)?;
     let (samples, stored_samples) = samples_for(&input_frames);
     let sessions = session_ids();
@@ -58,7 +116,7 @@ fn apply_body_dependent_candidate(plaintext: &[u8]) -> TestResult<(AppliedCandid
     let mut gate = CandidateGate::new(
         &samples,
         &stored_samples,
-        false,
+        primary_scope == SchemaOffsetScope::CompleteInput,
         RecordSchemaProposalLimits::default(),
         ArtifactValidationPolicy::default(),
         None,
@@ -67,20 +125,31 @@ fn apply_body_dependent_candidate(plaintext: &[u8]) -> TestResult<(AppliedCandid
         &RelationalTransformEvaluationContext {
             discovery_sessions,
             heldout_sessions,
-            work_bytes_remaining: APPLICATION_WORK_LIMIT,
+            work_bytes_remaining: primary_work_limit,
         },
         &candidate,
         &session_outputs(&outputs, discovery_sessions),
         &session_outputs(&outputs, heldout_sessions),
     )?;
     assert_ne!(primary.assessment.status, GateStatus::ArtifactValidated);
-    assert_eq!(
-        primary.assessment.assessment_scope,
-        Some(SchemaOffsetScope::PreservedHeader)
+    assert_eq!(primary.assessment.assessment_scope, Some(primary_scope));
+    if primary_scope == SchemaOffsetScope::CompleteInput {
+        let limited_at = primary
+            .assessment
+            .work_limited_at
+            .ok_or("the work-limited primary assessment has no admitted limit")?;
+        assert!(!primary.assessment.needs_full_inference(limited_at));
+    }
+    assert!(
+        primary
+            .assessment
+            .needs_full_inference(APPLICATION_WORK_LIMIT)
     );
-    assert!(primary.assessment.needs_full_inference());
     let report = transform_report(candidate, &sessions, primary.work_bytes)?;
-    let context = application_context(&stored_samples);
+    let mut context = application_context(&stored_samples);
+    if primary_scope == SchemaOffsetScope::CompleteInput {
+        context.key.framing_rule_json = super::RAW_RUN_FRAMING_RULE.to_owned();
+    }
     let search_plan = RelationalTransformPlan {
         limits: RelationalTransformLimits::default(),
         parser_scope: RelationalParserScope::AcrossSessions,
@@ -99,7 +168,7 @@ fn apply_body_dependent_candidate(plaintext: &[u8]) -> TestResult<(AppliedCandid
         &samples,
         &search_plan,
         ArtifactValidationPolicy::default(),
-        APPLICATION_WORK_LIMIT,
+        application_work_limit,
         &report,
         None,
     )?

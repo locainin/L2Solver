@@ -44,9 +44,8 @@ struct FinishEvaluationContext<'ctx, 'samples> {
     gate: &'ctx CandidateGate<'samples>,
 }
 
-pub(super) // Gate checks consume the same frozen outputs used by retained candidates
-struct CandidateGate
-<'a> {
+// Gate checks consume the same frozen outputs used by retained candidates
+pub(super) struct CandidateGate<'a> {
     samples: &'a [RelationalRecordSample<'a>],
     stored_samples: &'a [StoredSample],
     raw_directional_run: bool,
@@ -113,6 +112,7 @@ impl<'a> CandidateGate<'a> {
                     details: serde_json::json!({"reason":"candidate_did_not_require_across_session_gate"}),
                     accepted_schema: None,
                     assessment_scope: None,
+                    work_limited_at: None,
                 },
             });
         }
@@ -137,6 +137,7 @@ impl<'a> CandidateGate<'a> {
                 details: gate.details,
                 accepted_schema: gate.accepted_schema,
                 assessment_scope: Some(gate.assessment_scope),
+                work_limited_at: gate.work_limited_at,
             },
         })
     }

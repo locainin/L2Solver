@@ -31,7 +31,7 @@ use serde_json::Value;
 use std::collections::{BTreeSet, HashSet};
 
 const REPORT_KIND: &str = "recovery_relational_transform_report";
-const REPORT_VERSION: u16 = 1;
+const REPORT_VERSION: u16 = 2;
 const OUTPUT_KIND: &str = "relational_transform_output";
 pub(super) const DECODED_FRAME_KIND: &str = "relational_decoded_frame";
 const OUTPUT_REASON: &str = "This exact output was produced by a frozen session-relative rule that passed its parser checks";
@@ -167,14 +167,21 @@ struct GateAssessment {
     details: Value,
     accepted_schema: Option<AcceptedRecordSchema>,
     assessment_scope: Option<SchemaOffsetScope>,
+    work_limited_at: Option<usize>,
 }
 
 impl GateAssessment {
-    const fn needs_full_inference(&self) -> bool {
+    fn needs_full_inference(&self, available_work: usize) -> bool {
+        if self.status == GateStatus::ArtifactValidated {
+            return false;
+        }
+        // A larger application allowance can finish work cut short during ranking
         matches!(
             self.assessment_scope,
             Some(SchemaOffsetScope::PreservedHeader)
-        ) && !matches!(self.status, GateStatus::ArtifactValidated)
+        ) || self
+            .work_limited_at
+            .is_some_and(|previous_limit| available_work > previous_limit)
     }
 }
 

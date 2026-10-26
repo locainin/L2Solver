@@ -297,7 +297,7 @@ fn cache_key_does_not_reuse_the_previous_transform_proposal_policy() -> Result<(
 #[test]
 fn changed_recovery_algorithm_rejects_a_stale_partial_result() -> Result<(), Box<dyn Error>> {
     // Earlier stages lack current search, schema handoff, or deferred assembly semantics
-    for version in [4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14] {
+    for version in [4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15] {
         assert_previous_recovery_recomputed(version)?;
     }
     Ok(())
