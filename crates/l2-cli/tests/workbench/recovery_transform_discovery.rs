@@ -8,7 +8,7 @@ use l2_workbench::{
     evidence::{Case, Edge, EvidenceStatus, MAX_EDGES},
     recovery::{
         RecoveryCandidate, RecoveryCandidateState, RecoveryCoordinator, RecoveryResource,
-        RecoveryResult, RecoveryStage,
+        RecoveryResult, RecoveryStage, proposals::TRANSFORM_PROPOSAL_FORMAT_VERSION,
     },
 };
 use serde_json::Value;
@@ -288,7 +288,8 @@ fn equivalent_transform_keeps_proposal_receipts_for_each_origin() -> Result<(), 
 }
 
 #[test]
-fn proposal_association_budget_admits_a_prefix_before_scheduling() -> Result<(), Box<dyn Error>> {
+fn base64_aliases_do_not_consume_association_budget_or_trigger_omissions()
+-> Result<(), Box<dyn Error>> {
     let mut case = Case::new();
     let input_node = source(&mut case, "http_body", BASE64_HEX_INPUT)?;
     let mut bounded = policy();
@@ -296,13 +297,12 @@ fn proposal_association_budget_admits_a_prefix_before_scheduling() -> Result<(),
 
     let outcome = execute(&mut case, &automatic_recovery_plan(), &bounded)?;
 
-    let report_node = discovery_report_node_for_input(&case, &outcome.candidates, input_node)?;
     let report = discovery_report_for_input(&case, &outcome.candidates, input_node)?;
     let proposals = report
         .pointer("/proposal_report/proposals")
         .and_then(Value::as_array)
         .ok_or("transform proposal list is missing")?;
-    assert_eq!(proposals.len(), 2);
+    assert_eq!(proposals.len(), 1);
     let first_recipe: l2_workbench::derivation::Recipe = serde_json::from_value(
         proposals
             .first()
@@ -310,13 +310,21 @@ fn proposal_association_budget_admits_a_prefix_before_scheduling() -> Result<(),
             .cloned()
             .ok_or("first transform proposal recipe is missing")?,
     )?;
-    let omitted_recipe: l2_workbench::derivation::Recipe = serde_json::from_value(
-        proposals
-            .get(1)
-            .and_then(|proposal| proposal.get("recipe"))
-            .cloned()
-            .ok_or("second transform proposal recipe is missing")?,
-    )?;
+    let assessments = report
+        .pointer("/proposal_report/assessments")
+        .and_then(Value::as_array)
+        .ok_or("transform proposal assessments are missing")?;
+    assert!(assessments.iter().any(|assessment| {
+        assessment
+            .pointer("/result/eligible/disposition/alias_of")
+            .is_some()
+    }));
+    assert_eq!(
+        report
+            .pointer("/proposal_report/omissions/candidates")
+            .and_then(Value::as_u64),
+        Some(0)
+    );
     let input_transforms = outcome
         .candidates
         .iter()
@@ -336,26 +344,15 @@ fn proposal_association_budget_admits_a_prefix_before_scheduling() -> Result<(),
         first_transform.task(),
         &RecoveryTask::Transform(first_recipe)
     );
-    assert_ne!(
-        first_transform.task(),
-        &RecoveryTask::Transform(omitted_recipe)
-    );
     assert_eq!(outcome.resources.max_transform_proposal_associations, 1);
     assert_eq!(outcome.resources.transform_proposal_associations_charged, 1);
     assert_eq!(
         outcome.resources.transform_proposal_associations_remaining,
         0
     );
-    assert!(outcome.omissions.iter().any(|omission| matches!(
+    assert!(!outcome.omissions.iter().any(|omission| matches!(
         omission,
-        RecoveryOmission::TransformProposalAssociations {
-            report_node_id: omitted_report,
-            input_node_id: omitted_input,
-            used: 1,
-            limit: 1,
-            requested: 1,
-            omitted_count: 1,
-        } if *omitted_report == report_node && *omitted_input == input_node
+        RecoveryOmission::TransformProposalAssociations { .. }
     )));
     Ok(())
 }
@@ -496,7 +493,10 @@ fn proposal_candidate_budget_is_explicit_in_the_retained_report() -> Result<(), 
     let outcome = execute(&mut case, &automatic_recovery_plan(), &bounded)?;
 
     let report = discovery_report_for_input(&case, &outcome.candidates, input_node)?;
-    assert_eq!(report.get("version").and_then(Value::as_u64), Some(1));
+    assert_eq!(
+        report.get("version").and_then(Value::as_u64),
+        Some(u64::from(TRANSFORM_PROPOSAL_FORMAT_VERSION))
+    );
     assert_eq!(
         report.pointer("/input/node_id").and_then(Value::as_u64),
         Some(input_node)
@@ -538,7 +538,7 @@ fn proposal_candidate_budget_is_explicit_in_the_retained_report() -> Result<(), 
         report
             .pointer("/proposal_report/omissions/candidates")
             .and_then(Value::as_u64),
-        Some(2)
+        Some(1)
     );
     let assessments = report
         .pointer("/proposal_report/assessments")
@@ -588,7 +588,7 @@ fn report_budget_omissions_do_not_skip_candidate_scanning_or_scheduling()
             .pointer("/proposal_report/proposals")
             .and_then(Value::as_array)
             .map(Vec::len),
-        Some(2)
+        Some(1)
     );
     assert!(
         outcome

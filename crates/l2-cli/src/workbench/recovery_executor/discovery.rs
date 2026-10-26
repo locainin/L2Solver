@@ -11,8 +11,9 @@ use l2_workbench::{
         RecoveryCandidateState, RecoveryError, RecoveryResource, RecoveryResult,
         TransformProposalAssociationOutcome,
         proposals::{
-            TRANSFORM_PROPOSAL_OPERATION_COUNT, TransformProposalBudget, TransformProposalReport,
-            propose_transforms, transform_proposal_scan_work_bound,
+            TRANSFORM_PROPOSAL_FORMAT_VERSION, TRANSFORM_PROPOSAL_OPERATION_COUNT,
+            TransformProposalBudget, TransformProposalReport, propose_transforms,
+            transform_proposal_scan_work_bound,
         },
     },
 };
@@ -21,7 +22,7 @@ use serde_json::json;
 use std::{collections::HashSet, hash::Hash};
 
 const REPORT_KIND: &str = "recovery_transform_proposal_report";
-const REPORT_VERSION: u16 = 1;
+const REPORT_VERSION: u16 = TRANSFORM_PROPOSAL_FORMAT_VERSION;
 
 #[cfg(test)]
 #[path = "../../../tests/workbench/recovery_proposal_link_quota.rs"]

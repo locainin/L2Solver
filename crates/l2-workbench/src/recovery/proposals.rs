@@ -12,10 +12,13 @@
 //! its own integrity and format checks
 
 use crate::derivation::{Base64Alphabet, Base64Padding, Operation, Recipe};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 /// Number of canonical operations checked by one complete proposal pass
 pub const TRANSFORM_PROPOSAL_OPERATION_COUNT: usize = 7;
+
+/// Version of the syntax proposal algorithm and serialized assessment format
+pub const TRANSFORM_PROPOSAL_FORMAT_VERSION: u16 = 2;
 
 /// Upper bound for byte visits in one complete syntax assessment pass
 ///
@@ -38,14 +41,14 @@ pub fn transform_proposal_scan_work_bound(input_length: usize) -> Option<usize> 
 /// Caller-resolved limits for returned proposals and eligibility assessments
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
 pub struct TransformProposalBudget {
-    /// Maximum number of eligible recipes to return
+    /// Maximum number of unique eligible execution recipes to return
     pub max_candidates: usize,
     /// Maximum number of per-operation eligibility assessments to return
     pub max_reports: usize,
 }
 
 /// One eligible single-operation recipe with the evidence supporting its proposal
-#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct TransformProposal {
     /// Canonical recipe containing the proposed operation
     pub recipe: Recipe,
@@ -54,7 +57,7 @@ pub struct TransformProposal {
 }
 
 /// Eligibility evidence attached to one proposed operation
-#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum TransformEvidence {
     /// Every input byte is part of a non-empty, even-length hexadecimal string
@@ -81,7 +84,7 @@ pub enum TransformEvidence {
 }
 
 /// Why a syntactic candidate was not eligible for a proposal
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum TransformIneligibility {
     /// Empty input has no bytes that identify an encoding or compression format
@@ -99,7 +102,7 @@ pub enum TransformIneligibility {
 }
 
 /// Result of checking one supported canonical operation against the complete input
-#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct TransformAssessment {
     /// Operation checked in stable format order
     pub operation: Operation,
@@ -107,8 +110,8 @@ pub struct TransformAssessment {
     pub result: TransformAssessmentResult,
 }
 
-/// Eligibility decision and, when eligible, whether the candidate budget retained it
-#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+/// Eligibility decision and, when eligible, its unique recipe's retention or alias status
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum TransformAssessmentResult {
     /// Complete syntax or header evidence supports a proposal
@@ -120,33 +123,38 @@ pub enum TransformAssessmentResult {
     Ineligible { reason: TransformIneligibility },
 }
 
-/// Whether an eligible candidate fit the caller-selected proposal budget
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+/// Whether an eligible operation was retained, omitted, or aliases an earlier Base64 mode
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum TransformProposalDisposition {
     /// The recipe is present in the returned proposal list
     Proposed,
-    /// Eligibility was established, but the candidate budget was full
+    /// This operation is eligible, but its execution-class budget was full
     OmittedByCandidateBudget,
+    /// This syntax mode decodes to the same bytes as an earlier eligible Base64 mode
+    AliasOf {
+        /// First eligible Base64 operation in the fixed assessment order
+        representative: Operation,
+    },
 }
 
 /// Counts for eligible candidates and assessments omitted by caller-selected budgets
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize)]
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
 pub struct TransformProposalOmissions {
-    /// Eligible recipes omitted by the candidate budget
+    /// Unique eligible recipes omitted by the candidate budget
     pub candidates: usize,
     /// Per-operation assessments omitted by the report budget
     pub reports: usize,
 }
 
 /// Deterministic proposals, bounded assessments, and explicit omission counts
-#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct TransformProposalReport {
-    /// Eligible one-operation recipes in stable format order
+    /// Unique eligible one-operation recipes in stable format order
     pub proposals: Vec<TransformProposal>,
     /// Per-operation results up to the caller-selected report budget
     pub assessments: Vec<TransformAssessment>,
-    /// Eligible candidates and assessments left out by the selected budgets
+    /// Unique eligible execution classes and assessments left out by the selected budgets
     pub omissions: TransformProposalOmissions,
 }
 
@@ -163,7 +171,8 @@ pub fn propose_transforms(
 ) -> TransformProposalReport {
     let mut proposals = Vec::new();
     let mut assessments = Vec::new();
-    let mut eligible_count = 0_usize;
+    let mut unique_eligible_count = 0_usize;
+    let mut base64_representative = None;
     let mut report_count = 0_usize;
 
     // This fixed candidate list is the complete supported search space
@@ -172,19 +181,36 @@ pub fn propose_transforms(
         let eligibility = assess(input, candidate);
         let result = match eligibility {
             Ok(evidence) => {
-                eligible_count += 1;
-                let disposition = if proposals.len() < budget.max_candidates {
-                    proposals.push(TransformProposal {
-                        recipe: Recipe {
-                            steps: vec![operation.clone()],
-                            constraints: Vec::new(),
-                        },
-                        evidence: evidence.clone(),
-                    });
-                    TransformProposalDisposition::Proposed
-                } else {
-                    TransformProposalDisposition::OmittedByCandidateBudget
+                let representative = match candidate {
+                    CandidateKind::Base64 { .. } => base64_representative.clone(),
+                    CandidateKind::Hex | CandidateKind::Gzip | CandidateKind::Zlib => None,
                 };
+                let disposition = representative.map_or_else(
+                    || {
+                        if matches!(candidate, CandidateKind::Base64 { .. }) {
+                            base64_representative = Some(operation.clone());
+                        }
+                        unique_eligible_count += 1;
+                        if proposals.len() < budget.max_candidates {
+                            proposals.push(TransformProposal {
+                                recipe: Recipe {
+                                    steps: vec![operation.clone()],
+                                    constraints: Vec::new(),
+                                },
+                                evidence: evidence.clone(),
+                            });
+                            TransformProposalDisposition::Proposed
+                        } else {
+                            TransformProposalDisposition::OmittedByCandidateBudget
+                        }
+                    },
+                    |representative| {
+                        // Different alphabets accept together only when input uses their shared symbols
+                        // Different padding modes accept together only for unpadded full quartets
+                        // Eligibility proves equal decoded bytes without execution or a second pass
+                        TransformProposalDisposition::AliasOf { representative }
+                    },
+                );
                 TransformAssessmentResult::Eligible {
                     evidence,
                     disposition,
@@ -202,7 +228,7 @@ pub fn propose_transforms(
 
     TransformProposalReport {
         omissions: TransformProposalOmissions {
-            candidates: eligible_count - proposals.len(),
+            candidates: unique_eligible_count - proposals.len(),
             reports: report_count - assessments.len(),
         },
         proposals,

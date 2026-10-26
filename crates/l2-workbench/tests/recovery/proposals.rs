@@ -1,8 +1,9 @@
 use l2_workbench::{
-    derivation::{Base64Alphabet, Base64Padding, DerivationStatus, Operation, Recipe, run},
+    derivation::{run, Base64Alphabet, Base64Padding, DerivationStatus, Operation, Recipe},
     recovery::proposals::{
-        TransformAssessment, TransformAssessmentResult, TransformEvidence, TransformProposalBudget,
-        TransformProposalDisposition, propose_transforms, transform_proposal_scan_work_bound,
+        propose_transforms, transform_proposal_scan_work_bound, TransformAssessment,
+        TransformAssessmentResult, TransformEvidence, TransformProposalBudget,
+        TransformProposalDisposition,
     },
 };
 
@@ -13,6 +14,16 @@ const fn budget(max_candidates: usize, max_reports: usize) -> TransformProposalB
     }
 }
 
+const fn base64_mode(alphabet: Base64Alphabet, padding: Base64Padding) -> Operation {
+    Operation::Base64Decode { alphabet, padding }
+}
+
+fn alias_of(representative: &Operation) -> TransformProposalDisposition {
+    TransformProposalDisposition::AliasOf {
+        representative: representative.clone(),
+    }
+}
+
 fn proposed_operations(
     report: &l2_workbench::recovery::proposals::TransformProposalReport,
 ) -> Vec<Operation> {
@@ -20,6 +31,41 @@ fn proposed_operations(
         .proposals
         .iter()
         .filter_map(|proposal| proposal.recipe.steps.first().cloned())
+        .collect()
+}
+
+fn eligible_base64_mode_count(
+    report: &l2_workbench::recovery::proposals::TransformProposalReport,
+) -> usize {
+    report
+        .assessments
+        .iter()
+        .filter(|assessment| {
+            matches!(
+                &assessment.result,
+                TransformAssessmentResult::Eligible {
+                    evidence: TransformEvidence::Base64Syntax { .. },
+                    ..
+                }
+            )
+        })
+        .count()
+}
+
+fn eligible_base64_dispositions(
+    report: &l2_workbench::recovery::proposals::TransformProposalReport,
+) -> Vec<(Operation, TransformProposalDisposition)> {
+    report
+        .assessments
+        .iter()
+        .filter_map(|assessment| match &assessment.result {
+            TransformAssessmentResult::Eligible {
+                evidence: TransformEvidence::Base64Syntax { .. },
+                disposition,
+            } => Some((assessment.operation.clone(), disposition.clone())),
+            TransformAssessmentResult::Eligible { .. }
+            | TransformAssessmentResult::Ineligible { .. } => None,
+        })
         .collect()
 }
 
@@ -45,22 +91,11 @@ fn proposes_complete_syntax() {
                 alphabet: Base64Alphabet::Standard,
                 padding: Base64Padding::Required,
             },
-            Operation::Base64Decode {
-                alphabet: Base64Alphabet::Standard,
-                padding: Base64Padding::Forbidden,
-            },
-            Operation::Base64Decode {
-                alphabet: Base64Alphabet::UrlSafe,
-                padding: Base64Padding::Required,
-            },
-            Operation::Base64Decode {
-                alphabet: Base64Alphabet::UrlSafe,
-                padding: Base64Padding::Forbidden,
-            },
         ]
     );
-    assert_eq!(report.proposals.len(), 5);
+    assert_eq!(report.proposals.len(), 2);
     assert_eq!(report.assessments.len(), 7);
+    assert_eq!(eligible_base64_mode_count(&report), 4);
     assert!(report.proposals.iter().all(|proposal| {
         proposal.recipe.steps.len() == 1 && proposal.recipe.constraints.is_empty()
     }));
@@ -150,15 +185,8 @@ fn reports_budget_omissions() {
 
     assert_eq!(report.proposals.len(), 2);
     assert_eq!(report.assessments.len(), 3);
-    assert_eq!(report.omissions.candidates, 3);
+    assert_eq!(report.omissions.candidates, 0);
     assert_eq!(report.omissions.reports, 4);
-    assert!(report.assessments.iter().any(|item| matches!(
-        &item.result,
-        TransformAssessmentResult::Eligible {
-            disposition: TransformProposalDisposition::OmittedByCandidateBudget,
-            ..
-        }
-    )));
 }
 
 #[test]
@@ -167,7 +195,7 @@ fn keeps_budgets_independent() {
 
     assert_eq!(report.proposals.len(), 1);
     assert_eq!(report.assessments.len(), 0);
-    assert_eq!(report.omissions.candidates, 4);
+    assert_eq!(report.omissions.candidates, 1);
     assert_eq!(report.omissions.reports, 7);
     assert!(matches!(
         report.proposals.first().map(|proposal| &proposal.evidence),
@@ -180,6 +208,14 @@ fn rejects_empty_input() {
     let report = propose_transforms(b"", budget(8, 8));
 
     assert!(report.proposals.is_empty());
+    assert_eq!(report.assessments.len(), 7);
+    assert_eq!(report.omissions.candidates, 0);
+    assert!(report.assessments.iter().all(|item| matches!(
+        &item.result,
+        TransformAssessmentResult::Ineligible {
+            reason: l2_workbench::recovery::proposals::TransformIneligibility::EmptyInput,
+        }
+    )));
 }
 
 #[test]
@@ -200,6 +236,189 @@ fn reports_padding_variants() {
             alphabet: Base64Alphabet::UrlSafe,
             padding: Base64Padding::Forbidden,
         }]
+    );
+}
+
+#[test]
+fn shares_one_candidate_for_unpadded_full_quartets() {
+    let report = propose_transforms(b"TWFu", budget(8, 8));
+    let representative = base64_mode(Base64Alphabet::Standard, Base64Padding::Required);
+
+    assert_eq!(proposed_operations(&report), vec![representative.clone()]);
+    assert_eq!(eligible_base64_mode_count(&report), 4);
+    assert_eq!(
+        eligible_base64_dispositions(&report),
+        vec![
+            (
+                representative.clone(),
+                TransformProposalDisposition::Proposed
+            ),
+            (
+                base64_mode(Base64Alphabet::Standard, Base64Padding::Forbidden),
+                alias_of(&representative)
+            ),
+            (
+                base64_mode(Base64Alphabet::UrlSafe, Base64Padding::Required),
+                alias_of(&representative)
+            ),
+            (
+                base64_mode(Base64Alphabet::UrlSafe, Base64Padding::Forbidden),
+                alias_of(&representative)
+            ),
+        ]
+    );
+    assert_eq!(report.omissions.candidates, 0);
+}
+
+#[test]
+fn shares_candidates_for_padded_and_unpadded_partial_inputs() {
+    let padded = propose_transforms(b"TWE=", budget(8, 8));
+    let unpadded = propose_transforms(b"TWE", budget(8, 8));
+    let padded_representative = base64_mode(Base64Alphabet::Standard, Base64Padding::Required);
+    let unpadded_representative = base64_mode(Base64Alphabet::Standard, Base64Padding::Forbidden);
+
+    assert_eq!(
+        proposed_operations(&padded),
+        vec![padded_representative.clone()]
+    );
+    assert_eq!(eligible_base64_mode_count(&padded), 2);
+    assert_eq!(
+        eligible_base64_dispositions(&padded),
+        vec![
+            (
+                padded_representative.clone(),
+                TransformProposalDisposition::Proposed
+            ),
+            (
+                base64_mode(Base64Alphabet::UrlSafe, Base64Padding::Required),
+                alias_of(&padded_representative)
+            ),
+        ]
+    );
+    assert_eq!(
+        proposed_operations(&unpadded),
+        vec![unpadded_representative.clone()]
+    );
+    assert_eq!(eligible_base64_mode_count(&unpadded), 2);
+    assert_eq!(
+        eligible_base64_dispositions(&unpadded),
+        vec![
+            (
+                unpadded_representative.clone(),
+                TransformProposalDisposition::Proposed
+            ),
+            (
+                base64_mode(Base64Alphabet::UrlSafe, Base64Padding::Forbidden),
+                alias_of(&unpadded_representative)
+            ),
+        ]
+    );
+}
+
+#[test]
+fn keeps_alphabet_specific_modes_distinct_and_rejects_mixed_alphabets() {
+    let standard = propose_transforms(b"+///", budget(8, 8));
+    let url_safe = propose_transforms(b"-_8", budget(8, 8));
+    let mixed = propose_transforms(b"+_8", budget(8, 8));
+    let standard_representative = base64_mode(Base64Alphabet::Standard, Base64Padding::Required);
+
+    assert_eq!(
+        proposed_operations(&standard),
+        vec![standard_representative.clone()]
+    );
+    assert_eq!(eligible_base64_mode_count(&standard), 2);
+    assert_eq!(
+        eligible_base64_dispositions(&standard),
+        vec![
+            (
+                standard_representative.clone(),
+                TransformProposalDisposition::Proposed
+            ),
+            (
+                base64_mode(Base64Alphabet::Standard, Base64Padding::Forbidden),
+                alias_of(&standard_representative)
+            ),
+        ]
+    );
+    assert_eq!(
+        proposed_operations(&url_safe),
+        vec![Operation::Base64Decode {
+            alphabet: Base64Alphabet::UrlSafe,
+            padding: Base64Padding::Forbidden,
+        }]
+    );
+    assert_eq!(eligible_base64_mode_count(&url_safe), 1);
+    assert!(proposed_operations(&mixed).is_empty());
+    assert_eq!(eligible_base64_mode_count(&mixed), 0);
+    assert_eq!(mixed.assessments.len(), 7);
+    let mixed_base64_assessments = mixed
+        .assessments
+        .iter()
+        .filter(|assessment| matches!(&assessment.operation, Operation::Base64Decode { .. }))
+        .collect::<Vec<_>>();
+    assert_eq!(mixed_base64_assessments.len(), 4);
+    assert!(mixed_base64_assessments.iter().all(|assessment| matches!(
+        &assessment.result,
+        TransformAssessmentResult::Ineligible {
+            reason: l2_workbench::recovery::proposals::TransformIneligibility::InvalidBase64Syntax,
+        }
+    )));
+}
+
+#[test]
+fn serialized_report_round_trips_aliases_and_rejection_evidence(
+) -> Result<(), Box<dyn std::error::Error>> {
+    let report = propose_transforms(b"+///", budget(8, 7));
+    let serialized = serde_json::to_vec(&report)?;
+    let restored: l2_workbench::recovery::proposals::TransformProposalReport =
+        serde_json::from_slice(&serialized)?;
+
+    assert_eq!(restored, report);
+    assert!(eligible_base64_dispositions(&restored)
+        .iter()
+        .any(|(_, disposition)| matches!(
+            disposition,
+            TransformProposalDisposition::AliasOf { .. }
+        )));
+    assert!(restored.assessments.iter().any(|assessment| matches!(
+        &assessment.result,
+        TransformAssessmentResult::Ineligible {
+            reason: l2_workbench::recovery::proposals::TransformIneligibility::InvalidBase64Syntax,
+        }
+    )));
+    Ok(())
+}
+
+#[test]
+fn zero_candidate_budget_counts_equivalence_classes_and_retains_assessments() {
+    let report = propose_transforms(b"TWFu", budget(0, 7));
+    let representative = base64_mode(Base64Alphabet::Standard, Base64Padding::Required);
+
+    assert!(report.proposals.is_empty());
+    assert_eq!(report.assessments.len(), 7);
+    assert_eq!(report.omissions.candidates, 1);
+    assert_eq!(report.omissions.reports, 0);
+    assert_eq!(eligible_base64_mode_count(&report), 4);
+    assert_eq!(
+        eligible_base64_dispositions(&report),
+        vec![
+            (
+                representative.clone(),
+                TransformProposalDisposition::OmittedByCandidateBudget
+            ),
+            (
+                base64_mode(Base64Alphabet::Standard, Base64Padding::Forbidden),
+                alias_of(&representative)
+            ),
+            (
+                base64_mode(Base64Alphabet::UrlSafe, Base64Padding::Required),
+                alias_of(&representative)
+            ),
+            (
+                base64_mode(Base64Alphabet::UrlSafe, Base64Padding::Forbidden),
+                alias_of(&representative)
+            ),
+        ]
     );
 }
 
