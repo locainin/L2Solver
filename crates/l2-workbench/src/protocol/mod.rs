@@ -5,6 +5,7 @@ mod boundaries;
 mod correlation;
 mod correlation_candidates;
 mod error;
+mod family;
 mod framing;
 mod model;
 pub mod observation;
@@ -27,6 +28,12 @@ pub use boundaries::{
 pub use correlation::correlate_fields;
 pub use correlation::correlate_fields_with_limits;
 pub use correlation_candidates::infer_correlation_candidates;
+pub use family::{
+    DEFAULT_MAX_FAMILY_RANGES, DEFAULT_MAX_FAMILY_REPORT_BYTES, DEFAULT_MAX_FAMILY_SAMPLES,
+    DEFAULT_MAX_FAMILY_SELECTORS, DEFAULT_MAX_FAMILY_VALUES, MessageFamily, MessageFamilyError,
+    MessageFamilyLimits, MessageFamilyReport, MessageFamilySelector, UnassignedFamilyObservation,
+    UnassignedFamilyReason, discover_message_families,
+};
 pub use framing::{infer_framing, infer_framing_with_limits};
 pub use model::{
     BoundaryAliasGroup, BoundaryCandidate, BoundaryExtractionReport, BoundaryStatus, ByteOrder,
