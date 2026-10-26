@@ -69,10 +69,19 @@ fn decoded_frames_use_the_exact_applied_source_mapping() -> TestResult {
 }
 
 #[test]
-fn decoded_frames_reject_invalid_output_mappings() -> TestResult {
+fn decoded_frames_reject_invalid_output_mappings() {
     let session = session(1);
     let context = message_context(&session);
-    let cases = [
+    for (label, mappings) in invalid_output_mapping_cases() {
+        assert!(
+            decode_mapping_case(&session, &context, mappings).is_err(),
+            "decoded output should reject {label}"
+        );
+    }
+}
+
+fn invalid_output_mapping_cases() -> [(&'static str, Vec<RelationalOutputMapping>); 6] {
+    [
         (
             "output gap",
             vec![
@@ -149,19 +158,11 @@ fn decoded_frames_reject_invalid_output_mappings() -> TestResult {
                 },
             ],
         ),
-    ];
-
-    for (label, mappings) in cases {
-        assert!(
-            decode_mapping_case(&session, &context, mappings).is_err(),
-            "decoded output should reject {label}"
-        );
-    }
-    Ok(())
+    ]
 }
 
 #[test]
-fn decoded_frames_reject_mappings_from_another_source_scope_or_session() -> TestResult {
+fn decoded_frames_reject_mappings_from_another_source_scope_or_session() {
     let session = session(1);
     let original_context = message_context(&session);
     let cases = [
@@ -187,7 +188,6 @@ fn decoded_frames_reject_mappings_from_another_source_scope_or_session() -> Test
             "decoded output should reject a different {label}"
         );
     }
-    Ok(())
 }
 
 fn decode_mapping_case(
