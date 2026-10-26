@@ -1,9 +1,8 @@
 use l2_workbench::{
-    derivation::{run, Base64Alphabet, Base64Padding, DerivationStatus, Operation, Recipe},
+    derivation::{Base64Alphabet, Base64Padding, DerivationStatus, Operation, Recipe, run},
     recovery::proposals::{
-        propose_transforms, transform_proposal_scan_work_bound, TransformAssessment,
-        TransformAssessmentResult, TransformEvidence, TransformProposalBudget,
-        TransformProposalDisposition,
+        TransformAssessment, TransformAssessmentResult, TransformEvidence, TransformProposalBudget,
+        TransformProposalDisposition, propose_transforms, transform_proposal_scan_work_bound,
     },
 };
 
@@ -366,20 +365,22 @@ fn keeps_alphabet_specific_modes_distinct_and_rejects_mixed_alphabets() {
 }
 
 #[test]
-fn serialized_report_round_trips_aliases_and_rejection_evidence(
-) -> Result<(), Box<dyn std::error::Error>> {
+fn serialized_report_round_trips_aliases_and_rejection_evidence()
+-> Result<(), Box<dyn std::error::Error>> {
     let report = propose_transforms(b"+///", budget(8, 7));
     let serialized = serde_json::to_vec(&report)?;
     let restored: l2_workbench::recovery::proposals::TransformProposalReport =
         serde_json::from_slice(&serialized)?;
 
     assert_eq!(restored, report);
-    assert!(eligible_base64_dispositions(&restored)
-        .iter()
-        .any(|(_, disposition)| matches!(
-            disposition,
-            TransformProposalDisposition::AliasOf { .. }
-        )));
+    assert!(
+        eligible_base64_dispositions(&restored)
+            .iter()
+            .any(|(_, disposition)| matches!(
+                disposition,
+                TransformProposalDisposition::AliasOf { .. }
+            ))
+    );
     assert!(restored.assessments.iter().any(|assessment| matches!(
         &assessment.result,
         TransformAssessmentResult::Ineligible {

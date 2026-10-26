@@ -4,7 +4,7 @@ use l2_workbench::job::cache::{Cache, CacheEntry, SourceIdentity, StageKey, Stag
 use serde_json::json;
 
 fn stage_key(name: &str) -> Result<StageKey, Box<dyn Error>> {
-    let source = SourceIdentity::from_sha256(&"a".repeat(64))?;
+    let source = SourceIdentity::from_sha256("a".repeat(64))?;
     Ok(StageKey::new(
         name,
         1,
