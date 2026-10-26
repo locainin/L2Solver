@@ -262,6 +262,123 @@ fn discovers_disjoint_seed_and_payload_ranges_in_one_message() -> Result<(), Box
 }
 
 #[test]
+fn one_byte_counter_order_aliases_do_not_consume_candidate_or_work_budgets() -> TestResult<()> {
+    let records = same_message_sessions()?;
+    let samples = borrow_samples(&records)?;
+    let mut single_order_plan = same_message_plan();
+    single_order_plan.limits.max_locator_candidates = 8;
+    single_order_plan.limits.max_candidates = 512;
+    single_order_plan.limits.max_retained_candidates = 8;
+    single_order_plan.limits.max_work_bytes = 64 * 1024 * 1024;
+
+    let complete_single_order_report =
+        infer_relational_transform_candidates(&samples, &single_order_plan)?;
+    let exact_candidate_limit = complete_single_order_report.candidates_examined;
+    single_order_plan.limits.max_candidates = exact_candidate_limit;
+
+    let mut both_orders_plan = single_order_plan.clone();
+    both_orders_plan
+        .counter_byte_orders
+        .push(CounterByteOrder::LittleEndian);
+
+    let single_order_report = infer_relational_transform_candidates(&samples, &single_order_plan)?;
+    let both_orders_report = infer_relational_transform_candidates(&samples, &both_orders_plan)?;
+
+    assert!(single_order_report.candidates_examined > 0);
+    assert_eq!(
+        single_order_report.candidates_examined,
+        exact_candidate_limit
+    );
+    assert_eq!(
+        both_orders_report.candidates_examined,
+        single_order_report.candidates_examined
+    );
+    assert_eq!(
+        both_orders_report.work_bytes,
+        single_order_report.work_bytes
+    );
+    assert_eq!(
+        both_orders_report.candidate_limit_remaining,
+        single_order_report.candidate_limit_remaining
+    );
+    assert_eq!(both_orders_report.candidate_limit_remaining, 0);
+    assert_eq!(
+        both_orders_report.candidates,
+        single_order_report.candidates
+    );
+    assert!(both_orders_report.candidates.len() <= both_orders_plan.limits.max_retained_candidates);
+    assert_eq!(
+        both_orders_report.omitted_candidates,
+        single_order_report.omitted_candidates
+    );
+    assert_eq!(
+        both_orders_report.omitted_candidates_exact,
+        single_order_report.omitted_candidates_exact
+    );
+    assert_eq!(
+        both_orders_report.equivalent_candidate_aliases,
+        single_order_report.candidates_examined
+    );
+    assert_eq!(single_order_report.equivalent_candidate_aliases, 0);
+    assert_eq!(
+        both_orders_report.search_exhaustive_within_plan,
+        single_order_report.search_exhaustive_within_plan
+    );
+    assert_eq!(
+        both_orders_report.search_limits,
+        single_order_report.search_limits
+    );
+    assert!(
+        !both_orders_report
+            .search_limits
+            .contains(&l2_workbench::protocol::RelationalSearchLimit::CandidateCount)
+    );
+    Ok(())
+}
+
+#[test]
+fn one_payload_per_session_does_not_collapse_counter_reset_strategies() -> TestResult<()> {
+    let records = same_message_sessions()?;
+    let samples = borrow_samples(&records)?;
+    let mut continuous_plan = same_message_plan();
+    continuous_plan.limits.max_locator_candidates = 8;
+    continuous_plan.limits.max_candidates = 512;
+    continuous_plan.limits.max_retained_candidates = 32;
+    continuous_plan.limits.max_work_bytes = 64 * 1024 * 1024;
+
+    let mut both_resets_plan = continuous_plan.clone();
+    both_resets_plan
+        .counter_resets
+        .push(RelationalCounterReset::PerRecord);
+
+    let continuous_report = infer_relational_transform_candidates(&samples, &continuous_plan)?;
+    let both_resets_report = infer_relational_transform_candidates(&samples, &both_resets_plan)?;
+
+    assert!(continuous_report.candidates_examined > 0);
+    assert_eq!(
+        both_resets_report.candidates_examined,
+        continuous_report.candidates_examined * 2
+    );
+    assert_eq!(
+        both_resets_report.work_bytes,
+        continuous_report.work_bytes * 2
+    );
+    assert!(
+        both_resets_report.candidates.iter().any(|candidate| {
+            candidate.rule.counter_reset == RelationalCounterReset::Continuous
+        })
+    );
+    assert!(
+        both_resets_report
+            .candidates
+            .iter()
+            .any(|candidate| { candidate.rule.counter_reset == RelationalCounterReset::PerRecord })
+    );
+    assert_eq!(both_resets_report.equivalent_candidate_aliases, 0);
+    Ok(())
+}
+
+#[test]
 fn prioritizes_length_prefixed_seed_over_high_variance_ranges_under_candidate_budget()
 -> TestResult<()> {
     let records = length_prefixed_seed_sessions(
@@ -510,6 +627,53 @@ enum RetentionGateAssessment {
     Unresolved,
 }
 
+#[derive(Default)]
+struct RetentionEvaluatorState {
+    first_unresolved_rule: Option<l2_workbench::protocol::RelationalTransformRule>,
+    validated_after_unresolved: bool,
+}
+
+fn evaluate_retention_candidate(
+    context: &l2_workbench::protocol::RelationalTransformEvaluationContext<'_>,
+    candidate: &l2_workbench::protocol::RelationalTransformCandidate,
+    discovery_outputs: &[l2_workbench::protocol::RelationalAppliedOutput],
+    heldout_outputs: &[l2_workbench::protocol::RelationalAppliedOutput],
+    state: &mut RetentionEvaluatorState,
+) -> Result<RelationalCandidateEvaluation<RetentionGateAssessment>, std::io::Error> {
+    let all_outputs = ordered_outputs(discovery_outputs, heldout_outputs);
+    assert!(
+        all_outputs
+            .iter()
+            .all(|output| payload_output_ranges_are_valid(output))
+    );
+    let expected_sessions = context.discovery_sessions.len() + context.heldout_sessions.len();
+    let is_complete = all_outputs.len() == expected_sessions
+        && matches!(
+            candidate.status,
+            RelationalTransformStatus::AwaitingAcrossSessionValidation
+        );
+    let output_valid = aggregate_outputs(&all_outputs)
+        .map(|bytes| validates_exact_der(&bytes))
+        .map_err(|error| std::io::Error::other(error.to_string()))?;
+    let assessment = if is_complete && output_valid {
+        state.validated_after_unresolved |= state.first_unresolved_rule.is_some();
+        RetentionGateAssessment::ArtifactValidated
+    } else {
+        if state.first_unresolved_rule.is_none() && is_target_retention_rule(candidate, 9) {
+            state.first_unresolved_rule = Some(candidate.rule.clone());
+        }
+        RetentionGateAssessment::Unresolved
+    };
+    Ok(RelationalCandidateEvaluation {
+        priority: match assessment {
+            RetentionGateAssessment::ArtifactValidated => 3,
+            RetentionGateAssessment::Unresolved => 1,
+        },
+        work_bytes: 0,
+        assessment,
+    })
+}
+
 #[test]
 fn evaluator_priority_retains_later_valid_rule_and_keeps_deferred_rules_unresolved()
 -> TestResult<()> {
@@ -522,57 +686,41 @@ fn evaluator_priority_retains_later_valid_rule_and_keeps_deferred_rules_unresolv
     let options = RelationalTransformEvaluationOptions {
         max_retained_output_bytes: plan.limits.max_total_bytes,
     };
-    let mut first_unresolved_rule = None;
-    let mut validated_after_unresolved = false;
+    let mut evaluator_state = RetentionEvaluatorState::default();
     let evaluated = infer_relational_transform_candidates_with_evaluator(
         &samples,
         &plan,
         None,
         options,
         |context, candidate, discovery_outputs, heldout_outputs| {
-            let all_outputs = ordered_outputs(discovery_outputs, heldout_outputs);
-            assert!(
-                all_outputs
-                    .iter()
-                    .all(|output| payload_output_ranges_are_valid(output))
-            );
-            let expected_sessions =
-                context.discovery_sessions.len() + context.heldout_sessions.len();
-            let is_complete = all_outputs.len() == expected_sessions
-                && matches!(
-                    candidate.status,
-                    RelationalTransformStatus::AwaitingAcrossSessionValidation
-                );
-            let output_valid = aggregate_outputs(&all_outputs)
-                .map(|bytes| validates_exact_der(&bytes))
-                .map_err(|error| std::io::Error::other(error.to_string()))?;
-            let assessment = if is_complete && output_valid {
-                validated_after_unresolved |= first_unresolved_rule.is_some();
-                RetentionGateAssessment::ArtifactValidated
-            } else {
-                if first_unresolved_rule.is_none() && is_target_retention_rule(candidate, 9) {
-                    first_unresolved_rule = Some(candidate.rule.clone());
-                }
-                RetentionGateAssessment::Unresolved
-            };
-            Ok::<_, std::io::Error>(RelationalCandidateEvaluation {
-                priority: match assessment {
-                    RetentionGateAssessment::ArtifactValidated => 3,
-                    RetentionGateAssessment::Unresolved => 1,
-                },
-                work_bytes: 0,
-                assessment,
-            })
+            evaluate_retention_candidate(
+                context,
+                candidate,
+                discovery_outputs,
+                heldout_outputs,
+                &mut evaluator_state,
+            )
         },
     )?;
 
+    assert_priority_evaluation(&evaluated, &plan, options, &evaluator_state)
+}
+
+fn assert_priority_evaluation(
+    evaluated: &l2_workbench::protocol::RelationalCandidateEvaluationReport<
+        RetentionGateAssessment,
+    >,
+    plan: &RelationalTransformPlan,
+    options: RelationalTransformEvaluationOptions,
+    evaluator_state: &RetentionEvaluatorState,
+) -> TestResult<()> {
     let report = &evaluated.report;
     assert!(report.search_exhaustive_within_plan);
     assert!(report.omitted_candidates_exact);
     assert!(report.omitted_candidates > 0);
     assert_eq!(report.candidates.len(), plan.limits.max_retained_candidates);
     assert_eq!(evaluated.evaluations.len(), report.candidates.len());
-    assert!(validated_after_unresolved);
+    assert!(evaluator_state.validated_after_unresolved);
     assert!(evaluated.output_capture_complete);
     assert!(evaluated.output_bytes_retained <= options.max_retained_output_bytes);
 
@@ -604,7 +752,8 @@ fn evaluator_priority_retains_later_valid_rule_and_keeps_deferred_rules_unresolv
     let captured_outputs = ordered_outputs(&captured.discovery, &captured.heldout);
     assert!(validates_exact_der(&aggregate_outputs(&captured_outputs)?));
 
-    let unresolved_rule = first_unresolved_rule
+    let unresolved_rule = evaluator_state
+        .first_unresolved_rule
         .as_ref()
         .ok_or("the evaluator never observed a deferred rule")?;
     let unresolved_index = report

@@ -539,6 +539,8 @@ pub struct RelationalTransformReport {
     pub candidates: Vec<RelationalTransformCandidate>,
     /// Number of transform configurations actually applied
     pub candidates_examined: usize,
+    /// Number of one-byte counter byte-order configurations skipped as exact aliases
+    pub equivalent_candidate_aliases: usize,
     /// Number of reportable candidates omitted after the report-retention ceiling
     pub omitted_candidates: usize,
     /// Whether the omitted count covers every untested or unretained rule

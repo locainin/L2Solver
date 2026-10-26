@@ -23,6 +23,7 @@ use std::convert::Infallible;
 struct SearchState<T> {
     candidates: Vec<RetainedCandidate<T>>,
     candidates_examined: usize,
+    equivalent_candidate_aliases: usize,
     omitted_candidates: usize,
     omitted_candidates_exact: bool,
     work_bytes: usize,
@@ -77,6 +78,7 @@ impl<T> SearchState<T> {
         Self {
             candidates: Vec::new(),
             candidates_examined: 0,
+            equivalent_candidate_aliases: 0,
             omitted_candidates: 0,
             omitted_candidates_exact: true,
             work_bytes: 0,
@@ -430,7 +432,13 @@ impl SearchContext<'_, '_> {
             &[RelationalAppliedOutput],
         ) -> Result<RelationalCandidateEvaluation<T>, E>,
     {
+        let mut first_byte_order = true;
         for counter_byte_order in &self.plan.counter_byte_orders {
+            if counter_width == crate::derivation::CounterWidth::OneByte && !first_byte_order {
+                self.count_equivalent_candidate_aliases(search)?;
+                continue;
+            }
+            first_byte_order = false;
             for seed_order in &self.plan.seed_orders {
                 for counter_reset in &self.plan.counter_resets {
                     for parser_format in &self.plan.parser_formats {
@@ -634,6 +642,25 @@ impl SearchContext<'_, '_> {
             return Ok(false);
         }
         Ok(true)
+    }
+
+    fn count_equivalent_candidate_aliases<T>(
+        &self,
+        search: &mut SearchState<T>,
+    ) -> Result<(), RelationalTransformError> {
+        for _ in &self.plan.seed_orders {
+            for _ in &self.plan.counter_resets {
+                for _ in &self.plan.parser_formats {
+                    search.equivalent_candidate_aliases = search
+                        .equivalent_candidate_aliases
+                        .checked_add(1)
+                        .ok_or(RelationalTransformError::InvalidPlan(
+                            "equivalent relational candidate alias count overflowed",
+                        ))?;
+                }
+            }
+        }
+        Ok(())
     }
 }
 
@@ -936,6 +963,7 @@ fn build_report<T>(
             heldout_sessions: prepared.heldout_sessions,
             candidates,
             candidates_examined: search.candidates_examined,
+            equivalent_candidate_aliases: search.equivalent_candidate_aliases,
             omitted_candidates: search.omitted_candidates,
             omitted_candidates_exact: search.omitted_candidates_exact,
             candidate_limit_remaining: limits
