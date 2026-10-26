@@ -200,6 +200,15 @@ pub struct RecordSchemaAnalysisReport {
     pub discovery: Option<RecordSchemaDiscoveryReport>,
 }
 
+/// Strategy that produced one strictly validated record schema
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RecordSchemaStrategy {
+    /// One record occupies each caller-framed message
+    FixedLayout,
+    /// Repeated length fields locate record views inside caller-framed messages
+    RepeatedBoundaries,
+}
+
 /// Independent fixed-layout and repeated-boundary analyses with shared search budgets
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct RecordSchemaMultiStrategyAnalysisReport {

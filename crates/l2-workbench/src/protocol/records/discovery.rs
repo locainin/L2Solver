@@ -9,4 +9,6 @@ pub use model::{
     RecordSchemaHypothesis,
 };
 pub use search::discover_record_schemas;
-pub(super) use search::discover_record_schemas_from_candidates;
+pub(super) use search::{
+    discover_record_schemas_from_candidates, discover_record_schemas_from_candidates_observed,
+};

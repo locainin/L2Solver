@@ -35,7 +35,7 @@ pub(super) fn generate_candidates(
         lengths.supported.clear();
         lengths.record_ranges.clear();
         let pairs = empty_pair_fields(0);
-        return finish_candidate_generation(&raw_fields, pairs, lengths, limits);
+        return finish_candidate_generation(&raw_fields, pairs, lengths, limits, Vec::new());
     }
 
     let views = record_views(training_messages, &lengths.record_ranges)?;
@@ -50,7 +50,7 @@ pub(super) fn generate_candidates(
         &sequence_fields,
         limits.max_pair_checks,
     )?;
-    finish_candidate_generation(&fields, pairs, lengths, limits)
+    finish_candidate_generation(&fields, pairs, lengths, limits, Vec::new())
 }
 
 const fn split_field_check_budget(

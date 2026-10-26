@@ -11,21 +11,34 @@
 //! validation are later recovery steps
 
 use super::super::discovery::{
-    RecordDiscoveryError, RecordSchemaDiscoverySpace, discover_record_schemas_from_candidates,
+    RecordDiscoveryError, RecordSchemaDiscoverySpace, RecordSchemaHypothesis,
+    discover_record_schemas_from_candidates, discover_record_schemas_from_candidates_observed,
 };
-use super::super::{ByteField, IntegerField, RecordCount, RecordError, RecordSchema};
+use super::super::{
+    ByteField, IntegerField, RecordCount, RecordError, RecordParseReport, RecordSchema,
+};
 use super::model::{
     INTEGER_WIDTHS, LENGTH_MEANINGS, LIMITATIONS, RecordBoundaryCue, RecordSchemaAnalysisReport,
     RecordSchemaMultiStrategyAnalysisReport, RecordSchemaProposalLimits,
-    RecordSchemaProposalReport, RecordSchemaProposalValidationBasis, default_sequence_base,
+    RecordSchemaProposalReport, RecordSchemaProposalValidationBasis, RecordSchemaStrategy,
+    default_sequence_base,
 };
 use crate::integer::decode_unsigned;
 use crate::protocol::ByteOrder;
 use std::cmp::Reverse;
 use std::collections::{BinaryHeap, HashMap, HashSet};
 use std::hash::Hash;
+use std::ops::ControlFlow;
 
 mod repeated;
+
+type SurvivorObserver<'observer> = dyn FnMut(
+        RecordSchemaStrategy,
+        &RecordSchemaHypothesis,
+        &[RecordParseReport],
+        &[RecordParseReport],
+    ) -> ControlFlow<()>
+    + 'observer;
 
 /// Suggest possible record-header fields from training messages within search limits
 ///
@@ -44,7 +57,7 @@ pub fn propose_record_schema_space(
 ) -> Result<RecordSchemaProposalReport, RecordDiscoveryError> {
     limits.validate()?;
     validate_messages(training_messages, held_out_messages, limits)?;
-    let generated = generate_candidates(training_messages, limits)?;
+    let generated = generate_candidates(training_messages, limits, &[])?;
     Ok(proposal_report(
         training_messages,
         held_out_messages,
@@ -68,8 +81,8 @@ pub fn analyze_record_schemas(
 ) -> Result<RecordSchemaAnalysisReport, RecordDiscoveryError> {
     limits.validate()?;
     validate_messages(training_messages, held_out_messages, limits)?;
-    let generated = generate_candidates(training_messages, limits)?;
-    analyze_generated_candidates(training_messages, held_out_messages, limits, generated, &[])
+    let generated = generate_candidates(training_messages, limits, &[])?;
+    analyze_generated_candidates(training_messages, held_out_messages, limits, generated)
 }
 
 /// Analyze fixed-layout and repeated-boundary schemas as separate bounded strategies
@@ -110,100 +123,184 @@ pub fn analyze_record_schemas_with_repeated_boundaries_and_offsets(
     limits: RecordSchemaProposalLimits,
     training_data_offsets: &[usize],
 ) -> Result<RecordSchemaMultiStrategyAnalysisReport, RecordDiscoveryError> {
+    analyze_record_schemas_with_repeated_boundaries_and_offsets_impl(
+        training_messages,
+        held_out_messages,
+        limits,
+        training_data_offsets,
+        None,
+    )
+    .map(|(report, _)| report)
+}
+
+/// Analyze schemas while exposing each strict survivor before report retention
+///
+/// The callback receives the canonical parse reports for the exact training and held-out input
+/// order. Returning `Break(())` stops candidate search after the current survivor is accounted
+/// for; the returned discovery report keeps the remaining combinations marked unexamined
+///
+/// # Errors
+/// Rejects empty training input, invalid limits, and aggregate message resource excess
+pub fn analyze_record_schemas_with_repeated_boundaries_and_offsets_observed<F>(
+    training_messages: &[&[u8]],
+    held_out_messages: &[&[u8]],
+    limits: RecordSchemaProposalLimits,
+    training_data_offsets: &[usize],
+    observer: F,
+) -> Result<RecordSchemaMultiStrategyAnalysisReport, RecordDiscoveryError>
+where
+    F: FnMut(
+        RecordSchemaStrategy,
+        &RecordSchemaHypothesis,
+        &[RecordParseReport],
+        &[RecordParseReport],
+    ) -> ControlFlow<()>,
+{
+    analyze_record_schemas_with_repeated_boundaries_and_offsets_impl(
+        training_messages,
+        held_out_messages,
+        limits,
+        training_data_offsets,
+        Some(Box::new(observer)),
+    )
+    .map(|(report, _)| report)
+}
+
+fn analyze_record_schemas_with_repeated_boundaries_and_offsets_impl(
+    training_messages: &[&[u8]],
+    held_out_messages: &[&[u8]],
+    limits: RecordSchemaProposalLimits,
+    training_data_offsets: &[usize],
+    mut observer: Option<Box<SurvivorObserver<'_>>>,
+) -> Result<(RecordSchemaMultiStrategyAnalysisReport, bool), RecordDiscoveryError> {
     limits.validate()?;
     validate_messages(training_messages, held_out_messages, limits)?;
     if training_data_offsets.len() > limits.discovery.max_messages {
         return Err(RecordDiscoveryError::InvalidLimits);
     }
     let Some((fixed_limits, repeated_limits)) = split_strategy_limits(limits) else {
-        let fixed_layout = analyze_generated_candidates(
+        let (fixed_layout, stopped_by_observer) = analyze_generated_candidates_with_observer(
             training_messages,
             held_out_messages,
             limits,
-            generate_candidates(training_messages, limits)?,
-            training_data_offsets,
+            generate_candidates(training_messages, limits, training_data_offsets)?,
+            RecordSchemaStrategy::FixedLayout,
+            observer.as_deref_mut(),
         )?;
-        return Ok(RecordSchemaMultiStrategyAnalysisReport {
-            fixed_layout,
-            fixed_layout_limits: limits,
-            repeated_boundaries: None,
-            repeated_boundary_limits: None,
-        });
+        return Ok((
+            RecordSchemaMultiStrategyAnalysisReport {
+                fixed_layout,
+                fixed_layout_limits: limits,
+                repeated_boundaries: None,
+                repeated_boundary_limits: None,
+            },
+            stopped_by_observer,
+        ));
     };
 
-    let fixed_layout = analyze_generated_candidates(
+    let (fixed_layout, fixed_stopped) = analyze_generated_candidates_with_observer(
         training_messages,
         held_out_messages,
         fixed_limits,
-        generate_candidates(training_messages, fixed_limits)?,
-        training_data_offsets,
+        generate_candidates(training_messages, fixed_limits, training_data_offsets)?,
+        RecordSchemaStrategy::FixedLayout,
+        observer.as_deref_mut(),
     )?;
-    let repeated_boundaries = analyze_generated_candidates(
+    if fixed_stopped {
+        return Ok((
+            RecordSchemaMultiStrategyAnalysisReport {
+                fixed_layout,
+                fixed_layout_limits: fixed_limits,
+                repeated_boundaries: None,
+                repeated_boundary_limits: None,
+            },
+            true,
+        ));
+    }
+
+    let (repeated_boundaries, repeated_stopped) = analyze_generated_candidates_with_observer(
         training_messages,
         held_out_messages,
         repeated_limits,
         repeated::generate_candidates(training_messages, repeated_limits)?,
-        &[],
+        RecordSchemaStrategy::RepeatedBoundaries,
+        observer.as_deref_mut(),
     )?;
-    Ok(RecordSchemaMultiStrategyAnalysisReport {
-        fixed_layout,
-        fixed_layout_limits: fixed_limits,
-        repeated_boundaries: Some(repeated_boundaries),
-        repeated_boundary_limits: Some(repeated_limits),
-    })
+    Ok((
+        RecordSchemaMultiStrategyAnalysisReport {
+            fixed_layout,
+            fixed_layout_limits: fixed_limits,
+            repeated_boundaries: Some(repeated_boundaries),
+            repeated_boundary_limits: Some(repeated_limits),
+        },
+        repeated_stopped,
+    ))
 }
 
 fn analyze_generated_candidates(
     training_messages: &[&[u8]],
     held_out_messages: &[&[u8]],
     limits: RecordSchemaProposalLimits,
-    mut generated: CandidateGeneration,
-    training_data_offsets: &[usize],
+    generated: CandidateGeneration,
 ) -> Result<RecordSchemaAnalysisReport, RecordDiscoveryError> {
-    if let Some(space) = generated.candidate_space.as_mut() {
-        add_training_data_offsets(space, training_data_offsets, limits.max_field_offset)?;
-    }
+    analyze_generated_candidates_with_observer(
+        training_messages,
+        held_out_messages,
+        limits,
+        generated,
+        RecordSchemaStrategy::FixedLayout,
+        None,
+    )
+    .map(|(analysis, _)| analysis)
+}
+
+fn analyze_generated_candidates_with_observer(
+    training_messages: &[&[u8]],
+    held_out_messages: &[&[u8]],
+    limits: RecordSchemaProposalLimits,
+    generated: CandidateGeneration,
+    strategy: RecordSchemaStrategy,
+    observer: Option<&mut SurvivorObserver<'_>>,
+) -> Result<(RecordSchemaAnalysisReport, bool), RecordDiscoveryError> {
+    let mut observer_stopped = false;
     let discovery = if let Some(space) = generated.candidate_space.as_ref() {
         let mut schemas = generated.schemas(space)?;
-        Some(discover_record_schemas_from_candidates(
-            training_messages,
-            held_out_messages,
-            generated.candidate_combinations,
-            limits.discovery,
-            |_| schemas.next(),
-        )?)
+        let discovery = match observer {
+            Some(callback) => {
+                let observer = callback;
+                let (discovery, stopped) = discover_record_schemas_from_candidates_observed(
+                    training_messages,
+                    held_out_messages,
+                    generated.candidate_combinations,
+                    limits.discovery,
+                    |_| schemas.next(),
+                    &mut |hypothesis, training_reports, held_out_reports| {
+                        observer(strategy, hypothesis, training_reports, held_out_reports)
+                    },
+                )?;
+                observer_stopped = stopped;
+                discovery
+            }
+            None => discover_record_schemas_from_candidates(
+                training_messages,
+                held_out_messages,
+                generated.candidate_combinations,
+                limits.discovery,
+                |_| schemas.next(),
+            )?,
+        };
+        Some(discovery)
     } else {
         None
     };
     let proposal = proposal_report(training_messages, held_out_messages, generated);
-    Ok(RecordSchemaAnalysisReport {
-        proposal,
-        discovery,
-    })
-}
-
-fn add_training_data_offsets(
-    space: &mut RecordSchemaDiscoverySpace,
-    offsets: &[usize],
-    maximum_offset: usize,
-) -> Result<(), RecordDiscoveryError> {
-    for offset in offsets
-        .iter()
-        .copied()
-        .filter(|offset| *offset <= maximum_offset)
-    {
-        if space.data_offsets.contains(&offset) {
-            continue;
-        }
-        space
-            .data_offsets
-            .try_reserve(1)
-            .map_err(|_| RecordDiscoveryError::RecordOperation(RecordError::AllocationFailed))?;
-        space.data_offsets.push(offset);
-    }
-    space.data_offsets.sort_unstable();
-    space.data_offsets.dedup();
-    Ok(())
+    Ok((
+        RecordSchemaAnalysisReport {
+            proposal,
+            discovery,
+        },
+        observer_stopped,
+    ))
 }
 
 fn split_strategy_limits(
@@ -287,6 +384,7 @@ fn proposal_report(
 
 struct CandidateGeneration {
     candidate_space: Option<RecordSchemaDiscoverySpace>,
+    priority_data_offsets: Vec<usize>,
     supported_pairs: Vec<SupportedPair>,
     supported_lengths: Vec<SupportedLength>,
     compatible_pair_counts: Vec<usize>,
@@ -421,7 +519,16 @@ impl CandidateGeneration {
                 0,
             )
             .ok_or(RecordDiscoveryError::InvalidLimits)?;
+            let length = self
+                .supported_lengths
+                .get(length_index)
+                .ok_or(RecordDiscoveryError::InvalidLimits)?;
             rows.push(Reverse((
+                usize::from(
+                    self.priority_data_offsets
+                        .binary_search(&length.data_offset)
+                        .is_err(),
+                ),
                 length_index
                     .checked_add(pair_index)
                     .ok_or(RecordDiscoveryError::InvalidLimits)?,
@@ -431,6 +538,7 @@ impl CandidateGeneration {
         }
         Ok(SupportedSchemaIter {
             space,
+            priority_data_offsets: &self.priority_data_offsets,
             pairs: &self.supported_pairs,
             lengths: &self.supported_lengths,
             rows,
@@ -440,21 +548,27 @@ impl CandidateGeneration {
 
 struct SupportedSchemaIter<'a> {
     space: &'a RecordSchemaDiscoverySpace,
+    priority_data_offsets: &'a [usize],
     pairs: &'a [SupportedPair],
     lengths: &'a [SupportedLength],
-    rows: BinaryHeap<Reverse<(usize, usize, usize)>>,
+    rows: BinaryHeap<Reverse<(usize, usize, usize, usize)>>,
 }
 
 impl Iterator for SupportedSchemaIter<'_> {
     type Item = RecordSchema;
 
     fn next(&mut self) -> Option<Self::Item> {
-        let Reverse((_, length_index, pair_index)) = self.rows.pop()?;
+        let Reverse((_, _, length_index, pair_index)) = self.rows.pop()?;
         let pair = self.pairs.get(pair_index)?;
         let length = self.lengths.get(length_index)?;
         let next_start = pair_index.checked_add(1)?;
         if let Some(next_pair_index) = first_compatible_pair(self.pairs, length, next_start) {
             self.rows.push(Reverse((
+                usize::from(
+                    self.priority_data_offsets
+                        .binary_search(&length.data_offset)
+                        .is_err(),
+                ),
                 length_index.checked_add(next_pair_index)?,
                 length_index,
                 next_pair_index,
@@ -474,7 +588,7 @@ impl Iterator for SupportedSchemaIter<'_> {
     }
 }
 
-fn supported_pair_order(pair: &SupportedPair) -> SupportedPairOrder {
+fn supported_pair_order(pair: &SupportedPair, prioritize_evidence: bool) -> SupportedPairOrder {
     let identifier_end = pair.identifier.offset.saturating_add(pair.identifier.width);
     let sequence_end = pair.sequence.offset.saturating_add(pair.sequence.width);
     let field_gap = if identifier_end <= pair.sequence.offset {
@@ -484,12 +598,30 @@ fn supported_pair_order(pair: &SupportedPair) -> SupportedPairOrder {
     };
     let span_start = pair.identifier.offset.min(pair.sequence.offset);
     let span_end = identifier_end.max(sequence_end);
+    let (priority_ordinal_span_holes, priority_capture_order_violations) = if prioritize_evidence {
+        (
+            pair.evidence.ordinal_span_holes,
+            pair.evidence.capture_order_violations,
+        )
+    } else {
+        (0, 0)
+    };
+    let (fallback_capture_order_violations, fallback_ordinal_span_holes) = if prioritize_evidence {
+        (0, 0)
+    } else {
+        (
+            pair.evidence.capture_order_violations,
+            pair.evidence.ordinal_span_holes,
+        )
+    };
     SupportedPairOrder {
+        priority_ordinal_span_holes,
+        priority_capture_order_violations,
         field_gap,
         span_length: span_end.saturating_sub(span_start),
         field_width_sum: pair.identifier.width.saturating_add(pair.sequence.width),
-        capture_order_violations: pair.evidence.capture_order_violations,
-        ordinal_span_holes: pair.evidence.ordinal_span_holes,
+        fallback_capture_order_violations,
+        fallback_ordinal_span_holes,
         maximum_field_end: identifier_end.max(sequence_end),
         offset_sum: pair.identifier.offset.saturating_add(pair.sequence.offset),
         identifier_offset: pair.identifier.offset,
@@ -502,11 +634,13 @@ fn supported_pair_order(pair: &SupportedPair) -> SupportedPairOrder {
 
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
 struct SupportedPairOrder {
+    priority_ordinal_span_holes: u128,
+    priority_capture_order_violations: usize,
     field_gap: usize,
     span_length: usize,
     field_width_sum: usize,
-    capture_order_violations: usize,
-    ordinal_span_holes: u128,
+    fallback_capture_order_violations: usize,
+    fallback_ordinal_span_holes: u128,
     maximum_field_end: usize,
     offset_sum: usize,
     identifier_offset: usize,
@@ -583,8 +717,11 @@ const fn length_meaning_order(meaning: super::super::RecordLengthMeaning) -> u8 
 fn generate_candidates(
     training_messages: &[&[u8]],
     limits: RecordSchemaProposalLimits,
+    training_data_offsets: &[usize],
 ) -> Result<CandidateGeneration, RecordDiscoveryError> {
     let fields = candidate_field_domains(training_messages, limits)?;
+    let priority_data_offsets =
+        normalized_training_data_offsets(training_data_offsets, fields.maximum_offset)?;
     let sequence_fields = varying_sequence_fields(training_messages, &fields.integer_shapes)?;
     let pair_fields = sequence_group_candidates(
         training_messages,
@@ -601,9 +738,35 @@ fn generate_candidates(
             &fields.integer_shapes,
             fields.maximum_offset,
             limits.max_length_checks,
+            &priority_data_offsets,
         )?
     };
-    finish_candidate_generation(&fields, pair_fields, length_fields, limits)
+    finish_candidate_generation(
+        &fields,
+        pair_fields,
+        length_fields,
+        limits,
+        priority_data_offsets,
+    )
+}
+
+fn normalized_training_data_offsets(
+    offsets: &[usize],
+    maximum_offset: usize,
+) -> Result<Vec<usize>, RecordDiscoveryError> {
+    let mut normalized = Vec::new();
+    normalized
+        .try_reserve_exact(offsets.len())
+        .map_err(|_| allocation_error())?;
+    normalized.extend(
+        offsets
+            .iter()
+            .copied()
+            .filter(|offset| *offset <= maximum_offset),
+    );
+    normalized.sort_unstable();
+    normalized.dedup();
+    Ok(normalized)
 }
 
 fn candidate_field_domains(
@@ -660,6 +823,7 @@ fn finish_candidate_generation(
     mut pair_fields: PairFields,
     mut length_fields: LengthFields,
     limits: RecordSchemaProposalLimits,
+    priority_data_offsets: Vec<usize>,
 ) -> Result<CandidateGeneration, RecordDiscoveryError> {
     let omitted_pair_checks = pair_fields.omitted_checks;
     let omitted_length_checks = length_fields.omitted_checks;
@@ -667,10 +831,11 @@ fn finish_candidate_generation(
     let examined_pair_checks = pair_fields.examined_checks;
     let examined_length_checks = length_fields.examined_checks;
     let record_ranges = std::mem::take(&mut length_fields.record_ranges);
-    // Compact layouts rank first, with ordinal gaps and capture-order changes retained as evidence
+    // Source framing lets training evidence rank before compactness without changing default search
+    let prioritize_evidence = !priority_data_offsets.is_empty();
     pair_fields
         .supported
-        .sort_unstable_by_key(supported_pair_order);
+        .sort_unstable_by_key(|pair| supported_pair_order(pair, prioritize_evidence));
     let (compatible_pair_counts, candidate_combinations) =
         compatible_pair_counts(&pair_fields.supported, &length_fields.supported)?;
     let supported_pairs = std::mem::take(&mut pair_fields.supported);
@@ -689,6 +854,7 @@ fn finish_candidate_generation(
         && omitted_schema_combinations == Some(0);
     Ok(CandidateGeneration {
         candidate_space,
+        priority_data_offsets,
         supported_pairs,
         supported_lengths,
         compatible_pair_counts,
@@ -1092,13 +1258,20 @@ fn length_candidates(
     fields: &[IntegerField],
     maximum_data_offset: usize,
     maximum_checks: usize,
+    prioritized_offsets: &[usize],
 ) -> Result<LengthFields, RecordDiscoveryError> {
     let (total_checks, maximum_gap) = length_domain_stats(fields, maximum_data_offset)?;
 
     let mut result = empty_length_fields();
     let mut seen = LengthFieldMembership::default();
-    let mut checks = 0_usize;
-
+    let mut checks = prioritized_length_candidates(
+        messages,
+        fields,
+        prioritized_offsets,
+        maximum_checks,
+        &mut result,
+        &mut seen,
+    )?;
     // Advance every field by one gap before considering larger gaps
     if let Some(maximum_gap) = maximum_gap {
         'gaps: for gap in 0..=maximum_gap {
@@ -1116,6 +1289,9 @@ fn length_candidates(
                 let data_offset = field_end
                     .checked_add(gap)
                     .ok_or(RecordDiscoveryError::InvalidLimits)?;
+                if prioritized_offsets.binary_search(&data_offset).is_ok() {
+                    continue;
+                }
                 for meaning in LENGTH_MEANINGS {
                     if checks == maximum_checks {
                         break 'gaps;
@@ -1143,6 +1319,63 @@ fn length_candidates(
         .checked_sub(checks)
         .ok_or(RecordDiscoveryError::InvalidLimits)?;
     Ok(result)
+}
+
+fn prioritized_length_candidates(
+    messages: &[&[u8]],
+    fields: &[IntegerField],
+    prioritized_offsets: &[usize],
+    maximum_checks: usize,
+    result: &mut LengthFields,
+    seen: &mut LengthFieldMembership,
+) -> Result<usize, RecordDiscoveryError> {
+    let mut checks = 0_usize;
+    let mut priority_fields = Vec::new();
+    priority_fields
+        .try_reserve_exact(fields.len())
+        .map_err(|_| allocation_error())?;
+    priority_fields.extend(0..fields.len());
+    priority_fields.sort_unstable_by_key(|index| {
+        let field_end = fields
+            .get(*index)
+            .map_or(0, |field| field.offset.saturating_add(field.width));
+        (Reverse(field_end), *index)
+    });
+
+    // Framing boundaries narrow the payload start, so check their length meanings first
+    'prioritized: for data_offset in prioritized_offsets {
+        for field_index in &priority_fields {
+            let field = fields
+                .get(*field_index)
+                .ok_or(RecordDiscoveryError::InvalidLimits)?;
+            let field_end = field
+                .offset
+                .checked_add(field.width)
+                .ok_or(RecordDiscoveryError::InvalidLimits)?;
+            if field_end > *data_offset {
+                continue;
+            }
+            for meaning in LENGTH_MEANINGS {
+                if checks == maximum_checks {
+                    break 'prioritized;
+                }
+                checks = checks
+                    .checked_add(1)
+                    .ok_or(RecordDiscoveryError::InvalidLimits)?;
+                if matches_length(messages, *field, meaning, *data_offset) {
+                    result.retain_layout(
+                        seen,
+                        SupportedLength {
+                            field: *field,
+                            data_offset: *data_offset,
+                            meaning,
+                        },
+                    )?;
+                }
+            }
+        }
+    }
+    Ok(checks)
 }
 
 fn length_domain_stats(

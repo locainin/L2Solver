@@ -1,13 +1,16 @@
 use l2_workbench::protocol::{
-    ByteField, ByteOrder, IntegerField, RecordBoundaryCue, RecordCount, RecordDiscoveryError,
-    RecordDiscoveryLimits, RecordDiscoveryPartition, RecordLengthMeaning, RecordLimits,
-    RecordSchema, RecordSchemaDiscoverySpace, RecordSchemaProposalLimits,
-    RecordSchemaProposalValidationBasis, analyze_record_schemas,
-    analyze_record_schemas_with_repeated_boundaries,
-    analyze_record_schemas_with_repeated_boundaries_and_offsets, discover_record_schemas,
+    ByteField, ByteOrder, IntegerField, RecordAssemblyInput, RecordBoundaryCue, RecordCount,
+    RecordDiscoveryError, RecordDiscoveryLimits, RecordDiscoveryPartition, RecordLengthMeaning,
+    RecordLimits, RecordParseReport, RecordSchema, RecordSchemaDiscoveryReport,
+    RecordSchemaDiscoverySpace, RecordSchemaProposalLimits, RecordSchemaProposalValidationBasis,
+    RecordSchemaStrategy, analyze_record_schemas, analyze_record_schemas_with_repeated_boundaries,
+    analyze_record_schemas_with_repeated_boundaries_and_offsets,
+    analyze_record_schemas_with_repeated_boundaries_and_offsets_observed,
+    assemble_record_groups_from_inputs, discover_record_schemas, parse_records_with_limits,
     propose_record_schema_space,
 };
 use std::error::Error;
+use std::ops::ControlFlow;
 
 fn proposal_limits(max_candidates: usize) -> RecordSchemaProposalLimits {
     RecordSchemaProposalLimits {
@@ -38,6 +41,32 @@ fn record(identifier: &[u8], sequence: u16, payload: &[u8]) -> Vec<u8> {
     bytes
 }
 
+fn source_prefixed_record(sequence: u16, payload: &[u8]) -> Vec<u8> {
+    let mut bytes = vec![0x7a];
+    bytes.extend_from_slice(&record(b"OBJ", sequence, payload));
+    bytes
+}
+
+fn source_framed_record(sequence: u16, payload: &[u8]) -> Result<Vec<u8>, Box<dyn Error>> {
+    let encoded_payload_length = payload
+        .len()
+        .checked_add(1)
+        .ok_or("framed payload length overflowed")?;
+    let encoded_payload_length = u16::try_from(encoded_payload_length)?;
+    let mut body = Vec::new();
+    body.push(0x2d);
+    body.extend_from_slice(b"ID");
+    body.extend_from_slice(&sequence.to_be_bytes());
+    body.extend_from_slice(&encoded_payload_length.to_le_bytes());
+    body.push(0x6e);
+    body.extend_from_slice(payload);
+
+    let mut bytes = Vec::new();
+    bytes.extend_from_slice(&u16::try_from(body.len())?.to_be_bytes());
+    bytes.extend_from_slice(&body);
+    Ok(bytes)
+}
+
 fn gap_record(identifier: [u8; 2], sequence: u16, payload: &[u8]) -> Vec<u8> {
     let mut bytes = Vec::with_capacity(7 + payload.len());
     bytes.extend_from_slice(&identifier);
@@ -53,6 +82,12 @@ fn gap_record(identifier: [u8; 2], sequence: u16, payload: &[u8]) -> Vec<u8> {
 }
 
 type RepeatedTrainingRecords = [[Vec<u8>; 2]; 4];
+
+struct SourceFramedMessagePartitions {
+    training: Vec<Vec<u8>>,
+    held_out: Vec<Vec<u8>>,
+    expected: Vec<u8>,
+}
 
 fn repeated_training_records() -> RepeatedTrainingRecords {
     [
@@ -424,6 +459,69 @@ fn repeated_boundary_search_reaches_compact_headers_with_a_small_payload_gap()
 }
 
 #[test]
+fn repeated_boundaries_can_propose_schema_from_two_multirecord_training_messages()
+-> Result<(), Box<dyn Error>> {
+    let training = [
+        [record(b"OB", 4, b"a"), record(b"OB", 5, b"bc")].concat(),
+        [record(b"OB", 2, b"def"), record(b"OB", 3, b"ghij")].concat(),
+    ];
+    let held_out = [record(b"OB", 0, b"klmno"), record(b"OB", 1, b"p")].concat();
+    let training_messages = training.iter().map(Vec::as_slice).collect::<Vec<_>>();
+    let expected = RecordSchema {
+        records_offset: 0,
+        count: RecordCount::UntilEnd,
+        identifier: ByteField {
+            offset: 0,
+            width: 2,
+        },
+        sequence: IntegerField {
+            offset: 2,
+            width: 2,
+            byte_order: ByteOrder::LittleEndian,
+        },
+        length: IntegerField {
+            offset: 4,
+            width: 4,
+            byte_order: ByteOrder::BigEndian,
+        },
+        data_offset: 8,
+        length_meaning: RecordLengthMeaning::PayloadBytes,
+        sequence_base: 0,
+        terminal_sequence: None,
+    };
+
+    let analysis = analyze_record_schemas_with_repeated_boundaries(
+        &training_messages,
+        &[held_out.as_slice()],
+        proposal_limits(100_000),
+    )?;
+    let repeated = analysis
+        .repeated_boundaries
+        .as_ref()
+        .ok_or("a two-message repeated-boundary analysis should exist")?;
+    let proposal = &repeated.proposal;
+    let space = proposal
+        .candidate_space
+        .as_ref()
+        .ok_or("multiple records per message should create a schema candidate space")?;
+
+    assert!(space.length_fields.contains(&expected.length));
+    assert!(space.data_offsets.contains(&expected.data_offset));
+    assert!(space.length_meanings.contains(&expected.length_meaning));
+    assert!(
+        repeated
+            .discovery
+            .as_ref()
+            .is_some_and(|discovery| discovery
+                .surviving
+                .iter()
+                .any(|candidate| candidate.schema == expected)),
+        "the bounded schema should validate across a held-out message"
+    );
+    Ok(())
+}
+
+#[test]
 fn repeated_boundary_strategy_keeps_discovery_only_evidence_from_one_message()
 -> Result<(), Box<dyn Error>> {
     let message = [record(b"OB", 0, b"first"), record(b"OB", 1, b"second")].concat();
@@ -480,15 +578,32 @@ fn repeated_boundary_view_limit_reports_omissions_without_claiming_exhaustive_se
 #[test]
 fn explicit_training_header_offsets_are_included_in_the_fixed_schema_search()
 -> Result<(), Box<dyn Error>> {
-    let first = record(b"OBJ", 1, b"first");
-    let second = record(b"OBJ", 2, b"second");
-    let third = record(b"OBJ", 3, b"third");
-    let training = [first.as_slice(), second.as_slice(), third.as_slice()];
+    let training_messages = [
+        source_prefixed_record(0, b"aa"),
+        source_prefixed_record(1, b"bbb"),
+        source_prefixed_record(2, b"cccc"),
+        source_prefixed_record(3, b"ddddd"),
+    ];
+    let held_out_messages = [
+        source_prefixed_record(4, b"eeeeee"),
+        source_prefixed_record(5, b"fffffff"),
+    ];
+    let training = training_messages
+        .iter()
+        .map(Vec::as_slice)
+        .collect::<Vec<_>>();
+    let held_out = held_out_messages
+        .iter()
+        .map(Vec::as_slice)
+        .collect::<Vec<_>>();
+    let mut limits = proposal_limits(512);
+    limits.max_field_offset = 10;
+    limits.max_field_checks_per_domain = 512;
+    limits.max_pair_checks = 512;
+    limits.max_length_checks = 512;
+    limits.discovery.max_survivors = 128;
     let analysis = analyze_record_schemas_with_repeated_boundaries_and_offsets(
-        &training,
-        &[],
-        proposal_limits(10_000),
-        &[14],
+        &training, &held_out, limits, &[10; 4],
     )?;
     let space = analysis
         .fixed_layout
@@ -497,8 +612,239 @@ fn explicit_training_header_offsets_are_included_in_the_fixed_schema_search()
         .as_ref()
         .ok_or("expected the fixed-layout field evidence to yield a candidate space")?;
 
-    assert!(space.data_offsets.contains(&14));
+    assert!(space.data_offsets.contains(&10));
+    let surviving = analysis
+        .fixed_layout
+        .discovery
+        .as_ref()
+        .ok_or("fixed-layout discovery should check the framed samples")?
+        .surviving
+        .as_slice();
+    assert!(surviving.iter().any(|hypothesis| {
+        hypothesis.schema.data_offset == 10
+            && hypothesis.training_message_count == training.len()
+            && hypothesis.held_out_message_count == held_out.len()
+    }));
     Ok(())
+}
+
+#[test]
+fn source_boundary_schema_can_assemble_exact_bytes_without_a_pinned_field_layout()
+-> Result<(), Box<dyn Error>> {
+    let SourceFramedMessagePartitions {
+        training: training_owned,
+        held_out: held_out_owned,
+        expected,
+    } = source_framed_message_partitions()?;
+    let training_messages = training_owned.iter().map(Vec::as_slice).collect::<Vec<_>>();
+    let held_out_messages = held_out_owned.iter().map(Vec::as_slice).collect::<Vec<_>>();
+    let mut limits = proposal_limits(512);
+    limits.max_field_offset = 10;
+    limits.max_field_checks_per_domain = 512;
+    limits.max_pair_checks = 512;
+    limits.max_length_checks = 512;
+    limits.discovery.max_survivors = 128;
+
+    let analysis = analyze_record_schemas_with_repeated_boundaries_and_offsets(
+        &training_messages,
+        &held_out_messages,
+        limits,
+        &[10; 4],
+    )?;
+    let discovery = analysis
+        .fixed_layout
+        .discovery
+        .as_ref()
+        .ok_or("source-framed input should produce fixed-layout discovery")?;
+    let all_messages = training_messages
+        .iter()
+        .chain(&held_out_messages)
+        .copied()
+        .collect::<Vec<_>>();
+
+    assert!(
+        surviving_schema_assembles_exact_bytes(
+            discovery,
+            &all_messages,
+            limits.discovery.record_limits,
+            &expected,
+        ),
+        "a source-derived payload boundary should allow a surviving schema to reconstruct the exact ordered bytes"
+    );
+    Ok(())
+}
+
+fn source_framed_message_partitions() -> Result<SourceFramedMessagePartitions, Box<dyn Error>> {
+    let payloads = [
+        b"header".as_slice(),
+        b"valid".as_slice(),
+        b"compressed".as_slice(),
+        b"record".as_slice(),
+        b"bytes".as_slice(),
+        b"across".as_slice(),
+        b"frames".as_slice(),
+        b"end".as_slice(),
+    ];
+    let messages = payloads
+        .iter()
+        .enumerate()
+        .map(|(sequence, payload)| source_framed_record(u16::try_from(sequence)?, payload))
+        .collect::<Result<Vec<_>, Box<dyn Error>>>()?;
+    let observed_order = [4, 7, 5, 6, 0, 3, 1, 2];
+    let training = ordered_messages(&messages, &observed_order[..4])?;
+    let held_out = ordered_messages(&messages, &observed_order[4..])?;
+    Ok(SourceFramedMessagePartitions {
+        training,
+        held_out,
+        expected: payloads.concat(),
+    })
+}
+
+fn ordered_messages(messages: &[Vec<u8>], order: &[usize]) -> Result<Vec<Vec<u8>>, Box<dyn Error>> {
+    order
+        .iter()
+        .map(|index| {
+            messages
+                .get(*index)
+                .cloned()
+                .ok_or_else(|| "ordered message is missing".into())
+        })
+        .collect()
+}
+
+fn surviving_schema_assembles_exact_bytes(
+    discovery: &RecordSchemaDiscoveryReport,
+    messages: &[&[u8]],
+    limits: RecordLimits,
+    expected: &[u8],
+) -> bool {
+    discovery.surviving.iter().any(|hypothesis| {
+        let parsed = messages
+            .iter()
+            .map(|message| parse_records_with_limits(message, &hypothesis.schema, limits))
+            .collect::<Result<Vec<_>, _>>();
+        let Ok(parsed) = parsed else {
+            return false;
+        };
+        let inputs = messages
+            .iter()
+            .zip(&parsed)
+            .map(|(bytes, report)| RecordAssemblyInput::new(bytes, report))
+            .collect::<Vec<_>>();
+        assemble_record_groups_from_inputs(&inputs, limits).is_ok_and(|assembly| {
+            assembly
+                .groups()
+                .iter()
+                .any(|group| group.candidate_bytes() == expected)
+        })
+    })
+}
+
+#[test]
+fn survivor_observer_can_assemble_a_schema_omitted_from_the_bounded_report()
+-> Result<(), Box<dyn Error>> {
+    let SourceFramedMessagePartitions {
+        training: training_owned,
+        held_out: held_out_owned,
+        expected,
+    } = source_framed_message_partitions()?;
+    let training_messages = training_owned.iter().map(Vec::as_slice).collect::<Vec<_>>();
+    let held_out_messages = held_out_owned.iter().map(Vec::as_slice).collect::<Vec<_>>();
+    let mut limits = proposal_limits(512);
+    limits.max_field_offset = 10;
+    limits.max_field_checks_per_domain = 512;
+    limits.max_pair_checks = 512;
+    limits.max_length_checks = 512;
+    limits.discovery.max_survivors = 2;
+    let mut exact_schema = None;
+    let mut observer = |strategy,
+                        hypothesis: &l2_workbench::protocol::RecordSchemaHypothesis,
+                        training_reports: &[RecordParseReport],
+                        held_out_reports: &[RecordParseReport]| {
+        if strategy == RecordSchemaStrategy::FixedLayout
+            && reports_assemble_exact_bytes(
+                &training_messages,
+                training_reports,
+                &held_out_messages,
+                held_out_reports,
+                limits.discovery.record_limits,
+                &expected,
+            )
+        {
+            exact_schema = Some(hypothesis.schema.clone());
+            ControlFlow::Break(())
+        } else {
+            ControlFlow::Continue(())
+        }
+    };
+
+    let analysis = analyze_record_schemas_with_repeated_boundaries_and_offsets_observed(
+        &training_messages,
+        &held_out_messages,
+        limits,
+        &[10; 4],
+        &mut observer,
+    )?;
+    let discovery = analysis
+        .fixed_layout
+        .discovery
+        .as_ref()
+        .ok_or("observed fixed discovery report is missing")?;
+
+    assert!(
+        exact_schema.is_some(),
+        "the observer should find the exact assembly"
+    );
+    assert_eq!(discovery.surviving.len(), 1);
+    assert!(discovery.omitted_survivors > 0);
+    assert!(!discovery.search_exhaustive_within_plan);
+    let examined_and_unexamined = discovery
+        .examined_combinations
+        .checked_add(
+            discovery
+                .unexamined_combinations
+                .ok_or("missing unexamined count")?,
+        )
+        .ok_or("combination count overflow")?;
+    assert_eq!(
+        Some(examined_and_unexamined),
+        discovery.candidate_combinations
+    );
+    assert!(analysis.repeated_boundaries.is_none());
+    assert!(
+        !discovery
+            .surviving
+            .iter()
+            .any(|hypothesis| Some(&hypothesis.schema) == exact_schema.as_ref())
+    );
+    Ok(())
+}
+
+fn reports_assemble_exact_bytes(
+    training_messages: &[&[u8]],
+    training_reports: &[RecordParseReport],
+    held_out_messages: &[&[u8]],
+    held_out_reports: &[RecordParseReport],
+    limits: RecordLimits,
+    expected: &[u8],
+) -> bool {
+    if training_messages.len() != training_reports.len()
+        || held_out_messages.len() != held_out_reports.len()
+    {
+        return false;
+    }
+    let inputs = training_messages
+        .iter()
+        .zip(training_reports)
+        .chain(held_out_messages.iter().zip(held_out_reports))
+        .map(|(bytes, report)| RecordAssemblyInput::new(bytes, report))
+        .collect::<Vec<_>>();
+    assemble_record_groups_from_inputs(&inputs, limits).is_ok_and(|assembly| {
+        assembly
+            .groups()
+            .iter()
+            .any(|group| group.candidate_bytes() == expected)
+    })
 }
 
 #[test]

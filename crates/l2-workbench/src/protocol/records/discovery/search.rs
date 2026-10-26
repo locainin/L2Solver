@@ -8,6 +8,15 @@ use super::model::{
     RecordSchemaHypothesis, seen_candidate,
 };
 use std::collections::HashSet;
+use std::ops::ControlFlow;
+
+pub(in crate::protocol::records) type RecordSchemaParseObserver<'observer> =
+    dyn FnMut(
+            &RecordSchemaHypothesis,
+            &[RecordParseReport],
+            &[RecordParseReport],
+        ) -> ControlFlow<()>
+        + 'observer;
 
 /// Discover exact record layouts from caller-framed training and held-out messages
 ///
@@ -44,6 +53,49 @@ pub(in crate::protocol::records) fn discover_record_schemas_from_candidates<F>(
 where
     F: FnMut(usize) -> Option<RecordSchema>,
 {
+    discover_record_schemas_from_candidates_impl(
+        training_messages,
+        held_out_messages,
+        candidate_combinations,
+        limits,
+        candidate_at,
+        None,
+    )
+    .map(|(report, _)| report)
+}
+
+pub(in crate::protocol::records) fn discover_record_schemas_from_candidates_observed<F>(
+    training_messages: &[&[u8]],
+    held_out_messages: &[&[u8]],
+    candidate_combinations: Option<usize>,
+    limits: RecordDiscoveryLimits,
+    candidate_at: F,
+    observer: &mut RecordSchemaParseObserver<'_>,
+) -> Result<(RecordSchemaDiscoveryReport, bool), RecordDiscoveryError>
+where
+    F: FnMut(usize) -> Option<RecordSchema>,
+{
+    discover_record_schemas_from_candidates_impl(
+        training_messages,
+        held_out_messages,
+        candidate_combinations,
+        limits,
+        candidate_at,
+        Some(observer),
+    )
+}
+
+fn discover_record_schemas_from_candidates_impl<F>(
+    training_messages: &[&[u8]],
+    held_out_messages: &[&[u8]],
+    candidate_combinations: Option<usize>,
+    limits: RecordDiscoveryLimits,
+    candidate_at: F,
+    observer: Option<&mut RecordSchemaParseObserver<'_>>,
+) -> Result<(RecordSchemaDiscoveryReport, bool), RecordDiscoveryError>
+where
+    F: FnMut(usize) -> Option<RecordSchema>,
+{
     limits.validate()?;
     validate_messages(training_messages, held_out_messages, limits)?;
 
@@ -53,13 +105,14 @@ where
         RecordDiscoveryValidationBasis::HeldOutMessages
     };
     let mut report = discovery_report(candidate_combinations, validation_basis);
-    evaluate_combinations(
+    let stopped_by_observer = evaluate_combinations(
         &mut report,
         training_messages,
         held_out_messages,
         limits,
         candidate_combinations,
         candidate_at,
+        observer,
     )?;
     report.unexamined_combinations = candidate_combinations
         .map(|total| {
@@ -71,7 +124,7 @@ where
     report.search_exhaustive_within_plan = report.unexamined_combinations == Some(0);
     report.report_details_complete =
         report.omitted_survivors == 0 && report.omitted_falsification_examples == 0;
-    Ok(report)
+    Ok((report, stopped_by_observer))
 }
 
 fn validate_messages(
@@ -155,7 +208,8 @@ fn evaluate_combinations<F>(
     limits: RecordDiscoveryLimits,
     candidate_combinations: Option<usize>,
     mut candidate_at: F,
-) -> Result<(), RecordDiscoveryError>
+    mut observer: Option<&mut RecordSchemaParseObserver<'_>>,
+) -> Result<bool, RecordDiscoveryError>
 where
     F: FnMut(usize) -> Option<RecordSchema>,
 {
@@ -164,6 +218,7 @@ where
         .min(limits.max_candidates);
     let mut seen = HashSet::new();
 
+    let mut stopped_by_observer = false;
     for ordinal in 0..combination_budget {
         let schema = candidate_at(ordinal).ok_or(RecordDiscoveryError::InvalidLimits)?;
         report.examined_combinations = report
@@ -179,6 +234,7 @@ where
             training_messages,
             held_out_messages,
             limits.record_limits,
+            observer.is_some(),
         )? {
             CandidateEvaluation::Falsified {
                 partition,
@@ -195,28 +251,45 @@ where
             CandidateEvaluation::Survives {
                 training_record_count,
                 held_out_record_count,
+                parsed_reports,
             } => {
-                if report.surviving.len() >= limits.max_survivors {
-                    report.omitted_survivors = report
-                        .omitted_survivors
-                        .checked_add(1)
-                        .ok_or(RecordDiscoveryError::InvalidLimits)?;
-                    continue;
-                }
-                report.surviving.try_reserve(1).map_err(|_| {
-                    RecordDiscoveryError::RecordOperation(RecordError::AllocationFailed)
-                })?;
-                report.surviving.push(RecordSchemaHypothesis {
+                let hypothesis = RecordSchemaHypothesis {
                     schema,
                     training_message_count: training_messages.len(),
                     held_out_message_count: held_out_messages.len(),
                     training_record_count,
                     held_out_record_count,
-                });
+                };
+                if let (Some(observer), Some((training_reports, held_out_reports))) =
+                    (observer.as_deref_mut(), parsed_reports.as_ref())
+                    && matches!(
+                        observer(&hypothesis, training_reports, held_out_reports),
+                        ControlFlow::Break(())
+                    )
+                {
+                    stopped_by_observer = true;
+                }
+                if report.surviving.len() >= limits.max_survivors {
+                    report.omitted_survivors = report
+                        .omitted_survivors
+                        .checked_add(1)
+                        .ok_or(RecordDiscoveryError::InvalidLimits)?;
+                    if stopped_by_observer {
+                        break;
+                    }
+                    continue;
+                }
+                report.surviving.try_reserve(1).map_err(|_| {
+                    RecordDiscoveryError::RecordOperation(RecordError::AllocationFailed)
+                })?;
+                report.surviving.push(hypothesis);
+                if stopped_by_observer {
+                    break;
+                }
             }
         }
     }
-    Ok(())
+    Ok(stopped_by_observer)
 }
 
 enum CandidateEvaluation {
@@ -228,6 +301,7 @@ enum CandidateEvaluation {
     Survives {
         training_record_count: usize,
         held_out_record_count: usize,
+        parsed_reports: Option<(Vec<RecordParseReport>, Vec<RecordParseReport>)>,
     },
 }
 
@@ -236,10 +310,17 @@ fn evaluate_candidate(
     training_messages: &[&[u8]],
     held_out_messages: &[&[u8]],
     record_limits: super::super::RecordLimits,
+    capture_reports: bool,
 ) -> Result<CandidateEvaluation, RecordDiscoveryError> {
     let mut total_record_count = 0_usize;
     let mut total_metadata_bytes = 0_usize;
     let mut training_record_count = 0_usize;
+    let mut training_reports = Vec::new();
+    if capture_reports {
+        training_reports
+            .try_reserve_exact(training_messages.len())
+            .map_err(|_| RecordDiscoveryError::RecordOperation(RecordError::AllocationFailed))?;
+    }
     for (message_index, bytes) in training_messages.iter().enumerate() {
         match parse_records_with_limits(bytes, schema, record_limits) {
             Ok(report) => {
@@ -252,6 +333,9 @@ fn evaluate_candidate(
                 training_record_count = training_record_count
                     .checked_add(count)
                     .ok_or(RecordDiscoveryError::InvalidLimits)?;
+                if capture_reports {
+                    training_reports.push(report);
+                }
             }
             Err(error) => {
                 return Ok(CandidateEvaluation::Falsified {
@@ -263,6 +347,12 @@ fn evaluate_candidate(
         }
     }
     let mut held_out_record_count = 0_usize;
+    let mut held_out_reports = Vec::new();
+    if capture_reports {
+        held_out_reports
+            .try_reserve_exact(held_out_messages.len())
+            .map_err(|_| RecordDiscoveryError::RecordOperation(RecordError::AllocationFailed))?;
+    }
     for (message_index, bytes) in held_out_messages.iter().enumerate() {
         match parse_records_with_limits(bytes, schema, record_limits) {
             Ok(report) => {
@@ -275,6 +365,9 @@ fn evaluate_candidate(
                 held_out_record_count = held_out_record_count
                     .checked_add(count)
                     .ok_or(RecordDiscoveryError::InvalidLimits)?;
+                if capture_reports {
+                    held_out_reports.push(report);
+                }
             }
             Err(error) => {
                 return Ok(CandidateEvaluation::Falsified {
@@ -288,6 +381,7 @@ fn evaluate_candidate(
     Ok(CandidateEvaluation::Survives {
         training_record_count,
         held_out_record_count,
+        parsed_reports: capture_reports.then_some((training_reports, held_out_reports)),
     })
 }
 

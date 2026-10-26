@@ -60,9 +60,10 @@ pub use records::{
     RecordSchema, RecordSchemaAnalysisReport, RecordSchemaDiscoveryReport,
     RecordSchemaDiscoverySpace, RecordSchemaFalsification, RecordSchemaHypothesis,
     RecordSchemaMultiStrategyAnalysisReport, RecordSchemaProposalLimits,
-    RecordSchemaProposalReport, RecordSchemaProposalValidationBasis, analyze_record_schemas,
-    analyze_record_schemas_with_repeated_boundaries,
-    analyze_record_schemas_with_repeated_boundaries_and_offsets, assemble_record_groups,
+    RecordSchemaProposalReport, RecordSchemaProposalValidationBasis, RecordSchemaStrategy,
+    analyze_record_schemas, analyze_record_schemas_with_repeated_boundaries,
+    analyze_record_schemas_with_repeated_boundaries_and_offsets,
+    analyze_record_schemas_with_repeated_boundaries_and_offsets_observed, assemble_record_groups,
     assemble_record_groups_from_inputs, discover_record_schemas, parse_records,
     parse_records_with_limits, propose_record_schema_space,
 };
