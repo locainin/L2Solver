@@ -1,6 +1,6 @@
 use super::super::super::RecoveryExecutionError;
 use super::super::invalid_policy;
-use l2_workbench::protocol::{HeaderParseTemplate, RecordLimits, RecordSchema};
+use l2_workbench::protocol::{HeaderParseTemplate, RecordAssemblyPlan, RecordLimits, RecordSchema};
 
 #[derive(Clone)]
 pub(super) struct HeaderSchemaModel {
@@ -10,9 +10,8 @@ pub(super) struct HeaderSchemaModel {
     pub(super) retained_bytes: usize,
 }
 
-#[derive(Default)]
 pub(super) struct HeaderSchemaPlan {
-    pub(super) models: Vec<HeaderSchemaModel>,
+    pub(super) assembly_plan: RecordAssemblyPlan,
     pub(super) retained_bytes: usize,
     pub(super) omitted_models: usize,
 }

@@ -1544,6 +1544,25 @@ fn assert_session_relative_report(
                 .any(|check| { check.get("artifact_validated") == Some(&Value::Bool(true)) })),
         "the selected cohort report should retain evidence for the exact cross-session artifact; report={report_summary:#?}"
     );
+    assert_deferred_fallback_work_is_visible(report)?;
+    Ok(())
+}
+
+fn assert_deferred_fallback_work_is_visible(report: &Value) -> TestResult<()> {
+    let checks = report
+        .get("application_evidence_checks")
+        .and_then(Value::as_array)
+        .ok_or("relational report omitted application evidence")?;
+    assert!(
+        checks.iter().any(|check| {
+            check.pointer("/details/full_inference_fallback/attempted") == Some(&Value::Bool(true))
+                && check
+                    .pointer("/details/full_inference_fallback/work_bytes")
+                    .and_then(Value::as_u64)
+                    .is_some_and(|work| work > 0)
+        }),
+        "the automatic application path did not run deferred full inference"
+    );
     Ok(())
 }
 

@@ -43,6 +43,7 @@ fn distinct_training_families_can_recover_one_exact_png_without_cross_merging_sc
         details: Value::Null,
         has_unassigned_family_messages: false,
         family_search_complete: true,
+        assessment_scope: super::SchemaOffsetScope::CompleteInput,
     };
     let uniform_result = screen_with_schema_plan(
         &frames,

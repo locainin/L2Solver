@@ -7,7 +7,7 @@ use super::screen::SchemaObserverOptions;
 use super::selection::{LearningSelection, select_learning_frames};
 use super::{SchemaCandidateOptions, SchemaPlan, total_input_bytes};
 use analysis::{AnalysisRequest, analyze_group};
-use family::build_family_analysis;
+use family::{FamilyAnalysisRequest, build_family_analysis};
 use l2_workbench::{
     job::Job,
     protocol::{RecordSchemaProposalLimits, RelationalSessionId, RelationalTransformReport},
@@ -17,6 +17,21 @@ use std::collections::BTreeSet;
 
 const MAX_GATE_SCHEMA_CHECKS: usize = 512;
 const MAX_RETAINED_SCHEMA_HYPOTHESES: usize = 128;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(in crate::workbench::recovery_executor::relational) enum SchemaOffsetScope {
+    PreservedHeader,
+    CompleteInput,
+}
+
+impl SchemaOffsetScope {
+    pub(super) const fn as_str(self) -> &'static str {
+        match self {
+            Self::PreservedHeader => "preserved_header",
+            Self::CompleteInput => "complete_input",
+        }
+    }
+}
 
 pub(super) struct LearningMessages<'a> {
     training: Vec<&'a [u8]>,
@@ -44,6 +59,8 @@ struct PlanAnalysisRequest<'frames, 'messages> {
     artifact_policy: l2_workbench::artifact::ArtifactValidationPolicy,
     job: Option<&'frames Job>,
     header_inputs: Option<&'frames [l2_workbench::protocol::RecordInput<'frames>]>,
+    offset_scope: SchemaOffsetScope,
+    assessment_scope: SchemaOffsetScope,
 }
 
 struct LearningMessageContents<'a> {
@@ -128,7 +145,7 @@ pub(super) fn build_schema_plan(
     artifact_policy: l2_workbench::artifact::ArtifactValidationPolicy,
     job: Option<&Job>,
 ) -> Result<SchemaPlan, RecoveryExecutionError> {
-    build_schema_plan_with_inputs(
+    build_schema_plan_with_scope(
         frames,
         report,
         SchemaCandidateOptions {
@@ -139,6 +156,31 @@ pub(super) fn build_schema_plan(
             job,
         },
         None,
+        SchemaOffsetScope::PreservedHeader,
+    )
+}
+
+pub(super) fn build_full_schema_plan(
+    frames: &[DecodedFrameOutput],
+    report: &RelationalTransformReport,
+    schema_limits: RecordSchemaProposalLimits,
+    work_limit: usize,
+    parser_format: l2_workbench::artifact::ArtifactValidationFormat,
+    artifact_policy: l2_workbench::artifact::ArtifactValidationPolicy,
+    job: Option<&Job>,
+) -> Result<SchemaPlan, RecoveryExecutionError> {
+    build_schema_plan_with_scope(
+        frames,
+        report,
+        SchemaCandidateOptions {
+            parser_format,
+            schema_limits,
+            artifact_policy,
+            work_limit,
+            job,
+        },
+        None,
+        SchemaOffsetScope::CompleteInput,
     )
 }
 
@@ -147,6 +189,22 @@ pub(super) fn build_schema_plan_with_inputs(
     report: &RelationalTransformReport,
     options: SchemaCandidateOptions<'_>,
     header_inputs: Option<&[l2_workbench::protocol::RecordInput<'_>]>,
+) -> Result<SchemaPlan, RecoveryExecutionError> {
+    build_schema_plan_with_scope(
+        frames,
+        report,
+        options,
+        header_inputs,
+        SchemaOffsetScope::PreservedHeader,
+    )
+}
+
+fn build_schema_plan_with_scope(
+    frames: &[DecodedFrameOutput],
+    report: &RelationalTransformReport,
+    options: SchemaCandidateOptions<'_>,
+    header_inputs: Option<&[l2_workbench::protocol::RecordInput<'_>]>,
+    offset_scope: SchemaOffsetScope,
 ) -> Result<SchemaPlan, RecoveryExecutionError> {
     let SchemaCandidateOptions {
         parser_format,
@@ -161,6 +219,7 @@ pub(super) fn build_schema_plan_with_inputs(
         return Ok(pending_plan(
             "no_decoded_discovery_frames",
             &json!({"schema_candidates_examined":0}),
+            SchemaOffsetScope::CompleteInput,
         ));
     }
 
@@ -171,6 +230,12 @@ pub(super) fn build_schema_plan_with_inputs(
         &heldout,
     )?;
     let messages = collect_learning_messages(frames, &selection, &discovery, &heldout)?;
+    let assessment_scope = effective_offset_scope(
+        frames,
+        &messages.training_indices,
+        schema_limits,
+        offset_scope,
+    )?;
     if messages.training.is_empty()
         || messages.learning_bytes == 0
         || messages.full_input_bytes > work_limit
@@ -179,6 +244,7 @@ pub(super) fn build_schema_plan_with_inputs(
             messages.learning_bytes,
             messages.full_input_bytes,
             work_limit,
+            assessment_scope,
         ));
     }
 
@@ -189,12 +255,14 @@ pub(super) fn build_schema_plan_with_inputs(
         messages.training_indices.as_slice(),
         &messages,
         uniform_analysis_budget,
+        offset_scope,
     )?
     else {
         return Ok(work_limited_plan(
             messages.learning_bytes,
             messages.full_input_bytes,
             work_limit,
+            assessment_scope,
         ));
     };
     analyze_plan(&PlanAnalysisRequest {
@@ -208,6 +276,8 @@ pub(super) fn build_schema_plan_with_inputs(
         artifact_policy,
         job,
         header_inputs,
+        offset_scope,
+        assessment_scope,
     })
 }
 
@@ -240,15 +310,17 @@ fn analyze_plan(
     };
     let uniform = analyze_group(&uniform_request)?;
     let family_budget = request.work_limit.saturating_sub(uniform.work_bytes);
-    let family = build_family_analysis(
-        request.frames,
-        request.selection,
-        request.discovery,
-        request.limits,
-        family_budget,
+    let family_request = FamilyAnalysisRequest {
+        frames: request.frames,
+        selection: request.selection,
+        discovery_sessions: request.discovery,
+        base_limits: request.limits,
+        work_limit: family_budget,
         observer,
-        request.job,
-    )?;
+        offset_scope: request.offset_scope,
+        job: request.job,
+    };
+    let family = build_family_analysis(&family_request)?;
     let mut alternatives = uniform.alternatives;
     alternatives
         .try_reserve(family.alternatives.len())
@@ -264,7 +336,43 @@ fn analyze_plan(
         }),
         has_unassigned_family_messages: family.has_unassigned_messages,
         family_search_complete: family.complete,
+        assessment_scope: request.assessment_scope,
     })
+}
+
+fn effective_offset_scope(
+    frames: &[DecodedFrameOutput],
+    frame_indices: &[usize],
+    limits: RecordSchemaProposalLimits,
+    requested: SchemaOffsetScope,
+) -> Result<SchemaOffsetScope, RecoveryExecutionError> {
+    if requested == SchemaOffsetScope::CompleteInput || frame_indices.is_empty() {
+        return Ok(SchemaOffsetScope::CompleteInput);
+    }
+    let selected_frames = frame_indices
+        .iter()
+        .map(|index| {
+            frames
+                .get(*index)
+                .ok_or_else(|| invalid_policy("record gate scope frame is missing"))
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    if selected_frames
+        .iter()
+        .any(|frame| frame.preserved_header_end.is_none())
+    {
+        return Ok(SchemaOffsetScope::CompleteInput);
+    }
+    let prefix_end = selected_frames
+        .iter()
+        .filter_map(|frame| frame.preserved_header_end)
+        .min()
+        .unwrap_or_default();
+    if prefix_end > 0 && prefix_end < limits.max_field_offset {
+        Ok(SchemaOffsetScope::PreservedHeader)
+    } else {
+        Ok(SchemaOffsetScope::CompleteInput)
+    }
 }
 
 fn collect_learning_messages<'a>(
@@ -369,6 +477,7 @@ fn work_limited_plan(
     learning_bytes: usize,
     full_input_bytes: usize,
     work_limit: usize,
+    assessment_scope: SchemaOffsetScope,
 ) -> SchemaPlan {
     pending_plan(
         "record_schema_work_limit",
@@ -377,6 +486,7 @@ fn work_limited_plan(
             "full_input_bytes":full_input_bytes,
             "work_limit":work_limit,
         }),
+        assessment_scope,
     )
 }
 
@@ -386,14 +496,17 @@ pub(super) fn prepare_schema_limits(
     frame_indices: &[usize],
     messages: &LearningMessages<'_>,
     work_limit: usize,
+    offset_scope: SchemaOffsetScope,
 ) -> Result<Option<RecordSchemaProposalLimits>, RecoveryExecutionError> {
     let Some(mut limits) =
         bounded_schema_limits(initial, messages.analysis_input_bytes, work_limit)
     else {
         return Ok(None);
     };
-    // Keep clear-header candidates bounded by bytes that the transform cannot change
-    limits = restrict_header_offsets(limits, frames, frame_indices)?;
+    if offset_scope == SchemaOffsetScope::PreservedHeader {
+        // Keep the primary probe within bytes that the transform cannot change
+        limits = restrict_header_offsets(limits, frames, frame_indices)?;
+    }
     limits.discovery.max_survivors = limits
         .discovery
         .max_survivors
@@ -465,12 +578,17 @@ fn limit_record_input(limits: &mut RecordSchemaProposalLimits, full_input_bytes:
         .min(full_input_bytes);
 }
 
-fn pending_plan(reason: &'static str, details: &Value) -> SchemaPlan {
+fn pending_plan(
+    reason: &'static str,
+    details: &Value,
+    assessment_scope: SchemaOffsetScope,
+) -> SchemaPlan {
     SchemaPlan {
         alternatives: Vec::new(),
         details: json!({"reason":reason,"details":details}),
         has_unassigned_family_messages: false,
         family_search_complete: false,
+        assessment_scope,
     }
 }
 

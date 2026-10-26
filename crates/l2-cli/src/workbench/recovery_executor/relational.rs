@@ -13,6 +13,10 @@ pub(super) use application::aggregate_validator;
 #[path = "../../../tests/workbench/recovery_relational/materialization.rs"]
 mod materialization_tests;
 
+#[cfg(test)]
+#[path = "../../../tests/workbench/recovery_relational/application_fallback.rs"]
+mod application_fallback_tests;
+
 use super::record_discovery::{RecordCohortKey, RecordCohortOrigin, RecordFrameInput};
 use super::{
     Executor, RecoveryCandidateId, RecoveryExecutionError, RecoveryOmission, RecoveryStage,
@@ -22,7 +26,7 @@ use l2_workbench::{
     protocol::{MessageContext, RecordSchema, RelationalAppliedOutput},
     recovery::{EnqueueOutcome, RecoveryError, RecoveryResult},
 };
-use record_gate::{AcceptedRecordSchema, GateStatus};
+use record_gate::{AcceptedRecordSchema, GateStatus, SchemaOffsetScope};
 use serde_json::Value;
 use std::collections::{BTreeSet, HashSet};
 
@@ -162,6 +166,16 @@ struct GateAssessment {
     status: GateStatus,
     details: Value,
     accepted_schema: Option<AcceptedRecordSchema>,
+    assessment_scope: Option<SchemaOffsetScope>,
+}
+
+impl GateAssessment {
+    const fn needs_full_inference(&self) -> bool {
+        matches!(
+            self.assessment_scope,
+            Some(SchemaOffsetScope::PreservedHeader)
+        ) && !matches!(self.status, GateStatus::ArtifactValidated)
+    }
 }
 
 struct RetainedRelationalRule {

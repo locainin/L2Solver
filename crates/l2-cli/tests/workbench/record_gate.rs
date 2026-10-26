@@ -180,6 +180,7 @@ fn family_schema_support_stays_pending_when_any_message_is_unassigned() -> TestR
         details: json!({}),
         has_unassigned_family_messages: true,
         family_search_complete: false,
+        assessment_scope: super::SchemaOffsetScope::CompleteInput,
     };
 
     let result = screen_with_schema_plan(
@@ -236,6 +237,7 @@ fn schema_plan(
         details: json!({"reason":"no_record_schema_candidates"}),
         has_unassigned_family_messages: false,
         family_search_complete: true,
+        assessment_scope: super::SchemaOffsetScope::CompleteInput,
     }
 }
 
@@ -364,6 +366,7 @@ fn uniform_and_pending_family_plan() -> SchemaPlan {
         details: json!({}),
         has_unassigned_family_messages: true,
         family_search_complete: false,
+        assessment_scope: super::SchemaOffsetScope::CompleteInput,
     }
 }
 

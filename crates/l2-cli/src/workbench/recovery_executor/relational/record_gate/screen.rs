@@ -2,7 +2,8 @@ use super::super::super::RecoveryExecutionError;
 use super::super::{DecodedFrameOutput, aggregate_validator, invalid_policy, operational};
 use super::header::{HeaderSchemaModel, HeaderSchemaPlan};
 use super::{
-    GateResult, GateStatus, SchemaAlternative, SchemaPlan, record_inputs, record_job_work, result,
+    GateResult, GateStatus, SchemaAlternative, SchemaOffsetScope, SchemaPlan, record_inputs,
+    record_job_work, result,
 };
 use l2_workbench::{
     artifact::{
@@ -11,10 +12,11 @@ use l2_workbench::{
     },
     job::{Counter, Job, Phase},
     protocol::{
-        HeaderParseTemplate, MessageContext, RecordAssemblyInput, RecordAssemblyOutcome,
-        RecordError, RecordGroupReceipt, RecordInput, RecordParseReport, RecordSchema,
-        RecordSchemaDiscoveryReport, RecordSchemaHypothesis, RecordSchemaProposalLimits,
-        RecordSchemaStrategy, assemble_record_groups_from_inputs, parse_records_with_limits,
+        BoundRecordAssemblyPlan, HeaderParseTemplate, MessageContext, RecordAssemblyInput,
+        RecordAssemblyModelStatus, RecordAssemblyOutcome, RecordError, RecordGroupReceipt,
+        RecordInput, RecordParseReport, RecordSchema, RecordSchemaDiscoveryReport,
+        RecordSchemaHypothesis, RecordSchemaProposalLimits, RecordSchemaStrategy,
+        assemble_record_groups_from_inputs, parse_records_with_limits,
     },
 };
 use serde_json::{Value, json};
@@ -170,7 +172,7 @@ impl HypothesisEvidence {
     }
 }
 
-#[derive(Default)]
+#[derive(Clone, Copy, Default)]
 struct CandidateInspection {
     exact_artifact_match: bool,
     parser_omission: bool,
@@ -233,6 +235,7 @@ pub(super) fn screen_with_schema_plan(
         ),
     );
     gate_result.accepted_schema = evaluation.accepted_schema;
+    gate_result.assessment_scope = plan.assessment_scope;
     Ok(gate_result)
 }
 
@@ -255,22 +258,6 @@ pub(super) fn screen_with_header_plan(
         )?;
     }
     let full_input_bytes = super::total_input_bytes(frames)?;
-    if full_input_bytes > work_limit {
-        return Ok(result(
-            GateStatus::Pending,
-            work_limit,
-            json!({
-                "reason":"record_schema_work_limit",
-                "schema_plan_cache_hit":false,
-                "header_schema_plan_cache_hit":true,
-                "header_schema_models":plan.models.len(),
-                "header_schema_models_omitted":plan.omitted_models,
-                "work_bytes":work_limit,
-                "work_limit":work_limit,
-            }),
-        ));
-    }
-
     let inputs = record_inputs(frames)?;
     let frame_indices = all_frame_indices(frames.len())?;
     let context = SchemaScreenContext {
@@ -295,16 +282,23 @@ pub(super) fn screen_with_header_plan(
         status,
         evaluation.used_work,
         json!({
-            "reason":if evaluation.exact_artifact_matches == 0 { "header_schema_requires_fresh_inference" } else { status.as_str() },
+            "reason":if evaluation.exact_artifact_matches == 0 { "cached_partial_models_require_fresh_inference" } else { status.as_str() },
+            "assessment_scope":"cached_partial_models",
             "schema_plan_cache_hit":false,
             "header_schema_plan_cache_hit":true,
-            "header_schema_models":plan.models.len(),
+            "header_schema_models":plan.assembly_plan.model_count(),
             "header_schema_models_attempted":evaluation.models_attempted,
             "header_schema_models_checked":evaluation.schemas_checked,
             "header_schema_models_omitted":plan.omitted_models,
             "header_schema_rebind_rejections":evaluation.rebind_rejections,
             "header_schema_assembly_rejections":evaluation.assembly_rejections,
             "header_schema_models_deferred_for_work":evaluation.models_deferred_for_work,
+            "header_schema_prefix_bytes_checked":evaluation.prefix_bytes_checked,
+            "header_schema_shared_input_checks":evaluation.shared_input_checks,
+            "header_schema_model_input_checks":evaluation.model_input_checks,
+            "header_schema_layout_membership_checks":evaluation.layout_membership_checks,
+            "header_schema_layouts_materialized":evaluation.layouts_materialized,
+            "header_schema_layout_reuses":evaluation.layout_reuses,
             "schema_alternatives":evaluation.alternatives,
             "exact_artifact_matches":evaluation.exact_artifact_matches,
             "parser_omissions":evaluation.parser_omissions,
@@ -313,7 +307,23 @@ pub(super) fn screen_with_header_plan(
             "pending":evaluation.pending,
         }),
     );
+    gate_result.assessment_scope = SchemaOffsetScope::PreservedHeader;
     gate_result.accepted_schema = evaluation.accepted_schema;
+    let needs_full_inference = gate_result.needs_full_inference();
+    if let Some(details) = gate_result.details.as_object_mut() {
+        details.insert(
+            "full_inference_deferred".to_owned(),
+            Value::Bool(needs_full_inference),
+        );
+        details.insert(
+            "assessment_scope".to_owned(),
+            Value::String("cached_partial_models".to_owned()),
+        );
+        details.insert(
+            "full_inference_fallback_work_bytes".to_owned(),
+            Value::from(0),
+        );
+    }
     Ok(gate_result)
 }
 
@@ -325,6 +335,12 @@ struct HeaderPlanEvaluation {
     rebind_rejections: usize,
     assembly_rejections: usize,
     models_deferred_for_work: usize,
+    prefix_bytes_checked: usize,
+    shared_input_checks: usize,
+    model_input_checks: usize,
+    layout_membership_checks: usize,
+    layouts_materialized: usize,
+    layout_reuses: usize,
     exact_artifact_matches: usize,
     parser_omissions: usize,
     pending: bool,
@@ -332,163 +348,230 @@ struct HeaderPlanEvaluation {
     alternatives: Vec<Value>,
 }
 
+struct BoundHeaderEvaluation<'plan, 'input> {
+    bound: BoundRecordAssemblyPlan<'plan, 'input>,
+    layout_inspections: Vec<Option<CandidateInspection>>,
+    result: HeaderPlanEvaluation,
+}
+
 fn evaluate_header_models(
     context: &SchemaScreenContext<'_>,
     plan: &HeaderSchemaPlan,
 ) -> Result<HeaderPlanEvaluation, RecoveryExecutionError> {
-    let mut evaluation = HeaderPlanEvaluation::default();
-    evaluation
+    let inputs = context
+        .inputs
+        .ok_or_else(|| invalid_policy("record gate header inputs are missing"))?;
+    let assembly_plan = &plan.assembly_plan;
+    let bound = assembly_plan
+        .bind(inputs)
+        .map_err(|source| operational("record gate header plan bind failed", source))?;
+    let mut layout_inspections = Vec::new();
+    layout_inspections
+        .try_reserve_exact(assembly_plan.layout_count())
+        .map_err(|source| operational("header layout inspection allocation failed", source))?;
+    layout_inspections.resize(assembly_plan.layout_count(), None::<CandidateInspection>);
+    let mut result = HeaderPlanEvaluation {
+        prefix_bytes_checked: bound.stats().prefix_bytes_checked,
+        shared_input_checks: bound.stats().shared_input_checks,
+        model_input_checks: bound.stats().model_input_checks,
+        layout_membership_checks: bound.stats().layout_membership_checks,
+        ..HeaderPlanEvaluation::default()
+    };
+    let bind_work = result
+        .prefix_bytes_checked
+        .checked_add(result.shared_input_checks)
+        .and_then(|work| work.checked_add(result.model_input_checks))
+        .and_then(|work| work.checked_add(result.layout_membership_checks))
+        .ok_or_else(|| invalid_policy("record gate header bind work overflowed"))?;
+    if !reserve_schema_work(&mut result.used_work, bind_work, context.work_limit)? {
+        result.pending = true;
+        result.models_deferred_for_work = assembly_plan.model_count();
+        return Ok(result);
+    }
+    result
         .alternatives
         .try_reserve_exact(1)
         .map_err(|source| operational("header schema result allocation failed", source))?;
-    let mut identity_charged = false;
-    for (model_index, model) in plan.models.iter().enumerate() {
-        if let Some(job) = context.job {
-            job.check_cancelled()?;
-        }
-        if !identity_charged {
-            if !reserve_schema_work(
-                &mut evaluation.used_work,
-                context.full_input_bytes,
-                context.work_limit,
-            )? {
-                evaluation.pending = true;
-                evaluation.models_deferred_for_work = plan.models.len().saturating_sub(model_index);
-                break;
-            }
-            identity_charged = true;
-        }
-        if evaluate_header_model(context, plan, model, model_index, &mut evaluation)? {
+    let mut state = BoundHeaderEvaluation {
+        bound,
+        layout_inspections,
+        result,
+    };
+    for model_index in 0..assembly_plan.model_count() {
+        if evaluate_header_model(context, plan, &mut state, model_index)? {
             break;
         }
     }
-    Ok(evaluation)
+    Ok(state.result)
 }
 
 fn evaluate_header_model(
     context: &SchemaScreenContext<'_>,
     plan: &HeaderSchemaPlan,
-    model: &HeaderSchemaModel,
+    state: &mut BoundHeaderEvaluation<'_, '_>,
     model_index: usize,
-    evaluation: &mut HeaderPlanEvaluation,
 ) -> Result<bool, RecoveryExecutionError> {
-    let inputs = context
-        .inputs
-        .ok_or_else(|| invalid_policy("record gate header inputs are missing"))?;
-    let model_work_start = evaluation.used_work;
-    let header_work = header_rebind_work(context.frames, model)?;
-    if !reserve_schema_work(&mut evaluation.used_work, header_work, context.work_limit)? {
-        evaluation.pending = true;
-        evaluation.models_deferred_for_work = plan.models.len().saturating_sub(model_index);
-        return Ok(true);
+    if let Some(job) = context.job {
+        job.check_cancelled()?;
     }
-    evaluation.models_attempted = evaluation.models_attempted.saturating_add(1);
-    let Some(parse_reports) = rebind_header_model(inputs, context.frames, model)? else {
-        evaluation.parser_omissions = evaluation.parser_omissions.saturating_add(1);
-        evaluation.rebind_rejections = evaluation.rebind_rejections.saturating_add(1);
-        evaluation.pending = true;
-        return Ok(false);
-    };
-    let assembly_work = parse_reports.iter().try_fold(0_usize, |total, report| {
-        report
-            .records()
-            .iter()
-            .try_fold(total, |records_total, record| {
-                records_total.checked_add(record.payload.end.saturating_sub(record.payload.start))
-            })
-    });
-    let Some(assembly_work) = assembly_work.and_then(|bytes| bytes.checked_mul(2)) else {
-        return Err(invalid_policy(
-            "record gate header assembly work overflowed",
-        ));
-    };
-    // Materialization copies each payload and computes the assembly receipt digest
-    if !reserve_schema_work(&mut evaluation.used_work, assembly_work, context.work_limit)? {
-        evaluation.pending = true;
-        evaluation.models_deferred_for_work = plan.models.len().saturating_sub(model_index);
-        return Ok(true);
-    }
-    let Some(assembly) = assemble_header_model(
-        inputs,
-        context.frames,
-        context.frame_indices,
-        &parse_reports,
-        model,
-    )?
-    else {
-        evaluation.pending = true;
-        evaluation.parser_omissions = evaluation.parser_omissions.saturating_add(1);
-        evaluation.assembly_rejections = evaluation.assembly_rejections.saturating_add(1);
-        return Ok(false);
-    };
-    evaluation.schemas_checked = evaluation.schemas_checked.saturating_add(1);
-    inspect_header_assembly(
-        context,
-        model,
-        model_index,
-        model_work_start,
-        plan.models.len(),
-        &assembly,
-        evaluation,
-    )
-}
-
-fn inspect_header_assembly(
-    context: &SchemaScreenContext<'_>,
-    model: &HeaderSchemaModel,
-    model_index: usize,
-    model_work_start: usize,
-    model_count: usize,
-    assembly: &RecordAssemblyOutcome,
-    evaluation: &mut HeaderPlanEvaluation,
-) -> Result<bool, RecoveryExecutionError> {
-    let mut candidate_matches = 0_usize;
-    for group in assembly.report().groups {
-        let candidate_bytes = group.candidate_bytes();
-        if !reserve_schema_work(
-            &mut evaluation.used_work,
-            candidate_bytes.len(),
-            context.work_limit,
-        )? {
-            evaluation.pending = true;
-            evaluation.parser_omissions = evaluation.parser_omissions.saturating_add(1);
-            evaluation.models_deferred_for_work = model_count.saturating_sub(model_index);
-            break;
+    state.result.models_attempted = state.result.models_attempted.saturating_add(1);
+    match state.bound.model_status(model_index) {
+        Some(RecordAssemblyModelStatus::Ready) => {}
+        Some(_) => {
+            state.result.rebind_rejections = state.result.rebind_rejections.saturating_add(1);
+            state.result.pending = true;
+            return Ok(false);
         }
-        let inspection =
-            inspect_candidate_bytes(candidate_bytes, context, &mut evaluation.used_work)?;
-        evaluation.parser_omissions = evaluation
-            .parser_omissions
-            .saturating_add(usize::from(inspection.parser_omission));
-        evaluation.pending |= inspection.pending;
+        None => return Err(invalid_policy("record gate header model is missing")),
+    }
+    let Some(group_count) = state.bound.model_group_count(model_index) else {
+        return Err(invalid_policy("ready record gate model has no group count"));
+    };
+    if group_count == 0 {
+        state.result.assembly_rejections = state.result.assembly_rejections.saturating_add(1);
+        state.result.pending = true;
+        return Ok(false);
+    }
+    state.result.schemas_checked = state.result.schemas_checked.saturating_add(1);
+    let model_work_start = state.result.used_work;
+    let mut candidate_matches = 0_usize;
+    let mut model_pending = false;
+    for group_index in 0..group_count {
+        let Some(inspection) =
+            evaluate_header_group(context, plan, state, model_index, group_index)?
+        else {
+            return Ok(true);
+        };
+        state.result.pending |= inspection.pending;
         candidate_matches =
             candidate_matches.saturating_add(usize::from(inspection.exact_artifact_match));
-        if inspection.exact_artifact_match && evaluation.accepted_schema.is_none() {
-            evaluation.accepted_schema = Some(accepted_record_schema(
-                context,
-                model.schema.clone(),
-                RecordSchemaStrategy::FixedLayout,
-                group.receipt().clone(),
-            )?);
-        }
         if inspection.pending {
+            model_pending = true;
             break;
         }
     }
-    evaluation.exact_artifact_matches = evaluation
+    state.result.exact_artifact_matches = state
+        .result
         .exact_artifact_matches
         .saturating_add(candidate_matches);
     if candidate_matches > 0 {
-        evaluation.alternatives.push(json!({
+        state.result.alternatives.push(json!({
             "label":"header_only:fixed_layout",
             "status":GateStatus::ArtifactValidated.as_str(),
             "schema_model_ordinal":model_index.saturating_add(1),
             "exact_artifact_matches":candidate_matches,
-            "header_model_bytes":model.retained_bytes,
-            "work_bytes":evaluation.used_work.saturating_sub(model_work_start),
+            "header_model_bytes":plan.assembly_plan.retained_bytes(),
+            "work_bytes":state.result.used_work.saturating_sub(model_work_start),
         }));
+        return Ok(true);
     }
-    Ok(candidate_matches > 0 || evaluation.pending)
+    Ok(model_pending)
+}
+
+fn evaluate_header_group(
+    context: &SchemaScreenContext<'_>,
+    plan: &HeaderSchemaPlan,
+    state: &mut BoundHeaderEvaluation<'_, '_>,
+    model_index: usize,
+    group_index: usize,
+) -> Result<Option<CandidateInspection>, RecoveryExecutionError> {
+    let layout_id = state
+        .bound
+        .layout_id(model_index, group_index)
+        .ok_or_else(|| invalid_policy("record gate model layout is missing"))?;
+    let Some(inspection) = inspect_header_layout(context, plan, state, model_index, layout_id)?
+    else {
+        return Ok(None);
+    };
+
+    if inspection.exact_artifact_match && state.result.accepted_schema.is_none() {
+        if !reserve_schema_work(
+            &mut state.result.used_work,
+            context.full_input_bytes,
+            context.work_limit,
+        )? {
+            state.result.pending = true;
+            state.result.models_deferred_for_work =
+                plan.assembly_plan.model_count().saturating_sub(model_index);
+            return Ok(Some(CandidateInspection {
+                pending: true,
+                ..inspection
+            }));
+        }
+        let receipt = state
+            .bound
+            .group_receipt(model_index, group_index)
+            .map_err(|source| operational("record gate group receipt failed", source))?;
+        let schema = plan
+            .assembly_plan
+            .model_schema(model_index)
+            .cloned()
+            .ok_or_else(|| invalid_policy("accepted record gate schema is missing"))?;
+        state.result.accepted_schema = Some(accepted_record_schema(
+            context,
+            schema,
+            RecordSchemaStrategy::FixedLayout,
+            receipt,
+        )?);
+    }
+    Ok(Some(inspection))
+}
+
+fn inspect_header_layout(
+    context: &SchemaScreenContext<'_>,
+    plan: &HeaderSchemaPlan,
+    state: &mut BoundHeaderEvaluation<'_, '_>,
+    model_index: usize,
+    layout_id: usize,
+) -> Result<Option<CandidateInspection>, RecoveryExecutionError> {
+    if let Some(inspection) = state.layout_inspections.get(layout_id).copied().flatten() {
+        state.result.layout_reuses = state.result.layout_reuses.saturating_add(1);
+        return Ok(Some(inspection));
+    }
+    let output_length = state
+        .bound
+        .layout_output_length(layout_id)
+        .ok_or_else(|| invalid_policy("record gate layout length is missing"))?;
+    let copy_and_hash_work = output_length
+        .checked_mul(2)
+        .ok_or_else(|| invalid_policy("record gate layout work overflowed"))?;
+    if !reserve_schema_work(
+        &mut state.result.used_work,
+        copy_and_hash_work,
+        context.work_limit,
+    )? {
+        state.result.pending = true;
+        state.result.models_deferred_for_work =
+            plan.assembly_plan.model_count().saturating_sub(model_index);
+        return Ok(None);
+    }
+    let materialized = state
+        .bound
+        .materialize(layout_id)
+        .map_err(|source| operational("record gate layout materialization failed", source))?;
+    state.result.layouts_materialized = state.result.layouts_materialized.saturating_add(1);
+    let candidate_bytes = materialized.bytes();
+    if !reserve_schema_work(
+        &mut state.result.used_work,
+        candidate_bytes.len(),
+        context.work_limit,
+    )? {
+        state.result.pending = true;
+        state.result.parser_omissions = state.result.parser_omissions.saturating_add(1);
+        state.result.models_deferred_for_work =
+            plan.assembly_plan.model_count().saturating_sub(model_index);
+        return Ok(None);
+    }
+    let inspection =
+        inspect_candidate_bytes(candidate_bytes, context, &mut state.result.used_work)?;
+    state.result.parser_omissions = state
+        .result
+        .parser_omissions
+        .saturating_add(usize::from(inspection.parser_omission));
+    if let Some(slot) = state.layout_inspections.get_mut(layout_id) {
+        *slot = Some(inspection);
+    }
+    Ok(Some(inspection))
 }
 
 fn all_frame_indices(frame_count: usize) -> Result<Vec<usize>, RecoveryExecutionError> {
@@ -498,89 +581,6 @@ fn all_frame_indices(frame_count: usize) -> Result<Vec<usize>, RecoveryExecution
     })?;
     indices.extend(0..frame_count);
     Ok(indices)
-}
-
-fn header_rebind_work(
-    frames: &[DecodedFrameOutput],
-    model: &HeaderSchemaModel,
-) -> Result<usize, RecoveryExecutionError> {
-    frames.iter().try_fold(0_usize, |total, frame| {
-        let Some(prefix_end) = frame.preserved_header_end else {
-            return Err(invalid_policy("header schema plan lost a preserved prefix"));
-        };
-        if frame.bytes.get(..prefix_end).is_none() {
-            return Err(invalid_policy(
-                "header schema plan prefix exceeds its frame",
-            ));
-        }
-        total
-            .checked_add(prefix_end)
-            .and_then(|amount| amount.checked_add(model.schema.identifier.width))
-            .ok_or_else(|| invalid_policy("record gate header rebind work overflowed"))
-    })
-}
-
-fn rebind_header_model(
-    inputs: &[RecordInput<'_>],
-    frames: &[DecodedFrameOutput],
-    model: &HeaderSchemaModel,
-) -> Result<Option<Vec<RecordParseReport>>, RecoveryExecutionError> {
-    if model.templates.len() != frames.len() {
-        return Ok(None);
-    }
-    let mut reports = Vec::new();
-    reports
-        .try_reserve_exact(frames.len())
-        .map_err(|source| operational("record gate rebound report allocation failed", source))?;
-    for (frame_index, (template_index, template)) in model.templates.iter().enumerate() {
-        if frame_index != *template_index {
-            return Ok(None);
-        }
-        let input = inputs
-            .get(frame_index)
-            .ok_or_else(|| invalid_policy("record gate rebound input is missing"))?;
-        let Ok(report) = template.rebind(input, model.limits) else {
-            return Ok(None);
-        };
-        reports.push(report);
-    }
-    Ok(Some(reports))
-}
-
-fn assemble_header_model(
-    inputs: &[RecordInput<'_>],
-    frames: &[DecodedFrameOutput],
-    frame_indices: &[usize],
-    reports: &[RecordParseReport],
-    model: &HeaderSchemaModel,
-) -> Result<Option<RecordAssemblyOutcome>, RecoveryExecutionError> {
-    if inputs.len() != frame_indices.len() || reports.len() != frame_indices.len() {
-        return Ok(None);
-    }
-    let mut assembly_inputs = Vec::new();
-    assembly_inputs
-        .try_reserve_exact(frame_indices.len())
-        .map_err(|source| operational("record gate rebound assembly allocation failed", source))?;
-    for (position, frame_index) in frame_indices.iter().enumerate() {
-        let Some(input) = inputs.get(*frame_index) else {
-            return Err(invalid_policy(
-                "record gate rebound assembly input is missing",
-            ));
-        };
-        let Some(report) = reports.get(position) else {
-            return Err(invalid_policy(
-                "record gate rebound parse report is missing",
-            ));
-        };
-        let _frame = frames
-            .get(*frame_index)
-            .ok_or_else(|| invalid_policy("record gate rebound frame is missing"))?;
-        let Ok(assembly_input) = RecordAssemblyInput::from_input(input, report) else {
-            return Ok(None);
-        };
-        assembly_inputs.push(assembly_input);
-    }
-    Ok(assemble_record_groups_from_inputs(&assembly_inputs, model.limits).ok())
 }
 
 fn evaluate_plan_alternatives(
@@ -871,7 +871,7 @@ fn pending_work_result(
     cache_hit: bool,
     plan: &SchemaPlan,
 ) -> GateResult {
-    result(
+    let mut result = result(
         GateStatus::Pending,
         work_limit,
         json!({
@@ -881,7 +881,9 @@ fn pending_work_result(
             "work_limit":work_limit,
             "schema_plan":plan.details,
         }),
-    )
+    );
+    result.assessment_scope = plan.assessment_scope;
+    result
 }
 
 fn all_frames_have_preserved_headers(frames: &[DecodedFrameOutput]) -> bool {
@@ -1825,6 +1827,7 @@ fn evaluation_details(
     };
     json!({
         "reason":reason,
+        "assessment_scope":plan.assessment_scope.as_str(),
         "schema_only_constraints":unchanged_schema_only,
         "schema_alternatives":evaluation.alternatives,
         "schemas_checked":evaluation.schemas_checked,

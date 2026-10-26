@@ -1,22 +1,40 @@
+use super::key::schema_layout_key;
 use super::plan::build_schema_plan;
 use super::screen::{
     SchemaAlternativeEvaluation, SchemaScreenContext, SurvivingSchemaInputs,
     observe_surviving_schema,
 };
-use super::{GateStatus, SchemaCandidateOptions, SchemaPlanCache, screen_with_schema_plan};
+use super::{
+    GateStatus, MAX_CACHED_SCHEMA_PLANS, SchemaAlternative, SchemaCandidateOptions,
+    SchemaOffsetScope, SchemaPlan, SchemaPlanCache, header_plan_model_budget,
+    screen_with_schema_plan,
+};
 use crate::workbench::recovery_executor::relational::DecodedFrameOutput;
 use l2_workbench::{
     artifact::{ArtifactValidationFormat, ArtifactValidationPolicy, PNG_SIGNATURE},
     protocol::{
-        ByteRange, Direction, HoldoutBasis, MessageContext, RecordDiscoveryLimits,
-        RecordParseReport, RecordSchemaProposalLimits, RelationalSessionId,
-        RelationalTransformReport,
+        ByteRange, Direction, HoldoutBasis, MessageContext, RecordAssemblyInput,
+        RecordDiscoveryLimits, RecordLimits, RecordParseReport, RecordSchema,
+        RecordSchemaProposalLimits, RelationalSessionId, RelationalTransformReport,
+        assemble_record_groups_from_inputs, parse_records,
     },
 };
 use serde_json::Value;
 use std::error::Error;
+use std::sync::Arc;
 
 type TestResult<T> = Result<T, Box<dyn Error>>;
+
+#[test]
+fn header_model_budget_reserves_cached_plans_and_the_new_key() {
+    let total_budget = 4096;
+    let without_existing_bytes = header_plan_model_budget(total_budget, 0, 0);
+    let with_existing_bytes = header_plan_model_budget(total_budget, 128, 64);
+
+    assert_eq!(with_existing_bytes, without_existing_bytes - 192);
+    assert_eq!(header_plan_model_budget(192, 128, 64), 0);
+    assert_eq!(header_plan_model_budget(0, 0, 0), 0);
+}
 
 #[test]
 fn one_input_with_multiple_records_reaches_schema_discovery() -> TestResult<()> {
@@ -113,9 +131,13 @@ fn preserved_header_bytes_still_reach_schema_discovery() -> TestResult<()> {
     )?;
 
     assert_eq!(cache.plans.len(), 1);
+    assert_eq!(result.assessment_scope, SchemaOffsetScope::CompleteInput);
     assert_eq!(
-        result.details.get("reason").and_then(Value::as_str),
-        Some("clear_header_schema_only")
+        result
+            .details
+            .pointer("/full_inference_fallback/attempted")
+            .and_then(Value::as_bool),
+        Some(true)
     );
     Ok(())
 }
@@ -248,6 +270,186 @@ fn header_only_models_revalidate_changed_payloads_without_rebuilding_inference()
     Ok(())
 }
 
+#[test]
+fn cached_header_negative_defers_full_inference_and_remains_pending() -> TestResult<()> {
+    let fixture = crate::workbench::recovery_executor::record_discovery_tests::
+        build_session_relative_fixture()?;
+    let mut first_frames = source_framed_png_frames(&fixture.plaintext)?;
+    let mut second_frames = source_framed_png_frames(&fixture.plaintext)?;
+    replace_transformed_payloads(&mut first_frames, 0xa5)?;
+    replace_transformed_payloads(&mut second_frames, 0x5a)?;
+    let report = report_with_sessions(&[1, 2], &[3, 4]);
+    let options = candidate_options(
+        ArtifactValidationFormat::Png,
+        RecordSchemaProposalLimits::default(),
+        ArtifactValidationPolicy::default(),
+        64 * 1024 * 1024,
+    );
+    let mut cache = SchemaPlanCache::default();
+
+    let first = cache.screen_candidate(&first_frames, &report, options)?;
+    assert_ne!(first.status, GateStatus::ArtifactValidated);
+    assert!(first.needs_full_inference());
+    assert_eq!(cache.header_plans.len(), 1);
+    assert_eq!(
+        first.details.get("full_inference_deferred"),
+        Some(&Value::Bool(true))
+    );
+    let full_plan_count = cache.plans.len();
+
+    let second = cache.screen_candidate(&second_frames, &report, options)?;
+
+    assert_eq!(second.status, GateStatus::Pending);
+    assert!(second.needs_full_inference());
+    assert_eq!(cache.plans.len(), full_plan_count);
+    assert_eq!(
+        second
+            .details
+            .get("assessment_scope")
+            .and_then(Value::as_str),
+        Some("cached_partial_models")
+    );
+    assert_eq!(
+        second.details.get("full_inference_deferred"),
+        Some(&Value::Bool(true))
+    );
+    Ok(())
+}
+
+#[test]
+fn cold_candidate_without_a_reusable_header_plan_runs_complete_input_inference() -> TestResult<()> {
+    let fixture = crate::workbench::recovery_executor::record_discovery_tests::
+        build_session_relative_fixture()?;
+    let frames = nested_source_framed_png_frames(&fixture.plaintext)?;
+    let report = report_with_sessions(&[1, 2], &[3, 4]);
+    let options = candidate_options(
+        ArtifactValidationFormat::Png,
+        RecordSchemaProposalLimits::default(),
+        ArtifactValidationPolicy::default(),
+        64 * 1024 * 1024,
+    );
+    let mut cache = SchemaPlanCache::default();
+    let placeholder = Arc::new(SchemaPlan {
+        alternatives: Vec::<SchemaAlternative>::new(),
+        details: Value::Null,
+        has_unassigned_family_messages: false,
+        family_search_complete: true,
+        assessment_scope: SchemaOffsetScope::CompleteInput,
+    });
+    for work_limit in 0..MAX_CACHED_SCHEMA_PLANS {
+        let key = schema_layout_key(
+            &frames,
+            &report,
+            options.parser_format,
+            options.artifact_policy,
+            options.schema_limits,
+            work_limit,
+        )?;
+        cache.plans.insert(key, Arc::clone(&placeholder));
+    }
+    assert_eq!(cache.plans.len(), MAX_CACHED_SCHEMA_PLANS);
+
+    let result = cache.screen_candidate(&frames, &report, options)?;
+
+    assert_eq!(result.status, GateStatus::ArtifactValidated);
+    assert_eq!(result.assessment_scope, SchemaOffsetScope::CompleteInput);
+    assert!(
+        result
+            .details
+            .pointer("/full_inference_fallback/attempted")
+            .and_then(Value::as_bool)
+            .unwrap_or(false)
+    );
+    assert!(cache.header_plans.is_empty());
+    Ok(())
+}
+
+#[test]
+fn deferred_full_inference_can_validate_records_after_a_preserved_header() -> TestResult<()> {
+    let fixture = crate::workbench::recovery_executor::record_discovery_tests::
+        build_session_relative_fixture()?;
+    let mut first_decoy_frames = nested_source_framed_png_frames(&fixture.plaintext)?;
+    let mut second_decoy_frames = nested_source_framed_png_frames(&fixture.plaintext)?;
+    let valid_frames = nested_source_framed_png_frames(&fixture.plaintext)?;
+    replace_transformed_payloads(&mut first_decoy_frames, 0xa5)?;
+    replace_transformed_payloads(&mut second_decoy_frames, 0x5a)?;
+    let report = report_with_sessions(&[1, 2], &[3, 4]);
+    let schema = nested_payload_schema();
+    let parse_reports = valid_frames
+        .iter()
+        .map(|frame| parse_records(&frame.bytes, &schema))
+        .collect::<Result<Vec<_>, _>>()?;
+    let assembly_inputs = valid_frames
+        .iter()
+        .zip(&parse_reports)
+        .map(|(frame, parsed)| RecordAssemblyInput::new(&frame.bytes, parsed))
+        .collect::<Vec<_>>();
+    let assembly = assemble_record_groups_from_inputs(&assembly_inputs, RecordLimits::default())?;
+    assert!(
+        assembly
+            .report()
+            .groups
+            .iter()
+            .any(|group| group.candidate_bytes() == fixture.plaintext)
+    );
+    let options = candidate_options(
+        ArtifactValidationFormat::Png,
+        RecordSchemaProposalLimits::default(),
+        ArtifactValidationPolicy::default(),
+        64 * 1024 * 1024,
+    );
+    let mut cache = SchemaPlanCache::default();
+    let initial = cache.screen_candidate(&first_decoy_frames, &report, options)?;
+    assert_ne!(initial.status, GateStatus::ArtifactValidated);
+    assert_eq!(cache.header_plans.len(), 1);
+    let primary = cache.screen_candidate(&second_decoy_frames, &report, options)?;
+
+    assert_eq!(primary.status, GateStatus::Pending);
+    assert!(primary.needs_full_inference());
+    let fallback = SchemaPlanCache::screen_full_inference(&valid_frames, &report, options)?;
+
+    assert_eq!(
+        fallback.status,
+        GateStatus::ArtifactValidated,
+        "reason={}, exact_matches={}, checked={}",
+        fallback
+            .details
+            .get("reason")
+            .and_then(Value::as_str)
+            .unwrap_or("unknown"),
+        fallback
+            .details
+            .get("exact_artifact_matches")
+            .and_then(Value::as_u64)
+            .unwrap_or_default(),
+        fallback
+            .details
+            .get("schemas_checked")
+            .and_then(Value::as_u64)
+            .unwrap_or_default(),
+    );
+    assert!(!fallback.needs_full_inference());
+    let accepted_schema = fallback
+        .accepted_schema
+        .as_ref()
+        .ok_or("full inference accepted no schema")?;
+    assert!(accepted_schema.schema.sequence.offset >= 3);
+    assert!(accepted_schema.schema.length.offset >= 3);
+    assert!(accepted_schema.schema.data_offset > 3);
+    assert_eq!(
+        fallback.details.get("full_inference_fallback"),
+        Some(&Value::Bool(true))
+    );
+    assert_eq!(
+        fallback
+            .accepted_schema
+            .as_ref()
+            .and_then(|accepted| accepted.artifact_receipt.output_sha256.as_deref()),
+        Some(l2_workbench::sha256(&fixture.plaintext).as_str())
+    );
+    Ok(())
+}
+
 fn assert_cached_header_templates_rebind(
     cache: &SchemaPlanCache,
     frames: &[DecodedFrameOutput],
@@ -257,18 +459,17 @@ fn assert_cached_header_templates_rebind(
         .values()
         .next()
         .ok_or("header-only schema plan was not retained")?;
-    let cached_model = cached_plan
-        .models
-        .first()
-        .ok_or("header-only schema plan has no models")?;
-    for (frame_index, template) in &cached_model.templates {
-        let frame = frames
-            .get(*frame_index)
-            .ok_or("cached header template frame is missing")?;
-        let input = l2_workbench::protocol::RecordInput::new(&frame.bytes);
-        assert!(
-            template.rebind(&input, cached_model.limits).is_ok(),
-            "cached header template {frame_index} should rebind"
+    let inputs = frames
+        .iter()
+        .map(|frame| l2_workbench::protocol::RecordInput::new(&frame.bytes))
+        .collect::<Vec<_>>();
+    let bound = cached_plan.assembly_plan.bind(&inputs)?;
+    assert!(cached_plan.assembly_plan.model_count() > 0);
+    for model_index in 0..cached_plan.assembly_plan.model_count() {
+        assert_eq!(
+            bound.model_status(model_index),
+            Some(l2_workbench::protocol::RecordAssemblyModelStatus::Ready),
+            "cached header model {model_index} should rebind"
         );
     }
     Ok(())
@@ -733,7 +934,73 @@ fn source_record_schema() -> l2_workbench::protocol::RecordSchema {
     }
 }
 
+fn nested_payload_schema() -> RecordSchema {
+    RecordSchema {
+        identifier: l2_workbench::protocol::ByteField {
+            offset: 0,
+            width: 1,
+        },
+        sequence: l2_workbench::protocol::IntegerField {
+            offset: 3,
+            width: 1,
+            byte_order: l2_workbench::protocol::ByteOrder::BigEndian,
+        },
+        length: l2_workbench::protocol::IntegerField {
+            offset: 4,
+            width: 1,
+            byte_order: l2_workbench::protocol::ByteOrder::BigEndian,
+        },
+        data_offset: 5,
+        ..source_record_schema()
+    }
+}
+
 fn source_framed_png_frames(plaintext: &[u8]) -> TestResult<Vec<DecodedFrameOutput>> {
+    build_png_frames(plaintext, 10, source_framed_record)
+}
+
+fn nested_source_framed_png_frames(plaintext: &[u8]) -> TestResult<Vec<DecodedFrameOutput>> {
+    build_png_frames(plaintext, 3, preserved_outer_inner_record)
+}
+
+fn build_png_frames(
+    plaintext: &[u8],
+    preserved_header_end: usize,
+    mut make_frame_bytes: impl FnMut(u16, &[u8]) -> TestResult<Vec<u8>>,
+) -> TestResult<Vec<DecodedFrameOutput>> {
+    let fragments = png_fragments(plaintext)?;
+    let mut frames = Vec::new();
+    frames
+        .try_reserve_exact(fragments.len())
+        .map_err(|source| format!("frame allocation failed: {source}"))?;
+    for (sample_index, (sequence, session, fragment)) in fragments.into_iter().enumerate() {
+        let bytes = make_frame_bytes(sequence, fragment)?;
+        let mut frame = frame_with_identity(
+            u64::try_from(sample_index)?
+                .checked_add(1)
+                .ok_or("sample identity overflowed")?,
+            session,
+            &bytes,
+        );
+        frame.session_order = session;
+        frame.episode_node_id = session;
+        frame.stream_offset = usize::from(sequence);
+        frame.transformed_output_sha256 = l2_workbench::sha256(
+            bytes
+                .get(preserved_header_end..)
+                .ok_or("transformed payload range is missing")?,
+        );
+        frame.preserved_header_end = Some(preserved_header_end);
+        frame.payload_range = ByteRange {
+            start: preserved_header_end,
+            end: bytes.len(),
+        };
+        frames.push(frame);
+    }
+    Ok(frames)
+}
+
+fn png_fragments(plaintext: &[u8]) -> TestResult<Vec<(u16, u64, &[u8])>> {
     let length = plaintext.len();
     let prefix_lengths = [6_usize, 5, 10, 6, 5, 6, 6];
     let mut boundaries = Vec::<usize>::with_capacity(9);
@@ -758,11 +1025,11 @@ fn source_framed_png_frames(plaintext: &[u8]) -> TestResult<Vec<DecodedFrameOutp
         (1, 4),
         (2, 4),
     ];
-    let mut frames = Vec::new();
-    frames
+    let mut fragments = Vec::new();
+    fragments
         .try_reserve_exact(sequence_sessions.len())
-        .map_err(|source| format!("frame allocation failed: {source}"))?;
-    for (sample_index, (sequence, session)) in sequence_sessions.into_iter().enumerate() {
+        .map_err(|source| format!("PNG fragment allocation failed: {source}"))?;
+    for (sequence, session) in sequence_sessions {
         let start = *boundaries
             .get(usize::from(sequence))
             .ok_or("PNG fragment start is missing")?;
@@ -772,26 +1039,46 @@ fn source_framed_png_frames(plaintext: &[u8]) -> TestResult<Vec<DecodedFrameOutp
         let fragment = plaintext
             .get(start..end)
             .ok_or("PNG fragment range is invalid")?;
-        let bytes = source_framed_record(sequence, fragment)?;
-        let mut frame = frame_with_identity(
-            u64::try_from(sample_index)?
-                .checked_add(1)
-                .ok_or("sample identity overflowed")?,
-            session,
-            &bytes,
-        );
-        frame.session_order = session;
-        frame.episode_node_id = session;
-        frame.stream_offset = usize::from(sequence);
-        frame.transformed_output_sha256 = l2_workbench::sha256(fragment);
-        frame.preserved_header_end = Some(10);
-        frame.payload_range = ByteRange {
-            start: 10,
-            end: bytes.len(),
-        };
-        frames.push(frame);
+        fragments.push((sequence, session, fragment));
     }
-    Ok(frames)
+    Ok(fragments)
+}
+
+fn preserved_outer_inner_record(sequence: u16, payload: &[u8]) -> TestResult<Vec<u8>> {
+    let encoded_inner_length = u8::try_from(payload.len())?;
+    let encoded_outer_length = u8::try_from(
+        payload
+            .len()
+            .checked_add(2)
+            .ok_or("outer record length overflowed")?,
+    )?;
+    let total_length = 5_usize
+        .checked_add(payload.len())
+        .ok_or("nested record length overflowed")?;
+    let mut bytes = Vec::with_capacity(total_length);
+    bytes.push(b'I');
+    bytes.push(u8::try_from(7_u16.saturating_sub(sequence))?);
+    bytes.push(encoded_outer_length);
+    bytes.push(u8::try_from(sequence)?);
+    bytes.push(encoded_inner_length);
+    bytes.extend_from_slice(payload);
+    Ok(bytes)
+}
+
+fn replace_transformed_payloads(
+    frames: &mut [DecodedFrameOutput],
+    replacement: u8,
+) -> TestResult<()> {
+    for frame in frames {
+        let payload_start = frame.payload_range.start;
+        let payload = frame
+            .bytes
+            .get_mut(payload_start..)
+            .ok_or("transformed payload range is outside the frame")?;
+        payload.fill(replacement);
+        frame.transformed_output_sha256 = l2_workbench::sha256(payload);
+    }
+    Ok(())
 }
 
 fn source_framed_record(sequence: u16, payload: &[u8]) -> TestResult<Vec<u8>> {
@@ -934,3 +1221,6 @@ fn session(session: u64) -> RelationalSessionId {
         session,
     }
 }
+
+#[path = "record_gate_header_reuse.rs"]
+mod header_model_reuse;

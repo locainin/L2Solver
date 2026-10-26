@@ -1,7 +1,7 @@
 use super::super::{Executor, RecoveryExecutionError};
 use super::application::{CandidateApplication, DecodedFrameContext, decoded_payload_frames};
-use super::record_gate::SchemaCandidateOptions;
 use super::record_gate::SchemaPlanCache;
+use super::record_gate::{GateResult, SchemaCandidateOptions};
 use super::report::{budget_report, insufficient_sessions_report, report_json};
 use super::{
     DecodedFrameOutput, GateAssessment, PreparedRelationalCohort, RelationalDiscoveryContext,
@@ -31,6 +31,17 @@ struct CohortSearchResult {
     outputs: Vec<super::AppliedOutput>,
     decoded_frames: Vec<DecodedFrameOutput>,
     accepted_schemas: Vec<(usize, super::record_gate::AcceptedRecordSchema)>,
+}
+
+#[derive(Clone, Copy)]
+struct FinishEvaluationContext<'ctx, 'samples> {
+    context: &'ctx RelationalDiscoveryContext,
+    samples: &'ctx [RelationalRecordSample<'samples>],
+    search_plan: &'ctx l2_workbench::protocol::RelationalTransformPlan,
+    cohort_work_budget: usize,
+    artifact_validation_policy: ArtifactValidationPolicy,
+    job: Option<&'ctx Job>,
+    gate: &'ctx CandidateGate<'samples>,
 }
 
 pub(super) // Gate checks consume the same frozen outputs used by retained candidates
@@ -101,6 +112,7 @@ impl<'a> CandidateGate<'a> {
                     status,
                     details: serde_json::json!({"reason":"candidate_did_not_require_across_session_gate"}),
                     accepted_schema: None,
+                    assessment_scope: None,
                 },
             });
         }
@@ -124,8 +136,29 @@ impl<'a> CandidateGate<'a> {
                 status: gate.status,
                 details: gate.details,
                 accepted_schema: gate.accepted_schema,
+                assessment_scope: Some(gate.assessment_scope),
             },
         })
+    }
+
+    pub(super) fn screen_full_inference(
+        &self,
+        frames: &[DecodedFrameOutput],
+        report: &l2_workbench::protocol::RelationalTransformReport,
+        parser_format: l2_workbench::artifact::ArtifactValidationFormat,
+        work_limit: usize,
+    ) -> Result<GateResult, RecoveryExecutionError> {
+        SchemaPlanCache::screen_full_inference(
+            frames,
+            report,
+            SchemaCandidateOptions {
+                parser_format,
+                schema_limits: self.schema_limits,
+                artifact_policy: self.artifact_policy,
+                work_limit,
+                job: self.job,
+            },
+        )
     }
 
     fn frames_for_candidate(
@@ -359,25 +392,32 @@ fn evaluate_cohort(
         }
     };
     finish_evaluation(
-        context,
-        samples,
-        search_plan,
-        cohort_work_budget,
-        executor.policy.artifact_validation_policy,
+        FinishEvaluationContext {
+            context,
+            samples,
+            search_plan,
+            cohort_work_budget,
+            artifact_validation_policy: executor.policy.artifact_validation_policy,
+            job,
+            gate: &gate,
+        },
         evaluation,
-        job,
     )
 }
 
 fn finish_evaluation(
-    context: &RelationalDiscoveryContext,
-    samples: &[RelationalRecordSample<'_>],
-    search_plan: &l2_workbench::protocol::RelationalTransformPlan,
-    cohort_work_budget: usize,
-    artifact_validation_policy: ArtifactValidationPolicy,
+    context: FinishEvaluationContext<'_, '_>,
     evaluation: RelationalCandidateEvaluationReport<GateAssessment>,
-    job: Option<&Job>,
 ) -> Result<CohortSearchResult, RecoveryExecutionError> {
+    let FinishEvaluationContext {
+        context,
+        samples,
+        search_plan,
+        cohort_work_budget,
+        artifact_validation_policy,
+        job,
+        gate,
+    } = context;
     let RelationalCandidateEvaluationReport {
         report,
         evaluations,
@@ -392,7 +432,7 @@ fn finish_evaluation(
         &report,
         job,
     )?
-    .apply(&report, evaluations)?;
+    .apply(&report, evaluations, gate)?;
     let report_value = report_json(
         context,
         &report,

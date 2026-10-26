@@ -4,7 +4,7 @@ use super::super::SchemaAlternative;
 use super::super::screen::SchemaObserverOptions;
 use super::super::selection::LearningSelection;
 use super::analysis::{AnalysisRequest, analyze_group};
-use super::{LearningMessages, prepare_schema_limits};
+use super::{LearningMessages, SchemaOffsetScope, prepare_schema_limits};
 use l2_workbench::{
     job::Job,
     protocol::{
@@ -29,6 +29,18 @@ pub(super) struct FamilyAnalysis {
     pub(super) complete: bool,
 }
 
+#[derive(Clone, Copy)]
+pub(super) struct FamilyAnalysisRequest<'a> {
+    pub(super) frames: &'a [DecodedFrameOutput],
+    pub(super) selection: &'a LearningSelection,
+    pub(super) discovery_sessions: &'a BTreeSet<u64>,
+    pub(super) base_limits: RecordSchemaProposalLimits,
+    pub(super) work_limit: usize,
+    pub(super) observer: Option<SchemaObserverOptions<'a>>,
+    pub(super) offset_scope: SchemaOffsetScope,
+    pub(super) job: Option<&'a Job>,
+}
+
 struct FamilyGroup {
     training_ids: BTreeSet<u64>,
     heldout_ids: BTreeSet<u64>,
@@ -37,15 +49,29 @@ struct FamilyGroup {
     label: String,
 }
 
-pub(super) fn build_family_analysis(
-    frames: &[DecodedFrameOutput],
-    selection: &LearningSelection,
-    discovery_sessions: &BTreeSet<u64>,
+struct FamilyGroupContext<'a> {
+    frames: &'a [DecodedFrameOutput],
     base_limits: RecordSchemaProposalLimits,
     work_limit: usize,
-    observer: Option<SchemaObserverOptions<'_>>,
-    job: Option<&Job>,
+    observer: Option<SchemaObserverOptions<'a>>,
+    offset_scope: SchemaOffsetScope,
+    omitted_learning_messages: usize,
+    job: Option<&'a Job>,
+}
+
+pub(super) fn build_family_analysis(
+    request: &FamilyAnalysisRequest<'_>,
 ) -> Result<FamilyAnalysis, RecoveryExecutionError> {
+    let FamilyAnalysisRequest {
+        frames,
+        selection,
+        discovery_sessions,
+        base_limits,
+        work_limit,
+        observer,
+        offset_scope,
+        job,
+    } = *request;
     let messages = family_samples(frames, selection)?;
     let training_ids = training_sample_ids(&messages, discovery_sessions);
     let family_report = match discover_message_families(
@@ -67,15 +93,16 @@ pub(super) fn build_family_analysis(
     } else {
         None
     };
-    let group_analysis = analyze_family_groups(
+    let group_context = FamilyGroupContext {
         frames,
-        &groups,
         base_limits,
         work_limit,
-        family_observer,
-        selection.omitted_messages,
+        observer: family_observer,
+        offset_scope,
+        omitted_learning_messages: selection.omitted_messages,
         job,
-    )?;
+    };
+    let group_analysis = analyze_family_groups(&groups, &group_context)?;
     let has_unassigned_messages = groups_has_unassigned(&family_report);
     let complete =
         selection.omitted_messages == 0 && family_report.complete && group_analysis.complete;
@@ -158,15 +185,13 @@ struct FamilyGroupsAnalysis {
 }
 
 fn analyze_family_groups(
-    frames: &[DecodedFrameOutput],
     groups: &[FamilyGroup],
-    base_limits: RecordSchemaProposalLimits,
-    work_limit: usize,
-    observer: Option<SchemaObserverOptions<'_>>,
-    omitted_learning_messages: usize,
-    job: Option<&Job>,
+    context: &FamilyGroupContext<'_>,
 ) -> Result<FamilyGroupsAnalysis, RecoveryExecutionError> {
-    let per_group_budget = work_limit.checked_div(groups.len().max(1)).unwrap_or(0);
+    let per_group_budget = context
+        .work_limit
+        .checked_div(groups.len().max(1))
+        .unwrap_or(0);
     let mut alternatives = Vec::new();
     let maximum_alternatives = groups.len().saturating_mul(2);
     alternatives
@@ -179,29 +204,21 @@ fn analyze_family_groups(
         .map_err(|source| operational("family schema report allocation failed", source))?;
     let mut complete = true;
     for group in groups {
-        if let Some(job) = job {
+        if let Some(job) = context.job {
             job.check_cancelled()?;
         }
-        let group_analysis = analyze_family_group(
-            frames,
-            group,
-            base_limits,
-            per_group_budget,
-            observer,
-            omitted_learning_messages,
-            job,
-        )?;
+        let group_analysis = analyze_family_group(group, context, per_group_budget)?;
         let next_work = work_bytes
             .checked_add(group_analysis.work_bytes)
             .ok_or_else(|| invalid_policy("family schema work count overflowed"))?;
-        if next_work > work_limit {
+        if next_work > context.work_limit {
             complete = false;
             group_details.push(json!({
                 "label":group.label,
                 "reason":"record_schema_work_limit",
                 "family":group.details,
                 "requested_work_bytes":group_analysis.work_bytes,
-                "remaining_work_bytes":work_limit.saturating_sub(work_bytes),
+                "remaining_work_bytes":context.work_limit.saturating_sub(work_bytes),
             }));
             break;
         }
@@ -226,14 +243,19 @@ struct FamilyGroupResult {
 }
 
 fn analyze_family_group(
-    frames: &[DecodedFrameOutput],
     group: &FamilyGroup,
-    base_limits: RecordSchemaProposalLimits,
+    context: &FamilyGroupContext<'_>,
     work_limit: usize,
-    observer: Option<SchemaObserverOptions<'_>>,
-    omitted_learning_messages: usize,
-    job: Option<&Job>,
 ) -> Result<FamilyGroupResult, RecoveryExecutionError> {
+    let FamilyGroupContext {
+        frames,
+        base_limits,
+        observer,
+        offset_scope,
+        omitted_learning_messages,
+        job,
+        ..
+    } = context;
     let messages = collect_group_messages(frames, group)?;
     let analysis_budget = if observer.is_some() {
         work_limit.checked_div(2).unwrap_or(0)
@@ -241,11 +263,12 @@ fn analyze_family_group(
         work_limit
     };
     let Some(limits) = prepare_schema_limits(
-        base_limits,
+        *base_limits,
         frames,
         messages.training_indices.as_slice(),
         &messages,
         analysis_budget,
+        *offset_scope,
     )?
     else {
         return Ok(FamilyGroupResult {
@@ -272,9 +295,9 @@ fn analyze_family_group(
         work_limit,
         analysis_work_limit: analysis_budget,
         observer_work_limit: work_limit.saturating_sub(analysis_budget),
-        observer,
-        omitted_learning_messages,
-        job,
+        observer: *observer,
+        omitted_learning_messages: *omitted_learning_messages,
+        job: *job,
     };
     let analysis = analyze_group(&request)?;
     Ok(FamilyGroupResult {

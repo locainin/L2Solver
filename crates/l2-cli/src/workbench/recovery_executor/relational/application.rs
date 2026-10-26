@@ -1,4 +1,7 @@
-use super::record_gate::{AcceptedFrameIdentity, AcceptedRecordSchema, GateStatus};
+use super::record_gate::{
+    AcceptedFrameIdentity, AcceptedRecordSchema, GateStatus, SchemaOffsetScope,
+};
+use super::search::CandidateGate;
 use super::{
     AppliedOutput, DecodedFrameOutput, GateAssessment, RelationalDiscoveryContext,
     RetainedRelationalRule, StoredSample, checked_output_sha256, invalid_policy, operational,
@@ -137,6 +140,7 @@ impl<'a> CandidateApplication<'a> {
         mut self,
         report: &RelationalTransformReport,
         evaluations: Vec<RelationalRetainedEvaluation<GateAssessment>>,
+        gate: &CandidateGate<'_>,
     ) -> Result<AppliedCandidates, super::RecoveryExecutionError> {
         if evaluations.len() != report.candidates.len() {
             return Err(RecoveryError::InvariantFailure.into());
@@ -144,7 +148,7 @@ impl<'a> CandidateApplication<'a> {
         for (candidate_index, (candidate, evaluation)) in
             report.candidates.iter().zip(evaluations).enumerate()
         {
-            self.apply_candidate(candidate_index, candidate, evaluation)?;
+            self.apply_candidate(candidate_index, candidate, report, evaluation, gate)?;
         }
         self.retained_rules
             .sort_unstable_by_key(|rule| rule.candidate_index);
@@ -199,7 +203,9 @@ impl<'a> CandidateApplication<'a> {
         &mut self,
         candidate_index: usize,
         candidate: &l2_workbench::protocol::RelationalTransformCandidate,
+        report: &RelationalTransformReport,
         evaluation: RelationalRetainedEvaluation<GateAssessment>,
+        gate: &CandidateGate<'_>,
     ) -> Result<(), super::RecoveryExecutionError> {
         if !matches!(
             candidate.status,
@@ -217,6 +223,7 @@ impl<'a> CandidateApplication<'a> {
             status,
             details,
             accepted_schema,
+            assessment_scope,
         } = evaluation.assessment;
         match candidate.rule.parser_scope {
             RelationalParserScope::EachSession => {
@@ -233,7 +240,10 @@ impl<'a> CandidateApplication<'a> {
                     status,
                     details,
                     accepted_schema,
+                    assessment_scope,
                 },
+                report,
+                gate,
             ),
         }
     }
@@ -391,7 +401,9 @@ impl<'a> CandidateApplication<'a> {
         candidate_index: usize,
         candidate: &l2_workbench::protocol::RelationalTransformCandidate,
         mut candidate_outputs: Vec<RelationalAppliedOutput>,
-        gate_assessment: GateAssessment,
+        mut gate_assessment: GateAssessment,
+        report: &RelationalTransformReport,
+        gate: &CandidateGate<'_>,
     ) -> Result<(), super::RecoveryExecutionError> {
         candidate_outputs.sort_by_key(|output| output.session_order);
         let expected_session_orders = candidate_outputs
@@ -404,16 +416,36 @@ impl<'a> CandidateApplication<'a> {
             &candidate_outputs,
             &expected_session_orders,
         )?;
+        let exact_aggregate_output =
+            self.validate_aggregate(candidate_index, candidate, &candidate_outputs)?;
+        let fallback_required = gate_assessment.needs_full_inference();
+        if exact_aggregate_output.is_some() {
+            gate_assessment.status = GateStatus::ArtifactValidated;
+            gate_assessment.assessment_scope = Some(SchemaOffsetScope::CompleteInput);
+            if fallback_required {
+                gate_assessment.details = json!({
+                    "primary_header_assessment":gate_assessment.details,
+                    "full_inference_fallback":{
+                        "attempted":false,
+                        "reason":"aggregate_artifact_validated",
+                        "work_bytes":0,
+                    }
+                });
+            }
+        } else {
+            self.apply_deferred_full_inference(
+                candidate,
+                &candidate_frames,
+                report,
+                &mut gate_assessment,
+                gate,
+            )?;
+        }
         if let Some(accepted) = &gate_assessment.accepted_schema {
             validate_accepted_record_schema(candidate_index, &candidate_frames, accepted)?;
         }
-        let (mut candidate_status, candidate_priority) =
+        let (candidate_status, candidate_priority) =
             self.initial_candidate_status(&gate_assessment)?;
-        let exact_aggregate_output =
-            self.validate_aggregate(candidate_index, candidate, &candidate_outputs)?;
-        if exact_aggregate_output.is_some() {
-            candidate_status = GateStatus::ArtifactValidated;
-        }
         self.retain_across_session_candidate(AcrossSessionCandidate {
             candidate_index,
             rule: &candidate.rule,
@@ -428,6 +460,55 @@ impl<'a> CandidateApplication<'a> {
             },
             exact_aggregate_output,
         })
+    }
+
+    fn apply_deferred_full_inference(
+        &mut self,
+        candidate: &l2_workbench::protocol::RelationalTransformCandidate,
+        candidate_frames: &[DecodedFrameOutput],
+        report: &RelationalTransformReport,
+        assessment: &mut GateAssessment,
+        gate: &CandidateGate<'_>,
+    ) -> Result<(), super::RecoveryExecutionError> {
+        if !assessment.needs_full_inference() {
+            return Ok(());
+        }
+        let primary_details = assessment.details.clone();
+        if self.replay_work_remaining == 0 {
+            assessment.details = json!({
+                "primary_header_assessment":primary_details,
+                "full_inference_fallback":{
+                    "attempted":false,
+                    "reason":"application_work_limit",
+                    "work_bytes":0,
+                }
+            });
+            return Ok(());
+        }
+        let fallback = gate.screen_full_inference(
+            candidate_frames,
+            report,
+            candidate.rule.parser_format,
+            self.replay_work_remaining,
+        )?;
+        if fallback.work_bytes > self.replay_work_remaining {
+            return Err(invalid_policy(
+                "deferred relational inference exceeded admitted application work",
+            ));
+        }
+        self.replay_work_remaining -= fallback.work_bytes;
+        assessment.status = fallback.status;
+        assessment.accepted_schema = fallback.accepted_schema;
+        assessment.assessment_scope = Some(SchemaOffsetScope::CompleteInput);
+        assessment.details = json!({
+            "primary_header_assessment":primary_details,
+            "full_inference_fallback":{
+                "attempted":true,
+                "work_bytes":fallback.work_bytes,
+                "assessment":fallback.details,
+            }
+        });
+        Ok(())
     }
 
     fn initial_candidate_status(

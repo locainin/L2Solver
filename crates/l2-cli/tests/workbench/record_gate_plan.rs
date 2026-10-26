@@ -1,4 +1,4 @@
-use super::super::prepare_schema_limits;
+use super::super::{SchemaOffsetScope, prepare_schema_limits};
 use super::{AnalysisRequest, LearningMessages, analysis_details};
 use crate::workbench::recovery_executor::relational::DecodedFrameOutput;
 use crate::workbench::recovery_executor::relational::record_gate::GateStatus;
@@ -84,6 +84,7 @@ fn training_boundary_at_offset_sixteen_is_admitted_without_using_another_frame()
         &[0],
         &messages,
         64 * 1024,
+        SchemaOffsetScope::PreservedHeader,
     )?
     .ok_or("the input budget should permit analysis")?;
 
@@ -115,6 +116,7 @@ fn empty_preserved_prefix_does_not_cap_inferred_fields_at_zero() -> TestResult {
         &[0],
         &messages,
         64 * 1024,
+        SchemaOffsetScope::PreservedHeader,
     )?
     .ok_or("the input budget should permit analysis")?;
 
@@ -148,6 +150,7 @@ fn parser_limits_cover_full_eligible_frames_after_sampled_learning() -> TestResu
         &[0],
         &messages,
         64 * 1024,
+        SchemaOffsetScope::PreservedHeader,
     )?
     .ok_or("the sampled search budget should permit analysis")?;
 
@@ -158,6 +161,41 @@ fn parser_limits_cover_full_eligible_frames_after_sampled_learning() -> TestResu
     assert_eq!(
         limits.discovery.record_limits.max_output_bytes,
         eligible_bytes
+    );
+    Ok(())
+}
+
+#[test]
+fn full_input_scope_keeps_candidate_fields_after_the_preserved_prefix() -> TestResult {
+    let frames = [frame(1, Some(10))];
+    let messages = LearningMessages {
+        training: vec![frames[0].bytes.as_slice()],
+        heldout: Vec::new(),
+        training_indices: vec![0],
+        heldout_indices: Vec::new(),
+        all_training_indices: vec![0],
+        all_heldout_indices: Vec::new(),
+        training_data_offsets: vec![10],
+        learning_bytes: frames[0].bytes.len(),
+        analysis_input_bytes: frames[0].bytes.len(),
+        eligible_input_bytes: frames[0].bytes.len(),
+        full_input_bytes: frames[0].bytes.len(),
+        training_session_count: 1,
+    };
+
+    let limits = prepare_schema_limits(
+        RecordSchemaProposalLimits::default(),
+        &frames,
+        &[0],
+        &messages,
+        64 * 1024,
+        SchemaOffsetScope::CompleteInput,
+    )?
+    .ok_or("the input budget should permit analysis")?;
+
+    assert_eq!(
+        limits.max_field_offset,
+        RecordSchemaProposalLimits::default().max_field_offset
     );
     Ok(())
 }

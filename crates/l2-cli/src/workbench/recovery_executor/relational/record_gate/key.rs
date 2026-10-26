@@ -87,9 +87,6 @@ struct FrameHeaderKey {
     expected_session_orders: Vec<u64>,
     stream_offset: usize,
     frame_length: usize,
-    payload_start: usize,
-    preserved_header_end: usize,
-    preserved_header: Vec<u8>,
     parser_format: u8,
 }
 
@@ -165,7 +162,8 @@ pub(super) fn schema_header_key(
     if frames.is_empty() {
         return Ok(None);
     }
-    let Some(size) = header_key_size(frames, report, maximum_retained_bytes)? else {
+    // A cache hit selects partial models; binding still checks the current bytes and lengths
+    let Some(retained_bytes) = header_key_size(frames, report, maximum_retained_bytes) else {
         return Ok(None);
     };
 
@@ -187,52 +185,21 @@ pub(super) fn schema_header_key(
         validation_format: parser_format,
         validation_policy: artifact_policy,
         schema_limits,
-        retained_bytes: size.retained_bytes,
+        retained_bytes,
     }))
-}
-
-struct HeaderKeySize {
-    retained_bytes: usize,
 }
 
 fn header_key_size(
     frames: &[DecodedFrameOutput],
     report: &RelationalTransformReport,
     maximum_retained_bytes: usize,
-) -> Result<Option<HeaderKeySize>, RecoveryExecutionError> {
-    let mut header_bytes = 0_usize;
-    for frame in frames {
-        let Some(prefix_end) = frame.preserved_header_end else {
-            return Ok(None);
-        };
-        if prefix_end == 0 || frame.bytes.get(..prefix_end).is_none() {
-            return Ok(None);
-        }
-        if frame
-            .bytes
-            .get(frame.payload_range.start..frame.payload_range.end)
-            .is_none()
-            || frame.payload_range.end != frame.bytes.len()
-        {
-            return Err(invalid_policy(
-                "record gate transformed payload range is outside frame",
-            ));
-        }
-        header_bytes = header_bytes
-            .checked_add(prefix_end)
-            .ok_or_else(|| invalid_policy("record gate header key size overflowed"))?;
-        if header_bytes > maximum_retained_bytes {
-            return Ok(None);
-        }
-    }
-
+) -> Option<usize> {
     let session_bytes = report
         .discovery_sessions
         .len()
         .saturating_add(report.heldout_sessions.len())
         .saturating_mul(std::mem::size_of::<u64>());
     let mut retained_bytes = std::mem::size_of::<SchemaHeaderKey>()
-        .saturating_add(header_bytes)
         .saturating_add(
             frames
                 .len()
@@ -250,29 +217,16 @@ fn header_key_size(
                     .saturating_mul(std::mem::size_of::<u64>()),
             );
         if retained_bytes > maximum_retained_bytes {
-            return Ok(None);
+            return None;
         }
     }
     if retained_bytes > maximum_retained_bytes {
-        return Ok(None);
+        return None;
     }
-    Ok(Some(HeaderKeySize { retained_bytes }))
+    Some(retained_bytes)
 }
 
 fn frame_header_key(frame: &DecodedFrameOutput) -> Result<FrameHeaderKey, RecoveryExecutionError> {
-    let prefix_end = frame
-        .preserved_header_end
-        .ok_or_else(|| invalid_policy("record gate header key lost its prefix"))?;
-    let mut preserved_header = Vec::new();
-    preserved_header
-        .try_reserve_exact(prefix_end)
-        .map_err(|source| operational("record gate header bytes allocation failed", source))?;
-    preserved_header.extend_from_slice(
-        frame
-            .bytes
-            .get(..prefix_end)
-            .ok_or_else(|| invalid_policy("record gate preserved header is outside frame"))?,
-    );
     Ok(FrameHeaderKey {
         input_node_id: frame.input_node_id,
         seed_sample: frame.seed_sample,
@@ -289,9 +243,6 @@ fn frame_header_key(frame: &DecodedFrameOutput) -> Result<FrameHeaderKey, Recove
         expected_session_orders: try_copy_slice(&frame.expected_session_orders)?,
         stream_offset: frame.stream_offset,
         frame_length: frame.bytes.len(),
-        payload_start: frame.payload_range.start,
-        preserved_header_end: prefix_end,
-        preserved_header,
         parser_format: validation_format_key(frame.parser_format),
     })
 }

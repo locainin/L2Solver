@@ -6,6 +6,7 @@ mod plan;
 mod screen;
 mod selection;
 
+pub(super) use plan::SchemaOffsetScope;
 pub(super) use screen::{AcceptedFrameIdentity, AcceptedRecordSchema};
 
 #[cfg(test)]
@@ -23,7 +24,7 @@ mod screening_tests;
 use self::{
     header::HeaderSchemaPlan,
     key::{SchemaHeaderKey, SchemaLayoutKey, schema_header_key, schema_layout_key},
-    plan::{build_schema_plan, build_schema_plan_with_inputs},
+    plan::{build_full_schema_plan, build_schema_plan, build_schema_plan_with_inputs},
     screen::{screen_with_header_plan, screen_with_schema_plan},
 };
 use super::super::RecoveryExecutionError;
@@ -32,8 +33,8 @@ use l2_workbench::{
     artifact::{ArtifactValidationFormat, ArtifactValidationPolicy},
     job::{Counter, Job, Phase},
     protocol::{
-        RecordInput, RecordSchemaDiscoveryReport, RecordSchemaProposalLimits,
-        RelationalTransformReport,
+        RecordAssemblyHeaderModel, RecordAssemblyPlan, RecordInput, RecordSchemaDiscoveryReport,
+        RecordSchemaProposalLimits, RelationalTransformReport,
     },
 };
 use serde_json::Value;
@@ -75,6 +76,14 @@ pub(super) struct GateResult {
     pub(super) work_bytes: usize,
     pub(super) details: Value,
     pub(super) accepted_schema: Option<screen::AcceptedRecordSchema>,
+    pub(super) assessment_scope: SchemaOffsetScope,
+}
+
+impl GateResult {
+    pub(super) const fn needs_full_inference(&self) -> bool {
+        matches!(self.assessment_scope, SchemaOffsetScope::PreservedHeader)
+            && !matches!(self.status, GateStatus::ArtifactValidated)
+    }
 }
 
 #[derive(Default)]
@@ -89,6 +98,7 @@ pub(super) struct SchemaPlan {
     pub(super) details: Value,
     pub(super) has_unassigned_family_messages: bool,
     pub(super) family_search_complete: bool,
+    pub(super) assessment_scope: SchemaOffsetScope,
 }
 
 #[derive(Clone, Copy)]
@@ -148,12 +158,13 @@ impl SchemaPlanCache {
         )?;
         // Reuse plans only when their complete cache keys match
         if let Some(plan) = self.plans.get(&key) {
-            return screen_plan(frames, options, plan, true);
+            let primary = screen_plan(frames, options, plan, true)?;
+            return self.finish_primary_plan(frames, report, options, primary, header_key.as_ref());
         }
         if let Some(header_key) = header_key.as_ref()
             && let Some(plan) = self.header_plans.get(header_key)
         {
-            return screen_header_cache_hit(frames, report, options, plan);
+            return screen_header_cache_hit(frames, options, plan);
         }
 
         let plan = self.build_and_cache_plan(frames, report, options, key, header_key.as_ref())?;
@@ -161,7 +172,7 @@ impl SchemaPlanCache {
         if let Some(details) = result.details.as_object_mut() {
             add_header_cache_miss_details(details, header_key.as_ref(), self);
         }
-        Ok(result)
+        self.finish_primary_plan(frames, report, options, result, header_key.as_ref())
     }
 
     fn build_and_cache_plan(
@@ -186,8 +197,25 @@ impl SchemaPlanCache {
                 options.job,
             )?
         };
+        let header_cache_has_slot = header_key.is_some()
+            && self.plans.len().saturating_add(self.header_plans.len()) < MAX_CACHED_SCHEMA_PLANS;
+        let header_plan_maximum = if header_cache_has_slot {
+            header_plan_model_budget(
+                options
+                    .schema_limits
+                    .discovery
+                    .record_limits
+                    .max_report_bytes
+                    .min(MAX_CACHED_HEADER_PLAN_BYTES),
+                self.header_plan_bytes,
+                header_key.map_or(0, SchemaHeaderKey::retained_bytes),
+            )
+        } else {
+            0
+        };
+        let header_plan = take_header_plan(&mut built_plan, header_plan_maximum)?;
         if let Some(header_key) = header_key
-            && let Some(header_plan) = take_header_plan(&mut built_plan)
+            && let Some(header_plan) = header_plan
         {
             self.cache_header_plan(
                 header_key.clone(),
@@ -210,13 +238,82 @@ impl SchemaPlanCache {
         Ok(plan)
     }
 
+    fn finish_primary_plan(
+        &self,
+        frames: &[DecodedFrameOutput],
+        report: &RelationalTransformReport,
+        options: SchemaCandidateOptions<'_>,
+        primary: GateResult,
+        header_key: Option<&SchemaHeaderKey>,
+    ) -> Result<GateResult, RecoveryExecutionError> {
+        if !primary.needs_full_inference() {
+            return Ok(primary);
+        }
+        let reusable_header_plan =
+            header_key.is_some_and(|key| self.header_plans.contains_key(key));
+        if reusable_header_plan {
+            return Ok(deferred_header_result(
+                primary,
+                "reusable_header_plan",
+                "cached_partial_models",
+            ));
+        }
+
+        let remaining_work = options.work_limit.saturating_sub(primary.work_bytes);
+        if remaining_work == 0 {
+            return Ok(deferred_header_result(
+                primary,
+                "application_work_reserve",
+                SchemaOffsetScope::PreservedHeader.as_str(),
+            ));
+        }
+
+        let primary_work = primary.work_bytes;
+        let mut fallback_options = options;
+        fallback_options.work_limit = remaining_work;
+        let fallback = Self::screen_full_inference(frames, report, fallback_options)?;
+        if fallback.work_bytes > remaining_work {
+            return Err(invalid_policy(
+                "cold complete-input inference exceeded its admitted work",
+            ));
+        }
+        let total_work = primary_work
+            .checked_add(fallback.work_bytes)
+            .ok_or_else(|| invalid_policy("cold complete-input work count overflowed"))?;
+        if total_work > options.work_limit {
+            return Err(invalid_policy(
+                "cold complete-input inference exceeded its work limit",
+            ));
+        }
+        Ok(GateResult {
+            status: fallback.status,
+            work_bytes: total_work,
+            details: serde_json::json!({
+                "assessment_scope":SchemaOffsetScope::CompleteInput.as_str(),
+                "schema_plan_cache_hit":false,
+                "header_schema_plan_cache_hit":false,
+                "primary_header_assessment":primary.details,
+                "full_inference_deferred":false,
+                "full_inference_fallback":{
+                    "attempted":true,
+                    "work_bytes":fallback.work_bytes,
+                    "assessment":fallback.details,
+                },
+                "work_bytes":total_work,
+                "work_limit":options.work_limit,
+            }),
+            accepted_schema: fallback.accepted_schema,
+            assessment_scope: SchemaOffsetScope::CompleteInput,
+        })
+    }
+
     fn cache_header_plan(
         &mut self,
         key: SchemaHeaderKey,
         plan: HeaderSchemaPlan,
         maximum_bytes: usize,
     ) -> Result<(), RecoveryExecutionError> {
-        if plan.models.is_empty()
+        if plan.assembly_plan.model_count() == 0
             || self.plans.len().saturating_add(self.header_plans.len()) >= MAX_CACHED_SCHEMA_PLANS
             || self.header_plans.contains_key(&key)
         {
@@ -239,6 +336,52 @@ impl SchemaPlanCache {
         self.header_plan_bytes = total_bytes;
         Ok(())
     }
+
+    /// Run complete schema inference after a cached header-only probe found no artifact
+    pub(super) fn screen_full_inference(
+        frames: &[DecodedFrameOutput],
+        report: &RelationalTransformReport,
+        options: SchemaCandidateOptions<'_>,
+    ) -> Result<GateResult, RecoveryExecutionError> {
+        let plan = build_full_schema_plan(
+            frames,
+            report,
+            options.schema_limits,
+            options.work_limit,
+            options.parser_format,
+            options.artifact_policy,
+            options.job,
+        )?;
+        let mut result = screen_with_schema_plan(
+            frames,
+            options.parser_format,
+            options.artifact_policy,
+            options.work_limit,
+            options.job,
+            &plan,
+            false,
+        )?;
+        result.assessment_scope = SchemaOffsetScope::CompleteInput;
+        if let Some(details) = result.details.as_object_mut() {
+            details.insert("full_inference_fallback".to_owned(), Value::Bool(true));
+            details.insert(
+                "full_inference_fallback_work_bytes".to_owned(),
+                Value::from(result.work_bytes),
+            );
+        }
+        Ok(result)
+    }
+}
+
+const fn header_plan_model_budget(
+    maximum_bytes: usize,
+    cached_bytes: usize,
+    key_bytes: usize,
+) -> usize {
+    maximum_bytes
+        .saturating_sub(cached_bytes)
+        .saturating_sub(key_bytes)
+        .saturating_sub(std::mem::size_of::<HeaderSchemaPlan>())
 }
 
 fn screen_plan(
@@ -270,12 +413,34 @@ fn add_header_cache_miss_details(
     );
     details.insert(
         "header_schema_models_retained".to_owned(),
-        Value::from(retained_plan.map_or(0, |plan| plan.models.len())),
+        Value::from(retained_plan.map_or(0, |plan| plan.assembly_plan.model_count())),
     );
     details.insert(
         "header_schema_plan_retained_bytes".to_owned(),
         Value::from(retained_plan.map_or(0, |plan| plan.retained_bytes)),
     );
+}
+
+fn deferred_header_result(
+    mut primary: GateResult,
+    reason: &'static str,
+    assessment_scope: &'static str,
+) -> GateResult {
+    let work_bytes = primary.work_bytes;
+    primary.details = serde_json::json!({
+        "assessment_scope":assessment_scope,
+        "primary_header_assessment":primary.details,
+        "full_inference_deferred":true,
+        "full_inference_fallback":{
+            "attempted":false,
+            "reason":reason,
+            "work_bytes":0,
+        },
+        "full_inference_fallback_work_bytes":0,
+        "work_bytes":work_bytes,
+    });
+    primary.assessment_scope = SchemaOffsetScope::PreservedHeader;
+    primary
 }
 
 fn record_inputs(
@@ -291,11 +456,10 @@ fn record_inputs(
 
 fn screen_header_cache_hit(
     frames: &[DecodedFrameOutput],
-    report: &RelationalTransformReport,
     options: SchemaCandidateOptions<'_>,
     header_plan: &HeaderSchemaPlan,
 ) -> Result<GateResult, RecoveryExecutionError> {
-    let header_result = screen_with_header_plan(
+    screen_with_header_plan(
         frames,
         options.parser_format,
         options.artifact_policy,
@@ -303,79 +467,58 @@ fn screen_header_cache_hit(
         options.work_limit,
         options.job,
         header_plan,
-    )?;
-    if header_result.status == GateStatus::ArtifactValidated
-        || header_result.work_bytes >= options.work_limit
-    {
-        return Ok(header_result);
-    }
-
-    let remaining_work = options.work_limit.saturating_sub(header_result.work_bytes);
-    let fallback_plan = Arc::new(build_schema_plan(
-        frames,
-        report,
-        options.schema_limits,
-        remaining_work,
-        options.parser_format,
-        options.artifact_policy,
-        options.job,
-    )?);
-    let mut result = screen_with_schema_plan(
-        frames,
-        options.parser_format,
-        options.artifact_policy,
-        remaining_work,
-        options.job,
-        &fallback_plan,
-        false,
-    )?;
-    result.work_bytes = result.work_bytes.saturating_add(header_result.work_bytes);
-    if let Value::Object(details) = &mut result.details {
-        let checked_models = header_result
-            .details
-            .get("header_schema_models_checked")
-            .and_then(Value::as_u64)
-            .map_or_else(|| Value::from(0), Value::from);
-        let replay_details = header_result.details;
-        details.insert("header_schema_plan_cache_hit".to_owned(), Value::Bool(true));
-        details.insert(
-            "header_schema_models".to_owned(),
-            Value::from(header_plan.models.len()),
-        );
-        details.insert(
-            "header_schema_models_omitted".to_owned(),
-            Value::from(header_plan.omitted_models),
-        );
-        details.insert("header_schema_models_checked".to_owned(), checked_models);
-        details.insert(
-            "header_schema_work_bytes".to_owned(),
-            Value::from(header_result.work_bytes),
-        );
-        details.insert("header_schema_replay".to_owned(), replay_details);
-        details.insert("work_bytes".to_owned(), Value::from(result.work_bytes));
-    }
-    Ok(result)
+    )
 }
 
-fn take_header_plan(plan: &mut SchemaPlan) -> Option<HeaderSchemaPlan> {
-    let alternative = plan.alternatives.iter_mut().find(|alternative| {
+fn take_header_plan(
+    plan: &mut SchemaPlan,
+    maximum_retained_bytes: usize,
+) -> Result<Option<HeaderSchemaPlan>, RecoveryExecutionError> {
+    let Some(alternative) = plan.alternatives.iter_mut().find(|alternative| {
         alternative.label.ends_with(":fixed_layout") && alternative.frame_indices.is_none()
-    })?;
-    let observed = alternative.observed.as_mut()?;
+    }) else {
+        return Ok(None);
+    };
+    let Some(observed) = alternative.observed.as_mut() else {
+        return Ok(None);
+    };
+    if maximum_retained_bytes == 0 {
+        drop(std::mem::take(&mut observed.header_models));
+        return Ok(None);
+    }
     if observed.header_models.is_empty() {
-        return None;
+        return Ok(None);
     }
     let models = std::mem::take(&mut observed.header_models);
-    let retained_bytes = models.iter().fold(
-        std::mem::size_of::<HeaderSchemaPlan>()
-            .saturating_add(std::mem::size_of_val(models.as_slice())),
-        |total, model| total.saturating_add(model.retained_bytes),
-    );
-    Some(HeaderSchemaPlan {
-        models,
+    let mut compiled_models = Vec::new();
+    compiled_models
+        .try_reserve_exact(models.len())
+        .map_err(|source| operational("record gate compiled model allocation failed", source))?;
+    for model in models {
+        compiled_models.push(RecordAssemblyHeaderModel::new(
+            model.schema,
+            model.limits,
+            model.templates,
+        ));
+    }
+    let assembly_plan =
+        match RecordAssemblyPlan::compile_header_models(compiled_models, maximum_retained_bytes) {
+            Ok(plan) => plan,
+            Err(l2_workbench::protocol::RecordError::PlanTooLarge { .. }) => return Ok(None),
+            Err(source) => {
+                return Err(operational(
+                    "record gate header plan compilation failed",
+                    source,
+                ));
+            }
+        };
+    let retained_bytes =
+        std::mem::size_of::<HeaderSchemaPlan>().saturating_add(assembly_plan.retained_bytes());
+    Ok(Some(HeaderSchemaPlan {
+        assembly_plan,
         retained_bytes,
         omitted_models: observed.header_models_omitted,
-    })
+    }))
 }
 
 pub(super) fn record_job_work(
@@ -402,5 +545,6 @@ const fn result(status: GateStatus, work_bytes: usize, details: Value) -> GateRe
         work_bytes,
         details,
         accepted_schema: None,
+        assessment_scope: SchemaOffsetScope::CompleteInput,
     }
 }
