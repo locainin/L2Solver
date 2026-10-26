@@ -78,12 +78,14 @@ fn write_summary_status(output: &mut File, summary: &Summary<'_>) -> io::Result<
 fn write_evidence_status(output: &mut File, evidence: EvidenceCoverage) -> io::Result<()> {
     writeln!(
         output,
-        "Evidence sidecar: {}; {} Cases retained ({} encoded bytes), {} omitted ({} encoded bytes), {} byte aggregate budget",
+        "Evidence sidecar: {}; {} Cases retained ({} compressed bytes; {} logical JSONL bytes), {} omitted ({} compressed bytes; {} logical JSONL bytes), {} byte aggregate storage budget",
         evidence::SIDECAR_FILE_NAME,
         evidence.retained_cases,
         evidence.retained_bytes,
+        evidence.raw_retained_bytes,
         evidence.omitted_cases,
         evidence.omitted_bytes,
+        evidence.raw_omitted_bytes,
         evidence.budget_bytes
     )
 }

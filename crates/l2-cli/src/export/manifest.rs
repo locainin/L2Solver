@@ -55,7 +55,7 @@ pub(super) fn write_manifest(
     serde_json::to_writer(&mut output, &summary.discovery)?;
     output.write_all(b",\"evidence\":{\"file\":")?;
     serde_json::to_writer(&mut output, evidence::SIDECAR_FILE_NAME)?;
-    output.write_all(b",\"coverage\":")?;
+    output.write_all(b",\"encoding\":\"gzip\",\"coverage\":")?;
     serde_json::to_writer(&mut output, &summary.evidence)?;
     output.write_all(b"}")?;
     output.write_all(b",\"artifacts\":[")?;

@@ -2,7 +2,7 @@ use l2_workbench::reconstruction::Limits;
 use std::{
     error::Error,
     fs,
-    io::{Cursor, Write},
+    io::{Cursor, Read, Write},
     path::{Path, PathBuf},
     process::{Command, Output, Stdio},
 };
@@ -261,7 +261,7 @@ fn published_export_contains_one_evidence_sidecar_without_artifact_payloads()
     assert_eq!(
         entries
             .iter()
-            .filter(|entry| entry.file_name() == "evidence.jsonl")
+            .filter(|entry| entry.file_name() == "evidence.jsonl.gz")
             .count(),
         1,
         "publication must expose exactly one evidence sidecar"
@@ -273,7 +273,9 @@ fn published_export_contains_one_evidence_sidecar_without_artifact_payloads()
             .starts_with(".l2solver-evidence-case-")
     }));
 
-    let evidence = fs::read(destination.join("evidence.jsonl"))?;
+    let compressed = fs::read(destination.join("evidence.jsonl.gz"))?;
+    let mut evidence = Vec::new();
+    flate2::read::MultiGzDecoder::new(compressed.as_slice()).read_to_end(&mut evidence)?;
     assert!(!evidence.is_empty());
     assert!(!evidence.windows(BODY.len()).any(|window| window == BODY));
     let body_base64 = base64::Engine::encode(&base64::engine::general_purpose::STANDARD, BODY);
@@ -284,14 +286,26 @@ fn published_export_contains_one_evidence_sidecar_without_artifact_payloads()
         manifest
             .pointer("/evidence/file")
             .and_then(serde_json::Value::as_str),
-        Some("evidence.jsonl")
+        Some("evidence.jsonl.gz")
     );
     let coverage = manifest
         .pointer("/evidence/coverage")
         .ok_or("evidence coverage is missing from the manifest")?;
     assert_eq!(coverage["selected_cases"], coverage["retained_cases"]);
     assert_eq!(coverage["omitted_cases"], 0);
-    let evidence_records = fs::read_to_string(destination.join("evidence.jsonl"))?
+    assert_eq!(coverage["retained_bytes"], u64::try_from(compressed.len())?);
+    assert_eq!(
+        coverage["raw_retained_bytes"],
+        u64::try_from(evidence.len())?
+    );
+    assert_eq!(coverage["encoding_version"], 2);
+    assert_eq!(
+        manifest
+            .pointer("/evidence/encoding")
+            .and_then(serde_json::Value::as_str),
+        Some("gzip")
+    );
+    let evidence_records = String::from_utf8(evidence)?
         .lines()
         .map(serde_json::from_str::<serde_json::Value>)
         .collect::<Result<Vec<_>, _>>()?;
@@ -319,7 +333,7 @@ fn published_export_contains_one_evidence_sidecar_without_artifact_payloads()
         }
     }
     let summary = fs::read_to_string(destination.join("summary.txt"))?;
-    assert!(summary.contains("Evidence sidecar: evidence.jsonl"));
+    assert!(summary.contains("Evidence sidecar: evidence.jsonl.gz"));
     assert!(summary.contains("Cases retained ("));
     Ok(())
 }
@@ -2020,6 +2034,7 @@ fn is_report(path: &Path) -> bool {
             || name == "limitations.txt"
             || name == "manifest.json"
             || name == "evidence.jsonl"
+            || name == "evidence.jsonl.gz"
     })
 }
 

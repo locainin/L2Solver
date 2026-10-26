@@ -850,6 +850,7 @@ dependencies = [
  "clap_complete",
  "crc32fast",
  "ctrlc",
+ "flate2",
  "indicatif",
  "l2-audit",
  "l2-canary",

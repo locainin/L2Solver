@@ -24,6 +24,7 @@ pub(super) fn identity(
         source: SourceIdentity::Fast(fingerprint),
         settings: json!({
             "native_case_version": crate::workbench::full_source::NATIVE_CASE_VERSION,
+            "evidence_encoding_version": super::evidence::ENCODING_VERSION,
             "profile": options.recovery.profile,
             "memory_limit": options.recovery.memory_limit,
             "require_tshark": options.require_tshark,

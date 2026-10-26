@@ -391,8 +391,12 @@ fn record_case_evidence(
     }
     let coverage = evidence.coverage();
     let message = format!(
-        "Case {} was omitted from evidence.jsonl as one complete record ({} encoded bytes); aggregate evidence budget is {} bytes",
-        result.case_id, result.encoded_bytes, coverage.budget_bytes
+        "Case {} was omitted from {} as one complete record ({} compressed bytes; {} logical JSONL bytes); aggregate evidence storage budget is {} bytes",
+        result.case_id,
+        super::evidence::SIDECAR_FILE_NAME,
+        result.compressed_bytes,
+        result.encoded_bytes,
+        coverage.budget_bytes
     );
     match origin {
         CaseLimitationOrigin::Flow(flow_id) => limitations.push(Some(flow_id), message)?,
