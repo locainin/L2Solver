@@ -1,8 +1,10 @@
-use super::record_gate::SchemaCandidateOptions;
-use super::{
-    GateStatus, SchemaPlanCache, StoredSample, evaluate_candidate_before_retention,
-    should_retain_rule,
+use super::StoredSample;
+use super::application::{
+    DecodedFrameContext, decoded_payload_frames, should_retain_rule,
+    validate_accepted_record_schema,
 };
+use super::record_gate::{GateStatus, SchemaCandidateOptions, SchemaPlanCache};
+use super::search::CandidateGate;
 use l2_workbench::{
     artifact::{ArtifactValidationFormat, ArtifactValidationPolicy},
     derivation::{CounterByteOrder, CounterWidth, SeedCounterOrder},
@@ -75,10 +77,17 @@ fn evaluator_cache_does_not_reuse_a_plan_for_changed_transformed_bytes() -> Test
             stream_offset: 0,
         })
         .collect::<Vec<_>>();
-    let mut cache = SchemaPlanCache::default();
+    let mut gate = CandidateGate::new(
+        &samples,
+        &stored_samples,
+        false,
+        RecordSchemaProposalLimits::default(),
+        ArtifactValidationPolicy::default(),
+        None,
+    );
 
     let (first_candidate, first_outputs) = candidate_with_outputs(b"alpha", &sessions);
-    let first = evaluate_candidate_before_retention(
+    let first = gate.evaluate(
         &context,
         &first_candidate,
         first_outputs
@@ -87,13 +96,6 @@ fn evaluator_cache_does_not_reuse_a_plan_for_changed_transformed_bytes() -> Test
         first_outputs
             .get(2..)
             .ok_or("first held-out output partition is missing")?,
-        &samples,
-        &stored_samples,
-        false,
-        &mut cache,
-        RecordSchemaProposalLimits::default(),
-        ArtifactValidationPolicy::default(),
-        None,
     )?;
     assert_eq!(
         first.assessment.details.get("schema_plan_cache_hit"),
@@ -101,7 +103,7 @@ fn evaluator_cache_does_not_reuse_a_plan_for_changed_transformed_bytes() -> Test
     );
 
     let (second_candidate, second_outputs) = candidate_with_outputs(b"bravo", &sessions);
-    let second = evaluate_candidate_before_retention(
+    let second = gate.evaluate(
         &context,
         &second_candidate,
         second_outputs
@@ -110,13 +112,6 @@ fn evaluator_cache_does_not_reuse_a_plan_for_changed_transformed_bytes() -> Test
         second_outputs
             .get(2..)
             .ok_or("second held-out output partition is missing")?,
-        &samples,
-        &stored_samples,
-        false,
-        &mut cache,
-        RecordSchemaProposalLimits::default(),
-        ArtifactValidationPolicy::default(),
-        None,
     )?;
 
     assert_eq!(
@@ -232,18 +227,21 @@ fn replay_frozen_frames(
         .iter()
         .map(|output| output.session_order)
         .collect::<Vec<_>>();
+    let frame_context = DecodedFrameContext {
+        samples,
+        stored_samples,
+        candidate_index: 0,
+        expected_session_orders: &session_orders,
+        raw_directional_run: false,
+    };
     let mut frames = Vec::new();
     for output in &outputs {
         let output_sha = sha256(&output.bytes);
-        frames.extend(super::decoded_payload_frames(
-            samples,
-            stored_samples,
+        frames.extend(decoded_payload_frames(
+            &frame_context,
             output,
             rule,
-            0,
             &output_sha,
-            &session_orders,
-            false,
         )?);
     }
     assert_eq!(frames.len(), 8);
@@ -365,7 +363,7 @@ fn assert_accepted_schema_uses_byte_identity(
         frame.candidate_index = 7;
     }
     assert!(
-        super::validate_accepted_record_schema(7, frames, accepted).is_ok(),
+        validate_accepted_record_schema(7, frames, accepted).is_ok(),
         "the exact accepted bytes remain valid when the retained candidate index changes"
     );
     let original_bytes = frames
@@ -378,7 +376,7 @@ fn assert_accepted_schema_uses_byte_identity(
         .and_then(|frame| frame.bytes.first_mut())
         .ok_or("accepted schema frame is empty")? ^= 1;
     assert!(
-        super::validate_accepted_record_schema(7, frames, accepted).is_err(),
+        validate_accepted_record_schema(7, frames, accepted).is_err(),
         "changed decoded bytes must invalidate the accepted schema identity"
     );
     frames
