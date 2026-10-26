@@ -14,14 +14,17 @@ use l2_workbench::{
     store::{Flow, FlowCohortCoverage, IngestReceipt, Store},
 };
 use serde::Serialize;
-use std::{error::Error, io};
+use std::{error::Error, io, path::Path};
 
 #[cfg(test)]
 use l2_workbench::store::Options;
-#[cfg(test)]
-use std::path::Path;
 
 const FLOW_PAGE_SIZE: usize = 256;
+
+/// Return the bounded basename associated with the current capture request
+pub(crate) fn source_label(path: &Path) -> &str {
+    label(path, "capture")
+}
 
 /// Counters from a successful source read through clean EOF, separate from flow analysis
 /// coverage

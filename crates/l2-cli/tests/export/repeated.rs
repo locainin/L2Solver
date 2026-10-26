@@ -94,6 +94,132 @@ fn warm_cached_extraction_matches_cold_and_uncached_outputs() -> Result<(), Box<
 }
 
 #[test]
+fn moved_and_copied_capture_cache_reuse_matches_uncached_origins() -> Result<(), Box<dyn Error>> {
+    let temporary = tempfile::tempdir()?;
+    let root = temporary.path();
+    let original = root.join("original.pcap");
+    let moved = root.join("moved.pcap");
+    let copied = root.join("copied.pcap");
+    let later_copy = root.join("later-copy.pcap");
+    let cold_destination = root.join("cold");
+    let moved_destination = root.join("moved");
+    let moved_uncached_destination = root.join("moved-uncached");
+    let warm_destination = root.join("warm");
+    let uncached_destination = root.join("uncached");
+    let later_destination = root.join("later");
+    let later_uncached_destination = root.join("later-uncached");
+    fs::write(&original, capture_with_http_body(BODY)?)?;
+    let cold = extraction_command(root, &original, &cold_destination).output()?;
+    fs::rename(&original, &moved)?;
+    fs::copy(&moved, &copied)?;
+    fs::copy(&moved, &later_copy)?;
+
+    let moved_warm = extraction_command(root, &moved, &moved_destination).output()?;
+    let moved_uncached = extraction_command(root, &moved, &moved_uncached_destination)
+        .arg("--no-cache")
+        .output()?;
+    let warm = extraction_command(root, &copied, &warm_destination).output()?;
+    let uncached = extraction_command(root, &copied, &uncached_destination)
+        .arg("--no-cache")
+        .output()?;
+    let later = extraction_command(root, &later_copy, &later_destination).output()?;
+    let later_uncached = extraction_command(root, &later_copy, &later_uncached_destination)
+        .arg("--no-cache")
+        .output()?;
+
+    for result in [
+        &cold,
+        &moved_warm,
+        &moved_uncached,
+        &warm,
+        &uncached,
+        &later,
+        &later_uncached,
+    ] {
+        assert_eq!(
+            result.status.code(),
+            Some(0),
+            "extract failed: {}\n{}",
+            String::from_utf8_lossy(&result.stdout),
+            String::from_utf8_lossy(&result.stderr)
+        );
+    }
+
+    assert_current_source_label(&moved_destination, "moved.pcap")?;
+    assert_current_source_label(&warm_destination, "copied.pcap")?;
+    assert_current_source_label(&later_destination, "later-copy.pcap")?;
+    assert_export_outputs_match(&moved_destination, &moved_uncached_destination)?;
+    assert_export_outputs_match(&warm_destination, &uncached_destination)?;
+    assert_export_outputs_match(&later_destination, &later_uncached_destination)?;
+    assert_eq!(
+        artifact_contents(&cold_destination)?,
+        artifact_contents(&moved_destination)?
+    );
+    assert_eq!(
+        artifact_contents(&cold_destination)?,
+        artifact_contents(&warm_destination)?
+    );
+    assert_eq!(
+        artifact_contents(&cold_destination)?,
+        artifact_contents(&later_destination)?
+    );
+    let cold_counters = result_counters(&cold_destination)?;
+    for destination in [&moved_destination, &warm_destination, &later_destination] {
+        let counters = result_counters(destination)?;
+        assert!(
+            counters.cache_hits > cold_counters.cache_hits,
+            "copied capture did not reuse cached work"
+        );
+        assert!(
+            counters.candidates_examined < cold_counters.candidates_examined,
+            "copied capture repeated completed recovery work"
+        );
+    }
+    Ok(())
+}
+
+fn assert_current_source_label(
+    directory: &Path,
+    expected_label: &str,
+) -> Result<(), Box<dyn Error>> {
+    for record in evidence_records(directory)? {
+        let sources = case_sources(&record)?;
+        let current_sources = sources
+            .iter()
+            .filter(|source| {
+                source.get("label").and_then(serde_json::Value::as_str) == Some(expected_label)
+            })
+            .collect::<Vec<_>>();
+        let labels = sources
+            .iter()
+            .filter_map(|source| source.get("label").and_then(serde_json::Value::as_str))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            current_sources.len(),
+            1,
+            "expected source label {expected_label:?}, observed labels {labels:?}"
+        );
+        let current_source = current_sources
+            .first()
+            .ok_or("current evidence source disappeared")?;
+        let aliases = current_source
+            .get("aliases")
+            .and_then(serde_json::Value::as_array)
+            .ok_or("evidence source is missing its aliases")?;
+        assert!(aliases.is_empty(), "source retained a prior request label");
+    }
+    Ok(())
+}
+
+fn case_sources(record: &serde_json::Value) -> Result<&[serde_json::Value], Box<dyn Error>> {
+    record
+        .get("sources")
+        .and_then(serde_json::Value::as_array)
+        .map(Vec::as_slice)
+        .ok_or_else(|| "evidence Case is missing its sources".into())
+}
+
+#[test]
 fn unrelated_destination_is_rejected_before_reading_a_capture() -> Result<(), Box<dyn Error>> {
     let temporary = tempfile::tempdir()?;
     let root = temporary.path();
@@ -209,6 +335,14 @@ fn evidence_jsonl(directory: &Path) -> Result<Vec<u8>, Box<dyn Error>> {
     let mut bytes = Vec::new();
     decoder.read_to_end(&mut bytes)?;
     Ok(bytes)
+}
+
+fn evidence_records(directory: &Path) -> Result<Vec<serde_json::Value>, Box<dyn Error>> {
+    String::from_utf8(evidence_jsonl(directory)?)?
+        .lines()
+        .map(serde_json::from_str)
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(Into::into)
 }
 
 fn optional_file(path: PathBuf) -> Result<Option<Vec<u8>>, Box<dyn Error>> {

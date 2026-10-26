@@ -457,6 +457,35 @@ impl Case {
         Ok(id)
     }
 
+    /// Bind one source to the basename used by the current request
+    ///
+    /// Prior aliases are cleared while content identity and source ranges remain unchanged
+    ///
+    /// # Errors
+    /// Returns an error when the source identity or basename is invalid or the source is absent
+    pub fn rebind_source_label(
+        &mut self,
+        source_id: &str,
+        label: &str,
+    ) -> Result<(), EvidenceError> {
+        validate_content_id(source_id)?;
+        validate_label(label)?;
+        let index = self
+            .source_index
+            .get(source_id)
+            .copied()
+            .ok_or(EvidenceError::MissingReference { kind: "source" })?;
+        let source = self
+            .sources
+            .get_mut(index)
+            .ok_or(EvidenceError::SourceMetadataConflict)?;
+        if source.label != label {
+            label.clone_into(&mut source.label);
+        }
+        source.aliases.clear();
+        Ok(())
+    }
+
     /// Add one observation with checked source, blob, and detail references
     ///
     /// # Errors

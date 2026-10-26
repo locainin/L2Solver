@@ -169,8 +169,14 @@ fn collect_flow_cases(
     worker_count: usize,
 ) -> Result<workbench::full_source::FullSourceCoverage, Box<dyn Error>> {
     let native_cache = context.cache.filter(|_| !context.options.no_cache);
+    let source_id = indexed.receipt.source_id.as_str();
+    let source_label = workbench::full_source::source_label(&options.capture);
     let mut batch = Vec::with_capacity(worker_count);
-    let mut collect_case = |case| collect_recovered_case(case, collection);
+    let mut collect_case = |mut case: RecoveredCase| {
+        // Bind the request's basename after cached recovery and before evidence identity is written
+        bind_current_source_label(&mut case.item, source_id, source_label)?;
+        collect_recovered_case(case, collection)
+    };
     let analysis = workbench::full_source::analyze_indexed_source_with_context(
         &indexed.store,
         &indexed.receipt,
@@ -208,6 +214,20 @@ fn collect_flow_cases(
     })?;
     add_source_limitations(&mut collection.limitations, &coverage.source)?;
     Ok(coverage)
+}
+
+fn bind_current_source_label(
+    item: &mut workbench::full_source::FullSourceItem,
+    source_id: &str,
+    source_label: &str,
+) -> Result<(), Box<dyn Error>> {
+    let case = match item {
+        workbench::full_source::FullSourceItem::Flow(analysis) => &mut analysis.result.case,
+        workbench::full_source::FullSourceItem::FlowPage(page) => &mut page.result.case,
+        workbench::full_source::FullSourceItem::Cohort(cohort) => &mut cohort.result.case,
+    };
+    case.rebind_source_label(source_id, source_label)?;
+    Ok(())
 }
 
 fn collect_recovered_case(
