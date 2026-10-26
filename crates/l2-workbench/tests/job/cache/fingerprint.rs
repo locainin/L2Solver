@@ -29,8 +29,7 @@ fn whole_file_fingerprints_cross_the_read_buffer_boundary_without_changing_diges
 }
 
 #[test]
-fn larger_file_fingerprints_keep_the_existing_three_range_identity()
--> Result<(), Box<dyn Error>> {
+fn larger_file_fingerprints_keep_the_existing_three_range_identity() -> Result<(), Box<dyn Error>> {
     let temporary = tempfile::tempdir()?;
     let source = temporary.path().join("source.bin");
     for (size, ranges) in [
@@ -54,7 +53,8 @@ fn larger_file_fingerprints_keep_the_existing_three_range_identity()
         for (start, end) in ranges {
             expected_input.extend_from_slice(&u64::try_from(start)?.to_be_bytes());
             expected_input.extend_from_slice(&65_536_u64.to_be_bytes());
-            expected_input.extend_from_slice(bytes.get(start..end).ok_or("invalid sample fixture")?);
+            expected_input
+                .extend_from_slice(bytes.get(start..end).ok_or("invalid sample fixture")?);
         }
         assert_eq!(
             fingerprint.sample_sha256,
