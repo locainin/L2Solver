@@ -36,10 +36,11 @@ fn manifest_input_uses_only_listed_artifacts_and_ignores_sidecars() -> Result<()
 
     let input_set = prepare_input_set(directory.path())?;
     let sources = read_sources(&input_set, 1024, 1024, &l2_workbench::job::Job::new("test"))?;
+    let source = sources.first().ok_or("listed source is missing")?;
 
     assert_eq!(sources.len(), 1);
-    assert_eq!(sources[0].label, "object.bin");
-    assert_eq!(sources[0].bytes, artifact);
+    assert_eq!(source.label, "object.bin");
+    assert_eq!(source.bytes, artifact);
     Ok(())
 }
 
@@ -129,8 +130,10 @@ fn result_directory_keeps_original_and_writes_manifest_and_summary() -> Result<(
     let output_dir = directory.path().join("result.refined");
     let png = structural_png()?;
     fs::write(&input, &png)?;
-    let mut recovery = RecoveryOptions::default();
-    recovery.no_cache = true;
+    let recovery = RecoveryOptions {
+        no_cache: true,
+        ..RecoveryOptions::default()
+    };
     let options = RefineOptions {
         input,
         output: Some(output_dir.clone()),
@@ -143,20 +146,24 @@ fn result_directory_keeps_original_and_writes_manifest_and_summary() -> Result<(
     assert!(run(&options, &mut output)?);
     let manifest_bytes = fs::read(output_dir.join("manifest.json"))?;
     let manifest: serde_json::Value = serde_json::from_slice(&manifest_bytes)?;
-    let first_file = manifest["artifacts"][0]["file"]
-        .as_str()
-        .ok_or("manifest artifact name is missing")?;
+    let artifact = manifest_entry(&manifest, "artifacts", 0)?;
+    let first_file = string_field(artifact, "file")?;
 
     assert_eq!(fs::read(output_dir.join(first_file))?, png);
     assert!(output_dir.join("summary.txt").is_file());
     assert_eq!(
-        manifest["artifacts"][0]["sha256"],
+        string_field(artifact, "sha256")?,
         l2_workbench::sha256(&png)
     );
-    assert_eq!(
-        manifest["artifacts"][0]["origins"][0]["origin"]["kind"],
-        "source"
-    );
+    let origin_kind = artifact
+        .get("origins")
+        .and_then(serde_json::Value::as_array)
+        .and_then(|origins| origins.first())
+        .and_then(|origin| origin.get("origin"))
+        .and_then(|origin| origin.get("kind"))
+        .and_then(serde_json::Value::as_str)
+        .ok_or("manifest artifact origin kind is missing")?;
+    assert_eq!(origin_kind, "source");
     Ok(())
 }
 
@@ -167,8 +174,10 @@ fn unsupported_file_is_preserved_and_marked_incomplete() -> Result<(), Box<dyn E
     let output_dir = directory.path().join("unknown.refined");
     let bytes = b"arbitrary bytes without supported structure";
     fs::write(&input, bytes)?;
-    let mut recovery = RecoveryOptions::default();
-    recovery.no_cache = true;
+    let recovery = RecoveryOptions {
+        no_cache: true,
+        ..RecoveryOptions::default()
+    };
     let options = RefineOptions {
         input,
         output: Some(output_dir.clone()),
@@ -181,13 +190,18 @@ fn unsupported_file_is_preserved_and_marked_incomplete() -> Result<(), Box<dyn E
     assert!(!run(&options, &mut output)?);
     let manifest: serde_json::Value =
         serde_json::from_slice(&fs::read(output_dir.join("manifest.json"))?)?;
-    let artifact_file = manifest["artifacts"][0]["file"]
-        .as_str()
-        .ok_or("source artifact file name is missing")?;
+    let artifact = manifest_entry(&manifest, "artifacts", 0)?;
+    let artifact_file = string_field(artifact, "file")?;
 
     assert_eq!(fs::read(output_dir.join(artifact_file))?, bytes);
-    assert_eq!(manifest["complete"], false);
-    assert_eq!(manifest["sources"][0]["status"], "unsupported");
+    assert_eq!(
+        manifest
+            .get("complete")
+            .and_then(serde_json::Value::as_bool),
+        Some(false)
+    );
+    let source = manifest_entry(&manifest, "sources", 0)?;
+    assert_eq!(string_field(source, "status")?, "unsupported");
     Ok(())
 }
 
@@ -230,7 +244,14 @@ fn per_input_cache_reuses_the_complete_analysis_and_restores_artifact_bytes()
     let snapshot = job.snapshot()?;
 
     assert_eq!(first, second);
-    assert_eq!(second.artifacts[0].bytes, bytes);
+    assert_eq!(
+        second
+            .artifacts
+            .first()
+            .ok_or("cached artifact bytes are missing")?
+            .bytes,
+        bytes
+    );
     assert_eq!(
         snapshot
             .counters
@@ -305,8 +326,10 @@ fn matching_result_directory_is_reused_before_artifact_analysis() -> Result<(), 
     let output_dir = directory.path().join("result.refined");
     let png = structural_png()?;
     fs::write(&input, &png)?;
-    let mut recovery = RecoveryOptions::default();
-    recovery.no_cache = true;
+    let recovery = RecoveryOptions {
+        no_cache: true,
+        ..RecoveryOptions::default()
+    };
     let options = RefineOptions {
         input,
         output: Some(output_dir),
@@ -345,8 +368,10 @@ fn strict_reuse_rejects_mutated_artifact_bytes() -> Result<(), Box<dyn Error>> {
     let output_dir = directory.path().join("result.refined");
     let png = structural_png()?;
     fs::write(&input, &png)?;
-    let mut recovery = RecoveryOptions::default();
-    recovery.no_cache = true;
+    let recovery = RecoveryOptions {
+        no_cache: true,
+        ..RecoveryOptions::default()
+    };
     let mut options = RefineOptions {
         input,
         output: Some(output_dir.clone()),
@@ -359,9 +384,8 @@ fn strict_reuse_rejects_mutated_artifact_bytes() -> Result<(), Box<dyn Error>> {
 
     let manifest: serde_json::Value =
         serde_json::from_slice(&fs::read(output_dir.join("manifest.json"))?)?;
-    let artifact_file = manifest["artifacts"][0]["file"]
-        .as_str()
-        .ok_or("manifest artifact name is missing")?;
+    let artifact = manifest_entry(&manifest, "artifacts", 0)?;
+    let artifact_file = string_field(artifact, "file")?;
     let artifact_path = output_dir.join(artifact_file);
     let mut mutated = fs::read(&artifact_path)?;
     let first_byte = mutated.first_mut().ok_or("artifact is empty")?;
@@ -388,9 +412,11 @@ fn quiet_mode_suppresses_fresh_and_reused_completion_messages() -> Result<(), Bo
     let input = directory.path().join("source.bin");
     let output_dir = directory.path().join("result.refined");
     fs::write(&input, structural_png()?)?;
-    let mut recovery = RecoveryOptions::default();
-    recovery.no_cache = true;
-    recovery.quiet = true;
+    let recovery = RecoveryOptions {
+        no_cache: true,
+        quiet: true,
+        ..RecoveryOptions::default()
+    };
     let options = RefineOptions {
         input,
         output: Some(output_dir),
@@ -474,8 +500,10 @@ fn refresh_replaces_only_the_owned_result_with_current_source_bytes() -> Result<
     let first_png = structural_png()?;
     let second_source = b"changed but unsupported source";
     fs::write(&input, &first_png)?;
-    let mut recovery = RecoveryOptions::default();
-    recovery.no_cache = true;
+    let recovery = RecoveryOptions {
+        no_cache: true,
+        ..RecoveryOptions::default()
+    };
     let mut options = RefineOptions {
         input,
         output: Some(output_dir.clone()),
@@ -495,11 +523,17 @@ fn refresh_replaces_only_the_owned_result_with_current_source_bytes() -> Result<
     assert!(!run(&options, &mut refreshed_output)?);
     let manifest: serde_json::Value =
         serde_json::from_slice(&fs::read(output_dir.join("manifest.json"))?)?;
+    let source = manifest_entry(&manifest, "sources", 0)?;
     assert_eq!(
-        manifest["sources"][0]["sha256"],
+        string_field(source, "sha256")?,
         l2_workbench::sha256(second_source)
     );
-    assert_eq!(manifest["complete"], false);
+    assert_eq!(
+        manifest
+            .get("complete")
+            .and_then(serde_json::Value::as_bool),
+        Some(false)
+    );
     Ok(())
 }
 
@@ -532,4 +566,23 @@ fn append_png_chunk(
     bytes.extend_from_slice(payload);
     bytes.extend_from_slice(&crc32fast::hash(&[kind.as_slice(), payload].concat()).to_be_bytes());
     Ok(())
+}
+
+fn manifest_entry<'a>(
+    manifest: &'a serde_json::Value,
+    array_name: &str,
+    index: usize,
+) -> Result<&'a serde_json::Value, Box<dyn Error>> {
+    manifest
+        .get(array_name)
+        .and_then(serde_json::Value::as_array)
+        .and_then(|entries| entries.get(index))
+        .ok_or_else(|| format!("manifest {array_name} entry {index} is missing").into())
+}
+
+fn string_field<'a>(value: &'a serde_json::Value, field: &str) -> Result<&'a str, Box<dyn Error>> {
+    value
+        .get(field)
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| format!("manifest field {field} is missing or not a string").into())
 }
