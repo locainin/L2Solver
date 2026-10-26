@@ -13,6 +13,8 @@ use l2_workbench::{
 };
 use libfuzzer_sys::fuzz_target;
 
+#[path = "../../crates/l2-workbench/tests/protocol/assembly_plan_fuzz.rs"]
+mod assembly_plan_fuzz;
 #[path = "workbench/extensions.rs"]
 mod extensions;
 #[path = "workbench/observation.rs"]
@@ -35,6 +37,11 @@ fuzz_target!(|data: &[u8]| {
     exercise_reconstruction(input);
     extensions::exercise(input);
     observation::exercise(input);
+    let assembly_plan_result = assembly_plan_fuzz::exercise(input);
+    assert!(
+        assembly_plan_result.is_ok(),
+        "bounded assembly-plan property failed for input {input:?}: {assembly_plan_result:?}"
+    );
     recovery::exercise(input);
     stream_messages::exercise(input);
 });

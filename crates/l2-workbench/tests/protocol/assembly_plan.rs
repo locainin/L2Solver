@@ -5,6 +5,9 @@ use l2_workbench::protocol::{
 };
 use std::error::Error;
 
+#[path = "assembly_plan_fuzz.rs"]
+mod bounded_fuzz;
+
 const fn schema(identifier_offset: usize, sequence_offset: usize) -> RecordSchema {
     RecordSchema {
         records_offset: 0,
@@ -45,16 +48,6 @@ fn header_templates(
 ) -> Result<Vec<(usize, HeaderParseTemplate)>, Box<dyn Error>> {
     let input_indices = (0..frames.len()).collect::<Vec<_>>();
     header_templates_for_indices(frames, &input_indices, schema, limits, 5)
-}
-
-fn header_templates_with_end(
-    frames: &[Vec<u8>],
-    schema: &RecordSchema,
-    limits: RecordLimits,
-    preserved_header_end: usize,
-) -> Result<Vec<(usize, HeaderParseTemplate)>, Box<dyn Error>> {
-    let input_indices = (0..frames.len()).collect::<Vec<_>>();
-    header_templates_for_indices(frames, &input_indices, schema, limits, preserved_header_end)
 }
 
 fn header_templates_for_indices(
@@ -245,22 +238,31 @@ fn compiled_header_plan_rejects_changed_header_and_input_length() -> Result<(), 
 #[test]
 fn a_changed_byte_only_rejects_models_that_preserved_that_byte() -> Result<(), Box<dyn Error>> {
     let limits = RecordLimits::default();
-    let original_frames = vec![frame(0, 0, b'x'), frame(1, 0, b'y')];
+    let original_frames = [frame(0, 0, b'x'), frame(0, 0, b'y')];
     let short_model = header_model(&original_frames, schema(0, 1), limits)?;
+    let reversed_frames = [original_frames[1].clone(), original_frames[0].clone()];
+    let reversed_input_indices = [1, 0];
     let long_model = RecordAssemblyHeaderModel::new(
         schema(0, 1),
         limits,
-        header_templates_with_end(&original_frames, &schema(0, 1), limits, 6)?,
+        header_templates_for_indices(
+            &reversed_frames,
+            &reversed_input_indices,
+            &schema(0, 1),
+            limits,
+            6,
+        )?,
     );
     let plan =
         RecordAssemblyPlan::compile_header_models(vec![short_model, long_model], usize::MAX)?;
+    assert_eq!(plan.layout_count(), 2);
 
-    let changed_frames = [frame(0, 0, b'n'), frame(1, 0, b'w')];
+    let changed_frames = [frame(0, 0, b'n'), frame(0, 0, b'w')];
     let inputs = changed_frames
         .iter()
         .map(|bytes| RecordInput::new(bytes))
         .collect::<Vec<_>>();
-    let bound = plan.bind(&inputs)?;
+    let mut bound = plan.bind(&inputs)?;
 
     assert_eq!(
         bound.model_status(0),
@@ -268,13 +270,19 @@ fn a_changed_byte_only_rejects_models_that_preserved_that_byte() -> Result<(), B
     );
     assert_eq!(
         bound.model_status(1),
-        Some(RecordAssemblyModelStatus::PreservedHeaderMismatch { input_index: 0 })
+        Some(RecordAssemblyModelStatus::PreservedHeaderMismatch { input_index: 1 })
     );
     assert_eq!(bound.model_group_count(0), Some(1));
     assert_eq!(bound.model_group_count(1), None);
+    assert_eq!(bound.layout_id(1, 0), None);
     assert_eq!(bound.stats().shared_input_checks, 2);
     assert_eq!(bound.stats().model_input_checks, 3);
     assert_eq!(bound.stats().layout_membership_checks, 1);
+    let ready_layout = bound
+        .layout_id(0, 0)
+        .ok_or("ready model layout is missing while another model is rejected")?;
+    assert_eq!(bound.layout_output_length(ready_layout), Some(2));
+    assert_eq!(bound.materialize(ready_layout)?.bytes(), b"nw");
     Ok(())
 }
 
@@ -549,4 +557,25 @@ fn plan_construction_stops_before_large_diagnostics_exceeding_remaining_allowanc
         "failure occurred after final plan accounting"
     );
     Ok(())
+}
+
+#[test]
+fn bounded_generated_inputs_preserve_compiled_plan_semantics() {
+    let empty: [u8; 0] = [];
+    let zeros = [0; 64];
+    let high_bytes = [u8::MAX; 64];
+    let ascending = (0_u8..64).collect::<Vec<_>>();
+
+    for input in [
+        empty.as_slice(),
+        zeros.as_slice(),
+        high_bytes.as_slice(),
+        ascending.as_slice(),
+    ] {
+        assert_eq!(
+            bounded_fuzz::exercise(input),
+            Ok(()),
+            "bounded property failed for input {input:?}"
+        );
+    }
 }
