@@ -11,4 +11,5 @@ mod record_discovery;
 mod record_proposal;
 mod records;
 mod relational;
+mod relational_anchored;
 mod stream;

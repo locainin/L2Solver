@@ -138,20 +138,32 @@ pub enum RelationalCounterReset {
     PerRecord,
 }
 
+/// Coordinate system used for a relational message locator
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RelationalCoordinateBasis {
+    /// Offsets are measured from the start of the matched message
+    MessageStartV1,
+    /// Payload offsets are measured from the end of the matched fixed seed range
+    SeedRangeEndV1,
+}
+
 /// Marker and byte range learned independently from each session's messages
 #[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize)]
 pub struct RelationalByteRangeLocator {
+    /// Coordinate system used by the marker, value, and declared-length offsets
+    pub coordinate_basis: RelationalCoordinateBasis,
     /// Direction of messages selected by the marker
     pub direction: crate::protocol::Direction,
-    /// Offset of the stable marker in each selected message
+    /// Offset of the stable marker in the selected coordinate system
     pub marker_offset: usize,
     /// Marker bytes observed during discovery and checked again on held-out sessions
     pub marker: Vec<u8>,
-    /// Start of the located value or payload, relative to the message start
+    /// Start of the located value or payload in the selected coordinate system
     pub value_offset: usize,
     /// Fixed seed length; `None` means payload bytes extend through each message end
     pub value_length: Option<usize>,
-    /// Optional integer field immediately before the located seed, frozen from discovery
+    /// Optional integer field checked at its offset in the selected coordinate system
     pub declared_length: Option<RelationalLengthField>,
 }
 
@@ -430,6 +442,13 @@ pub enum RelationalFalsification {
         /// Decoded field value; absent when the selected message did not contain the field
         observed: Option<u64>,
     },
+    /// The selected payload range disagreed with its declared-length field
+    PayloadLengthMismatch {
+        /// Located payload length frozen from discovery
+        expected: usize,
+        /// Decoded field value; absent when the selected message did not contain the field
+        observed: Option<u64>,
+    },
     /// A selected payload message had no bytes after its located offset
     EmptyPayloadRange,
     /// The canonical transform rejected the supplied parameters or bytes
@@ -558,6 +577,19 @@ pub struct RelationalTransformReport {
     pub candidate_limit_remaining: usize,
     /// Number of seed and payload locators generated before their independent bounds
     pub locator_candidates_examined: usize,
+    /// Number of anchored candidate configurations considered for prefix ordering
+    pub prefix_probe_hypotheses_examined: usize,
+    /// Number of distinct canonical prefix transforms evaluated for candidate ordering
+    pub prefix_probes_examined: usize,
+    /// Number of parameter hypotheses reusing an equivalent prefix score
+    pub prefix_probe_cache_reuses: usize,
+    /// Number of distinct prefix probes finding repeated bytes absent at the same input ranges
+    pub prefix_probe_candidates_with_novelty: usize,
+    /// Canonical transform and observation work charged to prefix probes
+    pub prefix_probe_work_bytes: usize,
+    /// Whether every admitted seed-relative hypothesis received a complete ordering probe
+    /// This diagnostic does not determine whether full candidate search was exhaustive
+    pub prefix_probe_complete: bool,
     /// Remaining seed-plus-payload locator allowance
     pub locator_candidate_limit_remaining: usize,
     /// Canonical derivation work charged across discovery and held-out checks

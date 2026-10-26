@@ -1,7 +1,7 @@
 use super::{
     super::model::{
-        RelationalByteRangeLocator, RelationalLengthField, RelationalRecordSample,
-        RelationalTransformError, RelationalTransformLimits, Selector,
+        RelationalByteRangeLocator, RelationalCoordinateBasis, RelationalLengthField,
+        RelationalRecordSample, RelationalTransformError, RelationalTransformLimits, Selector,
     },
     input::{SelectorIndex, SessionGroup},
 };
@@ -14,6 +14,23 @@ pub(super) struct LocatorCandidate {
     varying_bytes: usize,
     ends_at_message_boundary: bool,
     pub(super) locator: RelationalByteRangeLocator,
+    pub(super) anchor_seed_index: Option<usize>,
+}
+
+impl LocatorCandidate {
+    pub(super) const fn anchored_payload(
+        seed_index: usize,
+        selector: Selector,
+        locator: RelationalByteRangeLocator,
+    ) -> Self {
+        Self {
+            selector,
+            varying_bytes: 0,
+            ends_at_message_boundary: false,
+            locator,
+            anchor_seed_index: Some(seed_index),
+        }
+    }
 }
 
 #[derive(Clone, Copy, Eq, Ord, PartialEq, PartialOrd)]
@@ -114,6 +131,7 @@ fn compare_locator_candidates(
     ranking
         .then_with(|| left.locator.cmp(&right.locator))
         .then_with(|| left.selector.cmp(&right.selector))
+        .then_with(|| left.anchor_seed_index.cmp(&right.anchor_seed_index))
 }
 
 fn compare_seed_locators(left: &LocatorCandidate, right: &LocatorCandidate) -> Ordering {
@@ -348,6 +366,7 @@ fn add_seed_locator_candidates(
         return Ok(());
     }
     let locator = RelationalByteRangeLocator {
+        coordinate_basis: RelationalCoordinateBasis::MessageStartV1,
         direction: selector.direction,
         marker_offset: selector.marker_offset,
         marker: selector.marker.clone(),
@@ -419,6 +438,7 @@ fn push_seed_locator_candidate(
         varying_bytes,
         ends_at_message_boundary,
         locator: locator.clone(),
+        anchor_seed_index: None,
     })
 }
 
@@ -428,9 +448,9 @@ pub(super) fn payload_locators(
     indexes: &[SelectorIndex],
     selectors: &[Selector],
     limits: RelationalTransformLimits,
+    maximum_candidates: usize,
 ) -> Result<(Vec<LocatorCandidate>, bool), RelationalTransformError> {
-    let mut candidates =
-        BoundedLocatorCandidates::new(LocatorRanking::Payload, limits.max_locator_candidates);
+    let mut candidates = BoundedLocatorCandidates::new(LocatorRanking::Payload, maximum_candidates);
     for selector in selectors {
         let Some(minimum_length) =
             minimum_selected_message_length(samples, indexes, selector, groups.len(), false)
@@ -442,6 +462,7 @@ pub(super) fn payload_locators(
             .min(limits.max_locator_offset);
         for value_offset in 0..=last_payload_offset {
             let locator = RelationalByteRangeLocator {
+                coordinate_basis: RelationalCoordinateBasis::MessageStartV1,
                 direction: selector.direction,
                 marker_offset: selector.marker_offset,
                 marker: selector.marker.clone(),
@@ -471,6 +492,7 @@ pub(super) fn payload_locators(
                     varying_bytes: 0,
                     ends_at_message_boundary: false,
                     locator,
+                    anchor_seed_index: None,
                 })?;
             }
         }

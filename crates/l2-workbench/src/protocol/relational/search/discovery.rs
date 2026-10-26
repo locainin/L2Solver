@@ -7,7 +7,9 @@ use super::super::model::{
     RelationalTransformEvaluationOptions, RelationalTransformLimits, RelationalTransformPlan,
     RelationalTransformReport, RelationalTransformRule, RelationalTransformStatus, Selector,
 };
+use super::probe::{maximum_full_candidate_work, score_candidate_prefix};
 use super::{
+    anchor::{AnchoredPayloadSearch, anchored_payload_locators},
     input::{
         SessionGroup, build_selector_indexes, group_sessions, shared_selectors, validate_plan,
     },
@@ -18,10 +20,15 @@ use super::{
     replay::{EvaluatedSplit, candidate_status, empty_fit, evaluate_split},
 };
 use crate::{
+    derivation::{CounterByteOrder, CounterWidth, SeedCounterOrder},
     job::{Counter, Job, Phase},
     protocol::{HoldoutBasis, RelationalSessionId},
 };
-use std::{cmp::Reverse, collections::BinaryHeap, convert::Infallible};
+use std::{
+    cmp::Reverse,
+    collections::{BTreeSet, BinaryHeap, HashMap},
+    convert::Infallible,
+};
 
 struct SearchState<T> {
     candidates: Vec<RetainedCandidate<T>>,
@@ -34,6 +41,12 @@ struct SearchState<T> {
     search_limit: Option<RelationalSearchLimit>,
     search_limits: Vec<RelationalSearchLimit>,
     locator_candidates_examined: usize,
+    prefix_probe_hypotheses_examined: usize,
+    prefix_probes_examined: usize,
+    prefix_probe_cache_reuses: usize,
+    prefix_probe_candidates_with_novelty: usize,
+    prefix_probe_work_bytes: usize,
+    prefix_probe_complete: bool,
     output_bytes_retained: usize,
     output_capture_omissions: usize,
 }
@@ -74,6 +87,105 @@ struct CandidateParameters {
     operation: RelationalSha256CounterXor,
     counter_reset: RelationalCounterReset,
     parser_format: crate::artifact::ArtifactValidationFormat,
+}
+
+fn candidate_parameters(
+    plan: &RelationalTransformPlan,
+) -> Result<Vec<CandidateParameters>, RelationalTransformError> {
+    let mut parameters = Vec::new();
+    'widths: for counter_width in &plan.counter_widths {
+        for initial_counter in &plan.initial_counters {
+            if *initial_counter > counter_width.maximum_counter() {
+                continue;
+            }
+            for (order_index, counter_byte_order) in plan.counter_byte_orders.iter().enumerate() {
+                // A one-byte counter has no byte order; keep only its first spelling
+                if *counter_width == crate::derivation::CounterWidth::OneByte && order_index > 0 {
+                    continue;
+                }
+                for seed_order in &plan.seed_orders {
+                    for counter_reset in &plan.counter_resets {
+                        for parser_format in &plan.parser_formats {
+                            if parameters.len() == plan.limits.max_candidates {
+                                break 'widths;
+                            }
+                            parameters
+                                .try_reserve(1)
+                                .map_err(|_| RelationalTransformError::AllocationFailed)?;
+                            parameters.push(CandidateParameters {
+                                operation: RelationalSha256CounterXor {
+                                    initial_counter: *initial_counter,
+                                    counter_width: *counter_width,
+                                    counter_byte_order: *counter_byte_order,
+                                    seed_order: *seed_order,
+                                },
+                                counter_reset: *counter_reset,
+                                parser_format: *parser_format,
+                            });
+                        }
+                    }
+                }
+            }
+        }
+    }
+    if parameters.is_empty() {
+        return Err(RelationalTransformError::InvalidPlan(
+            "relational candidate parameter domain is empty",
+        ));
+    }
+    Ok(parameters)
+}
+
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+struct CandidateId {
+    seed: usize,
+    payload: usize,
+    parameter: usize,
+}
+
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+struct PrefixProbeKey {
+    seed_index: usize,
+    payload_index: usize,
+    initial_counter: u64,
+    counter_width_bytes: u8,
+    counter_byte_order: u8,
+    seed_order: u8,
+}
+
+struct RankedAnchoredCandidate {
+    id: CandidateId,
+    novelty: usize,
+    full_replay_work_bytes: usize,
+    search_order: usize,
+}
+
+struct AnchorProbeState {
+    ranked: Vec<RankedAnchoredCandidate>,
+    score_cache: HashMap<PrefixProbeKey, Option<super::probe::PrefixProbeScore>>,
+    replay_reserve: usize,
+    search_order: usize,
+    last_progress_update: usize,
+    stopped: bool,
+}
+
+#[derive(Clone, Copy)]
+struct LocatorPair<'a> {
+    seed_index: usize,
+    payload_index: usize,
+    seed_locator: &'a LocatorCandidate,
+    payload_locator: &'a LocatorCandidate,
+}
+
+#[derive(Clone, Copy)]
+struct CounterOptions {
+    width: CounterWidth,
+    initial_counter: u64,
+}
+
+struct InitialPairSearch {
+    pairs: Vec<(usize, usize)>,
+    pre_evaluated: BTreeSet<CandidateId>,
 }
 
 type RelativeStartRank = (u8, usize);
@@ -420,9 +532,17 @@ fn ranked_payload_locators(
 ) -> Result<Vec<RankedPayloadLocator<'_>>, RelationalTransformError> {
     let mut payloads = Vec::new();
     payloads
-        .try_reserve_exact(candidates.len())
+        .try_reserve_exact(
+            candidates
+                .iter()
+                .filter(|candidate| candidate.anchor_seed_index.is_none())
+                .count(),
+        )
         .map_err(|_| RelationalTransformError::AllocationFailed)?;
     for (candidate_index, candidate) in candidates.iter().enumerate() {
+        if candidate.anchor_seed_index.is_some() {
+            continue;
+        }
         payloads.push(RankedPayloadLocator {
             selector: &candidate.selector,
             relative_start: locator_start_rank(candidate),
@@ -886,6 +1006,12 @@ impl<T> SearchState<T> {
             search_limit: None,
             search_limits: Vec::new(),
             locator_candidates_examined: 0,
+            prefix_probe_hypotheses_examined: 0,
+            prefix_probes_examined: 0,
+            prefix_probe_cache_reuses: 0,
+            prefix_probe_candidates_with_novelty: 0,
+            prefix_probe_work_bytes: 0,
+            prefix_probe_complete: true,
             output_bytes_retained: 0,
             output_capture_omissions: 0,
         }
@@ -912,9 +1038,11 @@ struct PreparedSearch {
     discovery_groups: Vec<SessionGroup>,
     heldout_groups: Vec<SessionGroup>,
     discovery_indexes: Vec<super::input::SelectorIndex>,
+    common_selectors: Vec<Selector>,
     seed_locators: Vec<LocatorCandidate>,
     payload_locators: Vec<LocatorCandidate>,
-    locators_complete: bool,
+    seed_locators_complete: bool,
+    absolute_locators_complete: bool,
 }
 
 const RETAINED_LOCATOR_PAIR_TARGET: usize = 8;
@@ -1045,12 +1173,12 @@ where
             ),
         ));
     }
-    let prepared = prepare_search(samples, plan)?;
+    let mut prepared = prepare_search(samples, plan)?;
     let search = search_candidates(
         samples,
         plan,
         job,
-        &prepared,
+        &mut prepared,
         SearchSettings {
             retention_mode,
             max_retained_output_bytes: options.max_retained_output_bytes,
@@ -1085,12 +1213,19 @@ fn prepare_search(
         &common_selectors,
         plan.limits,
     )?;
-    let (payload_locators, payload_locators_complete) = payload_locators(
+    // Keep the initial absolute domain small enough that anchor discovery can later use
+    // its existing share of the locator ceiling
+    let initial_absolute_limit = plan
+        .limits
+        .max_locator_candidates
+        .saturating_sub(plan.limits.max_locator_candidates.div_ceil(2));
+    let (payload_locators, _) = payload_locators(
         samples,
         &discovery_groups,
         &discovery_indexes,
         &common_selectors,
         plan.limits,
+        initial_absolute_limit,
     )?;
     Ok(PreparedSearch {
         discovery_sessions,
@@ -1098,9 +1233,12 @@ fn prepare_search(
         discovery_groups,
         heldout_groups,
         discovery_indexes,
+        common_selectors,
         seed_locators,
         payload_locators,
-        locators_complete: seed_locators_complete && payload_locators_complete,
+        seed_locators_complete,
+        // The final completeness result is set after the anchor allowance is allocated
+        absolute_locators_complete: true,
     })
 }
 
@@ -1108,7 +1246,7 @@ fn search_candidates<T, E, F>(
     samples: &[RelationalRecordSample<'_>],
     plan: &RelationalTransformPlan,
     job: Option<&Job>,
-    prepared: &PreparedSearch,
+    prepared: &mut PreparedSearch,
     settings: SearchSettings,
     evaluator: &mut F,
 ) -> Result<SearchState<T>, RelationalEvaluationError<E>>
@@ -1121,14 +1259,21 @@ where
     ) -> Result<RelationalCandidateEvaluation<T>, E>,
 {
     let mut search = SearchState::new();
+    search.prefix_probe_complete = false;
     search.locator_candidates_examined =
         prepared.seed_locators.len() + prepared.payload_locators.len();
+    let candidate_parameters = candidate_parameters(plan)?;
     SearchContext {
         samples,
         plan,
         job,
         prepared,
         settings,
+        candidate_parameters: &candidate_parameters,
+        anchor_work_limit: plan.limits.max_work_bytes,
+        anchor_candidate_limit: plan.limits.max_candidates,
+        active_work_limit: plan.limits.max_work_bytes,
+        active_candidate_limit: plan.limits.max_candidates,
     }
     .search_all(&mut search, evaluator)?;
     Ok(search)
@@ -1138,13 +1283,149 @@ struct SearchContext<'a, 'bytes> {
     samples: &'a [RelationalRecordSample<'bytes>],
     plan: &'a RelationalTransformPlan,
     job: Option<&'a Job>,
-    prepared: &'a PreparedSearch,
+    prepared: &'a mut PreparedSearch,
     settings: SearchSettings,
+    candidate_parameters: &'a [CandidateParameters],
+    anchor_work_limit: usize,
+    anchor_candidate_limit: usize,
+    active_work_limit: usize,
+    active_candidate_limit: usize,
 }
 
 impl SearchContext<'_, '_> {
-    fn search_all<T, E, F>(
+    fn prepare_anchored_payloads<T>(
+        &mut self,
+        search: &mut SearchState<T>,
+    ) -> Result<(), RelationalTransformError> {
+        let observation_work = self.anchor_allowance(search)?;
+        let anchored = self.discover_anchored_payloads(observation_work)?;
+        self.record_anchored_observation(search, &anchored)?;
+        self.merge_anchor_locators(search, anchored)
+    }
+
+    fn anchor_allowance<T>(
+        &mut self,
+        search: &SearchState<T>,
+    ) -> Result<usize, RelationalTransformError> {
+        let replay_reserve =
+            maximum_full_candidate_work(self.samples, self.plan.limits, &self.plan.counter_widths)?;
+        let work_limit = search
+            .work_bytes
+            .saturating_add(self.plan.limits.max_work_bytes.div_ceil(3))
+            .min(self.plan.limits.max_work_bytes);
+        let candidate_limit = search
+            .candidates_examined
+            .saturating_add(self.plan.limits.max_candidates.div_ceil(3))
+            .min(self.plan.limits.max_candidates);
+        self.anchor_work_limit = work_limit;
+        self.anchor_candidate_limit = candidate_limit;
+        self.active_work_limit = work_limit;
+        self.active_candidate_limit = candidate_limit;
+        Ok(work_limit
+            .saturating_sub(search.work_bytes)
+            .saturating_sub(replay_reserve))
+    }
+
+    fn discover_anchored_payloads(
         &self,
+        observation_work: usize,
+    ) -> Result<AnchoredPayloadSearch, RelationalTransformError> {
+        let mut limits = self.plan.limits;
+        limits.max_work_bytes = observation_work;
+        anchored_payload_locators(
+            self.samples,
+            &self.prepared.discovery_groups,
+            &self.prepared.discovery_indexes,
+            &self.prepared.seed_locators,
+            limits,
+            self.plan.limits.max_locator_candidates.div_ceil(2),
+            self.job,
+        )
+    }
+
+    fn record_anchored_observation<T>(
+        &self,
+        search: &mut SearchState<T>,
+        anchored: &AnchoredPayloadSearch,
+    ) -> Result<(), RelationalTransformError> {
+        search.work_bytes = search.work_bytes.checked_add(anchored.work_bytes).ok_or(
+            RelationalTransformError::InvalidPlan(
+                "relational work accounting overflowed during anchor observation",
+            ),
+        )?;
+        if search.work_bytes > self.anchor_work_limit {
+            return Err(RelationalTransformError::InvalidPlan(
+                "anchor observation exceeded its allocated work share",
+            ));
+        }
+        search.prefix_probe_complete = anchored.complete;
+        if anchored.work_limited {
+            search.stop(RelationalSearchLimit::WorkBytes);
+            search.omitted_candidates_exact = false;
+        }
+        if anchored.locator_limited {
+            search.stop(RelationalSearchLimit::LocatorCount);
+            search.omitted_candidates_exact = false;
+        }
+        Ok(())
+    }
+
+    fn merge_anchor_locators<T>(
+        &mut self,
+        search: &mut SearchState<T>,
+        anchored: AnchoredPayloadSearch,
+    ) -> Result<(), RelationalTransformError> {
+        let absolute_limit = self
+            .plan
+            .limits
+            .max_locator_candidates
+            .saturating_sub(anchored.candidates.len());
+        let (expanded_absolute_payloads, absolute_payloads_complete) = payload_locators(
+            self.samples,
+            &self.prepared.discovery_groups,
+            &self.prepared.discovery_indexes,
+            &self.prepared.common_selectors,
+            self.plan.limits,
+            absolute_limit,
+        )?;
+        let mut absolute_payloads = std::mem::take(&mut self.prepared.payload_locators);
+        absolute_payloads
+            .try_reserve(absolute_limit.saturating_sub(absolute_payloads.len()))
+            .map_err(|_| RelationalTransformError::AllocationFailed)?;
+        for candidate in expanded_absolute_payloads {
+            if absolute_payloads.len() == absolute_limit {
+                break;
+            }
+            if !absolute_payloads.iter().any(|existing| {
+                existing.selector == candidate.selector && existing.locator == candidate.locator
+            }) {
+                absolute_payloads.push(candidate);
+            }
+        }
+        absolute_payloads
+            .try_reserve(anchored.candidates.len())
+            .map_err(|_| RelationalTransformError::AllocationFailed)?;
+        absolute_payloads.extend(anchored.candidates);
+        self.prepared.payload_locators = absolute_payloads;
+        self.prepared.absolute_locators_complete =
+            self.prepared.seed_locators_complete && absolute_payloads_complete;
+        search.locator_candidates_examined = self
+            .prepared
+            .seed_locators
+            .len()
+            .checked_add(self.prepared.payload_locators.len())
+            .ok_or(RelationalTransformError::InvalidPlan(
+                "relational locator count overflowed",
+            ))?;
+        if !self.prepared.absolute_locators_complete {
+            search.stop(RelationalSearchLimit::LocatorCount);
+            search.omitted_candidates_exact = false;
+        }
+        Ok(())
+    }
+
+    fn search_all<T, E, F>(
+        &mut self,
         search: &mut SearchState<T>,
         evaluator: &mut F,
     ) -> Result<(), RelationalEvaluationError<E>>
@@ -1156,45 +1437,103 @@ impl SearchContext<'_, '_> {
             &[RelationalAppliedOutput],
         ) -> Result<RelationalCandidateEvaluation<T>, E>,
     {
-        if !self.prepared.locators_complete {
-            search.stop(RelationalSearchLimit::LocatorCount);
-            search.omitted_candidates_exact = false;
+        if search.work_bytes >= self.plan.limits.max_work_bytes {
+            stop_for_work_limit(search, false).map_err(RelationalEvaluationError::Search)?;
+            return Ok(());
         }
+        let Some(mut initial) = self.search_initial_pair_window(search, evaluator)? else {
+            return Ok(());
+        };
+        self.prepare_anchored_payloads(search)
+            .map_err(RelationalEvaluationError::Search)?;
+        if !self.search_ranked_anchor_candidates(search, &mut initial.pre_evaluated, evaluator)? {
+            return Ok(());
+        }
+
+        // Unused anchor allowance returns to the absolute search
+        self.active_work_limit = self.plan.limits.max_work_bytes;
+        self.active_candidate_limit = self.plan.limits.max_candidates;
+        if !self.resume_initial_pairs(search, &initial, evaluator)? {
+            return Ok(());
+        }
+        if !self.search_remaining_absolute_pairs(search, &initial, evaluator)? {
+            return Ok(());
+        }
+        self.search_anchored_pairs(search, &initial.pre_evaluated, evaluator)
+    }
+
+    fn search_initial_pair_window<T, E, F>(
+        &self,
+        search: &mut SearchState<T>,
+        evaluator: &mut F,
+    ) -> Result<Option<InitialPairSearch>, RelationalEvaluationError<E>>
+    where
+        F: FnMut(
+            &RelationalTransformEvaluationContext<'_>,
+            &RelationalTransformCandidate,
+            &[RelationalAppliedOutput],
+            &[RelationalAppliedOutput],
+        ) -> Result<RelationalCandidateEvaluation<T>, E>,
+    {
         let mut pair_schedule = LocatorPairSchedule::new(
             &self.prepared.seed_locators,
             &self.prepared.payload_locators,
         )
         .map_err(RelationalEvaluationError::Search)?;
-        while let Some((seed_index, payload_index)) = pair_schedule.next() {
-            let (Some(seed_locator), Some(payload_locator)) = (
-                self.prepared.seed_locators.get(seed_index),
-                self.prepared.payload_locators.get(payload_index),
-            ) else {
+        let first_parameters = self
+            .candidate_parameters
+            .first()
+            .copied()
+            .ok_or(RelationalTransformError::InvalidPlan(
+                "relational candidate parameter domain is empty",
+            ))
+            .map_err(RelationalEvaluationError::Search)?;
+        let mut initial = InitialPairSearch {
+            pairs: Vec::new(),
+            pre_evaluated: BTreeSet::new(),
+        };
+        initial
+            .pairs
+            .try_reserve_exact(INITIAL_RANK_ORDERED_PAIR_WINDOW)
+            .map_err(|_| {
+                RelationalEvaluationError::Search(RelationalTransformError::AllocationFailed)
+            })?;
+
+        // Give the first two usable absolute locator pairs a real replay before probing
+        while initial.pairs.len() < INITIAL_RANK_ORDERED_PAIR_WINDOW {
+            let Some((seed_index, payload_index)) = pair_schedule.next() else {
+                break;
+            };
+            let Some(pair) = self.locator_pair(seed_index, payload_index) else {
                 continue;
             };
-            let overlaps = locator_ranges_overlap(
-                self.samples,
-                &self.prepared.discovery_indexes,
-                &seed_locator.selector,
-                &payload_locator.selector,
-                &seed_locator.locator,
-                &payload_locator.locator,
-            );
-            if overlaps {
+            if locator_pair_overlaps(self.samples, &self.prepared.discovery_indexes, pair) {
                 continue;
             }
-            if !self.search_locator_pair(search, seed_locator, payload_locator, evaluator)? {
-                return Ok(());
+            let id = CandidateId {
+                seed: seed_index,
+                payload: payload_index,
+                parameter: 0,
+            };
+            if !self.try_candidate(
+                search,
+                pair.seed_locator,
+                pair.payload_locator,
+                first_parameters,
+                evaluator,
+            )? {
+                return Ok(None);
             }
+            initial.pre_evaluated.insert(id);
+            initial.pairs.push((seed_index, payload_index));
         }
-        Ok(())
+        Ok(Some(initial))
     }
 
-    fn search_locator_pair<T, E, F>(
+    fn search_ranked_anchor_candidates<T, E, F>(
         &self,
         search: &mut SearchState<T>,
-        seed_locator: &LocatorCandidate,
-        payload_locator: &LocatorCandidate,
+        pre_evaluated: &mut BTreeSet<CandidateId>,
         evaluator: &mut F,
     ) -> Result<bool, RelationalEvaluationError<E>>
     where
@@ -1205,17 +1544,356 @@ impl SearchContext<'_, '_> {
             &[RelationalAppliedOutput],
         ) -> Result<RelationalCandidateEvaluation<T>, E>,
     {
+        let mut ranked = self.rank_anchored_candidates(search)?;
+        ranked
+            .sort_unstable_by_key(|candidate| (Reverse(candidate.novelty), candidate.search_order));
+        for candidate in ranked {
+            if candidate.novelty == 0 {
+                continue;
+            }
+            let remaining_work = self.anchor_work_limit.saturating_sub(search.work_bytes);
+            if candidate.full_replay_work_bytes > remaining_work {
+                continue;
+            }
+            let Some(pair) = self.locator_pair(candidate.id.seed, candidate.id.payload) else {
+                return Err(RelationalEvaluationError::Search(
+                    RelationalTransformError::InvalidPlan(
+                        "anchored candidate references a missing locator",
+                    ),
+                ));
+            };
+            let Some(parameters) = self.candidate_parameters.get(candidate.id.parameter) else {
+                return Err(RelationalEvaluationError::Search(
+                    RelationalTransformError::InvalidPlan(
+                        "anchored candidate references missing transform parameters",
+                    ),
+                ));
+            };
+            if !self.try_candidate(
+                search,
+                pair.seed_locator,
+                pair.payload_locator,
+                *parameters,
+                evaluator,
+            )? {
+                return Ok(false);
+            }
+            pre_evaluated.insert(candidate.id);
+        }
+        Ok(true)
+    }
+
+    fn resume_initial_pairs<T, E, F>(
+        &self,
+        search: &mut SearchState<T>,
+        initial: &InitialPairSearch,
+        evaluator: &mut F,
+    ) -> Result<bool, RelationalEvaluationError<E>>
+    where
+        F: FnMut(
+            &RelationalTransformEvaluationContext<'_>,
+            &RelationalTransformCandidate,
+            &[RelationalAppliedOutput],
+            &[RelationalAppliedOutput],
+        ) -> Result<RelationalCandidateEvaluation<T>, E>,
+    {
+        for &(seed_index, payload_index) in &initial.pairs {
+            let Some(pair) = self.locator_pair(seed_index, payload_index) else {
+                continue;
+            };
+            if !self.search_locator_pair(search, pair, &initial.pre_evaluated, evaluator)? {
+                return Ok(false);
+            }
+        }
+        Ok(true)
+    }
+
+    fn search_remaining_absolute_pairs<T, E, F>(
+        &self,
+        search: &mut SearchState<T>,
+        initial: &InitialPairSearch,
+        evaluator: &mut F,
+    ) -> Result<bool, RelationalEvaluationError<E>>
+    where
+        F: FnMut(
+            &RelationalTransformEvaluationContext<'_>,
+            &RelationalTransformCandidate,
+            &[RelationalAppliedOutput],
+            &[RelationalAppliedOutput],
+        ) -> Result<RelationalCandidateEvaluation<T>, E>,
+    {
+        let mut pair_schedule = LocatorPairSchedule::new(
+            &self.prepared.seed_locators,
+            &self.prepared.payload_locators,
+        )
+        .map_err(RelationalEvaluationError::Search)?;
+        while let Some((seed_index, payload_index)) = pair_schedule.next() {
+            // The initial pairs were fully resumed above, so avoid counting them again
+            if initial.pairs.contains(&(seed_index, payload_index)) {
+                continue;
+            }
+            let Some(pair) = self.locator_pair(seed_index, payload_index) else {
+                continue;
+            };
+            if locator_pair_overlaps(self.samples, &self.prepared.discovery_indexes, pair) {
+                continue;
+            }
+            if !self.search_locator_pair(search, pair, &initial.pre_evaluated, evaluator)? {
+                return Ok(false);
+            }
+        }
+        Ok(true)
+    }
+
+    fn search_anchored_pairs<T, E, F>(
+        &self,
+        search: &mut SearchState<T>,
+        pre_evaluated: &BTreeSet<CandidateId>,
+        evaluator: &mut F,
+    ) -> Result<(), RelationalEvaluationError<E>>
+    where
+        F: FnMut(
+            &RelationalTransformEvaluationContext<'_>,
+            &RelationalTransformCandidate,
+            &[RelationalAppliedOutput],
+            &[RelationalAppliedOutput],
+        ) -> Result<RelationalCandidateEvaluation<T>, E>,
+    {
+        for (payload_index, payload_locator) in self.prepared.payload_locators.iter().enumerate() {
+            let Some(seed_index) = payload_locator.anchor_seed_index else {
+                continue;
+            };
+            let Some(seed_locator) = self.prepared.seed_locators.get(seed_index) else {
+                return Err(RelationalEvaluationError::Search(
+                    RelationalTransformError::InvalidPlan(
+                        "anchored payload references a missing seed locator",
+                    ),
+                ));
+            };
+            if !self.search_locator_pair(
+                search,
+                LocatorPair {
+                    seed_index,
+                    payload_index,
+                    seed_locator,
+                    payload_locator,
+                },
+                pre_evaluated,
+                evaluator,
+            )? {
+                break;
+            }
+        }
+        Ok(())
+    }
+
+    fn locator_pair(&self, seed_index: usize, payload_index: usize) -> Option<LocatorPair<'_>> {
+        Some(LocatorPair {
+            seed_index,
+            payload_index,
+            seed_locator: self.prepared.seed_locators.get(seed_index)?,
+            payload_locator: self.prepared.payload_locators.get(payload_index)?,
+        })
+    }
+
+    fn rank_anchored_candidates<T>(
+        &self,
+        search: &mut SearchState<T>,
+    ) -> Result<Vec<RankedAnchoredCandidate>, RelationalTransformError> {
+        let replay_reserve =
+            maximum_full_candidate_work(self.samples, self.plan.limits, &self.plan.counter_widths)?;
+        let probe_limit = self
+            .anchor_candidate_limit
+            .saturating_sub(search.candidates_examined)
+            .min(
+                self.plan
+                    .limits
+                    .max_candidates
+                    .saturating_sub(search.candidates_examined),
+            );
+        let mut state = AnchorProbeState {
+            ranked: Vec::new(),
+            score_cache: HashMap::new(),
+            replay_reserve,
+            search_order: 0,
+            last_progress_update: 0,
+            stopped: false,
+        };
+        'anchors: for (payload_index, payload_locator) in
+            self.prepared.payload_locators.iter().enumerate()
+        {
+            let Some(seed_index) = payload_locator.anchor_seed_index else {
+                continue;
+            };
+            let Some(seed_locator) = self.prepared.seed_locators.get(seed_index) else {
+                search.prefix_probe_complete = false;
+                continue;
+            };
+            for (parameter_index, parameters) in self.candidate_parameters.iter().enumerate() {
+                if search.prefix_probe_hypotheses_examined >= probe_limit {
+                    search.prefix_probe_complete = false;
+                    break 'anchors;
+                }
+                let score = self.score_anchored_candidate(
+                    search,
+                    &mut state,
+                    CandidateId {
+                        seed: seed_index,
+                        payload: payload_index,
+                        parameter: parameter_index,
+                    },
+                    seed_locator,
+                    payload_locator,
+                    parameters,
+                )?;
+                if state.stopped {
+                    break 'anchors;
+                }
+                let Some(score) = score else {
+                    state.search_order = state.search_order.saturating_add(1);
+                    continue;
+                };
+                if score.novelty > 0 {
+                    state
+                        .ranked
+                        .try_reserve(1)
+                        .map_err(|_| RelationalTransformError::AllocationFailed)?;
+                    state.ranked.push(RankedAnchoredCandidate {
+                        id: CandidateId {
+                            seed: seed_index,
+                            payload: payload_index,
+                            parameter: parameter_index,
+                        },
+                        novelty: score.novelty,
+                        full_replay_work_bytes: state.replay_reserve,
+                        search_order: state.search_order,
+                    });
+                }
+                state.search_order = state.search_order.saturating_add(1);
+            }
+        }
+        Ok(state.ranked)
+    }
+
+    fn score_anchored_candidate<T>(
+        &self,
+        search: &mut SearchState<T>,
+        state: &mut AnchorProbeState,
+        candidate_id: CandidateId,
+        seed_locator: &LocatorCandidate,
+        payload_locator: &LocatorCandidate,
+        parameters: &CandidateParameters,
+    ) -> Result<Option<super::probe::PrefixProbeScore>, RelationalTransformError> {
+        search.prefix_probe_hypotheses_examined = search
+            .prefix_probe_hypotheses_examined
+            .checked_add(1)
+            .ok_or(RelationalTransformError::InvalidPlan(
+                "prefix probe hypothesis count overflowed",
+            ))?;
+        if let Some(job) = self.job {
+            job.check_cancelled()
+                .map_err(RelationalTransformError::from)?;
+            let hypotheses = search.prefix_probe_hypotheses_examined;
+            if hypotheses == 1 || hypotheses.saturating_sub(state.last_progress_update) >= 256 {
+                match job.set_current(
+                    Phase::TransformDiscovery,
+                    format!("ranking seed-relative prefixes: {hypotheses} hypotheses"),
+                ) {
+                    Ok(()) | Err(crate::job::JobError::PhaseNotInProgress(_)) => {
+                        state.last_progress_update = hypotheses;
+                    }
+                    Err(error) => return Err(RelationalTransformError::from(error)),
+                }
+            }
+        }
+        let remaining_work = self.anchor_work_limit.saturating_sub(search.work_bytes);
+        let probe_allowance = remaining_work.saturating_sub(state.replay_reserve);
+        let key = prefix_probe_key(candidate_id.seed, candidate_id.payload, parameters);
+        let (score, reused) = if let Some(score) = state.score_cache.get(&key).copied() {
+            (score, true)
+        } else {
+            if probe_allowance == 0 {
+                search.prefix_probe_complete = false;
+                state.stopped = true;
+                return Ok(None);
+            }
+            let rule = make_rule(seed_locator, payload_locator, *parameters, self.plan);
+            let score = score_candidate_prefix(
+                self.samples,
+                &self.prepared.discovery_groups,
+                &rule,
+                self.plan.limits,
+                probe_allowance,
+            )?;
+            state
+                .score_cache
+                .try_reserve(1)
+                .map_err(|_| RelationalTransformError::AllocationFailed)?;
+            state.score_cache.insert(key, score);
+            (score, false)
+        };
+        if reused {
+            search.prefix_probe_cache_reuses =
+                search.prefix_probe_cache_reuses.checked_add(1).ok_or(
+                    RelationalTransformError::InvalidPlan("prefix probe reuse count overflowed"),
+                )?;
+        } else {
+            search.prefix_probes_examined = search.prefix_probes_examined.checked_add(1).ok_or(
+                RelationalTransformError::InvalidPlan("prefix probe count overflowed"),
+            )?;
+        }
+        let Some(score) = score else {
+            search.prefix_probe_complete = false;
+            return Ok(None);
+        };
+        if !reused {
+            charge_prefix_probe_work(search, self.job, score.work_bytes, probe_allowance)?;
+            if score.novelty > 0 {
+                search.prefix_probe_candidates_with_novelty = search
+                    .prefix_probe_candidates_with_novelty
+                    .checked_add(1)
+                    .ok_or(RelationalTransformError::InvalidPlan(
+                        "prefix probe novelty count overflowed",
+                    ))?;
+            }
+        }
+        if !score.complete {
+            search.prefix_probe_complete = false;
+        }
+        Ok(Some(score))
+    }
+
+    fn search_locator_pair<T, E, F>(
+        &self,
+        search: &mut SearchState<T>,
+        pair: LocatorPair<'_>,
+        pre_evaluated: &BTreeSet<CandidateId>,
+        evaluator: &mut F,
+    ) -> Result<bool, RelationalEvaluationError<E>>
+    where
+        F: FnMut(
+            &RelationalTransformEvaluationContext<'_>,
+            &RelationalTransformCandidate,
+            &[RelationalAppliedOutput],
+            &[RelationalAppliedOutput],
+        ) -> Result<RelationalCandidateEvaluation<T>, E>,
+    {
+        let mut parameter_index = 0_usize;
         for counter_width in &self.plan.counter_widths {
             for initial_counter in &self.plan.initial_counters {
                 if *initial_counter > counter_width.maximum_counter() {
                     continue;
                 }
+                let options = CounterOptions {
+                    width: *counter_width,
+                    initial_counter: *initial_counter,
+                };
                 if !self.search_counter_options(
                     search,
-                    seed_locator,
-                    payload_locator,
-                    *counter_width,
-                    *initial_counter,
+                    pair,
+                    options,
+                    &mut parameter_index,
+                    pre_evaluated,
                     evaluator,
                 )? {
                     return Ok(false);
@@ -1228,10 +1906,10 @@ impl SearchContext<'_, '_> {
     fn search_counter_options<T, E, F>(
         &self,
         search: &mut SearchState<T>,
-        seed_locator: &LocatorCandidate,
-        payload_locator: &LocatorCandidate,
-        counter_width: crate::derivation::CounterWidth,
-        initial_counter: u64,
+        pair: LocatorPair<'_>,
+        options: CounterOptions,
+        parameter_index: &mut usize,
+        pre_evaluated: &BTreeSet<CandidateId>,
         evaluator: &mut F,
     ) -> Result<bool, RelationalEvaluationError<E>>
     where
@@ -1244,7 +1922,7 @@ impl SearchContext<'_, '_> {
     {
         let mut first_byte_order = true;
         for counter_byte_order in &self.plan.counter_byte_orders {
-            if counter_width == crate::derivation::CounterWidth::OneByte && !first_byte_order {
+            if options.width == CounterWidth::OneByte && !first_byte_order {
                 self.count_equivalent_candidate_aliases(search)?;
                 continue;
             }
@@ -1252,14 +1930,27 @@ impl SearchContext<'_, '_> {
             for seed_order in &self.plan.seed_orders {
                 for counter_reset in &self.plan.counter_resets {
                     for parser_format in &self.plan.parser_formats {
+                        let id = CandidateId {
+                            seed: pair.seed_index,
+                            payload: pair.payload_index,
+                            parameter: *parameter_index,
+                        };
+                        *parameter_index = parameter_index.checked_add(1).ok_or(
+                            RelationalTransformError::InvalidPlan(
+                                "relational parameter index overflowed",
+                            ),
+                        )?;
+                        if pre_evaluated.contains(&id) {
+                            continue;
+                        }
                         if !self.try_candidate(
                             search,
-                            seed_locator,
-                            payload_locator,
+                            pair.seed_locator,
+                            pair.payload_locator,
                             CandidateParameters {
                                 operation: RelationalSha256CounterXor {
-                                    initial_counter,
-                                    counter_width,
+                                    initial_counter: options.initial_counter,
+                                    counter_width: options.width,
                                     counter_byte_order: *counter_byte_order,
                                     seed_order: *seed_order,
                                 },
@@ -1293,7 +1984,10 @@ impl SearchContext<'_, '_> {
             &[RelationalAppliedOutput],
         ) -> Result<RelationalCandidateEvaluation<T>, E>,
     {
-        if search.candidates_examined == self.plan.limits.max_candidates {
+        if search.candidates_examined >= self.active_candidate_limit {
+            if self.active_candidate_limit < self.plan.limits.max_candidates {
+                return Ok(false);
+            }
             search.stop(RelationalSearchLimit::CandidateCount);
             search.omitted_candidates = search.omitted_candidates.checked_add(1).ok_or(
                 RelationalTransformError::InvalidPlan(
@@ -1331,6 +2025,85 @@ fn make_rule(
     }
 }
 
+fn locator_pair_overlaps(
+    samples: &[RelationalRecordSample<'_>],
+    indexes: &[super::input::SelectorIndex],
+    pair: LocatorPair<'_>,
+) -> bool {
+    locator_ranges_overlap(
+        samples,
+        indexes,
+        &pair.seed_locator.selector,
+        &pair.payload_locator.selector,
+        &pair.seed_locator.locator,
+        &pair.payload_locator.locator,
+    )
+}
+
+fn charge_prefix_probe_work<T>(
+    search: &mut SearchState<T>,
+    job: Option<&Job>,
+    work_bytes: usize,
+    allowance: usize,
+) -> Result<(), RelationalTransformError> {
+    if work_bytes > allowance {
+        return Err(RelationalTransformError::InvalidPlan(
+            "prefix probe exceeded its shared work allowance",
+        ));
+    }
+    search.prefix_probe_work_bytes = search
+        .prefix_probe_work_bytes
+        .checked_add(work_bytes)
+        .ok_or(RelationalTransformError::InvalidPlan(
+            "prefix probe work accounting overflowed",
+        ))?;
+    search.work_bytes =
+        search
+            .work_bytes
+            .checked_add(work_bytes)
+            .ok_or(RelationalTransformError::InvalidPlan(
+                "relational work accounting overflowed",
+            ))?;
+    if let Some(job) = job {
+        job.record_work(
+            Phase::TransformDiscovery,
+            Counter::Bytes,
+            u64::try_from(work_bytes).map_err(|_| {
+                RelationalTransformError::InvalidPlan("prefix probe work counter overflowed")
+            })?,
+        )
+        .map_err(RelationalTransformError::from)?;
+    }
+    Ok(())
+}
+
+const fn prefix_probe_key(
+    seed_index: usize,
+    payload_index: usize,
+    parameters: &CandidateParameters,
+) -> PrefixProbeKey {
+    let operation = parameters.operation;
+    PrefixProbeKey {
+        seed_index,
+        payload_index,
+        initial_counter: operation.initial_counter,
+        counter_width_bytes: match operation.counter_width {
+            CounterWidth::OneByte => 1,
+            CounterWidth::TwoBytes => 2,
+            CounterWidth::FourBytes => 4,
+            CounterWidth::EightBytes => 8,
+        },
+        counter_byte_order: match operation.counter_byte_order {
+            CounterByteOrder::BigEndian => 0,
+            CounterByteOrder::LittleEndian => 1,
+        },
+        seed_order: match operation.seed_order {
+            SeedCounterOrder::SeedThenCounter => 0,
+            SeedCounterOrder::CounterThenSeed => 1,
+        },
+    }
+}
+
 impl SearchContext<'_, '_> {
     fn evaluate_candidate<T, E, F>(
         &self,
@@ -1351,7 +2124,7 @@ impl SearchContext<'_, '_> {
             &self.prepared.discovery_groups,
             Some(&self.prepared.discovery_indexes),
             &rule,
-            self.plan.limits,
+            self.active_limits(),
             &mut search.work_bytes,
             self.settings.capture_outputs_for_evaluator,
         )?;
@@ -1364,17 +2137,24 @@ impl SearchContext<'_, '_> {
                 job.increment(Counter::CandidatesRejected, 1)
                     .map_err(RelationalTransformError::from)?;
             }
+            if self.active_work_limit < self.plan.limits.max_work_bytes
+                && (discovery_unresolved_on_budget || search.work_bytes >= self.active_work_limit)
+            {
+                return Ok(false);
+            }
             if discovery_unresolved_on_budget
-                || search.work_bytes == self.plan.limits.max_work_bytes
+                || search.work_bytes >= self.plan.limits.max_work_bytes
             {
                 stop_for_work_limit(search, true)?;
             }
-            if search.work_bytes == self.plan.limits.max_work_bytes {
+            if search.work_bytes >= self.active_work_limit {
                 return Ok(false);
             }
             return Ok(true);
         }
-        if discovery_unresolved_on_budget {
+        if discovery_unresolved_on_budget
+            && self.active_work_limit == self.plan.limits.max_work_bytes
+        {
             search.stop(RelationalSearchLimit::WorkBytes);
             search.omitted_candidates_exact = false;
         }
@@ -1402,7 +2182,7 @@ impl SearchContext<'_, '_> {
         } = discovery_evaluation;
         let heldout_evaluation = evaluate_heldout(
             self.samples,
-            self.plan,
+            self.active_limits(),
             self.prepared,
             search,
             &rule,
@@ -1410,7 +2190,9 @@ impl SearchContext<'_, '_> {
             self.settings.capture_outputs_for_evaluator,
         )?;
         let heldout = heldout_evaluation.fit;
-        if heldout.status == RelationalFitStatus::UnresolvedOnBudget {
+        if heldout.status == RelationalFitStatus::UnresolvedOnBudget
+            && self.active_work_limit == self.plan.limits.max_work_bytes
+        {
             search.stop(RelationalSearchLimit::WorkBytes);
             search.omitted_candidates_exact = false;
         }
@@ -1425,11 +2207,7 @@ impl SearchContext<'_, '_> {
         let evaluation_context = RelationalTransformEvaluationContext {
             discovery_sessions: &self.prepared.discovery_sessions,
             heldout_sessions: &self.prepared.heldout_sessions,
-            work_bytes_remaining: self
-                .plan
-                .limits
-                .max_work_bytes
-                .saturating_sub(search.work_bytes),
+            work_bytes_remaining: self.active_work_limit.saturating_sub(search.work_bytes),
         };
         // The callback inspects outputs already produced by this frozen replay
         let evaluation = evaluator(
@@ -1463,11 +2241,19 @@ impl SearchContext<'_, '_> {
             self.plan.limits,
             self.settings,
         )?;
-        if search.work_bytes >= self.plan.limits.max_work_bytes {
-            stop_for_work_limit(search, false)?;
+        if search.work_bytes >= self.active_work_limit {
+            if self.active_work_limit == self.plan.limits.max_work_bytes {
+                stop_for_work_limit(search, false)?;
+            }
             return Ok(false);
         }
         Ok(true)
+    }
+
+    const fn active_limits(&self) -> RelationalTransformLimits {
+        let mut limits = self.plan.limits;
+        limits.max_work_bytes = self.active_work_limit;
+        limits
     }
 
     fn count_equivalent_candidate_aliases<T>(
@@ -1492,7 +2278,7 @@ impl SearchContext<'_, '_> {
 
 fn evaluate_heldout<T>(
     samples: &[RelationalRecordSample<'_>],
-    plan: &RelationalTransformPlan,
+    limits: RelationalTransformLimits,
     prepared: &PreparedSearch,
     search: &mut SearchState<T>,
     rule: &RelationalTransformRule,
@@ -1520,7 +2306,7 @@ fn evaluate_heldout<T>(
         &prepared.heldout_groups,
         None,
         rule,
-        plan.limits,
+        limits,
         &mut search.work_bytes,
         capture_outputs,
     )
@@ -1796,6 +2582,12 @@ fn build_report<T>(
                 .max_candidates
                 .saturating_sub(search.candidates_examined),
             locator_candidates_examined: search.locator_candidates_examined,
+            prefix_probe_hypotheses_examined: search.prefix_probe_hypotheses_examined,
+            prefix_probes_examined: search.prefix_probes_examined,
+            prefix_probe_cache_reuses: search.prefix_probe_cache_reuses,
+            prefix_probe_candidates_with_novelty: search.prefix_probe_candidates_with_novelty,
+            prefix_probe_work_bytes: search.prefix_probe_work_bytes,
+            prefix_probe_complete: search.prefix_probe_complete,
             locator_candidate_limit_remaining: limits
                 .max_locator_candidates
                 .saturating_mul(2)

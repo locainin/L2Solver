@@ -22,14 +22,11 @@ pub(super) fn work_overhead(input_length: usize, operation: &Operation) -> Optio
             seed,
             counter_width,
             ..
-        } => {
-            // Each SHA block hashes one copy of the seed and encoded counter
-            let block_count = input_length.div_ceil(SHA256_BLOCK_BYTES);
-            seed.as_literal_bytes()?
-                .len()
-                .checked_add(counter_width.byte_length())?
-                .checked_mul(block_count)
-        }
+        } => sha256_counter_xor_work_overhead(
+            input_length,
+            seed.as_literal_bytes()?.len(),
+            *counter_width,
+        ),
         Operation::AesGcmDecrypt {
             key,
             nonce,
@@ -58,6 +55,59 @@ pub(super) fn work_overhead(input_length: usize, operation: &Operation) -> Optio
         }
         _ => Some(0),
     }
+}
+
+pub(super) fn sha256_counter_xor_work(
+    input_length: usize,
+    seed_length: usize,
+    counter_width: CounterWidth,
+) -> Option<usize> {
+    input_length
+        .checked_mul(2)?
+        .checked_add(sha256_counter_xor_work_overhead(
+            input_length,
+            seed_length,
+            counter_width,
+        )?)
+}
+
+fn sha256_counter_xor_work_overhead(
+    input_length: usize,
+    seed_length: usize,
+    counter_width: CounterWidth,
+) -> Option<usize> {
+    // Each SHA block hashes one copy of the seed and encoded counter
+    seed_length
+        .checked_add(counter_width.byte_length())?
+        .checked_mul(input_length.div_ceil(SHA256_BLOCK_BYTES))
+}
+
+pub(super) fn validate_sha256_counter_xor_capacity(
+    input_length: usize,
+    initial_counter: u64,
+    counter_width: CounterWidth,
+) -> Result<(), StepFailure> {
+    let maximum = counter_width.maximum_counter();
+    if initial_counter > maximum {
+        return Err(StepFailure::CounterValueOutOfRange {
+            initial_counter,
+            maximum,
+        });
+    }
+
+    // Check the final counter before allocation so exhaustion keeps all input bytes
+    let block_count = input_length.div_ceil(SHA256_BLOCK_BYTES);
+    if block_count > 0 {
+        let last_block_offset =
+            u64::try_from(block_count - 1).map_err(|_| StepFailure::CounterExhausted)?;
+        let last_counter = initial_counter
+            .checked_add(last_block_offset)
+            .ok_or(StepFailure::CounterExhausted)?;
+        if last_counter > maximum {
+            return Err(StepFailure::CounterExhausted);
+        }
+    }
+    Ok(())
 }
 
 pub(super) fn scrypt_derive(
@@ -107,26 +157,7 @@ pub(super) fn sha256_counter_xor(
     budget: OutputBudget,
 ) -> Result<Vec<u8>, StepFailure> {
     check_output_size(input.len(), budget)?;
-    let maximum = counter_width.maximum_counter();
-    if initial_counter > maximum {
-        return Err(StepFailure::CounterValueOutOfRange {
-            initial_counter,
-            maximum,
-        });
-    }
-
-    // Check the final counter before allocating so exhaustion keeps all input bytes
-    let block_count = input.len().div_ceil(SHA256_BLOCK_BYTES);
-    if block_count > 0 {
-        let last_block_offset =
-            u64::try_from(block_count - 1).map_err(|_| StepFailure::CounterExhausted)?;
-        let last_counter = initial_counter
-            .checked_add(last_block_offset)
-            .ok_or(StepFailure::CounterExhausted)?;
-        if last_counter > maximum {
-            return Err(StepFailure::CounterExhausted);
-        }
-    }
+    validate_sha256_counter_xor_capacity(input.len(), initial_counter, counter_width)?;
 
     let mut output = Vec::new();
     output

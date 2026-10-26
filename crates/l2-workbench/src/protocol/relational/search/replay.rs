@@ -1,9 +1,10 @@
 use super::super::model::{
-    RelationalAppliedOutput, RelationalByteRangeLocator, RelationalCounterReset,
-    RelationalFalsification, RelationalFit, RelationalFitStatus, RelationalOperationTemplate,
-    RelationalOutputMapping, RelationalParserScope, RelationalRecordSample, RelationalSessionCheck,
-    RelationalTransformError, RelationalTransformLimits, RelationalTransformRule,
-    RelationalTransformStatus, Selector,
+    RelationalAppliedOutput, RelationalByteRangeLocator, RelationalCoordinateBasis,
+    RelationalCounterReset, RelationalFalsification, RelationalFit, RelationalFitStatus,
+    RelationalLengthField, RelationalOperationTemplate, RelationalOutputMapping,
+    RelationalParserScope, RelationalRecordSample, RelationalSessionCheck,
+    RelationalSha256CounterXor, RelationalTransformError, RelationalTransformLimits,
+    RelationalTransformRule, RelationalTransformStatus, Selector,
 };
 use super::input::{SelectorIndex, SessionGroup, group_sessions};
 use crate::{
@@ -20,8 +21,34 @@ type SessionCheckResult<T> = Result<Result<T, RelationalSessionCheck>, Relationa
 
 struct LocatedPayload<'a> {
     sample: u64,
+    sample_index: usize,
     source_range: crate::protocol::ByteRange,
     bytes: &'a [u8],
+}
+
+struct LocatedSeed<'a> {
+    sample: u64,
+    sample_index: usize,
+    range: crate::protocol::ByteRange,
+    bytes: &'a [u8],
+}
+
+pub(super) struct PrefixProbeMessage<'a> {
+    pub(super) sample: u64,
+    pub(super) context: crate::protocol::MessageContext,
+    pub(super) source_range: crate::protocol::ByteRange,
+    pub(super) input: &'a [u8],
+    pub(super) output: Vec<u8>,
+}
+
+pub(super) struct PrefixProbeOutput<'a> {
+    pub(super) messages: Vec<PrefixProbeMessage<'a>>,
+    pub(super) work_bytes: usize,
+}
+
+struct PreparedPrefixSession<'a> {
+    seed: LocatedSeed<'a>,
+    payload: LocatedPayload<'a>,
 }
 
 /// Replay one frozen relational rule against exactly one session and retain its output
@@ -40,12 +67,13 @@ pub fn apply_relational_transform_rule(
     work_limit: usize,
 ) -> Result<RelationalAppliedOutput, RelationalTransformError> {
     validate_replay_limits(limits)?;
+    validate_rule_coordinates(rule)?;
     let group = one_session_group(samples, limits)?;
-    let (seed_sample, seed) = replay_seed(samples, &group, rule, limits)?;
-    let payloads = replay_payloads(samples, &group, rule, limits)?;
+    let seed = replay_seed(samples, &group, rule, limits)?;
+    let payloads = replay_payloads(samples, &group, rule, limits, &seed)?;
     let work_estimate = transform_work_estimate(
         &payloads,
-        seed.len(),
+        seed.bytes.len(),
         rule.operation.sha256_counter_xor().counter_width,
         rule.counter_reset,
     )
@@ -57,14 +85,37 @@ pub fn apply_relational_transform_rule(
     }
     let transformed = apply_transform(
         &payloads,
-        seed,
+        seed.bytes,
         rule.operation,
         rule.counter_reset,
         limits.max_total_bytes,
         work_limit,
     )?;
     let (bytes, work_bytes) = transformed_bytes(transformed)?;
-    applied_output(group, seed_sample, &payloads, bytes, rule, work_bytes)
+    applied_output(group, seed.sample, &payloads, bytes, rule, work_bytes)
+}
+
+fn validate_rule_coordinates(
+    rule: &RelationalTransformRule,
+) -> Result<(), RelationalTransformError> {
+    if rule.seed_locator.coordinate_basis != RelationalCoordinateBasis::MessageStartV1 {
+        return Err(RelationalTransformError::InvalidPlan(
+            "seed locator coordinates must be message-relative",
+        ));
+    }
+    if rule.payload_locator.coordinate_basis == RelationalCoordinateBasis::SeedRangeEndV1
+        && (rule.payload_locator.direction != rule.seed_locator.direction
+            || rule
+                .seed_locator
+                .value_length
+                .is_none_or(|length| length == 0)
+            || rule.seed_locator.declared_length.is_none())
+    {
+        return Err(RelationalTransformError::InvalidPlan(
+            "seed-relative payload coordinates require the same direction and a declared fixed seed",
+        ));
+    }
+    Ok(())
 }
 
 const fn validate_replay_limits(
@@ -102,7 +153,7 @@ fn replay_seed<'a>(
     group: &SessionGroup,
     rule: &RelationalTransformRule,
     limits: RelationalTransformLimits,
-) -> Result<(u64, &'a [u8]), RelationalTransformError> {
+) -> Result<LocatedSeed<'a>, RelationalTransformError> {
     let seed_matches = locator_matches(samples, group, None, &rule.seed_locator)?;
     if seed_matches.len() != 1 {
         return Err(RelationalTransformError::RuleContradicted(format!(
@@ -156,7 +207,15 @@ fn replay_seed<'a>(
                 "located seed range is unavailable".to_owned(),
             )
         })?;
-    Ok((seed_sample.sample, seed))
+    Ok(LocatedSeed {
+        sample: seed_sample.sample,
+        sample_index: seed_index,
+        range: crate::protocol::ByteRange {
+            start: rule.seed_locator.value_offset,
+            end: seed_end,
+        },
+        bytes: seed,
+    })
 }
 
 fn replay_payloads<'a>(
@@ -164,8 +223,9 @@ fn replay_payloads<'a>(
     group: &SessionGroup,
     rule: &RelationalTransformRule,
     limits: RelationalTransformLimits,
+    seed: &LocatedSeed<'_>,
 ) -> Result<Vec<LocatedPayload<'a>>, RelationalTransformError> {
-    let payload_matches = locator_matches(samples, group, None, &rule.payload_locator)?;
+    let payload_matches = payload_locator_matches(samples, group, None, rule, seed)?;
     if payload_matches.is_empty() {
         return Err(RelationalTransformError::RuleContradicted(
             "payload locator selected no messages".to_owned(),
@@ -182,10 +242,12 @@ fn replay_payloads<'a>(
             .ok_or(RelationalTransformError::InvalidInput(
                 "payload locator references a missing message",
             ))?;
-        let source_range = crate::protocol::ByteRange {
-            start: rule.payload_locator.value_offset,
-            end: sample.bytes.len(),
-        };
+        let source_range = payload_source_range(&rule.payload_locator, seed, sample.bytes.len())
+            .ok_or_else(|| {
+                RelationalTransformError::RuleContradicted(
+                    "located payload range is unavailable".to_owned(),
+                )
+            })?;
         let bytes = sample
             .bytes
             .get(source_range.start..source_range.end)
@@ -204,13 +266,325 @@ fn replay_payloads<'a>(
                 limits.max_total_bytes
             )));
         }
+        if rule.payload_locator.declared_length.is_some() {
+            let expected = bytes.len();
+            let observed =
+                locator_declared_length_value(sample.bytes, &rule.payload_locator, seed.range.end);
+            if observed != u64::try_from(expected).ok() {
+                return Err(RelationalTransformError::RuleContradicted(format!(
+                    "payload length field decoded to {observed:?}, expected {expected}"
+                )));
+            }
+        }
         payloads.push(LocatedPayload {
             sample: sample.sample,
+            sample_index,
             source_range,
             bytes,
         });
     }
     Ok(payloads)
+}
+
+/// Preview the same bounded prefix from every discovery session after checking full ranges
+pub(super) fn preview_candidate_prefix<'a>(
+    samples: &[RelationalRecordSample<'a>],
+    discovery_groups: &[SessionGroup],
+    rule: &RelationalTransformRule,
+    limits: RelationalTransformLimits,
+    maximum_prefix_bytes: usize,
+    maximum_work_bytes: usize,
+) -> Result<Option<PrefixProbeOutput<'a>>, RelationalTransformError> {
+    if maximum_prefix_bytes == 0 {
+        return Ok(None);
+    }
+    let parameters = rule.operation.sha256_counter_xor();
+    let Some((discovery, common_prefix_length)) = prepare_prefix_discovery(
+        samples,
+        discovery_groups,
+        rule,
+        limits,
+        maximum_prefix_bytes,
+        parameters.counter_width,
+        parameters.initial_counter,
+    )?
+    else {
+        return Ok(None);
+    };
+    let transform_prefix_work =
+        prefix_transform_work(&discovery, common_prefix_length, parameters.counter_width)?;
+    if transform_prefix_work > maximum_work_bytes {
+        return Ok(None);
+    }
+    let Some(messages) =
+        transform_prefix_discovery(samples, discovery, parameters, common_prefix_length)?
+    else {
+        return Ok(None);
+    };
+    Ok(Some(PrefixProbeOutput {
+        messages,
+        work_bytes: transform_prefix_work,
+    }))
+}
+
+fn prepare_prefix_discovery<'a>(
+    samples: &[RelationalRecordSample<'a>],
+    discovery_groups: &[SessionGroup],
+    rule: &RelationalTransformRule,
+    limits: RelationalTransformLimits,
+    maximum_prefix_bytes: usize,
+    counter_width: CounterWidth,
+    initial_counter: u64,
+) -> Result<Option<(Vec<PreparedPrefixSession<'a>>, usize)>, RelationalTransformError> {
+    let mut discovery = Vec::new();
+    discovery
+        .try_reserve_exact(discovery_groups.len())
+        .map_err(|_| RelationalTransformError::AllocationFailed)?;
+    let mut common_prefix_length = maximum_prefix_bytes;
+
+    for group in discovery_groups {
+        let Some(prepared) =
+            prepare_prefix_session(samples, group, rule, limits, counter_width, initial_counter)?
+        else {
+            return Ok(None);
+        };
+        common_prefix_length = common_prefix_length.min(prepared.payload.bytes.len());
+        discovery.push(prepared);
+    }
+    if common_prefix_length == 0 {
+        return Ok(None);
+    }
+    Ok(Some((discovery, common_prefix_length)))
+}
+
+fn prefix_transform_work(
+    discovery: &[PreparedPrefixSession<'_>],
+    prefix_length: usize,
+    counter_width: CounterWidth,
+) -> Result<usize, RelationalTransformError> {
+    discovery
+        .iter()
+        .try_fold(0_usize, |total, prepared| {
+            let work = derivation::sha256_counter_xor_work(
+                prefix_length,
+                prepared.seed.bytes.len(),
+                counter_width,
+            )?;
+            total.checked_add(work)
+        })
+        .ok_or(RelationalTransformError::InvalidPlan(
+            "prefix probe work estimate overflowed",
+        ))
+}
+
+fn transform_prefix_discovery<'a>(
+    samples: &[RelationalRecordSample<'a>],
+    discovery: Vec<PreparedPrefixSession<'a>>,
+    parameters: RelationalSha256CounterXor,
+    common_prefix_length: usize,
+) -> Result<Option<Vec<PrefixProbeMessage<'a>>>, RelationalTransformError> {
+    let mut messages = Vec::new();
+    messages
+        .try_reserve_exact(discovery.len())
+        .map_err(|_| RelationalTransformError::AllocationFailed)?;
+    for prepared in discovery {
+        let input = prepared.payload.bytes.get(..common_prefix_length).ok_or(
+            RelationalTransformError::InvalidInput(
+                "prefix probe range is unavailable after preflight",
+            ),
+        )?;
+        let output = match derivation::preview_sha256_counter_xor(
+            input,
+            prepared.seed.bytes,
+            parameters.initial_counter,
+            parameters.counter_width,
+            parameters.counter_byte_order,
+            parameters.seed_order,
+        ) {
+            Ok(output) => output,
+            Err(crate::derivation::StepFailure::AllocationFailed) => {
+                return Err(RelationalTransformError::AllocationFailed);
+            }
+            Err(_) => return Ok(None),
+        };
+        let sample = samples.get(prepared.payload.sample_index).ok_or(
+            RelationalTransformError::InvalidInput("prefix probe references a missing sample"),
+        )?;
+        let source_end = prepared
+            .payload
+            .source_range
+            .start
+            .checked_add(common_prefix_length)
+            .ok_or(RelationalTransformError::InvalidInput(
+                "prefix probe source range overflowed",
+            ))?;
+        messages.push(PrefixProbeMessage {
+            sample: prepared.payload.sample,
+            context: sample.context.clone(),
+            source_range: crate::protocol::ByteRange {
+                start: prepared.payload.source_range.start,
+                end: source_end,
+            },
+            input,
+            output,
+        });
+    }
+    Ok(Some(messages))
+}
+
+fn prepare_prefix_session<'a>(
+    samples: &[RelationalRecordSample<'a>],
+    group: &SessionGroup,
+    rule: &RelationalTransformRule,
+    limits: RelationalTransformLimits,
+    counter_width: CounterWidth,
+    initial_counter: u64,
+) -> Result<Option<PreparedPrefixSession<'a>>, RelationalTransformError> {
+    let seed = match replay_seed(samples, group, rule, limits) {
+        Ok(seed) => seed,
+        Err(RelationalTransformError::RuleContradicted(_)) => return Ok(None),
+        Err(error) => return Err(error),
+    };
+    let payloads = match replay_payloads(samples, group, rule, limits, &seed) {
+        Ok(payloads) => payloads,
+        Err(RelationalTransformError::RuleContradicted(_)) => return Ok(None),
+        Err(error) => return Err(error),
+    };
+    if payloads.len() != 1
+        || !capacity_supports_full_payloads(
+            &payloads,
+            initial_counter,
+            counter_width,
+            rule.counter_reset,
+        )
+    {
+        return Ok(None);
+    }
+    Ok(Some(PreparedPrefixSession {
+        seed,
+        payload: payloads
+            .into_iter()
+            .next()
+            .ok_or(RelationalTransformError::InvalidInput(
+                "prefix payload disappeared after selection",
+            ))?,
+    }))
+}
+
+fn capacity_supports_full_payloads(
+    payloads: &[LocatedPayload<'_>],
+    initial_counter: u64,
+    counter_width: CounterWidth,
+    reset: RelationalCounterReset,
+) -> bool {
+    match reset {
+        RelationalCounterReset::Continuous => payloads
+            .iter()
+            .try_fold(0_usize, |total, payload| {
+                total.checked_add(payload.bytes.len())
+            })
+            .is_some_and(|length| {
+                derivation::validate_sha256_counter_xor_capacity(
+                    length,
+                    initial_counter,
+                    counter_width,
+                )
+                .is_ok()
+            }),
+        RelationalCounterReset::PerRecord => payloads.iter().all(|payload| {
+            derivation::validate_sha256_counter_xor_capacity(
+                payload.bytes.len(),
+                initial_counter,
+                counter_width,
+            )
+            .is_ok()
+        }),
+    }
+}
+
+fn payload_locator_matches(
+    samples: &[RelationalRecordSample<'_>],
+    group: &SessionGroup,
+    index: Option<&SelectorIndex>,
+    rule: &RelationalTransformRule,
+    seed: &LocatedSeed<'_>,
+) -> Result<Vec<usize>, RelationalTransformError> {
+    if rule.payload_locator.coordinate_basis == RelationalCoordinateBasis::MessageStartV1 {
+        return locator_matches(samples, group, index, &rule.payload_locator);
+    }
+
+    let marker_start =
+        offset_for_locator(&rule.payload_locator, seed.range.end, true).ok_or_else(|| {
+            RelationalTransformError::RuleContradicted("locator coordinate overflowed".to_owned())
+        })?;
+    let matches = samples.get(seed.sample_index).is_some_and(|sample| {
+        let direction_matches_payload = sample.context.direction == rule.payload_locator.direction;
+        let same_seed_sample = sample.sample == seed.sample;
+        let marker_matches = sample
+            .bytes
+            .get(marker_start..)
+            .and_then(|tail| tail.get(..rule.payload_locator.marker.len()))
+            == Some(rule.payload_locator.marker.as_slice());
+        direction_matches_payload && same_seed_sample && marker_matches
+    });
+    if !matches {
+        return Ok(Vec::new());
+    }
+    Ok(vec![seed.sample_index])
+}
+
+fn resolve_coordinate_offset(
+    basis: RelationalCoordinateBasis,
+    offset: usize,
+    seed_end: usize,
+) -> Result<usize, RelationalTransformError> {
+    let base = match basis {
+        RelationalCoordinateBasis::MessageStartV1 => 0,
+        RelationalCoordinateBasis::SeedRangeEndV1 => seed_end,
+    };
+    base.checked_add(offset).ok_or_else(|| {
+        RelationalTransformError::RuleContradicted("locator coordinate overflowed".to_owned())
+    })
+}
+
+fn payload_source_range(
+    locator: &RelationalByteRangeLocator,
+    seed: &LocatedSeed<'_>,
+    sample_length: usize,
+) -> Option<crate::protocol::ByteRange> {
+    let start = offset_for_locator(locator, seed.range.end, false)?;
+    let end = match locator.value_length {
+        Some(length) => start.checked_add(length)?,
+        None => sample_length,
+    };
+    (start < end).then_some(crate::protocol::ByteRange { start, end })
+}
+
+const fn offset_for_locator(
+    locator: &RelationalByteRangeLocator,
+    seed_end: usize,
+    marker: bool,
+) -> Option<usize> {
+    let offset = if marker {
+        locator.marker_offset
+    } else {
+        locator.value_offset
+    };
+    match locator.coordinate_basis {
+        RelationalCoordinateBasis::MessageStartV1 => Some(offset),
+        RelationalCoordinateBasis::SeedRangeEndV1 => seed_end.checked_add(offset),
+    }
+}
+
+fn locator_declared_length_value(
+    bytes: &[u8],
+    locator: &RelationalByteRangeLocator,
+    seed_end: usize,
+) -> Option<u64> {
+    let field = locator.declared_length?;
+    let offset =
+        resolve_coordinate_offset(locator.coordinate_basis, field.offset, seed_end).ok()?;
+    declared_length_value(bytes, RelationalLengthField { offset, ..field })
 }
 
 fn transformed_bytes(
@@ -413,14 +787,14 @@ fn check_session(
     };
     let Some(estimate) = transform_work_estimate(
         &inputs.payloads,
-        inputs.seed.len(),
+        inputs.seed.bytes.len(),
         context.rule.operation.sha256_counter_xor().counter_width,
         context.rule.counter_reset,
     ) else {
         return Ok(EvaluatedSessionCheck {
             check: failed_check(
                 group,
-                Some(inputs.seed_sample),
+                Some(inputs.seed.sample),
                 payload_sample_ids(&inputs.payloads)?,
                 RelationalFalsification::TransformFailed {
                     reason: "transform work estimate overflowed".to_owned(),
@@ -433,7 +807,7 @@ fn check_session(
         return Ok(EvaluatedSessionCheck {
             check: unresolved_check(
                 group,
-                Some(inputs.seed_sample),
+                Some(inputs.seed.sample),
                 payload_sample_ids(&inputs.payloads)?,
             ),
             output: None,
@@ -441,7 +815,7 @@ fn check_session(
     }
     let transformed = apply_transform(
         &inputs.payloads,
-        inputs.seed,
+        inputs.seed.bytes,
         context.rule.operation,
         context.rule.counter_reset,
         context.limits.max_total_bytes,
@@ -459,8 +833,7 @@ fn check_session(
 }
 
 struct SessionTransformInputs<'a> {
-    seed_sample: u64,
-    seed: &'a [u8],
+    seed: LocatedSeed<'a>,
     payloads: Vec<LocatedPayload<'a>>,
 }
 
@@ -471,20 +844,15 @@ fn prepare_session_inputs<'a>(
     rule: &RelationalTransformRule,
     limits: RelationalTransformLimits,
 ) -> SessionCheckResult<SessionTransformInputs<'a>> {
-    let (seed_sample, seed) = match locate_session_seed(samples, group, index, rule)? {
+    let seed = match locate_session_seed(samples, group, index, rule)? {
         Ok(seed) => seed,
         Err(failure) => return Ok(Err(failure)),
     };
-    let payloads = match locate_session_payloads(samples, group, index, rule, limits, seed_sample)?
-    {
+    let payloads = match locate_session_payloads(samples, group, index, rule, limits, &seed)? {
         Ok(payloads) => payloads,
         Err(failure) => return Ok(Err(failure)),
     };
-    Ok(Ok(SessionTransformInputs {
-        seed_sample,
-        seed,
-        payloads,
-    }))
+    Ok(Ok(SessionTransformInputs { seed, payloads }))
 }
 
 fn locate_session_seed<'a>(
@@ -492,7 +860,8 @@ fn locate_session_seed<'a>(
     group: &SessionGroup,
     index: Option<&SelectorIndex>,
     rule: &RelationalTransformRule,
-) -> SessionCheckResult<(u64, &'a [u8])> {
+) -> SessionCheckResult<LocatedSeed<'a>> {
+    validate_rule_coordinates(rule)?;
     let seed_matches = locator_matches(samples, group, index, &rule.seed_locator)?;
     if seed_matches.len() != 1 {
         return Ok(Err(failed_check(
@@ -553,7 +922,15 @@ fn locate_session_seed<'a>(
             RelationalFalsification::SeedRangeUnavailable,
         )));
     };
-    Ok(Ok((seed_sample.sample, seed)))
+    Ok(Ok(LocatedSeed {
+        sample: seed_sample.sample,
+        sample_index: seed_sample_index,
+        range: crate::protocol::ByteRange {
+            start: rule.seed_locator.value_offset,
+            end: seed_end,
+        },
+        bytes: seed,
+    }))
 }
 
 fn declared_length_value(
@@ -573,13 +950,13 @@ fn locate_session_payloads<'a>(
     index: Option<&SelectorIndex>,
     rule: &RelationalTransformRule,
     limits: RelationalTransformLimits,
-    seed_sample: u64,
+    seed: &LocatedSeed<'_>,
 ) -> SessionCheckResult<Vec<LocatedPayload<'a>>> {
-    let payload_matches = locator_matches(samples, group, index, &rule.payload_locator)?;
+    let payload_matches = payload_locator_matches(samples, group, index, rule, seed)?;
     if payload_matches.is_empty() {
         return Ok(Err(failed_check(
             group,
-            Some(seed_sample),
+            Some(seed.sample),
             Vec::new(),
             RelationalFalsification::NoPayloadMessages,
         )));
@@ -595,14 +972,20 @@ fn locate_session_payloads<'a>(
             .ok_or(RelationalTransformError::InvalidInput(
                 "payload locator references a missing message",
             ))?;
-        let source_range = crate::protocol::ByteRange {
-            start: rule.payload_locator.value_offset,
-            end: sample.bytes.len(),
+        let Some(source_range) =
+            payload_source_range(&rule.payload_locator, seed, sample.bytes.len())
+        else {
+            return Ok(Err(failed_check(
+                group,
+                Some(seed.sample),
+                payload_sample_ids(&payloads)?,
+                RelationalFalsification::EmptyPayloadRange,
+            )));
         };
         let Some(payload) = sample.bytes.get(source_range.start..source_range.end) else {
             return Ok(Err(failed_check(
                 group,
-                Some(seed_sample),
+                Some(seed.sample),
                 payload_sample_ids(&payloads)?,
                 RelationalFalsification::EmptyPayloadRange,
             )));
@@ -610,7 +993,7 @@ fn locate_session_payloads<'a>(
         if payload.is_empty() {
             return Ok(Err(failed_check(
                 group,
-                Some(seed_sample),
+                Some(seed.sample),
                 payload_sample_ids(&payloads)?,
                 RelationalFalsification::EmptyPayloadRange,
             )));
@@ -621,13 +1004,29 @@ fn locate_session_payloads<'a>(
         if payload_length > limits.max_total_bytes {
             return Ok(Err(failed_check(
                 group,
-                Some(seed_sample),
+                Some(seed.sample),
                 payload_sample_ids(&payloads)?,
                 RelationalFalsification::EmptyPayloadRange,
             )));
         }
+        if rule.payload_locator.declared_length.is_some() {
+            let observed =
+                locator_declared_length_value(sample.bytes, &rule.payload_locator, seed.range.end);
+            if observed != u64::try_from(payload.len()).ok() {
+                return Ok(Err(failed_check(
+                    group,
+                    Some(seed.sample),
+                    payload_sample_ids(&payloads)?,
+                    RelationalFalsification::PayloadLengthMismatch {
+                        expected: payload.len(),
+                        observed,
+                    },
+                )));
+            }
+        }
         payloads.push(LocatedPayload {
             sample: sample.sample,
+            sample_index,
             source_range,
             bytes: payload,
         });
@@ -642,11 +1041,8 @@ fn check_transformed_session(
     transformed: TransformOutput,
     output_mappings: Option<Vec<RelationalOutputMapping>>,
 ) -> Result<EvaluatedSessionCheck, RelationalTransformError> {
-    let SessionTransformInputs {
-        seed_sample,
-        payloads,
-        ..
-    } = inputs;
+    let SessionTransformInputs { seed, payloads } = inputs;
+    let seed_sample = seed.sample;
     let Some(output) = transformed.output else {
         return check_missing_transform_output(group, seed_sample, &payloads, transformed);
     };
@@ -994,11 +1390,7 @@ fn single_transform_work(
     seed_length: usize,
     counter_width: CounterWidth,
 ) -> Option<usize> {
-    let blocks = input_length.div_ceil(32);
-    let hash_input = seed_length
-        .checked_add(counter_width.byte_length())?
-        .checked_mul(blocks)?;
-    input_length.checked_mul(2)?.checked_add(hash_input)
+    derivation::sha256_counter_xor_work(input_length, seed_length, counter_width)
 }
 
 fn locator_matches(

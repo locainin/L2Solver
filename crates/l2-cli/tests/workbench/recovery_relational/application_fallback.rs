@@ -8,10 +8,10 @@ use l2_workbench::{
     protocol::{
         ByteRange, Direction, HoldoutBasis, MessageContext, RecordSchemaProposalLimits,
         RelationalAppliedOutput, RelationalByteRangeLocator, RelationalCandidateOutputs,
-        RelationalCounterReset, RelationalFit, RelationalFitStatus, RelationalOperationTemplate,
-        RelationalOutputMapping, RelationalParserScope, RelationalRecordSample,
-        RelationalRetainedEvaluation, RelationalSessionCheck, RelationalSessionId,
-        RelationalSha256CounterXor, RelationalTransformCandidate,
+        RelationalCoordinateBasis, RelationalCounterReset, RelationalFit, RelationalFitStatus,
+        RelationalOperationTemplate, RelationalOutputMapping, RelationalParserScope,
+        RelationalRecordSample, RelationalRetainedEvaluation, RelationalSessionCheck,
+        RelationalSessionId, RelationalSha256CounterXor, RelationalTransformCandidate,
         RelationalTransformEvaluationContext, RelationalTransformLimits, RelationalTransformPlan,
         RelationalTransformReport, RelationalTransformRule, RelationalTransformStatus,
     },
@@ -335,6 +335,7 @@ fn fit(checks: Vec<RelationalSessionCheck>) -> RelationalFit {
 
 fn nested_record_rule() -> RelationalTransformRule {
     let locator = RelationalByteRangeLocator {
+        coordinate_basis: RelationalCoordinateBasis::MessageStartV1,
         direction: Direction::FirstToSecond,
         marker_offset: 0,
         marker: vec![0x49],
@@ -382,6 +383,12 @@ fn transform_report(
         candidate_limit_remaining: 0,
         locator_candidates_examined: 1,
         locator_candidate_limit_remaining: 0,
+        prefix_probe_hypotheses_examined: 0,
+        prefix_probes_examined: 0,
+        prefix_probe_cache_reuses: 0,
+        prefix_probe_candidates_with_novelty: 0,
+        prefix_probe_work_bytes: 0,
+        prefix_probe_complete: true,
         work_bytes,
         work_bytes_remaining: APPLICATION_WORK_LIMIT.saturating_sub(work_bytes),
         search_exhaustive_within_plan: false,

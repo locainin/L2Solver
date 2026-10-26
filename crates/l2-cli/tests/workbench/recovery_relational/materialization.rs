@@ -11,12 +11,13 @@ use l2_workbench::{
     evidence::{Case, EvidenceStatus},
     protocol::{
         ByteRange, Direction, HoldoutBasis, MessageContext, RecordSchemaProposalLimits,
-        RelationalAppliedOutput, RelationalByteRangeLocator, RelationalCounterReset, RelationalFit,
-        RelationalFitStatus, RelationalOperationTemplate, RelationalOutputMapping,
-        RelationalParserScope, RelationalRecordSample, RelationalSessionCheck, RelationalSessionId,
-        RelationalSha256CounterXor, RelationalTransformCandidate,
-        RelationalTransformEvaluationContext, RelationalTransformLimits, RelationalTransformReport,
-        RelationalTransformRule, RelationalTransformStatus, apply_relational_transform_rule,
+        RelationalAppliedOutput, RelationalByteRangeLocator, RelationalCoordinateBasis,
+        RelationalCounterReset, RelationalFit, RelationalFitStatus, RelationalOperationTemplate,
+        RelationalOutputMapping, RelationalParserScope, RelationalRecordSample,
+        RelationalSessionCheck, RelationalSessionId, RelationalSha256CounterXor,
+        RelationalTransformCandidate, RelationalTransformEvaluationContext,
+        RelationalTransformLimits, RelationalTransformReport, RelationalTransformRule,
+        RelationalTransformStatus, apply_relational_transform_rule,
     },
     recovery::RecoveryTask,
     sha256,
@@ -373,6 +374,7 @@ fn frozen_session_relative_rule_replays_through_the_existing_record_gate() -> Te
 fn frozen_session_relative_rule() -> RelationalTransformRule {
     RelationalTransformRule {
         seed_locator: RelationalByteRangeLocator {
+            coordinate_basis: RelationalCoordinateBasis::MessageStartV1,
             direction: Direction::FirstToSecond,
             marker_offset: 3,
             marker: vec![0x1a, 0x73],
@@ -381,6 +383,7 @@ fn frozen_session_relative_rule() -> RelationalTransformRule {
             declared_length: None,
         },
         payload_locator: RelationalByteRangeLocator {
+            coordinate_basis: RelationalCoordinateBasis::MessageStartV1,
             direction: Direction::FirstToSecond,
             marker_offset: 3,
             marker: vec![0xb2, 0x39],
@@ -479,6 +482,12 @@ fn frozen_session_relative_report(
         candidate_limit_remaining: 0,
         locator_candidates_examined: 0,
         locator_candidate_limit_remaining: 0,
+        prefix_probe_hypotheses_examined: 0,
+        prefix_probes_examined: 0,
+        prefix_probe_cache_reuses: 0,
+        prefix_probe_candidates_with_novelty: 0,
+        prefix_probe_work_bytes: 0,
+        prefix_probe_complete: true,
         work_bytes: 0,
         work_bytes_remaining: work_limit,
         search_exhaustive_within_plan: true,
@@ -1135,6 +1144,7 @@ fn fit(checks: Vec<RelationalSessionCheck>) -> RelationalFit {
 
 fn locator(value_offset: usize) -> RelationalByteRangeLocator {
     RelationalByteRangeLocator {
+        coordinate_basis: RelationalCoordinateBasis::MessageStartV1,
         direction: Direction::FirstToSecond,
         marker_offset: 0,
         marker: vec![0x4d],

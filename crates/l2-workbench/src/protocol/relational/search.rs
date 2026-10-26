@@ -1,8 +1,10 @@
 //! Bounded search and frozen rule replay for relational transforms
 
+mod anchor;
 mod discovery;
 mod input;
 mod locator;
+mod probe;
 mod replay;
 
 pub use discovery::{

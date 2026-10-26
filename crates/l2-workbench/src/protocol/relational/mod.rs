@@ -5,12 +5,13 @@ mod search;
 
 pub use model::{
     RelationalAppliedOutput, RelationalByteRangeLocator, RelationalCandidateEvaluation,
-    RelationalCandidateEvaluationReport, RelationalCandidateOutputs, RelationalCounterReset,
-    RelationalEvaluationError, RelationalFalsification, RelationalFit, RelationalFitStatus,
-    RelationalLengthField, RelationalOperationTemplate, RelationalOutputMapping,
-    RelationalParserScope, RelationalRecordSample, RelationalRetainedEvaluation,
-    RelationalSearchLimit, RelationalSessionCheck, RelationalSessionId, RelationalSha256CounterXor,
-    RelationalTransformCandidate, RelationalTransformError, RelationalTransformEvaluationContext,
+    RelationalCandidateEvaluationReport, RelationalCandidateOutputs, RelationalCoordinateBasis,
+    RelationalCounterReset, RelationalEvaluationError, RelationalFalsification, RelationalFit,
+    RelationalFitStatus, RelationalLengthField, RelationalOperationTemplate,
+    RelationalOutputMapping, RelationalParserScope, RelationalRecordSample,
+    RelationalRetainedEvaluation, RelationalSearchLimit, RelationalSessionCheck,
+    RelationalSessionId, RelationalSha256CounterXor, RelationalTransformCandidate,
+    RelationalTransformError, RelationalTransformEvaluationContext,
     RelationalTransformEvaluationOptions, RelationalTransformLimits, RelationalTransformPlan,
     RelationalTransformReport, RelationalTransformRule, RelationalTransformStatus,
 };

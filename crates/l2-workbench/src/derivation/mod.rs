@@ -36,7 +36,10 @@ pub const MAX_RECIPE_PARAMETER_BYTES: usize = 4 * 1024 * 1024;
 pub const DEFAULT_MAX_WORK_BYTES: usize = MAX_INPUT_BYTES * MAX_STEPS + MAX_INTERMEDIATE_BYTES;
 
 pub(crate) use identity::OperationIdentity;
-pub(crate) use transform::select_bit_plane_chunks;
+pub(crate) use transform::{
+    preview_sha256_counter_xor, select_bit_plane_chunks, sha256_counter_xor_work,
+    validate_sha256_counter_xor_capacity,
+};
 
 /// Report whether one recipe binds any operand to its selected input node
 pub(crate) fn has_selected_input_reference(recipe: &Recipe) -> bool {

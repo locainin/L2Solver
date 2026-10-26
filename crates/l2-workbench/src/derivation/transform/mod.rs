@@ -4,12 +4,53 @@ mod codec;
 mod compression;
 mod crypto;
 
-use super::{OperandRef, Operation, StepFailure};
+use super::{CounterByteOrder, CounterWidth, OperandRef, Operation, SeedCounterOrder, StepFailure};
 
 pub use bits::select_bit_plane_chunks;
 
 pub(super) fn crypto_work_overhead(input_length: usize, operation: &Operation) -> Option<usize> {
     crypto::work_overhead(input_length, operation)
+}
+
+pub fn sha256_counter_xor_work(
+    input_length: usize,
+    seed_length: usize,
+    counter_width: CounterWidth,
+) -> Option<usize> {
+    crypto::sha256_counter_xor_work(input_length, seed_length, counter_width)
+}
+
+pub fn validate_sha256_counter_xor_capacity(
+    input_length: usize,
+    initial_counter: u64,
+    counter_width: CounterWidth,
+) -> Result<(), StepFailure> {
+    crypto::validate_sha256_counter_xor_capacity(input_length, initial_counter, counter_width)
+}
+
+/// Apply the canonical SHA-256 counter-XOR primitive to one bounded byte prefix
+pub fn preview_sha256_counter_xor(
+    input: &[u8],
+    seed: &[u8],
+    initial_counter: u64,
+    counter_width: CounterWidth,
+    counter_byte_order: CounterByteOrder,
+    seed_order: SeedCounterOrder,
+) -> Result<Vec<u8>, StepFailure> {
+    crypto::sha256_counter_xor(
+        input,
+        seed,
+        initial_counter,
+        counter_width,
+        counter_byte_order,
+        seed_order,
+        OutputBudget {
+            remaining_intermediate: input.len(),
+            max_output: input.len(),
+            max_intermediate: input.len(),
+            max_key_bytes: seed.len(),
+        },
+    )
 }
 
 #[derive(Clone, Copy)]
