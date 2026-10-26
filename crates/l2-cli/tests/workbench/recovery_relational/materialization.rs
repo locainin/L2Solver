@@ -365,7 +365,7 @@ fn assert_accepted_schema_uses_byte_identity(
         frame.candidate_index = 7;
     }
     assert!(
-        super::validate_accepted_record_schema(7, frames, &accepted).is_ok(),
+        super::validate_accepted_record_schema(7, frames, accepted).is_ok(),
         "the exact accepted bytes remain valid when the retained candidate index changes"
     );
     let original_bytes = frames
@@ -378,7 +378,7 @@ fn assert_accepted_schema_uses_byte_identity(
         .and_then(|frame| frame.bytes.first_mut())
         .ok_or("accepted schema frame is empty")? ^= 1;
     assert!(
-        super::validate_accepted_record_schema(7, frames, &accepted).is_err(),
+        super::validate_accepted_record_schema(7, frames, accepted).is_err(),
         "changed decoded bytes must invalidate the accepted schema identity"
     );
     frames

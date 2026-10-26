@@ -17,6 +17,7 @@ mod record_handoff;
 
 const REPORT_KIND: &str = "recovery_record_discovery_report";
 type TestResult<T> = Result<T, Box<dyn Error>>;
+type AcceptedFrameMember = (u64, u64, u64, u64, u64, String);
 
 struct MaterializedSession {
     episode_node: u64,
@@ -1552,11 +1553,40 @@ fn assert_relational_schema_handoff(
     report: &Value,
     expected_artifact: &[u8],
 ) -> TestResult<()> {
-    let checks = report
+    let accepted = exact_accepted_schema(report)?;
+    let schema = accepted
+        .get("schema")
+        .ok_or("accepted record schema is missing")?;
+    let frame_identities = accepted_frame_identities(accepted)?;
+    let expected_sha256 = l2_workbench::sha256(expected_artifact);
+    assert_exact_schema_artifact_receipt(accepted, &expected_sha256, expected_artifact.len())?;
+    let expected_members = accepted_frame_members(frame_identities)?;
+    let selected_receipts = selected_record_receipt_ids(case, report_node_id);
+    assert!(
+        !selected_receipts.is_empty(),
+        "the frozen relational schema was not scheduled for final assembly"
+    );
+    for receipt_id in selected_receipts {
+        let receipt_node = case
+            .node(receipt_id)
+            .ok_or("selected record receipt disappeared")?;
+        assert_receipt_uses_accepted_schema(
+            case,
+            receipt_node,
+            schema,
+            &expected_members,
+            &expected_sha256,
+            expected_artifact.len(),
+        )?;
+    }
+    Ok(())
+}
+
+fn exact_accepted_schema(report: &Value) -> TestResult<&Value> {
+    report
         .get("application_evidence_checks")
         .and_then(Value::as_array)
-        .ok_or("relational report omitted application evidence")?;
-    let accepted_check = checks
+        .ok_or("relational report omitted application evidence")?
         .iter()
         .find(|check| {
             check.get("artifact_validated") == Some(&Value::Bool(true))
@@ -1564,13 +1594,11 @@ fn assert_relational_schema_handoff(
                     .get("accepted_record_schema")
                     .is_some_and(Value::is_object)
         })
-        .ok_or("relational report has no exact artifact acceptance")?;
-    let accepted = accepted_check
-        .get("accepted_record_schema")
-        .ok_or("exact artifact acceptance omitted its frozen record schema")?;
-    let schema = accepted
-        .get("schema")
-        .ok_or("accepted record schema is missing")?;
+        .and_then(|check| check.get("accepted_record_schema"))
+        .ok_or_else(|| "relational report has no exact artifact acceptance".into())
+}
+
+fn accepted_frame_identities(accepted: &Value) -> TestResult<&[Value]> {
     let strategy = accepted
         .get("strategy")
         .and_then(Value::as_str)
@@ -1580,17 +1608,18 @@ fn assert_relational_schema_handoff(
         .get("frame_indices")
         .and_then(Value::as_array)
         .ok_or("accepted record schema omitted full frame membership")?;
-    let frame_identities = accepted
+    let identities = accepted
         .get("frame_identities")
         .and_then(Value::as_array)
         .ok_or("accepted record schema omitted frame identities")?;
     assert!(!frame_indices.is_empty());
-    assert_eq!(frame_indices.len(), frame_identities.len());
-    for (position, (index, identity)) in frame_indices.iter().zip(frame_identities).enumerate() {
-        assert_eq!(index.as_u64(), u64::try_from(position).ok());
+    assert_eq!(frame_indices.len(), identities.len());
+    for (position, (index, identity)) in frame_indices.iter().zip(identities).enumerate() {
+        let expected_index = u64::try_from(position).ok();
+        assert_eq!(index.as_u64(), expected_index);
         assert_eq!(
             identity.get("frame_index").and_then(Value::as_u64),
-            u64::try_from(position).ok()
+            expected_index
         );
         assert!(
             identity
@@ -1605,38 +1634,32 @@ fn assert_relational_schema_handoff(
                 .is_some_and(|digest| digest.len() == 64)
         );
     }
+    Ok(identities)
+}
 
-    let expected_sha256 = l2_workbench::sha256(expected_artifact);
-    let artifact_receipt = accepted
+fn assert_exact_schema_artifact_receipt(
+    accepted: &Value,
+    expected_sha256: &str,
+    expected_length: usize,
+) -> TestResult<()> {
+    let receipt = accepted
         .get("artifact_receipt")
         .ok_or("accepted schema omitted the exact assembled group receipt")?;
     assert_eq!(
-        artifact_receipt
-            .get("output_sha256")
-            .and_then(Value::as_str),
-        Some(expected_sha256.as_str())
+        receipt.get("output_sha256").and_then(Value::as_str),
+        Some(expected_sha256)
     );
     assert_eq!(
-        artifact_receipt
-            .get("output_length")
-            .and_then(Value::as_u64),
-        u64::try_from(expected_artifact.len()).ok()
+        receipt.get("output_length").and_then(Value::as_u64),
+        u64::try_from(expected_length).ok()
     );
+    Ok(())
+}
 
-    let selected_receipts = case
-        .edges()
-        .iter()
-        .filter(|edge| {
-            edge.from == report_node_id && edge.relation == "record_schema_selected_from"
-        })
-        .filter_map(|edge| case.node(edge.to))
-        .filter(|node| node.kind == "record_parse_receipt")
-        .collect::<Vec<_>>();
-    assert!(
-        !selected_receipts.is_empty(),
-        "the frozen relational schema was not scheduled for final assembly"
-    );
-    let expected_members = frame_identities
+fn accepted_frame_members(
+    identities: &[Value],
+) -> TestResult<std::collections::BTreeSet<AcceptedFrameMember>> {
+    identities
         .iter()
         .map(|identity| {
             Ok((
@@ -1667,94 +1690,129 @@ fn assert_relational_schema_handoff(
                     .to_owned(),
             ))
         })
-        .collect::<TestResult<std::collections::BTreeSet<_>>>()?;
+        .collect()
+}
 
-    for receipt_node in selected_receipts {
-        let receipt_blob_id = receipt_node
-            .blob
-            .as_deref()
-            .ok_or("selected record receipt has no serialized evidence")?;
-        let receipt_blob = case
-            .blob(receipt_blob_id)
-            .ok_or("selected record receipt bytes are missing")?;
-        let receipt: Value = serde_json::from_slice(&receipt_blob.bytes)?;
-        let inputs = receipt
-            .get("inputs")
-            .and_then(Value::as_array)
-            .ok_or("record receipt omitted its full input list")?;
-        assert_eq!(inputs.len(), expected_members.len());
-        for input in inputs {
-            let frame_node_id = input
-                .get("input_node")
-                .and_then(Value::as_u64)
-                .ok_or("record receipt input omitted its frame node")?;
-            let frame_node = case
-                .node(frame_node_id)
-                .filter(|node| node.kind == "relational_decoded_frame")
-                .ok_or("record receipt did not retain a relational decoded frame")?;
-            let actual_member = (
-                frame_node
-                    .details
-                    .get("input_frame_node_id")
-                    .and_then(Value::as_u64)
-                    .ok_or("decoded frame omitted its source input identity")?,
-                frame_node
-                    .details
-                    .get("session_node_id")
-                    .and_then(Value::as_u64)
-                    .ok_or("decoded frame omitted its session identity")?,
-                frame_node
-                    .details
-                    .get("session_order")
-                    .and_then(Value::as_u64)
-                    .ok_or("decoded frame omitted its session order")?,
-                frame_node
-                    .details
-                    .get("stream_offset")
-                    .and_then(Value::as_u64)
-                    .ok_or("decoded frame omitted its stream offset")?,
-                u64::try_from(
-                    frame_node
-                        .blob
-                        .as_deref()
-                        .and_then(|blob_id| case.blob(blob_id))
-                        .ok_or("decoded frame bytes are missing")?
-                        .bytes
-                        .len(),
-                )?,
-                frame_node
-                    .blob
-                    .as_deref()
-                    .and_then(|blob_id| blob_id.strip_prefix("sha256:"))
-                    .ok_or("decoded frame blob digest is missing")?
-                    .to_owned(),
-            );
-            assert!(expected_members.contains(&actual_member));
-            let parse_schema = input
-                .pointer("/parse/schema")
-                .ok_or("final record parse did not retain its schema")?;
-            assert_eq!(parse_schema, schema);
-        }
-        let receipt_members = inputs
-            .iter()
-            .filter_map(|input| input.get("input_node").and_then(Value::as_u64))
-            .collect::<std::collections::BTreeSet<_>>();
-        let expected_frame_nodes = inputs
-            .iter()
-            .filter_map(|input| input.get("input_node").and_then(Value::as_u64))
-            .count();
-        assert_eq!(receipt_members.len(), expected_frame_nodes);
+fn selected_record_receipt_ids(case: &Case, report_node_id: u64) -> Vec<u64> {
+    case.edges()
+        .iter()
+        .filter(|edge| {
+            edge.from == report_node_id && edge.relation == "record_schema_selected_from"
+        })
+        .map(|edge| edge.to)
+        .filter(|node_id| {
+            case.node(*node_id)
+                .is_some_and(|node| node.kind == "record_parse_receipt")
+        })
+        .collect()
+}
 
-        let groups = receipt
-            .pointer("/assembly/groups")
-            .and_then(Value::as_array)
-            .ok_or("final assembly receipt omitted its group mappings")?;
-        assert!(groups.iter().any(|group| {
-            group.get("output_sha256").and_then(Value::as_str) == Some(expected_sha256.as_str())
-                && group.get("output_length").and_then(Value::as_u64)
-                    == u64::try_from(expected_artifact.len()).ok()
-        }));
+fn assert_receipt_uses_accepted_schema(
+    case: &Case,
+    receipt_node: &l2_workbench::evidence::Node,
+    schema: &Value,
+    expected_members: &std::collections::BTreeSet<AcceptedFrameMember>,
+    expected_sha256: &str,
+    expected_length: usize,
+) -> TestResult<()> {
+    let blob_id = receipt_node
+        .blob
+        .as_deref()
+        .ok_or("selected record receipt has no serialized evidence")?;
+    let blob = case
+        .blob(blob_id)
+        .ok_or("selected record receipt bytes are missing")?;
+    let receipt: Value = serde_json::from_slice(&blob.bytes)?;
+    let inputs = receipt
+        .get("inputs")
+        .and_then(Value::as_array)
+        .ok_or("record receipt omitted its full input list")?;
+    assert_eq!(inputs.len(), expected_members.len());
+    assert_receipt_input_members(case, inputs, schema, expected_members)?;
+    assert_receipt_contains_exact_artifact(&receipt, expected_sha256, expected_length)
+}
+
+fn assert_receipt_input_members(
+    case: &Case,
+    inputs: &[Value],
+    schema: &Value,
+    expected_members: &std::collections::BTreeSet<AcceptedFrameMember>,
+) -> TestResult<()> {
+    let mut receipt_frame_ids = std::collections::BTreeSet::new();
+    for input in inputs {
+        let frame_node_id = input
+            .get("input_node")
+            .and_then(Value::as_u64)
+            .ok_or("record receipt input omitted its frame node")?;
+        assert!(receipt_frame_ids.insert(frame_node_id));
+        let frame = case
+            .node(frame_node_id)
+            .filter(|node| node.kind == "relational_decoded_frame")
+            .ok_or("record receipt did not retain a relational decoded frame")?;
+        assert!(expected_members.contains(&accepted_frame_member(case, frame)?));
+        let parse_schema = input
+            .pointer("/parse/schema")
+            .ok_or("final record parse did not retain its schema")?;
+        assert_eq!(parse_schema, schema);
     }
+    assert_eq!(receipt_frame_ids.len(), inputs.len());
+    Ok(())
+}
+
+fn accepted_frame_member(
+    case: &Case,
+    frame: &l2_workbench::evidence::Node,
+) -> TestResult<AcceptedFrameMember> {
+    let blob_id = frame
+        .blob
+        .as_deref()
+        .ok_or("decoded frame bytes are missing")?;
+    let blob = case
+        .blob(blob_id)
+        .ok_or("decoded frame bytes are missing")?;
+    let digest = blob_id
+        .strip_prefix("sha256:")
+        .ok_or("decoded frame blob digest is missing")?;
+    Ok((
+        frame
+            .details
+            .get("input_frame_node_id")
+            .and_then(Value::as_u64)
+            .ok_or("decoded frame omitted its source input identity")?,
+        frame
+            .details
+            .get("session_node_id")
+            .and_then(Value::as_u64)
+            .ok_or("decoded frame omitted its session identity")?,
+        frame
+            .details
+            .get("session_order")
+            .and_then(Value::as_u64)
+            .ok_or("decoded frame omitted its session order")?,
+        frame
+            .details
+            .get("stream_offset")
+            .and_then(Value::as_u64)
+            .ok_or("decoded frame omitted its stream offset")?,
+        u64::try_from(blob.bytes.len())?,
+        digest.to_owned(),
+    ))
+}
+
+fn assert_receipt_contains_exact_artifact(
+    receipt: &Value,
+    expected_sha256: &str,
+    expected_length: usize,
+) -> TestResult<()> {
+    let groups = receipt
+        .pointer("/assembly/groups")
+        .and_then(Value::as_array)
+        .ok_or("final assembly receipt omitted its group mappings")?;
+    assert!(groups.iter().any(|group| {
+        group.get("output_sha256").and_then(Value::as_str) == Some(expected_sha256)
+            && group.get("output_length").and_then(Value::as_u64)
+                == u64::try_from(expected_length).ok()
+    }));
     Ok(())
 }
 
@@ -2334,12 +2392,21 @@ fn save_case_snapshot(
 
 #[test]
 fn clear_record_headers_do_not_admit_randomly_decoded_payloads() -> TestResult<()> {
+    let mut case = Case::new();
+    let source = capture(&mut case, "clear-header-random-payload")?;
+    add_clear_header_random_sessions(&mut case, &source)?;
+    let _summary =
+        recover_case_with_job(&mut case, RecoveryProfile::Normal, 64 * 1024 * 1024, None)?;
+    let reports = load_relational_reports(&case);
+    assert_clear_header_report_is_pending(&reports);
+    assert_clear_header_produced_no_outputs(&case, &reports)
+}
+
+fn add_clear_header_random_sessions(case: &mut Case, source: &str) -> TestResult<()> {
     use l2_workbench::derivation::{
         CounterByteOrder, CounterWidth, OperandRef, Operation, Recipe, SeedCounterOrder, run,
     };
 
-    let mut case = Case::new();
-    let source = capture(&mut case, "clear-header-random-payload")?;
     for session_index in 0..4_u64 {
         let session_byte = u8::try_from(session_index)?;
         let seed = (0..8_u8)
@@ -2373,25 +2440,18 @@ fn clear_record_headers_do_not_admit_randomly_decoded_payloads() -> TestResult<(
 
         let packet = 8 + session_index * 10;
         let context = add_session_context(
-            &mut case,
+            case,
             "clear-header-random-payload-scope",
             packet,
             0,
             wire.len(),
         )?;
-        add_tcp_run_in_context(&mut case, &source, context.direction_node, packet, &wire)?;
+        add_tcp_run_in_context(case, source, context.direction_node, packet, &wire)?;
     }
+    Ok(())
+}
 
-    let _summary =
-        recover_case_with_job(&mut case, RecoveryProfile::Normal, 64 * 1024 * 1024, None)?;
-    let reports = case
-        .nodes()
-        .iter()
-        .filter(|node| node.kind == "recovery_relational_transform_report")
-        .filter_map(|node| node.blob.as_deref())
-        .filter_map(|blob_id| case.blob(blob_id))
-        .filter_map(|blob| serde_json::from_slice::<Value>(&blob.bytes).ok())
-        .collect::<Vec<_>>();
+fn assert_clear_header_report_is_pending(reports: &[Value]) {
     assert!(
         reports.iter().any(|report| {
             report
@@ -2407,6 +2467,9 @@ fn clear_record_headers_do_not_admit_randomly_decoded_payloads() -> TestResult<(
         }),
         "clear record headers should report schema support as unresolved without output"
     );
+}
+
+fn assert_clear_header_produced_no_outputs(case: &Case, reports: &[Value]) -> TestResult<()> {
     let unexpected_outputs = case
         .nodes()
         .iter()
@@ -2419,6 +2482,9 @@ fn clear_record_headers_do_not_admit_randomly_decoded_payloads() -> TestResult<(
         .take(12)
         .map(|node| (node.id, node.kind.as_str(), &node.details))
         .collect::<Vec<_>>();
+    if unexpected_outputs.is_empty() {
+        return Ok(());
+    }
     let unexpected_candidates = unexpected_outputs
         .iter()
         .filter_map(|(_, _, details)| {
@@ -2441,16 +2507,8 @@ fn clear_record_headers_do_not_admit_randomly_decoded_payloads() -> TestResult<(
         .take(12)
         .cloned()
         .collect::<Vec<_>>();
-    let failure_snapshot = if unexpected_outputs.is_empty() {
-        None
-    } else {
-        let details = serde_json::to_string_pretty(&matching_gate_checks)?;
-        Some(save_case_snapshot(
-            &case,
-            "l2-clear-header-gate-",
-            Some(&details),
-        )?)
-    };
+    let details = serde_json::to_string_pretty(&matching_gate_checks)?;
+    let failure_snapshot = save_case_snapshot(case, "l2-clear-header-gate-", Some(&details))?;
     assert!(
         unexpected_outputs.is_empty(),
         "valid unchanged headers must not materialize random transformed payloads: outputs={unexpected_outputs:#?}; gate_checks={matching_gate_checks:#?}; snapshot={failure_snapshot:?}"
