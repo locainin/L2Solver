@@ -1,7 +1,8 @@
 use l2_workbench::{
     derivation::{CounterByteOrder, CounterWidth, SeedCounterOrder},
     protocol::{
-        Direction, MessageContext, RelationalCounterReset, RelationalFitStatus,
+        ByteOrder, Direction, MessageContext, RelationalCounterReset, RelationalFalsification,
+        RelationalFitStatus, RelationalLengthField, RelationalOperationTemplate,
         RelationalParserScope, RelationalRecordSample, RelationalTransformLimits,
         RelationalTransformPlan, RelationalTransformStatus, apply_relational_transform_rule,
         infer_relational_transform_candidates,
@@ -58,30 +59,11 @@ fn learns_session_relative_seed_and_payload_ranges_across_frozen_sessions()
         candidate.status,
         RelationalTransformStatus::HeldoutConstraintsSatisfied
     );
-    assert_eq!(
-        candidate.rule.operation.sha256_counter_xor().counter_width,
-        CounterWidth::EightBytes
-    );
-    assert_eq!(
-        candidate
-            .rule
-            .operation
-            .sha256_counter_xor()
-            .counter_byte_order,
-        CounterByteOrder::LittleEndian
-    );
-    assert_eq!(
-        candidate.rule.operation.sha256_counter_xor().seed_order,
-        SeedCounterOrder::CounterThenSeed
-    );
-    assert_eq!(
-        candidate
-            .rule
-            .operation
-            .sha256_counter_xor()
-            .initial_counter,
-        3
-    );
+    let RelationalOperationTemplate::Sha256CounterXor(operation) = candidate.rule.operation;
+    assert_eq!(operation.counter_width, CounterWidth::EightBytes);
+    assert_eq!(operation.counter_byte_order, CounterByteOrder::LittleEndian);
+    assert_eq!(operation.seed_order, SeedCounterOrder::CounterThenSeed);
+    assert_eq!(operation.initial_counter, 3);
     assert_eq!(
         report.candidate_limit_remaining,
         search_plan().limits.max_candidates - report.candidates_examined
@@ -270,6 +252,168 @@ fn discovers_disjoint_seed_and_payload_ranges_in_one_message() -> Result<(), Box
 }
 
 #[test]
+fn prioritizes_length_prefixed_seed_over_high_variance_ranges_under_candidate_budget()
+-> TestResult<()> {
+    let records = length_prefixed_seed_sessions(
+        SeedLengthEncoding {
+            width: CounterWidth::OneByte,
+            byte_order: ByteOrder::BigEndian,
+        },
+        None,
+    )?;
+    let samples = borrow_samples(&records)?;
+    let plan = length_prefixed_seed_plan();
+    let report = infer_relational_transform_candidates(&samples, &plan)?;
+
+    assert_eq!(report.candidates_examined, 1);
+    let candidate = report
+        .candidates
+        .first()
+        .ok_or("the bounded search did not retain its first candidate")?;
+    assert_eq!(candidate.rule.seed_locator.value_offset, 2);
+    assert_eq!(candidate.rule.seed_locator.value_length, Some(SEED_LENGTH));
+    assert_eq!(
+        candidate.rule.seed_locator.declared_length,
+        Some(RelationalLengthField {
+            offset: 1,
+            width: CounterWidth::OneByte,
+            byte_order: ByteOrder::BigEndian,
+        })
+    );
+    assert_eq!(candidate.rule.payload_locator.value_offset, 1);
+    assert_eq!(
+        candidate.status,
+        RelationalTransformStatus::HeldoutConstraintsSatisfied
+    );
+    Ok(())
+}
+
+#[test]
+fn frozen_seed_length_field_rejects_changed_and_truncated_heldout_prefixes() -> TestResult<()> {
+    for mutation in [
+        HeldoutPrefixMutation::Changed,
+        HeldoutPrefixMutation::Truncated,
+    ] {
+        let encoding = SeedLengthEncoding {
+            width: CounterWidth::OneByte,
+            byte_order: ByteOrder::BigEndian,
+        };
+        let records = length_prefixed_seed_sessions(encoding, Some(mutation))?;
+        let samples = borrow_samples(&records)?;
+        let plan = length_prefixed_seed_plan();
+        let report = infer_relational_transform_candidates(&samples, &plan)?;
+        let candidate = report
+            .candidates
+            .first()
+            .ok_or("the bounded search did not retain its first candidate")?;
+
+        assert_eq!(candidate.rule.seed_locator.value_offset, 2);
+        assert!(candidate.rule.seed_locator.declared_length.is_some());
+        assert_eq!(
+            candidate.discovery.status,
+            RelationalFitStatus::ConstraintsSatisfied
+        );
+        assert_eq!(candidate.heldout.status, RelationalFitStatus::Contradicted);
+        assert_eq!(
+            candidate.status,
+            RelationalTransformStatus::ContradictedByHeldoutSession
+        );
+        let heldout_check = candidate
+            .heldout
+            .checks
+            .iter()
+            .find(|check| check.session.session == 4)
+            .ok_or("the mutated held-out session was not checked")?;
+        assert_eq!(
+            heldout_check.falsification,
+            Some(RelationalFalsification::SeedLengthMismatch {
+                expected: SEED_LENGTH,
+                observed: match mutation {
+                    HeldoutPrefixMutation::Changed => Some(u64::try_from(SEED_LENGTH - 1)?),
+                    HeldoutPrefixMutation::Truncated => None,
+                },
+            })
+        );
+
+        let heldout_samples = samples
+            .iter()
+            .filter(|sample| sample.context.session == 4)
+            .cloned()
+            .collect::<Vec<_>>();
+        assert!(
+            apply_relational_transform_rule(
+                &heldout_samples,
+                &candidate.rule,
+                plan.limits,
+                plan.limits.max_work_bytes,
+            )
+            .is_err()
+        );
+    }
+    Ok(())
+}
+
+#[test]
+fn recognizes_length_fields_across_supported_widths_and_byte_orders() -> TestResult<()> {
+    for encoding in [
+        SeedLengthEncoding {
+            width: CounterWidth::OneByte,
+            byte_order: ByteOrder::BigEndian,
+        },
+        SeedLengthEncoding {
+            width: CounterWidth::TwoBytes,
+            byte_order: ByteOrder::BigEndian,
+        },
+        SeedLengthEncoding {
+            width: CounterWidth::TwoBytes,
+            byte_order: ByteOrder::LittleEndian,
+        },
+        SeedLengthEncoding {
+            width: CounterWidth::FourBytes,
+            byte_order: ByteOrder::BigEndian,
+        },
+        SeedLengthEncoding {
+            width: CounterWidth::FourBytes,
+            byte_order: ByteOrder::LittleEndian,
+        },
+        SeedLengthEncoding {
+            width: CounterWidth::EightBytes,
+            byte_order: ByteOrder::BigEndian,
+        },
+        SeedLengthEncoding {
+            width: CounterWidth::EightBytes,
+            byte_order: ByteOrder::LittleEndian,
+        },
+    ] {
+        let records = length_prefixed_seed_sessions(encoding, None)?;
+        let samples = borrow_samples(&records)?;
+        let plan = length_prefixed_seed_plan();
+        let report = infer_relational_transform_candidates(&samples, &plan)?;
+        let candidate = report
+            .candidates
+            .first()
+            .ok_or("the bounded search did not retain its first candidate")?;
+        assert_eq!(
+            candidate.rule.seed_locator.value_offset,
+            1 + encoding.width.byte_length()
+        );
+        assert_eq!(
+            candidate.rule.seed_locator.declared_length,
+            Some(RelationalLengthField {
+                offset: 1,
+                width: encoding.width,
+                byte_order: encoding.byte_order,
+            })
+        );
+        assert_eq!(
+            candidate.status,
+            RelationalTransformStatus::HeldoutConstraintsSatisfied
+        );
+    }
+    Ok(())
+}
+
+#[test]
 fn does_not_retain_a_same_message_rule_with_overlapping_seed_and_payload_ranges()
 -> Result<(), Box<dyn Error>> {
     let records = overlapping_same_message_sessions();
@@ -344,6 +488,113 @@ fn same_message_plan() -> RelationalTransformPlan {
         initial_counters: vec![0],
         counter_resets: vec![RelationalCounterReset::Continuous],
     }
+}
+
+fn length_prefixed_seed_plan() -> RelationalTransformPlan {
+    RelationalTransformPlan {
+        limits: RelationalTransformLimits {
+            max_cohorts: 4,
+            max_sessions: 4,
+            max_records_per_session: 2,
+            max_record_bytes: 128,
+            max_total_bytes: 1024,
+            max_marker_bytes: 1,
+            max_marker_offset: 0,
+            max_seed_bytes: SEED_LENGTH,
+            max_locator_offset: 18,
+            max_locator_candidates: 2048,
+            max_candidates: 1,
+            max_retained_candidates: 4,
+            max_work_bytes: 1024 * 1024,
+        },
+        parser_scope: RelationalParserScope::EachSession,
+        parser_formats: vec![l2_workbench::artifact::ArtifactValidationFormat::Der],
+        counter_widths: vec![CounterWidth::OneByte],
+        counter_byte_orders: vec![CounterByteOrder::BigEndian],
+        seed_orders: vec![SeedCounterOrder::SeedThenCounter],
+        initial_counters: vec![0],
+        counter_resets: vec![RelationalCounterReset::Continuous],
+    }
+}
+
+fn length_prefixed_seed_sessions(
+    encoding: SeedLengthEncoding,
+    heldout_mutation: Option<HeldoutPrefixMutation>,
+) -> TestResult<Vec<OwnedRecord>> {
+    let mut records = Vec::new();
+    for session_number in 1_u8..=4 {
+        let session = u32::from(session_number);
+        let seed = (0_u8..u8::try_from(SEED_LENGTH)?)
+            .map(|index| {
+                session_number
+                    .wrapping_mul(37)
+                    .wrapping_add(index.wrapping_mul(19))
+            })
+            .collect::<Vec<_>>();
+        let mut seed_message = vec![SEED_MARKER];
+        seed_message.extend(encode_seed_length(SEED_LENGTH, encoding)?);
+        seed_message.extend_from_slice(&seed);
+        seed_message.extend(session_noise(session_number));
+
+        let plaintext = der_sample(session_number);
+        let ciphertext = encrypt_continuous(&plaintext, &seed)?;
+        let payload = tagged(PAYLOAD_MARKER, &ciphertext);
+        if session_number == 4 {
+            match heldout_mutation {
+                Some(HeldoutPrefixMutation::Changed) => {
+                    let changed = encode_seed_length(SEED_LENGTH - 1, encoding)?;
+                    let prefix_end = 1 + encoding.width.byte_length();
+                    if let Some(prefix) = seed_message.get_mut(1..prefix_end) {
+                        prefix.copy_from_slice(&changed);
+                    }
+                }
+                Some(HeldoutPrefixMutation::Truncated) => seed_message.truncate(1),
+                None => {}
+            }
+        }
+        records.push((session, Direction::FirstToSecond, seed_message));
+        records.push((session, Direction::SecondToFirst, payload));
+    }
+    Ok(records)
+}
+
+#[derive(Clone, Copy)]
+enum HeldoutPrefixMutation {
+    Changed,
+    Truncated,
+}
+
+#[derive(Clone, Copy)]
+struct SeedLengthEncoding {
+    width: CounterWidth,
+    byte_order: ByteOrder,
+}
+
+fn encode_seed_length(length: usize, encoding: SeedLengthEncoding) -> TestResult<Vec<u8>> {
+    let length = u64::try_from(length)?;
+    let bytes = match encoding.byte_order {
+        ByteOrder::BigEndian => length.to_be_bytes(),
+        ByteOrder::LittleEndian => length.to_le_bytes(),
+    };
+    let width = encoding.width.byte_length();
+    let encoded = match encoding.byte_order {
+        ByteOrder::BigEndian => bytes.get(8 - width..),
+        ByteOrder::LittleEndian => bytes.get(..width),
+    }
+    .ok_or("seed length encoding has an invalid width")?;
+    Ok(encoded.to_vec())
+}
+
+fn session_noise(session: u8) -> Vec<u8> {
+    let mut state = u32::from(session).wrapping_mul(0x9e37_79b9);
+    (0..16)
+        .map(|_| {
+            state ^= state << 13;
+            state ^= state >> 17;
+            state ^= state << 5;
+            u8::try_from((state & 0xff) | 0x20).unwrap_or(0x20)
+        })
+        .collect()
 }
 
 fn same_message_sessions() -> TestResult<Vec<OwnedRecord>> {

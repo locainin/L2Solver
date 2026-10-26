@@ -1,10 +1,11 @@
 use super::{
     super::model::{
-        RelationalByteRangeLocator, RelationalRecordSample, RelationalTransformError,
-        RelationalTransformLimits, Selector,
+        RelationalByteRangeLocator, RelationalLengthField, RelationalRecordSample,
+        RelationalTransformError, RelationalTransformLimits, Selector,
     },
     input::{SelectorIndex, SessionGroup},
 };
+use crate::{derivation::CounterWidth, integer::decode_unsigned, protocol::ByteOrder};
 
 #[derive(Clone)]
 pub(super) struct LocatorCandidate {
@@ -90,6 +91,65 @@ fn range_ends_message_boundary(
     })
 }
 
+fn matching_preceding_lengths(
+    samples: &[RelationalRecordSample<'_>],
+    indexes: &[SelectorIndex],
+    selector: &Selector,
+    value_offset: usize,
+    value_length: usize,
+) -> Result<Vec<RelationalLengthField>, RelationalTransformError> {
+    let mut fields = Vec::new();
+    let Ok(expected) = u64::try_from(value_length) else {
+        return Ok(fields);
+    };
+    for width in [
+        CounterWidth::OneByte,
+        CounterWidth::TwoBytes,
+        CounterWidth::FourBytes,
+        CounterWidth::EightBytes,
+    ] {
+        let width_bytes = width.byte_length();
+        let Some(offset) = value_offset.checked_sub(width_bytes) else {
+            continue;
+        };
+        for byte_order in [ByteOrder::BigEndian, ByteOrder::LittleEndian] {
+            if width == CounterWidth::OneByte && byte_order == ByteOrder::LittleEndian {
+                continue;
+            }
+            let matches_every_session = indexes.iter().all(|index| {
+                index.get(selector).is_some_and(|selected| {
+                    selected.len() == 1
+                        && selected.first().is_some_and(|sample_index| {
+                            samples.get(*sample_index).is_some_and(|sample| {
+                                offset
+                                    .checked_add(width_bytes)
+                                    .and_then(|end| sample.bytes.get(offset..end))
+                                    .and_then(|bytes| {
+                                        decode_unsigned(
+                                            bytes,
+                                            byte_order == ByteOrder::LittleEndian,
+                                        )
+                                    })
+                                    == Some(expected)
+                            })
+                        })
+                })
+            });
+            if matches_every_session {
+                fields
+                    .try_reserve(1)
+                    .map_err(|_| RelationalTransformError::AllocationFailed)?;
+                fields.push(RelationalLengthField {
+                    offset,
+                    width,
+                    byte_order,
+                });
+            }
+        }
+    }
+    Ok(fields)
+}
+
 pub(super) fn seed_locators(
     samples: &[RelationalRecordSample<'_>],
     groups: &[SessionGroup],
@@ -101,61 +161,28 @@ pub(super) fn seed_locators(
     for selector in selectors {
         for value_offset in 0..=limits.max_locator_offset {
             for value_length in 1..=limits.max_seed_bytes {
-                let locator = RelationalByteRangeLocator {
-                    direction: selector.direction,
-                    marker_offset: selector.marker_offset,
-                    marker: selector.marker.clone(),
-                    value_offset,
-                    value_length: Some(value_length),
-                };
-                if groups.iter().enumerate().all(|(group_index, _group)| {
-                    let Some(index) = indexes.get(group_index) else {
-                        return false;
-                    };
-                    let Some(indices) = index.get(selector) else {
-                        return false;
-                    };
-                    indices.len() == 1
-                        && indices.first().is_some_and(|sample_index| {
-                            samples.get(*sample_index).is_some_and(|sample| {
-                                value_offset
-                                    .checked_add(value_length)
-                                    .is_some_and(|end| end <= sample.bytes.len())
-                            })
-                        })
-                }) {
-                    if candidates.len() == limits.max_locator_candidates {
-                        return Ok((candidates, false));
-                    }
-                    candidates
-                        .try_reserve(1)
-                        .map_err(|_| RelationalTransformError::AllocationFailed)?;
-                    candidates.push(LocatorCandidate {
-                        selector: selector.clone(),
-                        varying_bytes: varying_range_bytes(
-                            samples,
-                            indexes,
-                            selector,
-                            value_offset,
-                            value_length,
-                        ),
-                        ends_at_message_boundary: range_ends_message_boundary(
-                            samples,
-                            indexes,
-                            selector,
-                            value_offset,
-                            value_length,
-                        ),
-                        locator,
-                    });
+                if !add_seed_locator_candidates(
+                    samples,
+                    groups,
+                    indexes,
+                    selector,
+                    (value_offset, value_length),
+                    limits,
+                    &mut candidates,
+                )? {
+                    return Ok((candidates, false));
                 }
             }
         }
     }
     candidates.sort_by(|left, right| {
-        right
-            .ends_at_message_boundary
-            .cmp(&left.ends_at_message_boundary)
+        declared_length_rank(left)
+            .cmp(&declared_length_rank(right))
+            .then_with(|| {
+                right
+                    .ends_at_message_boundary
+                    .cmp(&left.ends_at_message_boundary)
+            })
             .then_with(|| {
                 let left_length = left.locator.value_length.unwrap_or_default() as u128;
                 let right_length = right.locator.value_length.unwrap_or_default() as u128;
@@ -177,6 +204,115 @@ pub(super) fn seed_locators(
     Ok((candidates, true))
 }
 
+fn add_seed_locator_candidates(
+    samples: &[RelationalRecordSample<'_>],
+    groups: &[SessionGroup],
+    indexes: &[SelectorIndex],
+    selector: &Selector,
+    value_range: (usize, usize),
+    limits: RelationalTransformLimits,
+    candidates: &mut Vec<LocatorCandidate>,
+) -> Result<bool, RelationalTransformError> {
+    let (value_offset, value_length) = value_range;
+    if !seed_locator_supported(
+        samples,
+        groups,
+        indexes,
+        selector,
+        value_offset,
+        value_length,
+    ) {
+        return Ok(true);
+    }
+    let locator = RelationalByteRangeLocator {
+        direction: selector.direction,
+        marker_offset: selector.marker_offset,
+        marker: selector.marker.clone(),
+        value_offset,
+        value_length: Some(value_length),
+        declared_length: None,
+    };
+    let varying_bytes = varying_range_bytes(samples, indexes, selector, value_offset, value_length);
+    let ends_at_message_boundary =
+        range_ends_message_boundary(samples, indexes, selector, value_offset, value_length);
+    let matching_lengths =
+        matching_preceding_lengths(samples, indexes, selector, value_offset, value_length)?;
+    if !push_seed_locator_candidate(
+        candidates,
+        limits.max_locator_candidates,
+        selector,
+        &locator,
+        varying_bytes,
+        ends_at_message_boundary,
+    )? {
+        return Ok(false);
+    }
+    for field in matching_lengths {
+        let mut constrained_locator = locator.clone();
+        constrained_locator.declared_length = Some(field);
+        if !push_seed_locator_candidate(
+            candidates,
+            limits.max_locator_candidates,
+            selector,
+            &constrained_locator,
+            varying_bytes,
+            ends_at_message_boundary,
+        )? {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
+fn seed_locator_supported(
+    samples: &[RelationalRecordSample<'_>],
+    groups: &[SessionGroup],
+    indexes: &[SelectorIndex],
+    selector: &Selector,
+    value_offset: usize,
+    value_length: usize,
+) -> bool {
+    groups.iter().enumerate().all(|(group_index, _group)| {
+        let Some(index) = indexes.get(group_index) else {
+            return false;
+        };
+        let Some(indices) = index.get(selector) else {
+            return false;
+        };
+        indices.len() == 1
+            && indices.first().is_some_and(|sample_index| {
+                samples.get(*sample_index).is_some_and(|sample| {
+                    value_offset
+                        .checked_add(value_length)
+                        .is_some_and(|end| end <= sample.bytes.len())
+                })
+            })
+    })
+}
+
+fn push_seed_locator_candidate(
+    candidates: &mut Vec<LocatorCandidate>,
+    maximum: usize,
+    selector: &Selector,
+    locator: &RelationalByteRangeLocator,
+    varying_bytes: usize,
+    ends_at_message_boundary: bool,
+) -> Result<bool, RelationalTransformError> {
+    if candidates.len() == maximum {
+        return Ok(false);
+    }
+    candidates
+        .try_reserve(1)
+        .map_err(|_| RelationalTransformError::AllocationFailed)?;
+    candidates.push(LocatorCandidate {
+        selector: selector.clone(),
+        varying_bytes,
+        ends_at_message_boundary,
+        locator: locator.clone(),
+    });
+    Ok(true)
+}
+
 pub(super) fn payload_locators(
     samples: &[RelationalRecordSample<'_>],
     groups: &[SessionGroup],
@@ -193,6 +329,7 @@ pub(super) fn payload_locators(
                 marker: selector.marker.clone(),
                 value_offset,
                 value_length: None,
+                declared_length: None,
             };
             let supported = groups.iter().enumerate().all(|(group_index, _group)| {
                 let Some(index) = indexes.get(group_index) else {
@@ -240,6 +377,24 @@ pub(super) fn payload_locators(
             .then_with(|| left.selector.marker.cmp(&right.selector.marker))
     });
     Ok((candidates, true))
+}
+
+fn declared_length_rank(candidate: &LocatorCandidate) -> (u8, usize, usize, u8) {
+    // Wider matching fields preserve more of the frozen equality check
+    candidate
+        .locator
+        .declared_length
+        .map_or((1, usize::MAX, usize::MAX, u8::MAX), |field| {
+            (
+                0,
+                usize::MAX - field.width.byte_length(),
+                field.offset,
+                match field.byte_order {
+                    ByteOrder::BigEndian => 0,
+                    ByteOrder::LittleEndian => 1,
+                },
+            )
+        })
 }
 
 pub(super) fn locator_ranges_overlap(

@@ -11,6 +11,8 @@ use crate::{
     derivation::{
         self, CounterWidth, DerivationLimits, DerivationStatus, OperandRef, Operation, Recipe,
     },
+    integer::decode_unsigned,
+    protocol::ByteOrder,
     sha256,
 };
 
@@ -125,6 +127,14 @@ fn replay_seed<'a>(
             "seed length {seed_length} exceeds replay limit {}",
             limits.max_seed_bytes
         )));
+    }
+    if let Some(field) = rule.seed_locator.declared_length {
+        let observed = declared_length_value(seed_sample.bytes, field);
+        if observed != u64::try_from(seed_length).ok() {
+            return Err(RelationalTransformError::RuleContradicted(format!(
+                "seed length field decoded to {observed:?}, expected {seed_length}"
+            )));
+        }
     }
     let seed_end = rule
         .seed_locator
@@ -393,6 +403,18 @@ fn locate_session_seed<'a>(
             .ok_or(RelationalTransformError::InvalidInput(
                 "seed locator references a missing message",
             ))?;
+    if let Some(field) = rule.seed_locator.declared_length {
+        let expected = rule.seed_locator.value_length.unwrap_or_default();
+        let observed = declared_length_value(seed_sample.bytes, field);
+        if observed != u64::try_from(expected).ok() {
+            return Ok(Err(failed_check(
+                group,
+                Some(seed_sample.sample),
+                Vec::new(),
+                RelationalFalsification::SeedLengthMismatch { expected, observed },
+            )));
+        }
+    }
     let Some(seed_end) = rule
         .seed_locator
         .value_offset
@@ -417,6 +439,17 @@ fn locate_session_seed<'a>(
         )));
     };
     Ok(Ok((seed_sample.sample, seed)))
+}
+
+fn declared_length_value(
+    bytes: &[u8],
+    field: super::super::model::RelationalLengthField,
+) -> Option<u64> {
+    let end = field.offset.checked_add(field.width.byte_length())?;
+    decode_unsigned(
+        bytes.get(field.offset..end)?,
+        field.byte_order == ByteOrder::LittleEndian,
+    )
 }
 
 fn locate_session_payloads<'a>(

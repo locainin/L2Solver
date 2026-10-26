@@ -5,7 +5,7 @@ use crate::{
     derivation::{CounterByteOrder, CounterWidth, SeedCounterOrder},
 };
 use serde::Serialize;
-use std::{error::Error, fmt};
+use std::{cmp::Ordering, error::Error, fmt};
 
 /// One exact message in a reconstructed session with its observed direction and bytes
 #[derive(Clone, Debug)]
@@ -151,6 +151,47 @@ pub struct RelationalByteRangeLocator {
     pub value_offset: usize,
     /// Fixed seed length; `None` means payload bytes extend through each message end
     pub value_length: Option<usize>,
+    /// Optional integer field immediately before the located seed, frozen from discovery
+    pub declared_length: Option<RelationalLengthField>,
+}
+
+/// Integer field checked against the located seed length in every session
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+pub struct RelationalLengthField {
+    /// Start of the length field relative to the selected message
+    pub offset: usize,
+    /// Number of bytes used to encode the field
+    pub width: CounterWidth,
+    /// Byte order used to decode the field
+    pub byte_order: crate::protocol::ByteOrder,
+}
+
+impl Ord for RelationalLengthField {
+    fn cmp(&self, other: &Self) -> Ordering {
+        (
+            self.offset,
+            self.width.byte_length(),
+            byte_order_rank(self.byte_order),
+        )
+            .cmp(&(
+                other.offset,
+                other.width.byte_length(),
+                byte_order_rank(other.byte_order),
+            ))
+    }
+}
+
+impl PartialOrd for RelationalLengthField {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+const fn byte_order_rank(byte_order: crate::protocol::ByteOrder) -> u8 {
+    match byte_order {
+        crate::protocol::ByteOrder::BigEndian => 0,
+        crate::protocol::ByteOrder::LittleEndian => 1,
+    }
 }
 
 /// Explicit parameters for one discovered SHA-256 counter-XOR rule
@@ -213,7 +254,7 @@ pub enum RelationalOperationTemplate {
 impl RelationalOperationTemplate {
     /// Return the finite parameters when this template selects SHA-256 counter-XOR
     #[must_use]
-    pub const fn sha256_counter_xor(self) -> RelationalSha256CounterXor {
+    pub(super) const fn sha256_counter_xor(self) -> RelationalSha256CounterXor {
         match self {
             Self::Sha256CounterXor(parameters) => parameters,
         }
@@ -256,6 +297,13 @@ pub enum RelationalFalsification {
     NoPayloadMessages,
     /// The located seed did not fit within its selected message
     SeedRangeUnavailable,
+    /// The seed's declared-length field was truncated or decoded to a different value
+    SeedLengthMismatch {
+        /// Fixed seed length established during discovery
+        expected: usize,
+        /// Decoded field value; absent when the selected message did not contain the field
+        observed: Option<u64>,
+    },
     /// A selected payload message had no bytes after its located offset
     EmptyPayloadRange,
     /// The canonical transform rejected the supplied parameters or bytes
