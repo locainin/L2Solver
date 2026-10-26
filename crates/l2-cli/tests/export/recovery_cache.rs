@@ -240,6 +240,94 @@ fn cache_key_does_not_reuse_the_previous_transform_proposal_policy() -> Result<(
 }
 
 #[test]
+fn changed_recovery_algorithm_rejects_a_stale_partial_result() -> Result<(), Box<dyn Error>> {
+    let temporary = tempfile::tempdir()?;
+    let cache = open_cache(temporary.path())?;
+    let options = RecoveryOptions::default();
+    let (mut old_case, scope) = case_and_scope(b"4142", 37)?;
+    let mut previous = recover(
+        &mut old_case,
+        RecoveryCaseKind::Flow,
+        &scope,
+        &RecoveryContext {
+            cache: None,
+            job: None,
+            options: &options,
+        },
+    )?;
+    assert!(previous.coverage.is_complete());
+    previous.coverage.flow_cases_with_non_exhaustive_search = 1;
+    previous
+        .omissions
+        .push("previous algorithm omitted 720 length checks".into());
+    previous.coverage.omissions = u64::try_from(previous.omissions.len())?;
+    old_case.add_node("previous_algorithm_marker", None, Vec::new(), json!({}))?;
+    let previous_key = version_four_key(&scope, &options)?;
+    super::store_result(cache.lease(&previous_key)?, &old_case, &previous)?;
+
+    let job = Job::new("recovery algorithm invalidation");
+    let (mut current_case, _) = case_and_scope(b"4142", 37)?;
+    let current = recover(
+        &mut current_case,
+        RecoveryCaseKind::Flow,
+        &scope,
+        &RecoveryContext {
+            cache: Some(&cache),
+            job: Some(&job),
+            options: &options,
+        },
+    )?;
+    assert!(
+        current.coverage.is_complete(),
+        "stale partial recovery was replayed"
+    );
+    assert!(current.omissions.is_empty());
+    assert!(
+        !current_case
+            .nodes()
+            .iter()
+            .any(|node| node.kind == "previous_algorithm_marker")
+    );
+    assert_eq!(
+        job.snapshot()?.counters.get(&Counter::CacheMisses),
+        Some(&1)
+    );
+    // Invalidation changes the affected stage key instead of deleting other cached work
+    assert!(
+        cache
+            .lookup(&previous_key, CacheReadPolicy::AllowPartial)?
+            .is_some()
+    );
+    assert_eq!(cache.stats()?.entries, 2);
+    Ok(())
+}
+
+fn version_four_key(
+    scope: &Value,
+    options: &RecoveryOptions,
+) -> Result<l2_workbench::job::cache::StageKey, Box<dyn Error>> {
+    use l2_workbench::job::cache::{SourceIdentity, StageKey};
+
+    // Preserve the exact old key format that replayed obsolete search omissions
+    let policy = json!({
+        "native_case_version": crate::workbench::full_source::NATIVE_CASE_VERSION,
+        "transform_proposal_version": l2_workbench::recovery::proposals::TRANSFORM_PROPOSAL_FORMAT_VERSION,
+        "kind": "flow",
+        "profile": "normal",
+        "memory_limit_bytes": options.memory_limit,
+        "scope": scope,
+    });
+    Ok(StageKey::new(
+        super::RECOVERY_STAGE,
+        4,
+        super::RECOVERY_ALGORITHM,
+        &policy,
+        &SourceIdentity::from_sha256(sha256(b"4142"))?,
+        &[],
+    )?)
+}
+
+#[test]
 fn corrupt_cached_case_is_rejected_in_strict_mode_and_recomputed_otherwise()
 -> Result<(), Box<dyn Error>> {
     let temporary = tempfile::tempdir()?;

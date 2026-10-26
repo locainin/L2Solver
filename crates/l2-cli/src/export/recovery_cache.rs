@@ -21,7 +21,9 @@ use std::{
     io::{self, BufWriter, Read, Write},
 };
 
-pub(super) const RECOVERY_STAGE_VERSION: u32 = 4;
+// Advance when recovery generation, cohorting, constraints, or application semantics change
+// Capture indexing and native reconstruction keep their separate upstream versions
+pub(super) const RECOVERY_STAGE_VERSION: u32 = 5;
 const RECOVERY_STAGE: &str = "default_case_recovery";
 const RECOVERY_ALGORITHM: &str = "l2-default-case-recovery";
 const CASE_FILE: &str = "case.json";
