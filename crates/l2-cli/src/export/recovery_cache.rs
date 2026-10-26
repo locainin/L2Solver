@@ -11,6 +11,7 @@ use l2_workbench::{
         Counter, Job, PhaseState,
         cache::{Cache, CacheEntry, CacheReadPolicy, Lease, SourceIdentity, StageKey, StageStatus},
     },
+    recovery::proposals::TRANSFORM_PROPOSAL_FORMAT_VERSION,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -136,6 +137,7 @@ fn recovery_key(
     )?;
     let policy = json!({
         "native_case_version": workbench::full_source::NATIVE_CASE_VERSION,
+        "transform_proposal_version": TRANSFORM_PROPOSAL_FORMAT_VERSION,
         "kind": kind_name(kind),
         "profile": profile_name(options.profile),
         "memory_limit_bytes": options.memory_limit,

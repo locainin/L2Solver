@@ -211,6 +211,35 @@ fn cache_key_tracks_scope_profile_and_memory_policy_only() -> Result<(), Box<dyn
 }
 
 #[test]
+fn cache_key_does_not_reuse_the_previous_transform_proposal_policy() -> Result<(), Box<dyn Error>> {
+    use l2_workbench::job::cache::{SourceIdentity, StageKey};
+
+    let (_, scope) = case_and_scope(b"4142", 19)?;
+    let options = RecoveryOptions::default();
+    let source = SourceIdentity::from_sha256(&sha256(b"4142"))?;
+    let previous_policy = json!({
+        "native_case_version": crate::workbench::full_source::NATIVE_CASE_VERSION,
+        "kind": "flow",
+        "profile": "normal",
+        "memory_limit_bytes": options.memory_limit,
+        "scope": scope,
+    });
+    let previous_key = StageKey::new(
+        super::RECOVERY_STAGE,
+        super::RECOVERY_STAGE_VERSION,
+        super::RECOVERY_ALGORITHM,
+        &previous_policy,
+        &source,
+        &[],
+    )?;
+    assert_ne!(
+        recovery_key(RecoveryCaseKind::Flow, &scope, &options)?,
+        previous_key
+    );
+    Ok(())
+}
+
+#[test]
 fn corrupt_cached_case_is_rejected_in_strict_mode_and_recomputed_otherwise()
 -> Result<(), Box<dyn Error>> {
     let temporary = tempfile::tempdir()?;
