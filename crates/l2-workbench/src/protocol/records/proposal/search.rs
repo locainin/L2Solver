@@ -235,7 +235,7 @@ fn split_strategy_limits(
     Some((fixed, repeated))
 }
 
-fn split_limit(fixed: &mut usize, repeated: &mut usize) -> Option<()> {
+const fn split_limit(fixed: &mut usize, repeated: &mut usize) -> Option<()> {
     if *fixed < 2 {
         return None;
     }
@@ -341,6 +341,47 @@ struct LengthFields {
     omitted_record_views: usize,
     examined_checks: usize,
     omitted_checks: usize,
+}
+
+#[derive(Default)]
+struct LengthFieldMembership {
+    fields: HashSet<(usize, usize, u8)>,
+    data_offsets: HashSet<usize>,
+    meanings: HashSet<u8>,
+}
+
+impl LengthFields {
+    fn retain_layout(
+        &mut self,
+        seen: &mut LengthFieldMembership,
+        layout: SupportedLength,
+    ) -> Result<(), RecordDiscoveryError> {
+        let field = layout.field;
+        push_unique_by(
+            &mut self.fields,
+            &mut seen.fields,
+            field,
+            (
+                field.offset,
+                field.width,
+                byte_order_order(field.byte_order),
+            ),
+        )?;
+        push_unique_by(
+            &mut self.data_offsets,
+            &mut seen.data_offsets,
+            layout.data_offset,
+            layout.data_offset,
+        )?;
+        push_unique_by(
+            &mut self.meanings,
+            &mut seen.meanings,
+            layout.meaning,
+            length_meaning_order(layout.meaning),
+        )?;
+        // Both strategies visit each field, boundary, and meaning combination once
+        push(&mut self.supported, layout)
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
@@ -1054,13 +1095,8 @@ fn length_candidates(
 ) -> Result<LengthFields, RecordDiscoveryError> {
     let (total_checks, maximum_gap) = length_domain_stats(fields, maximum_data_offset)?;
 
-    let mut length_fields = Vec::new();
-    let mut data_offsets = Vec::new();
-    let mut meanings = Vec::new();
-    let mut supported = Vec::new();
-    let mut seen_fields = HashSet::new();
-    let mut seen_data_offsets = HashSet::new();
-    let mut seen_meanings = HashSet::new();
+    let mut result = empty_length_fields();
+    let mut seen = LengthFieldMembership::default();
     let mut checks = 0_usize;
 
     // Advance every field by one gap before considering larger gaps
@@ -1090,31 +1126,8 @@ fn length_candidates(
                     if !matches_length(messages, *field, meaning, data_offset) {
                         continue;
                     }
-                    push_unique_by(
-                        &mut length_fields,
-                        &mut seen_fields,
-                        *field,
-                        (
-                            field.offset,
-                            field.width,
-                            byte_order_order(field.byte_order),
-                        ),
-                    )?;
-                    push_unique_by(
-                        &mut data_offsets,
-                        &mut seen_data_offsets,
-                        data_offset,
-                        data_offset,
-                    )?;
-                    push_unique_by(
-                        &mut meanings,
-                        &mut seen_meanings,
-                        meaning,
-                        length_meaning_order(meaning),
-                    )?;
-                    // The field, gap, and meaning loop visits each supported layout once
-                    push(
-                        &mut supported,
+                    result.retain_layout(
+                        &mut seen,
                         SupportedLength {
                             field: *field,
                             data_offset,
@@ -1125,19 +1138,11 @@ fn length_candidates(
             }
         }
     }
-    Ok(LengthFields {
-        fields: length_fields,
-        data_offsets,
-        meanings,
-        supported,
-        record_ranges: Vec::new(),
-        has_repeated_boundaries: false,
-        omitted_record_views: 0,
-        examined_checks: checks,
-        omitted_checks: total_checks
-            .checked_sub(checks)
-            .ok_or(RecordDiscoveryError::InvalidLimits)?,
-    })
+    result.examined_checks = checks;
+    result.omitted_checks = total_checks
+        .checked_sub(checks)
+        .ok_or(RecordDiscoveryError::InvalidLimits)?;
+    Ok(result)
 }
 
 fn length_domain_stats(

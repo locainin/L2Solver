@@ -2,9 +2,10 @@
 
 use super::super::model::{LENGTH_MEANINGS, RecordSchemaProposalLimits, default_sequence_base};
 use super::{
-    CandidateGeneration, FieldDomains, LengthFields, RecordRange, SupportedLength,
-    candidate_field_domains, empty_pair_fields, finish_candidate_generation, length_domain_stats,
-    push, push_unique_by, sequence_group_candidates, varying_sequence_fields,
+    CandidateGeneration, FieldDomains, LengthFieldMembership, LengthFields, RecordRange,
+    SupportedLength, allocation_error, candidate_field_domains, empty_length_fields,
+    empty_pair_fields, finish_candidate_generation, length_domain_stats, sequence_group_candidates,
+    varying_sequence_fields,
 };
 use crate::protocol::{
     ByteField, ByteOrder, IntegerField, RecordCount, RecordDiscoveryError, RecordError,
@@ -52,7 +53,7 @@ pub(super) fn generate_candidates(
     finish_candidate_generation(&fields, pairs, lengths, limits)
 }
 
-fn split_field_check_budget(
+const fn split_field_check_budget(
     limits: RecordSchemaProposalLimits,
 ) -> (RecordSchemaProposalLimits, RecordSchemaProposalLimits) {
     let raw = limits.max_field_checks_per_domain / 2 + limits.max_field_checks_per_domain % 2;
@@ -152,9 +153,7 @@ struct LengthCandidateSearch<'a> {
     per_message_limits: Vec<usize>,
     maximum_record_views: usize,
     result: LengthFields,
-    seen_fields: HashSet<(usize, usize, u8)>,
-    seen_data_offsets: HashSet<usize>,
-    seen_meanings: HashSet<u8>,
+    seen_layout_fields: LengthFieldMembership,
     seen_record_ranges: HashSet<(usize, usize, usize)>,
     incomplete_checks: usize,
 }
@@ -172,20 +171,8 @@ impl<'a> LengthCandidateSearch<'a> {
             record_limits,
             per_message_limits,
             maximum_record_views,
-            result: LengthFields {
-                fields: Vec::new(),
-                data_offsets: Vec::new(),
-                meanings: Vec::new(),
-                supported: Vec::new(),
-                record_ranges: Vec::new(),
-                has_repeated_boundaries: false,
-                omitted_record_views: 0,
-                examined_checks: 0,
-                omitted_checks: 0,
-            },
-            seen_fields: HashSet::new(),
-            seen_data_offsets: HashSet::new(),
-            seen_meanings: HashSet::new(),
+            result: empty_length_fields(),
+            seen_layout_fields: LengthFieldMembership::default(),
             seen_record_ranges: HashSet::new(),
             incomplete_checks: 0,
         })
@@ -232,30 +219,8 @@ impl<'a> LengthCandidateSearch<'a> {
         ranges: Vec<RecordRange>,
         omitted: usize,
     ) -> Result<(), RecordDiscoveryError> {
-        push_unique_by(
-            &mut self.result.fields,
-            &mut self.seen_fields,
-            field,
-            (
-                field.offset,
-                field.width,
-                byte_order_order(field.byte_order),
-            ),
-        )?;
-        push_unique_by(
-            &mut self.result.data_offsets,
-            &mut self.seen_data_offsets,
-            data_offset,
-            data_offset,
-        )?;
-        push_unique_by(
-            &mut self.result.meanings,
-            &mut self.seen_meanings,
-            meaning,
-            length_meaning_order(meaning),
-        )?;
-        push(
-            &mut self.result.supported,
+        self.result.retain_layout(
+            &mut self.seen_layout_fields,
             SupportedLength {
                 field,
                 data_offset,
@@ -431,23 +396,4 @@ fn length_ranges(
             .ok_or(RecordDiscoveryError::InvalidLimits)?;
     }
     Ok(LengthCheck::Matched { ranges, omitted })
-}
-
-const fn byte_order_order(order: ByteOrder) -> u8 {
-    match order {
-        ByteOrder::BigEndian => 0,
-        ByteOrder::LittleEndian => 1,
-    }
-}
-
-const fn length_meaning_order(meaning: RecordLengthMeaning) -> u8 {
-    match meaning {
-        RecordLengthMeaning::PayloadBytes => 0,
-        RecordLengthMeaning::WholeRecord => 1,
-        RecordLengthMeaning::BytesAfterLengthField => 2,
-    }
-}
-
-fn allocation_error() -> RecordDiscoveryError {
-    RecordDiscoveryError::RecordOperation(RecordError::AllocationFailed)
 }
