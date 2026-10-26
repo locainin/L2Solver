@@ -1,11 +1,14 @@
 use super::plan::build_schema_plan;
-use super::{GateStatus, SchemaPlan, screen_with_schema_plan};
+use super::{
+    GateStatus, SchemaCandidateOptions, SchemaPlan, SchemaPlanCache, screen_with_schema_plan,
+};
 use crate::workbench::recovery_executor::relational::DecodedFrameOutput;
 use l2_workbench::{
     artifact::{ArtifactValidationFormat, ArtifactValidationPolicy},
     protocol::{
-        ByteRange, Direction, HoldoutBasis, MessageContext, RecordSchemaProposalLimits,
-        RelationalSessionId, RelationalTransformReport,
+        ByteField, ByteRange, Direction, HoldoutBasis, IntegerField, MessageContext, RecordCount,
+        RecordLengthMeaning, RecordLimits, RecordSchema, RecordSchemaProposalLimits,
+        RelationalSessionId, RelationalTransformReport, parse_records_with_limits,
     },
 };
 use serde_json::Value;
@@ -41,6 +44,7 @@ fn distinct_training_families_can_recover_one_exact_png_without_cross_merging_sc
             .cloned()
             .collect(),
         details: Value::Null,
+        work_limited: false,
         has_unassigned_family_messages: false,
         family_search_complete: true,
         assessment_scope: super::SchemaOffsetScope::CompleteInput,
@@ -80,6 +84,113 @@ fn distinct_training_families_can_recover_one_exact_png_without_cross_merging_sc
                     && alternative.get("status").and_then(Value::as_str)
                         == Some("artifact_validated")
             }))
+    );
+    Ok(())
+}
+
+#[test]
+fn one_megabyte_record_stream_fits_actual_schema_work_budget() -> TestResult {
+    let (frames, plaintext) = large_record_sessions()?;
+    assert_eq!(frames.len(), 13);
+    let schema = large_record_schema();
+    for frame in &frames {
+        assert_eq!(frame.preserved_header_end, None);
+        assert_eq!(
+            frame.payload_range,
+            ByteRange {
+                start: 0,
+                end: frame.bytes.len(),
+            }
+        );
+        assert!(
+            parse_records_with_limits(&frame.bytes, &schema, RecordLimits::default())?
+                .records()
+                .len()
+                >= 2
+        );
+    }
+    let report = report_for_partition(7, 6);
+    let work_limit = 32 * 1024 * 1024;
+    let mut cache = SchemaPlanCache::default();
+    let result = cache.screen_candidate(
+        &frames,
+        &report,
+        SchemaCandidateOptions {
+            parser_format: ArtifactValidationFormat::Png,
+            schema_limits: RecordSchemaProposalLimits::default(),
+            artifact_policy: ArtifactValidationPolicy::default(),
+            work_limit,
+            job: None,
+        },
+    )?;
+
+    assert!(plaintext.len() >= 1024 * 1024);
+    assert_eq!(
+        result.status,
+        GateStatus::ArtifactValidated,
+        "{:?}",
+        result.details
+    );
+    assert!(result.work_bytes <= work_limit);
+    let accepted = result
+        .accepted_schema
+        .as_ref()
+        .ok_or("exact PNG validation must retain the accepted record schema")?;
+    assert_eq!(
+        accepted.artifact_receipt.output_sha256.as_deref(),
+        Some(l2_workbench::sha256(&plaintext).as_str())
+    );
+    Ok(())
+}
+
+#[test]
+fn exhausted_actual_schema_work_remains_pending_without_a_false_contradiction() -> TestResult {
+    let (frames, _) = large_record_sessions()?;
+    let report = report_for_partition(7, 6);
+    let input_bytes = frames.iter().try_fold(0_usize, |total, frame| {
+        total
+            .checked_add(frame.bytes.len())
+            .ok_or("input length overflowed")
+    })?;
+    let work_limit = input_bytes.checked_add(1).ok_or("work limit overflowed")?;
+    let mut cache = SchemaPlanCache::default();
+    let result = cache.screen_candidate(
+        &frames,
+        &report,
+        SchemaCandidateOptions {
+            parser_format: ArtifactValidationFormat::Png,
+            schema_limits: RecordSchemaProposalLimits::default(),
+            artifact_policy: ArtifactValidationPolicy::default(),
+            work_limit,
+            job: None,
+        },
+    )?;
+
+    assert_eq!(result.status, GateStatus::Pending, "{:?}", result.details);
+    assert!(result.work_bytes <= work_limit);
+    assert!(result.work_bytes > 0);
+    let alternatives = result
+        .details
+        .get("schema_alternatives")
+        .and_then(Value::as_array)
+        .ok_or("work-limited analyses should retain their alternatives")?;
+    assert!(
+        alternatives.iter().any(|alternative| {
+            alternative
+                .get("analysis")
+                .and_then(|details| details.get("reason"))
+                .and_then(Value::as_str)
+                == Some("record_schema_work_limit")
+        }),
+        "expected a work-limit reason in gate alternatives: {:?}",
+        result.details
+    );
+    assert!(
+        result
+            .details
+            .get("schema_search_exhaustive")
+            .and_then(Value::as_bool)
+            != Some(true)
     );
     Ok(())
 }
@@ -137,7 +248,7 @@ fn unsupported_unique_values_remain_unassigned_and_keep_the_gate_pending() -> Te
 }
 
 fn mixed_layout_sessions() -> Result<Vec<DecodedFrameOutput>, Box<dyn Error>> {
-    let png = valid_png();
+    let png = valid_png()?;
     let (first_chunk, second_chunk) = png
         .split_at_checked(23)
         .ok_or("PNG fixture is shorter than the configured family split")?;
@@ -233,24 +344,134 @@ fn encode_record(family: u8, object_id: u8, sequence: u8, payload: &[u8]) -> Vec
     record
 }
 
-fn valid_png() -> Vec<u8> {
-    let mut png = b"\x89PNG\r\n\x1a\n".to_vec();
-    let mut header = Vec::new();
-    header.extend_from_slice(&1_u32.to_be_bytes());
-    header.extend_from_slice(&1_u32.to_be_bytes());
-    header.extend_from_slice(&[8, 2, 0, 0, 0]);
-    append_png_chunk(&mut png, *b"IHDR", &header);
-    append_png_chunk(&mut png, *b"IEND", &[]);
-    png
+fn valid_png() -> Result<Vec<u8>, Box<dyn Error>> {
+    let mut bytes = Vec::new();
+    let mut encoder = png::Encoder::new(&mut bytes, 1, 1);
+    encoder.set_color(png::ColorType::Rgb);
+    encoder.set_depth(png::BitDepth::Eight);
+    encoder.write_header()?.write_image_data(&[10, 20, 30])?;
+    Ok(bytes)
 }
 
-fn append_png_chunk(png: &mut Vec<u8>, kind: [u8; 4], data: &[u8]) {
-    png.extend_from_slice(&u32::try_from(data.len()).unwrap_or(u32::MAX).to_be_bytes());
+fn large_record_sessions() -> Result<(Vec<DecodedFrameOutput>, Vec<u8>), Box<dyn Error>> {
+    let mut png = valid_png()?;
+    let mut text = b"RecoveryFixture\0".to_vec();
+    text.resize(1024 * 1024, b'x');
+    let iend_start = png.len().checked_sub(12).ok_or("PNG has no IEND chunk")?;
+    if png.get(iend_start + 4..iend_start + 8) != Some(b"IEND") {
+        return Err("PNG does not end with IEND".into());
+    }
+    let mut text_chunk = Vec::new();
+    append_png_chunk(&mut text_chunk, *b"tEXt", &text)?;
+    png.splice(iend_start..iend_start, text_chunk);
+
+    let session_count = 13_usize;
+    let chunk_size = 16 * 1024;
+    let payloads = png.chunks(chunk_size).collect::<Vec<_>>();
+    let records_per_session = payloads.len().div_ceil(session_count);
+    let mut frames = Vec::with_capacity(session_count);
+    for session_index in 0..session_count {
+        let first_record = session_index
+            .checked_mul(records_per_session)
+            .ok_or("record group offset overflowed")?;
+        let mut bytes = Vec::new();
+        for record_index in first_record..first_record.saturating_add(records_per_session) {
+            let Some(payload) = payloads.get(record_index) else {
+                break;
+            };
+            let sequence = u16::try_from(record_index)?;
+            let payload_length = u16::try_from(payload.len())?;
+            // One raw decoded suffix contains several complete records
+            bytes.extend_from_slice(b"D1");
+            bytes.extend_from_slice(&sequence.to_be_bytes());
+            bytes.extend_from_slice(&payload_length.to_be_bytes());
+            bytes.push(0xa7);
+            bytes.extend_from_slice(payload);
+        }
+        let session = u64::try_from(session_index)?
+            .checked_add(1)
+            .ok_or("session overflowed")?;
+        frames.push(DecodedFrameOutput {
+            context: MessageContext {
+                source: "large-generated-capture".to_owned(),
+                scope: "all".to_owned(),
+                session,
+                direction: Direction::FirstToSecond,
+            },
+            input_node_id: session,
+            seed_sample: session,
+            session_order: 0,
+            transformed_output_sha256: l2_workbench::sha256(&bytes),
+            direction_node_id: session,
+            episode_node_id: session,
+            stream_offset: 0,
+            candidate_index: 0,
+            parser_format: ArtifactValidationFormat::Png,
+            expected_session_orders: vec![0],
+            payload_range: ByteRange {
+                start: 0,
+                end: bytes.len(),
+            },
+            preserved_header_end: None,
+            bytes,
+        });
+    }
+    Ok((frames, png))
+}
+
+fn large_record_schema() -> RecordSchema {
+    RecordSchema {
+        records_offset: 0,
+        count: RecordCount::UntilEnd,
+        identifier: ByteField {
+            offset: 0,
+            width: 2,
+        },
+        sequence: IntegerField {
+            offset: 2,
+            width: 2,
+            byte_order: l2_workbench::protocol::ByteOrder::BigEndian,
+        },
+        length: IntegerField {
+            offset: 4,
+            width: 2,
+            byte_order: l2_workbench::protocol::ByteOrder::BigEndian,
+        },
+        data_offset: 7,
+        length_meaning: RecordLengthMeaning::PayloadBytes,
+        sequence_base: 0,
+        terminal_sequence: None,
+    }
+}
+
+fn report_for_partition(discovery_count: usize, heldout_count: usize) -> RelationalTransformReport {
+    let mut report = discovery_report();
+    report.discovery_sessions = (1..=u64::try_from(discovery_count).unwrap_or(u64::MAX))
+        .map(|session| RelationalSessionId {
+            source: "large-generated-capture".to_owned(),
+            scope: "all".to_owned(),
+            session,
+        })
+        .collect();
+    report.heldout_sessions = (u64::try_from(discovery_count).unwrap_or(u64::MAX) + 1
+        ..=u64::try_from(discovery_count.saturating_add(heldout_count)).unwrap_or(u64::MAX))
+        .map(|session| RelationalSessionId {
+            source: "large-generated-capture".to_owned(),
+            scope: "all".to_owned(),
+            session,
+        })
+        .collect();
+    report
+}
+
+fn append_png_chunk(png: &mut Vec<u8>, kind: [u8; 4], data: &[u8]) -> TestResult {
+    png.extend_from_slice(&u32::try_from(data.len())?.to_be_bytes());
     png.extend_from_slice(&kind);
     png.extend_from_slice(data);
     let mut checksum_bytes = kind.to_vec();
     checksum_bytes.extend_from_slice(data);
     png.extend_from_slice(&crc32fast::hash(&checksum_bytes).to_be_bytes());
+    Ok(())
 }
 
 fn discovery_report() -> RelationalTransformReport {

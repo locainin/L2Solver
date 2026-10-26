@@ -74,6 +74,7 @@ impl GateStatus {
 pub(super) struct GateResult {
     pub(super) status: GateStatus,
     pub(super) work_bytes: usize,
+    pub(super) work_limited_at: Option<usize>,
     pub(super) details: Value,
     pub(super) accepted_schema: Option<screen::AcceptedRecordSchema>,
     pub(super) assessment_scope: SchemaOffsetScope,
@@ -96,6 +97,7 @@ pub(super) struct SchemaPlanCache {
 pub(super) struct SchemaPlan {
     pub(super) alternatives: Vec<SchemaAlternative>,
     pub(super) details: Value,
+    pub(super) work_limited: bool,
     pub(super) has_unassigned_family_messages: bool,
     pub(super) family_search_complete: bool,
     pub(super) assessment_scope: SchemaOffsetScope,
@@ -288,6 +290,7 @@ impl SchemaPlanCache {
         Ok(GateResult {
             status: fallback.status,
             work_bytes: total_work,
+            work_limited_at: fallback.work_limited_at,
             details: serde_json::json!({
                 "assessment_scope":SchemaOffsetScope::CompleteInput.as_str(),
                 "schema_plan_cache_hit":false,
@@ -543,6 +546,7 @@ const fn result(status: GateStatus, work_bytes: usize, details: Value) -> GateRe
     GateResult {
         status,
         work_bytes,
+        work_limited_at: None,
         details,
         accepted_schema: None,
         assessment_scope: SchemaOffsetScope::CompleteInput,

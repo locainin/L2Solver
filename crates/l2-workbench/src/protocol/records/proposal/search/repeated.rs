@@ -1,31 +1,36 @@
 //! Repeated-record boundary search independent of fixed-layout schema proposals
 
 use super::super::model::{RecordSchemaProposalLimits, default_sequence_base};
-use super::length_layouts::{LengthLayoutOrder, visit_length_layouts};
+use super::length_layouts::{LengthLayoutOrder, length_domain_stats, visit_length_layouts};
 use super::{
     CandidateGeneration, FieldDomains, LengthFieldMembership, LengthFields, RecordRange,
     SupportedLength, allocation_error, candidate_field_domains, empty_length_fields,
-    empty_pair_fields, finish_candidate_generation, sequence_group_candidates,
+    empty_pair_fields, finish_candidate_generation, sequence_group_candidates, try_charge_work,
     varying_sequence_fields,
 };
 use crate::protocol::{
     ByteField, ByteOrder, IntegerField, RecordCount, RecordDiscoveryError, RecordError,
-    RecordLengthMeaning, RecordLimits, RecordSchema, parse_records_with_limits,
+    RecordInput, RecordLengthMeaning, RecordLimits, RecordSchema, RecordWorkBudget,
 };
 use std::collections::HashSet;
+use std::ops::ControlFlow;
 
 pub(super) fn generate_candidates(
     training_messages: &[&[u8]],
+    training_inputs: &[&RecordInput<'_>],
     limits: RecordSchemaProposalLimits,
+    work: &mut Option<&mut RecordWorkBudget>,
 ) -> Result<CandidateGeneration, RecordDiscoveryError> {
     let (raw_limits, header_limits) = split_field_check_budget(limits);
-    let raw_fields = candidate_field_domains(training_messages, raw_limits)?;
+    let raw_fields = candidate_field_domains(training_messages, raw_limits, work)?;
     let mut lengths = length_candidates(
         training_messages,
+        training_inputs,
         &raw_fields.integer_shapes,
         raw_fields.maximum_offset,
         limits.max_length_checks,
         limits.discovery.record_limits,
+        work,
     )?;
 
     if !lengths.has_repeated_boundaries {
@@ -36,22 +41,40 @@ pub(super) fn generate_candidates(
         lengths.supported.clear();
         lengths.record_ranges.clear();
         let pairs = empty_pair_fields(0);
-        return finish_candidate_generation(&raw_fields, pairs, lengths, limits, Vec::new());
+        return finish_candidate_generation(&raw_fields, pairs, lengths, limits, Vec::new(), work);
     }
 
-    let views = record_views(training_messages, &lengths.record_ranges)?;
-    let header_fields = candidate_field_domains(&views, header_limits)?;
+    let Some(views) = record_views(training_messages, &lengths.record_ranges, work)? else {
+        lengths.work_limit_reached = true;
+        lengths.omitted_record_views = lengths
+            .omitted_record_views
+            .checked_add(lengths.record_ranges.len())
+            .ok_or(RecordDiscoveryError::InvalidLimits)?;
+        return finish_candidate_generation(
+            &raw_fields,
+            empty_pair_fields(0),
+            lengths,
+            limits,
+            Vec::new(),
+            work,
+        );
+    };
+    let header_fields = candidate_field_domains(&views, header_limits, work)?;
     let mut fields = raw_fields;
     add_field_check_counts(&mut fields, &header_fields)?;
+    fields.work_limit_reached |= header_fields.work_limit_reached;
 
-    let sequence_fields = varying_sequence_fields(&views, &header_fields.integer_shapes)?;
-    let pairs = sequence_group_candidates(
+    let (sequence_fields, sequence_work_limit) =
+        varying_sequence_fields(&views, &header_fields.integer_shapes, work)?;
+    let mut pairs = sequence_group_candidates(
         &views,
         &header_fields.identifiers,
         &sequence_fields,
         limits.max_pair_checks,
+        work,
     )?;
-    finish_candidate_generation(&fields, pairs, lengths, limits, Vec::new())
+    pairs.work_limit_reached |= sequence_work_limit;
+    finish_candidate_generation(&fields, pairs, lengths, limits, Vec::new(), work)
 }
 
 const fn split_field_check_budget(
@@ -92,7 +115,14 @@ fn add_field_check_counts(
 fn record_views<'a>(
     messages: &'a [&'a [u8]],
     ranges: &[RecordRange],
-) -> Result<Vec<&'a [u8]>, RecordDiscoveryError> {
+    work: &mut Option<&mut RecordWorkBudget>,
+) -> Result<Option<Vec<&'a [u8]>>, RecordDiscoveryError> {
+    let view_storage = std::mem::size_of::<&[u8]>()
+        .checked_mul(ranges.len())
+        .ok_or(RecordDiscoveryError::InvalidLimits)?;
+    if !try_charge_work(work, view_storage) {
+        return Ok(None);
+    }
     let mut views = Vec::new();
     views
         .try_reserve_exact(ranges.len())
@@ -106,30 +136,51 @@ fn record_views<'a>(
             .ok_or(RecordDiscoveryError::InvalidLimits)?;
         views.push(view);
     }
-    Ok(views)
+    Ok(Some(views))
 }
 
 fn length_candidates(
     messages: &[&[u8]],
+    inputs: &[&RecordInput<'_>],
     fields: &[IntegerField],
     maximum_data_offset: usize,
     maximum_checks: usize,
     record_limits: RecordLimits,
+    work: &mut Option<&mut RecordWorkBudget>,
 ) -> Result<LengthFields, RecordDiscoveryError> {
-    let mut search = LengthCandidateSearch::new(messages, record_limits)?;
-    let (examined_checks, total_checks) = visit_length_layouts(
+    // The visitor keeps a bounded frontier and one temporary priority list
+    let total_checks = length_domain_stats(fields, maximum_data_offset)?;
+    let workspace_bytes = std::mem::size_of::<usize>()
+        .checked_mul(fields.len())
+        .and_then(|bytes| bytes.checked_mul(2))
+        .ok_or(RecordDiscoveryError::InvalidLimits)?;
+    if !try_charge_work(work, workspace_bytes) {
+        let mut result = empty_length_fields();
+        result.omitted_checks = total_checks;
+        result.work_limit_reached = true;
+        return Ok(result);
+    }
+    let Some(mut search) = LengthCandidateSearch::new(messages, inputs, record_limits, work)?
+    else {
+        let mut result = empty_length_fields();
+        result.omitted_checks = total_checks;
+        result.work_limit_reached = true;
+        return Ok(result);
+    };
+    let (examined_checks, _domain_checks, stopped) = visit_length_layouts(
         fields,
         maximum_data_offset,
         maximum_checks,
         &[],
         LengthLayoutOrder::CompactPrefix,
-        &mut |field, data_offset, meaning| search.check_layout(field, data_offset, meaning),
+        &mut |field, data_offset, meaning| search.check_layout(field, data_offset, meaning, work),
     )?;
-    search.finish(total_checks, examined_checks)
+    search.finish(total_checks, examined_checks, stopped)
 }
 
-struct LengthCandidateSearch<'a> {
+struct LengthCandidateSearch<'a, 'input> {
     messages: &'a [&'a [u8]],
+    inputs: &'a [&'a RecordInput<'input>],
     record_limits: RecordLimits,
     per_message_limits: Vec<usize>,
     maximum_record_views: usize,
@@ -139,16 +190,28 @@ struct LengthCandidateSearch<'a> {
     incomplete_checks: usize,
 }
 
-impl<'a> LengthCandidateSearch<'a> {
+impl<'a, 'input> LengthCandidateSearch<'a, 'input> {
     fn new(
         messages: &'a [&'a [u8]],
+        inputs: &'a [&'a RecordInput<'input>],
         record_limits: RecordLimits,
-    ) -> Result<Self, RecordDiscoveryError> {
+        work: &mut Option<&mut RecordWorkBudget>,
+    ) -> Result<Option<Self>, RecordDiscoveryError> {
+        if messages.len() != inputs.len() {
+            return Err(RecordDiscoveryError::InvalidLimits);
+        }
         let maximum_record_views = maximum_record_views(record_limits);
+        let limit_bytes = std::mem::size_of::<usize>()
+            .checked_mul(messages.len())
+            .ok_or(RecordDiscoveryError::InvalidLimits)?;
+        if !try_charge_work(work, limit_bytes) {
+            return Ok(None);
+        }
         let per_message_limits =
             distribute_record_view_limit(maximum_record_views, messages.len())?;
-        Ok(Self {
+        Ok(Some(Self {
             messages,
+            inputs,
             record_limits,
             per_message_limits,
             maximum_record_views,
@@ -156,7 +219,7 @@ impl<'a> LengthCandidateSearch<'a> {
             seen_layout_fields: LengthFieldMembership::default(),
             seen_record_ranges: HashSet::new(),
             incomplete_checks: 0,
-        })
+        }))
     }
 
     fn check_layout(
@@ -164,25 +227,39 @@ impl<'a> LengthCandidateSearch<'a> {
         field: IntegerField,
         data_offset: usize,
         meaning: RecordLengthMeaning,
-    ) -> Result<(), RecordDiscoveryError> {
+        work: &mut Option<&mut RecordWorkBudget>,
+    ) -> Result<ControlFlow<()>, RecordDiscoveryError> {
         match length_ranges(
-            self.messages,
+            self.inputs,
             field,
             meaning,
             data_offset,
             self.record_limits,
             &self.per_message_limits,
+            work,
         )? {
-            LengthCheck::Mismatch => Ok(()),
+            LengthCheck::Mismatch => Ok(ControlFlow::Continue(())),
             LengthCheck::Incomplete => {
                 self.incomplete_checks = self
                     .incomplete_checks
                     .checked_add(1)
                     .ok_or(RecordDiscoveryError::InvalidLimits)?;
-                Ok(())
+                Ok(ControlFlow::Continue(()))
+            }
+            LengthCheck::WorkLimit => {
+                self.result.work_limit_reached = true;
+                Ok(ControlFlow::Break(()))
             }
             LengthCheck::Matched { ranges, omitted } => {
-                self.retain_layout(field, data_offset, meaning, ranges, omitted)
+                if !try_charge_work(work, std::mem::size_of::<SupportedLength>()) {
+                    self.result.work_limit_reached = true;
+                    return Ok(ControlFlow::Break(()));
+                }
+                if !self.retain_layout(field, data_offset, meaning, ranges, omitted, work)? {
+                    self.result.work_limit_reached = true;
+                    return Ok(ControlFlow::Break(()));
+                }
+                Ok(ControlFlow::Continue(()))
             }
         }
     }
@@ -194,7 +271,8 @@ impl<'a> LengthCandidateSearch<'a> {
         meaning: RecordLengthMeaning,
         ranges: Vec<RecordRange>,
         omitted: usize,
-    ) -> Result<(), RecordDiscoveryError> {
+        work: &mut Option<&mut RecordWorkBudget>,
+    ) -> Result<bool, RecordDiscoveryError> {
         self.result.retain_layout(
             &mut self.seen_layout_fields,
             SupportedLength {
@@ -211,16 +289,22 @@ impl<'a> LengthCandidateSearch<'a> {
         if layout_has_repeated_boundaries(&ranges, self.messages.len()) {
             self.result.has_repeated_boundaries = true;
             for range in ranges {
-                self.retain_record_range(range)?;
+                if !self.retain_record_range(range, work)? {
+                    return Ok(false);
+                }
             }
         }
-        Ok(())
+        Ok(true)
     }
 
-    fn retain_record_range(&mut self, range: RecordRange) -> Result<(), RecordDiscoveryError> {
+    fn retain_record_range(
+        &mut self,
+        range: RecordRange,
+        work: &mut Option<&mut RecordWorkBudget>,
+    ) -> Result<bool, RecordDiscoveryError> {
         let key = (range.message_index, range.start, range.end);
         if self.seen_record_ranges.contains(&key) {
-            return Ok(());
+            return Ok(true);
         }
         if self.result.record_ranges.len() == self.maximum_record_views {
             self.result.omitted_record_views = self
@@ -228,7 +312,13 @@ impl<'a> LengthCandidateSearch<'a> {
                 .omitted_record_views
                 .checked_add(1)
                 .ok_or(RecordDiscoveryError::InvalidLimits)?;
-            return Ok(());
+            return Ok(true);
+        }
+        let retained_bytes = std::mem::size_of::<RecordRange>()
+            .checked_add(std::mem::size_of::<(usize, usize, usize)>())
+            .ok_or(RecordDiscoveryError::InvalidLimits)?;
+        if !try_charge_work(work, retained_bytes) {
+            return Ok(false);
         }
         self.seen_record_ranges
             .try_reserve(1)
@@ -239,19 +329,21 @@ impl<'a> LengthCandidateSearch<'a> {
             .map_err(|_| allocation_error())?;
         self.seen_record_ranges.insert(key);
         self.result.record_ranges.push(range);
-        Ok(())
+        Ok(true)
     }
 
     fn finish(
         mut self,
         total_checks: usize,
         examined_checks: usize,
+        stopped: bool,
     ) -> Result<LengthFields, RecordDiscoveryError> {
-        self.result.examined_checks = examined_checks;
+        let incomplete = self.incomplete_checks.min(examined_checks);
+        self.result.examined_checks = examined_checks.saturating_sub(incomplete);
         self.result.omitted_checks = total_checks
-            .checked_sub(examined_checks)
-            .and_then(|unexamined| unexamined.checked_add(self.incomplete_checks))
+            .checked_sub(self.result.examined_checks)
             .ok_or(RecordDiscoveryError::InvalidLimits)?;
+        self.result.work_limit_reached |= stopped;
         Ok(self.result)
     }
 }
@@ -302,6 +394,7 @@ fn distribute_record_view_limit(
 enum LengthCheck {
     Mismatch,
     Incomplete,
+    WorkLimit,
     Matched {
         ranges: Vec<RecordRange>,
         omitted: usize,
@@ -309,12 +402,13 @@ enum LengthCheck {
 }
 
 fn length_ranges(
-    messages: &[&[u8]],
+    inputs: &[&RecordInput<'_>],
     field: IntegerField,
     meaning: RecordLengthMeaning,
     data_offset: usize,
     record_limits: RecordLimits,
     per_message_limits: &[usize],
+    work: &mut Option<&mut RecordWorkBudget>,
 ) -> Result<LengthCheck, RecordDiscoveryError> {
     let probe_schema = RecordSchema {
         records_offset: 0,
@@ -336,9 +430,14 @@ fn length_ranges(
     };
     let mut ranges = Vec::new();
     let mut omitted = 0_usize;
-    for (message_index, message) in messages.iter().enumerate() {
-        let parsed = match parse_records_with_limits(message, &probe_schema, record_limits) {
+    for (message_index, input) in inputs.iter().enumerate() {
+        let parsed_result = work.as_deref_mut().map_or_else(
+            || input.parse(&probe_schema, record_limits),
+            |work| input.parse_with_work(&probe_schema, record_limits, work),
+        );
+        let parsed = match parsed_result {
             Ok(parsed) => parsed,
+            Err(RecordError::WorkLimitExceeded { .. }) => return Ok(LengthCheck::WorkLimit),
             Err(RecordError::TooManyRecords { .. } | RecordError::ReportTooLarge { .. }) => {
                 return Ok(LengthCheck::Incomplete);
             }
@@ -362,6 +461,12 @@ fn length_ranges(
             .get(message_index)
             .ok_or(RecordDiscoveryError::InvalidLimits)?;
         let retained = parsed.records().len().min(message_limit);
+        let range_storage = std::mem::size_of::<RecordRange>()
+            .checked_mul(retained)
+            .ok_or(RecordDiscoveryError::InvalidLimits)?;
+        if !try_charge_work(work, range_storage) {
+            return Ok(LengthCheck::WorkLimit);
+        }
         ranges
             .try_reserve(retained)
             .map_err(|_| allocation_error())?;

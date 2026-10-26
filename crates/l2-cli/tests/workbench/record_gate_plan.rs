@@ -19,6 +19,7 @@ fn analysis_details_retain_omitted_views_and_training_boundary_cues() {
     let analysis = RecordSchemaAnalysisReport {
         proposal,
         discovery: Some(discovery),
+        work_bytes: None,
     };
     let messages = LearningMessages {
         training: vec![&[]],
@@ -29,7 +30,6 @@ fn analysis_details_retain_omitted_views_and_training_boundary_cues() {
         all_heldout_indices: Vec::new(),
         training_data_offsets: Vec::new(),
         learning_bytes: 0,
-        analysis_input_bytes: 0,
         eligible_input_bytes: 0,
         full_input_bytes: 0,
         training_session_count: 2,
@@ -39,6 +39,7 @@ fn analysis_details_retain_omitted_views_and_training_boundary_cues() {
         family_details: None,
         frame_indices: None,
         messages: &messages,
+        inputs: &[],
         limits: RecordSchemaProposalLimits::default(),
         work_limit: 128,
         analysis_work_limit: 128,
@@ -72,7 +73,6 @@ fn training_boundary_at_offset_sixteen_is_admitted_without_using_another_frame()
         all_heldout_indices: Vec::new(),
         training_data_offsets: vec![16],
         learning_bytes: frames[0].bytes.len(),
-        analysis_input_bytes: frames[0].bytes.len(),
         eligible_input_bytes: frames[0].bytes.len(),
         full_input_bytes: frames.iter().map(|item| item.bytes.len()).sum(),
         training_session_count: 1,
@@ -83,10 +83,8 @@ fn training_boundary_at_offset_sixteen_is_admitted_without_using_another_frame()
         &frames,
         &[0],
         &messages,
-        64 * 1024,
         SchemaOffsetScope::PreservedHeader,
-    )?
-    .ok_or("the input budget should permit analysis")?;
+    )?;
 
     assert_eq!(limits.max_field_offset, 16);
     Ok(())
@@ -104,7 +102,6 @@ fn empty_preserved_prefix_does_not_cap_inferred_fields_at_zero() -> TestResult {
         all_heldout_indices: Vec::new(),
         training_data_offsets: Vec::new(),
         learning_bytes: frames[0].bytes.len(),
-        analysis_input_bytes: frames[0].bytes.len(),
         eligible_input_bytes: frames[0].bytes.len(),
         full_input_bytes: frames[0].bytes.len(),
         training_session_count: 1,
@@ -115,10 +112,8 @@ fn empty_preserved_prefix_does_not_cap_inferred_fields_at_zero() -> TestResult {
         &frames,
         &[0],
         &messages,
-        64 * 1024,
         SchemaOffsetScope::PreservedHeader,
-    )?
-    .ok_or("the input budget should permit analysis")?;
+    )?;
 
     assert_eq!(limits.max_field_offset, 15);
     Ok(())
@@ -138,7 +133,6 @@ fn parser_limits_cover_full_eligible_frames_after_sampled_learning() -> TestResu
         all_heldout_indices: Vec::new(),
         training_data_offsets: Vec::new(),
         learning_bytes: selected_bytes,
-        analysis_input_bytes: selected_bytes,
         eligible_input_bytes: eligible_bytes,
         full_input_bytes: eligible_bytes,
         training_session_count: 1,
@@ -149,10 +143,8 @@ fn parser_limits_cover_full_eligible_frames_after_sampled_learning() -> TestResu
         &frames,
         &[0],
         &messages,
-        64 * 1024,
         SchemaOffsetScope::PreservedHeader,
-    )?
-    .ok_or("the sampled search budget should permit analysis")?;
+    )?;
 
     assert_eq!(
         limits.discovery.record_limits.max_input_bytes,
@@ -177,7 +169,6 @@ fn full_input_scope_keeps_candidate_fields_after_the_preserved_prefix() -> TestR
         all_heldout_indices: Vec::new(),
         training_data_offsets: vec![10],
         learning_bytes: frames[0].bytes.len(),
-        analysis_input_bytes: frames[0].bytes.len(),
         eligible_input_bytes: frames[0].bytes.len(),
         full_input_bytes: frames[0].bytes.len(),
         training_session_count: 1,
@@ -188,10 +179,8 @@ fn full_input_scope_keeps_candidate_fields_after_the_preserved_prefix() -> TestR
         &frames,
         &[0],
         &messages,
-        64 * 1024,
         SchemaOffsetScope::CompleteInput,
-    )?
-    .ok_or("the input budget should permit analysis")?;
+    )?;
 
     assert_eq!(
         limits.max_field_offset,
@@ -244,6 +233,7 @@ fn proposal() -> RecordSchemaProposalReport {
             range: l2_workbench::protocol::ByteRange { start: 3, end: 5 },
         }],
         omitted_schema_combinations: Some(0),
+        work_limit_reached: false,
         search_exhaustive_within_plan: false,
         limitations: ["test", "test"],
     }
@@ -262,5 +252,7 @@ fn empty_report() -> RecordSchemaDiscoveryReport {
         falsifications: Vec::new(),
         falsified_count: 0,
         omitted_falsification_examples: 0,
+        work_limit_reached: false,
+        resource_limited_candidates: 0,
     }
 }

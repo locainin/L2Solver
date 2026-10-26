@@ -444,6 +444,15 @@ pub enum RecordError {
     OutputTooLarge { length: usize, maximum: usize },
     /// Compiled assembly metadata exceeds its caller-provided retention ceiling
     PlanTooLarge { bytes: usize, maximum: usize },
+    /// The next record operation exceeds its shared logical work-byte budget
+    WorkLimitExceeded {
+        /// Maximum logical work bytes allowed
+        limit: usize,
+        /// Logical work bytes already consumed
+        consumed: usize,
+        /// Logical work bytes needed for the next operation
+        requested: usize,
+    },
     /// A bounded allocation failed
     AllocationFailed,
 }

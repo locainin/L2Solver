@@ -5,7 +5,7 @@ use super::super::super::RecoveryExecutionError;
 use super::super::{DecodedFrameOutput, invalid_policy, operational};
 use super::screen::SchemaObserverOptions;
 use super::selection::{LearningSelection, select_learning_frames};
-use super::{SchemaCandidateOptions, SchemaPlan, total_input_bytes};
+use super::{SchemaCandidateOptions, SchemaPlan, record_inputs, total_input_bytes};
 use analysis::{AnalysisRequest, analyze_group};
 use family::{FamilyAnalysisRequest, build_family_analysis};
 use l2_workbench::{
@@ -15,7 +15,6 @@ use l2_workbench::{
 use serde_json::{Value, json};
 use std::collections::BTreeSet;
 
-const MAX_GATE_SCHEMA_CHECKS: usize = 512;
 const MAX_RETAINED_SCHEMA_HYPOTHESES: usize = 128;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -42,7 +41,6 @@ pub(super) struct LearningMessages<'a> {
     all_heldout_indices: Vec<usize>,
     training_data_offsets: Vec<usize>,
     learning_bytes: usize,
-    analysis_input_bytes: usize,
     eligible_input_bytes: usize,
     full_input_bytes: usize,
     training_session_count: usize,
@@ -58,7 +56,7 @@ struct PlanAnalysisRequest<'frames, 'messages> {
     parser_format: l2_workbench::artifact::ArtifactValidationFormat,
     artifact_policy: l2_workbench::artifact::ArtifactValidationPolicy,
     job: Option<&'frames Job>,
-    header_inputs: Option<&'frames [l2_workbench::protocol::RecordInput<'frames>]>,
+    inputs: &'frames [l2_workbench::protocol::RecordInput<'frames>],
     offset_scope: SchemaOffsetScope,
     assessment_scope: SchemaOffsetScope,
 }
@@ -72,7 +70,6 @@ struct LearningMessageContents<'a> {
     all_heldout_indices: Vec<usize>,
     training_data_offsets: Vec<usize>,
     learning_bytes: usize,
-    analysis_input_bytes: usize,
     eligible_input_bytes: usize,
 }
 
@@ -90,7 +87,6 @@ impl LearningMessageContents<'_> {
             all_heldout_indices: Vec::new(),
             training_data_offsets: Vec::new(),
             learning_bytes: 0,
-            analysis_input_bytes: 0,
             eligible_input_bytes: 0,
         };
         contents.reserve_selected(selected_count)?;
@@ -184,11 +180,11 @@ pub(super) fn build_full_schema_plan(
     )
 }
 
-pub(super) fn build_schema_plan_with_inputs(
-    frames: &[DecodedFrameOutput],
+pub(super) fn build_schema_plan_with_inputs<'frames>(
+    frames: &'frames [DecodedFrameOutput],
     report: &RelationalTransformReport,
     options: SchemaCandidateOptions<'_>,
-    header_inputs: Option<&[l2_workbench::protocol::RecordInput<'_>]>,
+    header_inputs: Option<&'frames [l2_workbench::protocol::RecordInput<'frames>]>,
 ) -> Result<SchemaPlan, RecoveryExecutionError> {
     build_schema_plan_with_scope(
         frames,
@@ -199,11 +195,11 @@ pub(super) fn build_schema_plan_with_inputs(
     )
 }
 
-fn build_schema_plan_with_scope(
-    frames: &[DecodedFrameOutput],
+fn build_schema_plan_with_scope<'frames>(
+    frames: &'frames [DecodedFrameOutput],
     report: &RelationalTransformReport,
     options: SchemaCandidateOptions<'_>,
-    header_inputs: Option<&[l2_workbench::protocol::RecordInput<'_>]>,
+    header_inputs: Option<&'frames [l2_workbench::protocol::RecordInput<'frames>]>,
     offset_scope: SchemaOffsetScope,
 ) -> Result<SchemaPlan, RecoveryExecutionError> {
     let SchemaCandidateOptions {
@@ -230,16 +226,20 @@ fn build_schema_plan_with_scope(
         &heldout,
     )?;
     let messages = collect_learning_messages(frames, &selection, &discovery, &heldout)?;
+    let owned_inputs = header_inputs
+        .is_none()
+        .then(|| record_inputs(frames))
+        .transpose()?;
+    let inputs = header_inputs
+        .or(owned_inputs.as_deref())
+        .ok_or_else(|| invalid_policy("record gate input identities are missing"))?;
     let assessment_scope = effective_offset_scope(
         frames,
         &messages.training_indices,
         schema_limits,
         offset_scope,
     )?;
-    if messages.training.is_empty()
-        || messages.learning_bytes == 0
-        || messages.full_input_bytes > work_limit
-    {
+    if messages.training.is_empty() || messages.learning_bytes == 0 {
         return Ok(work_limited_plan(
             messages.learning_bytes,
             messages.full_input_bytes,
@@ -248,23 +248,13 @@ fn build_schema_plan_with_scope(
         ));
     }
 
-    let uniform_analysis_budget = work_limit.checked_div(2).unwrap_or(0);
-    let Some(limits) = prepare_schema_limits(
+    let limits = prepare_schema_limits(
         schema_limits,
         frames,
         messages.training_indices.as_slice(),
         &messages,
-        uniform_analysis_budget,
         offset_scope,
-    )?
-    else {
-        return Ok(work_limited_plan(
-            messages.learning_bytes,
-            messages.full_input_bytes,
-            work_limit,
-            assessment_scope,
-        ));
-    };
+    )?;
     analyze_plan(&PlanAnalysisRequest {
         frames,
         selection: &selection,
@@ -275,7 +265,7 @@ fn build_schema_plan_with_scope(
         parser_format,
         artifact_policy,
         job,
-        header_inputs,
+        inputs,
         offset_scope,
         assessment_scope,
     })
@@ -289,7 +279,6 @@ fn analyze_plan(
     }
     let observer = Some(SchemaObserverOptions {
         frames: request.frames,
-        inputs: request.header_inputs,
         parser_format: request.parser_format,
         artifact_policy: request.artifact_policy,
         job: request.job,
@@ -300,6 +289,7 @@ fn analyze_plan(
         family_details: None,
         frame_indices: None,
         messages: request.messages,
+        inputs: request.inputs,
         limits: request.limits,
         work_limit: request.work_limit,
         analysis_work_limit: uniform_analysis_budget,
@@ -312,6 +302,7 @@ fn analyze_plan(
     let family_budget = request.work_limit.saturating_sub(uniform.work_bytes);
     let family_request = FamilyAnalysisRequest {
         frames: request.frames,
+        inputs: request.inputs,
         selection: request.selection,
         discovery_sessions: request.discovery,
         base_limits: request.limits,
@@ -321,6 +312,7 @@ fn analyze_plan(
         job: request.job,
     };
     let family = build_family_analysis(&family_request)?;
+    let work_limited = uniform.work_limited || family.work_limited;
     let mut alternatives = uniform.alternatives;
     alternatives
         .try_reserve(family.alternatives.len())
@@ -334,6 +326,7 @@ fn analyze_plan(
             "family_work_bytes":family.work_bytes,
             "family_search_complete":family.complete,
         }),
+        work_limited,
         has_unassigned_family_messages: family.has_unassigned_messages,
         family_search_complete: family.complete,
         assessment_scope: request.assessment_scope,
@@ -403,7 +396,6 @@ fn collect_learning_messages<'a>(
         all_heldout_indices: contents.all_heldout_indices,
         training_data_offsets: contents.training_data_offsets,
         learning_bytes: contents.learning_bytes,
-        analysis_input_bytes: contents.analysis_input_bytes,
         eligible_input_bytes: contents.eligible_input_bytes,
         full_input_bytes,
         training_session_count,
@@ -453,10 +445,6 @@ fn collect_selected_frames<'a>(
         if discovery.contains(&frame.context.session) {
             contents.training.push(frame.bytes.as_slice());
             contents.training_indices.push(*frame_index);
-            contents.analysis_input_bytes = contents
-                .analysis_input_bytes
-                .checked_add(frame.bytes.len())
-                .ok_or_else(|| invalid_policy("record gate analysis input count overflowed"))?;
             training_sessions.insert(frame.context.session);
             if let Some(offset) = frame.preserved_header_end {
                 contents.training_data_offsets.push(offset);
@@ -464,10 +452,6 @@ fn collect_selected_frames<'a>(
         } else if heldout.contains(&frame.context.session) {
             contents.heldout.push(frame.bytes.as_slice());
             contents.heldout_indices.push(*frame_index);
-            contents.analysis_input_bytes = contents
-                .analysis_input_bytes
-                .checked_add(frame.bytes.len())
-                .ok_or_else(|| invalid_policy("record gate analysis input count overflowed"))?;
         }
     }
     Ok(())
@@ -495,14 +479,10 @@ pub(super) fn prepare_schema_limits(
     frames: &[DecodedFrameOutput],
     frame_indices: &[usize],
     messages: &LearningMessages<'_>,
-    work_limit: usize,
     offset_scope: SchemaOffsetScope,
-) -> Result<Option<RecordSchemaProposalLimits>, RecoveryExecutionError> {
-    let Some(mut limits) =
-        bounded_schema_limits(initial, messages.analysis_input_bytes, work_limit)
-    else {
-        return Ok(None);
-    };
+) -> Result<RecordSchemaProposalLimits, RecoveryExecutionError> {
+    // Search caps come from the proposal policy; actual reads and parses use RecordWorkBudget
+    let mut limits = initial;
     if offset_scope == SchemaOffsetScope::PreservedHeader {
         // Keep the primary probe within bytes that the transform cannot change
         limits = restrict_header_offsets(limits, frames, frame_indices)?;
@@ -512,25 +492,7 @@ pub(super) fn prepare_schema_limits(
         .max_survivors
         .min(MAX_RETAINED_SCHEMA_HYPOTHESES);
     limit_record_input(&mut limits, messages.eligible_input_bytes);
-    Ok(Some(limits))
-}
-
-fn bounded_schema_limits(
-    mut limits: RecordSchemaProposalLimits,
-    input_bytes: usize,
-    work_limit: usize,
-) -> Option<RecordSchemaProposalLimits> {
-    let steps = work_limit.checked_div(input_bytes)?;
-    if steps < 6 {
-        return None;
-    }
-    // Divide the caller budget across the six independent proposal checks
-    let per_domain_limit = steps.checked_div(6)?.clamp(1, MAX_GATE_SCHEMA_CHECKS);
-    limits.max_field_checks_per_domain = limits.max_field_checks_per_domain.min(per_domain_limit);
-    limits.max_pair_checks = limits.max_pair_checks.min(per_domain_limit);
-    limits.max_length_checks = limits.max_length_checks.min(per_domain_limit);
-    limits.discovery.max_candidates = limits.discovery.max_candidates.min(per_domain_limit);
-    Some(limits)
+    Ok(limits)
 }
 
 fn restrict_header_offsets(
@@ -586,6 +548,7 @@ fn pending_plan(
     SchemaPlan {
         alternatives: Vec::new(),
         details: json!({"reason":reason,"details":details}),
+        work_limited: false,
         has_unassigned_family_messages: false,
         family_search_complete: false,
         assessment_scope,

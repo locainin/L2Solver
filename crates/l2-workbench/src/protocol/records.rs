@@ -8,6 +8,7 @@ mod header;
 mod model;
 mod parse;
 mod proposal;
+mod work;
 
 pub use assemble::{assemble_record_groups, assemble_record_groups_from_inputs};
 pub use assembly_plan::{
@@ -33,8 +34,11 @@ pub use parse::{parse_records, parse_records_with_limits};
 pub use proposal::{
     RecordBoundaryCue, RecordSchemaAnalysisReport, RecordSchemaMultiStrategyAnalysisReport,
     RecordSchemaProposalLimits, RecordSchemaProposalReport, RecordSchemaProposalValidationBasis,
-    RecordSchemaStrategy, analyze_record_schemas, analyze_record_schemas_with_repeated_boundaries,
+    RecordSchemaStrategy, analyze_record_inputs_with_repeated_boundaries_and_offsets,
+    analyze_record_inputs_with_repeated_boundaries_and_offsets_observed, analyze_record_schemas,
+    analyze_record_schemas_with_repeated_boundaries,
     analyze_record_schemas_with_repeated_boundaries_and_offsets,
     analyze_record_schemas_with_repeated_boundaries_and_offsets_observed,
     propose_record_schema_space,
 };
+pub use work::RecordWorkBudget;

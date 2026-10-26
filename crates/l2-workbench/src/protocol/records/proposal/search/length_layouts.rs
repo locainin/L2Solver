@@ -6,6 +6,7 @@ use super::super::model::LENGTH_MEANINGS;
 use super::allocation_error;
 use std::cmp::Reverse;
 use std::collections::BinaryHeap;
+use std::ops::ControlFlow;
 
 /// Order fallback checks without changing the layouts included in the full domain
 #[derive(Clone, Copy)]
@@ -28,23 +29,26 @@ pub(super) fn visit_length_layouts(
         IntegerField,
         usize,
         RecordLengthMeaning,
-    ) -> Result<(), RecordDiscoveryError>,
-) -> Result<(usize, usize), RecordDiscoveryError> {
+    ) -> Result<ControlFlow<()>, RecordDiscoveryError>,
+) -> Result<(usize, usize, bool), RecordDiscoveryError> {
     let total_checks = length_domain_stats(fields, maximum_data_offset)?;
     let mut checks = 0_usize;
 
     if !prioritized_offsets.is_empty() {
-        visit_prioritized_length_layouts(
+        let stopped = visit_prioritized_length_layouts(
             fields,
             prioritized_offsets,
             maximum_checks,
             &mut checks,
             visitor,
         )?;
+        if stopped {
+            return Ok((checks, total_checks, true));
+        }
     }
 
     if checks < maximum_checks {
-        visit_fallback_length_layouts(
+        let stopped = visit_fallback_length_layouts(
             fields,
             maximum_data_offset,
             maximum_checks,
@@ -53,9 +57,12 @@ pub(super) fn visit_length_layouts(
             &mut checks,
             visitor,
         )?;
+        if stopped {
+            return Ok((checks, total_checks, true));
+        }
     }
 
-    Ok((checks, total_checks))
+    Ok((checks, total_checks, false))
 }
 
 fn visit_prioritized_length_layouts(
@@ -67,8 +74,8 @@ fn visit_prioritized_length_layouts(
         IntegerField,
         usize,
         RecordLengthMeaning,
-    ) -> Result<(), RecordDiscoveryError>,
-) -> Result<(), RecordDiscoveryError> {
+    ) -> Result<ControlFlow<()>, RecordDiscoveryError>,
+) -> Result<bool, RecordDiscoveryError> {
     let mut priority_fields = Vec::new();
     priority_fields
         .try_reserve_exact(fields.len())
@@ -98,14 +105,19 @@ fn visit_prioritized_length_layouts(
                 if *checks == maximum_checks {
                     break 'prioritized;
                 }
-                *checks = checks
+                if matches!(
+                    visitor(*field, *data_offset, meaning)?,
+                    ControlFlow::Break(())
+                ) {
+                    return Ok(true);
+                }
+                *checks = (*checks)
                     .checked_add(1)
                     .ok_or(RecordDiscoveryError::InvalidLimits)?;
-                visitor(*field, *data_offset, meaning)?;
             }
         }
     }
-    Ok(())
+    Ok(false)
 }
 
 fn visit_fallback_length_layouts(
@@ -119,8 +131,8 @@ fn visit_fallback_length_layouts(
         IntegerField,
         usize,
         RecordLengthMeaning,
-    ) -> Result<(), RecordDiscoveryError>,
-) -> Result<(), RecordDiscoveryError> {
+    ) -> Result<ControlFlow<()>, RecordDiscoveryError>,
+) -> Result<bool, RecordDiscoveryError> {
     let mut pending = BinaryHeap::new();
     pending
         .try_reserve(fields.len())
@@ -155,12 +167,17 @@ fn visit_fallback_length_layouts(
             .ok_or(RecordDiscoveryError::InvalidLimits)?;
         for meaning in LENGTH_MEANINGS {
             if *checks == maximum_checks {
-                return Ok(());
+                return Ok(false);
+            }
+            if matches!(
+                visitor(*field, data_offset, meaning)?,
+                ControlFlow::Break(())
+            ) {
+                return Ok(true);
             }
             *checks = (*checks)
                 .checked_add(1)
                 .ok_or(RecordDiscoveryError::InvalidLimits)?;
-            visitor(*field, data_offset, meaning)?;
         }
 
         let Some(next_gap) = gap.checked_add(1) else {
@@ -178,7 +195,7 @@ fn visit_fallback_length_layouts(
         let priority = length_layout_priority(order, field_end, next_gap, maximum_data_offset)?;
         pending.push(Reverse((priority, field_index, next_gap)));
     }
-    Ok(())
+    Ok(false)
 }
 
 fn next_unprioritized_gap(
@@ -224,7 +241,7 @@ fn length_layout_priority(
     }
 }
 
-fn length_domain_stats(
+pub(super) fn length_domain_stats(
     fields: &[IntegerField],
     maximum_data_offset: usize,
 ) -> Result<usize, RecordDiscoveryError> {

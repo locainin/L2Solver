@@ -66,6 +66,14 @@ impl fmt::Display for RecordError {
                 formatter,
                 "compiled record plan needs {bytes} bytes; maximum is {maximum}"
             ),
+            Self::WorkLimitExceeded {
+                limit,
+                consumed,
+                requested,
+            } => write!(
+                formatter,
+                "record work needs {requested} bytes after {consumed} of {limit} were used"
+            ),
             Self::AllocationFailed => formatter.write_str("record operation allocation failed"),
         }
     }

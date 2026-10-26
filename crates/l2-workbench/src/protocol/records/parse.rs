@@ -1,3 +1,4 @@
+use super::RecordWorkBudget;
 use super::{
     ByteField, IntegerField, ParsedRecord, RecordCount, RecordError, RecordInput,
     RecordLengthMeaning, RecordLimits, RecordParseReport, RecordSchema,
@@ -36,7 +37,27 @@ pub(super) fn parse_with_input(
     schema: &RecordSchema,
     limits: RecordLimits,
 ) -> Result<RecordParseReport, RecordError> {
+    parse_with_input_inner(input, schema, limits, None)
+}
+
+pub(super) fn parse_with_input_metered(
+    input: &RecordInput<'_>,
+    schema: &RecordSchema,
+    limits: RecordLimits,
+    work: &mut RecordWorkBudget,
+) -> Result<RecordParseReport, RecordError> {
+    parse_with_input_inner(input, schema, limits, Some(work))
+}
+
+fn parse_with_input_inner(
+    input: &RecordInput<'_>,
+    schema: &RecordSchema,
+    limits: RecordLimits,
+    mut work: Option<&mut RecordWorkBudget>,
+) -> Result<RecordParseReport, RecordError> {
     let bytes = input.bytes;
+    // The report stores its schema inline, so one report-size charge covers both
+    charge_work(&mut work, std::mem::size_of::<RecordParseReport>())?;
     validate_limits(limits)?;
     validate_schema(schema, limits)?;
     if bytes.len() > limits.max_input_bytes {
@@ -53,7 +74,7 @@ pub(super) fn parse_with_input(
     }
 
     // Resolve the declared count before allocating report storage
-    let declared_count = declared_count(bytes, schema)?;
+    let declared_count = declared_count(bytes, schema, &mut work)?;
     if let Some(count) = declared_count {
         ensure_record_count(count, limits.max_records)?;
     }
@@ -67,7 +88,12 @@ pub(super) fn parse_with_input(
         .transpose()?;
     // Only reserve records that could fit in the selected input
     let remaining_bytes = bytes.len() - schema.records_offset;
-    let reserve_count = initial_record_capacity(expected, remaining_bytes, schema, limits)?;
+    // Metered work grows report storage one record at a time before committing it
+    let reserve_count = if work.is_some() {
+        0
+    } else {
+        initial_record_capacity(expected, remaining_bytes, schema, limits)?
+    };
     let mut records = Vec::new();
     records
         .try_reserve_exact(reserve_count)
@@ -77,9 +103,9 @@ pub(super) fn parse_with_input(
     match expected {
         Some(count) => {
             for record_index in 0..count {
-                let record = parse_one(bytes, schema, record_index, cursor)?;
+                let record = parse_one(bytes, schema, record_index, cursor, &mut work)?;
                 cursor = record.record.end;
-                push_record(&mut records, record, limits)?;
+                push_record(&mut records, record, limits, &mut work)?;
             }
         }
         None => {
@@ -93,9 +119,9 @@ pub(super) fn parse_with_input(
                         maximum: limits.max_records,
                     });
                 }
-                let record = parse_one(bytes, schema, records.len(), cursor)?;
+                let record = parse_one(bytes, schema, records.len(), cursor, &mut work)?;
                 cursor = record.record.end;
-                push_record(&mut records, record, limits)?;
+                push_record(&mut records, record, limits, &mut work)?;
             }
         }
     }
@@ -106,6 +132,9 @@ pub(super) fn parse_with_input(
             offset: cursor,
             remaining: bytes.len().saturating_sub(cursor),
         });
+    }
+    if !input.identity_is_computed() {
+        charge_work(&mut work, bytes.len())?;
     }
     Ok(RecordParseReport {
         schema: schema.clone(),
@@ -222,11 +251,16 @@ fn validate_integer_field(
     )
 }
 
-fn declared_count(bytes: &[u8], schema: &RecordSchema) -> Result<Option<u64>, RecordError> {
+fn declared_count(
+    bytes: &[u8],
+    schema: &RecordSchema,
+    work: &mut Option<&mut RecordWorkBudget>,
+) -> Result<Option<u64>, RecordError> {
     match schema.count {
         RecordCount::UntilEnd => Ok(None),
         RecordCount::Exact { records } => Ok(Some(records)),
         RecordCount::Field { field } => {
+            charge_work(work, field.width)?;
             let end = field
                 .offset
                 .checked_add(field.width)
@@ -256,6 +290,7 @@ fn parse_one(
     schema: &RecordSchema,
     record_index: usize,
     start: usize,
+    work: &mut Option<&mut RecordWorkBudget>,
 ) -> Result<ParsedRecord, RecordError> {
     let header_end = start
         .checked_add(schema.data_offset)
@@ -271,8 +306,9 @@ fn parse_one(
         });
     }
 
-    let sequence = decode_record_integer(bytes, start, schema.sequence, record_index)?;
-    let encoded_length = decode_record_integer(bytes, start, schema.length, record_index)?;
+    let sequence = decode_record_integer(bytes, start, schema.sequence, record_index, work)?;
+    let encoded_length = decode_record_integer(bytes, start, schema.length, record_index, work)?;
+    charge_work(work, 1)?;
     let relative_end = record_end(schema, encoded_length, record_index)?;
     let end = start
         .checked_add(relative_end)
@@ -299,6 +335,7 @@ fn parse_one(
         .ok_or(RecordError::LengthOverflow {
             record: record_index,
         })?;
+    charge_work(work, schema.identifier.width)?;
     let identifier_slice = bytes
         .get(identifier_start..identifier_end)
         .ok_or(RecordError::InvalidReport)?;
@@ -325,7 +362,9 @@ fn decode_record_integer(
     record_start: usize,
     field: IntegerField,
     record_index: usize,
+    work: &mut Option<&mut RecordWorkBudget>,
 ) -> Result<u64, RecordError> {
+    charge_work(work, field.width)?;
     let start = record_start
         .checked_add(field.offset)
         .ok_or(RecordError::LengthOverflow {
@@ -379,6 +418,7 @@ fn push_record(
     records: &mut Vec<ParsedRecord>,
     record: ParsedRecord,
     limits: RecordLimits,
+    work: &mut Option<&mut RecordWorkBudget>,
 ) -> Result<(), RecordError> {
     let next_count = records
         .len()
@@ -392,10 +432,18 @@ fn push_record(
             maximum: limits.max_report_bytes,
         });
     }
+    charge_work(work, std::mem::size_of::<ParsedRecord>())?;
     records
         .try_reserve(1)
         .map_err(|_| RecordError::AllocationFailed)?;
     records.push(record);
+    Ok(())
+}
+
+fn charge_work(work: &mut Option<&mut RecordWorkBudget>, amount: usize) -> Result<(), RecordError> {
+    if let Some(work) = work.as_deref_mut() {
+        work.charge(amount)?;
+    }
     Ok(())
 }
 

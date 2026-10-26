@@ -840,3 +840,40 @@ fn rejects_empty_list_domains() {
         Err(RecordDiscoveryError::InvalidLimits)
     ));
 }
+
+#[test]
+fn parser_resource_limits_leave_candidates_unresolved_instead_of_falsified()
+-> Result<(), Box<dyn Error>> {
+    let mut message = Vec::new();
+    push_record(&mut message, b"R1", 0, b"x");
+    let mut space = byte_sequence_space(
+        vec![ByteField {
+            offset: 0,
+            width: 2,
+        }],
+        vec![ByteOrder::BigEndian],
+    );
+    space.counts = vec![RecordCount::Exact { records: 2 }];
+    let mut limits = discovery_limits(1);
+    limits.record_limits.max_records = 1;
+
+    let too_many_records = discover_record_schemas(&[message.as_slice()], &[], &space, limits)?;
+    assert_unresolved_resource_candidate(&too_many_records);
+
+    space.counts = vec![RecordCount::Exact { records: 1 }];
+    limits.record_limits.max_report_bytes = 1;
+    let report_limit = discover_record_schemas(&[message.as_slice()], &[], &space, limits)?;
+    assert_unresolved_resource_candidate(&report_limit);
+    Ok(())
+}
+
+fn assert_unresolved_resource_candidate(
+    report: &l2_workbench::protocol::RecordSchemaDiscoveryReport,
+) {
+    assert_eq!(report.resource_limited_candidates, 1);
+    assert_eq!(report.examined_combinations, 0);
+    assert_eq!(report.unexamined_combinations, Some(1));
+    assert_eq!(report.falsified_count, 0);
+    assert!(!report.search_exhaustive_within_plan);
+    assert!(!report.report_details_complete);
+}

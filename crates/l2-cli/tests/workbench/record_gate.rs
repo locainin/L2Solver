@@ -14,6 +14,9 @@ use std::sync::Arc;
 
 type TestResult = Result<(), Box<dyn Error>>;
 
+// Corroboration tests need room for parser metadata as well as the tiny input bytes
+const STRUCTURAL_CHECK_WORK_LIMIT: usize = 64 * 1024;
+
 #[test]
 fn clear_header_frames_without_a_schema_report_remain_pending() -> TestResult {
     let frames = [clear_header_frame()];
@@ -62,7 +65,7 @@ fn constant_size_records_without_sequence_evidence_remain_pending() -> TestResul
         &frames,
         ArtifactValidationFormat::Png,
         ArtifactValidationPolicy::default(),
-        1024,
+        STRUCTURAL_CHECK_WORK_LIMIT,
         None,
         &plan,
         false,
@@ -71,12 +74,37 @@ fn constant_size_records_without_sequence_evidence_remain_pending() -> TestResul
     assert_eq!(result.status, GateStatus::Pending);
     assert_eq!(
         result.details.get("reason").and_then(Value::as_str),
-        Some("record_corroboration_missing")
+        Some("record_corroboration_missing"),
+        "{:?}",
+        result.details
     );
     assert_eq!(
         result.details.get("underdetermined_schemas"),
         Some(&Value::from(1))
     );
+    Ok(())
+}
+
+#[test]
+fn parser_metadata_work_limit_keeps_a_corroborated_schema_pending() -> TestResult {
+    let frames = structural_frames();
+    let plan = schema_plan(Some(surviving_report(frames.len())), true);
+    let work_limit = 1024;
+    let result = screen_with_schema_plan(
+        &frames,
+        ArtifactValidationFormat::Png,
+        ArtifactValidationPolicy::default(),
+        work_limit,
+        None,
+        &plan,
+        false,
+    )?;
+
+    assert_eq!(result.status, GateStatus::Pending);
+    assert_eq!(result.work_limited_at, Some(work_limit));
+    assert!(result.work_bytes > 0 && result.work_bytes <= work_limit);
+    assert!(result.accepted_schema.is_none());
+    assert_eq!(result.details.get("schemas_checked"), Some(&Value::from(0)));
     Ok(())
 }
 
@@ -92,13 +120,18 @@ fn varying_record_lengths_support_a_schema_when_sequences_repeat() -> TestResult
         &frames,
         ArtifactValidationFormat::Png,
         ArtifactValidationPolicy::default(),
-        1024,
+        STRUCTURAL_CHECK_WORK_LIMIT,
         None,
         &plan,
         false,
     )?;
 
-    assert_eq!(result.status, GateStatus::StructurallySupported);
+    assert_eq!(
+        result.status,
+        GateStatus::StructurallySupported,
+        "{:?}",
+        result.details
+    );
     Ok(())
 }
 
@@ -115,13 +148,18 @@ fn identical_duplicate_records_keep_contiguous_cross_session_support() -> TestRe
         &frames,
         ArtifactValidationFormat::Png,
         ArtifactValidationPolicy::default(),
-        1024,
+        STRUCTURAL_CHECK_WORK_LIMIT,
         None,
         &plan,
         false,
     )?;
 
-    assert_eq!(result.status, GateStatus::StructurallySupported);
+    assert_eq!(
+        result.status,
+        GateStatus::StructurallySupported,
+        "{:?}",
+        result.details
+    );
     Ok(())
 }
 
@@ -133,13 +171,18 @@ fn contiguous_sequences_support_unknown_terminal_with_optional_family_uncertaint
         &frames,
         ArtifactValidationFormat::Png,
         ArtifactValidationPolicy::default(),
-        1024,
+        STRUCTURAL_CHECK_WORK_LIMIT,
         None,
         &plan,
         false,
     )?;
 
-    assert_eq!(result.status, GateStatus::StructurallySupported);
+    assert_eq!(
+        result.status,
+        GateStatus::StructurallySupported,
+        "{:?}",
+        result.details
+    );
     assert_eq!(
         result.details.get("family_unassigned_messages"),
         Some(&Value::Bool(true))
@@ -178,6 +221,7 @@ fn family_schema_support_stays_pending_when_any_message_is_unassigned() -> TestR
     let plan = SchemaPlan {
         alternatives: vec![family_alternative],
         details: json!({}),
+        work_limited: false,
         has_unassigned_family_messages: true,
         family_search_complete: false,
         assessment_scope: super::SchemaOffsetScope::CompleteInput,
@@ -187,7 +231,7 @@ fn family_schema_support_stays_pending_when_any_message_is_unassigned() -> TestR
         &frames,
         ArtifactValidationFormat::Png,
         ArtifactValidationPolicy::default(),
-        1024,
+        STRUCTURAL_CHECK_WORK_LIMIT,
         None,
         &plan,
         false,
@@ -234,6 +278,7 @@ fn schema_plan(
             observed: None,
             details: json!({"reason":"no_record_schema_candidates"}),
         }],
+        work_limited: false,
         details: json!({"reason":"no_record_schema_candidates"}),
         has_unassigned_family_messages: false,
         family_search_complete: true,
@@ -254,6 +299,8 @@ fn empty_exhaustive_report() -> RecordSchemaDiscoveryReport {
         falsifications: Vec::new(),
         falsified_count: 0,
         omitted_falsification_examples: 0,
+        work_limit_reached: false,
+        resource_limited_candidates: 0,
     }
 }
 
@@ -363,6 +410,7 @@ fn uniform_and_pending_family_plan() -> SchemaPlan {
                 details: json!({"family":{"unassigned_samples":[3]}}),
             },
         ],
+        work_limited: false,
         details: json!({}),
         has_unassigned_family_messages: true,
         family_search_complete: false,
@@ -389,6 +437,8 @@ fn surviving_report(training_message_count: usize) -> RecordSchemaDiscoveryRepor
         falsifications: Vec::new(),
         falsified_count: 0,
         omitted_falsification_examples: 0,
+        work_limit_reached: false,
+        resource_limited_candidates: 0,
     }
 }
 

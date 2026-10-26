@@ -264,11 +264,13 @@ impl ArtifactValidator {
         for format in candidates.into_iter().flatten() {
             let outcome = if format == ArtifactValidationFormat::Zip {
                 zip_budget_remaining.as_deref_mut().map_or_else(
-                    || self.validate_as_with_zip_budget(format, bytes, None),
-                    |remaining| self.validate_as_with_zip_budget(format, bytes, Some(remaining)),
+                    || self.validate_as_with_operation_budget(format, bytes, None),
+                    |remaining| {
+                        self.validate_as_with_operation_budget(format, bytes, Some(remaining))
+                    },
                 )
             } else {
-                self.validate_as_with_zip_budget(format, bytes, None)
+                self.validate_as_with_operation_budget(format, bytes, None)
             };
             match outcome {
                 outcome @ ArtifactValidationOutcome::Validated { .. } => return outcome,
@@ -308,10 +310,24 @@ impl ArtifactValidator {
         format: ArtifactValidationFormat,
         bytes: &'a [u8],
     ) -> ArtifactValidationOutcome<'a> {
-        self.validate_as_with_zip_budget(format, bytes, None)
+        self.validate_as_with_operation_budget(format, bytes, None)
     }
 
-    fn validate_as_with_zip_budget<'a>(
+    /// Validate one explicit format while consuming a shared ZIP expansion budget
+    ///
+    /// The remaining budget is reduced before each member extraction, including failed
+    /// checksum and decompression attempts. Non-ZIP formats leave it unchanged
+    #[must_use]
+    pub fn validate_as_with_zip_budget<'a>(
+        &self,
+        format: ArtifactValidationFormat,
+        bytes: &'a [u8],
+        zip_budget_remaining: &mut usize,
+    ) -> ArtifactValidationOutcome<'a> {
+        self.validate_as_with_operation_budget(format, bytes, Some(zip_budget_remaining))
+    }
+
+    fn validate_as_with_operation_budget<'a>(
         &self,
         format: ArtifactValidationFormat,
         bytes: &'a [u8],

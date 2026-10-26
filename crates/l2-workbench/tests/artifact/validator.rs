@@ -186,6 +186,35 @@ fn zip_validates_exact_input() -> Result<(), Box<dyn Error>> {
 }
 
 #[test]
+fn explicit_zip_validation_consumes_expansion_budget_before_failed_member_data()
+-> Result<(), Box<dyn Error>> {
+    let content = b"payload whose checksum will fail";
+    let bytes =
+        zip_support::build_zip(&[
+            zip_support::FixtureEntry::stored(b"member.txt", content).with_crc(0)
+        ])?;
+    let mut remaining = content.len();
+
+    let result = ArtifactValidator::default().validate_as_with_zip_budget(
+        ArtifactValidationFormat::Zip,
+        &bytes,
+        &mut remaining,
+    );
+
+    let ArtifactValidationOutcome::Validated {
+        structure: ArtifactStructure::Zip(report),
+        ..
+    } = result
+    else {
+        return Err("expected ZIP structure with one failed member".into());
+    };
+    assert_eq!(remaining, 0);
+    assert_eq!(report.expanded_work_byte_count, content.len());
+    assert_eq!(report.omitted_entry_count, 1);
+    Ok(())
+}
+
+#[test]
 fn zip_entry_limit_omits() -> Result<(), Box<dyn Error>> {
     let bytes = zip_support::build_zip(&[
         zip_support::FixtureEntry::stored(b"one", b"1"),

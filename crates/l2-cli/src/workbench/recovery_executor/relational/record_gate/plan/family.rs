@@ -9,8 +9,8 @@ use l2_workbench::{
     job::Job,
     protocol::{
         DEFAULT_MAX_FAMILY_RANGES, DEFAULT_MAX_FAMILY_REPORT_BYTES, DEFAULT_MAX_FAMILY_SAMPLES,
-        Direction, MessageFamilyLimits, MessageRole, MessageSample, RecordSchemaProposalLimits,
-        discover_message_families,
+        Direction, MessageFamilyLimits, MessageRole, MessageSample, RecordInput,
+        RecordSchemaProposalLimits, discover_message_families,
     },
 };
 use serde_json::{Value, json};
@@ -25,6 +25,7 @@ pub(super) struct FamilyAnalysis {
     pub(super) alternatives: Vec<SchemaAlternative>,
     pub(super) details: Value,
     pub(super) work_bytes: usize,
+    pub(super) work_limited: bool,
     pub(super) has_unassigned_messages: bool,
     pub(super) complete: bool,
 }
@@ -32,6 +33,7 @@ pub(super) struct FamilyAnalysis {
 #[derive(Clone, Copy)]
 pub(super) struct FamilyAnalysisRequest<'a> {
     pub(super) frames: &'a [DecodedFrameOutput],
+    pub(super) inputs: &'a [RecordInput<'a>],
     pub(super) selection: &'a LearningSelection,
     pub(super) discovery_sessions: &'a BTreeSet<u64>,
     pub(super) base_limits: RecordSchemaProposalLimits,
@@ -51,6 +53,7 @@ struct FamilyGroup {
 
 struct FamilyGroupContext<'a> {
     frames: &'a [DecodedFrameOutput],
+    inputs: &'a [RecordInput<'a>],
     base_limits: RecordSchemaProposalLimits,
     work_limit: usize,
     observer: Option<SchemaObserverOptions<'a>>,
@@ -64,6 +67,7 @@ pub(super) fn build_family_analysis(
 ) -> Result<FamilyAnalysis, RecoveryExecutionError> {
     let FamilyAnalysisRequest {
         frames,
+        inputs,
         selection,
         discovery_sessions,
         base_limits,
@@ -95,6 +99,7 @@ pub(super) fn build_family_analysis(
     };
     let group_context = FamilyGroupContext {
         frames,
+        inputs,
         base_limits,
         work_limit,
         observer: family_observer,
@@ -119,6 +124,7 @@ pub(super) fn build_family_analysis(
         alternatives: group_analysis.alternatives,
         details,
         work_bytes: group_analysis.work_bytes,
+        work_limited: group_analysis.work_limited,
         has_unassigned_messages,
         complete,
     })
@@ -172,6 +178,7 @@ fn unavailable_family_analysis(error: &str, training_count: usize) -> FamilyAnal
             "training_samples":training_count,
         }),
         work_bytes: 0,
+        work_limited: false,
         has_unassigned_messages: true,
         complete: false,
     }
@@ -181,6 +188,7 @@ struct FamilyGroupsAnalysis {
     alternatives: Vec<SchemaAlternative>,
     details: Vec<Value>,
     work_bytes: usize,
+    work_limited: bool,
     complete: bool,
 }
 
@@ -198,6 +206,7 @@ fn analyze_family_groups(
         .try_reserve_exact(maximum_alternatives)
         .map_err(|source| operational("family schema alternative allocation failed", source))?;
     let mut work_bytes = 0_usize;
+    let mut work_limited = false;
     let mut group_details = Vec::new();
     group_details
         .try_reserve_exact(groups.len())
@@ -213,6 +222,7 @@ fn analyze_family_groups(
             .ok_or_else(|| invalid_policy("family schema work count overflowed"))?;
         if next_work > context.work_limit {
             complete = false;
+            work_limited = true;
             group_details.push(json!({
                 "label":group.label,
                 "reason":"record_schema_work_limit",
@@ -223,6 +233,7 @@ fn analyze_family_groups(
             break;
         }
         work_bytes = next_work;
+        work_limited |= group_analysis.work_limited;
         complete &= group_analysis.complete;
         group_details.push(group_analysis.details);
         alternatives.extend(group_analysis.alternatives);
@@ -231,6 +242,7 @@ fn analyze_family_groups(
         alternatives,
         details: group_details,
         work_bytes,
+        work_limited,
         complete,
     })
 }
@@ -239,6 +251,7 @@ struct FamilyGroupResult {
     alternatives: Vec<SchemaAlternative>,
     details: Value,
     work_bytes: usize,
+    work_limited: bool,
     complete: bool,
 }
 
@@ -262,35 +275,20 @@ fn analyze_family_group(
     } else {
         work_limit
     };
-    let Some(limits) = prepare_schema_limits(
+    let limits = prepare_schema_limits(
         *base_limits,
         frames,
         messages.training_indices.as_slice(),
         &messages,
-        analysis_budget,
         *offset_scope,
-    )?
-    else {
-        return Ok(FamilyGroupResult {
-            alternatives: Vec::new(),
-            details: json!({
-                "label":group.label,
-                "reason":"record_schema_work_limit",
-                "family":group.details,
-                "learning_bytes":messages.learning_bytes,
-                "input_bytes":messages.full_input_bytes,
-                "work_limit":work_limit,
-            }),
-            work_bytes: 0,
-            complete: false,
-        });
-    };
+    )?;
     let frame_indices = frame_slice(group.frames.as_slice())?;
     let request = AnalysisRequest {
         label: &group.label,
         family_details: Some(&group.details),
         frame_indices: Some(frame_indices),
         messages: &messages,
+        inputs: context.inputs,
         limits,
         work_limit,
         analysis_work_limit: analysis_budget,
@@ -304,6 +302,7 @@ fn analyze_family_group(
         alternatives: analysis.alternatives,
         details: analysis.details,
         work_bytes: analysis.work_bytes,
+        work_limited: analysis.work_limited,
         complete: analysis.exhaustive,
     })
 }
@@ -439,7 +438,7 @@ fn collect_group_messages<'a>(
         .try_reserve_exact(group.training_ids.len())
         .map_err(|source| operational("family offset allocation failed", source))?;
     let mut learning_bytes = 0_usize;
-    let mut analysis_input_bytes = 0_usize;
+    let mut eligible_input_bytes = 0_usize;
     for index in &group.frames {
         let frame = frames
             .get(*index)
@@ -450,9 +449,9 @@ fn collect_group_messages<'a>(
                 .ok_or_else(|| invalid_policy("family training byte count overflowed"))?;
             training.push(frame.bytes.as_slice());
             training_indices.push(*index);
-            analysis_input_bytes = analysis_input_bytes
+            eligible_input_bytes = eligible_input_bytes
                 .checked_add(frame.bytes.len())
-                .ok_or_else(|| invalid_policy("family analysis input count overflowed"))?;
+                .ok_or_else(|| invalid_policy("family eligible input count overflowed"))?;
             training_sessions.insert(frame.context.session);
             if let Some(offset) = frame.preserved_header_end {
                 training_data_offsets.push(offset);
@@ -460,9 +459,9 @@ fn collect_group_messages<'a>(
         } else if group.heldout_ids.contains(&frame.input_node_id) {
             heldout.push(frame.bytes.as_slice());
             heldout_indices.push(*index);
-            analysis_input_bytes = analysis_input_bytes
+            eligible_input_bytes = eligible_input_bytes
                 .checked_add(frame.bytes.len())
-                .ok_or_else(|| invalid_policy("family analysis input count overflowed"))?;
+                .ok_or_else(|| invalid_policy("family eligible input count overflowed"))?;
         }
     }
     Ok(LearningMessages {
@@ -474,8 +473,7 @@ fn collect_group_messages<'a>(
         heldout_indices,
         training_data_offsets,
         learning_bytes,
-        analysis_input_bytes,
-        eligible_input_bytes: analysis_input_bytes,
+        eligible_input_bytes,
         full_input_bytes: input_bytes,
         training_session_count: training_sessions.len(),
     })

@@ -7,16 +7,16 @@ use super::{
 };
 use l2_workbench::{
     artifact::{
-        ArtifactStructure, ArtifactValidationFormat, ArtifactValidationOutcome,
-        ArtifactValidationPolicy, scan_file_signatures,
+        ArtifactValidationFormat, ArtifactValidationOutcome, ArtifactValidationPolicy,
+        scan_file_signatures,
     },
     job::{Counter, Job, Phase},
     protocol::{
         BoundRecordAssemblyPlan, HeaderParseTemplate, MessageContext, RecordAssemblyInput,
         RecordAssemblyModelStatus, RecordAssemblyOutcome, RecordError, RecordGroupReceipt,
         RecordInput, RecordParseReport, RecordSchema, RecordSchemaDiscoveryReport,
-        RecordSchemaHypothesis, RecordSchemaProposalLimits, RecordSchemaStrategy,
-        assemble_record_groups_from_inputs, parse_records_with_limits,
+        RecordSchemaHypothesis, RecordSchemaProposalLimits, RecordSchemaStrategy, RecordWorkBudget,
+        assemble_record_groups_from_inputs,
     },
 };
 use serde_json::{Value, json};
@@ -24,6 +24,9 @@ use std::{
     borrow::Cow,
     collections::{BTreeMap, HashMap},
 };
+
+#[derive(Clone, Copy)]
+struct WorkLimitHit;
 
 #[derive(Default)]
 struct SchemaEvaluation {
@@ -36,6 +39,7 @@ struct SchemaEvaluation {
     coherent_sequence_schemas: usize,
     sequence_conflict_schemas: usize,
     surviving_schemas: usize,
+    work_limited: Option<WorkLimitHit>,
     pending: bool,
     uniform_structural_support: bool,
     family_structural_support: bool,
@@ -49,6 +53,7 @@ struct HypothesisEvaluation {
     accepted_receipt: Option<RecordGroupReceipt>,
     parser_omissions: usize,
     evidence: HypothesisEvidence,
+    work_limited: bool,
     pending: bool,
 }
 
@@ -66,6 +71,7 @@ pub(in crate::workbench::recovery_executor::relational) struct SchemaAlternative
     pub(super) strict_survivors_seen: usize,
     pub(super) exact_artifact_survivor_ordinal: Option<usize>,
     pub(super) accepted_schema: Option<AcceptedRecordSchema>,
+    pub(super) work_limited: bool,
     pub(super) survives: bool,
     pub(super) pending: bool,
     pub(super) header_models: Vec<HeaderSchemaModel>,
@@ -107,7 +113,6 @@ pub(in crate::workbench::recovery_executor::relational) struct AcceptedFrameIden
 #[derive(Clone, Copy)]
 pub(super) struct SchemaObserverOptions<'a> {
     pub(super) frames: &'a [DecodedFrameOutput],
-    pub(super) inputs: Option<&'a [RecordInput<'a>]>,
     pub(super) parser_format: ArtifactValidationFormat,
     pub(super) artifact_policy: ArtifactValidationPolicy,
     pub(super) job: Option<&'a Job>,
@@ -176,6 +181,7 @@ impl HypothesisEvidence {
 struct CandidateInspection {
     exact_artifact_match: bool,
     parser_omission: bool,
+    work_limited: Option<WorkLimitHit>,
     pending: bool,
 }
 
@@ -234,6 +240,8 @@ pub(super) fn screen_with_schema_plan(
             parser_format,
         ),
     );
+    gate_result.work_limited_at =
+        (evaluation.work_limited.is_some() || plan.work_limited).then_some(work_limit);
     gate_result.accepted_schema = evaluation.accepted_schema;
     gate_result.assessment_scope = plan.assessment_scope;
     Ok(gate_result)
@@ -262,7 +270,7 @@ pub(super) fn screen_with_header_plan(
     let frame_indices = all_frame_indices(frames.len())?;
     let context = SchemaScreenContext {
         frames,
-        inputs: Some(&inputs),
+        inputs: &inputs,
         frame_indices: &frame_indices,
         limits,
         parser_format,
@@ -307,6 +315,7 @@ pub(super) fn screen_with_header_plan(
             "pending":evaluation.pending,
         }),
     );
+    gate_result.work_limited_at = evaluation.work_limited.then_some(work_limit);
     gate_result.assessment_scope = SchemaOffsetScope::PreservedHeader;
     gate_result.accepted_schema = evaluation.accepted_schema;
     let needs_full_inference = gate_result.needs_full_inference();
@@ -343,6 +352,7 @@ struct HeaderPlanEvaluation {
     layout_reuses: usize,
     exact_artifact_matches: usize,
     parser_omissions: usize,
+    work_limited: bool,
     pending: bool,
     accepted_schema: Option<AcceptedRecordSchema>,
     alternatives: Vec<Value>,
@@ -358,9 +368,7 @@ fn evaluate_header_models(
     context: &SchemaScreenContext<'_>,
     plan: &HeaderSchemaPlan,
 ) -> Result<HeaderPlanEvaluation, RecoveryExecutionError> {
-    let inputs = context
-        .inputs
-        .ok_or_else(|| invalid_policy("record gate header inputs are missing"))?;
+    let inputs = context.inputs;
     let assembly_plan = &plan.assembly_plan;
     let bound = assembly_plan
         .bind(inputs)
@@ -385,6 +393,7 @@ fn evaluate_header_models(
         .ok_or_else(|| invalid_policy("record gate header bind work overflowed"))?;
     if !reserve_schema_work(&mut result.used_work, bind_work, context.work_limit)? {
         result.pending = true;
+        result.work_limited = true;
         result.models_deferred_for_work = assembly_plan.model_count();
         return Ok(result);
     }
@@ -491,6 +500,7 @@ fn evaluate_header_group(
             context.work_limit,
         )? {
             state.result.pending = true;
+            state.result.work_limited = true;
             state.result.models_deferred_for_work =
                 plan.assembly_plan.model_count().saturating_sub(model_index);
             return Ok(Some(CandidateInspection {
@@ -512,6 +522,7 @@ fn evaluate_header_group(
             schema,
             RecordSchemaStrategy::FixedLayout,
             receipt,
+            None,
         )?);
     }
     Ok(Some(inspection))
@@ -541,6 +552,7 @@ fn inspect_header_layout(
         context.work_limit,
     )? {
         state.result.pending = true;
+        state.result.work_limited = true;
         state.result.models_deferred_for_work =
             plan.assembly_plan.model_count().saturating_sub(model_index);
         return Ok(None);
@@ -557,6 +569,7 @@ fn inspect_header_layout(
         context.work_limit,
     )? {
         state.result.pending = true;
+        state.result.work_limited = true;
         state.result.parser_omissions = state.result.parser_omissions.saturating_add(1);
         state.result.models_deferred_for_work =
             plan.assembly_plan.model_count().saturating_sub(model_index);
@@ -564,6 +577,7 @@ fn inspect_header_layout(
     }
     let inspection =
         inspect_candidate_bytes(candidate_bytes, context, &mut state.result.used_work)?;
+    state.result.work_limited |= inspection.work_limited.is_some();
     state.result.parser_omissions = state
         .result
         .parser_omissions
@@ -592,14 +606,17 @@ fn evaluate_plan_alternatives(
     plan: &SchemaPlan,
     initial_work: usize,
 ) -> Result<(SchemaEvaluation, bool), RecoveryExecutionError> {
+    let inputs = record_inputs(frames)?;
     let mut evaluation = SchemaEvaluation {
         used_work: initial_work,
+        work_limited: plan.work_limited.then_some(WorkLimitHit),
         ..SchemaEvaluation::default()
     };
     if plan.alternatives.is_empty() {
         evaluation.pending = true;
     }
     let options = PlanScreenOptions {
+        inputs: &inputs,
         parser_format,
         artifact_policy,
         work_limit,
@@ -618,6 +635,7 @@ fn evaluate_plan_alternatives(
 }
 
 struct PlanScreenOptions<'a> {
+    inputs: &'a [RecordInput<'a>],
     parser_format: ArtifactValidationFormat,
     artifact_policy: ArtifactValidationPolicy,
     work_limit: usize,
@@ -630,26 +648,26 @@ fn evaluate_alternative(
     options: &PlanScreenOptions<'_>,
     evaluation: &mut SchemaEvaluation,
 ) -> Result<bool, RecoveryExecutionError> {
-    let Some(report) = alternative.discovery_report.as_ref() else {
-        record_missing_report(alternative, evaluation);
-        return Ok(false);
-    };
     if let Some(job) = options.job {
         job.check_cancelled()?;
     }
+    let before = EvaluationSnapshot::capture(evaluation);
+    let Some(report) = alternative.discovery_report.as_ref() else {
+        return Ok(evaluate_unreported_alternative(
+            alternative,
+            before,
+            evaluation,
+        ));
+    };
     if alternative.omitted_learning_messages > 0 && alternative.observed.is_none() {
         record_incomplete_application(alternative, evaluation);
         return Ok(false);
     }
     let frame_indices = alternative_frame_indices(frames, alternative)?;
     let full_input_bytes = total_indexed_bytes(frames, &frame_indices)?;
-    if full_input_bytes > options.work_limit.saturating_sub(evaluation.used_work) {
-        evaluation.pending = true;
-        return Ok(true);
-    }
     let context = SchemaScreenContext {
         frames,
-        inputs: None,
+        inputs: options.inputs,
         frame_indices: frame_indices.as_slice(),
         limits: alternative.limits,
         parser_format: options.parser_format,
@@ -658,7 +676,6 @@ fn evaluate_alternative(
         job: options.job,
         full_input_bytes,
     };
-    let before = EvaluationSnapshot::capture(evaluation);
     let alt_result = if let Some(observed) = alternative.observed.as_ref() {
         accumulate_observed_evaluation(evaluation, observed);
         SchemaAlternativeEvaluation {
@@ -674,6 +691,7 @@ fn evaluate_alternative(
             strict_survivors_seen: observed.strict_survivors_seen,
             exact_artifact_survivor_ordinal: observed.exact_artifact_survivor_ordinal,
             accepted_schema: observed.accepted_schema.clone(),
+            work_limited: observed.work_limited,
             survives: observed.survives,
             pending: observed.pending,
             ..SchemaAlternativeEvaluation::default()
@@ -693,6 +711,9 @@ fn evaluate_alternative(
             .is_some_and(|count| count > 0)
         || !alternative.proposal_search_exhaustive;
     evaluation.pending |= alternative_pending;
+    if alt_result.work_limited {
+        evaluation.work_limited = Some(WorkLimitHit);
+    }
     // One corroborated schema is positive structural evidence even when other schemas remain unexamined
     record_structural_support(alternative, &alt_result, evaluation);
     let alternative_status = alternative_status(alternative, &alt_result, alternative_pending);
@@ -705,6 +726,40 @@ fn evaluate_alternative(
         alternative_status,
     ));
     Ok(evaluation.exact_artifact_matches > before.matches)
+}
+
+fn evaluate_unreported_alternative(
+    alternative: &SchemaAlternative,
+    before: EvaluationSnapshot,
+    evaluation: &mut SchemaEvaluation,
+) -> bool {
+    let Some(observed) = alternative.observed.as_ref() else {
+        record_missing_report(alternative, evaluation);
+        return false;
+    };
+    accumulate_observed_evaluation(evaluation, observed);
+    if evaluation.accepted_schema.is_none() {
+        evaluation
+            .accepted_schema
+            .clone_from(&observed.accepted_schema);
+    }
+    evaluation.pending = true;
+    record_structural_support(alternative, observed, evaluation);
+    let status = alternative_status(alternative, observed, true);
+    evaluation.alternatives.push(json!({
+        "label":alternative.label,
+        "status":status.as_str(),
+        "reason":"record_schema_analysis_incomplete",
+        "schemas_checked":evaluation.schemas_checked.saturating_sub(before.checked),
+        "schemas_structurally_supported":evaluation.surviving_schemas.saturating_sub(before.survivors),
+        "exact_artifact_matches":evaluation.exact_artifact_matches.saturating_sub(before.matches),
+        "parser_omissions":evaluation.parser_omissions.saturating_sub(before.omissions),
+        "strict_survivors_observed":observed.strict_survivors_seen,
+        "artifact_validating_survivor_ordinal":observed.exact_artifact_survivor_ordinal,
+        "work_bytes":alternative.discovery_work_bytes,
+        "analysis":alternative.details,
+    }));
+    evaluation.exact_artifact_matches > before.matches
 }
 
 fn record_missing_report(alternative: &SchemaAlternative, evaluation: &mut SchemaEvaluation) {
@@ -839,6 +894,9 @@ const fn accumulate_observed_evaluation(
     evaluation.surviving_schemas = evaluation
         .surviving_schemas
         .saturating_add(observed.surviving_schemas);
+    if observed.work_limited {
+        evaluation.work_limited = Some(WorkLimitHit);
+    }
     evaluation.pending |= observed.pending;
 }
 
@@ -882,6 +940,7 @@ fn pending_work_result(
             "schema_plan":plan.details,
         }),
     );
+    result.work_limited_at = Some(work_limit);
     result.assessment_scope = plan.assessment_scope;
     result
 }
@@ -933,7 +992,7 @@ fn total_indexed_bytes(
 
 pub(super) struct SchemaScreenContext<'a> {
     pub(super) frames: &'a [DecodedFrameOutput],
-    pub(super) inputs: Option<&'a [RecordInput<'a>]>,
+    pub(super) inputs: &'a [RecordInput<'a>],
     pub(super) frame_indices: &'a [usize],
     pub(super) limits: RecordSchemaProposalLimits,
     pub(super) parser_format: ArtifactValidationFormat,
@@ -949,19 +1008,9 @@ fn evaluate_surviving_schemas(
     evaluation: &mut SchemaEvaluation,
 ) -> Result<SchemaAlternativeEvaluation, RecoveryExecutionError> {
     let mut alternative = SchemaAlternativeEvaluation::default();
-    for hypothesis in &report.surviving {
+    for (index, hypothesis) in report.surviving.iter().enumerate() {
         if let Some(job) = context.job {
             job.check_cancelled()?;
-        }
-        // Charge the full schema parse before starting work on any frame
-        if !reserve_schema_work(
-            &mut evaluation.used_work,
-            context.full_input_bytes,
-            context.work_limit,
-        )? {
-            evaluation.pending = true;
-            alternative.pending = true;
-            break;
         }
         let result = evaluate_hypothesis(context, hypothesis, &mut evaluation.used_work)?;
         evaluation.exact_artifact_matches = evaluation
@@ -998,9 +1047,20 @@ fn evaluate_surviving_schemas(
             .surviving_schemas
             .saturating_add(usize::from(result.evidence.is_supported()));
         alternative.survives |= result.evidence.is_supported();
+        if result.work_limited {
+            evaluation.work_limited = Some(WorkLimitHit);
+        }
+        alternative.work_limited |= result.work_limited;
         evaluation.pending |= result.pending;
         alternative.pending |= result.pending;
         if result.exact_artifact_matches > 0 {
+            break;
+        }
+        if evaluation.used_work >= context.work_limit && index + 1 < report.surviving.len() {
+            evaluation.pending = true;
+            evaluation.work_limited = Some(WorkLimitHit);
+            alternative.pending = true;
+            alternative.work_limited = true;
             break;
         }
     }
@@ -1019,22 +1079,20 @@ pub(super) fn observe_surviving_schema(
         job.check_cancelled()?;
     }
     let before_work = *observer_work;
-    let Some(next_work) = context
-        .full_input_bytes
-        .checked_mul(3)
-        .and_then(|amount| before_work.checked_add(amount))
-        .filter(|work| *work <= context.work_limit)
-    else {
-        evaluation.pending = true;
-        return Ok(std::ops::ControlFlow::Break(()));
-    };
-    *observer_work = next_work;
-
-    let completed_reports = match complete_application_reports(context, hypothesis, inputs)? {
+    let mut parser_work = RecordWorkBudget::new(context.work_limit.saturating_sub(before_work));
+    let completed = complete_application_reports(context, hypothesis, inputs, &mut parser_work);
+    reserve_schema_work(observer_work, parser_work.consumed(), context.work_limit)?;
+    let completed_reports = match completed? {
         FullApplicationReports::Complete(reports) => reports,
         FullApplicationReports::Contradicted => {
             finish_observer_work(evaluation, *observer_work, before_work);
             return Ok(std::ops::ControlFlow::Continue(()));
+        }
+        FullApplicationReports::WorkLimit => {
+            evaluation.pending = true;
+            evaluation.work_limited = true;
+            finish_observer_work(evaluation, *observer_work, before_work);
+            return Ok(std::ops::ControlFlow::Break(()));
         }
         FullApplicationReports::Omitted => {
             evaluation.pending = true;
@@ -1043,7 +1101,13 @@ pub(super) fn observe_surviving_schema(
         }
     };
     if strategy == RecordSchemaStrategy::FixedLayout
-        && let Some(model) = capture_header_model(context, hypothesis, &completed_reports)?
+        && let Some(model) = capture_header_model(
+            context,
+            hypothesis,
+            &completed_reports,
+            observer_work,
+            &mut evaluation.work_limited,
+        )?
     {
         let next_bytes = evaluation
             .header_model_bytes
@@ -1070,7 +1134,14 @@ pub(super) fn observe_surviving_schema(
     let result = evaluate_hypothesis_reports(context, &report_references, observer_work)?;
     let artifact_validated = result.exact_artifact_matches > 0;
     finish_observer_work(evaluation, *observer_work, before_work);
-    accumulate_hypothesis_result(context, strategy, hypothesis, result, evaluation)?;
+    accumulate_hypothesis_result(
+        context,
+        strategy,
+        hypothesis,
+        result,
+        &report_references,
+        evaluation,
+    )?;
     Ok(if artifact_validated {
         std::ops::ControlFlow::Break(())
     } else {
@@ -1082,10 +1153,10 @@ fn capture_header_model(
     context: &SchemaScreenContext<'_>,
     hypothesis: &RecordSchemaHypothesis,
     reports: &[Cow<'_, RecordParseReport>],
+    observer_work: &mut usize,
+    work_limited: &mut bool,
 ) -> Result<Option<HeaderSchemaModel>, RecoveryExecutionError> {
-    let Some(inputs) = context.inputs else {
-        return Ok(None);
-    };
+    let inputs = context.inputs;
     if inputs.len() != context.frames.len()
         || context.frame_indices.len() != context.frames.len()
         || context
@@ -1119,11 +1190,16 @@ fn capture_header_model(
     if estimated_bytes > context.limits.discovery.record_limits.max_report_bytes {
         return Ok(None);
     }
+    // Header templates copy exact prefixes and parser metadata only after the shared gate reserves the cost
+    if !reserve_schema_work(observer_work, estimated_bytes, context.work_limit)? {
+        *work_limited = true;
+        return Ok(None);
+    }
 
     let mut templates = Vec::new();
-    templates
-        .try_reserve_exact(context.frames.len())
-        .map_err(|source| operational("record gate header template allocation failed", source))?;
+    if templates.try_reserve_exact(context.frames.len()).is_err() {
+        return Ok(None);
+    }
     for (frame_index, report) in context.frame_indices.iter().zip(reports) {
         let frame = context
             .frames
@@ -1152,6 +1228,7 @@ fn capture_header_model(
 enum FullApplicationReports<'a> {
     Complete(Vec<Cow<'a, RecordParseReport>>),
     Contradicted,
+    WorkLimit,
     Omitted,
 }
 
@@ -1159,6 +1236,7 @@ fn complete_application_reports<'reports>(
     context: &SchemaScreenContext<'_>,
     hypothesis: &RecordSchemaHypothesis,
     inputs: &SurvivingSchemaInputs<'reports>,
+    work: &mut RecordWorkBudget,
 ) -> Result<FullApplicationReports<'reports>, RecoveryExecutionError> {
     let mut totals = RecordReportTotals::default();
     let training = match complete_reports(
@@ -1168,9 +1246,11 @@ fn complete_application_reports<'reports>(
         inputs.all_training_indices,
         hypothesis,
         &mut totals,
+        work,
     )? {
         CompleteReports::Complete(reports) => reports,
         CompleteReports::Contradicted => return Ok(FullApplicationReports::Contradicted),
+        CompleteReports::WorkLimit => return Ok(FullApplicationReports::WorkLimit),
         CompleteReports::Omitted => return Ok(FullApplicationReports::Omitted),
     };
     let heldout = match complete_reports(
@@ -1180,9 +1260,11 @@ fn complete_application_reports<'reports>(
         inputs.all_heldout_indices,
         hypothesis,
         &mut totals,
+        work,
     )? {
         CompleteReports::Complete(reports) => reports,
         CompleteReports::Contradicted => return Ok(FullApplicationReports::Contradicted),
+        CompleteReports::WorkLimit => return Ok(FullApplicationReports::WorkLimit),
         CompleteReports::Omitted => return Ok(FullApplicationReports::Omitted),
     };
     let report_count = training
@@ -1218,6 +1300,7 @@ fn accumulate_hypothesis_result(
     strategy: RecordSchemaStrategy,
     hypothesis: &RecordSchemaHypothesis,
     result: HypothesisEvaluation,
+    parse_reports: &[&RecordParseReport],
     evaluation: &mut SchemaAlternativeEvaluation,
 ) -> Result<(), RecoveryExecutionError> {
     evaluation.exact_artifact_matches = evaluation
@@ -1247,6 +1330,7 @@ fn accumulate_hypothesis_result(
     evaluation.surviving_schemas = evaluation
         .surviving_schemas
         .saturating_add(usize::from(result.evidence.is_supported()));
+    evaluation.work_limited |= result.work_limited;
     if result.exact_artifact_matches > 0 {
         let receipt = result
             .accepted_receipt
@@ -1256,6 +1340,7 @@ fn accumulate_hypothesis_result(
             hypothesis.schema.clone(),
             strategy,
             receipt,
+            Some(parse_reports),
         )?);
     }
     evaluation.survives |= result.evidence.is_supported();
@@ -1278,6 +1363,7 @@ fn accepted_record_schema(
     schema: RecordSchema,
     strategy: RecordSchemaStrategy,
     artifact_receipt: RecordGroupReceipt,
+    parse_reports: Option<&[&RecordParseReport]>,
 ) -> Result<AcceptedRecordSchema, RecoveryExecutionError> {
     if artifact_receipt.output_length.is_none() || artifact_receipt.output_sha256.is_none() {
         return Err(invalid_policy(
@@ -1294,7 +1380,13 @@ fn accepted_record_schema(
         .map_err(|source| {
             operational("accepted schema frame identity allocation failed", source)
         })?;
+    if parse_reports.is_some_and(|reports| reports.len() != context.frame_indices.len()) {
+        return Err(invalid_policy(
+            "accepted schema parse report count differs from its frames",
+        ));
+    }
     for frame_index in context.frame_indices {
+        let frame_position = frame_indices.len();
         let frame = context
             .frames
             .get(*frame_index)
@@ -1307,7 +1399,19 @@ fn accepted_record_schema(
             session_order: frame.session_order,
             stream_offset: frame.stream_offset,
             frame_byte_length: frame.bytes.len(),
-            frame_bytes_sha256: l2_workbench::sha256(&frame.bytes),
+            frame_bytes_sha256: if let Some(reports) = parse_reports {
+                let report = reports
+                    .get(frame_position)
+                    .ok_or_else(|| invalid_policy("accepted schema parse report is missing"))?;
+                if report.input_length() != frame.bytes.len() || report.schema() != &schema {
+                    return Err(invalid_policy(
+                        "accepted schema parse report changed before receipt creation",
+                    ));
+                }
+                report.input_sha256().to_owned()
+            } else {
+                l2_workbench::sha256(&frame.bytes)
+            },
         });
     }
     Ok(AcceptedRecordSchema {
@@ -1350,6 +1454,14 @@ impl RecordReportTotals {
 enum CompleteReports<'a> {
     Complete(Vec<Cow<'a, RecordParseReport>>),
     Contradicted,
+    WorkLimit,
+    Omitted,
+}
+
+enum HypothesisParseReports {
+    Complete(Vec<RecordParseReport>),
+    Contradicted,
+    WorkLimit,
     Omitted,
 }
 
@@ -1360,6 +1472,7 @@ fn complete_reports<'reports>(
     all_indices: &[usize],
     hypothesis: &RecordSchemaHypothesis,
     totals: &mut RecordReportTotals,
+    work: &mut RecordWorkBudget,
 ) -> Result<CompleteReports<'reports>, RecoveryExecutionError> {
     if context.full_input_bytes > context.limits.discovery.record_limits.max_input_bytes {
         return Ok(CompleteReports::Omitted);
@@ -1383,20 +1496,20 @@ fn complete_reports<'reports>(
         .try_reserve_exact(all_indices.len())
         .map_err(|source| operational("record gate full parse report allocation failed", source))?;
     for index in all_indices {
-        let frame = context
-            .frames
-            .get(*index)
-            .ok_or_else(|| invalid_policy("record gate full application frame is missing"))?;
         let report = if let Some(report) = selected_by_index.remove(index) {
             Cow::Borrowed(report)
         } else {
             if let Some(job) = context.job {
                 job.check_cancelled()?;
             }
-            match parse_records_with_limits(
-                &frame.bytes,
+            let input = context
+                .inputs
+                .get(*index)
+                .ok_or_else(|| invalid_policy("record gate full application input is missing"))?;
+            match input.parse_with_work(
                 &hypothesis.schema,
                 context.limits.discovery.record_limits,
+                work,
             ) {
                 Ok(report) => Cow::Owned(report),
                 Err(
@@ -1405,6 +1518,9 @@ fn complete_reports<'reports>(
                     | RecordError::ReportTooLarge { .. }
                     | RecordError::AllocationFailed,
                 ) => return Ok(CompleteReports::Omitted),
+                Err(RecordError::WorkLimitExceeded { .. }) => {
+                    return Ok(CompleteReports::WorkLimit);
+                }
                 Err(_) => {
                     if let Some(job) = context.job {
                         job.increment(Counter::CandidatesRejected, 1)?;
@@ -1428,17 +1544,14 @@ fn complete_reports<'reports>(
 
 fn reserve_schema_work(
     used_work: &mut usize,
-    full_input_bytes: usize,
+    requested_work: usize,
     work_limit: usize,
 ) -> Result<bool, RecoveryExecutionError> {
-    let schema_work = full_input_bytes
-        .checked_mul(3)
-        .ok_or_else(|| invalid_policy("record gate schema work overflowed"))?;
-    if schema_work > work_limit.saturating_sub(*used_work) {
+    if requested_work > work_limit.saturating_sub(*used_work) {
         return Ok(false);
     }
     *used_work = used_work
-        .checked_add(schema_work)
+        .checked_add(requested_work)
         .ok_or_else(|| invalid_policy("record gate work count overflowed"))?;
     Ok(true)
 }
@@ -1448,8 +1561,27 @@ fn evaluate_hypothesis(
     hypothesis: &RecordSchemaHypothesis,
     used_work: &mut usize,
 ) -> Result<HypothesisEvaluation, RecoveryExecutionError> {
-    let Some(parse_reports) = parse_hypothesis_frames(context, hypothesis)? else {
-        return Ok(HypothesisEvaluation::default());
+    let mut parser_work = RecordWorkBudget::new(context.work_limit.saturating_sub(*used_work));
+    let parsed = parse_hypothesis_frames(context, hypothesis, &mut parser_work);
+    reserve_schema_work(used_work, parser_work.consumed(), context.work_limit)?;
+    let parse_reports = match parsed? {
+        HypothesisParseReports::Complete(reports) => reports,
+        HypothesisParseReports::Contradicted => return Ok(HypothesisEvaluation::default()),
+        HypothesisParseReports::WorkLimit => {
+            return Ok(HypothesisEvaluation {
+                pending: true,
+                parser_omissions: 1,
+                work_limited: true,
+                ..HypothesisEvaluation::default()
+            });
+        }
+        HypothesisParseReports::Omitted => {
+            return Ok(HypothesisEvaluation {
+                pending: true,
+                parser_omissions: 1,
+                ..HypothesisEvaluation::default()
+            });
+        }
     };
     let mut report_references = Vec::new();
     report_references
@@ -1464,6 +1596,15 @@ fn evaluate_hypothesis_reports(
     parse_reports: &[&RecordParseReport],
     used_work: &mut usize,
 ) -> Result<HypothesisEvaluation, RecoveryExecutionError> {
+    let assembly_work = assembly_work_bytes(parse_reports)?;
+    if !reserve_schema_work(used_work, assembly_work, context.work_limit)? {
+        return Ok(HypothesisEvaluation {
+            pending: true,
+            parser_omissions: 1,
+            work_limited: true,
+            ..HypothesisEvaluation::default()
+        });
+    }
     let Some(assembly) = assemble_hypothesis(context, parse_reports)? else {
         return Ok(HypothesisEvaluation {
             pending: true,
@@ -1498,29 +1639,66 @@ fn evaluate_hypothesis_reports(
 fn parse_hypothesis_frames(
     context: &SchemaScreenContext<'_>,
     hypothesis: &RecordSchemaHypothesis,
-) -> Result<Option<Vec<RecordParseReport>>, RecoveryExecutionError> {
+    work: &mut RecordWorkBudget,
+) -> Result<HypothesisParseReports, RecoveryExecutionError> {
     let mut reports = Vec::new();
     reports
         .try_reserve_exact(context.frame_indices.len())
         .map_err(|source| operational("record gate parse report allocation failed", source))?;
     for frame_index in context.frame_indices {
-        let frame = context
-            .frames
+        let input = context
+            .inputs
             .get(*frame_index)
-            .ok_or_else(|| invalid_policy("record gate alternative references a missing frame"))?;
-        let Ok(parsed) = parse_records_with_limits(
-            &frame.bytes,
+            .ok_or_else(|| invalid_policy("record gate alternative input is missing"))?;
+        let parsed = match input.parse_with_work(
             &hypothesis.schema,
             context.limits.discovery.record_limits,
-        ) else {
-            if let Some(job) = context.job {
-                job.increment(Counter::CandidatesRejected, 1)?;
+            work,
+        ) {
+            Ok(parsed) => parsed,
+            Err(RecordError::WorkLimitExceeded { .. }) => {
+                return Ok(HypothesisParseReports::WorkLimit);
             }
-            return Ok(None);
+            Err(
+                RecordError::InputTooLarge { .. }
+                | RecordError::TooManyRecords { .. }
+                | RecordError::ReportTooLarge { .. }
+                | RecordError::AllocationFailed,
+            ) => return Ok(HypothesisParseReports::Omitted),
+            Err(_) => {
+                if let Some(job) = context.job {
+                    job.increment(Counter::CandidatesRejected, 1)?;
+                }
+                return Ok(HypothesisParseReports::Contradicted);
+            }
         };
         reports.push(parsed);
     }
-    Ok(Some(reports))
+    Ok(HypothesisParseReports::Complete(reports))
+}
+
+fn assembly_work_bytes(
+    parse_reports: &[&RecordParseReport],
+) -> Result<usize, RecoveryExecutionError> {
+    let mut metadata_bytes = 0_usize;
+    let mut output_bytes = 0_usize;
+    for report in parse_reports {
+        metadata_bytes = metadata_bytes
+            .checked_add(report.metadata_bytes())
+            .ok_or_else(|| invalid_policy("record gate assembly metadata work overflowed"))?;
+        for record in report.records() {
+            output_bytes = output_bytes
+                .checked_add(record.payload.end.saturating_sub(record.payload.start))
+                .ok_or_else(|| invalid_policy("record gate assembly output work overflowed"))?;
+        }
+    }
+    metadata_bytes
+        .checked_add(
+            output_bytes
+                .checked_mul(2)
+                .ok_or_else(|| invalid_policy("record gate assembly output work overflowed"))?,
+        )
+        .ok_or_else(|| invalid_policy("record gate assembly work overflowed"))
 }
 
 fn assemble_hypothesis(
@@ -1531,18 +1709,20 @@ fn assemble_hypothesis(
     inputs
         .try_reserve_exact(context.frame_indices.len())
         .map_err(|source| operational("record gate assembly input allocation failed", source))?;
-    inputs.extend(context.frame_indices.iter().zip(parse_reports).filter_map(
-        |(frame_index, parsed)| {
-            context
-                .frames
-                .get(*frame_index)
-                .map(|frame| RecordAssemblyInput::new(&frame.bytes, parsed))
-        },
-    ));
-    if inputs.len() != context.frame_indices.len() {
+    if parse_reports.len() != context.frame_indices.len() {
         return Err(invalid_policy(
-            "record gate alternative references a missing frame",
+            "record gate parser report count differs from inputs",
         ));
+    }
+    for (frame_index, parsed) in context.frame_indices.iter().zip(parse_reports) {
+        let input = context
+            .inputs
+            .get(*frame_index)
+            .ok_or_else(|| invalid_policy("record gate assembly input is missing"))?;
+        inputs.push(
+            RecordAssemblyInput::from_input(input, parsed)
+                .map_err(|source| operational("record gate input identity changed", source))?,
+        );
     }
     Ok(assemble_record_groups_from_inputs(&inputs, context.limits.discovery.record_limits).ok())
 }
@@ -1572,6 +1752,7 @@ fn inspect_assembly(
         result.parser_omissions = result
             .parser_omissions
             .saturating_add(usize::from(inspection.parser_omission));
+        result.work_limited |= inspection.work_limited.is_some();
         result.pending |= inspection.pending;
         if inspection.pending {
             break;
@@ -1716,50 +1897,62 @@ fn inspect_candidate_bytes(
     context: &SchemaScreenContext<'_>,
     used_work: &mut usize,
 ) -> Result<CandidateInspection, RecoveryExecutionError> {
-    if candidate_bytes.is_empty() || scan_file_signatures(candidate_bytes).matches.is_empty() {
+    if candidate_bytes.is_empty() {
         return Ok(CandidateInspection::default());
     }
-    let remaining = context.work_limit.saturating_sub(*used_work);
-    if candidate_bytes.len() > remaining {
+    let signature_scan_work = candidate_bytes.len();
+    if !reserve_schema_work(used_work, signature_scan_work, context.work_limit)? {
         return Ok(CandidateInspection {
             parser_omission: true,
+            work_limited: Some(WorkLimitHit),
             pending: true,
             ..CandidateInspection::default()
         });
     }
+    if scan_file_signatures(candidate_bytes).matches.is_empty() {
+        return Ok(CandidateInspection::default());
+    }
+    if !reserve_schema_work(used_work, candidate_bytes.len(), context.work_limit)? {
+        return Ok(CandidateInspection {
+            parser_omission: true,
+            work_limited: Some(WorkLimitHit),
+            pending: true,
+            ..CandidateInspection::default()
+        });
+    }
+    let remaining_after_input = context.work_limit.saturating_sub(*used_work);
     let Ok(validator) = aggregate_validator(
         context.artifact_policy,
         candidate_bytes.len(),
-        remaining.saturating_sub(candidate_bytes.len()),
+        remaining_after_input,
     ) else {
         return Ok(CandidateInspection {
             parser_omission: true,
+            work_limited: (remaining_after_input == 0).then_some(WorkLimitHit),
             pending: true,
             ..CandidateInspection::default()
         });
     };
-    let validation = validator.validate_as(context.parser_format, candidate_bytes);
-    let expansion_work = match &validation {
-        ArtifactValidationOutcome::Validated {
-            structure: ArtifactStructure::Zip(report),
-            ..
-        } => report.expanded_work_byte_count,
-        _ => 0,
-    };
-    let parser_work = candidate_bytes
-        .len()
-        .checked_add(expansion_work)
-        .ok_or_else(|| invalid_policy("record gate parser work overflowed"))?;
-    if parser_work > remaining {
+    let mut expansion_remaining = remaining_after_input;
+    let validation =
+        if context.parser_format == l2_workbench::artifact::ArtifactValidationFormat::Zip {
+            validator.validate_as_with_zip_budget(
+                context.parser_format,
+                candidate_bytes,
+                &mut expansion_remaining,
+            )
+        } else {
+            validator.validate_as(context.parser_format, candidate_bytes)
+        };
+    let expansion_work = remaining_after_input.saturating_sub(expansion_remaining);
+    if !reserve_schema_work(used_work, expansion_work, context.work_limit)? {
         return Ok(CandidateInspection {
             parser_omission: true,
+            work_limited: Some(WorkLimitHit),
             pending: true,
             ..CandidateInspection::default()
         });
     }
-    *used_work = used_work
-        .checked_add(parser_work)
-        .ok_or_else(|| invalid_policy("record gate work count overflowed"))?;
     let exact_artifact_match = matches!(
         validation,
         ArtifactValidationOutcome::Validated { ref range, .. }

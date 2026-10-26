@@ -1,3 +1,4 @@
+use super::RecordWorkBudget;
 use super::model::{
     IntegerField, ParsedRecord, RecordAssemblyInput, RecordCount, RecordError, RecordLimits,
     RecordParseReport, RecordSchema, parsed_record_metadata_bytes,
@@ -36,8 +37,34 @@ impl<'a> RecordInput<'a> {
         super::parse::parse_with_input(self, schema, limits)
     }
 
+    /// Parse records while charging field reads, metadata, and first-time identity work
+    ///
+    /// The input identity is hashed only after a successful parse and is reused by later parses
+    /// and assembly operations on this input
+    ///
+    /// # Errors
+    /// Rejects invalid layouts, truncated inputs, trailing bytes, limit violations, and exhausted work budgets
+    pub fn parse_with_work(
+        &self,
+        schema: &RecordSchema,
+        limits: RecordLimits,
+        work: &mut RecordWorkBudget,
+    ) -> Result<RecordParseReport, RecordError> {
+        super::parse::parse_with_input_metered(self, schema, limits, work)
+    }
+
+    /// Return the immutable bytes paired with this input identity
+    #[must_use]
+    pub const fn bytes(&self) -> &'a [u8] {
+        self.bytes
+    }
+
     pub(super) fn input_sha256(&self) -> &str {
         self.input_sha256.get_or_init(|| crate::sha256(self.bytes))
+    }
+
+    pub(super) fn identity_is_computed(&self) -> bool {
+        self.input_sha256.get().is_some()
     }
 }
 
@@ -178,7 +205,7 @@ impl RecordParseReport {
                 maximum: limits.max_report_bytes,
             });
         }
-        let Some(preserved_header) = input.bytes.get(..preserved_header_end) else {
+        let Some(prefix) = input.bytes.get(..preserved_header_end) else {
             return Ok(None);
         };
         if preserved_header_end > limits.max_report_bytes
@@ -192,13 +219,37 @@ impl RecordParseReport {
         {
             return Ok(None);
         }
+        // Reserve both copies before retaining a template so allocation failure stays recoverable
+        let mut preserved_header = Vec::new();
+        preserved_header
+            .try_reserve_exact(preserved_header_end)
+            .map_err(|_| RecordError::AllocationFailed)?;
+        preserved_header.extend_from_slice(prefix);
+        let mut records = Vec::new();
+        records
+            .try_reserve_exact(self.records.len())
+            .map_err(|_| RecordError::AllocationFailed)?;
+        for record in &self.records {
+            let mut identifier = Vec::new();
+            identifier
+                .try_reserve_exact(record.identifier.len())
+                .map_err(|_| RecordError::AllocationFailed)?;
+            identifier.extend_from_slice(&record.identifier);
+            records.push(ParsedRecord {
+                index: record.index,
+                record: record.record,
+                identifier,
+                sequence: record.sequence,
+                payload: record.payload,
+            });
+        }
         Ok(Some(HeaderParseTemplate {
             schema: self.schema.clone(),
             input_length: self.input_length,
-            preserved_header: preserved_header.to_vec(),
+            preserved_header,
             limits,
             declared_count: self.declared_count,
-            records: self.records.clone(),
+            records,
         }))
     }
 }

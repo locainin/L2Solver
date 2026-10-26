@@ -261,6 +261,10 @@ pub struct RecordSchemaDiscoveryReport {
     pub search_exhaustive_within_plan: bool,
     /// Whether every surviving schema and falsification example is retained
     pub report_details_complete: bool,
+    /// Whether the shared logical work-byte budget stopped candidate evaluation
+    pub work_limit_reached: bool,
+    /// Number of candidates that could not be completed under parser resource limits
+    pub resource_limited_candidates: usize,
     /// Surviving unique schemas retained within the explicit survivor limit
     pub surviving: Vec<RecordSchemaHypothesis>,
     /// Surviving schemas omitted by the explicit survivor limit

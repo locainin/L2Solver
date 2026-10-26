@@ -9,6 +9,7 @@ mod proposal_length_budget;
 mod reconstructed_framing;
 mod record_discovery;
 mod record_proposal;
+mod record_work;
 mod records;
 mod relational;
 mod relational_anchored;

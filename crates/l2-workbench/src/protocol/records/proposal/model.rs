@@ -178,6 +178,8 @@ pub struct RecordSchemaProposalReport {
     pub omitted_schema_combinations: Option<usize>,
     /// Whether all bounded candidate-generation checks and schema combinations were examined
     pub search_exhaustive_within_plan: bool,
+    /// Whether the shared logical work-byte budget stopped proposal generation
+    pub work_limit_reached: bool,
     /// Limits of the structural evidence used to build the candidate domains
     pub limitations: [&'static str; 2],
 }
@@ -198,6 +200,8 @@ pub struct RecordSchemaAnalysisReport {
     pub proposal: RecordSchemaProposalReport,
     /// Strict parsing results, absent only when proposal found no candidate fields
     pub discovery: Option<RecordSchemaDiscoveryReport>,
+    /// Logical work bytes charged while generating and checking this strategy, when metered
+    pub work_bytes: Option<usize>,
 }
 
 /// Strategy that produced one strictly validated record schema

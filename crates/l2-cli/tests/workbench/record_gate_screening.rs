@@ -6,7 +6,7 @@ use super::screen::{
 };
 use super::{
     GateStatus, MAX_CACHED_SCHEMA_PLANS, SchemaAlternative, SchemaCandidateOptions,
-    SchemaOffsetScope, SchemaPlan, SchemaPlanCache, header_plan_model_budget,
+    SchemaOffsetScope, SchemaPlan, SchemaPlanCache, header_plan_model_budget, record_inputs,
     screen_with_schema_plan,
 };
 use crate::workbench::recovery_executor::relational::DecodedFrameOutput;
@@ -14,7 +14,7 @@ use l2_workbench::{
     artifact::{ArtifactValidationFormat, ArtifactValidationPolicy, PNG_SIGNATURE},
     protocol::{
         ByteRange, Direction, HoldoutBasis, MessageContext, RecordAssemblyInput,
-        RecordDiscoveryLimits, RecordLimits, RecordParseReport, RecordSchema,
+        RecordDiscoveryLimits, RecordInput, RecordLimits, RecordParseReport, RecordSchema,
         RecordSchemaProposalLimits, RelationalSessionId, RelationalTransformReport,
         assemble_record_groups_from_inputs, parse_records,
     },
@@ -184,6 +184,7 @@ fn schema_discovery_returns_pending_when_its_work_budget_is_too_small() -> TestR
 
     assert_eq!(result.status, GateStatus::Pending);
     assert!(result.work_bytes <= 16);
+    assert_eq!(result.work_limited_at, Some(16));
     assert_eq!(cache.plans.len(), 1);
     Ok(())
 }
@@ -332,6 +333,7 @@ fn cold_candidate_without_a_reusable_header_plan_runs_complete_input_inference()
     let placeholder = Arc::new(SchemaPlan {
         alternatives: Vec::<SchemaAlternative>::new(),
         details: Value::Null,
+        work_limited: false,
         has_unassigned_family_messages: false,
         family_search_complete: true,
         assessment_scope: SchemaOffsetScope::CompleteInput,
@@ -648,6 +650,7 @@ fn exact_artifact_validation_uses_a_survivor_omitted_from_report_details() -> Te
     )?;
 
     assert_eq!(gate.status, GateStatus::ArtifactValidated);
+    assert_eq!(gate.work_limited_at, None);
     assert!(gate.work_bytes <= work_limit);
     let details = gate
         .details
@@ -784,6 +787,7 @@ fn observe_with_one_omitted_frame(
     frames: &[DecodedFrameOutput],
     limits: RecordSchemaProposalLimits,
 ) -> TestResult<SchemaAlternativeEvaluation> {
+    let inputs = record_inputs(frames)?;
     let selected_count = frames.len().saturating_sub(1);
     let indices = selected_frame_indices(frames, selected_count);
     let hypothesis = l2_workbench::protocol::RecordSchemaHypothesis {
@@ -793,14 +797,14 @@ fn observe_with_one_omitted_frame(
         training_record_count: indices.selected_training.len(),
         held_out_record_count: indices.selected_heldout.len(),
     };
-    let training_reports = parse_selected_frames(
-        frames,
+    let training_reports = parse_selected_inputs(
+        &inputs,
         &indices.selected_training,
         &hypothesis.schema,
         limits,
     )?;
-    let heldout_reports = parse_selected_frames(
-        frames,
+    let heldout_reports = parse_selected_inputs(
+        &inputs,
         &indices.selected_heldout,
         &hypothesis.schema,
         limits,
@@ -814,7 +818,7 @@ fn observe_with_one_omitted_frame(
         .ok_or("full input size overflowed or a frame is missing")?;
     let context = SchemaScreenContext {
         frames,
-        inputs: None,
+        inputs: &inputs,
         frame_indices: &indices.all_frames,
         limits,
         parser_format: ArtifactValidationFormat::Png,
@@ -890,8 +894,8 @@ fn selected_frame_indices(frames: &[DecodedFrameOutput], selected_count: usize) 
     indices
 }
 
-fn parse_selected_frames(
-    frames: &[DecodedFrameOutput],
+fn parse_selected_inputs(
+    inputs: &[RecordInput<'_>],
     indices: &[usize],
     schema: &l2_workbench::protocol::RecordSchema,
     limits: RecordSchemaProposalLimits,
@@ -899,12 +903,8 @@ fn parse_selected_frames(
     indices
         .iter()
         .map(|index| {
-            let frame = frames.get(*index).ok_or("selected frame is missing")?;
-            Ok(l2_workbench::protocol::parse_records_with_limits(
-                &frame.bytes,
-                schema,
-                limits.discovery.record_limits,
-            )?)
+            let input = inputs.get(*index).ok_or("selected input is missing")?;
+            Ok(input.parse(schema, limits.discovery.record_limits)?)
         })
         .collect()
 }
@@ -1190,13 +1190,13 @@ fn report_with_sessions(discovery: &[u64], heldout: &[u64]) -> RelationalTransfo
         omitted_candidates_exact: true,
         candidate_limit_remaining: 0,
         locator_candidates_examined: 0,
-        locator_candidate_limit_remaining: 0,
         prefix_probe_hypotheses_examined: 0,
         prefix_probes_examined: 0,
         prefix_probe_cache_reuses: 0,
         prefix_probe_candidates_with_novelty: 0,
         prefix_probe_work_bytes: 0,
         prefix_probe_complete: true,
+        locator_candidate_limit_remaining: 0,
         work_bytes: 0,
         work_bytes_remaining: 0,
         search_exhaustive_within_plan: true,
