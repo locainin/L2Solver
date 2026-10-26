@@ -15,6 +15,8 @@ use libfuzzer_sys::fuzz_target;
 
 #[path = "workbench/extensions.rs"]
 mod extensions;
+#[path = "workbench/observation.rs"]
+mod observation;
 #[path = "workbench/recovery.rs"]
 mod recovery;
 #[path = "workbench/stream_messages.rs"]
@@ -32,6 +34,7 @@ fuzz_target!(|data: &[u8]| {
     exercise_evidence(input);
     exercise_reconstruction(input);
     extensions::exercise(input);
+    observation::exercise(input);
     recovery::exercise(input);
     stream_messages::exercise(input);
 });
