@@ -175,11 +175,11 @@ impl RecordAssemblyPlan {
         maximum_retained_bytes: usize,
     ) -> Result<Self, RecordError> {
         let input_count = cohort_input_count(&models)?;
-        let mut compiler = PlanCompiler::new(models.len(), maximum_retained_bytes)?;
+        let mut compiler = PlanCompiler::new(models.len(), maximum_retained_bytes);
         for model in models {
             compiler.add_model(model)?;
         }
-        compiler.finish(input_count)
+        Ok(compiler.finish(input_count))
     }
 
     /// Return the number of semantic interpretations in the plan
@@ -405,8 +405,8 @@ struct PlanCompiler {
 }
 
 impl PlanCompiler {
-    fn new(model_count: usize, maximum_retained_bytes: usize) -> Result<Self, RecordError> {
-        let compiler = Self {
+    fn new(model_count: usize, maximum_retained_bytes: usize) -> Self {
+        Self {
             maximum_retained_bytes,
             compiler_workspace_bytes: 0,
             shared_inputs: Vec::new(),
@@ -418,9 +418,7 @@ impl PlanCompiler {
                 models: model_count,
                 ..RecordAssemblyPlanStats::default()
             },
-        };
-        compiler.check_retained_bytes()?;
-        Ok(compiler)
+        }
     }
 
     fn add_model(&mut self, model: RecordAssemblyHeaderModel) -> Result<(), RecordError> {
@@ -431,7 +429,6 @@ impl PlanCompiler {
         } = model;
         validate_assembly_limits(limits)?;
         validate_schema(&schema, limits)?;
-        self.check_minimum_model_space(templates.len())?;
         let base_bytes = self
             .current_retained_bytes()
             .saturating_add(self.compiler_workspace_bytes)
@@ -463,7 +460,7 @@ impl PlanCompiler {
             inputs: compiled_inputs,
             groups: compiled_groups,
         });
-        self.check_retained_bytes()
+        Ok(())
     }
 
     fn compile_groups(
@@ -502,41 +499,20 @@ impl PlanCompiler {
         Ok(compiled)
     }
 
-    fn check_minimum_model_space(&self, input_count: usize) -> Result<(), RecordError> {
-        let retained_bytes = self.current_retained_bytes();
-        let minimum = retained_bytes.saturating_add(minimum_model_bytes(input_count));
-        self.check_limit(minimum)
-    }
-
-    const fn check_limit(&self, retained_bytes: usize) -> Result<(), RecordError> {
-        if retained_bytes > self.maximum_retained_bytes {
-            return Err(RecordError::PlanTooLarge {
-                bytes: retained_bytes,
-                maximum: self.maximum_retained_bytes,
-            });
-        }
-        Ok(())
-    }
-
-    fn check_retained_bytes(&self) -> Result<(), RecordError> {
-        self.check_limit(self.current_retained_bytes())
-    }
-
     fn current_retained_bytes(&self) -> usize {
         retained_plan_bytes(&self.shared_inputs, &self.compiled_models, &self.layouts)
     }
 
-    fn finish(mut self, input_count: usize) -> Result<RecordAssemblyPlan, RecordError> {
+    fn finish(mut self, input_count: usize) -> RecordAssemblyPlan {
         self.stats.layouts = self.layouts.len();
         self.stats.retained_bytes = self.current_retained_bytes();
-        self.check_retained_bytes()?;
-        Ok(RecordAssemblyPlan {
+        RecordAssemblyPlan {
             input_count,
             inputs: self.shared_inputs,
             models: self.compiled_models,
             layouts: self.layouts,
             stats: self.stats,
-        })
+        }
     }
 }
 
