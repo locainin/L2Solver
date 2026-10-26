@@ -1,3 +1,15 @@
+//! Infer record-header layouts from training bytes and test schemas on held-out messages
+//!
+//! A record schema locates the object identifier, sequence number, length field, and payload
+//! This search proposes field positions, widths, byte orders, and length meanings that fit
+//! the training input, then enumerates compatible layouts in a stable, bounded order
+//! Supported field relationships stay together instead of forming an unrestricted product
+//!
+//! Proposal generation reads training bytes only. The shared strict record parser checks
+//! candidate schemas against training and held-out messages, preserving failures and search
+//! omissions in the report. Surviving layouts remain hypotheses; record assembly and file
+//! validation are later recovery steps
+
 use super::super::discovery::{
     RecordDiscoveryError, RecordSchemaDiscoverySpace, discover_record_schemas_from_candidates,
 };
@@ -13,12 +25,13 @@ use std::cmp::Reverse;
 use std::collections::{BinaryHeap, HashMap, HashSet};
 use std::hash::Hash;
 
-/// Derive bounded field domains from framed training messages
+/// Suggest possible record-header fields from training messages within search limits
 ///
-/// Candidate generation reads only training bytes. Supplied held-out messages are retained as
-/// a validation basis for the canonical record discovery call, which performs strict parsing and
-/// falsification. Assembly remains a separate operation. With no holdout, candidates remain
-/// discovery-only
+/// Checks field positions, widths, byte orders, identifier/sequence relationships, and candidate
+/// length layouts using training bytes only. The report describes the proposed field domains
+/// and how much search was completed. Supplied held-out input is recorded as a validation basis
+/// Use [`analyze_record_schemas`] to enumerate compatible schemas and check them with the strict
+/// parser. Without held-out input, a surviving schema has discovery support only
 ///
 /// # Errors
 /// Rejects empty training input, invalid limits, and aggregate message resource excess
@@ -37,10 +50,12 @@ pub fn propose_record_schema_space(
     ))
 }
 
-/// Propose and strictly validate schemas while preserving supported field relationships
+/// Infer compatible record schemas and check each against training and held-out messages
 ///
-/// The explanatory candidate space contains independent field projections. Discovery uses the
-/// supported identifier/sequence pairs and length layouts retained from the same generation pass
+/// Reuses the supported field pairs and length layouts from one proposal pass. This avoids
+/// retrying unrelated field combinations from the report's individual field lists. The shared
+/// strict parser checks each complete schema; the result retains surviving hypotheses,
+/// falsifications, and search coverage. Record assembly remains a separate operation
 ///
 /// # Errors
 /// Rejects empty training input, invalid limits, and aggregate message resource excess
