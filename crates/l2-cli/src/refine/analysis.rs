@@ -17,6 +17,7 @@ use l2_workbench::{
         Counter, Job, Phase,
         cache::{Cache, CacheEntry, CacheReadPolicy, Lease, SourceIdentity, StageKey, StageStatus},
     },
+    recovery::proposals::TRANSFORM_PROPOSAL_FORMAT_VERSION,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::json;
@@ -26,7 +27,8 @@ use std::{
     io::{self, Write},
 };
 
-const CACHE_ANALYSIS_SCHEMA_VERSION: u32 = 1;
+pub(super) const REFINE_ANALYZER_ALGORITHM_VERSION: u32 = 2;
+pub(super) const CACHE_ANALYSIS_SCHEMA_VERSION: u32 = 1;
 const MAX_CACHE_RECEIPT_BYTES: usize = 8 * 1024 * 1024;
 
 pub(super) fn analyze_sources(
@@ -191,13 +193,14 @@ pub(super) fn analyze_source_cached(
     let identity = SourceIdentity::from_sha256(source.sha256.clone())?;
     let policy = json!({
         "schema_version": CACHE_ANALYSIS_SCHEMA_VERSION,
+        "transform_proposal_format_version": TRANSFORM_PROPOSAL_FORMAT_VERSION,
         "analyzer": options,
         "profile": recovery_profile_name(recovery.profile),
     });
     let key = StageKey::new(
         "file_artifact_analysis",
         CACHE_ANALYSIS_SCHEMA_VERSION,
-        "l2_artifact_analyzer_v1",
+        format!("l2_artifact_analyzer_v{REFINE_ANALYZER_ALGORITHM_VERSION}"),
         &policy,
         &identity,
         &[],

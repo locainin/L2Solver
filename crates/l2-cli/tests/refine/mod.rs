@@ -224,6 +224,25 @@ fn per_input_cache_reuses_the_complete_analysis_and_restores_artifact_bytes()
     let options = analyzer_options(&recovery, false, 4096, 8192);
     let job = l2_workbench::job::Job::new("cache test");
     let mut warnings = Vec::new();
+    let identity = l2_workbench::job::cache::SourceIdentity::from_sha256(source.sha256.clone())?;
+    let previous_policy = json!({
+        "schema_version": 1,
+        "analyzer": options,
+        "profile": "normal",
+    });
+    let previous_key = l2_workbench::job::cache::StageKey::new(
+        "file_artifact_analysis",
+        1,
+        "l2_artifact_analyzer_v1",
+        &previous_policy,
+        &identity,
+        &[],
+    )?;
+    drop(
+        cache
+            .lease(&previous_key)?
+            .commit(l2_workbench::job::cache::StageStatus::Complete, json!({}))?,
+    );
 
     let first = analyze_source_cached(
         &source,
@@ -289,6 +308,21 @@ fn result_identity_uses_ordered_content_hashes_and_analysis_settings() -> Result
     let recovery = RecoveryOptions::default();
     let policy = RefinePolicy::new(&recovery, false)?;
     let identity = result_identity(&sources, &recovery, &policy)?;
+    assert_eq!(identity.algorithm_version, 2);
+    assert_eq!(
+        identity.settings.get("analyzer_algorithm_version"),
+        Some(&json!(2))
+    );
+    assert_eq!(
+        identity.settings.get("analysis_receipt_schema_version"),
+        Some(&json!(1))
+    );
+    assert_eq!(
+        identity.settings.get("transform_proposal_format_version"),
+        Some(&json!(
+            l2_workbench::recovery::proposals::TRANSFORM_PROPOSAL_FORMAT_VERSION
+        ))
+    );
     let relabeled = [
         loaded_source("renamed-first", first),
         loaded_source("renamed-second", second),
@@ -357,6 +391,57 @@ fn matching_result_directory_is_reused_before_artifact_analysis() -> Result<(), 
             .phase(l2_workbench::job::Phase::TransformDiscovery)
             .map(|phase| phase.state),
         Some(l2_workbench::job::PhaseState::Skipped)
+    );
+    Ok(())
+}
+
+#[test]
+fn pre_region_result_identity_is_not_reused_for_region_analysis() -> Result<(), Box<dyn Error>> {
+    let directory = tempfile::tempdir()?;
+    let input = directory.path().join("source.bin");
+    let output_dir = directory.path().join("result.refined");
+    fs::write(&input, structural_png()?)?;
+    let recovery = RecoveryOptions {
+        no_cache: true,
+        ..RecoveryOptions::default()
+    };
+    let options = RefineOptions {
+        input,
+        output: Some(output_dir.clone()),
+        dry_run: false,
+        salvage: false,
+        recovery,
+    };
+    let mut output = Vec::new();
+    assert!(run(&options, &mut output)?);
+
+    let manifest_path = output_dir.join("manifest.json");
+    let mut manifest: serde_json::Value = serde_json::from_slice(&fs::read(&manifest_path)?)?;
+    let receipt = manifest
+        .get_mut("l2solver_result")
+        .and_then(serde_json::Value::as_object_mut)
+        .ok_or("result receipt is missing")?;
+    let identity = receipt
+        .get_mut("identity")
+        .and_then(serde_json::Value::as_object_mut)
+        .ok_or("result identity is missing")?;
+    identity.insert("algorithm_version".to_owned(), json!(1));
+    let settings = identity
+        .get_mut("settings")
+        .and_then(serde_json::Value::as_object_mut)
+        .ok_or("result settings are missing")?;
+    settings.remove("analyzer_algorithm_version");
+    settings.remove("analysis_receipt_schema_version");
+    settings.remove("transform_proposal_format_version");
+    fs::write(&manifest_path, serde_json::to_vec(&manifest)?)?;
+
+    let error = run(&options, &mut Vec::new())
+        .err()
+        .ok_or("pre-region result was reused for the updated analyzer")?;
+    assert!(
+        error
+            .to_string()
+            .contains("result policy or algorithm version differs")
     );
     Ok(())
 }

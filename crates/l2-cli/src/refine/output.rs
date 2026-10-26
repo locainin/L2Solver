@@ -1,7 +1,12 @@
 //! Refinement identity, provenance manifest, and user-facing summaries
 
 use super::{
-    analysis::recovery_profile_name, input::LoadedSource, invalid_input, policy::RefinePolicy,
+    analysis::{
+        CACHE_ANALYSIS_SCHEMA_VERSION, REFINE_ANALYZER_ALGORITHM_VERSION, recovery_profile_name,
+    },
+    input::LoadedSource,
+    invalid_input,
+    policy::RefinePolicy,
 };
 use crate::{
     arguments::RecoveryOptions,
@@ -11,6 +16,7 @@ use crate::{
 use l2_workbench::{
     artifact::{AnalysisOmission, AnalysisStatus, ArtifactOrigin},
     job::cache::SourceIdentity,
+    recovery::proposals::TRANSFORM_PROPOSAL_FORMAT_VERSION,
     sha256,
 };
 use serde::Serialize;
@@ -23,7 +29,7 @@ use std::{
     path::{Path, PathBuf},
 };
 
-const REFINE_ALGORITHM_VERSION: u32 = 1;
+const REFINE_ALGORITHM_VERSION: u32 = 2;
 
 #[derive(Serialize)]
 pub(super) struct SourceRecord {
@@ -89,6 +95,9 @@ pub(super) fn result_identity(
             "recovery_mode": policy.analyzer.recovery,
             "profile": recovery_profile_name(recovery.profile),
             "memory_limit": u64::try_from(policy.memory_limit)?,
+            "analyzer_algorithm_version": REFINE_ANALYZER_ALGORITHM_VERSION,
+            "analysis_receipt_schema_version": CACHE_ANALYSIS_SCHEMA_VERSION,
+            "transform_proposal_format_version": TRANSFORM_PROPOSAL_FORMAT_VERSION,
         }),
     })
 }

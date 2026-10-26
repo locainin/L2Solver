@@ -131,6 +131,107 @@ fn default_recovery_discovers_a_two_stage_chain_without_promoting_neutral_bytes(
 }
 
 #[test]
+fn region_transform_discovery_queues_the_complete_slice_and_decode_recipe()
+-> Result<(), Box<dyn Error>> {
+    let input = b"\x01\x02|ZGVhZA==|\xfe";
+    let start = 3;
+    let length = b"ZGVhZA==".len();
+    let mut case = Case::new();
+    let input_node = source(&mut case, "http_body", input)?;
+
+    let outcome = execute(&mut case, &automatic_recovery_plan(), &policy())?;
+    let report = discovery_report_for_input(&case, &outcome.candidates, input_node)?;
+    let region_candidate = outcome
+        .candidates
+        .iter()
+        .find(|candidate| {
+            let RecoveryTask::Transform(recipe) = candidate.task() else {
+                return false;
+            };
+            matches!(
+                recipe.steps.as_slice(),
+                [
+                    l2_workbench::derivation::Operation::Slice {
+                        start: recipe_start,
+                        length: Some(recipe_length)
+                    },
+                    l2_workbench::derivation::Operation::Base64Decode { .. }
+                ] if *recipe_start == start && *recipe_length == length
+            ) && candidate
+                .inputs()
+                .first()
+                .is_some_and(|source| source.blob_id() == blob_id(input))
+        })
+        .ok_or("bounded region transform candidate is missing")?;
+
+    assert!(matches!(
+        region_candidate.state(),
+        RecoveryCandidateState::Finished {
+            stage: RecoveryStage::Transform,
+            result: RecoveryResult::Derived { .. },
+        }
+    ));
+    assert!(case.blobs().iter().any(|blob| blob.bytes == b"dead"));
+    assert_eq!(
+        report
+            .pointer("/scan/region_work_bytes")
+            .and_then(Value::as_u64),
+        Some(213)
+    );
+    assert!(
+        report
+            .pointer("/region_report/coverage/complete")
+            .and_then(Value::as_bool)
+            .unwrap_or(false)
+    );
+    Ok(())
+}
+
+#[test]
+fn region_discovery_retains_complete_negative_assessments_for_the_selected_range()
+-> Result<(), Box<dyn Error>> {
+    let input = b"\x01\x02|SGVsbG8=bad|\xfe";
+    let mut case = Case::new();
+    let input_node = source(&mut case, "http_body", input)?;
+
+    let outcome = execute(&mut case, &automatic_recovery_plan(), &policy())?;
+    let report = discovery_report_for_input(&case, &outcome.candidates, input_node)?;
+    let expected_end = u64::try_from(3 + b"SGVsbG8=bad".len())?;
+    let regions = report
+        .pointer("/region_report/regions")
+        .and_then(Value::as_array)
+        .ok_or("region assessment list is missing")?;
+    let invalid_region = regions
+        .iter()
+        .find(|region| {
+            region.pointer("/range/start").and_then(Value::as_u64) == Some(3)
+                && region.pointer("/range/end").and_then(Value::as_u64) == Some(expected_end)
+        })
+        .ok_or("invalid Base64 region was not retained")?;
+
+    assert_eq!(
+        invalid_region
+            .pointer("/proposal_report/assessments")
+            .and_then(Value::as_array)
+            .map(Vec::len),
+        Some(7)
+    );
+    assert!(
+        invalid_region
+            .pointer("/proposal_report/proposals")
+            .and_then(Value::as_array)
+            .is_some_and(Vec::is_empty)
+    );
+    assert_eq!(
+        report
+            .pointer("/region_report/coverage/complete")
+            .and_then(Value::as_bool),
+        Some(true)
+    );
+    Ok(())
+}
+
+#[test]
 fn recover_case_runs_default_transform_discovery_without_a_plan() -> Result<(), Box<dyn Error>> {
     let mut case = Case::new();
     let input_node = source(&mut case, "http_body", BASE64_HEX_INPUT)?;
@@ -520,7 +621,7 @@ fn proposal_candidate_budget_is_explicit_in_the_retained_report() -> Result<(), 
         report
             .pointer("/scan/work_bytes_charged")
             .and_then(Value::as_u64),
-        Some(62)
+        Some(230)
     );
     assert_eq!(
         report
@@ -643,7 +744,7 @@ fn discovery_scan_stage_limit_is_a_partial_result_without_global_work_charge()
         RecoveryOmission::StageWorkLimit {
             task: RecoveryTask::TransformDiscovery,
             limit: 1,
-            work_bytes: 62,
+            work_bytes: 230,
             input_node_ids,
         } if input_node_ids == &[input_node]
     )));

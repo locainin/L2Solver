@@ -15,6 +15,10 @@ use l2_workbench::{
             TransformProposalBudget, TransformProposalReport, propose_transforms,
             transform_proposal_scan_work_bound,
         },
+        regions::{
+            TransformRegionLimits, TransformRegionReport, propose_region_transforms,
+            transform_discovery_scan_work_bound, transform_region_scan_work_bound,
+        },
     },
 };
 use serde::Serialize;
@@ -163,6 +167,7 @@ struct TransformProposalReceipt<'a> {
     scan: TransformProposalScan,
     proposal_budget: TransformProposalBudget,
     proposal_report: &'a TransformProposalReport,
+    region_report: &'a TransformRegionReport,
 }
 
 #[derive(Serialize)]
@@ -172,10 +177,21 @@ struct TransformProposalInput<'a> {
     byte_length: usize,
 }
 
-#[derive(Serialize)]
+#[derive(Clone, Copy, Serialize)]
 struct TransformProposalScan {
     operation_count: usize,
+    whole_input_work_bytes: usize,
+    region_work_bytes: usize,
     work_bytes_charged: usize,
+}
+
+struct TransformProposalAnalysis {
+    input_node: u64,
+    input_length: usize,
+    input_blob_id: String,
+    scan: TransformProposalScan,
+    proposal_report: TransformProposalReport,
+    region_report: TransformRegionReport,
 }
 
 impl Executor<'_> {
@@ -224,48 +240,88 @@ impl Executor<'_> {
         input_node: u64,
         input_length: usize,
     ) -> Result<(), RecoveryExecutionError> {
-        let scan_work_bytes =
-            transform_proposal_scan_work_bound(input_length).ok_or_else(|| {
-                RecoveryExecutionError::InvalidPolicy(
-                    "transform proposal scan work cannot be represented".to_owned(),
-                )
-            })?;
+        let scan = transform_proposal_scan(input_length)?;
         let scan_limit = self
             .policy
             .transform_exploration
             .max_scan_work_bytes_per_input;
-        if scan_work_bytes > scan_limit {
+        if scan.work_bytes_charged > scan_limit {
             return self.finish_scan_work_limit(
                 candidate_id,
                 input_node,
                 scan_limit,
-                scan_work_bytes,
+                scan.work_bytes_charged,
             );
         }
 
         let task = RecoveryTask::TransformDiscovery;
-        if !self.charge_work(candidate_id, &task, &[input_node], scan_work_bytes)? {
+        if !self.charge_work(candidate_id, &task, &[input_node], scan.work_bytes_charged)? {
             return Ok(());
         }
 
-        let (input_blob_id, proposal_report) =
+        let (input_blob_id, proposal_report, region_report) =
             self.assess_transform_input(candidate_id, input_length)?;
         self.record_transform_discovery_omissions(input_node, &proposal_report);
-        // An empty retained list is negative only when no eligible recipe was budgeted out
-        if self.finish_complete_negative_transform_search(candidate_id, &proposal_report)? {
+        // Retain regional negative evidence before finishing this source as unsupported
+        if self.finish_complete_negative_transform_search(
+            candidate_id,
+            &proposal_report,
+            &region_report,
+        )? {
             return Ok(());
         }
 
-        let report_bytes = serialize_transform_proposal_report(
+        self.retain_transform_analysis(
+            candidate_id,
+            TransformProposalAnalysis {
+                input_node,
+                input_length,
+                input_blob_id,
+                scan,
+                proposal_report,
+                region_report,
+            },
+        )
+    }
+
+    fn retain_transform_analysis(
+        &mut self,
+        candidate_id: RecoveryCandidateId,
+        analysis: TransformProposalAnalysis,
+    ) -> Result<(), RecoveryExecutionError> {
+        let TransformProposalAnalysis {
             input_node,
             input_length,
-            scan_work_bytes,
-            &input_blob_id,
-            &proposal_report,
-            self.policy.transform_exploration.proposal_budget,
-        )?;
-        let proposal_count = proposal_report.proposals.len();
-        let assessment_count = proposal_report.assessments.len();
+            input_blob_id,
+            scan,
+            proposal_report,
+            region_report,
+        } = analysis;
+        let receipt = TransformProposalReceipt {
+            version: REPORT_VERSION,
+            input: TransformProposalInput {
+                node_id: input_node,
+                blob_id: &input_blob_id,
+                byte_length: input_length,
+            },
+            scan,
+            proposal_budget: self.policy.transform_exploration.proposal_budget,
+            proposal_report: &proposal_report,
+            region_report: &region_report,
+        };
+        let report_bytes = serialize_transform_proposal_report(&receipt)?;
+        let region_proposal_count = region_report
+            .regions
+            .iter()
+            .map(|region| region.proposal_report.proposals.len())
+            .sum::<usize>();
+        let region_assessment_count = region_report
+            .regions
+            .iter()
+            .map(|region| region.proposal_report.assessments.len())
+            .sum::<usize>();
+        let proposal_count = proposal_report.proposals.len() + region_proposal_count;
+        let assessment_count = proposal_report.assessments.len() + region_assessment_count;
         let Some(report_node) = self.retain_transform_proposal_report(
             candidate_id,
             input_node,
@@ -277,17 +333,16 @@ impl Executor<'_> {
                 "assessment_count":assessment_count,
                 "proposal_count":proposal_count,
                 "candidate_omissions":proposal_report.omissions.candidates,
-                "report_omissions":proposal_report.omissions.reports
+                "report_omissions":proposal_report.omissions.reports,
+                "region_count":region_report.regions.len(),
+                "region_scan_complete":region_report.coverage.complete,
+                "region_omissions":region_report.coverage.omissions
             }),
         )?
         else {
             return Ok(());
         };
-        let recipes = proposal_report
-            .proposals
-            .into_iter()
-            .map(|proposal| proposal.recipe)
-            .collect::<Vec<_>>();
+        let recipes = transform_proposal_recipes(proposal_report, region_report);
         // The report order defines the retained prefix when the shared budget fills
         let recipes = self.admit_proposal_prefix(report_node, input_node, &recipes)?;
         let contexts = {
@@ -326,8 +381,24 @@ impl Executor<'_> {
         &mut self,
         candidate_id: RecoveryCandidateId,
         proposal_report: &TransformProposalReport,
+        region_report: &TransformRegionReport,
     ) -> Result<bool, RecoveryExecutionError> {
-        if !proposal_report.proposals.is_empty() || proposal_report.omissions.candidates != 0 {
+        let region_has_proposals = region_report
+            .regions
+            .iter()
+            .any(|region| !region.proposal_report.proposals.is_empty());
+        let region_is_incomplete = !region_report.coverage.complete
+            || region_report.regions.iter().any(|region| {
+                region.proposal_report.omissions.candidates != 0
+                    || region.proposal_report.omissions.reports != 0
+            });
+        if !proposal_report.proposals.is_empty()
+            || proposal_report.omissions.candidates != 0
+            || proposal_report.omissions.reports != 0
+            || region_has_proposals
+            || region_is_incomplete
+            || !region_report.regions.is_empty()
+        {
             return Ok(false);
         }
         self.complete_negative_transform_searches = self
@@ -389,7 +460,8 @@ impl Executor<'_> {
         &self,
         candidate_id: RecoveryCandidateId,
         input_length: usize,
-    ) -> Result<(String, TransformProposalReport), RecoveryExecutionError> {
+    ) -> Result<(String, TransformProposalReport, TransformRegionReport), RecoveryExecutionError>
+    {
         let input = self.coordinator.input_blob(self.case, candidate_id)?;
         if input.bytes.len() != input_length {
             return Err(RecoveryError::InvariantFailure.into());
@@ -398,7 +470,13 @@ impl Executor<'_> {
             &input.bytes,
             self.policy.transform_exploration.proposal_budget,
         );
-        Ok((input.id.clone(), report))
+        let region_report = propose_region_transforms(
+            &input.bytes,
+            &[],
+            TransformRegionLimits::for_input(input_length),
+            self.policy.transform_exploration.proposal_budget,
+        );
+        Ok((input.id.clone(), report, region_report))
     }
 
     pub(super) fn link_transform_proposals(
@@ -756,29 +834,60 @@ impl Executor<'_> {
 }
 
 fn serialize_transform_proposal_report(
-    input_node: u64,
-    input_length: usize,
-    scan_work_bytes: usize,
-    input_blob_id: &str,
-    proposal_report: &TransformProposalReport,
-    proposal_budget: TransformProposalBudget,
+    receipt: &TransformProposalReceipt<'_>,
 ) -> Result<Vec<u8>, RecoveryExecutionError> {
-    serde_json::to_vec(&TransformProposalReceipt {
-        version: REPORT_VERSION,
-        input: TransformProposalInput {
-            node_id: input_node,
-            blob_id: input_blob_id,
-            byte_length: input_length,
-        },
-        scan: TransformProposalScan {
-            operation_count: TRANSFORM_PROPOSAL_OPERATION_COUNT,
-            work_bytes_charged: scan_work_bytes,
-        },
-        proposal_budget,
-        proposal_report,
-    })
-    .map_err(|source| RecoveryExecutionError::Operational {
+    serde_json::to_vec(receipt).map_err(|source| RecoveryExecutionError::Operational {
         stage: RecoveryStage::TransformDiscovery,
         source: Box::new(source),
     })
+}
+
+fn transform_proposal_scan(
+    input_length: usize,
+) -> Result<TransformProposalScan, RecoveryExecutionError> {
+    let whole_input_work_bytes =
+        transform_proposal_scan_work_bound(input_length).ok_or_else(|| {
+            RecoveryExecutionError::InvalidPolicy(
+                "transform proposal scan work cannot be represented".to_owned(),
+            )
+        })?;
+    let region_limits = TransformRegionLimits::for_input(input_length);
+    let region_work_bytes = transform_region_scan_work_bound(region_limits).ok_or_else(|| {
+        RecoveryExecutionError::InvalidPolicy(
+            "transform region scan work cannot be represented".to_owned(),
+        )
+    })?;
+    let work_bytes_charged =
+        transform_discovery_scan_work_bound(input_length).ok_or_else(|| {
+            RecoveryExecutionError::InvalidPolicy(
+                "combined transform scan work cannot be represented".to_owned(),
+            )
+        })?;
+    Ok(TransformProposalScan {
+        operation_count: TRANSFORM_PROPOSAL_OPERATION_COUNT,
+        whole_input_work_bytes,
+        region_work_bytes,
+        work_bytes_charged,
+    })
+}
+
+fn transform_proposal_recipes(
+    proposal_report: TransformProposalReport,
+    region_report: TransformRegionReport,
+) -> Vec<Recipe> {
+    let mut recipes = proposal_report
+        .proposals
+        .into_iter()
+        .map(|proposal| proposal.recipe)
+        .collect::<Vec<_>>();
+    for region in region_report.regions {
+        recipes.extend(
+            region
+                .proposal_report
+                .proposals
+                .into_iter()
+                .map(|proposal| proposal.recipe),
+        );
+    }
+    recipes
 }

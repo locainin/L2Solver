@@ -31,8 +31,9 @@ use l2_workbench::{
         RecoveryError, RecoveryResourcePolicy, RecoveryTask,
         proposals::{
             TRANSFORM_PROPOSAL_OPERATION_COUNT, TransformProposalBudget,
-            transform_proposal_operations, transform_proposal_scan_work_bound,
+            transform_proposal_operations,
         },
+        regions::{DEFAULT_MAX_TRANSFORM_REGIONS_PER_INPUT, transform_discovery_scan_work_bound},
     },
 };
 use std::collections::HashMap;
@@ -126,7 +127,7 @@ fn build_execution_policy(
         discover_records: true,
         ..RecoveryPlan::default()
     };
-    let max_scan_work_bytes_per_input = transform_proposal_scan_work_bound(max_input_bytes)
+    let max_scan_work_bytes_per_input = transform_discovery_scan_work_bound(max_input_bytes)
         .ok_or_else(|| {
             RecoveryExecutionError::InvalidPolicy(
                 "transform proposal scan allowance cannot be represented".to_owned(),
@@ -145,10 +146,11 @@ fn build_execution_policy(
         &embedded_child_tasks,
         &expanded_child_tasks,
     )?;
+    let transform_proposal_capacity = transform_proposal_capacity()?;
     let parent_task_multiplicity = embedded_child_tasks
         .len()
         .max(expanded_child_tasks.len())
-        .checked_add(TRANSFORM_PROPOSAL_OPERATION_COUNT)
+        .checked_add(transform_proposal_capacity)
         .ok_or_else(|| {
             RecoveryExecutionError::InvalidPolicy(
                 "recovery parent-link allowance exceeds this platform's address space".into(),
@@ -193,6 +195,17 @@ fn build_execution_policy(
         record_schema_proposal_limits,
         record_phase_work_limit: source_work.record_phase_work,
     })
+}
+
+fn transform_proposal_capacity() -> Result<usize, RecoveryExecutionError> {
+    DEFAULT_MAX_TRANSFORM_REGIONS_PER_INPUT
+        .checked_add(1)
+        .and_then(|region_count| region_count.checked_mul(TRANSFORM_PROPOSAL_OPERATION_COUNT))
+        .ok_or_else(|| {
+            RecoveryExecutionError::InvalidPolicy(
+                "transform proposal capacity cannot be represented".to_owned(),
+            )
+        })
 }
 
 fn default_work_allowance(
@@ -815,7 +828,7 @@ fn task_input_bytes(
     task: &RecoveryTask,
 ) -> Result<usize, RecoveryExecutionError> {
     let assessment_bytes = if matches!(task, RecoveryTask::TransformDiscovery) {
-        transform_proposal_scan_work_bound(input_bytes).ok_or_else(|| {
+        transform_discovery_scan_work_bound(input_bytes).ok_or_else(|| {
             RecoveryExecutionError::InvalidPolicy(
                 "transform proposal scan work cannot be represented".to_owned(),
             )
