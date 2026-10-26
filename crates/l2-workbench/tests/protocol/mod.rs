@@ -9,4 +9,5 @@ mod reconstructed_framing;
 mod record_discovery;
 mod record_proposal;
 mod records;
+mod relational;
 mod stream;

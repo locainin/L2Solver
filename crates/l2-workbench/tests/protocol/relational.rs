@@ -1,6 +1,7 @@
 use l2_workbench::{
     artifact::{ArtifactValidationFormat, ArtifactValidationOutcome, ArtifactValidator},
     derivation::{CounterByteOrder, CounterWidth, SeedCounterOrder},
+    job::{Counter, Job},
     protocol::{
         ByteOrder, ByteRange, Direction, MessageContext, RelationalCandidateEvaluation,
         RelationalCounterReset, RelationalFalsification, RelationalFitStatus,
@@ -9,6 +10,7 @@ use l2_workbench::{
         RelationalTransformPlan, RelationalTransformStatus, apply_relational_transform_rule,
         infer_relational_transform_candidates,
         infer_relational_transform_candidates_with_evaluator,
+        infer_relational_transform_candidates_with_job,
     },
 };
 use std::error::Error;
@@ -391,7 +393,6 @@ fn prioritizes_length_prefixed_seed_over_high_variance_ranges_under_candidate_bu
     let samples = borrow_samples(&records)?;
     let plan = length_prefixed_seed_plan();
     let report = infer_relational_transform_candidates(&samples, &plan)?;
-
     assert_eq!(report.candidates_examined, 1);
     let candidate = report
         .candidates
@@ -537,6 +538,200 @@ fn recognizes_length_fields_across_supported_widths_and_byte_orders() -> TestRes
             RelationalTransformStatus::HeldoutConstraintsSatisfied
         );
     }
+    Ok(())
+}
+
+#[test]
+fn bounded_seed_locator_retention_keeps_later_declared_length_evidence() -> TestResult<()> {
+    let encoding = SeedLengthEncoding {
+        width: CounterWidth::TwoBytes,
+        byte_order: ByteOrder::BigEndian,
+    };
+    let records = length_prefixed_seed_sessions(encoding, None)?;
+    let samples = borrow_samples(&records)?;
+    let mut plan = length_prefixed_seed_plan();
+    plan.limits.max_locator_candidates = 8;
+    plan.limits.max_candidates = 4096;
+    plan.limits.max_retained_candidates = 128;
+
+    let report = infer_relational_transform_candidates(&samples, &plan)?;
+
+    let candidate = report
+        .candidates
+        .iter()
+        .find(|candidate| {
+            candidate.rule.seed_locator.marker == [SEED_MARKER]
+                && candidate.rule.seed_locator.value_offset == 3
+                && candidate.rule.seed_locator.value_length == Some(SEED_LENGTH)
+                && candidate.rule.seed_locator.declared_length
+                    == Some(RelationalLengthField {
+                        offset: 1,
+                        width: CounterWidth::TwoBytes,
+                        byte_order: ByteOrder::BigEndian,
+                    })
+                && candidate.rule.payload_locator.marker == [PAYLOAD_MARKER]
+                && candidate.rule.payload_locator.value_offset == 1
+        })
+        .ok_or("bounded retention discarded the later length-backed seed locator")?;
+
+    assert_eq!(
+        candidate.status,
+        RelationalTransformStatus::HeldoutConstraintsSatisfied
+    );
+    assert!(!report.search_exhaustive_within_plan);
+    assert!(
+        report
+            .search_limits
+            .contains(&l2_workbench::protocol::RelationalSearchLimit::LocatorCount)
+    );
+    Ok(())
+}
+
+#[test]
+fn bounded_pair_schedule_reaches_later_seed_before_exhausting_earlier_rows() -> TestResult<()> {
+    let records = fair_pair_schedule_sessions()?;
+    let samples = borrow_samples(&records)?;
+    let plan = RelationalTransformPlan {
+        limits: RelationalTransformLimits {
+            max_cohorts: 1,
+            max_sessions: 4,
+            max_records_per_session: 17,
+            max_record_bytes: 128,
+            max_total_bytes: 1024,
+            max_marker_bytes: 1,
+            max_marker_offset: 0,
+            max_seed_bytes: 1,
+            max_locator_offset: 62,
+            max_locator_candidates: 256,
+            max_candidates: 1026,
+            max_retained_candidates: 64,
+            max_work_bytes: 16 * 1024 * 1024,
+        },
+        parser_scope: RelationalParserScope::EachSession,
+        parser_formats: vec![ArtifactValidationFormat::Der],
+        counter_widths: vec![CounterWidth::OneByte],
+        counter_byte_orders: vec![CounterByteOrder::BigEndian],
+        seed_orders: vec![
+            SeedCounterOrder::CounterThenSeed,
+            SeedCounterOrder::SeedThenCounter,
+        ],
+        initial_counters: vec![0],
+        counter_resets: vec![RelationalCounterReset::PerRecord],
+    };
+
+    let report = infer_relational_transform_candidates(&samples, &plan)?;
+    let target = report
+        .candidates
+        .iter()
+        .find(|candidate| {
+            candidate.rule.seed_locator.marker == [0x2f]
+                && candidate.rule.seed_locator.value_offset == 1
+                && candidate.rule.seed_locator.value_length == Some(1)
+                && candidate.rule.payload_locator.marker == [PAYLOAD_MARKER]
+                && candidate.rule.payload_locator.value_offset == 1
+        })
+        .ok_or_else(|| {
+            format!(
+                "the bounded schedule did not reach the later seed/payload pair: examined {}, retained {}, limits {:?}, locators {}",
+                report.candidates_examined,
+                report.candidates.len(),
+                report.search_limits,
+                report.locator_candidates_examined
+            )
+        })?;
+
+    assert_eq!(
+        target.status,
+        RelationalTransformStatus::HeldoutConstraintsSatisfied
+    );
+    assert_eq!(report.candidates_examined, plan.limits.max_candidates);
+    assert!(!report.search_exhaustive_within_plan);
+    assert!(!report.omitted_candidates_exact);
+    assert!(
+        report
+            .search_limits
+            .contains(&l2_workbench::protocol::RelationalSearchLimit::CandidateCount)
+    );
+    Ok(())
+}
+
+#[test]
+fn sparse_relative_start_cue_reaches_seed_51_payload_129_within_pair_budget() -> TestResult<()> {
+    let records = sparse_aligned_rank_pair_schedule_sessions()?;
+    let samples = borrow_samples(&records)?;
+    let mut plan = ranked_pair_schedule_plan(1_170, 53);
+    plan.limits.max_locator_offset = 130;
+    plan.limits.max_locator_candidates = 512;
+    plan.limits.max_record_bytes = 256;
+    plan.limits.max_total_bytes = 4_096;
+
+    let report = infer_relational_transform_candidates(&samples, &plan)?;
+    let target = report
+        .candidates
+        .iter()
+        .find(|candidate| {
+            candidate.rule.seed_locator.marker == [0x43]
+                && candidate.rule.seed_locator.value_offset == 130
+                && candidate.rule.seed_locator.value_length == Some(1)
+                && candidate.rule.payload_locator.marker == [0x82]
+                && candidate.rule.payload_locator.value_offset == 130
+        })
+        .ok_or_else(|| {
+            format!(
+                "the sparse cue did not reach the rank-51/rank-129 pair: examined {}, retained {}, limits {:?}",
+                report.candidates_examined,
+                report.candidates.len(),
+                report.search_limits
+            )
+        })?;
+
+    assert_eq!(
+        target.status,
+        RelationalTransformStatus::HeldoutConstraintsSatisfied
+    );
+    assert_eq!(report.candidates_examined, plan.limits.max_candidates);
+    assert!(!report.search_exhaustive_within_plan);
+    assert!(
+        report
+            .search_limits
+            .contains(&l2_workbench::protocol::RelationalSearchLimit::CandidateCount)
+    );
+    Ok(())
+}
+
+#[test]
+fn unaligned_late_locator_pair_remains_reachable_through_fallback() -> TestResult<()> {
+    let records = ranked_pair_schedule_sessions(0x40, 0x4b, 0x92, 7)?;
+    let samples = borrow_samples(&records)?;
+    let plan = ranked_pair_schedule_plan(1_500, 13);
+
+    let report = infer_relational_transform_candidates(&samples, &plan)?;
+    let target = report
+        .candidates
+        .iter()
+        .find(|candidate| {
+            candidate.rule.seed_locator.marker == [0x4b]
+                && candidate.rule.seed_locator.value_offset == 6
+                && candidate.rule.seed_locator.value_length == Some(1)
+                && candidate.rule.payload_locator.marker == [0x92]
+                && candidate.rule.payload_locator.value_offset == 7
+        })
+        .ok_or_else(|| {
+            format!(
+                "the unaligned late-ranked pair was lost: examined {}, retained {}, limits {:?}",
+                report.candidates_examined,
+                report.candidates.len(),
+                report.search_limits
+            )
+        })?;
+
+    assert_eq!(
+        target.status,
+        RelationalTransformStatus::HeldoutConstraintsSatisfied
+    );
+    assert_eq!(report.candidates_examined, plan.limits.max_candidates);
+    assert!(!report.search_exhaustive_within_plan);
+    assert!(!report.omitted_candidates_exact);
     Ok(())
 }
 
@@ -817,6 +1012,38 @@ fn evaluator_output_capture_respects_its_global_byte_budget() -> TestResult<()> 
 }
 
 #[test]
+fn positive_residual_work_insufficient_for_fit_prevents_exhaustive_negative() -> TestResult<()> {
+    let records = same_message_sessions()?;
+    let samples = borrow_samples(&records)?;
+    let mut plan = same_message_plan();
+    plan.limits.max_work_bytes = 1;
+    plan.limits.max_candidates = 4_096;
+    let job = Job::new("budget-limited relational search");
+
+    let report = infer_relational_transform_candidates_with_job(&samples, &plan, Some(&job))?;
+
+    assert!(report.candidates_examined > 0);
+    assert_eq!(report.work_bytes_remaining, 1);
+    assert!(!report.search_exhaustive_within_plan);
+    assert!(!report.omitted_candidates_exact);
+    assert!(
+        report
+            .search_limits
+            .contains(&l2_workbench::protocol::RelationalSearchLimit::WorkBytes)
+    );
+    assert!(
+        !report
+            .search_limits
+            .contains(&l2_workbench::protocol::RelationalSearchLimit::CandidateCount)
+    );
+    assert_eq!(
+        job.snapshot()?.counters.get(&Counter::CandidatesRejected),
+        Some(&0)
+    );
+    Ok(())
+}
+
+#[test]
 fn evaluator_work_must_fit_the_remaining_shared_search_budget() -> TestResult<()> {
     let records = relational_retention_sessions()?;
     let samples = borrow_samples(&records)?;
@@ -843,7 +1070,7 @@ fn evaluator_work_must_fit_the_remaining_shared_search_budget() -> TestResult<()
         Err(l2_workbench::protocol::RelationalEvaluationError::EvaluatorWorkLimit {
             requested,
             remaining,
-        }) if requested == remaining.saturating_add(1)
+        }) if remaining > 0 && requested == remaining.saturating_add(1)
     ));
     Ok(())
 }
@@ -924,7 +1151,7 @@ fn incomplete_locator_search_does_not_become_exact_after_retention_omissions() -
     let records = relational_retention_sessions()?;
     let samples = borrow_samples(&records)?;
     let mut plan = relational_retention_plan();
-    plan.limits.max_locator_candidates = 2;
+    plan.limits.max_locator_candidates = 8;
     plan.limits.max_candidates = 128;
     plan.limits.max_retained_candidates = 1;
     let report = infer_relational_transform_candidates(&samples, &plan)?;
@@ -1404,6 +1631,147 @@ fn borrow_samples(records: &[OwnedRecord]) -> TestResult<Vec<RelationalRecordSam
             })
         })
         .collect()
+}
+
+fn fair_pair_schedule_sessions() -> TestResult<Vec<OwnedRecord>> {
+    let mut records = Vec::new();
+    for session_number in 1_u8..=4 {
+        let session = u32::from(session_number);
+        let target_seed = 0x2f_u8.wrapping_add(session_number);
+        for marker in 0x20_u8..=0x2f {
+            let seed = marker.wrapping_add(session_number);
+            let message = vec![marker, seed];
+            records.push((session, Direction::FirstToSecond, message));
+        }
+        let plaintext = der_sample(session_number);
+        let ciphertext = encrypt_pair_schedule_target(&plaintext, target_seed)?;
+        records.push((
+            session,
+            Direction::SecondToFirst,
+            tagged(PAYLOAD_MARKER, &ciphertext),
+        ));
+    }
+    Ok(records)
+}
+
+fn ranked_pair_schedule_sessions(
+    first_seed_marker: u8,
+    target_seed_marker: u8,
+    payload_marker: u8,
+    payload_value_offset: usize,
+) -> TestResult<Vec<OwnedRecord>> {
+    let payload_padding_length = payload_value_offset
+        .checked_sub(1)
+        .ok_or("the payload value offset must follow its marker")?;
+    let mut records = Vec::new();
+    for session_number in 1_u8..=4 {
+        let session = u32::from(session_number);
+        let target_seed = target_seed_marker.wrapping_add(session_number);
+        for marker in first_seed_marker..=target_seed_marker {
+            let message = if marker == target_seed_marker {
+                vec![marker, 0x55, 0x55, 0x55, 0x55, 0x55, target_seed]
+            } else {
+                vec![marker, marker.wrapping_add(session_number)]
+            };
+            records.push((session, Direction::FirstToSecond, message));
+        }
+        let plaintext = der_sample(session_number);
+        let ciphertext = encrypt_pair_schedule_target(&plaintext, target_seed)?;
+        let mut payload = Vec::with_capacity(payload_value_offset + ciphertext.len());
+        payload.push(payload_marker);
+        payload.extend(std::iter::repeat_n(0x55, payload_padding_length));
+        payload.extend_from_slice(&ciphertext);
+        records.push((session, Direction::SecondToFirst, payload));
+    }
+    Ok(records)
+}
+
+fn sparse_aligned_rank_pair_schedule_sessions() -> TestResult<Vec<OwnedRecord>> {
+    let mut records = Vec::new();
+    for session_number in 1_u8..=4 {
+        let session = u32::from(session_number);
+        let target_seed = 0x43_u8.wrapping_add(session_number);
+        for marker in 0x10_u8..=0x42 {
+            records.push((
+                session,
+                Direction::FirstToSecond,
+                vec![marker, marker.wrapping_add(session_number)],
+            ));
+        }
+
+        let mut seed_message = vec![0x55; 131];
+        if let Some(marker) = seed_message.first_mut() {
+            *marker = 0x43;
+        }
+        if let Some(seed) = seed_message.get_mut(130) {
+            *seed = target_seed;
+        }
+        records.push((session, Direction::FirstToSecond, seed_message));
+
+        let plaintext = der_sample(session_number);
+        let ciphertext = encrypt_pair_schedule_target(&plaintext, target_seed)?;
+        let mut payload_message = vec![0x55; 130 + ciphertext.len()];
+        if let Some(marker) = payload_message.first_mut() {
+            *marker = 0x82;
+        }
+        if let Some(payload) = payload_message.get_mut(130..) {
+            payload.copy_from_slice(&ciphertext);
+        }
+        records.push((session, Direction::SecondToFirst, payload_message));
+    }
+    Ok(records)
+}
+
+fn ranked_pair_schedule_plan(
+    max_candidates: usize,
+    records_per_session: usize,
+) -> RelationalTransformPlan {
+    RelationalTransformPlan {
+        limits: RelationalTransformLimits {
+            max_cohorts: 1,
+            max_sessions: 4,
+            max_records_per_session: records_per_session,
+            max_record_bytes: 128,
+            max_total_bytes: 2_048,
+            max_marker_bytes: 1,
+            max_marker_offset: 0,
+            max_seed_bytes: 1,
+            max_locator_offset: 10,
+            max_locator_candidates: 256,
+            max_candidates,
+            max_retained_candidates: 512,
+            max_work_bytes: 16 * 1024 * 1024,
+        },
+        parser_scope: RelationalParserScope::EachSession,
+        parser_formats: vec![ArtifactValidationFormat::Der],
+        counter_widths: vec![CounterWidth::OneByte],
+        counter_byte_orders: vec![CounterByteOrder::BigEndian],
+        seed_orders: vec![
+            SeedCounterOrder::CounterThenSeed,
+            SeedCounterOrder::SeedThenCounter,
+        ],
+        initial_counters: vec![0],
+        counter_resets: vec![RelationalCounterReset::PerRecord],
+    }
+}
+
+fn encrypt_pair_schedule_target(bytes: &[u8], seed: u8) -> TestResult<Vec<u8>> {
+    use l2_workbench::derivation::{OperandRef, Operation, Recipe, run};
+
+    let report = run(
+        bytes,
+        &Recipe {
+            steps: vec![Operation::Sha256CounterXor {
+                seed: OperandRef::from(vec![seed]),
+                initial_counter: 0,
+                counter_width: CounterWidth::OneByte,
+                counter_byte_order: CounterByteOrder::BigEndian,
+                seed_order: SeedCounterOrder::SeedThenCounter,
+            }],
+            constraints: Vec::new(),
+        },
+    )?;
+    Ok(report.output)
 }
 
 fn tagged(marker: u8, body: &[u8]) -> Vec<u8> {

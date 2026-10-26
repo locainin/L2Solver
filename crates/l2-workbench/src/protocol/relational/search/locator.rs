@@ -6,6 +6,7 @@ use super::{
     input::{SelectorIndex, SessionGroup},
 };
 use crate::{derivation::CounterWidth, integer::decode_unsigned, protocol::ByteOrder};
+use std::{cmp::Ordering, collections::BinaryHeap};
 
 #[derive(Clone)]
 pub(super) struct LocatorCandidate {
@@ -13,6 +14,146 @@ pub(super) struct LocatorCandidate {
     varying_bytes: usize,
     ends_at_message_boundary: bool,
     pub(super) locator: RelationalByteRangeLocator,
+}
+
+#[derive(Clone, Copy, Eq, Ord, PartialEq, PartialOrd)]
+enum LocatorRanking {
+    Seed,
+    Payload,
+}
+
+struct RankedLocatorCandidate {
+    ranking: LocatorRanking,
+    candidate: LocatorCandidate,
+}
+
+impl PartialEq for RankedLocatorCandidate {
+    fn eq(&self, other: &Self) -> bool {
+        self.cmp(other) == Ordering::Equal
+    }
+}
+
+impl Eq for RankedLocatorCandidate {}
+
+impl PartialOrd for RankedLocatorCandidate {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for RankedLocatorCandidate {
+    fn cmp(&self, other: &Self) -> Ordering {
+        self.ranking.cmp(&other.ranking).then_with(|| {
+            compare_locator_candidates(self.ranking, &self.candidate, &other.candidate)
+        })
+    }
+}
+
+struct BoundedLocatorCandidates {
+    ranking: LocatorRanking,
+    maximum: usize,
+    retained: BinaryHeap<RankedLocatorCandidate>,
+    omitted: bool,
+}
+
+impl BoundedLocatorCandidates {
+    const fn new(ranking: LocatorRanking, maximum: usize) -> Self {
+        Self {
+            ranking,
+            maximum,
+            retained: BinaryHeap::new(),
+            omitted: false,
+        }
+    }
+
+    fn retain(&mut self, candidate: LocatorCandidate) -> Result<(), RelationalTransformError> {
+        let candidate = RankedLocatorCandidate {
+            ranking: self.ranking,
+            candidate,
+        };
+        if self.retained.len() < self.maximum {
+            self.retained
+                .try_reserve(1)
+                .map_err(|_| RelationalTransformError::AllocationFailed)?;
+            self.retained.push(candidate);
+            return Ok(());
+        }
+
+        self.omitted = true;
+        if self
+            .retained
+            .peek()
+            .is_some_and(|worst| candidate.cmp(worst).is_lt())
+        {
+            self.retained.pop();
+            self.retained.push(candidate);
+        }
+        Ok(())
+    }
+
+    fn finish(self) -> (Vec<LocatorCandidate>, bool) {
+        let candidates = self
+            .retained
+            .into_sorted_vec()
+            .into_iter()
+            .map(|ranked| ranked.candidate)
+            .collect();
+        (candidates, !self.omitted)
+    }
+}
+
+fn compare_locator_candidates(
+    ranking: LocatorRanking,
+    left: &LocatorCandidate,
+    right: &LocatorCandidate,
+) -> Ordering {
+    let ranking = match ranking {
+        LocatorRanking::Seed => compare_seed_locators(left, right),
+        LocatorRanking::Payload => compare_payload_locators(left, right),
+    };
+    ranking
+        .then_with(|| left.locator.cmp(&right.locator))
+        .then_with(|| left.selector.cmp(&right.selector))
+}
+
+fn compare_seed_locators(left: &LocatorCandidate, right: &LocatorCandidate) -> Ordering {
+    declared_length_rank(left)
+        .cmp(&declared_length_rank(right))
+        .then_with(|| {
+            right
+                .ends_at_message_boundary
+                .cmp(&left.ends_at_message_boundary)
+        })
+        .then_with(|| {
+            let left_length = left.locator.value_length.unwrap_or_default() as u128;
+            let right_length = right.locator.value_length.unwrap_or_default() as u128;
+            (right.varying_bytes as u128 * left_length)
+                .cmp(&(left.varying_bytes as u128 * right_length))
+        })
+        .then_with(|| right.varying_bytes.cmp(&left.varying_bytes))
+        .then_with(|| locator_start_rank(left).cmp(&locator_start_rank(right)))
+        .then_with(|| {
+            right
+                .selector
+                .marker_offset
+                .cmp(&left.selector.marker_offset)
+        })
+        .then_with(|| right.selector.marker.len().cmp(&left.selector.marker.len()))
+        .then_with(|| right.locator.value_length.cmp(&left.locator.value_length))
+        .then_with(|| left.selector.marker.cmp(&right.selector.marker))
+}
+
+fn compare_payload_locators(left: &LocatorCandidate, right: &LocatorCandidate) -> Ordering {
+    locator_start_rank(left)
+        .cmp(&locator_start_rank(right))
+        .then_with(|| {
+            right
+                .selector
+                .marker_offset
+                .cmp(&left.selector.marker_offset)
+        })
+        .then_with(|| right.selector.marker.len().cmp(&left.selector.marker.len()))
+        .then_with(|| left.selector.marker.cmp(&right.selector.marker))
 }
 
 pub(super) const fn locator_start_rank(candidate: &LocatorCandidate) -> (u8, usize) {
@@ -157,51 +298,34 @@ pub(super) fn seed_locators(
     selectors: &[Selector],
     limits: RelationalTransformLimits,
 ) -> Result<(Vec<LocatorCandidate>, bool), RelationalTransformError> {
-    let mut candidates = Vec::new();
+    let mut candidates =
+        BoundedLocatorCandidates::new(LocatorRanking::Seed, limits.max_locator_candidates);
     for selector in selectors {
-        for value_offset in 0..=limits.max_locator_offset {
-            for value_length in 1..=limits.max_seed_bytes {
-                if !add_seed_locator_candidates(
+        let Some(minimum_length) =
+            minimum_selected_message_length(samples, indexes, selector, groups.len(), true)
+        else {
+            continue;
+        };
+        let last_seed_offset = minimum_length
+            .saturating_sub(1)
+            .min(limits.max_locator_offset);
+        for value_offset in 0..=last_seed_offset {
+            let maximum_seed_length = limits
+                .max_seed_bytes
+                .min(minimum_length.saturating_sub(value_offset));
+            for value_length in 1..=maximum_seed_length {
+                add_seed_locator_candidates(
                     samples,
                     groups,
                     indexes,
                     selector,
                     (value_offset, value_length),
-                    limits,
                     &mut candidates,
-                )? {
-                    return Ok((candidates, false));
-                }
+                )?;
             }
         }
     }
-    candidates.sort_by(|left, right| {
-        declared_length_rank(left)
-            .cmp(&declared_length_rank(right))
-            .then_with(|| {
-                right
-                    .ends_at_message_boundary
-                    .cmp(&left.ends_at_message_boundary)
-            })
-            .then_with(|| {
-                let left_length = left.locator.value_length.unwrap_or_default() as u128;
-                let right_length = right.locator.value_length.unwrap_or_default() as u128;
-                (right.varying_bytes as u128 * left_length)
-                    .cmp(&(left.varying_bytes as u128 * right_length))
-            })
-            .then_with(|| right.varying_bytes.cmp(&left.varying_bytes))
-            .then_with(|| locator_start_rank(left).cmp(&locator_start_rank(right)))
-            .then_with(|| {
-                right
-                    .selector
-                    .marker_offset
-                    .cmp(&left.selector.marker_offset)
-            })
-            .then_with(|| right.selector.marker.len().cmp(&left.selector.marker.len()))
-            .then_with(|| right.locator.value_length.cmp(&left.locator.value_length))
-            .then_with(|| left.selector.marker.cmp(&right.selector.marker))
-    });
-    Ok((candidates, true))
+    Ok(candidates.finish())
 }
 
 fn add_seed_locator_candidates(
@@ -210,9 +334,8 @@ fn add_seed_locator_candidates(
     indexes: &[SelectorIndex],
     selector: &Selector,
     value_range: (usize, usize),
-    limits: RelationalTransformLimits,
-    candidates: &mut Vec<LocatorCandidate>,
-) -> Result<bool, RelationalTransformError> {
+    candidates: &mut BoundedLocatorCandidates,
+) -> Result<(), RelationalTransformError> {
     let (value_offset, value_length) = value_range;
     if !seed_locator_supported(
         samples,
@@ -222,7 +345,7 @@ fn add_seed_locator_candidates(
         value_offset,
         value_length,
     ) {
-        return Ok(true);
+        return Ok(());
     }
     let locator = RelationalByteRangeLocator {
         direction: selector.direction,
@@ -237,31 +360,25 @@ fn add_seed_locator_candidates(
         range_ends_message_boundary(samples, indexes, selector, value_offset, value_length);
     let matching_lengths =
         matching_preceding_lengths(samples, indexes, selector, value_offset, value_length)?;
-    if !push_seed_locator_candidate(
+    push_seed_locator_candidate(
         candidates,
-        limits.max_locator_candidates,
         selector,
         &locator,
         varying_bytes,
         ends_at_message_boundary,
-    )? {
-        return Ok(false);
-    }
+    )?;
     for field in matching_lengths {
         let mut constrained_locator = locator.clone();
         constrained_locator.declared_length = Some(field);
-        if !push_seed_locator_candidate(
+        push_seed_locator_candidate(
             candidates,
-            limits.max_locator_candidates,
             selector,
             &constrained_locator,
             varying_bytes,
             ends_at_message_boundary,
-        )? {
-            return Ok(false);
-        }
+        )?;
     }
-    Ok(true)
+    Ok(())
 }
 
 fn seed_locator_supported(
@@ -291,26 +408,18 @@ fn seed_locator_supported(
 }
 
 fn push_seed_locator_candidate(
-    candidates: &mut Vec<LocatorCandidate>,
-    maximum: usize,
+    candidates: &mut BoundedLocatorCandidates,
     selector: &Selector,
     locator: &RelationalByteRangeLocator,
     varying_bytes: usize,
     ends_at_message_boundary: bool,
-) -> Result<bool, RelationalTransformError> {
-    if candidates.len() == maximum {
-        return Ok(false);
-    }
-    candidates
-        .try_reserve(1)
-        .map_err(|_| RelationalTransformError::AllocationFailed)?;
-    candidates.push(LocatorCandidate {
+) -> Result<(), RelationalTransformError> {
+    candidates.retain(LocatorCandidate {
         selector: selector.clone(),
         varying_bytes,
         ends_at_message_boundary,
         locator: locator.clone(),
-    });
-    Ok(true)
+    })
 }
 
 pub(super) fn payload_locators(
@@ -320,9 +429,18 @@ pub(super) fn payload_locators(
     selectors: &[Selector],
     limits: RelationalTransformLimits,
 ) -> Result<(Vec<LocatorCandidate>, bool), RelationalTransformError> {
-    let mut candidates = Vec::new();
+    let mut candidates =
+        BoundedLocatorCandidates::new(LocatorRanking::Payload, limits.max_locator_candidates);
     for selector in selectors {
-        for value_offset in 0..=limits.max_locator_offset {
+        let Some(minimum_length) =
+            minimum_selected_message_length(samples, indexes, selector, groups.len(), false)
+        else {
+            continue;
+        };
+        let last_payload_offset = minimum_length
+            .saturating_sub(1)
+            .min(limits.max_locator_offset);
+        for value_offset in 0..=last_payload_offset {
             let locator = RelationalByteRangeLocator {
                 direction: selector.direction,
                 marker_offset: selector.marker_offset,
@@ -332,51 +450,56 @@ pub(super) fn payload_locators(
                 declared_length: None,
             };
             let supported = groups.iter().enumerate().all(|(group_index, _group)| {
-                let Some(index) = indexes.get(group_index) else {
-                    return false;
-                };
-                let Some(indices) = index.get(selector) else {
-                    return false;
-                };
-                !indices.is_empty()
-                    && indices.iter().all(|sample_index| {
-                        samples.get(*sample_index).is_some_and(|sample| {
-                            sample
-                                .bytes
-                                .get(value_offset..)
-                                .is_some_and(|range| !range.is_empty())
-                        })
+                indexes
+                    .get(group_index)
+                    .and_then(|index| index.get(selector))
+                    .is_some_and(|selected| {
+                        !selected.is_empty()
+                            && selected.iter().all(|sample_index| {
+                                samples.get(*sample_index).is_some_and(|sample| {
+                                    sample
+                                        .bytes
+                                        .get(value_offset..)
+                                        .is_some_and(|range| !range.is_empty())
+                                })
+                            })
                     })
             });
             if supported {
-                if candidates.len() == limits.max_locator_candidates {
-                    return Ok((candidates, false));
-                }
-                candidates
-                    .try_reserve(1)
-                    .map_err(|_| RelationalTransformError::AllocationFailed)?;
-                candidates.push(LocatorCandidate {
+                candidates.retain(LocatorCandidate {
                     selector: selector.clone(),
                     varying_bytes: 0,
                     ends_at_message_boundary: false,
                     locator,
-                });
+                })?;
             }
         }
     }
-    candidates.sort_by(|left, right| {
-        locator_start_rank(left)
-            .cmp(&locator_start_rank(right))
-            .then_with(|| {
-                right
-                    .selector
-                    .marker_offset
-                    .cmp(&left.selector.marker_offset)
-            })
-            .then_with(|| right.selector.marker.len().cmp(&left.selector.marker.len()))
-            .then_with(|| left.selector.marker.cmp(&right.selector.marker))
-    });
-    Ok((candidates, true))
+    Ok(candidates.finish())
+}
+
+fn minimum_selected_message_length(
+    samples: &[RelationalRecordSample<'_>],
+    indexes: &[SelectorIndex],
+    selector: &Selector,
+    expected_groups: usize,
+    require_single_per_group: bool,
+) -> Option<usize> {
+    if indexes.len() != expected_groups {
+        return None;
+    }
+    let mut minimum_length = usize::MAX;
+    for index in indexes {
+        let selected = index.get(selector)?;
+        if selected.is_empty() || (require_single_per_group && selected.len() != 1) {
+            return None;
+        }
+        for sample_index in selected {
+            let sample = samples.get(*sample_index)?;
+            minimum_length = minimum_length.min(sample.bytes.len());
+        }
+    }
+    (minimum_length != usize::MAX && minimum_length > 0).then_some(minimum_length)
 }
 
 fn declared_length_rank(candidate: &LocatorCandidate) -> (u8, usize, usize, u8) {

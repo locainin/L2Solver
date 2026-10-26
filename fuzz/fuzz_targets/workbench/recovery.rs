@@ -18,6 +18,8 @@ use l2_workbench::{
 };
 use serde_json::json;
 
+mod relational;
+
 const MAX_RECOVERY_INPUT_BYTES: usize = 256;
 const MAX_RECORD_INPUT_BYTES: usize = 272;
 const MAX_RECORDS: usize = 8;
@@ -34,6 +36,7 @@ pub(super) fn exercise(input: &[u8]) {
     exercise_framing(input);
     exercise_records(input);
     exercise_embedded(input);
+    relational::exercise(input);
 }
 
 pub(super) fn exercise_reconstructed_framing(
