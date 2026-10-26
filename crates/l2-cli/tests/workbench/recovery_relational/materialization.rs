@@ -12,8 +12,8 @@ use l2_workbench::{
     protocol::{
         ByteRange, Direction, HoldoutBasis, MessageContext, RecordSchemaProposalLimits,
         RelationalAppliedOutput, RelationalByteRangeLocator, RelationalCounterReset, RelationalFit,
-        RelationalFitStatus, RelationalOperationTemplate, RelationalParserScope,
-        RelationalRecordSample, RelationalSessionCheck, RelationalSessionId,
+        RelationalFitStatus, RelationalOperationTemplate, RelationalOutputMapping,
+        RelationalParserScope, RelationalRecordSample, RelationalSessionCheck, RelationalSessionId,
         RelationalSha256CounterXor, RelationalTransformCandidate,
         RelationalTransformEvaluationContext, RelationalTransformLimits, RelationalTransformReport,
         RelationalTransformRule, RelationalTransformStatus, apply_relational_transform_rule,
@@ -44,6 +44,205 @@ fn structural_support_requires_complete_search_coverage() {
 fn unresolved_and_contradicted_rules_are_not_retained() {
     assert!(!should_retain_rule(GateStatus::Pending, true));
     assert!(!should_retain_rule(GateStatus::Contradicted, true));
+}
+
+#[test]
+fn decoded_frames_use_the_exact_applied_source_mapping() -> TestResult {
+    let session = session(1);
+    let context = message_context(&session);
+    let mappings = vec![RelationalOutputMapping {
+        sample: 101,
+        source_range: ByteRange { start: 3, end: 10 },
+        output_range: ByteRange { start: 0, end: 7 },
+    }];
+    let frames = decode_mapping_case(&session, &context, mappings)?;
+    let frame = frames
+        .first()
+        .ok_or("decoded mapping did not produce a frame")?;
+    assert_eq!(frame.input_node_id, 101);
+    assert_eq!(frame.bytes, b"hdrPLAINTXtail");
+    assert_eq!(frame.payload_range, ByteRange { start: 3, end: 10 });
+    assert_eq!(frame.preserved_header_end, Some(3));
+    assert_eq!(frame.stream_offset, 500);
+    assert_eq!(frame.transformed_output_sha256, sha256(b"PLAINTX"));
+    Ok(())
+}
+
+#[test]
+fn decoded_frames_reject_invalid_output_mappings() -> TestResult {
+    let session = session(1);
+    let context = message_context(&session);
+    let cases = [
+        (
+            "output gap",
+            vec![
+                RelationalOutputMapping {
+                    sample: 101,
+                    source_range: ByteRange { start: 3, end: 6 },
+                    output_range: ByteRange { start: 0, end: 3 },
+                },
+                RelationalOutputMapping {
+                    sample: 102,
+                    source_range: ByteRange { start: 3, end: 6 },
+                    output_range: ByteRange { start: 4, end: 7 },
+                },
+            ],
+        ),
+        (
+            "output overlap",
+            vec![
+                RelationalOutputMapping {
+                    sample: 101,
+                    source_range: ByteRange { start: 3, end: 7 },
+                    output_range: ByteRange { start: 0, end: 4 },
+                },
+                RelationalOutputMapping {
+                    sample: 102,
+                    source_range: ByteRange { start: 3, end: 7 },
+                    output_range: ByteRange { start: 3, end: 7 },
+                },
+            ],
+        ),
+        (
+            "reversed source range",
+            vec![RelationalOutputMapping {
+                sample: 101,
+                source_range: ByteRange { start: 10, end: 3 },
+                output_range: ByteRange { start: 0, end: 7 },
+            }],
+        ),
+        (
+            "output range past transformed bytes",
+            vec![RelationalOutputMapping {
+                sample: 101,
+                source_range: ByteRange { start: 3, end: 11 },
+                output_range: ByteRange { start: 0, end: 8 },
+            }],
+        ),
+        (
+            "source range past input bytes",
+            vec![
+                RelationalOutputMapping {
+                    sample: 101,
+                    source_range: ByteRange { start: 3, end: 5 },
+                    output_range: ByteRange { start: 0, end: 2 },
+                },
+                RelationalOutputMapping {
+                    sample: 102,
+                    source_range: ByteRange { start: 12, end: 17 },
+                    output_range: ByteRange { start: 2, end: 7 },
+                },
+            ],
+        ),
+        (
+            "duplicate sample identity",
+            vec![
+                RelationalOutputMapping {
+                    sample: 101,
+                    source_range: ByteRange { start: 3, end: 6 },
+                    output_range: ByteRange { start: 0, end: 3 },
+                },
+                RelationalOutputMapping {
+                    sample: 101,
+                    source_range: ByteRange { start: 6, end: 10 },
+                    output_range: ByteRange { start: 3, end: 7 },
+                },
+            ],
+        ),
+    ];
+
+    for (label, mappings) in cases {
+        assert!(
+            decode_mapping_case(&session, &context, mappings).is_err(),
+            "decoded output should reject {label}"
+        );
+    }
+    Ok(())
+}
+
+#[test]
+fn decoded_frames_reject_mappings_from_another_source_scope_or_session() -> TestResult {
+    let session = session(1);
+    let original_context = message_context(&session);
+    let cases = [
+        ("source", "other-source", "scope", 1),
+        ("scope", "source", "other-scope", 1),
+        ("session", "source", "scope", 2),
+    ];
+
+    for (label, source, scope, session_id) in cases {
+        let sample_context = MessageContext {
+            source: source.to_owned(),
+            scope: scope.to_owned(),
+            session: session_id,
+            direction: original_context.direction,
+        };
+        let mapping = RelationalOutputMapping {
+            sample: 101,
+            source_range: ByteRange { start: 3, end: 10 },
+            output_range: ByteRange { start: 0, end: 7 },
+        };
+        assert!(
+            decode_mapping_case(&session, &sample_context, vec![mapping]).is_err(),
+            "decoded output should reject a different {label}"
+        );
+    }
+    Ok(())
+}
+
+fn decode_mapping_case(
+    session: &RelationalSessionId,
+    sample_context: &MessageContext,
+    mappings: Vec<RelationalOutputMapping>,
+) -> TestResult<Vec<super::DecodedFrameOutput>> {
+    let mut sample_ids = Vec::new();
+    for mapping in &mappings {
+        if !sample_ids.contains(&mapping.sample) {
+            sample_ids.push(mapping.sample);
+        }
+    }
+    let samples = sample_ids
+        .iter()
+        .map(|sample| RelationalRecordSample {
+            sample: *sample,
+            context: sample_context.clone(),
+            session_order: 1,
+            bytes: b"hdrSOURCE!tail",
+        })
+        .collect::<Vec<_>>();
+    let stored_samples = sample_ids
+        .iter()
+        .map(|sample| StoredSample {
+            node_id: *sample,
+            context: sample_context.clone(),
+            session_order: 1,
+            direction_node_id: 20,
+            episode_node_id: session.session,
+            stream_offset: 500,
+        })
+        .collect::<Vec<_>>();
+    let expected_session_orders = [1];
+    let context = DecodedFrameContext {
+        samples: &samples,
+        stored_samples: &stored_samples,
+        candidate_index: 0,
+        expected_session_orders: &expected_session_orders,
+        raw_directional_run: false,
+    };
+    let applied = RelationalAppliedOutput {
+        session: session.clone(),
+        session_order: 1,
+        seed_sample: 102,
+        payload_mappings: mappings,
+        bytes: b"PLAINTX".to_vec(),
+        parser_validation_deferred: true,
+        work_bytes: 0,
+    };
+    let mut rule = frozen_session_relative_rule();
+    // The applied mapping remains authoritative when the rule uses another coordinate basis
+    rule.payload_locator.value_offset = 1;
+    let digest = sha256(&applied.bytes);
+    Ok(decoded_payload_frames(&context, &applied, &rule, &digest)?)
 }
 
 #[test]
@@ -873,10 +1072,13 @@ fn candidate_with_outputs(
                 session: session.clone(),
                 session_order: session.session,
                 seed_sample: sample.saturating_add(100),
-                payload_samples: vec![sample],
-                payload_ranges: vec![ByteRange {
-                    start: 0,
-                    end: bytes.len(),
+                payload_mappings: vec![RelationalOutputMapping {
+                    sample,
+                    source_range: ByteRange { start: 4, end: 9 },
+                    output_range: ByteRange {
+                        start: 0,
+                        end: bytes.len(),
+                    },
                 }],
                 bytes: bytes.to_vec(),
                 parser_validation_deferred: true,
@@ -889,7 +1091,11 @@ fn candidate_with_outputs(
         .map(|output| RelationalSessionCheck {
             session: output.session.clone(),
             seed_sample: Some(output.seed_sample),
-            payload_samples: output.payload_samples.clone(),
+            payload_samples: output
+                .payload_mappings
+                .iter()
+                .map(|mapping| mapping.sample)
+                .collect(),
             status: RelationalFitStatus::TransformConstraintsSatisfied,
             output_length: Some(output.bytes.len()),
             output_sha256: Some(sha256(&output.bytes)),

@@ -10,10 +10,10 @@ use l2_workbench::{
     artifact::{ArtifactStructure, ArtifactValidationOutcome, ArtifactValidationPolicy},
     job::{Counter, Job},
     protocol::{
-        RecordSchemaStrategy, RelationalAppliedOutput, RelationalCandidateOutputs,
-        RelationalParserScope, RelationalRecordSample, RelationalRetainedEvaluation,
-        RelationalTransformPlan, RelationalTransformReport, RelationalTransformRule,
-        apply_relational_transform_rule,
+        ByteRange, RecordSchemaStrategy, RelationalAppliedOutput, RelationalCandidateOutputs,
+        RelationalOutputMapping, RelationalParserScope, RelationalRecordSample,
+        RelationalRetainedEvaluation, RelationalTransformPlan, RelationalTransformReport,
+        RelationalTransformRule, apply_relational_transform_rule,
     },
     recovery::RecoveryError,
     sha256,
@@ -54,8 +54,7 @@ pub(super) struct DecodedFrameContext<'a> {
 
 struct AggregateOutput {
     bytes: Vec<u8>,
-    payload_samples: Vec<u64>,
-    payload_ranges: Vec<l2_workbench::protocol::ByteRange>,
+    payload_mappings: Vec<RelationalOutputMapping>,
     seed_samples: Vec<u64>,
     session_ids: Vec<u64>,
     session_orders: Vec<u64>,
@@ -68,6 +67,9 @@ struct DecodedFrameBytes {
     preserved_header_end: Option<usize>,
     stream_offset: usize,
 }
+
+type DecodedOutputMappingKey = (u64, usize, usize, usize, usize);
+type DecodedAliasKey = (Vec<DecodedOutputMappingKey>, Vec<String>, String);
 
 pub(super) struct CandidateApplication<'a> {
     context: &'a RelationalDiscoveryContext,
@@ -86,7 +88,7 @@ pub(super) struct CandidateApplication<'a> {
     retained_rules: Vec<RetainedRelationalRule>,
     retained_frame_bytes: usize,
     aliases: HashSet<(Vec<u64>, String)>,
-    decoded_aliases: HashSet<(Vec<u64>, Vec<String>, usize, String)>,
+    decoded_aliases: HashSet<DecodedAliasKey>,
 }
 
 impl<'a> CandidateApplication<'a> {
@@ -736,8 +738,7 @@ impl<'a> CandidateApplication<'a> {
                 session: first.session.clone(),
                 session_order: first.session_order,
                 seed_sample: first.seed_sample,
-                payload_samples: aggregate.payload_samples,
-                payload_ranges: aggregate.payload_ranges,
+                payload_mappings: aggregate.payload_mappings,
                 bytes: aggregate.bytes,
                 parser_validation_deferred: false,
                 work_bytes,
@@ -770,13 +771,22 @@ impl<'a> CandidateApplication<'a> {
         let decoded_alias = (
             outputs
                 .iter()
-                .flat_map(|output| output.payload_samples.iter().copied())
+                .flat_map(|output| {
+                    output.payload_mappings.iter().map(|mapping| {
+                        (
+                            mapping.sample,
+                            mapping.source_range.start,
+                            mapping.source_range.end,
+                            mapping.output_range.start,
+                            mapping.output_range.end,
+                        )
+                    })
+                })
                 .collect::<Vec<_>>(),
             outputs
                 .iter()
                 .map(|output| sha256(&output.bytes))
                 .collect::<Vec<_>>(),
-            rule.payload_locator.value_offset,
             format!("{:?}", rule.parser_format),
         );
         let has_unique_decoded_alias =
@@ -845,29 +855,29 @@ fn concatenate_outputs(
     bytes
         .try_reserve_exact(aggregate_length)
         .map_err(|source| operational("relational aggregate output allocation failed", source))?;
-    let mut payload_samples = Vec::new();
-    let payload_range_count = outputs
+    let mapping_count = outputs
         .iter()
         .try_fold(0_usize, |total, output| {
-            total.checked_add(output.payload_ranges.len())
+            total.checked_add(output.payload_mappings.len())
         })
-        .ok_or_else(|| invalid_policy("relational payload range count overflowed"))?;
-    let mut payload_ranges = Vec::new();
-    payload_ranges
-        .try_reserve_exact(payload_range_count)
-        .map_err(|source| operational("relational payload range allocation failed", source))?;
+        .ok_or_else(|| invalid_policy("relational payload mapping count overflowed"))?;
+    let mut payload_mappings = Vec::new();
+    payload_mappings
+        .try_reserve_exact(mapping_count)
+        .map_err(|source| operational("relational payload mapping allocation failed", source))?;
     let mut seed_samples = Vec::new();
     let mut session_ids = Vec::new();
     let mut session_orders = Vec::new();
     let mut session_work = 0_usize;
     for applied in outputs {
-        if applied.payload_ranges.len() != applied.payload_samples.len() {
-            return Err(RecoveryError::InvariantFailure.into());
-        }
+        validate_output_mappings(&applied.payload_mappings, applied.bytes.len())?;
         let aggregate_offset = bytes.len();
         bytes.extend_from_slice(&applied.bytes);
-        payload_samples.extend_from_slice(&applied.payload_samples);
-        append_aggregate_ranges(&mut payload_ranges, aggregate_offset, applied)?;
+        append_aggregate_mappings(
+            &mut payload_mappings,
+            aggregate_offset,
+            &applied.payload_mappings,
+        )?;
         seed_samples.push(applied.seed_sample);
         session_ids.push(applied.session.session);
         session_orders.push(applied.session_order);
@@ -877,8 +887,7 @@ fn concatenate_outputs(
     }
     Ok(AggregateOutput {
         bytes,
-        payload_samples,
-        payload_ranges,
+        payload_mappings,
         seed_samples,
         session_ids,
         session_orders,
@@ -886,22 +895,58 @@ fn concatenate_outputs(
     })
 }
 
-fn append_aggregate_ranges(
-    ranges: &mut Vec<l2_workbench::protocol::ByteRange>,
-    aggregate_offset: usize,
-    applied: &RelationalAppliedOutput,
+fn validate_output_mappings(
+    mappings: &[RelationalOutputMapping],
+    output_length: usize,
 ) -> Result<(), super::RecoveryExecutionError> {
-    for range in &applied.payload_ranges {
-        if range.start > range.end || range.end > applied.bytes.len() {
+    let mut next_output_start = 0_usize;
+    let mut samples = HashSet::new();
+    for mapping in mappings {
+        let source_length = mapping
+            .source_range
+            .end
+            .checked_sub(mapping.source_range.start)
+            .ok_or(RecoveryError::InvariantFailure)?;
+        let mapped_output_length = mapping
+            .output_range
+            .end
+            .checked_sub(mapping.output_range.start)
+            .ok_or(RecoveryError::InvariantFailure)?;
+        if mapping.sample == 0
+            || !samples.insert(mapping.sample)
+            || source_length == 0
+            || source_length != mapped_output_length
+            || mapping.output_range.start != next_output_start
+            || mapping.output_range.end > output_length
+        {
             return Err(RecoveryError::InvariantFailure.into());
         }
-        ranges.push(l2_workbench::protocol::ByteRange {
-            start: aggregate_offset
-                .checked_add(range.start)
-                .ok_or_else(|| invalid_policy("relational payload offset overflowed"))?,
-            end: aggregate_offset
-                .checked_add(range.end)
-                .ok_or_else(|| invalid_policy("relational payload offset overflowed"))?,
+        next_output_start = mapping.output_range.end;
+    }
+    if mappings.is_empty() || next_output_start != output_length {
+        return Err(RecoveryError::InvariantFailure.into());
+    }
+    Ok(())
+}
+
+fn append_aggregate_mappings(
+    mappings: &mut Vec<RelationalOutputMapping>,
+    aggregate_offset: usize,
+    applied_mappings: &[RelationalOutputMapping],
+) -> Result<(), super::RecoveryExecutionError> {
+    for mapping in applied_mappings {
+        let output_range = mapping.output_range;
+        mappings.push(RelationalOutputMapping {
+            sample: mapping.sample,
+            source_range: mapping.source_range,
+            output_range: ByteRange {
+                start: aggregate_offset
+                    .checked_add(output_range.start)
+                    .ok_or_else(|| invalid_policy("relational payload offset overflowed"))?,
+                end: aggregate_offset
+                    .checked_add(output_range.end)
+                    .ok_or_else(|| invalid_policy("relational payload offset overflowed"))?,
+            },
         });
     }
     Ok(())
@@ -913,43 +958,41 @@ pub(super) fn decoded_payload_frames(
     rule: &RelationalTransformRule,
     transformed_output_sha256: &str,
 ) -> Result<Vec<DecodedFrameOutput>, super::RecoveryExecutionError> {
+    validate_output_mappings(&applied.payload_mappings, applied.bytes.len())?;
     let mut frames = Vec::new();
     frames
-        .try_reserve_exact(applied.payload_samples.len())
+        .try_reserve_exact(applied.payload_mappings.len())
         .map_err(|source| operational("decoded relational frame allocation failed", source))?;
-    let payload_start = rule.payload_locator.value_offset;
-    if applied.payload_samples.len() != applied.payload_ranges.len() {
-        return Err(RecoveryError::InvariantFailure.into());
-    }
-    for (payload_sample, output_range) in
-        applied.payload_samples.iter().zip(&applied.payload_ranges)
-    {
-        if output_range.start > output_range.end || output_range.end > applied.bytes.len() {
-            return Err(RecoveryError::InvariantFailure.into());
-        }
+    for mapping in &applied.payload_mappings {
         let sample = context
             .samples
             .iter()
-            .find(|sample| sample.sample == *payload_sample)
+            .find(|sample| sample.sample == mapping.sample)
             .ok_or(RecoveryError::InvariantFailure)?;
         let stored = context
             .stored_samples
             .iter()
-            .find(|stored| stored.node_id == *payload_sample)
+            .find(|stored| stored.node_id == mapping.sample)
             .ok_or(RecoveryError::InvariantFailure)?;
-        if sample.context.session != applied.session.session {
+        if sample.context.source != applied.session.source
+            || sample.context.scope != applied.session.scope
+            || sample.context.session != applied.session.session
+            || sample.context.direction != rule.payload_locator.direction
+            || sample.context != stored.context
+            || sample.session_order != applied.session_order
+            || stored.session_order != applied.session_order
+        {
             return Err(RecoveryError::InvariantFailure.into());
         }
         let transformed = applied
             .bytes
-            .get(output_range.start..output_range.end)
-            .filter(|payload| !payload.is_empty())
+            .get(mapping.output_range.start..mapping.output_range.end)
             .ok_or(RecoveryError::InvariantFailure)?;
         let decoded = materialize_decoded_frame_bytes(
             sample.bytes,
             stored.stream_offset,
             transformed,
-            payload_start,
+            mapping.source_range,
             context.raw_directional_run,
         )?;
         frames.push(DecodedFrameOutput {
@@ -976,31 +1019,26 @@ fn materialize_decoded_frame_bytes(
     sample_bytes: &[u8],
     stream_offset: usize,
     transformed: &[u8],
-    payload_start: usize,
+    source_range: ByteRange,
     raw_directional_run: bool,
 ) -> Result<DecodedFrameBytes, super::RecoveryExecutionError> {
-    let payload_end = payload_start
-        .checked_add(transformed.len())
-        .ok_or_else(|| invalid_policy("decoded relational payload range overflowed"))?;
-    sample_bytes
-        .get(payload_start..payload_end)
-        .filter(|payload| !payload.is_empty())
-        .ok_or(RecoveryError::InvariantFailure)?;
-
     // Raw runs have no observed header; framed records keep their original header
-    let mut bytes = Vec::new();
     if raw_directional_run {
+        let source_payload = sample_bytes
+            .get(source_range.start..source_range.end)
+            .ok_or(RecoveryError::InvariantFailure)?;
+        let mut bytes = Vec::new();
         bytes
-            .try_reserve_exact(transformed.len())
+            .try_reserve_exact(source_payload.len())
             .map_err(|source| operational("decoded relational frame allocation failed", source))?;
         bytes.extend_from_slice(transformed);
         let payload_end = bytes.len();
         let stream_offset = stream_offset
-            .checked_add(payload_start)
+            .checked_add(source_range.start)
             .ok_or_else(|| invalid_policy("decoded stream offset overflowed"))?;
         Ok(DecodedFrameBytes {
             bytes,
-            payload_range: l2_workbench::protocol::ByteRange {
+            payload_range: ByteRange {
                 start: 0,
                 end: payload_end,
             },
@@ -1014,16 +1052,13 @@ fn materialize_decoded_frame_bytes(
             .map_err(|source| operational("decoded relational frame allocation failed", source))?;
         bytes.extend_from_slice(sample_bytes);
         let destination = bytes
-            .get_mut(payload_start..payload_end)
+            .get_mut(source_range.start..source_range.end)
             .ok_or(RecoveryError::InvariantFailure)?;
         destination.copy_from_slice(transformed);
         Ok(DecodedFrameBytes {
             bytes,
-            payload_range: l2_workbench::protocol::ByteRange {
-                start: payload_start,
-                end: sample_bytes.len(),
-            },
-            preserved_header_end: Some(payload_start),
+            payload_range: source_range,
+            preserved_header_end: Some(source_range.start),
             stream_offset,
         })
     }

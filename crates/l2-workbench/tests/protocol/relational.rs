@@ -199,6 +199,30 @@ fn replays_a_frozen_rule_with_the_selected_sessions_own_seed() -> Result<(), Box
     assert_eq!(applied.session.session, 1);
     assert_eq!(applied.bytes, der_sample(1));
     assert!(applied.work_bytes >= applied.bytes.len());
+    let mut next_output_start = 0_usize;
+    for mapping in &applied.payload_mappings {
+        let selected_sample = session_samples
+            .iter()
+            .find(|sample| sample.sample == mapping.sample)
+            .ok_or("payload mapping references a sample outside the replay session")?;
+        let source_length = mapping
+            .source_range
+            .end
+            .checked_sub(mapping.source_range.start)
+            .ok_or("payload source range is reversed")?;
+        assert_eq!(
+            mapping.source_range.start,
+            candidate.rule.payload_locator.value_offset
+        );
+        assert_eq!(mapping.source_range.end, selected_sample.bytes.len());
+        assert_eq!(mapping.output_range.start, next_output_start);
+        assert_eq!(
+            mapping.output_range.end - mapping.output_range.start,
+            source_length
+        );
+        next_output_start = mapping.output_range.end;
+    }
+    assert_eq!(next_output_start, applied.bytes.len());
     Ok(())
 }
 
@@ -253,12 +277,28 @@ fn discovers_disjoint_seed_and_payload_ranges_in_one_message() -> Result<(), Box
     )?;
     assert_eq!(applied.bytes, der_sample(1));
     assert_eq!(applied.session.session, 1);
+    let first_session_sample = session_samples
+        .first()
+        .ok_or("session payload sample is missing")?;
+    let payload_mapping = applied
+        .payload_mappings
+        .first()
+        .ok_or("applied payload mapping is missing")?;
+    assert_eq!(applied.payload_mappings.len(), 1);
+    assert_eq!(payload_mapping.sample, first_session_sample.sample);
     assert_eq!(
-        applied.payload_ranges,
-        [ByteRange {
+        payload_mapping.source_range,
+        ByteRange {
+            start: 4,
+            end: first_session_sample.bytes.len(),
+        }
+    );
+    assert_eq!(
+        payload_mapping.output_range,
+        ByteRange {
             start: 0,
             end: applied.bytes.len(),
-        }]
+        }
     );
     Ok(())
 }
@@ -839,7 +879,7 @@ fn evaluate_retention_candidate(
     assert!(
         all_outputs
             .iter()
-            .all(|output| payload_output_ranges_are_valid(output))
+            .all(|output| payload_output_mappings_are_valid(output))
     );
     let expected_sessions = context.discovery_sessions.len() + context.heldout_sessions.len();
     let is_complete = all_outputs.len() == expected_sessions
@@ -1100,23 +1140,39 @@ fn aggregate_outputs(
     Ok(aggregate)
 }
 
-fn payload_output_ranges_are_valid(
+fn payload_output_mappings_are_valid(
     output: &l2_workbench::protocol::RelationalAppliedOutput,
 ) -> bool {
-    if output.payload_samples.len() != output.payload_ranges.len() {
-        return false;
-    }
     let mut expected_start = 0_usize;
-    for range in &output.payload_ranges {
-        if range.start != expected_start
-            || range.end < range.start
-            || output.bytes.get(range.start..range.end).is_none()
+    for mapping in &output.payload_mappings {
+        let Some(source_length) = mapping
+            .source_range
+            .end
+            .checked_sub(mapping.source_range.start)
+        else {
+            return false;
+        };
+        let Some(output_length) = mapping
+            .output_range
+            .end
+            .checked_sub(mapping.output_range.start)
+        else {
+            return false;
+        };
+        if mapping.sample == 0
+            || mapping.output_range.start != expected_start
+            || output_length == 0
+            || source_length != output_length
+            || output
+                .bytes
+                .get(mapping.output_range.start..mapping.output_range.end)
+                .is_none()
         {
             return false;
         }
-        expected_start = range.end;
+        expected_start = mapping.output_range.end;
     }
-    expected_start == output.bytes.len()
+    !output.payload_mappings.is_empty() && expected_start == output.bytes.len()
 }
 
 #[test]

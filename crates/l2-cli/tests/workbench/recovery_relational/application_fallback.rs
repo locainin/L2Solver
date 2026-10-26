@@ -9,11 +9,11 @@ use l2_workbench::{
         ByteRange, Direction, HoldoutBasis, MessageContext, RecordSchemaProposalLimits,
         RelationalAppliedOutput, RelationalByteRangeLocator, RelationalCandidateOutputs,
         RelationalCounterReset, RelationalFit, RelationalFitStatus, RelationalOperationTemplate,
-        RelationalParserScope, RelationalRecordSample, RelationalRetainedEvaluation,
-        RelationalSessionCheck, RelationalSessionId, RelationalSha256CounterXor,
-        RelationalTransformCandidate, RelationalTransformEvaluationContext,
-        RelationalTransformLimits, RelationalTransformPlan, RelationalTransformReport,
-        RelationalTransformRule, RelationalTransformStatus,
+        RelationalOutputMapping, RelationalParserScope, RelationalRecordSample,
+        RelationalRetainedEvaluation, RelationalSessionCheck, RelationalSessionId,
+        RelationalSha256CounterXor, RelationalTransformCandidate,
+        RelationalTransformEvaluationContext, RelationalTransformLimits, RelationalTransformPlan,
+        RelationalTransformReport, RelationalTransformRule, RelationalTransformStatus,
     },
     sha256,
 };
@@ -249,8 +249,7 @@ fn outputs_for(
         .map_err(|source| format!("application fixture output allocation failed: {source}"))?;
     for session in sessions {
         let mut bytes = Vec::new();
-        let mut payload_samples = Vec::new();
-        let mut payload_ranges = Vec::new();
+        let mut payload_mappings = Vec::new();
         for frame in frames
             .iter()
             .filter(|frame| frame.context.session == session.session)
@@ -258,22 +257,27 @@ fn outputs_for(
             let body = record_body(frame.sequence, &frame.fragment)?;
             let start = bytes.len();
             bytes.extend_from_slice(&body);
-            payload_samples.push(frame.sample_id);
-            payload_ranges.push(ByteRange {
-                start,
-                end: bytes.len(),
+            payload_mappings.push(RelationalOutputMapping {
+                sample: frame.sample_id,
+                source_range: ByteRange {
+                    start: 3,
+                    end: frame.source_bytes.len(),
+                },
+                output_range: ByteRange {
+                    start,
+                    end: bytes.len(),
+                },
             });
         }
-        let seed_sample = payload_samples
+        let seed_sample = payload_mappings
             .first()
-            .copied()
+            .map(|mapping| mapping.sample)
             .ok_or("fixture session has no payload sample")?;
         outputs.push(RelationalAppliedOutput {
             session: session.clone(),
             session_order: session.session,
             seed_sample,
-            payload_samples,
-            payload_ranges,
+            payload_mappings,
             bytes,
             parser_validation_deferred: true,
             work_bytes: 0,
@@ -291,7 +295,11 @@ fn candidate_for_outputs(
         .map(|output| RelationalSessionCheck {
             session: output.session.clone(),
             seed_sample: Some(output.seed_sample),
-            payload_samples: output.payload_samples.clone(),
+            payload_samples: output
+                .payload_mappings
+                .iter()
+                .map(|mapping| mapping.sample)
+                .collect(),
             status: RelationalFitStatus::TransformConstraintsSatisfied,
             output_length: Some(output.bytes.len()),
             output_sha256: Some(sha256(&output.bytes)),

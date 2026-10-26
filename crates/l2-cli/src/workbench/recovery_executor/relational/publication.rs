@@ -124,7 +124,7 @@ fn publish_outputs(
             "session_orders":output.session_orders,
             "seed_sample":output.value.seed_sample,
             "seed_samples":output.seed_samples,
-            "payload_samples":output.value.payload_samples,
+            "payload_mappings":output.value.payload_mappings,
             "parser_format":format!("{:?}", output.parser_format),
             "parser_scope":if output.session_ids.len() > 1 { "across_sessions" } else { "each_session" },
             "parser_validation_deferred":output.value.parser_validation_deferred,
@@ -134,7 +134,12 @@ fn publish_outputs(
         });
         let output_node =
             case.add_bytes_node(OUTPUT_KIND, &output.value.bytes, Vec::new(), details)?;
-        let mut parents = output.value.payload_samples.clone();
+        let mut parents = output
+            .value
+            .payload_mappings
+            .iter()
+            .map(|mapping| mapping.sample)
+            .collect::<Vec<_>>();
         parents.extend_from_slice(&output.seed_samples);
         parents.sort_unstable();
         parents.dedup();

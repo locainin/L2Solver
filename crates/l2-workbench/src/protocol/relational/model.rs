@@ -233,16 +233,25 @@ pub struct RelationalAppliedOutput {
     pub session_order: u64,
     /// Sample whose located range supplied this session's seed bytes
     pub seed_sample: u64,
-    /// Payload samples used in their retained capture order
-    pub payload_samples: Vec<u64>,
-    /// Half-open ranges aligned with payload samples in the concatenated decoded bytes
-    pub payload_ranges: Vec<crate::protocol::ByteRange>,
+    /// Exact source-to-output ranges for each transformed payload, in output order
+    pub payload_mappings: Vec<RelationalOutputMapping>,
     /// Complete transformed bytes for this session
     pub bytes: Vec<u8>,
     /// True when the rule's parser scope was validated during this session replay
     pub parser_validation_deferred: bool,
     /// Canonical derivation work consumed while replaying the rule
     pub work_bytes: usize,
+}
+
+/// Maps one selected sample range to its exact interval in transformed output
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct RelationalOutputMapping {
+    /// Stable identity of the sample containing the source range
+    pub sample: u64,
+    /// Half-open range relative to the selected sample's bytes
+    pub source_range: crate::protocol::ByteRange,
+    /// Half-open range relative to [`RelationalAppliedOutput::bytes`]
+    pub output_range: crate::protocol::ByteRange,
 }
 
 /// Read-only context supplied to an evaluator before candidate retention

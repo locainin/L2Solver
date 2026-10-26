@@ -1,7 +1,7 @@
 use super::super::model::{
     RelationalAppliedOutput, RelationalByteRangeLocator, RelationalCounterReset,
     RelationalFalsification, RelationalFit, RelationalFitStatus, RelationalOperationTemplate,
-    RelationalParserScope, RelationalRecordSample, RelationalSessionCheck,
+    RelationalOutputMapping, RelationalParserScope, RelationalRecordSample, RelationalSessionCheck,
     RelationalTransformError, RelationalTransformLimits, RelationalTransformRule,
     RelationalTransformStatus, Selector,
 };
@@ -17,7 +17,12 @@ use crate::{
 };
 
 type SessionCheckResult<T> = Result<Result<T, RelationalSessionCheck>, RelationalTransformError>;
-type SessionPayloads<'a> = (Vec<u64>, Vec<&'a [u8]>);
+
+struct LocatedPayload<'a> {
+    sample: u64,
+    source_range: crate::protocol::ByteRange,
+    bytes: &'a [u8],
+}
 
 /// Replay one frozen relational rule against exactly one session and retain its output
 ///
@@ -37,9 +42,9 @@ pub fn apply_relational_transform_rule(
     validate_replay_limits(limits)?;
     let group = one_session_group(samples, limits)?;
     let (seed_sample, seed) = replay_seed(samples, &group, rule, limits)?;
-    let (payload_samples, payload_ranges) = replay_payloads(samples, &group, rule, limits)?;
+    let payloads = replay_payloads(samples, &group, rule, limits)?;
     let work_estimate = transform_work_estimate(
-        &payload_ranges,
+        &payloads,
         seed.len(),
         rule.operation.sha256_counter_xor().counter_width,
         rule.counter_reset,
@@ -51,7 +56,7 @@ pub fn apply_relational_transform_rule(
         return Err(RelationalTransformError::RuleWorkLimit);
     }
     let transformed = apply_transform(
-        &payload_ranges,
+        &payloads,
         seed,
         rule.operation,
         rule.counter_reset,
@@ -59,15 +64,7 @@ pub fn apply_relational_transform_rule(
         work_limit,
     )?;
     let (bytes, work_bytes) = transformed_bytes(transformed)?;
-    applied_output(
-        group,
-        seed_sample,
-        payload_samples,
-        &payload_ranges,
-        bytes,
-        rule,
-        work_bytes,
-    )
+    applied_output(group, seed_sample, &payloads, bytes, rule, work_bytes)
 }
 
 const fn validate_replay_limits(
@@ -167,19 +164,15 @@ fn replay_payloads<'a>(
     group: &SessionGroup,
     rule: &RelationalTransformRule,
     limits: RelationalTransformLimits,
-) -> Result<(Vec<u64>, Vec<&'a [u8]>), RelationalTransformError> {
+) -> Result<Vec<LocatedPayload<'a>>, RelationalTransformError> {
     let payload_matches = locator_matches(samples, group, None, &rule.payload_locator)?;
     if payload_matches.is_empty() {
         return Err(RelationalTransformError::RuleContradicted(
             "payload locator selected no messages".to_owned(),
         ));
     }
-    let mut payload_ranges = Vec::new();
-    let mut payload_samples = Vec::new();
-    payload_ranges
-        .try_reserve_exact(payload_matches.len())
-        .map_err(|_| RelationalTransformError::AllocationFailed)?;
-    payload_samples
+    let mut payloads = Vec::new();
+    payloads
         .try_reserve_exact(payload_matches.len())
         .map_err(|_| RelationalTransformError::AllocationFailed)?;
     let mut payload_length = 0_usize;
@@ -189,16 +182,20 @@ fn replay_payloads<'a>(
             .ok_or(RelationalTransformError::InvalidInput(
                 "payload locator references a missing message",
             ))?;
-        let range = sample
+        let source_range = crate::protocol::ByteRange {
+            start: rule.payload_locator.value_offset,
+            end: sample.bytes.len(),
+        };
+        let bytes = sample
             .bytes
-            .get(rule.payload_locator.value_offset..)
+            .get(source_range.start..source_range.end)
             .filter(|range| !range.is_empty())
             .ok_or_else(|| {
                 RelationalTransformError::RuleContradicted(
                     "located payload range is empty".to_owned(),
                 )
             })?;
-        payload_length = payload_length.checked_add(range.len()).ok_or_else(|| {
+        payload_length = payload_length.checked_add(bytes.len()).ok_or_else(|| {
             RelationalTransformError::RuleContradicted("payload length overflowed".to_owned())
         })?;
         if payload_length > limits.max_total_bytes {
@@ -207,10 +204,13 @@ fn replay_payloads<'a>(
                 limits.max_total_bytes
             )));
         }
-        payload_samples.push(sample.sample);
-        payload_ranges.push(range);
+        payloads.push(LocatedPayload {
+            sample: sample.sample,
+            source_range,
+            bytes,
+        });
     }
-    Ok((payload_samples, payload_ranges))
+    Ok(payloads)
 }
 
 fn transformed_bytes(
@@ -236,21 +236,20 @@ fn transformed_bytes(
 fn applied_output(
     group: SessionGroup,
     seed_sample: u64,
-    payload_samples: Vec<u64>,
-    payload_ranges: &[&[u8]],
+    payloads: &[LocatedPayload<'_>],
     bytes: Vec<u8>,
     rule: &RelationalTransformRule,
     work_bytes: usize,
 ) -> Result<RelationalAppliedOutput, RelationalTransformError> {
     let session_order = group.session_order;
-    let payload_output_ranges = payload_output_ranges(payload_ranges)?;
+    let payload_mappings = payload_output_mappings(payloads)?;
+    validate_output_coverage(&payload_mappings, bytes.len())?;
     if rule.parser_scope == RelationalParserScope::AcrossSessions {
         return Ok(RelationalAppliedOutput {
             session: group.id,
             session_order,
             seed_sample,
-            payload_samples,
-            payload_ranges: payload_output_ranges,
+            payload_mappings,
             bytes,
             parser_validation_deferred: true,
             work_bytes,
@@ -264,8 +263,7 @@ fn applied_output(
                 session: group.id,
                 session_order,
                 seed_sample,
-                payload_samples,
-                payload_ranges: payload_output_ranges,
+                payload_mappings,
                 bytes,
                 parser_validation_deferred: false,
                 work_bytes,
@@ -277,25 +275,60 @@ fn applied_output(
     }
 }
 
-fn payload_output_ranges(
-    payload_ranges: &[&[u8]],
-) -> Result<Vec<crate::protocol::ByteRange>, RelationalTransformError> {
-    let mut outputs = Vec::new();
-    outputs
-        .try_reserve_exact(payload_ranges.len())
+fn payload_output_mappings(
+    payloads: &[LocatedPayload<'_>],
+) -> Result<Vec<RelationalOutputMapping>, RelationalTransformError> {
+    let mut mappings = Vec::new();
+    mappings
+        .try_reserve_exact(payloads.len())
         .map_err(|_| RelationalTransformError::AllocationFailed)?;
     let mut start = 0_usize;
-    for payload in payload_ranges {
-        let end =
-            start
-                .checked_add(payload.len())
-                .ok_or(RelationalTransformError::InvalidInput(
-                    "transformed payload range overflowed",
-                ))?;
-        outputs.push(crate::protocol::ByteRange { start, end });
+    for payload in payloads {
+        let end = start.checked_add(payload.bytes.len()).ok_or(
+            RelationalTransformError::InvalidInput("transformed payload range overflowed"),
+        )?;
+        mappings.push(RelationalOutputMapping {
+            sample: payload.sample,
+            source_range: payload.source_range,
+            output_range: crate::protocol::ByteRange { start, end },
+        });
         start = end;
     }
-    Ok(outputs)
+    Ok(mappings)
+}
+
+fn payload_sample_ids(
+    payloads: &[LocatedPayload<'_>],
+) -> Result<Vec<u64>, RelationalTransformError> {
+    let mut samples = Vec::new();
+    samples
+        .try_reserve_exact(payloads.len())
+        .map_err(|_| RelationalTransformError::AllocationFailed)?;
+    samples.extend(payloads.iter().map(|payload| payload.sample));
+    Ok(samples)
+}
+
+fn validate_output_coverage(
+    mappings: &[RelationalOutputMapping],
+    output_length: usize,
+) -> Result<(), RelationalTransformError> {
+    let mut next_output_start = 0_usize;
+    for mapping in mappings {
+        if mapping.output_range.start != next_output_start
+            || mapping.output_range.end <= mapping.output_range.start
+        {
+            return Err(RelationalTransformError::InvalidInput(
+                "relational output mappings do not cover the transformed bytes",
+            ));
+        }
+        next_output_start = mapping.output_range.end;
+    }
+    if mappings.is_empty() || next_output_start != output_length {
+        return Err(RelationalTransformError::InvalidInput(
+            "relational output mappings do not cover the transformed bytes",
+        ));
+    }
+    Ok(())
 }
 
 pub(super) fn evaluate_split(
@@ -379,7 +412,7 @@ fn check_session(
         }
     };
     let Some(estimate) = transform_work_estimate(
-        &inputs.payload_ranges,
+        &inputs.payloads,
         inputs.seed.len(),
         context.rule.operation.sha256_counter_xor().counter_width,
         context.rule.counter_reset,
@@ -388,7 +421,7 @@ fn check_session(
             check: failed_check(
                 group,
                 Some(inputs.seed_sample),
-                inputs.payload_samples,
+                payload_sample_ids(&inputs.payloads)?,
                 RelationalFalsification::TransformFailed {
                     reason: "transform work estimate overflowed".to_owned(),
                 },
@@ -398,12 +431,16 @@ fn check_session(
     };
     if estimate > context.work_remaining {
         return Ok(EvaluatedSessionCheck {
-            check: unresolved_check(group, Some(inputs.seed_sample), inputs.payload_samples),
+            check: unresolved_check(
+                group,
+                Some(inputs.seed_sample),
+                payload_sample_ids(&inputs.payloads)?,
+            ),
             output: None,
         });
     }
     let transformed = apply_transform(
-        &inputs.payload_ranges,
+        &inputs.payloads,
         inputs.seed,
         context.rule.operation,
         context.rule.counter_reset,
@@ -413,25 +450,18 @@ fn check_session(
     *work_bytes = work_bytes.checked_add(transformed.work_bytes).ok_or(
         RelationalTransformError::InvalidPlan("relational work accounting overflowed"),
     )?;
-    let output_ranges = if context.capture_output {
-        Some(payload_output_ranges(&inputs.payload_ranges)?)
+    let output_mappings = if context.capture_output {
+        Some(payload_output_mappings(&inputs.payloads)?)
     } else {
         None
     };
-    Ok(check_transformed_session(
-        group,
-        inputs,
-        context.rule,
-        transformed,
-        output_ranges,
-    ))
+    check_transformed_session(group, inputs, context.rule, transformed, output_mappings)
 }
 
 struct SessionTransformInputs<'a> {
     seed_sample: u64,
     seed: &'a [u8],
-    payload_samples: Vec<u64>,
-    payload_ranges: Vec<&'a [u8]>,
+    payloads: Vec<LocatedPayload<'a>>,
 }
 
 fn prepare_session_inputs<'a>(
@@ -445,16 +475,15 @@ fn prepare_session_inputs<'a>(
         Ok(seed) => seed,
         Err(failure) => return Ok(Err(failure)),
     };
-    let (payload_samples, payload_ranges) =
-        match locate_session_payloads(samples, group, index, rule, limits, seed_sample)? {
-            Ok(payloads) => payloads,
-            Err(failure) => return Ok(Err(failure)),
-        };
+    let payloads = match locate_session_payloads(samples, group, index, rule, limits, seed_sample)?
+    {
+        Ok(payloads) => payloads,
+        Err(failure) => return Ok(Err(failure)),
+    };
     Ok(Ok(SessionTransformInputs {
         seed_sample,
         seed,
-        payload_samples,
-        payload_ranges,
+        payloads,
     }))
 }
 
@@ -545,7 +574,7 @@ fn locate_session_payloads<'a>(
     rule: &RelationalTransformRule,
     limits: RelationalTransformLimits,
     seed_sample: u64,
-) -> SessionCheckResult<SessionPayloads<'a>> {
+) -> SessionCheckResult<Vec<LocatedPayload<'a>>> {
     let payload_matches = locator_matches(samples, group, index, &rule.payload_locator)?;
     if payload_matches.is_empty() {
         return Ok(Err(failed_check(
@@ -555,12 +584,8 @@ fn locate_session_payloads<'a>(
             RelationalFalsification::NoPayloadMessages,
         )));
     }
-    let mut payload_ranges = Vec::new();
-    payload_ranges
-        .try_reserve_exact(payload_matches.len())
-        .map_err(|_| RelationalTransformError::AllocationFailed)?;
-    let mut payload_samples = Vec::new();
-    payload_samples
+    let mut payloads = Vec::new();
+    payloads
         .try_reserve_exact(payload_matches.len())
         .map_err(|_| RelationalTransformError::AllocationFailed)?;
     let mut payload_length = 0_usize;
@@ -570,11 +595,15 @@ fn locate_session_payloads<'a>(
             .ok_or(RelationalTransformError::InvalidInput(
                 "payload locator references a missing message",
             ))?;
-        let Some(payload) = sample.bytes.get(rule.payload_locator.value_offset..) else {
+        let source_range = crate::protocol::ByteRange {
+            start: rule.payload_locator.value_offset,
+            end: sample.bytes.len(),
+        };
+        let Some(payload) = sample.bytes.get(source_range.start..source_range.end) else {
             return Ok(Err(failed_check(
                 group,
                 Some(seed_sample),
-                payload_samples,
+                payload_sample_ids(&payloads)?,
                 RelationalFalsification::EmptyPayloadRange,
             )));
         };
@@ -582,7 +611,7 @@ fn locate_session_payloads<'a>(
             return Ok(Err(failed_check(
                 group,
                 Some(seed_sample),
-                payload_samples,
+                payload_sample_ids(&payloads)?,
                 RelationalFalsification::EmptyPayloadRange,
             )));
         }
@@ -593,14 +622,17 @@ fn locate_session_payloads<'a>(
             return Ok(Err(failed_check(
                 group,
                 Some(seed_sample),
-                payload_samples,
+                payload_sample_ids(&payloads)?,
                 RelationalFalsification::EmptyPayloadRange,
             )));
         }
-        payload_samples.push(sample.sample);
-        payload_ranges.push(payload);
+        payloads.push(LocatedPayload {
+            sample: sample.sample,
+            source_range,
+            bytes: payload,
+        });
     }
-    Ok(Ok((payload_samples, payload_ranges)))
+    Ok(Ok(payloads))
 }
 
 fn check_transformed_session(
@@ -608,86 +640,79 @@ fn check_transformed_session(
     inputs: SessionTransformInputs<'_>,
     rule: &RelationalTransformRule,
     transformed: TransformOutput,
-    output_ranges: Option<Vec<crate::protocol::ByteRange>>,
-) -> EvaluatedSessionCheck {
+    output_mappings: Option<Vec<RelationalOutputMapping>>,
+) -> Result<EvaluatedSessionCheck, RelationalTransformError> {
     let SessionTransformInputs {
         seed_sample,
-        payload_samples,
+        payloads,
         ..
     } = inputs;
     let Some(output) = transformed.output else {
-        return check_missing_transform_output(group, seed_sample, payload_samples, transformed);
+        return check_missing_transform_output(group, seed_sample, &payloads, transformed);
     };
     let output_sha256 = sha256(&output);
-    let capture_output = output_ranges.is_some();
+    let payload_samples = payload_sample_ids(&payloads)?;
+    if let Some(mappings) = output_mappings.as_deref() {
+        validate_output_coverage(mappings, output.len())?;
+    }
     if rule.parser_scope == RelationalParserScope::AcrossSessions {
-        let (check_payloads, output_payloads) = if capture_output {
-            (payload_samples.clone(), Some(payload_samples))
-        } else {
-            (payload_samples, None)
-        };
-        return EvaluatedSessionCheck {
+        return Ok(EvaluatedSessionCheck {
             check: RelationalSessionCheck {
                 session: group.id.clone(),
                 seed_sample: Some(seed_sample),
-                payload_samples: check_payloads,
+                payload_samples,
                 status: RelationalFitStatus::TransformConstraintsSatisfied,
                 output_length: Some(output.len()),
                 output_sha256: Some(output_sha256),
                 falsification: None,
             },
-            output: output_payloads.zip(output_ranges).map(|(samples, ranges)| {
+            output: output_mappings.map(|mappings| {
                 captured_session_output(
                     group,
                     seed_sample,
-                    samples,
-                    ranges,
+                    mappings,
                     output,
                     transformed.work_bytes,
                     true,
                 )
             }),
-        };
+        });
     }
-    let (check_payloads, output_payloads) = if capture_output {
-        (payload_samples.clone(), Some(payload_samples))
-    } else {
-        (payload_samples, None)
-    };
     let check = validate_session_output(
         group,
         seed_sample,
-        check_payloads,
+        payload_samples,
         rule,
         &output,
         output_sha256,
     );
-    let retained_output = (check.status == RelationalFitStatus::ConstraintsSatisfied)
-        .then(|| output_payloads.zip(output_ranges))
-        .flatten()
-        .map(|(samples, ranges)| {
+    let retained_output = if check.status == RelationalFitStatus::ConstraintsSatisfied {
+        output_mappings.map(|mappings| {
             captured_session_output(
                 group,
                 seed_sample,
-                samples,
-                ranges,
+                mappings,
                 output,
                 transformed.work_bytes,
                 false,
             )
-        });
-    EvaluatedSessionCheck {
+        })
+    } else {
+        None
+    };
+    Ok(EvaluatedSessionCheck {
         check,
         output: retained_output,
-    }
+    })
 }
 
 fn check_missing_transform_output(
     group: &SessionGroup,
     seed_sample: u64,
-    payload_samples: Vec<u64>,
+    payloads: &[LocatedPayload<'_>],
     transformed: TransformOutput,
-) -> EvaluatedSessionCheck {
+) -> Result<EvaluatedSessionCheck, RelationalTransformError> {
+    let payload_samples = payload_sample_ids(payloads)?;
     let check = if transformed.unresolved_on_budget {
         unresolved_check(group, Some(seed_sample), payload_samples)
     } else {
@@ -704,17 +729,16 @@ fn check_missing_transform_output(
             },
         )
     };
-    EvaluatedSessionCheck {
+    Ok(EvaluatedSessionCheck {
         check,
         output: None,
-    }
+    })
 }
 
 fn captured_session_output(
     group: &SessionGroup,
     seed_sample: u64,
-    payload_samples: Vec<u64>,
-    payload_ranges: Vec<crate::protocol::ByteRange>,
+    payload_mappings: Vec<RelationalOutputMapping>,
     bytes: Vec<u8>,
     work_bytes: usize,
     parser_validation_deferred: bool,
@@ -723,8 +747,7 @@ fn captured_session_output(
         session: group.id.clone(),
         session_order: group.session_order,
         seed_sample,
-        payload_samples,
-        payload_ranges,
+        payload_mappings,
         bytes,
         parser_validation_deferred,
         work_bytes,
@@ -820,14 +843,16 @@ struct TransformOutput {
 }
 
 fn apply_transform(
-    payload_ranges: &[&[u8]],
+    payloads: &[LocatedPayload<'_>],
     seed: &[u8],
     operation_template: RelationalOperationTemplate,
     reset: RelationalCounterReset,
     max_output_bytes: usize,
     work_limit: usize,
 ) -> Result<TransformOutput, RelationalTransformError> {
-    let Some(total_length) = total_payload_length(payload_ranges) else {
+    let Some(total_length) = payloads.iter().try_fold(0_usize, |total, payload| {
+        total.checked_add(payload.bytes.len())
+    }) else {
         return Ok(TransformOutput::failed("payload length overflowed"));
     };
     if total_length > max_output_bytes {
@@ -842,8 +867,8 @@ fn apply_transform(
             combined
                 .try_reserve_exact(total_length)
                 .map_err(|_| RelationalTransformError::AllocationFailed)?;
-            for payload in payload_ranges {
-                combined.extend_from_slice(payload);
+            for payload in payloads {
+                combined.extend_from_slice(payload.bytes);
             }
             run_transform_ranges(
                 std::iter::once(combined.as_slice()),
@@ -855,7 +880,7 @@ fn apply_transform(
             )
         }
         RelationalCounterReset::PerRecord => run_transform_ranges(
-            payload_ranges.iter().copied(),
+            payloads.iter().map(|payload| payload.bytes),
             &recipe,
             total_length,
             seed.len(),
@@ -874,12 +899,6 @@ impl TransformOutput {
             failure: Some(reason.to_owned()),
         }
     }
-}
-
-fn total_payload_length(payload_ranges: &[&[u8]]) -> Option<usize> {
-    payload_ranges
-        .iter()
-        .try_fold(0_usize, |total, range| total.checked_add(range.len()))
 }
 
 fn transform_recipe(seed: &[u8], operation_template: RelationalOperationTemplate) -> Recipe {
@@ -948,27 +967,25 @@ fn run_transform_ranges<'a>(
 }
 
 fn transform_work_estimate(
-    payload_ranges: &[&[u8]],
+    payloads: &[LocatedPayload<'_>],
     seed_length: usize,
     counter_width: CounterWidth,
     reset: RelationalCounterReset,
 ) -> Option<usize> {
     match reset {
         RelationalCounterReset::Continuous => {
-            let total_length = payload_ranges
-                .iter()
-                .try_fold(0_usize, |total, range| total.checked_add(range.len()))?;
+            let total_length = payloads.iter().try_fold(0_usize, |total, payload| {
+                total.checked_add(payload.bytes.len())
+            })?;
             single_transform_work(total_length, seed_length, counter_width)
         }
-        RelationalCounterReset::PerRecord => {
-            payload_ranges.iter().try_fold(0_usize, |total, range| {
-                total.checked_add(single_transform_work(
-                    range.len(),
-                    seed_length,
-                    counter_width,
-                )?)
-            })
-        }
+        RelationalCounterReset::PerRecord => payloads.iter().try_fold(0_usize, |total, payload| {
+            total.checked_add(single_transform_work(
+                payload.bytes.len(),
+                seed_length,
+                counter_width,
+            )?)
+        }),
     }
 }
 
