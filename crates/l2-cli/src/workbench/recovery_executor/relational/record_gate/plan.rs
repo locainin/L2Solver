@@ -5,7 +5,7 @@ use super::super::super::RecoveryExecutionError;
 use super::super::{DecodedFrameOutput, invalid_policy, operational};
 use super::screen::SchemaObserverOptions;
 use super::selection::{LearningSelection, select_learning_frames};
-use super::{SchemaPlan, total_input_bytes};
+use super::{SchemaCandidateOptions, SchemaPlan, total_input_bytes};
 use analysis::{AnalysisRequest, analyze_group};
 use family::build_family_analysis;
 use l2_workbench::{
@@ -43,6 +43,7 @@ struct PlanAnalysisRequest<'frames, 'messages> {
     parser_format: l2_workbench::artifact::ArtifactValidationFormat,
     artifact_policy: l2_workbench::artifact::ArtifactValidationPolicy,
     job: Option<&'frames Job>,
+    header_inputs: Option<&'frames [l2_workbench::protocol::RecordInput<'frames>]>,
 }
 
 struct LearningMessageContents<'a> {
@@ -127,6 +128,33 @@ pub(super) fn build_schema_plan(
     artifact_policy: l2_workbench::artifact::ArtifactValidationPolicy,
     job: Option<&Job>,
 ) -> Result<SchemaPlan, RecoveryExecutionError> {
+    build_schema_plan_with_inputs(
+        frames,
+        report,
+        SchemaCandidateOptions {
+            parser_format,
+            schema_limits,
+            artifact_policy,
+            work_limit,
+            job,
+        },
+        None,
+    )
+}
+
+pub(super) fn build_schema_plan_with_inputs(
+    frames: &[DecodedFrameOutput],
+    report: &RelationalTransformReport,
+    options: SchemaCandidateOptions<'_>,
+    header_inputs: Option<&[l2_workbench::protocol::RecordInput<'_>]>,
+) -> Result<SchemaPlan, RecoveryExecutionError> {
+    let SchemaCandidateOptions {
+        parser_format,
+        schema_limits,
+        artifact_policy,
+        work_limit,
+        job,
+    } = options;
     let discovery = session_ids(&report.discovery_sessions);
     let heldout = session_ids(&report.heldout_sessions);
     if discovery.is_empty() || frames.is_empty() {
@@ -179,6 +207,7 @@ pub(super) fn build_schema_plan(
         parser_format,
         artifact_policy,
         job,
+        header_inputs,
     })
 }
 
@@ -190,6 +219,7 @@ fn analyze_plan(
     }
     let observer = Some(SchemaObserverOptions {
         frames: request.frames,
+        inputs: request.header_inputs,
         parser_format: request.parser_format,
         artifact_policy: request.artifact_policy,
         job: request.job,

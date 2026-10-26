@@ -203,6 +203,117 @@ fn changed_transformed_bytes_with_the_same_layout_do_not_reuse_a_schema_plan() -
 }
 
 #[test]
+fn header_only_models_revalidate_changed_payloads_without_rebuilding_inference() -> TestResult<()> {
+    let fixture = crate::workbench::recovery_executor::record_discovery_tests::
+        build_session_relative_fixture()?;
+    let plaintext = fixture.plaintext;
+    let mut decoy_frames = source_framed_png_frames(&plaintext)?;
+    for frame in &mut decoy_frames {
+        let payload_hash = {
+            let payload = frame
+                .bytes
+                .get_mut(10..)
+                .ok_or("framed sample has no transformed payload")?;
+            payload.fill(0xa5);
+            l2_workbench::sha256(payload)
+        };
+        frame.transformed_output_sha256 = payload_hash;
+    }
+    let valid_frames = source_framed_png_frames(&plaintext)?;
+    let report = report_with_sessions(&[1, 2], &[3, 4]);
+    let discovery_work_limit = 64 * 1024 * 1024;
+    let options = candidate_options(
+        ArtifactValidationFormat::Png,
+        RecordSchemaProposalLimits::default(),
+        ArtifactValidationPolicy::default(),
+        discovery_work_limit,
+    );
+    let mut cache = SchemaPlanCache::default();
+    let decoy = cache.screen_candidate(&decoy_frames, &report, options)?;
+    assert_ne!(decoy.status, GateStatus::ArtifactValidated);
+    assert_cached_header_templates_rebind(&cache, &valid_frames)?;
+
+    let work_limit = 16 * 1024;
+    let validated = cache.screen_candidate(
+        &valid_frames,
+        &report,
+        candidate_options(
+            ArtifactValidationFormat::Png,
+            RecordSchemaProposalLimits::default(),
+            ArtifactValidationPolicy::default(),
+            work_limit,
+        ),
+    )?;
+    assert_fresh_cached_artifact_validation(&validated, &plaintext, work_limit)?;
+    Ok(())
+}
+
+fn assert_cached_header_templates_rebind(
+    cache: &SchemaPlanCache,
+    frames: &[DecodedFrameOutput],
+) -> TestResult<()> {
+    let cached_plan = cache
+        .header_plans
+        .values()
+        .next()
+        .ok_or("header-only schema plan was not retained")?;
+    let cached_model = cached_plan
+        .models
+        .first()
+        .ok_or("header-only schema plan has no models")?;
+    for (frame_index, template) in &cached_model.templates {
+        let frame = frames
+            .get(*frame_index)
+            .ok_or("cached header template frame is missing")?;
+        let input = l2_workbench::protocol::RecordInput::new(&frame.bytes);
+        assert!(
+            template.rebind(&input, cached_model.limits).is_ok(),
+            "cached header template {frame_index} should rebind"
+        );
+    }
+    Ok(())
+}
+
+fn assert_fresh_cached_artifact_validation(
+    validated: &super::GateResult,
+    plaintext: &[u8],
+    work_limit: usize,
+) -> TestResult<()> {
+    assert_eq!(
+        validated.details.get("header_schema_plan_cache_hit"),
+        Some(&Value::Bool(true)),
+        "same preserved headers should reuse only the schema models: {:?}",
+        validated.details
+    );
+    assert!(
+        validated
+            .details
+            .get("header_schema_models_checked")
+            .and_then(Value::as_u64)
+            .is_some_and(|count| count > 0),
+        "at least one model should be reapplied: {:?}",
+        validated.details
+    );
+    assert_eq!(
+        validated.status,
+        GateStatus::ArtifactValidated,
+        "cached header models should validate the current payload: {:?}",
+        validated.details
+    );
+    let accepted = validated
+        .accepted_schema
+        .as_ref()
+        .ok_or("fresh artifact validation did not retain its record schema")?;
+    let expected_artifact_sha = l2_workbench::sha256(plaintext);
+    assert_eq!(
+        accepted.artifact_receipt.output_sha256.as_deref(),
+        Some(expected_artifact_sha.as_str())
+    );
+    assert!(validated.work_bytes <= work_limit);
+    Ok(())
+}
+
+#[test]
 fn schema_plan_cache_scopes_format_policy_limits_and_work_budget() -> TestResult<()> {
     let frames = [clear_header_frame(b"same layout")];
     let report = report_with_sessions(&[1], &[]);
@@ -502,6 +613,7 @@ fn observe_with_one_omitted_frame(
         .ok_or("full input size overflowed or a frame is missing")?;
     let context = SchemaScreenContext {
         frames,
+        inputs: None,
         frame_indices: &indices.all_frames,
         limits,
         parser_format: ArtifactValidationFormat::Png,

@@ -103,6 +103,7 @@ fn observer_context<'a>(
 ) -> Option<SchemaScreenContext<'a>> {
     request.observer.map(|options| SchemaScreenContext {
         frames: options.frames,
+        inputs: options.inputs,
         frame_indices: indices,
         limits: request.limits,
         parser_format: options.parser_format,

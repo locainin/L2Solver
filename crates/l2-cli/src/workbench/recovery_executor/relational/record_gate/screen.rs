@@ -1,6 +1,9 @@
 use super::super::super::RecoveryExecutionError;
 use super::super::{DecodedFrameOutput, aggregate_validator, invalid_policy, operational};
-use super::{GateResult, GateStatus, SchemaAlternative, SchemaPlan, record_job_work, result};
+use super::header::{HeaderSchemaModel, HeaderSchemaPlan};
+use super::{
+    GateResult, GateStatus, SchemaAlternative, SchemaPlan, record_inputs, record_job_work, result,
+};
 use l2_workbench::{
     artifact::{
         ArtifactStructure, ArtifactValidationFormat, ArtifactValidationOutcome,
@@ -8,10 +11,10 @@ use l2_workbench::{
     },
     job::{Counter, Job, Phase},
     protocol::{
-        MessageContext, RecordAssemblyInput, RecordAssemblyOutcome, RecordError,
-        RecordGroupReceipt, RecordParseReport, RecordSchema, RecordSchemaDiscoveryReport,
-        RecordSchemaHypothesis, RecordSchemaProposalLimits, RecordSchemaStrategy,
-        assemble_record_groups_from_inputs, parse_records_with_limits,
+        HeaderParseTemplate, MessageContext, RecordAssemblyInput, RecordAssemblyOutcome,
+        RecordError, RecordGroupReceipt, RecordInput, RecordParseReport, RecordSchema,
+        RecordSchemaDiscoveryReport, RecordSchemaHypothesis, RecordSchemaProposalLimits,
+        RecordSchemaStrategy, assemble_record_groups_from_inputs, parse_records_with_limits,
     },
 };
 use serde_json::{Value, json};
@@ -63,6 +66,9 @@ pub(in crate::workbench::recovery_executor::relational) struct SchemaAlternative
     pub(super) accepted_schema: Option<AcceptedRecordSchema>,
     pub(super) survives: bool,
     pub(super) pending: bool,
+    pub(super) header_models: Vec<HeaderSchemaModel>,
+    pub(super) header_model_bytes: usize,
+    pub(super) header_models_omitted: usize,
 }
 
 #[derive(Default)]
@@ -99,6 +105,7 @@ pub(in crate::workbench::recovery_executor::relational) struct AcceptedFrameIden
 #[derive(Clone, Copy)]
 pub(super) struct SchemaObserverOptions<'a> {
     pub(super) frames: &'a [DecodedFrameOutput],
+    pub(super) inputs: Option<&'a [RecordInput<'a>]>,
     pub(super) parser_format: ArtifactValidationFormat,
     pub(super) artifact_policy: ArtifactValidationPolicy,
     pub(super) job: Option<&'a Job>,
@@ -229,6 +236,353 @@ pub(super) fn screen_with_schema_plan(
     Ok(gate_result)
 }
 
+pub(super) fn screen_with_header_plan(
+    frames: &[DecodedFrameOutput],
+    parser_format: ArtifactValidationFormat,
+    artifact_policy: ArtifactValidationPolicy,
+    limits: RecordSchemaProposalLimits,
+    work_limit: usize,
+    job: Option<&Job>,
+    plan: &HeaderSchemaPlan,
+) -> Result<GateResult, RecoveryExecutionError> {
+    if let Some(job) = job {
+        job.check_cancelled()?;
+        record_job_work(
+            job,
+            Phase::TransformDiscovery,
+            Counter::CandidatesExamined,
+            1,
+        )?;
+    }
+    let full_input_bytes = super::total_input_bytes(frames)?;
+    if full_input_bytes > work_limit {
+        return Ok(result(
+            GateStatus::Pending,
+            work_limit,
+            json!({
+                "reason":"record_schema_work_limit",
+                "schema_plan_cache_hit":false,
+                "header_schema_plan_cache_hit":true,
+                "header_schema_models":plan.models.len(),
+                "header_schema_models_omitted":plan.omitted_models,
+                "work_bytes":work_limit,
+                "work_limit":work_limit,
+            }),
+        ));
+    }
+
+    let inputs = record_inputs(frames)?;
+    let frame_indices = all_frame_indices(frames.len())?;
+    let context = SchemaScreenContext {
+        frames,
+        inputs: Some(&inputs),
+        frame_indices: &frame_indices,
+        limits,
+        parser_format,
+        artifact_policy,
+        work_limit,
+        job,
+        full_input_bytes,
+    };
+    let evaluation = evaluate_header_models(&context, plan)?;
+
+    let status = if evaluation.exact_artifact_matches > 0 {
+        GateStatus::ArtifactValidated
+    } else {
+        GateStatus::Pending
+    };
+    let mut gate_result = result(
+        status,
+        evaluation.used_work,
+        json!({
+            "reason":if evaluation.exact_artifact_matches == 0 { "header_schema_requires_fresh_inference" } else { status.as_str() },
+            "schema_plan_cache_hit":false,
+            "header_schema_plan_cache_hit":true,
+            "header_schema_models":plan.models.len(),
+            "header_schema_models_attempted":evaluation.models_attempted,
+            "header_schema_models_checked":evaluation.schemas_checked,
+            "header_schema_models_omitted":plan.omitted_models,
+            "header_schema_rebind_rejections":evaluation.rebind_rejections,
+            "header_schema_assembly_rejections":evaluation.assembly_rejections,
+            "header_schema_models_deferred_for_work":evaluation.models_deferred_for_work,
+            "schema_alternatives":evaluation.alternatives,
+            "exact_artifact_matches":evaluation.exact_artifact_matches,
+            "parser_omissions":evaluation.parser_omissions,
+            "work_bytes":evaluation.used_work,
+            "work_limit":work_limit,
+            "pending":evaluation.pending,
+        }),
+    );
+    gate_result.accepted_schema = evaluation.accepted_schema;
+    Ok(gate_result)
+}
+
+#[derive(Default)]
+struct HeaderPlanEvaluation {
+    used_work: usize,
+    schemas_checked: usize,
+    models_attempted: usize,
+    rebind_rejections: usize,
+    assembly_rejections: usize,
+    models_deferred_for_work: usize,
+    exact_artifact_matches: usize,
+    parser_omissions: usize,
+    pending: bool,
+    accepted_schema: Option<AcceptedRecordSchema>,
+    alternatives: Vec<Value>,
+}
+
+fn evaluate_header_models(
+    context: &SchemaScreenContext<'_>,
+    plan: &HeaderSchemaPlan,
+) -> Result<HeaderPlanEvaluation, RecoveryExecutionError> {
+    let mut evaluation = HeaderPlanEvaluation::default();
+    evaluation
+        .alternatives
+        .try_reserve_exact(1)
+        .map_err(|source| operational("header schema result allocation failed", source))?;
+    let mut identity_charged = false;
+    for (model_index, model) in plan.models.iter().enumerate() {
+        if let Some(job) = context.job {
+            job.check_cancelled()?;
+        }
+        if !identity_charged {
+            if !reserve_schema_work(
+                &mut evaluation.used_work,
+                context.full_input_bytes,
+                context.work_limit,
+            )? {
+                evaluation.pending = true;
+                evaluation.models_deferred_for_work = plan.models.len().saturating_sub(model_index);
+                break;
+            }
+            identity_charged = true;
+        }
+        if evaluate_header_model(context, plan, model, model_index, &mut evaluation)? {
+            break;
+        }
+    }
+    Ok(evaluation)
+}
+
+fn evaluate_header_model(
+    context: &SchemaScreenContext<'_>,
+    plan: &HeaderSchemaPlan,
+    model: &HeaderSchemaModel,
+    model_index: usize,
+    evaluation: &mut HeaderPlanEvaluation,
+) -> Result<bool, RecoveryExecutionError> {
+    let inputs = context
+        .inputs
+        .ok_or_else(|| invalid_policy("record gate header inputs are missing"))?;
+    let model_work_start = evaluation.used_work;
+    let header_work = header_rebind_work(context.frames, model)?;
+    if !reserve_schema_work(&mut evaluation.used_work, header_work, context.work_limit)? {
+        evaluation.pending = true;
+        evaluation.models_deferred_for_work = plan.models.len().saturating_sub(model_index);
+        return Ok(true);
+    }
+    evaluation.models_attempted = evaluation.models_attempted.saturating_add(1);
+    let Some(parse_reports) = rebind_header_model(inputs, context.frames, model)? else {
+        evaluation.parser_omissions = evaluation.parser_omissions.saturating_add(1);
+        evaluation.rebind_rejections = evaluation.rebind_rejections.saturating_add(1);
+        evaluation.pending = true;
+        return Ok(false);
+    };
+    let assembly_work = parse_reports.iter().try_fold(0_usize, |total, report| {
+        report
+            .records()
+            .iter()
+            .try_fold(total, |records_total, record| {
+                records_total.checked_add(record.payload.end.saturating_sub(record.payload.start))
+            })
+    });
+    let Some(assembly_work) = assembly_work.and_then(|bytes| bytes.checked_mul(2)) else {
+        return Err(invalid_policy(
+            "record gate header assembly work overflowed",
+        ));
+    };
+    // Materialization copies each payload and computes the assembly receipt digest
+    if !reserve_schema_work(&mut evaluation.used_work, assembly_work, context.work_limit)? {
+        evaluation.pending = true;
+        evaluation.models_deferred_for_work = plan.models.len().saturating_sub(model_index);
+        return Ok(true);
+    }
+    let Some(assembly) = assemble_header_model(
+        inputs,
+        context.frames,
+        context.frame_indices,
+        &parse_reports,
+        model,
+    )?
+    else {
+        evaluation.pending = true;
+        evaluation.parser_omissions = evaluation.parser_omissions.saturating_add(1);
+        evaluation.assembly_rejections = evaluation.assembly_rejections.saturating_add(1);
+        return Ok(false);
+    };
+    evaluation.schemas_checked = evaluation.schemas_checked.saturating_add(1);
+    inspect_header_assembly(
+        context,
+        model,
+        model_index,
+        model_work_start,
+        plan.models.len(),
+        &assembly,
+        evaluation,
+    )
+}
+
+fn inspect_header_assembly(
+    context: &SchemaScreenContext<'_>,
+    model: &HeaderSchemaModel,
+    model_index: usize,
+    model_work_start: usize,
+    model_count: usize,
+    assembly: &RecordAssemblyOutcome,
+    evaluation: &mut HeaderPlanEvaluation,
+) -> Result<bool, RecoveryExecutionError> {
+    let mut candidate_matches = 0_usize;
+    for group in assembly.report().groups {
+        let candidate_bytes = group.candidate_bytes();
+        if !reserve_schema_work(
+            &mut evaluation.used_work,
+            candidate_bytes.len(),
+            context.work_limit,
+        )? {
+            evaluation.pending = true;
+            evaluation.parser_omissions = evaluation.parser_omissions.saturating_add(1);
+            evaluation.models_deferred_for_work = model_count.saturating_sub(model_index);
+            break;
+        }
+        let inspection =
+            inspect_candidate_bytes(candidate_bytes, context, &mut evaluation.used_work)?;
+        evaluation.parser_omissions = evaluation
+            .parser_omissions
+            .saturating_add(usize::from(inspection.parser_omission));
+        evaluation.pending |= inspection.pending;
+        candidate_matches =
+            candidate_matches.saturating_add(usize::from(inspection.exact_artifact_match));
+        if inspection.exact_artifact_match && evaluation.accepted_schema.is_none() {
+            evaluation.accepted_schema = Some(accepted_record_schema(
+                context,
+                model.schema.clone(),
+                RecordSchemaStrategy::FixedLayout,
+                group.receipt().clone(),
+            )?);
+        }
+        if inspection.pending {
+            break;
+        }
+    }
+    evaluation.exact_artifact_matches = evaluation
+        .exact_artifact_matches
+        .saturating_add(candidate_matches);
+    if candidate_matches > 0 {
+        evaluation.alternatives.push(json!({
+            "label":"header_only:fixed_layout",
+            "status":GateStatus::ArtifactValidated.as_str(),
+            "schema_model_ordinal":model_index.saturating_add(1),
+            "exact_artifact_matches":candidate_matches,
+            "header_model_bytes":model.retained_bytes,
+            "work_bytes":evaluation.used_work.saturating_sub(model_work_start),
+        }));
+    }
+    Ok(candidate_matches > 0 || evaluation.pending)
+}
+
+fn all_frame_indices(frame_count: usize) -> Result<Vec<usize>, RecoveryExecutionError> {
+    let mut indices = Vec::new();
+    indices.try_reserve_exact(frame_count).map_err(|source| {
+        operational("record gate header frame index allocation failed", source)
+    })?;
+    indices.extend(0..frame_count);
+    Ok(indices)
+}
+
+fn header_rebind_work(
+    frames: &[DecodedFrameOutput],
+    model: &HeaderSchemaModel,
+) -> Result<usize, RecoveryExecutionError> {
+    frames.iter().try_fold(0_usize, |total, frame| {
+        let Some(prefix_end) = frame.preserved_header_end else {
+            return Err(invalid_policy("header schema plan lost a preserved prefix"));
+        };
+        if frame.bytes.get(..prefix_end).is_none() {
+            return Err(invalid_policy(
+                "header schema plan prefix exceeds its frame",
+            ));
+        }
+        total
+            .checked_add(prefix_end)
+            .and_then(|amount| amount.checked_add(model.schema.identifier.width))
+            .ok_or_else(|| invalid_policy("record gate header rebind work overflowed"))
+    })
+}
+
+fn rebind_header_model(
+    inputs: &[RecordInput<'_>],
+    frames: &[DecodedFrameOutput],
+    model: &HeaderSchemaModel,
+) -> Result<Option<Vec<RecordParseReport>>, RecoveryExecutionError> {
+    if model.templates.len() != frames.len() {
+        return Ok(None);
+    }
+    let mut reports = Vec::new();
+    reports
+        .try_reserve_exact(frames.len())
+        .map_err(|source| operational("record gate rebound report allocation failed", source))?;
+    for (frame_index, (template_index, template)) in model.templates.iter().enumerate() {
+        if frame_index != *template_index {
+            return Ok(None);
+        }
+        let input = inputs
+            .get(frame_index)
+            .ok_or_else(|| invalid_policy("record gate rebound input is missing"))?;
+        let Ok(report) = template.rebind(input, model.limits) else {
+            return Ok(None);
+        };
+        reports.push(report);
+    }
+    Ok(Some(reports))
+}
+
+fn assemble_header_model(
+    inputs: &[RecordInput<'_>],
+    frames: &[DecodedFrameOutput],
+    frame_indices: &[usize],
+    reports: &[RecordParseReport],
+    model: &HeaderSchemaModel,
+) -> Result<Option<RecordAssemblyOutcome>, RecoveryExecutionError> {
+    if inputs.len() != frame_indices.len() || reports.len() != frame_indices.len() {
+        return Ok(None);
+    }
+    let mut assembly_inputs = Vec::new();
+    assembly_inputs
+        .try_reserve_exact(frame_indices.len())
+        .map_err(|source| operational("record gate rebound assembly allocation failed", source))?;
+    for (position, frame_index) in frame_indices.iter().enumerate() {
+        let Some(input) = inputs.get(*frame_index) else {
+            return Err(invalid_policy(
+                "record gate rebound assembly input is missing",
+            ));
+        };
+        let Some(report) = reports.get(position) else {
+            return Err(invalid_policy(
+                "record gate rebound parse report is missing",
+            ));
+        };
+        let _frame = frames
+            .get(*frame_index)
+            .ok_or_else(|| invalid_policy("record gate rebound frame is missing"))?;
+        let Ok(assembly_input) = RecordAssemblyInput::from_input(input, report) else {
+            return Ok(None);
+        };
+        assembly_inputs.push(assembly_input);
+    }
+    Ok(assemble_record_groups_from_inputs(&assembly_inputs, model.limits).ok())
+}
+
 fn evaluate_plan_alternatives(
     frames: &[DecodedFrameOutput],
     parser_format: ArtifactValidationFormat,
@@ -295,6 +649,7 @@ fn evaluate_alternative(
     }
     let context = SchemaScreenContext {
         frames,
+        inputs: None,
         frame_indices: frame_indices.as_slice(),
         limits: alternative.limits,
         parser_format: options.parser_format,
@@ -321,6 +676,7 @@ fn evaluate_alternative(
             accepted_schema: observed.accepted_schema.clone(),
             survives: observed.survives,
             pending: observed.pending,
+            ..SchemaAlternativeEvaluation::default()
         }
     } else {
         evaluate_surviving_schemas(&context, report, evaluation)?
@@ -575,6 +931,7 @@ fn total_indexed_bytes(
 
 pub(super) struct SchemaScreenContext<'a> {
     pub(super) frames: &'a [DecodedFrameOutput],
+    pub(super) inputs: Option<&'a [RecordInput<'a>]>,
     pub(super) frame_indices: &'a [usize],
     pub(super) limits: RecordSchemaProposalLimits,
     pub(super) parser_format: ArtifactValidationFormat,
@@ -683,6 +1040,26 @@ pub(super) fn observe_surviving_schema(
             return Ok(std::ops::ControlFlow::Continue(()));
         }
     };
+    if strategy == RecordSchemaStrategy::FixedLayout
+        && let Some(model) = capture_header_model(context, hypothesis, &completed_reports)?
+    {
+        let next_bytes = evaluation
+            .header_model_bytes
+            .checked_add(model.retained_bytes)
+            .ok_or_else(|| invalid_policy("record gate header model size overflowed"))?;
+        if next_bytes <= context.limits.discovery.record_limits.max_report_bytes {
+            evaluation
+                .header_models
+                .try_reserve_exact(1)
+                .map_err(|source| {
+                    operational("record gate header model allocation failed", source)
+                })?;
+            evaluation.header_models.push(model);
+            evaluation.header_model_bytes = next_bytes;
+        } else {
+            evaluation.header_models_omitted = evaluation.header_models_omitted.saturating_add(1);
+        }
+    }
     let mut report_references = Vec::new();
     report_references
         .try_reserve_exact(completed_reports.len())
@@ -697,6 +1074,77 @@ pub(super) fn observe_surviving_schema(
     } else {
         std::ops::ControlFlow::Continue(())
     })
+}
+
+fn capture_header_model(
+    context: &SchemaScreenContext<'_>,
+    hypothesis: &RecordSchemaHypothesis,
+    reports: &[Cow<'_, RecordParseReport>],
+) -> Result<Option<HeaderSchemaModel>, RecoveryExecutionError> {
+    let Some(inputs) = context.inputs else {
+        return Ok(None);
+    };
+    if inputs.len() != context.frames.len()
+        || context.frame_indices.len() != context.frames.len()
+        || context
+            .frame_indices
+            .iter()
+            .copied()
+            .ne(0..context.frames.len())
+        || reports.len() != context.frame_indices.len()
+    {
+        return Ok(None);
+    }
+
+    let mut estimated_bytes = std::mem::size_of::<HeaderSchemaModel>()
+        .saturating_add(context.frames.len() * std::mem::size_of::<(usize, HeaderParseTemplate)>());
+    for (frame_index, report) in context.frame_indices.iter().zip(reports) {
+        let frame = context
+            .frames
+            .get(*frame_index)
+            .ok_or_else(|| invalid_policy("record gate header model frame is missing"))?;
+        let Some(prefix_end) = frame.preserved_header_end else {
+            return Ok(None);
+        };
+        if prefix_end == 0 || report.schema() != &hypothesis.schema {
+            return Ok(None);
+        }
+        estimated_bytes = estimated_bytes
+            .saturating_add(std::mem::size_of::<HeaderParseTemplate>())
+            .saturating_add(prefix_end)
+            .saturating_add(report.metadata_bytes());
+    }
+    if estimated_bytes > context.limits.discovery.record_limits.max_report_bytes {
+        return Ok(None);
+    }
+
+    let mut templates = Vec::new();
+    templates
+        .try_reserve_exact(context.frames.len())
+        .map_err(|source| operational("record gate header template allocation failed", source))?;
+    for (frame_index, report) in context.frame_indices.iter().zip(reports) {
+        let frame = context
+            .frames
+            .get(*frame_index)
+            .ok_or_else(|| invalid_policy("record gate header template frame is missing"))?;
+        let prefix_end = frame
+            .preserved_header_end
+            .ok_or_else(|| invalid_policy("record gate header template lost its prefix"))?;
+        let input = inputs
+            .get(*frame_index)
+            .ok_or_else(|| invalid_policy("record gate header template input is missing"))?;
+        let Ok(Some(template)) =
+            report.header_only_template(input, prefix_end, context.limits.discovery.record_limits)
+        else {
+            return Ok(None);
+        };
+        templates.push((*frame_index, template));
+    }
+    Ok(Some(HeaderSchemaModel::with_templates(
+        hypothesis.schema.clone(),
+        context.limits.discovery.record_limits,
+        templates,
+    )?))
 }
 
 enum FullApplicationReports<'a> {
