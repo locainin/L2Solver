@@ -31,11 +31,15 @@ SOURCE_FIELDS = {
 }
 SUMMARY_FIELDS = {
     "sections", "reported_sections", "incomplete_sections", "capture_dropped",
-    "interface_dropped",
+    "interface_dropped", "packet_block_packets_dropped",
+    "packet_blocks_with_unavailable_drop_count",
+}
+LEGACY_SUMMARY_FIELDS = SUMMARY_FIELDS - {
+    "packet_block_packets_dropped", "packet_blocks_with_unavailable_drop_count",
 }
 FLOW_FIELDS = {
     "id", "source_id", "scope", "protocol", "endpoint_a", "port_a", "endpoint_b",
-    "port_b", "first_packet", "last_packet", "packets", "payload_bytes",
+    "port_b", "first_packet", "last_packet", "packets", "frame_bytes", "payload_bytes",
 }
 RELATIONSHIP_FIELDS = {
     "source_id", "request_packet", "response_packet", "destination_packet",
@@ -45,7 +49,7 @@ RELATIONSHIP_FIELDS = {
 RANGE_FIELDS = {"source", "packet", "offset", "length"}
 FLOW_QUERY = (
     "SELECT f.id,s.sha256,c.value,f.protocol,f.a,f.ap,f.b,f.bp,MIN(p.number),"
-    "MAX(p.number),COUNT(*),SUM(p.payload_length) FROM flows f "
+    "MAX(p.number),COUNT(*),SUM(p.length),SUM(p.payload_length) FROM flows f "
     "JOIN sources s ON s.id=f.source JOIN scopes c ON c.id=f.scope "
     "JOIN packets p ON p.flow=f.id GROUP BY f.id ORDER BY f.id"
 )
@@ -80,9 +84,6 @@ def validate_index_output(directory, sample):
     database = _regular_file(index_directory / "index.sqlite", "index database")
     manifest = read_json(_regular_file(index_directory / "manifest.json", "index manifest"),
                          MAX_INDEX_JSON_BYTES)
-    stdout_receipt = read_json(_regular_file(directory / "index.stdout.log", "index receipt"),
-                               MAX_INDEX_JSON_BYTES)
-    require(stdout_receipt == manifest, "index receipt output disagrees with its manifest")
 
     expected_id = "sha256:" + sample.metadata["capture_sha256"]
     inventory, source = _check_receipt(manifest, sample.metadata, expected_id)
@@ -262,7 +263,8 @@ def _flow_record(row):
         "first_packet": row[8],
         "last_packet": row[9],
         "packets": row[10],
-        "payload_bytes": row[11],
+        "frame_bytes": row[11],
+        "payload_bytes": row[12],
     }
 
 
@@ -282,8 +284,11 @@ def _validate_flow_record(flow, packet_count, source_bytes):
     packets = _integer(flow["packets"], "flow packet count", minimum=1)
     require(last <= packet_count and packets <= last - first + 1,
             "flow packet range exceeds indexed source records")
+    frame_bytes = _integer(flow["frame_bytes"], "flow frame bytes")
+    require(frame_bytes <= source_bytes, "flow frame bytes exceed source byte length")
     payload_bytes = _integer(flow["payload_bytes"], "flow payload bytes")
     require(payload_bytes <= source_bytes, "flow payload bytes exceed source byte length")
+    require(payload_bytes <= frame_bytes, "flow payload bytes exceed captured frame bytes")
 
 
 def _check_relationships(connection, path, capture, expected_id, packet_count, capture_length):
@@ -453,10 +458,12 @@ def _check_receipt(receipt, metadata, expected_id):
 
 
 def _check_summary(summary):
-    require(isinstance(summary, dict) and set(summary) == SUMMARY_FIELDS,
+    require(isinstance(summary, dict)
+            and set(summary) in (LEGACY_SUMMARY_FIELDS, SUMMARY_FIELDS),
             "invalid collection summary")
     for name in SUMMARY_FIELDS:
-        _integer(summary[name], f"collection summary {name}")
+        if name in summary:
+            _integer(summary[name], f"collection summary {name}")
     require(summary["reported_sections"] <= summary["sections"]
             and summary["incomplete_sections"] <= summary["reported_sections"],
             "inconsistent collection summary counters")

@@ -24,7 +24,9 @@ def program(root, capture, metadata, packets, flows, relationships, *,
             database_flows=None, database_relationships=None, database_dns_scope=None,
             database_destination_direction=None,
             changed_capture=None, exit_stage=None, locator_delta=0,
-            change_binary_stage=None):
+            change_binary_stage=None,
+            index_stdout="Created index directory: index\nSources: 1; packets: 2; flows: 1\n",
+            collection_summary=None):
     path = root / "analyzer"
     source_id = "sha256:" + metadata["capture_sha256"]
     database_flows = flows if database_flows is None else database_flows
@@ -96,12 +98,14 @@ def program(root, capture, metadata, packets, flows, relationships, *,
             1, response, relationship["request_packet"],
             relationship["association"], json.dumps(relationship["questions"]),
         )
-    summary = {
+    summary = collection_summary or {
         "sections": 0,
         "reported_sections": 0,
         "incomplete_sections": 0,
         "capture_dropped": 0,
         "interface_dropped": 0,
+        "packet_block_packets_dropped": 0,
+        "packet_blocks_with_unavailable_drop_count": 0,
     }
     inventory = {
         "sources": 1,
@@ -150,6 +154,7 @@ def program(root, capture, metadata, packets, flows, relationships, *,
         "exit_stage": exit_stage,
         "locator_delta": locator_delta,
         "change_binary_stage": change_binary_stage,
+        "index_stdout": index_stdout,
     })
     body = f"""import json, pathlib, sqlite3, sys
 fixture = {payload}
@@ -178,7 +183,7 @@ if args[1] == 'index':
     connection.commit()
     connection.close()
     (root / 'sources' / (fixture['source_id'][7:] + '.pcap')).write_bytes(fixture['capture'])
-    print(json.dumps(fixture['receipt']), end='')
+    print(fixture['index_stdout'], end='')
     if fixture['changed_capture'] is not None:
         pathlib.Path(args[2]).write_bytes(fixture['changed_capture'])
 elif args[1] == 'indexed':
@@ -225,6 +230,7 @@ def packet_sample(root, payloads=(b"\xc0\x00\x02\x02", b"destination")):
 def sample_facts(metadata, packets):
     source_id = "sha256:" + metadata["capture_sha256"]
     first = packets[0]
+    frame_bytes = sum(packet.length for packet in packets[:2])
     return [
         {
             "id": 1,
@@ -238,6 +244,7 @@ def sample_facts(metadata, packets):
             "first_packet": 1,
             "last_packet": 2,
             "packets": 2,
+            "frame_bytes": frame_bytes,
             "payload_bytes": 12,
         }
     ], [
@@ -262,6 +269,65 @@ def sample_facts(metadata, packets):
 
 
 class IndexExecutionTests(unittest.TestCase):
+    def test_validates_manifest_when_index_command_prints_human_summary(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            catalogue, _, metadata, capture, packets = packet_sample(root)
+            flows, relationships = sample_facts(metadata, packets)
+            binary = program(root, capture, metadata, packets, flows, relationships)
+
+            result = run_sample(load_catalogue(catalogue)[0], binary, "human-index", 5,
+                                mode="index")
+
+            self.assertEqual(result["status"], "complete")
+            self.assertEqual(result["validation"]["source_sha256"], metadata["capture_sha256"])
+
+    def test_accepts_legacy_collection_summary_fields(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            catalogue, _, metadata, capture, packets = packet_sample(root)
+            flows, relationships = sample_facts(metadata, packets)
+            legacy_summary = {
+                "sections": 0,
+                "reported_sections": 0,
+                "incomplete_sections": 0,
+                "capture_dropped": 0,
+                "interface_dropped": 0,
+            }
+            binary = program(
+                root, capture, metadata, packets, flows, relationships,
+                collection_summary=legacy_summary,
+            )
+
+            result = run_sample(load_catalogue(catalogue)[0], binary, "legacy-summary", 5,
+                                mode="index")
+
+            self.assertEqual(result["status"], "complete")
+
+    def test_rejects_partially_extended_collection_summary_fields(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            catalogue, _, metadata, capture, packets = packet_sample(root)
+            flows, relationships = sample_facts(metadata, packets)
+            summary = {
+                "sections": 0,
+                "reported_sections": 0,
+                "incomplete_sections": 0,
+                "capture_dropped": 0,
+                "interface_dropped": 0,
+                "packet_block_packets_dropped": 0,
+            }
+            binary = program(
+                root, capture, metadata, packets, flows, relationships,
+                collection_summary=summary,
+            )
+
+            result = run_sample(load_catalogue(catalogue)[0], binary, "partial-summary", 5,
+                                mode="index")
+
+            self.assertEqual(result["status"], "evidence_failure")
+            self.assertIn("invalid collection summary", result["error"])
+
     def test_verifies_and_streams_source_facts(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -338,6 +404,20 @@ class IndexExecutionTests(unittest.TestCase):
 
             self.assertEqual(result["status"], "evidence_failure")
             self.assertIn("source byte", result["error"])
+
+    def test_rejects_payload_bytes_above_captured_frame_bytes(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            catalogue, _, metadata, capture, packets = packet_sample(root)
+            flows, relationships = sample_facts(metadata, packets)
+            flows[0]["payload_bytes"] = flows[0]["frame_bytes"] + 1
+            binary = program(root, capture, metadata, packets, flows, relationships)
+
+            result = run_sample(load_catalogue(catalogue)[0], binary, "oversized-payload", 5,
+                                mode="index")
+
+            self.assertEqual(result["status"], "evidence_failure")
+            self.assertIn("frame bytes", result["error"])
 
     def test_rejects_noncanonical_flow_endpoints(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -423,7 +503,7 @@ class IndexExecutionTests(unittest.TestCase):
             )
             flows, relationships = sample_facts(metadata, packets)
             second = dict(flows[0], id=2, first_packet=3, last_packet=3, packets=1,
-                          endpoint_a="192.0.2.3")
+                          endpoint_a="192.0.2.3", frame_bytes=packets[2].length)
             canonical = [dict(relationships[0])]
             relationships[0]["destination_flow"] = 2
             binary = program(root, capture, metadata, packets, [flows[0], second], relationships,
@@ -622,7 +702,7 @@ class IndexExecutionTests(unittest.TestCase):
             )
             flows, relationships = sample_facts(metadata, packets)
             second_flow = dict(flows[0], id=2, first_packet=3, last_packet=3, packets=1,
-                               port_a=53001)
+                               port_a=53001, frame_bytes=packets[2].length)
             second_relationship = dict(relationships[0], destination_packet=3, destination_flow=2)
             binary = program(
                 root, capture, metadata, packets, [*flows, second_flow],
