@@ -47,6 +47,29 @@ fn source_prefixed_record(sequence: u16, payload: &[u8]) -> Vec<u8> {
     bytes
 }
 
+fn four_byte_header_record(identifier: [u8; 4], sequence: u32, payload: &[u8]) -> Vec<u8> {
+    let mut bytes = Vec::with_capacity(12 + payload.len());
+    bytes.extend_from_slice(&identifier);
+    bytes.extend_from_slice(&sequence.to_be_bytes());
+    bytes.extend_from_slice(
+        &u32::try_from(payload.len())
+            .unwrap_or(u32::MAX)
+            .to_be_bytes(),
+    );
+    bytes.extend_from_slice(payload);
+    bytes
+}
+
+fn four_byte_header_message(first_sequence: u32, payload_marker: u8) -> Vec<u8> {
+    let first_payload =
+        vec![0xa0_u8.wrapping_add(payload_marker); 24 + usize::from(payload_marker)];
+    let second_payload =
+        vec![0xb0_u8.wrapping_add(payload_marker); 32 + usize::from(payload_marker)];
+    let first = four_byte_header_record(*b"DATA", first_sequence, &first_payload);
+    let second = four_byte_header_record(*b"DATA", first_sequence + 1, &second_payload);
+    [first, second].concat()
+}
+
 fn source_framed_record(sequence: u16, payload: &[u8]) -> Result<Vec<u8>, Box<dyn Error>> {
     let encoded_payload_length = payload
         .len()
@@ -375,6 +398,92 @@ fn repeated_records_in_each_message_propose_and_validate_the_record_layout()
         "the same learned layout should parse the held-out concatenated message"
     );
     assert_repeated_boundary_cues(&repeated.proposal.repeated_boundary_cues, &training_records);
+    Ok(())
+}
+
+#[test]
+fn repeated_boundaries_reach_a_four_byte_length_within_the_split_check_budget()
+-> Result<(), Box<dyn Error>> {
+    let training_owned = [
+        four_byte_header_message(0x8080_8080, 1),
+        four_byte_header_message(0x8080_8082, 2),
+        four_byte_header_message(0x8080_8084, 3),
+        four_byte_header_message(0x8080_8086, 4),
+    ];
+    let held_out_owned = [
+        four_byte_header_message(0x8080_8088, 5),
+        four_byte_header_message(0x8080_808a, 6),
+    ];
+    let training = training_owned.iter().map(Vec::as_slice).collect::<Vec<_>>();
+    let held_out = held_out_owned.iter().map(Vec::as_slice).collect::<Vec<_>>();
+    let expected = RecordSchema {
+        records_offset: 0,
+        count: RecordCount::UntilEnd,
+        identifier: ByteField {
+            offset: 0,
+            width: 4,
+        },
+        sequence: IntegerField {
+            offset: 4,
+            width: 4,
+            byte_order: ByteOrder::BigEndian,
+        },
+        length: IntegerField {
+            offset: 8,
+            width: 4,
+            byte_order: ByteOrder::BigEndian,
+        },
+        data_offset: 12,
+        length_meaning: RecordLengthMeaning::PayloadBytes,
+        sequence_base: 0,
+        terminal_sequence: None,
+    };
+    let mut limits = proposal_limits(20_000);
+    limits.max_field_offset = 15;
+    // Keep unrelated field, pair, and parser caps above their small fixture domains
+    limits.max_length_checks = 512;
+    let analysis = analyze_record_schemas_with_repeated_boundaries(&training, &held_out, limits)?;
+    let repeated_limits = analysis
+        .repeated_boundary_limits
+        .ok_or("the repeated-boundary strategy should receive half the check budget")?;
+    assert_eq!(repeated_limits.max_length_checks, 256);
+    let repeated = analysis
+        .repeated_boundaries
+        .as_ref()
+        .ok_or("the repeated-boundary strategy report is missing")?;
+    assert_eq!(repeated.proposal.examined_length_checks, 256);
+    assert!(repeated.proposal.omitted_length_checks > 0);
+    let discovery = repeated
+        .discovery
+        .as_ref()
+        .ok_or("the repeated layout should be strictly checked")?;
+    let candidate_space = repeated.proposal.candidate_space.as_ref();
+    let field_presence = candidate_space.map(|space| {
+        (
+            space.identifier_fields.contains(&expected.identifier),
+            space.sequence_fields.contains(&expected.sequence),
+            space.length_fields.contains(&expected.length),
+            space.data_offsets.contains(&expected.data_offset),
+            space.length_meanings.contains(&expected.length_meaning),
+            space.identifier_fields.len(),
+            space.sequence_fields.len(),
+        )
+    });
+    assert!(
+        discovery
+            .surviving
+            .iter()
+            .any(|hypothesis| hypothesis.schema == expected),
+        "bounded repeated search missed the four-byte layout: field_presence={field_presence:?}, pair_checks={}/{}, cues={}, candidate_combinations={:?}, examined_schemas={}, unexamined_schemas={:?}, retained_survivors={}, omitted_survivors={}",
+        repeated.proposal.examined_pair_checks,
+        repeated.proposal.omitted_pair_checks,
+        repeated.proposal.repeated_boundary_cues.len(),
+        repeated.proposal.candidate_combinations,
+        discovery.examined_combinations,
+        discovery.unexamined_combinations,
+        discovery.surviving.len(),
+        discovery.omitted_survivors,
+    );
     Ok(())
 }
 

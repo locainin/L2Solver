@@ -18,7 +18,7 @@ use super::super::{
     ByteField, IntegerField, RecordCount, RecordError, RecordParseReport, RecordSchema,
 };
 use super::model::{
-    INTEGER_WIDTHS, LENGTH_MEANINGS, LIMITATIONS, RecordBoundaryCue, RecordSchemaAnalysisReport,
+    INTEGER_WIDTHS, LIMITATIONS, RecordBoundaryCue, RecordSchemaAnalysisReport,
     RecordSchemaMultiStrategyAnalysisReport, RecordSchemaProposalLimits,
     RecordSchemaProposalReport, RecordSchemaProposalValidationBasis, RecordSchemaStrategy,
     default_sequence_base,
@@ -30,7 +30,10 @@ use std::collections::{BinaryHeap, HashMap, HashSet};
 use std::hash::Hash;
 use std::ops::ControlFlow;
 
+mod length_layouts;
 mod repeated;
+
+use length_layouts::{LengthLayoutOrder, visit_length_layouts};
 
 type SurvivorObserver<'observer> = dyn FnMut(
         RecordSchemaStrategy,
@@ -92,6 +95,9 @@ pub fn analyze_record_schemas(
 /// analysis first uses length fields to locate bounded record views and only then proposes header
 /// fields. Each strategy retains its own proposal and parser report so unrelated candidate
 /// dimensions are never combined into a synthetic Cartesian search space
+///
+/// Repeated-boundary layouts use a deterministic compact-prefix priority heuristic. The report's
+/// omission counts show when the configured check cap leaves layouts unexamined
 ///
 /// # Errors
 /// Rejects empty training input, invalid limits, and aggregate message resource excess
@@ -1260,150 +1266,33 @@ fn length_candidates(
     maximum_checks: usize,
     prioritized_offsets: &[usize],
 ) -> Result<LengthFields, RecordDiscoveryError> {
-    let (total_checks, maximum_gap) = length_domain_stats(fields, maximum_data_offset)?;
-
     let mut result = empty_length_fields();
     let mut seen = LengthFieldMembership::default();
-    let mut checks = prioritized_length_candidates(
-        messages,
+    let (checks, total_checks) = visit_length_layouts(
         fields,
-        prioritized_offsets,
+        maximum_data_offset,
         maximum_checks,
-        &mut result,
-        &mut seen,
-    )?;
-    // Advance every field by one gap before considering larger gaps
-    if let Some(maximum_gap) = maximum_gap {
-        'gaps: for gap in 0..=maximum_gap {
-            for field in fields {
-                let field_end = field
-                    .offset
-                    .checked_add(field.width)
-                    .ok_or(RecordDiscoveryError::InvalidLimits)?;
-                let Some(remaining_gap) = maximum_data_offset.checked_sub(field_end) else {
-                    continue;
-                };
-                if gap > remaining_gap {
-                    continue;
-                }
-                let data_offset = field_end
-                    .checked_add(gap)
-                    .ok_or(RecordDiscoveryError::InvalidLimits)?;
-                if prioritized_offsets.binary_search(&data_offset).is_ok() {
-                    continue;
-                }
-                for meaning in LENGTH_MEANINGS {
-                    if checks == maximum_checks {
-                        break 'gaps;
-                    }
-                    checks = checks
-                        .checked_add(1)
-                        .ok_or(RecordDiscoveryError::InvalidLimits)?;
-                    if !matches_length(messages, *field, meaning, data_offset) {
-                        continue;
-                    }
-                    result.retain_layout(
-                        &mut seen,
-                        SupportedLength {
-                            field: *field,
-                            data_offset,
-                            meaning,
-                        },
-                    )?;
-                }
+        prioritized_offsets,
+        LengthLayoutOrder::GapFirst,
+        &mut |field, data_offset, meaning| {
+            if !matches_length(messages, field, meaning, data_offset) {
+                return Ok(());
             }
-        }
-    }
+            result.retain_layout(
+                &mut seen,
+                SupportedLength {
+                    field,
+                    data_offset,
+                    meaning,
+                },
+            )
+        },
+    )?;
     result.examined_checks = checks;
     result.omitted_checks = total_checks
         .checked_sub(checks)
         .ok_or(RecordDiscoveryError::InvalidLimits)?;
     Ok(result)
-}
-
-fn prioritized_length_candidates(
-    messages: &[&[u8]],
-    fields: &[IntegerField],
-    prioritized_offsets: &[usize],
-    maximum_checks: usize,
-    result: &mut LengthFields,
-    seen: &mut LengthFieldMembership,
-) -> Result<usize, RecordDiscoveryError> {
-    let mut checks = 0_usize;
-    let mut priority_fields = Vec::new();
-    priority_fields
-        .try_reserve_exact(fields.len())
-        .map_err(|_| allocation_error())?;
-    priority_fields.extend(0..fields.len());
-    priority_fields.sort_unstable_by_key(|index| {
-        let field_end = fields
-            .get(*index)
-            .map_or(0, |field| field.offset.saturating_add(field.width));
-        (Reverse(field_end), *index)
-    });
-
-    // Framing boundaries narrow the payload start, so check their length meanings first
-    'prioritized: for data_offset in prioritized_offsets {
-        for field_index in &priority_fields {
-            let field = fields
-                .get(*field_index)
-                .ok_or(RecordDiscoveryError::InvalidLimits)?;
-            let field_end = field
-                .offset
-                .checked_add(field.width)
-                .ok_or(RecordDiscoveryError::InvalidLimits)?;
-            if field_end > *data_offset {
-                continue;
-            }
-            for meaning in LENGTH_MEANINGS {
-                if checks == maximum_checks {
-                    break 'prioritized;
-                }
-                checks = checks
-                    .checked_add(1)
-                    .ok_or(RecordDiscoveryError::InvalidLimits)?;
-                if matches_length(messages, *field, meaning, *data_offset) {
-                    result.retain_layout(
-                        seen,
-                        SupportedLength {
-                            field: *field,
-                            data_offset: *data_offset,
-                            meaning,
-                        },
-                    )?;
-                }
-            }
-        }
-    }
-    Ok(checks)
-}
-
-fn length_domain_stats(
-    fields: &[IntegerField],
-    maximum_data_offset: usize,
-) -> Result<(usize, Option<usize>), RecordDiscoveryError> {
-    let mut total_checks = 0_usize;
-    let mut maximum_gap = None;
-    for field in fields {
-        let field_end = field
-            .offset
-            .checked_add(field.width)
-            .ok_or(RecordDiscoveryError::InvalidLimits)?;
-        let Some(gap) = maximum_data_offset.checked_sub(field_end) else {
-            continue;
-        };
-        let boundary_count = gap
-            .checked_add(1)
-            .ok_or(RecordDiscoveryError::InvalidLimits)?;
-        let field_checks = boundary_count
-            .checked_mul(LENGTH_MEANINGS.len())
-            .ok_or(RecordDiscoveryError::InvalidLimits)?;
-        total_checks = total_checks
-            .checked_add(field_checks)
-            .ok_or(RecordDiscoveryError::InvalidLimits)?;
-        maximum_gap = Some(maximum_gap.map_or(gap, |current: usize| current.max(gap)));
-    }
-    Ok((total_checks, maximum_gap))
 }
 
 fn matches_length(

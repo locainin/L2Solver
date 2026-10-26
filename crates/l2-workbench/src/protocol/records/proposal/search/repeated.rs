@@ -1,10 +1,11 @@
 //! Repeated-record boundary search independent of fixed-layout schema proposals
 
-use super::super::model::{LENGTH_MEANINGS, RecordSchemaProposalLimits, default_sequence_base};
+use super::super::model::{RecordSchemaProposalLimits, default_sequence_base};
+use super::length_layouts::{LengthLayoutOrder, visit_length_layouts};
 use super::{
     CandidateGeneration, FieldDomains, LengthFieldMembership, LengthFields, RecordRange,
     SupportedLength, allocation_error, candidate_field_domains, empty_length_fields,
-    empty_pair_fields, finish_candidate_generation, length_domain_stats, sequence_group_candidates,
+    empty_pair_fields, finish_candidate_generation, sequence_group_candidates,
     varying_sequence_fields,
 };
 use crate::protocol::{
@@ -115,30 +116,16 @@ fn length_candidates(
     maximum_checks: usize,
     record_limits: RecordLimits,
 ) -> Result<LengthFields, RecordDiscoveryError> {
-    let (total_checks, _) = length_domain_stats(fields, maximum_data_offset)?;
     let mut search = LengthCandidateSearch::new(messages, record_limits)?;
-
-    // Visit the shortest payload boundaries first so compact headers share the budget fairly
-    if maximum_data_offset > 0 {
-        'boundaries: for data_offset in 1..=maximum_data_offset {
-            for field in fields {
-                let field_end = field
-                    .offset
-                    .checked_add(field.width)
-                    .ok_or(RecordDiscoveryError::InvalidLimits)?;
-                if field_end > data_offset {
-                    continue;
-                }
-                for meaning in LENGTH_MEANINGS {
-                    if search.result.examined_checks == maximum_checks {
-                        break 'boundaries;
-                    }
-                    search.check_layout(*field, data_offset, meaning)?;
-                }
-            }
-        }
-    }
-    search.finish(total_checks)
+    let (examined_checks, total_checks) = visit_length_layouts(
+        fields,
+        maximum_data_offset,
+        maximum_checks,
+        &[],
+        LengthLayoutOrder::CompactPrefix,
+        &mut |field, data_offset, meaning| search.check_layout(field, data_offset, meaning),
+    )?;
+    search.finish(total_checks, examined_checks)
 }
 
 struct LengthCandidateSearch<'a> {
@@ -178,11 +165,6 @@ impl<'a> LengthCandidateSearch<'a> {
         data_offset: usize,
         meaning: RecordLengthMeaning,
     ) -> Result<(), RecordDiscoveryError> {
-        self.result.examined_checks = self
-            .result
-            .examined_checks
-            .checked_add(1)
-            .ok_or(RecordDiscoveryError::InvalidLimits)?;
         match length_ranges(
             self.messages,
             field,
@@ -260,9 +242,14 @@ impl<'a> LengthCandidateSearch<'a> {
         Ok(())
     }
 
-    fn finish(mut self, total_checks: usize) -> Result<LengthFields, RecordDiscoveryError> {
+    fn finish(
+        mut self,
+        total_checks: usize,
+        examined_checks: usize,
+    ) -> Result<LengthFields, RecordDiscoveryError> {
+        self.result.examined_checks = examined_checks;
         self.result.omitted_checks = total_checks
-            .checked_sub(self.result.examined_checks)
+            .checked_sub(examined_checks)
             .and_then(|unexamined| unexamined.checked_add(self.incomplete_checks))
             .ok_or(RecordDiscoveryError::InvalidLimits)?;
         Ok(self.result)
