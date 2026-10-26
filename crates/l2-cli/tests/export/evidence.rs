@@ -274,7 +274,10 @@ fn case_id_matches_the_digest_of_its_persisted_record() -> Result<(), Box<dyn Er
         Some(record.case_id.as_bytes())
     );
 
-    encoded[id_start..id_end].copy_from_slice(placeholder.as_bytes());
+    encoded
+        .get_mut(id_start..id_end)
+        .ok_or("case ID field should remain inside the persisted record")?
+        .copy_from_slice(placeholder.as_bytes());
     let mut digest = Sha256::new();
     digest.update(HASH_DOMAIN);
     digest.update(1_u64.to_be_bytes());
@@ -312,12 +315,18 @@ fn gzip_sidecar_appends_valid_members_and_checks_each_member_crc() -> Result<(),
     );
     let records = read_sidecar(&sidecar_path)?;
     assert_eq!(records.len(), 2);
+    let first_record_value = records
+        .first()
+        .ok_or("first gzip member should contain a JSONL record")?;
+    let second_record_value = records
+        .get(1)
+        .ok_or("second gzip member should contain a JSONL record")?;
     assert_eq!(
-        records[0].get("case_id").and_then(Value::as_str),
+        first_record_value.get("case_id").and_then(Value::as_str),
         Some(first_record.case_id.as_str())
     );
     assert_eq!(
-        records[1].get("case_id").and_then(Value::as_str),
+        second_record_value.get("case_id").and_then(Value::as_str),
         Some(second_record.case_id.as_str())
     );
 
@@ -331,9 +340,13 @@ fn gzip_sidecar_appends_valid_members_and_checks_each_member_crc() -> Result<(),
     *crc ^= 1;
     let corrupted_path = temporary.path().join("corrupted-evidence.jsonl.gz");
     fs::write(&corrupted_path, encoded)?;
-    let mut decoder = MultiGzDecoder::new(fs::File::open(corrupted_path)?);
-    let mut decoded = Vec::new();
-    assert!(decoder.read_to_end(&mut decoded).is_err());
+    let mut crc_checked_reader = MultiGzDecoder::new(fs::File::open(corrupted_path)?);
+    let mut decompressed_bytes = Vec::new();
+    assert!(
+        crc_checked_reader
+            .read_to_end(&mut decompressed_bytes)
+            .is_err()
+    );
     Ok(())
 }
 
@@ -612,10 +625,10 @@ fn slice_item<'a>(
 }
 
 fn read_sidecar_bytes(path: &Path) -> Result<Vec<u8>, Box<dyn Error>> {
-    let mut decoder = MultiGzDecoder::new(fs::File::open(path)?);
-    let mut decoded = Vec::new();
-    decoder.read_to_end(&mut decoded)?;
-    Ok(decoded)
+    let mut gzip_reader = MultiGzDecoder::new(fs::File::open(path)?);
+    let mut jsonl_bytes = Vec::new();
+    gzip_reader.read_to_end(&mut jsonl_bytes)?;
+    Ok(jsonl_bytes)
 }
 
 fn read_sidecar(path: &Path) -> Result<Vec<Value>, Box<dyn Error>> {

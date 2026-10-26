@@ -97,14 +97,22 @@ fn json_mode_emits_a_parseable_newline_delimited_snapshot() -> Result<(), Box<dy
     let parsed: serde_json::Value = serde_json::from_str(line.trim_end())?;
 
     assert!(line.ends_with('\n'));
-    assert_eq!(parsed["label"], "machine-readable run");
-    assert_eq!(parsed["current_phase"], "preparation");
+    assert_eq!(
+        parsed.get("label").and_then(serde_json::Value::as_str),
+        Some("machine-readable run")
+    );
+    assert_eq!(
+        parsed
+            .get("current_phase")
+            .and_then(serde_json::Value::as_str),
+        Some("preparation")
+    );
     Ok(())
 }
 
 #[test]
-fn quiet_json_filters_routine_progress_but_keeps_cancel_and_failure_ndjson()
--> Result<(), Box<dyn Error>> {
+fn quiet_json_filters_routine_progress_but_keeps_cancellation_ndjson() -> Result<(), Box<dyn Error>>
+{
     let running_job = Job::new("quiet machine-readable run");
     running_job.start(Phase::TransformDiscovery, None)?;
     running_job.advance(Phase::TransformDiscovery, 4)?;
@@ -122,10 +130,17 @@ fn quiet_json_filters_routine_progress_but_keeps_cancel_and_failure_ndjson()
     assert_eq!(cancellation_event, JsonEvent::CancellationRequested);
     let cancellation_lines = capture_json_lines(&running_job, LinePolicy::QuietJsonEvents)?;
     assert_eq!(cancellation_lines.len(), 1);
-    let cancellation_json: serde_json::Value =
-        serde_json::from_str(cancellation_lines[0].trim_end())?;
-    assert!(cancellation_lines[0].ends_with('\n'));
-    assert_eq!(cancellation_json["cancel_requested"], true);
+    let cancellation_line = cancellation_lines
+        .first()
+        .ok_or_else(|| std::io::Error::other("cancellation snapshot should be emitted"))?;
+    let cancellation_json: serde_json::Value = serde_json::from_str(cancellation_line.trim_end())?;
+    assert!(cancellation_line.ends_with('\n'));
+    assert_eq!(
+        cancellation_json
+            .get("cancel_requested")
+            .and_then(serde_json::Value::as_bool),
+        Some(true)
+    );
     events.mark_emitted(cancellation_event);
     assert_eq!(events.pending_event(&cancellation_snapshot), None);
 
@@ -141,23 +156,35 @@ fn quiet_json_filters_routine_progress_but_keeps_cancel_and_failure_ndjson()
     let terminal_line = render_json_line(&terminal_cancellation)?;
     let terminal_json: serde_json::Value = serde_json::from_str(terminal_line.trim_end())?;
     assert!(terminal_line.ends_with('\n'));
-    let transform_phase = terminal_json["phases"]
-        .as_array()
+    let transform_phase = terminal_json
+        .get("phases")
+        .and_then(serde_json::Value::as_array)
         .and_then(|phases| {
-            phases
-                .iter()
-                .find(|phase| phase["phase"] == "transform_discovery")
+            phases.iter().find(|phase| {
+                phase.get("phase").and_then(serde_json::Value::as_str)
+                    == Some("transform_discovery")
+            })
         })
         .ok_or_else(|| std::io::Error::other("transform phase should be in the JSON snapshot"))?;
-    assert_eq!(transform_phase["state"], "cancelled");
+    assert_eq!(
+        transform_phase
+            .get("state")
+            .and_then(serde_json::Value::as_str),
+        Some("cancelled")
+    );
     events.mark_emitted(terminal_event);
     assert_eq!(events.pending_event(&terminal_cancellation), None);
+    Ok(())
+}
 
+#[test]
+fn quiet_json_keeps_failure_ndjson() -> Result<(), Box<dyn Error>> {
     let failed_job = Job::new("failed machine-readable run");
     failed_job.start(Phase::Preparation, None)?;
     failed_job.set_current(Phase::Preparation, "invalid source metadata")?;
     failed_job.finish(Phase::Preparation, PhaseOutcome::Failed)?;
     let failed_snapshot = failed_job.snapshot()?;
+    let events = JsonEventTracker::default();
     let failed_event = events
         .pending_event(&failed_snapshot)
         .ok_or_else(|| std::io::Error::other("failed phase event should be emitted"))?;
@@ -167,13 +194,26 @@ fn quiet_json_filters_routine_progress_but_keeps_cancel_and_failure_ndjson()
     );
     let failed_lines = capture_json_lines(&failed_job, LinePolicy::QuietJsonEvents)?;
     assert_eq!(failed_lines.len(), 1);
-    let failed_json: serde_json::Value = serde_json::from_str(failed_lines[0].trim_end())?;
-    assert!(failed_lines[0].ends_with('\n'));
-    let preparation_phase = failed_json["phases"]
-        .as_array()
-        .and_then(|phases| phases.iter().find(|phase| phase["phase"] == "preparation"))
+    let failed_line = failed_lines
+        .first()
+        .ok_or_else(|| std::io::Error::other("failure snapshot should be emitted"))?;
+    let failed_json: serde_json::Value = serde_json::from_str(failed_line.trim_end())?;
+    assert!(failed_line.ends_with('\n'));
+    let preparation_phase = failed_json
+        .get("phases")
+        .and_then(serde_json::Value::as_array)
+        .and_then(|phases| {
+            phases.iter().find(|phase| {
+                phase.get("phase").and_then(serde_json::Value::as_str) == Some("preparation")
+            })
+        })
         .ok_or_else(|| std::io::Error::other("preparation phase should be in the JSON snapshot"))?;
-    assert_eq!(preparation_phase["state"], "failed");
+    assert_eq!(
+        preparation_phase
+            .get("state")
+            .and_then(serde_json::Value::as_str),
+        Some("failed")
+    );
     Ok(())
 }
 
