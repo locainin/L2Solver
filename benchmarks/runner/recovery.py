@@ -13,6 +13,7 @@ from .process import DEFAULT_MAX_LOG_BYTES
 DEFAULT_MAX_OUTPUT_BYTES = 4 * 1024 * 1024 * 1024
 DEFAULT_MAX_MANIFEST_BYTES = 64 * 1024 * 1024
 PROFILES = ("fast", "normal", "deep")
+DEFAULT_MEMORY_LIMIT = "512MiB"
 SEARCH_PHASES = (
     "framing_record_discovery",
     "transform_discovery",
@@ -55,6 +56,8 @@ def build_extract_command(
         profile,
         "--progress",
         "json",
+        "--memory-limit",
+        DEFAULT_MEMORY_LIMIT,
     ]
     if jobs is not None:
         command.extend(("--jobs", str(jobs)))

@@ -1,4 +1,4 @@
-"""Measure cold, reused, recomputed, deep, interrupted, and resumed recovery."""
+"""Measure cold/warm reuse and optional deep, interrupted, and resumed recovery."""
 
 import argparse
 import json
@@ -23,6 +23,7 @@ from .runner.process import DEFAULT_MAX_LOG_BYTES, run_child, validate_timeout
 from .runner.recovery import (
     DEFAULT_MAX_MANIFEST_BYTES,
     DEFAULT_MAX_OUTPUT_BYTES,
+    DEFAULT_MEMORY_LIMIT,
     PROFILES,
     SEARCH_PHASES,
     ProgressWatcher,
@@ -285,6 +286,7 @@ def run_recovery_benchmark(
     run_id,
     catalogue_path=None,
     profile="normal",
+    scenario_set="full",
     jobs=None,
     strict_cache=False,
     timeout=DEFAULT_TIMEOUT_SECONDS,
@@ -299,6 +301,8 @@ def run_recovery_benchmark(
     validate_timeout(timeout)
     if profile not in PROFILES:
         raise ValueError("profile must be fast, normal, or deep")
+    if scenario_set not in ("full", "cold-warm"):
+        raise ValueError("scenario_set must be full or cold-warm")
     for label, value in (
         ("max_log_bytes", max_log_bytes),
         ("max_output_bytes", max_output_bytes),
@@ -376,6 +380,8 @@ def run_recovery_benchmark(
         },
         "conditions": {
             "timeout_seconds": timeout,
+            "memory_limit": DEFAULT_MEMORY_LIMIT,
+            "scenario_set": scenario_set,
             "max_log_bytes": max_log_bytes,
             "max_output_bytes": max_output_bytes,
             "max_manifest_bytes": max_manifest_bytes,
@@ -446,6 +452,13 @@ def run_recovery_benchmark(
         if not warm["same_output_identity_as_cold"]:
             raise RuntimeError("warm reuse changed the existing output identity")
         _write_report(report_path, report)
+
+        # The cold-warm set ends after the same-output reuse has been verified
+        if scenario_set == "cold-warm":
+            report["status"] = "complete"
+            report["finished_utc"] = datetime.now(UTC).isoformat()
+            _write_report(report_path, report)
+            return report
 
         warm_recompute = _phase_record(
             "warm_recompute",
@@ -601,6 +614,12 @@ def parse_arguments(arguments=None):
     )
     parser.add_argument("--run-id")
     parser.add_argument("--profile", choices=PROFILES, default="normal")
+    parser.add_argument(
+        "--scenario-set",
+        choices=("full", "cold-warm"),
+        default="full",
+        help="Run the complete scenario set or only cold and same-output warm reuse",
+    )
     parser.add_argument("--jobs", type=int)
     parser.add_argument("--strict-cache", action="store_true")
     parser.add_argument("--timeout", type=float, default=DEFAULT_TIMEOUT_SECONDS)
@@ -645,6 +664,7 @@ def main(arguments=None):
             run_id=run_id,
             catalogue_path=options.catalogue,
             profile=options.profile,
+            scenario_set=options.scenario_set,
             jobs=options.jobs,
             strict_cache=options.strict_cache,
             timeout=options.timeout,
