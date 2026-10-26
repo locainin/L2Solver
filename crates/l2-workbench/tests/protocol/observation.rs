@@ -485,7 +485,7 @@ fn length_hypotheses_use_canonical_offset_width_and_meaning_order() -> Result<()
     Ok(())
 }
 
-fn literal_input(
+const fn literal_input(
     sample: u64,
     bytes: &[u8],
     context: Option<MessageContext>,
@@ -510,11 +510,11 @@ fn context(source: &str, session: u64) -> MessageContext {
     }
 }
 
-fn range(start: usize, end: usize) -> ByteRange {
+const fn range(start: usize, end: usize) -> ByteRange {
     ByteRange { start, end }
 }
 
-fn length_hypothesis(
+const fn length_hypothesis(
     offset: usize,
     width: usize,
     byte_order: ByteOrder,
