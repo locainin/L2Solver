@@ -9,8 +9,12 @@ from pathlib import Path
 
 from .catalogue import read_json
 from .process import DEFAULT_MAX_LOG_BYTES
+from .recovery_acceptance import (
+    DEFAULT_MAX_RECOVERY_ARTIFACT_BYTES,
+    _valid_text,
+)
 
-DEFAULT_MAX_OUTPUT_BYTES = 4 * 1024 * 1024 * 1024
+DEFAULT_MAX_OUTPUT_BYTES = DEFAULT_MAX_RECOVERY_ARTIFACT_BYTES
 DEFAULT_MAX_MANIFEST_BYTES = 64 * 1024 * 1024
 PROFILES = ("fast", "normal", "deep")
 DEFAULT_MEMORY_LIMIT = "512MiB"
@@ -332,6 +336,57 @@ def _hash_regular_file(path, expected_stat):
     return digest.hexdigest()
 
 
+def _artifact_origins(manifest_artifact):
+    origins = []
+    provenance = manifest_artifact.get("provenance", [])
+    if not isinstance(provenance, list):
+        return origins
+
+    for reference in provenance:
+        if not isinstance(reference, dict):
+            continue
+        case_id = reference.get("case_id")
+        node = reference.get("node")
+        if not _valid_text(case_id, 256) or not isinstance(node, dict):
+            continue
+        node_id = node.get("id")
+        node_kind = node.get("kind")
+        blob_id = node.get("blob")
+        if type(node_id) is not int or not 0 < node_id <= 2**64 - 1:
+            continue
+        if not _valid_text(node_kind, 128):
+            continue
+        if (
+            not isinstance(blob_id, str)
+            or re.fullmatch(r"sha256:[0-9a-f]{64}", blob_id) is None
+        ):
+            continue
+
+        origin = {
+            "case_id": case_id,
+            "node_id": node_id,
+            "node_kind": node_kind,
+            "blob_id": blob_id,
+        }
+        if node_kind == "archive_member":
+            details = node.get("details")
+            if not isinstance(details, dict):
+                continue
+            parent_node_id = details.get("archive_node")
+            member_name = details.get("utf8_name")
+            if (
+                type(parent_node_id) is not int
+                or not 0 < parent_node_id <= 2**64 - 1
+                or not _valid_text(member_name, 4096)
+                or "\x00" in member_name
+            ):
+                continue
+            origin["parent_node_id"] = parent_node_id
+            origin["member_name"] = member_name
+        origins.append(origin)
+    return origins
+
+
 def validate_export_output(
     directory,
     *,
@@ -373,6 +428,7 @@ def validate_export_output(
         raise ValueError("export manifest has an invalid evidence byte count")
 
     artifacts_by_name = {}
+    origins_by_name = {}
     reserved_names = {"manifest.json", "summary.txt", "limitations.txt", evidence_name}
     for artifact in manifest["artifacts"]:
         if not isinstance(artifact, dict) or not _safe_name(artifact.get("file")):
@@ -386,6 +442,7 @@ def validate_export_output(
                 "export manifest lists a duplicate or reserved artifact path"
             )
         artifacts_by_name[name] = byte_length
+        origins_by_name[name] = _artifact_origins(artifact)
 
     required = {"manifest.json", "summary.txt", evidence_name, *artifacts_by_name}
     optional = {"limitations.txt"}
@@ -434,6 +491,7 @@ def validate_export_output(
             "file": name,
             "byte_length": artifacts_by_name[name],
             "sha256": artifact_hashes[name],
+            "origins": origins_by_name[name],
         }
         for name in sorted(artifacts_by_name)
     ]
