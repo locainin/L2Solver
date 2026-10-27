@@ -3,11 +3,16 @@ use super::{
     ArtifactCollection, ArtifactLimits, ArtifactProvenance, ArtifactSourceContext, EvidenceSidecar,
     artifact_collection::AddOutcome, collect_case_artifacts_with_context,
 };
-use flate2::read::MultiGzDecoder;
+use flate2::{Compression, read::MultiGzDecoder, write::GzEncoder};
 use l2_workbench::evidence::{Case, Edge, EvidenceStatus, SourceRange};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
-use std::{error::Error, fs, io::Read, path::Path};
+use std::{
+    error::Error,
+    fs,
+    io::{self, BufReader, Cursor, Read},
+    path::Path,
+};
 
 #[test]
 fn shared_artifact_keeps_resolvable_origins_from_distinct_cases() -> Result<(), Box<dyn Error>> {
@@ -419,6 +424,77 @@ fn evidence_budget_uses_physical_gzip_bytes_and_tracks_raw_bytes() -> Result<(),
 }
 
 #[test]
+fn repetitive_evidence_fits_a_tighter_budget_without_changing_the_v2_record()
+-> Result<(), Box<dyn Error>> {
+    let case = repetitive_case()?;
+    let scope = json!({"kind": "flow", "flow_id": 32});
+    let sizing_directory = tempfile::tempdir()?;
+    let mut sizing = EvidenceSidecar::new(sizing_directory.path(), u64::MAX)?;
+    let first = sizing.record_case(&case, &scope)?;
+    sizing.finish()?;
+    let raw = read_sidecar_bytes(&sizing_directory.path().join(SIDECAR_FILE_NAME))?;
+    let mut fast = GzEncoder::new(Vec::new(), Compression::fast());
+    io::copy(
+        &mut BufReader::with_capacity(64 * 1024, Cursor::new(&raw)),
+        &mut fast,
+    )?;
+    let fast_bytes = u64::try_from(fast.finish()?.len())?;
+    assert!(
+        first.compressed_bytes < fast_bytes,
+        "repeated provenance should use fewer bytes than fast gzip"
+    );
+
+    let empty_member_bytes = sizing.coverage().retained_bytes - first.compressed_bytes;
+    let budget = empty_member_bytes + fast_bytes - 1;
+    let budget_directory = tempfile::tempdir()?;
+    let mut budgeted = EvidenceSidecar::new(budget_directory.path(), budget)?;
+    let second = budgeted.record_case(&case, &scope)?;
+    budgeted.finish()?;
+    assert!(
+        second.retained,
+        "the complete Case should fit the tighter budget"
+    );
+    assert_eq!(second.case_id, first.case_id);
+    assert_eq!(second.encoded_bytes, u64::try_from(raw.len())?);
+    assert_eq!(budgeted.coverage().retained_cases, 1);
+    assert_eq!(budgeted.coverage().omitted_cases, 0);
+    assert_eq!(
+        budgeted.coverage().raw_retained_bytes,
+        u64::try_from(raw.len())?
+    );
+    assert_eq!(
+        budgeted.coverage().retained_bytes,
+        fs::metadata(budget_directory.path().join(SIDECAR_FILE_NAME))?.len()
+    );
+    assert_eq!(
+        read_sidecar_bytes(&budget_directory.path().join(SIDECAR_FILE_NAME))?,
+        raw
+    );
+
+    let records = read_sidecar(&budget_directory.path().join(SIDECAR_FILE_NAME))?;
+    let record = records.first().ok_or("retained Case is missing")?;
+    assert_eq!(record.get("scope"), Some(&scope));
+    assert_eq!(
+        record.get("sources"),
+        Some(&serde_json::to_value(case.sources())?)
+    );
+    assert_eq!(
+        record.get("nodes"),
+        Some(&serde_json::to_value(case.nodes())?)
+    );
+    assert_eq!(
+        record.get("edges"),
+        Some(&serde_json::to_value(case.edges())?)
+    );
+    assert_eq!(
+        record.get("limitations"),
+        Some(&serde_json::to_value(case.limitations())?)
+    );
+    assert_receipt_case(record)?;
+    Ok(())
+}
+
+#[test]
 fn evidence_budget_omits_a_whole_case_and_leaves_no_artifact_node_reference()
 -> Result<(), Box<dyn Error>> {
     let temporary = tempfile::tempdir()?;
@@ -488,6 +564,46 @@ fn case_with_receipt(output_bytes: &[u8]) -> Result<Case, Box<dyn Error>> {
         reason: String::from("receipt observes the retained output mapping"),
     })?;
     case.add_limitation("sample scope limitation")?;
+    Ok(case)
+}
+
+fn repetitive_case() -> Result<Case, Box<dyn Error>> {
+    let mut case = case_with_receipt(b"complete recovered artifact")?;
+    let source = case
+        .sources()
+        .first()
+        .ok_or("fixture source is missing")?
+        .id
+        .clone();
+    for index in 0..800_u64 {
+        let node = case.add_node(
+            "custom_protocol_frame",
+            None,
+            vec![SourceRange {
+                source: source.clone(),
+                packet: Some(index + 1),
+                offset: index,
+                length: 1,
+            }],
+            json!({
+                "frame_index": index,
+                "input_node": 1,
+                "framing_rule": {"kind": "fixed_size", "bytes": 1},
+                "stream_range": {"start": index, "end": index + 1},
+            }),
+        )?;
+        case.add_edge(Edge {
+            from: 1,
+            to: node,
+            relation: "candidate_framed_as".to_owned(),
+            status: if index % 2 == 0 {
+                EvidenceStatus::Hypothesis
+            } else {
+                EvidenceStatus::ConstraintFailed
+            },
+            reason: "the same framing rule describes each source range".to_owned(),
+        })?;
+    }
     Ok(case)
 }
 

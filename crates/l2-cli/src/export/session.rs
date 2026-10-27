@@ -25,6 +25,7 @@ pub(super) fn identity(
         settings: json!({
             "native_case_version": crate::workbench::full_source::NATIVE_CASE_VERSION,
             "evidence_encoding_version": super::evidence::ENCODING_VERSION,
+            "evidence_compression_policy": super::evidence::COMPRESSION_POLICY_VERSION,
             "transform_proposal_version": l2_workbench::recovery::proposals::TRANSFORM_PROPOSAL_FORMAT_VERSION,
             "profile": options.recovery.profile,
             "memory_limit": options.recovery.memory_limit,

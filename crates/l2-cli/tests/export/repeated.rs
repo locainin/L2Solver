@@ -30,6 +30,37 @@ fn identical_extraction_reuses_the_published_result() -> Result<(), Box<dyn Erro
 }
 
 #[test]
+fn older_evidence_compression_policy_does_not_reuse_the_published_result()
+-> Result<(), Box<dyn Error>> {
+    let temporary = tempfile::tempdir()?;
+    let root = temporary.path();
+    let capture = root.join("capture.pcap");
+    let destination = root.join("result");
+    fs::write(&capture, capture_with_http_body(BODY)?)?;
+    let first = extraction_command(root, &capture, &destination).output()?;
+    assert!(
+        matches!(first.status.code(), Some(0 | 3)),
+        "extraction failed: {}",
+        String::from_utf8_lossy(&first.stderr)
+    );
+
+    let manifest_path = destination.join("manifest.json");
+    let mut manifest: serde_json::Value = serde_json::from_slice(&fs::read(&manifest_path)?)?;
+    let settings = manifest
+        .pointer_mut("/l2solver_result/identity/settings")
+        .and_then(serde_json::Value::as_object_mut)
+        .ok_or("result settings are missing")?;
+    assert!(settings.remove("evidence_compression_policy").is_some());
+    fs::write(&manifest_path, serde_json::to_vec(&manifest)?)?;
+
+    let stale = extraction_command(root, &capture, &destination).output()?;
+    assert!(!stale.status.success());
+    assert!(String::from_utf8_lossy(&stale.stderr).contains("policy or algorithm version differs"));
+    assert!(!String::from_utf8_lossy(&stale.stdout).contains("Reused"));
+    Ok(())
+}
+
+#[test]
 fn warm_cached_extraction_matches_cold_and_uncached_outputs() -> Result<(), Box<dyn Error>> {
     let temporary = tempfile::tempdir()?;
     let root = temporary.path();

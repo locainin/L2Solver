@@ -18,6 +18,10 @@ use std::{
 
 pub(super) const SIDECAR_FILE_NAME: &str = "evidence.jsonl.gz";
 pub(super) const ENCODING_VERSION: u32 = 2;
+// Compression can change which whole Cases fit without changing the record format
+pub(super) const COMPRESSION_POLICY_VERSION: u32 = 1;
+// Level 3 reduces repeated evidence while retaining a fast streaming encoder
+const CASE_COMPRESSION_LEVEL: u32 = 3;
 const TEMP_FILE_PREFIX: &str = ".l2solver-evidence-case-";
 const RECORD_BUFFER_CAPACITY: usize = 64 * 1024;
 // The serialized first field prefix `{"case_id":"` occupies twelve bytes
@@ -226,7 +230,7 @@ fn compress_spool(
         .create_new(true)
         .open(compressed_path)?;
     let bounded_spool = BoundedSpoolWriter::new(compressed_file, maximum_stored_bytes);
-    let mut encoder = GzEncoder::new(bounded_spool, Compression::fast());
+    let mut encoder = GzEncoder::new(bounded_spool, Compression::new(CASE_COMPRESSION_LEVEL));
     io::copy(&mut raw, &mut encoder)?;
     let mut bounded_spool = encoder.finish()?;
     bounded_spool.flush()?;
