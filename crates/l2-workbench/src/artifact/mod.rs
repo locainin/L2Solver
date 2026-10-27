@@ -12,6 +12,7 @@ mod model;
 mod pe;
 mod png;
 mod png_pixels;
+mod png_stream;
 mod r2;
 mod range_analyzer;
 mod signatures;
@@ -60,6 +61,7 @@ pub use png_pixels::{
     MAX_PNG_PIXEL_WORK_BYTES, MAX_PNG_PIXELS, PngPixel, PngPixelDecodeError, PngPixelImage,
     PngPixelLimits, decode_png_pixels,
 };
+pub use png_stream::{PngRangeChunk, PngRangeReport, PngReadError, parse_png_from_reader};
 pub use r2::import_r2_json;
 pub use range_analyzer::analyze_artifacts_from_reader;
 pub use signatures::{

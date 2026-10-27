@@ -502,6 +502,11 @@ const fn classify_png_error<'a>(
             input_range,
             reason: ArtifactResourceOmissionReason::PngChunkLimit { maximum },
         },
+        PngError::AllocationFailure => ArtifactValidationOutcome::Omitted {
+            format: Some(format),
+            input_range,
+            reason: ArtifactResourceOmissionReason::AllocationFailure,
+        },
         PngError::InvalidLimits => ArtifactValidationOutcome::Omitted {
             format: Some(format),
             input_range,

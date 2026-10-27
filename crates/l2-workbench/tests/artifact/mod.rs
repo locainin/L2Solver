@@ -7,6 +7,7 @@ mod inspect;
 mod limits;
 mod png;
 mod png_pixels;
+mod png_stream;
 mod r2;
 mod range_analysis;
 mod rgb_reachability;

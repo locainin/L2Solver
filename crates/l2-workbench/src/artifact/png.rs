@@ -7,7 +7,6 @@ pub const PNG_SIGNATURE: [u8; 8] = [137, 80, 78, 71, 13, 10, 26, 10];
 
 const MAX_PNG_BYTES: usize = 16 * 1024 * 1024;
 const MAX_PNG_CHUNKS: usize = 65_536;
-const IHDR_LENGTH: usize = 13;
 
 /// Input and metadata limits for one PNG structural scan
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -99,6 +98,8 @@ impl<'a> PngReport<'a> {
 pub enum PngError {
     /// The parser received invalid or zero-valued resource limits
     InvalidLimits,
+    /// Bounded chunk metadata could not be allocated
+    AllocationFailure,
     /// The input exceeded its configured size ceiling
     InputTooLarge { length: usize, maximum: usize },
     /// The required eight-byte PNG signature was missing
@@ -127,6 +128,7 @@ impl fmt::Display for PngError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::InvalidLimits => formatter.write_str("PNG parser limits must be positive"),
+            Self::AllocationFailure => formatter.write_str("PNG chunk metadata allocation failed"),
             Self::InputTooLarge { length, maximum } => {
                 write!(
                     formatter,
@@ -163,155 +165,42 @@ impl std::error::Error for PngError {}
 /// Returns an error for malformed signatures, chunk boundaries, type codes,
 /// checksums, the checked IHDR/IEND boundaries, or exceeded limits
 pub fn parse_png(bytes: &[u8], limits: PngLimits) -> Result<PngReport<'_>, PngError> {
-    validate_limits(bytes, limits)?;
-
-    if bytes.get(..PNG_SIGNATURE.len()) != Some(PNG_SIGNATURE.as_slice()) {
-        return Err(PngError::InvalidSignature);
-    }
-
+    let mut reader = std::io::Cursor::new(bytes);
+    let parsed = super::png_stream::parse_png_from_reader(&mut reader, bytes.len(), limits)
+        .map_err(|error| match error {
+            super::png_stream::PngReadError::Format(error) => error,
+            super::png_stream::PngReadError::Io(_) => PngError::TruncatedChunk,
+        })?;
     let mut chunks = Vec::new();
-    let mut cursor = PNG_SIGNATURE.len();
-
-    loop {
-        if cursor == bytes.len() {
-            return Err(PngError::MissingIend);
-        }
-        if chunks.len() >= limits.max_chunks {
-            return Err(PngError::TooManyChunks {
-                maximum: limits.max_chunks,
-            });
-        }
-
-        let (chunk, chunk_end) = parse_chunk(bytes, cursor, chunks.is_empty())?;
-        let is_iend = chunk.type_code == *b"IEND";
-        chunks.push(chunk);
-
-        if is_iend {
-            let bytes_after_iend = bytes.get(chunk_end..).ok_or(PngError::TruncatedChunk)?;
-            return Ok(PngReport {
-                chunks,
-                bytes_after_iend,
-                bytes_after_iend_range: FileRange {
-                    offset: chunk_end,
-                    length: bytes_after_iend.len(),
-                },
-            });
-        }
-
-        cursor = chunk_end;
-    }
-}
-
-fn parse_chunk(
-    bytes: &[u8],
-    cursor: usize,
-    is_first_chunk: bool,
-) -> Result<(PngChunk<'_>, usize), PngError> {
-    // A chunk starts with a big-endian payload length followed by four type bytes
-    let length = read_u32(bytes, cursor)?;
-    let length_usize = usize::try_from(length).map_err(|_| PngError::TruncatedChunk)?;
-    let type_offset = cursor.checked_add(4).ok_or(PngError::TruncatedChunk)?;
-    let payload_offset = type_offset.checked_add(4).ok_or(PngError::TruncatedChunk)?;
-    let payload_end = payload_offset
-        .checked_add(length_usize)
-        .ok_or(PngError::TruncatedChunk)?;
-    let crc_offset = payload_end;
-    let chunk_end = crc_offset.checked_add(4).ok_or(PngError::TruncatedChunk)?;
-
-    // Every field range is checked before it is borrowed or read
-    let type_slice = bytes
-        .get(type_offset..payload_offset)
-        .ok_or(PngError::TruncatedChunk)?;
-    let type_code: [u8; 4] = type_slice
-        .try_into()
-        .map_err(|_| PngError::TruncatedChunk)?;
-    validate_type_code(type_code)?;
-    let payload = bytes
-        .get(payload_offset..payload_end)
-        .ok_or(PngError::TruncatedChunk)?;
-    let stored_crc32 = read_u32(bytes, crc_offset)?;
-
-    // PNG CRC covers the type and payload, but excludes length and stored CRC
-    let mut checksum = crc32fast::Hasher::new();
-    checksum.update(&type_code);
-    checksum.update(payload);
-    if checksum.finalize() != stored_crc32 {
-        return Err(PngError::InvalidChecksum { type_code });
-    }
-
-    // IHDR is the single required first chunk; IEND closes the parsed stream
-    if is_first_chunk {
-        if type_code != *b"IHDR" {
-            return Err(PngError::IhdrNotFirst);
-        }
-        if length_usize != IHDR_LENGTH {
-            return Err(PngError::InvalidIhdrLength);
-        }
-    } else if type_code == *b"IHDR" {
-        return Err(PngError::RepeatedIhdr);
-    }
-
-    if type_code == *b"IEND" && length_usize != 0 {
-        return Err(PngError::InvalidIendLength);
-    }
-
-    let chunk = PngChunk {
-        type_code,
-        chunk_range: FileRange {
-            offset: cursor,
-            length: chunk_end - cursor,
-        },
-        length_range: FileRange {
-            offset: cursor,
-            length: 4,
-        },
-        type_range: FileRange {
-            offset: type_offset,
-            length: 4,
-        },
-        payload_range: FileRange {
-            offset: payload_offset,
-            length: length_usize,
-        },
-        crc_range: FileRange {
-            offset: crc_offset,
-            length: 4,
-        },
-        payload,
-        stored_crc32,
-    };
-
-    Ok((chunk, chunk_end))
-}
-
-const fn validate_limits(bytes: &[u8], limits: PngLimits) -> Result<(), PngError> {
-    if limits.max_input_bytes == 0 || limits.max_chunks == 0 {
-        return Err(PngError::InvalidLimits);
-    }
-    if bytes.len() > limits.max_input_bytes {
-        return Err(PngError::InputTooLarge {
-            length: bytes.len(),
-            maximum: limits.max_input_bytes,
+    chunks
+        .try_reserve_exact(parsed.chunks.len())
+        .map_err(|_| PngError::AllocationFailure)?;
+    for chunk in parsed.chunks {
+        let end = chunk
+            .payload_range
+            .offset
+            .checked_add(chunk.payload_range.length)
+            .ok_or(PngError::TruncatedChunk)?;
+        let payload = bytes
+            .get(chunk.payload_range.offset..end)
+            .ok_or(PngError::TruncatedChunk)?;
+        chunks.push(PngChunk {
+            type_code: chunk.type_code,
+            chunk_range: chunk.chunk_range,
+            length_range: chunk.length_range,
+            type_range: chunk.type_range,
+            payload_range: chunk.payload_range,
+            crc_range: chunk.crc_range,
+            payload,
+            stored_crc32: chunk.stored_crc32,
         });
     }
-    Ok(())
-}
-
-fn validate_type_code(type_code: [u8; 4]) -> Result<(), PngError> {
-    let [first, second, third, fourth] = type_code;
-    if ![first, second, third, fourth]
-        .iter()
-        .all(u8::is_ascii_alphabetic)
-        || !third.is_ascii_uppercase()
-    {
-        return Err(PngError::InvalidChunkType { type_code });
-    }
-    Ok(())
-}
-
-fn read_u32(bytes: &[u8], offset: usize) -> Result<u32, PngError> {
-    let end = offset.checked_add(4).ok_or(PngError::TruncatedChunk)?;
-    let raw = bytes.get(offset..end).ok_or(PngError::TruncatedChunk)?;
-    let array: [u8; 4] = raw.try_into().map_err(|_| PngError::TruncatedChunk)?;
-    Ok(u32::from_be_bytes(array))
+    let bytes_after_iend = bytes
+        .get(parsed.bytes_after_iend_range.offset..)
+        .ok_or(PngError::TruncatedChunk)?;
+    Ok(PngReport {
+        chunks,
+        bytes_after_iend,
+        bytes_after_iend_range: parsed.bytes_after_iend_range,
+    })
 }

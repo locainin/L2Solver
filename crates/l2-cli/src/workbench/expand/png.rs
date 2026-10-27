@@ -33,6 +33,10 @@ pub(super) fn expand(
             )?;
             return Ok(());
         }
+        Err(PngError::AllocationFailure) => {
+            expansion.omit(item.node, "png_allocation_failure", &json!({}))?;
+            return Ok(());
+        }
         // Invalid parser configuration is a service failure, not a rejected candidate
         Err(error @ PngError::InvalidLimits) => {
             return Err(ExpansionError::invariant(error));
