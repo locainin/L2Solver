@@ -1,5 +1,6 @@
 use super::super::case_scan::{ScanAdmission, case_scan_work_bounds, preflight_scan};
 use super::super::derived_discovery::DerivedFramingCohort;
+use super::super::diagnostics::{record_cohort_enqueue, record_cohort_omission};
 use super::super::evidence::case_evidence_quota;
 use super::super::{
     Executor, RecoveryCandidateId, RecoveryExecutionError, RecoveryOmission, RecoveryStage,
@@ -7,7 +8,7 @@ use super::super::{
 };
 use super::input::{FramingInput, collect_plan};
 use super::work::work_bound;
-use l2_workbench::evidence::Case;
+use l2_workbench::{evidence::Case, job::RecoveryTransitionStage};
 use l2_workbench::{
     protocol::{
         ByteRange as StreamRange, ByteRunSample, Direction, FramingBootstrapExecution,
@@ -123,6 +124,19 @@ impl Executor<'_> {
             }
         }
         for (source_id, omission) in &plan.omissions {
+            for (reason, count) in &omission.counts {
+                let input_node_id = omission
+                    .example
+                    .and_then(|(id, example_reason)| (example_reason == *reason).then_some(id));
+                record_cohort_omission(
+                    self,
+                    RecoveryTransitionStage::Framing,
+                    source_id.as_deref(),
+                    input_node_id,
+                    *count,
+                    reason,
+                )?;
+            }
             if omission.total > 0 {
                 self.omissions
                     .push(RecoveryOmission::FramingDiscoveryInputs {
@@ -189,6 +203,13 @@ impl Executor<'_> {
                 EnqueueOutcome::ResourceExhausted { .. } => None,
             };
             self.record_enqueue(result, &task, &node_ids)?;
+            record_cohort_enqueue(
+                self,
+                RecoveryTransitionStage::Framing,
+                &cohort_key.source_id,
+                &node_ids,
+                result,
+            )?;
             if let Some(candidate_id) = candidate_id {
                 self.framing_discoveries.insert(
                     candidate_id,

@@ -30,3 +30,28 @@ pub(super) fn deserialize<'de, D: Deserializer<'de>>(
     }
     deserializer.deserialize_str(DigestVisitor)
 }
+
+pub(super) mod optional {
+    use serde::{Deserialize, Deserializer, Serialize, Serializer};
+
+    #[derive(Deserialize, Serialize)]
+    #[serde(transparent)]
+    struct Digest(#[serde(with = "super")] [u8; 32]);
+
+    #[expect(
+        clippy::ref_option,
+        reason = "Serde passes optional fields by reference"
+    )]
+    pub(in crate::job::recovery_transition) fn serialize<S: Serializer>(
+        value: &Option<[u8; 32]>,
+        serializer: S,
+    ) -> Result<S::Ok, S::Error> {
+        value.map(Digest).serialize(serializer)
+    }
+
+    pub(in crate::job::recovery_transition) fn deserialize<'de, D: Deserializer<'de>>(
+        deserializer: D,
+    ) -> Result<Option<[u8; 32]>, D::Error> {
+        Option::<Digest>::deserialize(deserializer).map(|value| value.map(|digest| digest.0))
+    }
+}

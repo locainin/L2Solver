@@ -7,6 +7,7 @@ use crate::result_directory::{ResultDirectory, ResultIdentity, ResultKind};
 
 type TestResult<T = ()> = Result<T, Box<dyn Error>>;
 
+mod publication_transition;
 mod publish;
 
 struct Fixture {

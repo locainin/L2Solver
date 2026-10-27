@@ -46,10 +46,18 @@ impl InputOmissionKind {
 pub(super) struct FramingInputOmissions {
     pub(super) counts: BTreeMap<&'static str, usize>,
     pub(super) total: usize,
+    pub(super) example: Option<(u64, &'static str)>,
 }
 
 impl FramingInputOmissions {
-    fn record(&mut self, kind: InputOmissionKind) -> Result<(), RecoveryExecutionError> {
+    fn record(
+        &mut self,
+        kind: InputOmissionKind,
+        node_id: u64,
+    ) -> Result<(), RecoveryExecutionError> {
+        if self.example.is_none() {
+            self.example = Some((node_id, kind.name()));
+        }
         let count = self.counts.entry(kind.name()).or_default();
         *count = count.checked_add(1).ok_or_else(graph_work_overflow)?;
         self.total = self.total.checked_add(1).ok_or_else(graph_work_overflow)?;
@@ -219,11 +227,12 @@ impl FramingDiscoveryPlan {
         &mut self,
         source_id: Option<&str>,
         kind: InputOmissionKind,
+        node_id: u64,
     ) -> Result<(), RecoveryExecutionError> {
         self.omissions
             .entry(source_id.map(str::to_owned))
             .or_default()
-            .record(kind)
+            .record(kind, node_id)
     }
 }
 
@@ -264,7 +273,7 @@ pub(in crate::workbench::recovery_executor) fn collect_plan(
         match collect_tcp_run(node, &node_by_id, &blobs, &ancestry, limits) {
             Ok((key, input)) => plan.cohorts.entry(key).or_default().push(input),
             Err((source_id, reason)) => {
-                plan.record_omission(source_id.as_deref(), reason)?;
+                plan.record_omission(source_id.as_deref(), reason, node.id)?;
             }
         }
     }
@@ -551,7 +560,7 @@ fn sort_and_cap_cohorts(
                 None
             };
             if let Some(reason) = reason {
-                capped_omissions.push((reason, input.source_id));
+                capped_omissions.push((reason, input.source_id, input.node_id));
                 continue;
             }
             retained = next_count.ok_or_else(graph_work_overflow)?;
@@ -560,8 +569,8 @@ fn sort_and_cap_cohorts(
         }
         *inputs = kept;
     }
-    for (reason, source_id) in capped_omissions {
-        plan.record_omission(Some(&source_id), reason)?;
+    for (reason, source_id, node_id) in capped_omissions {
+        plan.record_omission(Some(&source_id), reason, node_id)?;
     }
     Ok(())
 }

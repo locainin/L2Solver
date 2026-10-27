@@ -1,5 +1,9 @@
 use super::{ResultDirectory, ResultIdentity, ResultKind, manifest, stamp::OutputFileStamp};
 use l2_workbench::job::{Job, Phase, PhaseOutcome, cache::SourceIdentity};
+use l2_workbench::job::{
+    RecoveryArtifactSample, RecoveryPublicationSample, RecoveryPublicationSourceBasis,
+    RecoveryTransitionOutcome,
+};
 use std::{cell::Cell, error::Error, io, path::Path};
 
 pub(super) fn publish<T>(
@@ -9,7 +13,18 @@ pub(super) fn publish<T>(
     writer: impl FnOnce(&Path) -> Result<T, Box<dyn Error>>,
 ) -> Result<T, Box<dyn Error>> {
     let super::ResultDirectory { path, kind, state } = directory;
+    let capture = PublicationCapture {
+        started: Cell::new(false),
+        sample: Cell::new(crate::publication_transition::initial_sample(Some(
+            &identity.source,
+        ))),
+    };
     if kind != identity.kind {
+        crate::publication_transition::record(
+            job,
+            RecoveryTransitionOutcome::PublicationFailed,
+            capture.sample.get(),
+        );
         return Err(manifest::actionable_conflict(
             "result identity uses a different workflow than the inspected destination",
         )
@@ -19,18 +34,12 @@ pub(super) fn publish<T>(
 
     let mut writer = Some(writer);
     let mut value = None;
-    let publication_started = Cell::new(false);
     let write_stage = |staging: &Path| -> Result<(), Box<dyn Error>> {
         let write = writer
             .take()
             .ok_or_else(|| io::Error::other("result writer was already consumed"))?;
         value = Some(write_result_stage(
-            staging,
-            kind,
-            identity,
-            job,
-            write,
-            &publication_started,
+            staging, kind, identity, job, write, &capture,
         )?);
         Ok(())
     };
@@ -46,13 +55,21 @@ pub(super) fn publish<T>(
         }
         manifest::DirectoryState::Legacy { prepared }
         | manifest::DirectoryState::Owned { prepared, .. } => {
-            prepared.check_location()?;
+            if let Err(error) = prepared.check_location() {
+                crate::publication_transition::record(
+                    job,
+                    RecoveryTransitionOutcome::PublicationFailed,
+                    capture.sample.get(),
+                );
+                return Err(Box::new(error));
+            }
             crate::publish::replace_directory_with_precommit(&prepared, write_stage, before_commit)
         }
     };
 
+    crate::publication_transition::record_result(job, &publication, capture.sample.get());
     if let Err(error) = publication {
-        if publication_started.get() {
+        if capture.started.get() {
             let outcome = if job.is_cancelled() {
                 PhaseOutcome::Cancelled
             } else {
@@ -66,19 +83,24 @@ pub(super) fn publish<T>(
     value.ok_or_else(|| io::Error::other("result writer completed without a value").into())
 }
 
+struct PublicationCapture {
+    started: Cell<bool>,
+    sample: Cell<RecoveryPublicationSample>,
+}
+
 fn write_result_stage<T>(
     staging: &Path,
     kind: ResultKind,
     identity: &ResultIdentity,
     job: &Job,
     write: impl FnOnce(&Path) -> Result<T, Box<dyn Error>>,
-    publication_started: &Cell<bool>,
+    capture: &PublicationCapture,
 ) -> Result<T, Box<dyn Error>> {
     let result = write(staging)?;
     // Mark publication only after the writer has produced all user-visible files
     job.check_cancelled()?;
     job.start(Phase::Publication, None)?;
-    publication_started.set(true);
+    capture.started.set(true);
     let snapshot = job.snapshot()?;
 
     let parsed = manifest::parse_staged_manifest(staging, kind)?;
@@ -99,6 +121,35 @@ fn write_result_stage<T>(
             )
         })
         .collect::<io::Result<Vec<_>>>()?;
+    let artifact = parsed.artifacts.first().and_then(|artifact| {
+        output_files
+            .iter()
+            .find(|stamp| stamp.file == artifact.file)
+            .and_then(|stamp| {
+                stamp
+                    .sha256
+                    .as_deref()
+                    .and_then(l2_workbench::parse_sha256_digest)
+                    .map(|sha256| RecoveryArtifactSample {
+                        sha256,
+                        byte_length: stamp.byte_length,
+                    })
+            })
+    });
+    let source_set_sha256 = l2_workbench::parse_sha256_digest(&parsed.source_identity_sha256);
+    capture.sample.set(RecoveryPublicationSample {
+        source_set_sha256,
+        source_basis: if source_set_sha256.is_some() {
+            RecoveryPublicationSourceBasis::StagedManifest
+        } else {
+            RecoveryPublicationSourceBasis::Unavailable
+        },
+        artifact,
+        artifact_count: Some(
+            u64::try_from(parsed.artifacts.len())
+                .map_err(|_| io::Error::other("artifact count overflowed"))?,
+        ),
+    });
     let receipt = manifest::ResultReceipt {
         schema_version: 1,
         identity: identity.clone(),

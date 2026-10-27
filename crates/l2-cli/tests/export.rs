@@ -2001,6 +2001,70 @@ fn stdin_reports_tshark_omission() -> Result<(), Box<dyn Error>> {
 }
 
 #[test]
+fn stdin_publication_transition_reports_the_exact_source_and_staged_artifact()
+-> Result<(), Box<dyn Error>> {
+    let temporary = tempfile::tempdir()?;
+    let capture = capture_with_http_body(BODY)?;
+    let destination = temporary.path().join("stdin-publication");
+    let mut child = Command::new(env!("CARGO_BIN_EXE_l2solver"))
+        .args(["extract", "-", "--output"])
+        .arg(&destination)
+        .args(["--progress", "json"])
+        .env("PATH", temporary.path())
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()?;
+    child
+        .stdin
+        .take()
+        .ok_or("child standard input is unavailable")?
+        .write_all(&capture)?;
+    let output = child.wait_with_output()?;
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let snapshots = String::from_utf8(output.stderr)?;
+    let last = snapshots
+        .lines()
+        .last()
+        .ok_or("final progress snapshot is missing")?;
+    let snapshot: serde_json::Value = serde_json::from_str(last)?;
+    let records = snapshot
+        .pointer("/recovery_transitions/records")
+        .and_then(serde_json::Value::as_array)
+        .ok_or("publication records are missing")?;
+    let record = records
+        .iter()
+        .find(|record| {
+            record.get("stage").and_then(serde_json::Value::as_str) == Some("publication")
+                && record.get("outcome").and_then(serde_json::Value::as_str) == Some("published")
+        })
+        .ok_or("published transition is missing")?;
+    assert_eq!(
+        record
+            .pointer("/sample/detail/source_basis")
+            .and_then(serde_json::Value::as_str),
+        Some("staged_manifest")
+    );
+    assert_eq!(
+        record
+            .pointer("/sample/detail/source_set_sha256")
+            .and_then(serde_json::Value::as_str),
+        Some(l2_workbench::sha256(&capture).as_str())
+    );
+    assert_eq!(
+        record
+            .pointer("/sample/detail/artifact/sha256")
+            .and_then(serde_json::Value::as_str),
+        Some(l2_workbench::sha256(BODY).as_str())
+    );
+    Ok(())
+}
+
+#[test]
 fn fragmented_packet_scope() -> Result<(), Box<dyn Error>> {
     let temporary = tempfile::tempdir()?;
     let capture = temporary.path().join("mixed-flow.pcap");

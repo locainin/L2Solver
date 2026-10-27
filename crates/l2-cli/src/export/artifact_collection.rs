@@ -1,6 +1,9 @@
 //! Disk-backed artifact files, exact-byte indexes, and streamed provenance
 
-use l2_workbench::evidence::{Node, SourceRange};
+use l2_workbench::{
+    evidence::{Node, SourceRange},
+    job::RecoveryArtifactSample,
+};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::{
@@ -363,6 +366,32 @@ impl ArtifactCollection {
 
     pub(super) const fn coverage(&self) -> ArtifactCoverage {
         self.coverage
+    }
+
+    pub(super) fn first_artifact_sample(
+        &self,
+    ) -> Result<Option<RecoveryArtifactSample>, Box<dyn Error>> {
+        // Read one bounded index row rather than loading the artifact inventory
+        const MAX_INDEX_ROW_BYTES: u64 = 4_096;
+        let file = File::open(&self.ordered_records_path)?;
+        let mut reader = BufReader::new(file).take(MAX_INDEX_ROW_BYTES + 1);
+        let mut line = String::new();
+        if reader.read_line(&mut line)? == 0 {
+            return Ok(None);
+        }
+        if u64::try_from(line.len())? > MAX_INDEX_ROW_BYTES || !line.ends_with('\n') {
+            return Err(invalid("artifact index row is incomplete or too large").into());
+        }
+        let record: IndexedArtifact = serde_json::from_str(line.trim_end())?;
+        let sha256 = record
+            .bucket_name
+            .split_once('-')
+            .and_then(|(_, digest)| l2_workbench::parse_sha256_digest(digest))
+            .ok_or_else(|| invalid("artifact index has no valid content digest"))?;
+        Ok(Some(RecoveryArtifactSample {
+            sha256,
+            byte_length: record.byte_length,
+        }))
     }
 
     pub(super) fn file_names(

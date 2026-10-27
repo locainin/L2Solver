@@ -2,7 +2,9 @@ use super::super::{JobProgress, RecoveryPlan, execute_internal, normal_policy};
 use super::{TestResult, add_unframed_sessions, capture, decode_report};
 use l2_workbench::{
     evidence::Case,
-    job::{Counter, Job, RecoveryTransitionOutcome, RecoveryTransitionStage},
+    job::{
+        Counter, Job, RecoveryTransitionOutcome, RecoveryTransitionSample, RecoveryTransitionStage,
+    },
     protocol::FramingKind,
     recovery::{RecoveryCandidateState, RecoveryResult, RecoveryTask},
 };
@@ -123,6 +125,13 @@ fn assert_pipeline_progress(case: &Case, job: &Job) -> TestResult<()> {
         "only committed parser input applications are counted, including repeated schema trials"
     );
     let records = snapshot.recovery_transitions.records();
+    assert!(
+        records
+            .iter()
+            .any(|record| record.stage() == RecoveryTransitionStage::Schema
+                && record.outcome() == RecoveryTransitionOutcome::LearningSampleOmitted),
+        "bounded learning samples are reported separately from input eligibility failures"
+    );
     for (stage, disposition) in [
         (
             RecoveryTransitionStage::Framing,
@@ -145,9 +154,9 @@ fn assert_pipeline_progress(case: &Case, job: &Job) -> TestResult<()> {
             .iter()
             .find(|record| record.stage() == stage && record.outcome() == disposition)
             .ok_or("expected observed pipeline transition is missing")?;
-        let sample = observed
-            .sample()
-            .ok_or("candidate transition must retain a bounded evidence reference")?;
+        let Some(RecoveryTransitionSample::Candidate(sample)) = observed.sample() else {
+            return Err("candidate transition must retain a bounded evidence reference".into());
+        };
         let node = case
             .node(sample.input_node_id)
             .ok_or("transition input node is missing")?;
@@ -306,9 +315,9 @@ fn partially_rejected_record_batches_preserve_exact_input_contradictions() -> Te
                 && record.outcome() == RecoveryTransitionOutcome::InputContradicted
         })
         .ok_or("a rejected input from a partly successful batch must be reported")?;
-    let sample = rejection
-        .sample()
-        .ok_or("rejected input sample is missing")?;
+    let Some(RecoveryTransitionSample::Candidate(sample)) = rejection.sample() else {
+        return Err("rejected input sample is missing".into());
+    };
     assert!(outcome.omissions.iter().any(|omission| matches!(omission,
         super::super::RecoveryOmission::RecordInputRejected { input_node_id, .. } if *input_node_id == sample.input_node_id)));
     let node = case
@@ -442,4 +451,84 @@ fn alternative_schema() -> l2_workbench::protocol::RecordSchema {
         sequence_base: 0,
         terminal_sequence: None,
     }
+}
+
+#[test]
+fn record_cohort_events_bind_admitted_and_omitted_frames_to_their_source() -> TestResult<()> {
+    use super::{add_materialized_session, add_unmaterialized_frame, record, recovery_plan};
+    use l2_workbench::job::{RecoveryCohortReason, RecoveryTransitionSample};
+    let mut case = Case::new();
+    let source = capture(&mut case, "record-cohort-transitions")?;
+    let messages = [record(b"abc", 1, b"hello"), record(b"abc", 2, b"world")];
+    let session = add_materialized_session(
+        &mut case,
+        &source,
+        "cohort",
+        10,
+        0,
+        &messages,
+        &FramingKind::FixedSize { bytes: 14 },
+    )?;
+    let omitted = add_unmaterialized_frame(
+        &mut case,
+        &source,
+        30,
+        Some(serde_json::json!({"kind":"caller_supplied"})),
+    )?;
+    let policy = normal_policy(&case)?;
+    let job = Job::new("record cohort transitions");
+    let progress = JobProgress::new(job.clone());
+    execute_internal(&mut case, &recovery_plan(), &policy, true, Some(&progress))?;
+    let snapshot = job.snapshot()?;
+    let source_digest = source
+        .strip_prefix("sha256:")
+        .and_then(l2_workbench::parse_sha256_digest)
+        .ok_or("invalid source identity")?;
+    for (outcome, expected_node, reason) in [
+        (
+            RecoveryTransitionOutcome::CohortAdmitted,
+            *session
+                .frame_nodes
+                .first()
+                .ok_or("missing admitted frame")?,
+            RecoveryCohortReason::Admitted,
+        ),
+        (
+            RecoveryTransitionOutcome::CohortOmitted,
+            omitted,
+            RecoveryCohortReason::MissingMaterializationReceipt,
+        ),
+    ] {
+        let record = snapshot
+            .recovery_transitions
+            .records()
+            .iter()
+            .find(|record| {
+                record.stage() == RecoveryTransitionStage::Schema && record.outcome() == outcome
+            })
+            .ok_or("record cohort transition is missing")?;
+        let Some(RecoveryTransitionSample::Cohort(sample)) = record.sample() else {
+            return Err("record cohort source sample is missing".into());
+        };
+        assert_eq!(sample.source_sha256, Some(source_digest));
+        assert_eq!(sample.input_node_id, Some(expected_node));
+        assert_eq!(sample.reason, reason);
+        if outcome == RecoveryTransitionOutcome::CohortAdmitted {
+            assert!(sample.candidate_index.is_some());
+            assert!(sample.input_batch_sha256.is_some());
+            assert!(sample.task_sha256.is_some());
+        } else {
+            assert_eq!(sample.candidate_index, None);
+        }
+        let node = case
+            .node(expected_node)
+            .ok_or("cohort input node is missing")?;
+        let digest = node
+            .blob
+            .as_deref()
+            .and_then(|blob| blob.strip_prefix("sha256:"))
+            .and_then(l2_workbench::parse_sha256_digest);
+        assert_eq!(sample.input_blob_sha256, digest);
+    }
+    Ok(())
 }

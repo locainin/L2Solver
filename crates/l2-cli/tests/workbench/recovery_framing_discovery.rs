@@ -1839,3 +1839,6 @@ fn default_recovery_uses_typed_framing_survivors_when_report_details_are_compact
     }));
     Ok(())
 }
+
+#[path = "recovery_framing_cohort_transitions.rs"]
+mod cohort_transitions;

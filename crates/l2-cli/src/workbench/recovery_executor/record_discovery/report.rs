@@ -1,4 +1,5 @@
 use super::super::case_scan::{ScanAdmission, case_scan_work_bounds, preflight_scan};
+use super::super::diagnostics::{record_cohort_enqueue, record_cohort_omission};
 use super::super::discovery::OrderedUnique;
 use super::super::evidence::{add_transaction_links, case_evidence_quota};
 use super::super::{
@@ -14,6 +15,7 @@ use super::input::{
 use super::work::cohort_work_bound;
 use l2_workbench::{
     evidence::Case,
+    job::RecoveryTransitionStage,
     protocol::{
         RecordDiscoveryPartition, RecordSchema, RecordSchemaDiscoveryReport,
         RecordSchemaMultiStrategyAnalysisReport, RecordSchemaProposalReport,
@@ -342,6 +344,22 @@ impl Executor<'_> {
         derived_parents: Option<&HashMap<u64, RecoveryCandidateId>>,
     ) -> Result<(), RecoveryExecutionError> {
         for (source_id, omission) in &plan.omissions {
+            for (reason, count) in &omission.reason_counts {
+                let input_node_id = omission
+                    .examples
+                    .iter()
+                    .find(|example| example.get("reason").and_then(Value::as_str) == Some(*reason))
+                    .and_then(|example| example.get("frame_node_id"))
+                    .and_then(Value::as_u64);
+                record_cohort_omission(
+                    self,
+                    RecoveryTransitionStage::Schema,
+                    source_id.as_deref(),
+                    input_node_id,
+                    *count,
+                    reason,
+                )?;
+            }
             if omission.total > 0 {
                 self.omissions
                     .push(RecoveryOmission::RecordDiscoveryInputs {
@@ -433,14 +451,15 @@ impl Executor<'_> {
                 self.coordinator
                     .enqueue_nodes(self.case, &node_ids, task.clone())?
             };
-            let candidate_id = match &result {
-                EnqueueOutcome::Queued(id)
-                | EnqueueOutcome::Merged(id)
-                | EnqueueOutcome::MergedNeedsContext(id) => Some(*id),
-                EnqueueOutcome::CycleSkipped { candidate_id } => Some(*candidate_id),
-                EnqueueOutcome::ResourceExhausted { .. } => None,
-            };
+            let candidate_id = super::super::scheduler::enqueue_candidate_id(&result);
             self.record_enqueue(result, &task, &node_ids)?;
+            record_cohort_enqueue(
+                self,
+                RecoveryTransitionStage::Schema,
+                &key.source_id,
+                &node_ids,
+                result,
+            )?;
             if let Some(candidate_id) = candidate_id {
                 let omitted_frames = plan
                     .cohort_omitted_frames
@@ -649,6 +668,13 @@ impl Executor<'_> {
             EnqueueOutcome::ResourceExhausted { .. } => None,
         };
         self.record_enqueue(outcome, &task, &node_ids)?;
+        record_cohort_enqueue(
+            self,
+            RecoveryTransitionStage::Schema,
+            &context.key.source_id,
+            &node_ids,
+            outcome,
+        )?;
         if let Some(candidate_id) = candidate_id {
             let mut later = context;
             later.inputs = inputs;

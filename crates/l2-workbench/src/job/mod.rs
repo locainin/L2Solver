@@ -17,7 +17,8 @@ pub use model::{
 };
 
 pub use recovery_transition::{
-    RecoveryTransition, RecoveryTransitionOutcome, RecoveryTransitionRecord,
-    RecoveryTransitionSample, RecoveryTransitionSourceRange, RecoveryTransitionStage,
-    RecoveryTransitionSummary,
+    RecoveryArtifactSample, RecoveryCandidateSample, RecoveryCohortReason, RecoveryCohortSample,
+    RecoveryPublicationSample, RecoveryPublicationSourceBasis, RecoveryTransition,
+    RecoveryTransitionOutcome, RecoveryTransitionRecord, RecoveryTransitionSample,
+    RecoveryTransitionSourceRange, RecoveryTransitionStage, RecoveryTransitionSummary,
 };

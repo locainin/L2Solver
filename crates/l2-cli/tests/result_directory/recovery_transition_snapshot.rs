@@ -1,6 +1,7 @@
 use super::deserialize_job_snapshot;
 use l2_workbench::job::{
-    Job, JobSnapshot, RecoveryTransition, RecoveryTransitionOutcome, RecoveryTransitionSample,
+    Job, JobSnapshot, RecoveryCandidateSample, RecoveryCohortReason, RecoveryCohortSample,
+    RecoveryTransition, RecoveryTransitionOutcome, RecoveryTransitionSample,
     RecoveryTransitionSourceRange, RecoveryTransitionStage,
 };
 use serde::Deserialize;
@@ -15,7 +16,6 @@ struct Envelope {
 #[test]
 fn maximum_transition_categories_round_trip_through_bounded_manifest_reader()
 -> Result<(), Box<dyn Error>> {
-    let job = Job::new("bounded transition snapshot");
     let stages = [
         RecoveryTransitionStage::Cohort,
         RecoveryTransitionStage::Framing,
@@ -36,8 +36,15 @@ fn maximum_transition_categories_round_trip_through_bounded_manifest_reader()
         RecoveryTransitionOutcome::BudgetExhausted,
         RecoveryTransitionOutcome::WorkOmitted,
         RecoveryTransitionOutcome::Unsupported,
+        RecoveryTransitionOutcome::CohortAdmitted,
+        RecoveryTransitionOutcome::CohortOmitted,
+        RecoveryTransitionOutcome::LearningSampleOmitted,
+        RecoveryTransitionOutcome::Published,
+        RecoveryTransitionOutcome::PublishedDurabilityUncertain,
+        RecoveryTransitionOutcome::PublishedReplacementUncertain,
+        RecoveryTransitionOutcome::PublicationFailed,
     ];
-    let sample = RecoveryTransitionSample {
+    let candidate = RecoveryCandidateSample {
         candidate_index: 4,
         input_node_id: 5,
         input_blob_sha256: [1; 32],
@@ -52,21 +59,34 @@ fn maximum_transition_categories_round_trip_through_bounded_manifest_reader()
         }),
         evidence_node_id: Some(8),
     };
-    for stage in stages {
-        for outcome in outcomes {
-            job.record_recovery_transition(RecoveryTransition {
-                stage,
-                outcome,
-                sample: Some(sample),
-            })?;
+    let sample = RecoveryTransitionSample::Cohort(RecoveryCohortSample {
+        source_sha256: Some([6; 32]),
+        input_node_id: Some(5),
+        input_blob_sha256: Some([1; 32]),
+        input_count: 2,
+        candidate_index: Some(candidate.candidate_index),
+        input_batch_sha256: Some(candidate.input_batch_sha256),
+        task_sha256: Some(candidate.task_sha256),
+        reason: RecoveryCohortReason::Admitted,
+    });
+    for sample in [RecoveryTransitionSample::Candidate(candidate), sample] {
+        let job = Job::new("bounded transition snapshot");
+        for stage in stages {
+            for outcome in outcomes {
+                job.record_recovery_transition(RecoveryTransition {
+                    stage,
+                    outcome,
+                    sample: Some(sample),
+                })?;
+            }
         }
+        let snapshot = job.snapshot()?;
+        let wire = serde_json::to_vec(&serde_json::json!({"job": snapshot}))?;
+        let decoded: Envelope = serde_json::from_slice(&wire)?;
+        assert_eq!(
+            decoded.job.recovery_transitions,
+            snapshot.recovery_transitions
+        );
     }
-    let snapshot = job.snapshot()?;
-    let wire = serde_json::to_vec(&serde_json::json!({"job": snapshot}))?;
-    let decoded: Envelope = serde_json::from_slice(&wire)?;
-    assert_eq!(
-        decoded.job.recovery_transitions,
-        snapshot.recovery_transitions
-    );
     Ok(())
 }

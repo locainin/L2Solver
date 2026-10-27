@@ -21,6 +21,7 @@ mod observe;
 mod outcome;
 mod output;
 mod presentation;
+mod publication_transition;
 mod publish;
 mod record;
 mod recovery_job;

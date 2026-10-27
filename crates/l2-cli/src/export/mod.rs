@@ -38,7 +38,7 @@ mod provenance_tests;
 mod source_identity_tests;
 
 use self::{
-    artifact_collection::ArtifactLimits,
+    artifact_collection::{ArtifactCollection, ArtifactLimits},
     collection::collect_export,
     coverage::{
         ExportCompletionInputs, cohort_analysis_complete, discovery_coverage, export_completion,
@@ -50,7 +50,7 @@ use self::{
 };
 #[cfg(test)]
 use self::{
-    artifact_collection::{ArtifactCollection, ArtifactCoverage, ArtifactProvenance},
+    artifact_collection::{ArtifactCoverage, ArtifactProvenance},
     collection::{
         CaseArtifactIndex, capture_identity_matches, collect_case_artifacts_with_context,
         collect_cohort_artifacts, collect_matching_tshark_snapshot,
@@ -72,9 +72,13 @@ use crate::{
     publish,
     result_directory::{ResultDirectory, ResultKind},
 };
-use l2_workbench::job::{CacheStage, Counter, Job, Phase, PhaseOutcome};
+use l2_workbench::job::{
+    CacheStage, Counter, Job, Phase, PhaseOutcome, RecoveryPublicationSample,
+    RecoveryPublicationSourceBasis,
+};
 use recovery_cache::RecoveryContext;
 use std::{
+    cell::Cell,
     collections::HashSet,
     error::Error,
     ffi::OsString,
@@ -141,7 +145,7 @@ pub fn run_with_job(
             options: &options.recovery,
         };
         directory.publish(&identity, job, |staging| {
-            let result = build_export(staging, options, artifact_limits, &context)?;
+            let result = build_export(staging, options, artifact_limits, &context, None)?;
             session::check_source_unchanged(options, &identity)?;
             Ok(result)
         })
@@ -182,6 +186,7 @@ fn build_export(
     options: &ExportOptions,
     limits: ArtifactLimits,
     context: &RecoveryContext<'_>,
+    publication_sample: Option<&Cell<RecoveryPublicationSample>>,
 ) -> Result<(u64, bool), Box<dyn Error>> {
     let mut collected = collect_export(staging, options, limits, context)?;
     let artifact_coverage = collected.artifacts.coverage();
@@ -245,6 +250,14 @@ fn build_export(
     if has_limitations {
         expected_names.insert(OsString::from("limitations.txt"));
     }
+    if let Some(publication_sample) = publication_sample {
+        capture_publication_sample(
+            publication_sample,
+            &collected.coverage,
+            &collected.artifacts,
+            artifact_count,
+        );
+    }
     collected.artifacts.cleanup_index()?;
     validate_stage(staging, &expected_names)?;
     File::open(staging)?.sync_all()?;
@@ -252,6 +265,31 @@ fn build_export(
         job.finish(Phase::Reports, PhaseOutcome::Completed)?;
     }
     Ok((artifact_count, complete))
+}
+
+fn capture_publication_sample(
+    target: &Cell<RecoveryPublicationSample>,
+    coverage: &crate::workbench::full_source::FullSourceCoverage,
+    artifacts: &ArtifactCollection,
+    artifact_count: u64,
+) {
+    let source_set_sha256 = coverage
+        .source
+        .source_id
+        .strip_prefix("sha256:")
+        .and_then(l2_workbench::parse_sha256_digest);
+    // The manifest writer already flushed this index; a failed diagnostic read is nonfatal
+    let artifact = artifacts.first_artifact_sample().ok().flatten();
+    target.set(RecoveryPublicationSample {
+        source_set_sha256,
+        source_basis: if source_set_sha256.is_some() {
+            RecoveryPublicationSourceBasis::StagedManifest
+        } else {
+            RecoveryPublicationSourceBasis::Unavailable
+        },
+        artifact,
+        artifact_count: Some(artifact_count),
+    });
 }
 
 fn run_standard_input(
@@ -268,10 +306,17 @@ fn run_standard_input(
     };
     job.start(Phase::Preparation, None)?;
     job.finish(Phase::Preparation, PhaseOutcome::Completed)?;
-    let (count, complete) = publish::create_directory_with_precommit(
+    let publication_sample = Cell::new(crate::publication_transition::initial_sample(None));
+    let publication = publish::create_directory_with_precommit(
         destination,
         |staging| {
-            let result = build_export(staging, options, limits, &context)?;
+            let result = build_export(
+                staging,
+                options,
+                limits,
+                &context,
+                Some(&publication_sample),
+            )?;
             job.check_cancelled()?;
             job.start(Phase::Publication, None)?;
             Ok(result)
@@ -280,7 +325,9 @@ fn run_standard_input(
             job.check_cancelled()?;
             Ok(())
         },
-    )?;
+    );
+    crate::publication_transition::record_result(job, &publication, publication_sample.get());
+    let (count, complete) = publication?;
     job.finish(Phase::Publication, PhaseOutcome::Completed)?;
     print_completion(output, options, destination, count, complete)?;
     Ok(complete)

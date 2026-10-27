@@ -8,8 +8,8 @@ use std::{
 };
 
 use l2_workbench::job::{
-    CacheFallbackKind, CacheStage, Counter, Job, RecoveryTransition, RecoveryTransitionOutcome,
-    RecoveryTransitionStage,
+    CacheFallbackKind, CacheStage, Counter, Job, RecoveryCandidateSample, RecoveryTransition,
+    RecoveryTransitionOutcome, RecoveryTransitionSample, RecoveryTransitionStage,
     cache::{
         Cache, CacheError, CacheReadPolicy, CheckpointStatus, SourceFingerprint, SourceIdentity,
         StageKey, StageStatus,
@@ -577,12 +577,12 @@ fn checkpoint_snapshot_versions_are_validated_before_restore() -> Result<(), Box
 }
 
 #[test]
-fn checkpoint_version_three_round_trips_transitions_and_reads_legacy_versions()
+fn checkpoint_version_four_round_trips_transitions_and_reads_legacy_versions()
 -> Result<(), Box<dyn Error>> {
     let temporary = tempfile::tempdir()?;
     let cache = cache_at(temporary.path(), 1024)?;
-    let current_key = stage_key("version-three-transitions")?;
-    let current_job = Job::new("version three checkpoint");
+    let current_key = stage_key("version-four-transitions")?;
+    let current_job = Job::new("version four checkpoint");
     current_job.record_cache_fallback(
         CacheStage::CaseRecovery,
         CacheFallbackKind::CommitCaseTooLarge,
@@ -598,10 +598,10 @@ fn checkpoint_version_three_round_trips_transitions_and_reads_legacy_versions()
     cache.write_checkpoint(&current_key, &current_snapshot, CheckpointStatus::Active)?;
     let current = cache
         .read_checkpoint(&current_key)?
-        .ok_or_else(|| missing("version-three checkpoint should be available"))?;
-    assert_eq!(current.snapshot_version, 3);
+        .ok_or_else(|| missing("version-four checkpoint should be available"))?;
+    assert_eq!(current.snapshot_version, 4);
     assert_eq!(current.snapshot, current_snapshot);
-    for version in [1, 2] {
+    for version in [1, 2, 3] {
         assert_legacy_checkpoint(&cache, temporary.path(), version)?;
     }
     Ok(())
@@ -619,16 +619,42 @@ fn assert_legacy_checkpoint(
         CacheFallbackKind::InvalidEntry,
         format_args!("cached Case could not be restored"),
     )?;
+    legacy_job.record_recovery_transition(RecoveryTransition {
+        stage: RecoveryTransitionStage::Schema,
+        outcome: RecoveryTransitionOutcome::Hypothesis,
+        sample: Some(RecoveryTransitionSample::Candidate(
+            RecoveryCandidateSample {
+                candidate_index: 1,
+                input_node_id: 2,
+                input_blob_sha256: [3; 32],
+                input_batch_sha256: [4; 32],
+                task_sha256: [5; 32],
+                source_range: None,
+                input_count: 1,
+                evidence_node_id: Some(6),
+            },
+        )),
+    })?;
     let mut legacy_json = serde_json::to_value(legacy_job.snapshot()?)?;
-    legacy_json
-        .as_object_mut()
-        .ok_or_else(|| missing("snapshot must be an object"))?
-        .remove("recovery_transitions");
-    legacy_json
-        .get_mut("counters")
-        .and_then(Value::as_object_mut)
-        .ok_or_else(|| missing("snapshot counters must be an object"))?
-        .remove("record_input_applications");
+    if version < 3 {
+        legacy_json
+            .as_object_mut()
+            .ok_or_else(|| missing("snapshot must be an object"))?
+            .remove("recovery_transitions");
+        legacy_json
+            .get_mut("counters")
+            .and_then(Value::as_object_mut)
+            .ok_or_else(|| missing("snapshot counters must be an object"))?
+            .remove("record_input_applications");
+    } else {
+        let sample = legacy_json
+            .pointer_mut("/recovery_transitions/records/0/sample")
+            .ok_or_else(|| missing("legacy candidate sample is missing"))?;
+        *sample = sample
+            .get("detail")
+            .cloned()
+            .ok_or_else(|| missing("candidate detail is missing"))?;
+    }
     let expected: l2_workbench::job::JobSnapshot = serde_json::from_value(legacy_json.clone())?;
     cache.write_checkpoint(&key, &legacy_job.snapshot()?, CheckpointStatus::Active)?;
     let database = rusqlite::Connection::open(directory.join("state").join("cache.sqlite3"))?;
