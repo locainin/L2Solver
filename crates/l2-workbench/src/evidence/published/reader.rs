@@ -21,9 +21,9 @@ use std::{
 
 /// Decode supported published records to canonical version-two JSON Lines
 ///
-/// Versions three and four check record order, references, ranges, declared counts, and Case IDs.
+/// Versions three and four check record order, references, ranges, declared counts, and Case IDs
 /// Version two is parsed as a stream and copied without changing its bytes. A caller that
-/// persists the output should publish it only after this function succeeds.
+/// persists the output should publish it only after this function succeeds
 ///
 /// # Errors
 /// Returns an error for unsupported versions, malformed records, exceeded limits, invalid

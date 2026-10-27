@@ -21,7 +21,7 @@ use std::{
 
 /// Write one normalized, independently complete Case and return its canonical identity
 ///
-/// The selected ordinal is one-based and includes Cases omitted by the storage budget.
+/// The selected ordinal is one-based and includes Cases omitted by the storage budget
 /// The caller must keep or discard the entire stream as one unit
 /// A supplied budget must be shared with the enclosing recovery job
 /// A memory rejection remains available through `io::Error::get_ref`
