@@ -69,7 +69,7 @@ pub use png_stream::{
 };
 pub use r2::import_r2_json;
 pub use range_analyzer::{
-    StreamPngBoundary, StreamSourceAnalysis, analyze_artifacts_from_reader,
+    StreamMemory, StreamPngBoundary, StreamSourceAnalysis, analyze_artifacts_from_reader,
     analyze_artifacts_observing_zip_ends,
 };
 pub use signatures::{

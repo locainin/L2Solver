@@ -382,7 +382,7 @@ fn analyze_source_stream(
     reader.read_exact(prefix)?;
     // Feed the already-read prefix to the analyzer without reopening the source
     let is_png = count == signature.len() && signature == l2_workbench::artifact::PNG_SIGNATURE;
-    let (scratch, retained) = super::analysis_memory::reserve(memory, length, options, is_png)?;
+    let (scratch, mut retained) = super::analysis_memory::reserve(memory, length, options, is_png)?;
     let prefix = signature
         .get(..count)
         .ok_or_else(|| invalid_input("source prefix length is invalid"))?;
@@ -418,7 +418,10 @@ fn analyze_source_stream(
         checkpoint,
         is_png,
         limits,
-        Some(&mut png_metadata),
+        Some(l2_workbench::artifact::StreamMemory {
+            png_metadata: &mut png_metadata,
+            report: &mut retained,
+        }),
     )
     .map_err(stream_error)?;
     drop(scratch);

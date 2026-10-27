@@ -37,6 +37,14 @@ pub struct StreamSourceAnalysis {
     pub zip_observation: Option<ZipEndObservation>,
 }
 
+/// Shared live-memory leases used by one streaming source analysis
+pub struct StreamMemory<'a> {
+    /// Temporary PNG chunk metadata
+    pub png_metadata: &'a mut MemoryLease,
+    /// Retained range bytes and provenance, held until the report is dropped
+    pub report: &'a mut MemoryLease,
+}
+
 /// Analyze bounded PNG and ZIP ranges while hashing the complete source stream
 ///
 /// Only objects no larger than half the in-memory input limit, capped at 4 MiB, are
@@ -52,7 +60,7 @@ pub fn analyze_artifacts_from_reader(
     source_length: usize,
     options: ArtifactAnalysisOptions,
 ) -> io::Result<ArtifactAnalysis> {
-    let mut reader = ScannedReader::new(reader, source_length, options, None, None)?;
+    let mut reader = ScannedReader::new(reader, source_length, options, None, None, None)?;
     reader.drain_source()?;
     Ok(reader.finish()?.0)
 }
@@ -71,8 +79,11 @@ pub fn analyze_artifacts_observing_zip_ends(
     checkpoint: Option<usize>,
     scan_png: bool,
     limits: ZipEndScanLimits,
-    memory: Option<&mut MemoryLease>,
+    memory: Option<StreamMemory<'_>>,
 ) -> io::Result<StreamSourceAnalysis> {
+    let (png_memory, report_memory) = memory.map_or((None, None), |memory| {
+        (Some(memory.png_metadata), Some(memory.report))
+    });
     let scan_work = source_length.min(limits.max_scan_bytes);
     let mut scan_options = options;
     scan_options.limits.max_total_work_bytes = options
@@ -93,7 +104,8 @@ pub fn analyze_artifacts_observing_zip_ends(
             scan_options,
             checkpoint,
             Some(limits),
-            memory,
+            png_memory,
+            report_memory,
         )?
     } else {
         let mut reader = ScannedReader::new(
@@ -102,6 +114,7 @@ pub fn analyze_artifacts_observing_zip_ends(
             scan_options,
             checkpoint,
             Some(limits),
+            report_memory,
         )?;
         reader.drain_source()?;
         let (analysis, prefix_sha256, zip_observation) = reader.finish()?;
@@ -120,6 +133,10 @@ pub fn analyze_artifacts_observing_zip_ends(
     Ok(result)
 }
 
+#[expect(
+    clippy::too_many_lines,
+    reason = "PNG validation and the shared source stream form one pass"
+)]
 fn analyze_png_inner(
     reader: &mut impl Read,
     source_length: usize,
@@ -127,15 +144,29 @@ fn analyze_png_inner(
     checkpoint: Option<usize>,
     zip_limits: Option<ZipEndScanLimits>,
     mut memory: Option<&mut MemoryLease>,
+    report_memory: Option<&mut MemoryLease>,
 ) -> io::Result<StreamSourceAnalysis> {
     if source_length >= options.limits.max_total_work_bytes {
-        return png_work_omitted(reader, source_length, options, checkpoint, zip_limits);
+        return png_work_omitted(
+            reader,
+            source_length,
+            options,
+            checkpoint,
+            zip_limits,
+            report_memory,
+        );
     }
     let mut scan_options = options;
     // Reserve the worst-case PNG scan before the rolling scanner spends work
     scan_options.limits.max_total_work_bytes -= source_length;
-    let mut reader =
-        ScannedReader::new(reader, source_length, scan_options, checkpoint, zip_limits)?;
+    let mut reader = ScannedReader::new(
+        reader,
+        source_length,
+        scan_options,
+        checkpoint,
+        zip_limits,
+        report_memory,
+    )?;
     // Keep chunk metadata within the caller's bounded input allowance
     let metadata_bytes = std::mem::size_of::<super::PngRangeChunk>().max(1);
     let limits = PngLimits {
@@ -209,8 +240,16 @@ fn png_work_omitted(
     options: ArtifactAnalysisOptions,
     checkpoint: Option<usize>,
     zip_limits: Option<ZipEndScanLimits>,
+    report_memory: Option<&mut MemoryLease>,
 ) -> io::Result<StreamSourceAnalysis> {
-    let mut reader = ScannedReader::new(reader, source_length, options, checkpoint, zip_limits)?;
+    let mut reader = ScannedReader::new(
+        reader,
+        source_length,
+        options,
+        checkpoint,
+        zip_limits,
+        report_memory,
+    )?;
     reader.drain_source()?;
     let (mut analysis, prefix_sha256, zip_observation) = reader.finish()?;
     analysis
@@ -229,7 +268,7 @@ fn png_work_omitted(
 
 struct ScannedReader<'a, R> {
     inner: &'a mut R,
-    scanned: RangeCollector,
+    scanned: RangeCollector<'a>,
 }
 
 impl<'a, R: Read> ScannedReader<'a, R> {
@@ -239,10 +278,17 @@ impl<'a, R: Read> ScannedReader<'a, R> {
         options: ArtifactAnalysisOptions,
         checkpoint: Option<usize>,
         zip_limits: Option<ZipEndScanLimits>,
+        report_memory: Option<&'a mut MemoryLease>,
     ) -> io::Result<Self> {
         Ok(Self {
             inner: reader,
-            scanned: RangeCollector::new(source_length, options, checkpoint, zip_limits)?,
+            scanned: RangeCollector::new(
+                source_length,
+                options,
+                checkpoint,
+                zip_limits,
+                report_memory,
+            )?,
         })
     }
 
@@ -296,8 +342,8 @@ impl<R: Read> Read for ScannedReader<'_, R> {
     }
 }
 
-struct RangeCollector {
-    state: RangeState,
+struct RangeCollector<'a> {
+    state: RangeState<'a>,
     source_length: usize,
     read_bytes: usize,
     offset: usize,
@@ -308,12 +354,13 @@ struct RangeCollector {
     stopped: bool,
 }
 
-impl RangeCollector {
+impl<'a> RangeCollector<'a> {
     fn new(
         source_length: usize,
         options: ArtifactAnalysisOptions,
         checkpoint: Option<usize>,
         zip_limits: Option<ZipEndScanLimits>,
+        report_memory: Option<&'a mut MemoryLease>,
     ) -> io::Result<Self> {
         // A full Case may leave no output space while the source still needs hashing
         let mut validation_limits = options.limits;
@@ -335,7 +382,7 @@ impl RangeCollector {
             .try_reserve_exact(window_capacity.min(source_length))
             .map_err(io::Error::other)?;
         Ok(Self {
-            state: RangeState::new(options, source_length),
+            state: RangeState::new(options, source_length, report_memory),
             source_length,
             read_bytes: 0,
             offset: 0,
@@ -391,7 +438,7 @@ impl RangeCollector {
     }
 }
 
-struct RangeState {
+struct RangeState<'a> {
     options: ArtifactAnalysisOptions,
     source_length: usize,
     artifacts: Vec<AnalyzedArtifact>,
@@ -404,9 +451,21 @@ struct RangeState {
     omitted_candidates: usize,
     zip_entry_count_limited: usize,
     signature_scans_omitted: usize,
+    report_memory: Option<&'a mut MemoryLease>,
 }
 
-impl RangeState {
+impl<'a> RangeState<'a> {
+    fn charge_report(&mut self, bytes: usize) -> io::Result<()> {
+        if let Some(lease) = &mut self.report_memory {
+            let total = lease
+                .bytes()
+                .checked_add(u64::try_from(bytes).map_err(io::Error::other)?)
+                .ok_or_else(|| io::Error::other("range report memory overflows"))?;
+            lease.try_resize(total).map_err(io::Error::other)?;
+        }
+        Ok(())
+    }
+
     fn refund_work(&mut self, bytes: usize) -> io::Result<()> {
         self.work_remaining = self
             .work_remaining
@@ -421,7 +480,11 @@ impl RangeState {
         Ok(())
     }
 
-    const fn new(options: ArtifactAnalysisOptions, source_length: usize) -> Self {
+    const fn new(
+        options: ArtifactAnalysisOptions,
+        source_length: usize,
+        report_memory: Option<&'a mut MemoryLease>,
+    ) -> Self {
         let limits = options.limits;
         Self {
             options,
@@ -436,6 +499,7 @@ impl RangeState {
             omitted_candidates: 0,
             zip_entry_count_limited: 0,
             signature_scans_omitted: 0,
+            report_memory,
         }
     }
 
@@ -536,19 +600,12 @@ impl RangeState {
             EmbeddedValidationEvidence::Png { .. } => crate::sha256(bytes),
         };
         // Equal bytes keep every distinct source range as separate evidence
-        if let Some(existing) = self
+        if let Some(index) = self
             .artifacts
-            .iter_mut()
-            .find(|artifact| artifact.sha256 == digest && artifact.bytes == bytes)
+            .iter()
+            .position(|artifact| artifact.sha256 == digest && artifact.bytes == bytes)
         {
-            if !existing.origins.contains(&origin) {
-                if existing.origins.len() >= self.options.limits.max_artifacts {
-                    self.omitted_candidates = self.omitted_candidates.saturating_add(1);
-                } else {
-                    existing.origins.try_reserve(1).map_err(io::Error::other)?;
-                    existing.origins.push(origin);
-                }
-            }
+            self.add_existing_origin(index, origin)?;
             return Ok(());
         }
         if self.artifacts.len() >= self.options.limits.max_artifacts
@@ -562,12 +619,7 @@ impl RangeState {
             self.omitted_candidates = self.omitted_candidates.saturating_add(1);
             return Ok(());
         }
-        let mut retained = Vec::new();
-        retained
-            .try_reserve_exact(bytes.len())
-            .map_err(io::Error::other)?;
-        retained.extend_from_slice(bytes);
-        self.artifacts.try_reserve(1).map_err(io::Error::other)?;
+        let (retained, origins) = self.prepare_retained(bytes, origin, digest.capacity())?;
         let signatures_scanned =
             bytes.len() <= self.work_remaining && bytes.len() <= self.signature_remaining;
         let signature_match_count = if signatures_scanned {
@@ -581,13 +633,86 @@ impl RangeState {
         self.output_bytes += bytes.len();
         self.artifacts.push(AnalyzedArtifact {
             index: self.artifacts.len(),
-            origins: vec![origin],
+            origins,
             sha256: digest,
             signature_match_count,
             signatures_scanned,
             validation: validation_summary(bytes.len(), evidence),
             bytes: retained,
         });
+        Ok(())
+    }
+
+    fn prepare_retained(
+        &mut self,
+        bytes: &[u8],
+        origin: ArtifactOrigin,
+        digest_capacity: usize,
+    ) -> io::Result<(Vec<u8>, Vec<ArtifactOrigin>)> {
+        // Admit vector growth before keeping the candidate and its provenance
+        let artifact_growth = vector_growth(&self.artifacts);
+        let metadata = artifact_growth
+            .checked_mul(std::mem::size_of::<AnalyzedArtifact>())
+            .and_then(|count| count.checked_add(std::mem::size_of::<ArtifactOrigin>()))
+            .and_then(|count| count.checked_add(digest_capacity))
+            .ok_or_else(|| io::Error::other("range artifact metadata overflows"))?;
+        self.charge_report(
+            bytes
+                .len()
+                .checked_add(metadata)
+                .ok_or_else(|| io::Error::other("range artifact memory overflows"))?,
+        )?;
+        let mut retained = Vec::new();
+        retained
+            .try_reserve_exact(bytes.len())
+            .map_err(io::Error::other)?;
+        self.charge_report(retained.capacity() - bytes.len())?;
+        retained.extend_from_slice(bytes);
+        let previous_capacity = self.artifacts.capacity();
+        self.artifacts
+            .try_reserve_exact(artifact_growth)
+            .map_err(io::Error::other)?;
+        self.charge_report(
+            (self.artifacts.capacity() - previous_capacity - artifact_growth)
+                * std::mem::size_of::<AnalyzedArtifact>(),
+        )?;
+        let mut origins = Vec::new();
+        origins.try_reserve_exact(1).map_err(io::Error::other)?;
+        self.charge_report((origins.capacity() - 1) * std::mem::size_of::<ArtifactOrigin>())?;
+        origins.push(origin);
+        Ok((retained, origins))
+    }
+
+    fn add_existing_origin(&mut self, index: usize, origin: ArtifactOrigin) -> io::Result<()> {
+        let existing = self
+            .artifacts
+            .get(index)
+            .ok_or_else(|| io::Error::other("range artifact is missing"))?;
+        if existing.origins.contains(&origin) {
+            return Ok(());
+        }
+        if existing.origins.len() >= self.options.limits.max_artifacts {
+            self.omitted_candidates = self.omitted_candidates.saturating_add(1);
+            return Ok(());
+        }
+        let growth = vector_growth(&existing.origins);
+        self.charge_report(growth * std::mem::size_of::<ArtifactOrigin>())?;
+        let existing = self
+            .artifacts
+            .get_mut(index)
+            .ok_or_else(|| io::Error::other("range artifact is missing"))?;
+        let previous_capacity = existing.origins.capacity();
+        existing
+            .origins
+            .try_reserve_exact(growth)
+            .map_err(io::Error::other)?;
+        let extra = existing.origins.capacity() - previous_capacity - growth;
+        self.charge_report(extra * std::mem::size_of::<ArtifactOrigin>())?;
+        let existing = self
+            .artifacts
+            .get_mut(index)
+            .ok_or_else(|| io::Error::other("range artifact is missing"))?;
+        existing.origins.push(origin);
         Ok(())
     }
 
@@ -613,6 +738,14 @@ impl RangeState {
             work_bytes: self.options.limits.max_total_work_bytes - self.work_remaining,
             zip_expanded_work_bytes: 0,
         }
+    }
+}
+
+fn vector_growth<T>(values: &Vec<T>) -> usize {
+    if values.len() == values.capacity() {
+        values.capacity().max(1)
+    } else {
+        0
     }
 }
 

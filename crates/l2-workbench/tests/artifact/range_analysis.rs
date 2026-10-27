@@ -6,9 +6,73 @@ use std::{
 use super::{image_support::structural_png, zip_support};
 use l2_workbench::artifact::{
     AnalysisOmission, AnalysisStatus, ArtifactAnalysisOptions, ArtifactOrigin,
-    ArtifactValidationState, EmbeddedFormat, FileRange, ZipEndScanLimits,
+    ArtifactValidationState, EmbeddedFormat, FileRange, StreamMemory, ZipEndScanLimits,
     analyze_artifacts_from_reader, analyze_artifacts_observing_zip_ends,
 };
+
+#[test]
+fn retained_range_bytes_grow_the_shared_report_lease() -> Result<(), Box<dyn Error>> {
+    use l2_workbench::job::{MemoryBudget, MemoryClass, MemoryError};
+    let png = structural_png(&[])?;
+    let source = [b"prefix".as_slice(), png.as_slice()].concat();
+    let budget = MemoryBudget::new(4096);
+    let mut png_memory = budget.try_reserve(MemoryClass::Executor, 0)?;
+    let mut report_memory = budget.try_reserve(MemoryClass::Executor, 0)?;
+    let result = analyze_artifacts_observing_zip_ends(
+        &mut Cursor::new(&source),
+        source.len(),
+        options(),
+        None,
+        false,
+        ZipEndScanLimits {
+            max_scan_bytes: 0,
+            max_candidates: 0,
+        },
+        Some(StreamMemory {
+            png_metadata: &mut png_memory,
+            report: &mut report_memory,
+        }),
+    )?;
+    assert!(
+        result
+            .analysis
+            .artifacts
+            .iter()
+            .any(|artifact| artifact.bytes == png)
+    );
+    assert!(report_memory.bytes() >= u64::try_from(png.len())?);
+    drop(result);
+    drop(report_memory);
+    drop(png_memory);
+    assert_eq!(budget.snapshot()?.used_bytes, 0);
+    let budget = MemoryBudget::new(1);
+    let mut png_memory = budget.try_reserve(MemoryClass::Executor, 0)?;
+    let mut report_memory = budget.try_reserve(MemoryClass::Executor, 0)?;
+    let error = analyze_artifacts_observing_zip_ends(
+        &mut Cursor::new(&source),
+        source.len(),
+        options(),
+        None,
+        false,
+        ZipEndScanLimits {
+            max_scan_bytes: 0,
+            max_candidates: 0,
+        },
+        Some(StreamMemory {
+            png_metadata: &mut png_memory,
+            report: &mut report_memory,
+        }),
+    )
+    .err()
+    .ok_or("range output ignored memory pressure")?;
+    assert!(matches!(
+        error
+            .get_ref()
+            .and_then(|source| source.downcast_ref::<MemoryError>()),
+        Some(MemoryError::Limit { .. })
+    ));
+    Ok(())
+}
 
 fn analyze_with_checkpoint(
     reader: &mut impl Read,

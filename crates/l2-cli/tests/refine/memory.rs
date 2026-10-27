@@ -117,7 +117,7 @@ fn range_scanner_scratch_shares_the_job_budget_and_fails_before_publication()
         },
     };
     let budget = MemoryBudget::new(options.recovery.memory_limit);
-    let held = budget.try_reserve(MemoryClass::Cache, 4 * 1024 * 1024)?;
+    let held = budget.try_reserve(MemoryClass::Cache, 6 * 1024 * 1024)?;
     let error = crate::refine::run_with_memory_budget(
         &options,
         &mut Vec::new(),
@@ -139,8 +139,53 @@ fn range_scanner_scratch_shares_the_job_budget_and_fails_before_publication()
         &budget
     )?);
     let snapshot = budget.snapshot()?;
-    assert!(snapshot.peak_bytes > 4 * 1024 * 1024 && snapshot.peak_bytes <= snapshot.limit_bytes);
+    assert!(snapshot.peak_bytes > 6 * 1024 * 1024 && snapshot.peak_bytes <= snapshot.limit_bytes);
     assert_eq!(snapshot.used_bytes, 0);
+    Ok(())
+}
+
+#[test]
+fn range_scan_does_not_reserve_unused_maximum_output() -> Result<(), Box<dyn Error>> {
+    let directory = tempfile::tempdir()?;
+    let input = directory.path().join("large.bin");
+    let output = directory.path().join("result");
+    fs::File::create(&input)?.set_len(5 * 1024 * 1024)?;
+    let mut options = RefineOptions {
+        input,
+        output: Some(output.clone()),
+        dry_run: false,
+        salvage: false,
+        recovery: RecoveryOptions {
+            no_cache: true,
+            memory_limit: 8 * 1024 * 1024,
+            ..RecoveryOptions::default()
+        },
+    };
+    let budget = MemoryBudget::new(options.recovery.memory_limit);
+    let held = budget.try_reserve(MemoryClass::Cache, 4 * 1024 * 1024)?;
+    assert!(!crate::refine::run_with_memory_budget(
+        &options,
+        &mut Vec::new(),
+        &Job::new("bounded range scan"),
+        &budget
+    )?);
+    assert!(output.join("manifest.json").is_file());
+    assert_eq!(budget.snapshot()?.used_bytes, held.bytes());
+    let first: serde_json::Value =
+        serde_json::from_slice(&fs::read(output.join("manifest.json"))?)?;
+    drop(held);
+    let retry = directory.path().join("retry");
+    options.output = Some(retry.clone());
+    assert!(!crate::refine::run_with_memory_budget(
+        &options,
+        &mut Vec::new(),
+        &Job::new("uncontended range scan"),
+        &budget
+    )?);
+    let second: serde_json::Value =
+        serde_json::from_slice(&fs::read(retry.join("manifest.json"))?)?;
+    assert_eq!(first.get("sources"), second.get("sources"));
+    assert_eq!(first.get("artifacts"), second.get("artifacts"));
     Ok(())
 }
 
