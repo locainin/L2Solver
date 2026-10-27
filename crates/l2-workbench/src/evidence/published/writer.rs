@@ -178,12 +178,11 @@ struct Dictionary<'a> {
     indexes: HashMap<&'a str, usize>,
     values: Vec<&'a str>,
     bytes: usize,
-    full: bool,
 }
 
 impl<'a> Dictionary<'a> {
     fn add(&mut self, value: &'a str, scratch: &Scratch) -> io::Result<()> {
-        if self.full || self.indexes.contains_key(value) || self.values.len() == MAX_STRINGS {
+        if self.indexes.contains_key(value) || self.values.len() == MAX_STRINGS {
             return Ok(());
         }
         let Some(next) = self.bytes.checked_add(value.len()) else {
@@ -192,11 +191,8 @@ impl<'a> Dictionary<'a> {
         if next > MAX_DICTIONARY_BYTES {
             return Ok(());
         }
-        // Further strings remain inline when the shared budget cannot grow the index
-        if !scratch.grow(256, true)? {
-            self.full = true;
-            return Ok(());
-        }
+        // Budget pressure fails the Case so retention cannot depend on worker timing
+        scratch.grow(256)?;
         self.indexes.try_reserve(1).map_err(io::Error::other)?;
         self.values.try_reserve(1).map_err(io::Error::other)?;
         self.indexes.insert(value, self.values.len());

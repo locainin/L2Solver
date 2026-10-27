@@ -63,7 +63,7 @@ impl<'a> BlobRecords<'a> {
             {
                 if !inline_ids.contains_key(id) {
                     // Each entry charge covers table capacity and resize overhead
-                    scratch.grow(256, false)?;
+                    scratch.grow(256)?;
                     inline_ids.try_reserve(1).map_err(io::Error::other)?;
                 }
                 *inline_ids.entry(id).or_insert(false) |= node.kind == "record_parse_receipt";

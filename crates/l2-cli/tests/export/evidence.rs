@@ -59,6 +59,47 @@ fn publication_memory_pressure_keeps_the_prior_member_and_reports_typed_error()
 }
 
 #[test]
+fn admitted_shared_budget_keeps_the_same_retained_cases_and_wire_bytes()
+-> Result<(), Box<dyn Error>> {
+    use l2_workbench::job::MemoryBudget;
+    let first = case_with_receipt(b"first retained artifact")?;
+    let second = repetitive_case()?;
+    let scope = json!({"kind":"flow", "flow_id":38});
+    let sizing_dir = tempfile::tempdir()?;
+    let mut sizing = sidecar_with_budget(sizing_dir.path(), u64::MAX)?;
+    sizing.record_case(&first, &scope)?;
+    let limit = sizing.coverage().retained_bytes;
+    let baseline_dir = tempfile::tempdir()?;
+    let mut baseline = sidecar_with_budget(baseline_dir.path(), limit)?;
+    let baseline_first = baseline.record_case(&first, &scope)?;
+    let baseline_second = baseline.record_case(&second, &scope)?;
+    baseline.finish()?;
+    let budget_dir = tempfile::tempdir()?;
+    let memory = MemoryBudget::new(16 * 1024 * 1024);
+    let mut budgeted = EvidenceSidecar::new(budget_dir.path(), limit, Some(&memory))?;
+    let budgeted_first = budgeted.record_case(&first, &scope)?;
+    let budgeted_second = budgeted.record_case(&second, &scope)?;
+    budgeted.finish()?;
+    assert!(baseline_first.retained && budgeted_first.retained);
+    assert!(!baseline_second.retained && !budgeted_second.retained);
+    assert_eq!(baseline_first.case_id, budgeted_first.case_id);
+    assert_eq!(baseline_second.case_id, budgeted_second.case_id);
+    assert_eq!(
+        baseline_second.compressed_bytes,
+        budgeted_second.compressed_bytes
+    );
+    assert_eq!(
+        baseline.coverage().omitted_bytes,
+        budgeted.coverage().omitted_bytes
+    );
+    assert_eq!(
+        fs::read(baseline_dir.path().join(SIDECAR_FILE_NAME))?,
+        fs::read(budget_dir.path().join(SIDECAR_FILE_NAME))?
+    );
+    Ok(())
+}
+
+#[test]
 fn shared_artifact_keeps_resolvable_origins_from_distinct_cases() -> Result<(), Box<dyn Error>> {
     let temporary = tempfile::tempdir()?;
     let mut sidecar =

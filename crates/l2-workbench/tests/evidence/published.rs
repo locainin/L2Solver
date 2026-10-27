@@ -766,8 +766,8 @@ fn publication_scratch_uses_shared_lease_and_reports_pressure() -> TestResult {
 }
 
 #[test]
-fn dictionary_pressure_falls_back_to_inline_text_without_losing_graph_data() -> TestResult {
-    use l2_workbench::job::{MemoryBudget, MemoryClass};
+fn dictionary_pressure_reports_typed_failure_and_admission_keeps_wire_bytes_stable() -> TestResult {
+    use l2_workbench::job::{MemoryBudget, MemoryClass, MemoryError};
     let mut case = Case::new();
     let node = case.add_node("candidate", None, Vec::new(), json!({}))?;
     for index in 0..80 {
@@ -780,38 +780,43 @@ fn dictionary_pressure_falls_back_to_inline_text_without_losing_graph_data() -> 
         })?;
     }
     let scope = json!({"kind":"test"});
-    let (_, expected) = canonical(&case, &scope, 1)?;
     let budget = MemoryBudget::new(2_048);
-    let mut encoded = Vec::new();
-    l2_workbench::evidence::write_published_case(&case, &scope, 1, &mut encoded, Some(&budget))?;
-    let header: Value = serde_json::from_slice(
-        encoded
-            .split(|byte| *byte == b'\n')
-            .next()
-            .ok_or("header missing")?,
-    )?;
+    let mut interrupted = Vec::new();
+    let error = l2_workbench::evidence::write_published_case(
+        &case,
+        &scope,
+        1,
+        &mut interrupted,
+        Some(&budget),
+    )
+    .err()
+    .ok_or("dictionary pressure unexpectedly completed a Case")?;
     assert!(
-        header
-            .pointer("/value/strings")
-            .and_then(Value::as_array)
-            .is_some_and(|strings| strings.len() < 80)
+        error
+            .get_ref()
+            .is_some_and(|cause| cause.downcast_ref::<MemoryError>().is_some())
     );
+    assert!(interrupted.is_empty());
     assert!(budget.snapshot()?.rejected > 0);
     assert_eq!(budget.snapshot()?.used(MemoryClass::Publication), 0);
-    let mut decoded = Vec::new();
-    decode_published_evidence(
-        4,
-        Cursor::new(encoded),
-        &mut decoded,
-        PublishedEvidenceLimits::new(1_000_000, 100_000),
+    let mut unrestricted = Vec::new();
+    write_published_case(&case, &scope, 1, &mut unrestricted)?;
+    let mut admitted = Vec::new();
+    let sufficient = MemoryBudget::new(1_000_000);
+    l2_workbench::evidence::write_published_case(
+        &case,
+        &scope,
+        1,
+        &mut admitted,
+        Some(&sufficient),
     )?;
-    assert_eq!(decoded, expected);
+    assert_eq!(admitted, unrestricted);
     Ok(())
 }
 
 #[test]
-fn schema_pressure_falls_back_to_inline_shapes_without_losing_receipts() -> TestResult {
-    use l2_workbench::job::{MemoryBudget, MemoryClass};
+fn schema_pressure_reports_typed_failure_and_admission_keeps_wire_bytes_stable() -> TestResult {
+    use l2_workbench::job::{MemoryBudget, MemoryClass, MemoryError};
     let rows = (0..80)
         .map(|index| json!({(format!("field_{index}")):index}))
         .collect::<Vec<_>>();
@@ -824,32 +829,36 @@ fn schema_pressure_falls_back_to_inline_shapes_without_losing_receipts() -> Test
         json!({"representation":"json_blob"}),
     )?;
     let scope = json!({});
-    let (_, expected) = canonical(&case, &scope, 1)?;
     let budget = MemoryBudget::new(12_000);
-    let mut encoded = Vec::new();
-    l2_workbench::evidence::write_published_case(&case, &scope, 1, &mut encoded, Some(&budget))?;
-    let records = std::str::from_utf8(&encoded)?
-        .lines()
-        .map(serde_json::from_str::<Value>)
-        .collect::<Result<Vec<_>, _>>()?;
-    let blob = records
-        .iter()
-        .find(|record| record.get("record") == Some(&json!("blob")))
-        .ok_or("blob missing")?;
+    let mut interrupted = Vec::new();
+    let error = l2_workbench::evidence::write_published_case(
+        &case,
+        &scope,
+        1,
+        &mut interrupted,
+        Some(&budget),
+    )
+    .err()
+    .ok_or("schema pressure unexpectedly completed a Case")?;
     assert!(
-        blob.pointer("/value/schema_payload/schemas")
-            .and_then(Value::as_array)
-            .is_some_and(|schemas| schemas.len() < 80)
+        error
+            .get_ref()
+            .is_some_and(|cause| cause.downcast_ref::<MemoryError>().is_some())
     );
+    assert!(!interrupted.ends_with(b"{\"record\":\"end\"}\n"));
     assert!(budget.snapshot()?.rejected > 0);
     assert_eq!(budget.snapshot()?.used(MemoryClass::Publication), 0);
-    let mut decoded = Vec::new();
-    decode_published_evidence(
-        4,
-        Cursor::new(encoded),
-        &mut decoded,
-        PublishedEvidenceLimits::new(1_000_000, 100_000),
+    let mut unrestricted = Vec::new();
+    write_published_case(&case, &scope, 1, &mut unrestricted)?;
+    let mut admitted = Vec::new();
+    let sufficient = MemoryBudget::new(1_000_000);
+    l2_workbench::evidence::write_published_case(
+        &case,
+        &scope,
+        1,
+        &mut admitted,
+        Some(&sufficient),
     )?;
-    assert_eq!(decoded, expected);
+    assert_eq!(admitted, unrestricted);
     Ok(())
 }

@@ -24,25 +24,24 @@ impl Scratch {
     }
 
     pub(super) fn claim(&self, bytes: u64) -> io::Result<Charge<'_>> {
-        self.grow(bytes, false)?;
+        self.grow(bytes)?;
         Ok(Charge {
             scratch: self,
             bytes,
         })
     }
 
-    pub(super) fn grow(&self, bytes: u64, optional: bool) -> io::Result<bool> {
+    pub(super) fn grow(&self, bytes: u64) -> io::Result<()> {
         let mut lease = self.lease.borrow_mut();
         let Some(lease) = lease.as_mut() else {
-            return Ok(true);
+            return Ok(());
         };
         let total = lease
             .bytes()
             .checked_add(bytes)
             .ok_or_else(|| io::Error::other("publication scratch count overflow"))?;
         match lease.try_resize(total) {
-            Ok(()) => Ok(true),
-            Err(MemoryError::Limit { .. }) if optional => Ok(false),
+            Ok(()) => Ok(()),
             Err(error) => {
                 self.failure.set(Some(error));
                 Err(io::Error::other(error))
@@ -81,15 +80,13 @@ pub(super) struct Charge<'a> {
 }
 
 impl Charge<'_> {
-    pub(super) fn grow(&mut self, bytes: u64, optional: bool) -> io::Result<bool> {
-        if !self.scratch.grow(bytes, optional)? {
-            return Ok(false);
-        }
+    pub(super) fn grow(&mut self, bytes: u64) -> io::Result<()> {
+        self.scratch.grow(bytes)?;
         self.bytes = self
             .bytes
             .checked_add(bytes)
             .ok_or_else(|| io::Error::other("publication scratch count overflow"))?;
-        Ok(true)
+        Ok(())
     }
 }
 

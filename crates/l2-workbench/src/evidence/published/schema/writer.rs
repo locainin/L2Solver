@@ -49,7 +49,6 @@ struct Schemas<'a> {
     shapes: Vec<Vec<String>>,
     lookup: HashMap<u64, Vec<usize>>,
     bytes: usize,
-    full: bool,
     scratch: &'a Scratch,
     // Shapes and lookup storage must be released before the lease
     charge: Charge<'a>,
@@ -61,7 +60,6 @@ impl<'a> Schemas<'a> {
             shapes: Vec::new(),
             lookup: HashMap::new(),
             bytes: 0,
-            full: false,
             scratch,
             charge: scratch.claim(0)?,
         })
@@ -113,7 +111,7 @@ impl<'a> Schemas<'a> {
     }
 
     fn add(&mut self, fields: &RawObject<'_>) -> io::Result<()> {
-        if self.full || self.find(fields).is_some() || self.shapes.len() == MAX_SCHEMAS {
+        if self.find(fields).is_some() || self.shapes.len() == MAX_SCHEMAS {
             return Ok(());
         }
         let count = fields.unique().count();
@@ -141,11 +139,8 @@ impl<'a> Schemas<'a> {
             })
             .and_then(|n| n.checked_add(512))
             .ok_or_else(|| io::Error::other("receipt schema size overflow"))?;
-        // Unindexed shapes remain inline when the shared budget is exhausted
-        if !self.charge.grow(cost, true)? {
-            self.full = true;
-            return Ok(());
-        }
+        // A fixed format cap selects inline shapes independently of shared pressure
+        self.charge.grow(cost)?;
         let mut shape = Vec::new();
         shape.try_reserve_exact(count).map_err(io::Error::other)?;
         for (key, _) in fields.unique() {
