@@ -1,9 +1,28 @@
 //! Check that write errors cannot replace a completed directory
 
 use super::publish;
-use std::{error::Error, fs, io, os::unix::fs::PermissionsExt, path::Path};
+use std::{
+    error::Error,
+    fs, io,
+    os::unix::{fs::PermissionsExt, process::ExitStatusExt},
+    path::Path,
+    process::{Child, Command, Stdio},
+    thread,
+    time::{Duration, Instant},
+};
 
 type TestResult = Result<(), Box<dyn Error>>;
+
+struct OwnedChild(Child);
+
+impl Drop for OwnedChild {
+    fn drop(&mut self) {
+        if matches!(self.0.try_wait(), Ok(None)) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+}
 
 fn old_output(destination: &Path) -> TestResult {
     publish::create_directory(destination, |staging| {
@@ -143,5 +162,76 @@ fn real_read_only_filesystem_preserves_the_existing_directory() -> TestResult {
     assert_before_publication_errno(result, libc::EROFS)?;
     assert_eq!(fs::read(destination.join("payload"))?, b"previous output");
     assert_eq!(fs::read_dir(Path::new(&base))?.count(), 1);
+    Ok(())
+}
+
+#[test]
+fn directory_crash_child() -> TestResult {
+    let Some(base) = std::env::var_os("L2_TEST_DIRECTORY_CRASH_ROOT") else {
+        return Ok(());
+    };
+    let base = Path::new(&base);
+    let prepared = publish::prepare_directory_replacement(&base.join("bundle"))?;
+    publish::replace_directory_with_precommit(
+        &prepared,
+        |staging| {
+            fs::write(staging.join("payload"), b"staged output")?;
+            Ok(())
+        },
+        || {
+            fs::write(base.join("ready"), b"ready")?;
+            let deadline = Instant::now() + Duration::from_secs(10);
+            while Instant::now() < deadline {
+                thread::sleep(Duration::from_millis(10));
+            }
+            Err(io::Error::other("parent did not interrupt publication").into())
+        },
+    )?;
+    Err("publication unexpectedly completed".into())
+}
+
+#[test]
+fn killing_the_publisher_before_commit_preserves_the_previous_directory() -> TestResult {
+    let root = tempfile::tempdir()?;
+    let destination = root.path().join("bundle");
+    old_output(&destination)?;
+    let mut child = OwnedChild(
+        Command::new(std::env::current_exe()?)
+            .args(["--exact", "faults::directory_crash_child", "--nocapture"])
+            .env("L2_TEST_DIRECTORY_CRASH_ROOT", root.path())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()?,
+    );
+    let deadline = Instant::now() + Duration::from_secs(8);
+    while !root.path().join("ready").exists() && Instant::now() < deadline {
+        if child.0.try_wait()?.is_some() {
+            return Err("publisher exited before reaching its precommit pause".into());
+        }
+        thread::sleep(Duration::from_millis(10));
+    }
+    let ready = root.path().join("ready").exists();
+    child.0.kill()?;
+    let status = child.0.wait()?;
+    assert!(ready, "publisher did not reach its precommit pause");
+    assert_eq!(status.signal(), Some(libc::SIGKILL));
+    assert_eq!(fs::read(destination.join("payload"))?, b"previous output");
+
+    // A killed process cannot remove its staged directory, so it stays recoverable
+    let staged: Vec<_> = fs::read_dir(root.path())?
+        .collect::<Result<Vec<_>, _>>()?
+        .into_iter()
+        .filter(|entry| {
+            entry
+                .file_name()
+                .to_string_lossy()
+                .starts_with(".l2solver-")
+        })
+        .collect();
+    assert_eq!(staged.len(), 1, "interrupted staging was not retained");
+    assert_eq!(
+        fs::read(staged[0].path().join("payload"))?,
+        b"staged output"
+    );
     Ok(())
 }
