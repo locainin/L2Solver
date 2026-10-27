@@ -8,7 +8,8 @@ use std::{
 };
 
 use l2_workbench::job::{
-    CacheFallbackKind, CacheStage, Job,
+    CacheFallbackKind, CacheStage, Counter, Job, RecoveryTransition, RecoveryTransitionOutcome,
+    RecoveryTransitionStage,
     cache::{
         Cache, CacheError, CacheReadPolicy, CheckpointStatus, SourceFingerprint, SourceIdentity,
         StageKey, StageStatus,
@@ -576,48 +577,80 @@ fn checkpoint_snapshot_versions_are_validated_before_restore() -> Result<(), Box
 }
 
 #[test]
-fn checkpoint_version_two_round_trips_new_fallbacks_and_reads_compatible_version_one()
+fn checkpoint_version_three_round_trips_transitions_and_reads_legacy_versions()
 -> Result<(), Box<dyn Error>> {
     let temporary = tempfile::tempdir()?;
     let cache = cache_at(temporary.path(), 1024)?;
-
-    let current_key = stage_key("version-two-fallbacks")?;
-    let current_job = Job::new("version two fallback checkpoint");
+    let current_key = stage_key("version-three-transitions")?;
+    let current_job = Job::new("version three checkpoint");
     current_job.record_cache_fallback(
         CacheStage::CaseRecovery,
         CacheFallbackKind::CommitCaseTooLarge,
         format_args!("Case JSON exceeds the recovery-cache limit"),
     )?;
+    current_job.increment(Counter::RecordInputApplications, 3)?;
+    current_job.record_recovery_transition(RecoveryTransition {
+        stage: RecoveryTransitionStage::Schema,
+        outcome: RecoveryTransitionOutcome::ReportRetained,
+        sample: None,
+    })?;
     let current_snapshot = current_job.snapshot()?;
     cache.write_checkpoint(&current_key, &current_snapshot, CheckpointStatus::Active)?;
     let current = cache
         .read_checkpoint(&current_key)?
-        .ok_or_else(|| missing("version-two checkpoint should be available"))?;
-    assert_eq!(current.snapshot_version, 2);
+        .ok_or_else(|| missing("version-three checkpoint should be available"))?;
+    assert_eq!(current.snapshot_version, 3);
     assert_eq!(current.snapshot, current_snapshot);
+    for version in [1, 2] {
+        assert_legacy_checkpoint(&cache, temporary.path(), version)?;
+    }
+    Ok(())
+}
 
-    let legacy_key = stage_key("compatible-version-one")?;
-    let legacy_job = Job::new("compatible version one checkpoint");
+fn assert_legacy_checkpoint(
+    cache: &Cache,
+    directory: &Path,
+    version: u32,
+) -> Result<(), Box<dyn Error>> {
+    let key = stage_key(&format!("compatible-version-{version}"))?;
+    let legacy_job = Job::new("compatible legacy checkpoint");
     legacy_job.record_cache_fallback(
         CacheStage::CaseRecovery,
         CacheFallbackKind::InvalidEntry,
         format_args!("cached Case could not be restored"),
     )?;
-    let legacy_snapshot = legacy_job.snapshot()?;
-    cache.write_checkpoint(&legacy_key, &legacy_snapshot, CheckpointStatus::Active)?;
-    let database =
-        rusqlite::Connection::open(temporary.path().join("state").join("cache.sqlite3"))?;
+    let mut legacy_json = serde_json::to_value(legacy_job.snapshot()?)?;
+    legacy_json
+        .as_object_mut()
+        .ok_or_else(|| missing("snapshot must be an object"))?
+        .remove("recovery_transitions");
+    legacy_json
+        .get_mut("counters")
+        .and_then(Value::as_object_mut)
+        .ok_or_else(|| missing("snapshot counters must be an object"))?
+        .remove("record_input_applications");
+    let expected: l2_workbench::job::JobSnapshot = serde_json::from_value(legacy_json.clone())?;
+    cache.write_checkpoint(&key, &legacy_job.snapshot()?, CheckpointStatus::Active)?;
+    let database = rusqlite::Connection::open(directory.join("state").join("cache.sqlite3"))?;
     database.execute(
-        "UPDATE checkpoints SET snapshot_version = 1 WHERE key = ?1",
-        [legacy_key.as_str()],
+        "UPDATE checkpoints SET snapshot_version = ?1, snapshot_json = ?2 WHERE key = ?3",
+        rusqlite::params![version, serde_json::to_string(&legacy_json)?, key.as_str()],
     )?;
     drop(database);
-
     let legacy = cache
-        .read_checkpoint(&legacy_key)?
-        .ok_or_else(|| missing("compatible version-one checkpoint should be available"))?;
-    assert_eq!(legacy.snapshot_version, 1);
-    assert_eq!(legacy.snapshot, legacy_snapshot);
+        .read_checkpoint(&key)?
+        .ok_or_else(|| missing("legacy checkpoint should be available"))?;
+    assert_eq!(legacy.snapshot_version, version);
+    assert_eq!(legacy.snapshot, expected);
+    let restored = Job::new("restored legacy checkpoint");
+    restored.restore(legacy.snapshot)?;
+    assert_eq!(
+        restored
+            .snapshot()?
+            .counters
+            .get(&Counter::RecordInputApplications),
+        Some(&0)
+    );
     Ok(())
 }
 
