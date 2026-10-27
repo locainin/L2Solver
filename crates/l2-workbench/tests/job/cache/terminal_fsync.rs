@@ -8,6 +8,15 @@ use l2_workbench::job::{
 use serde_json::json;
 use std::{error::Error, fs, path::Path, process::Command};
 
+pub(super) fn strace_available(directory: &Path) -> bool {
+    let probe = Command::new("strace")
+        .args(["-qq", "-o"])
+        .arg(directory.join("probe.trace"))
+        .arg("true")
+        .output();
+    matches!(probe, Ok(output) if output.status.success())
+}
+
 #[test]
 fn terminal_fsync_failure_child() -> Result<(), Box<dyn Error>> {
     let Some(base) = std::env::var_os("L2_TEST_TERMINAL_FSYNC_ROOT") else {
@@ -27,17 +36,9 @@ fn terminal_fsync_failure_child() -> Result<(), Box<dyn Error>> {
 fn terminal_fsync_failure_keeps_previous_entry_and_active_generation() -> Result<(), Box<dyn Error>>
 {
     let temporary = tempfile::tempdir()?;
-    let probe = Command::new("strace")
-        .args(["-qq", "-o"])
-        .arg(temporary.path().join("probe.trace"))
-        .arg("true")
-        .output();
-    match probe {
-        Ok(output) if output.status.success() => {}
-        _ => {
-            eprintln!("terminal fsync fault test needs usable strace");
-            return Ok(());
-        }
+    if !strace_available(temporary.path()) {
+        eprintln!("terminal fsync fault test needs usable strace");
+        return Ok(());
     }
 
     let cache = cache_at(temporary.path(), 64 * 1024)?;
