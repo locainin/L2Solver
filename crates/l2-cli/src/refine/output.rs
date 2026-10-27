@@ -4,6 +4,7 @@ use super::{
     analysis::{
         CACHE_ANALYSIS_SCHEMA_VERSION, REFINE_ANALYZER_ALGORITHM_VERSION, recovery_profile_name,
     },
+    file_artifact::FileArtifact,
     input::LoadedSource,
     invalid_input,
     policy::RefinePolicy,
@@ -29,7 +30,7 @@ use std::{
     path::{Path, PathBuf},
 };
 
-const REFINE_ALGORITHM_VERSION: u32 = 4;
+const REFINE_ALGORITHM_VERSION: u32 = 5;
 
 #[derive(Serialize)]
 pub(super) struct SourceRecord {
@@ -175,6 +176,7 @@ pub(super) fn write_reused_summary(
 
 pub(super) fn make_manifest<'a>(
     selected: &'a [SelectedArtifact<'a>],
+    file_artifacts: &'a [FileArtifact],
     sources: &'a [SourceRecord],
     artifacts: &'a [ArtifactRecord],
     complete: bool,
@@ -193,7 +195,12 @@ pub(super) fn make_manifest<'a>(
 
     let mut published = Vec::new();
     published
-        .try_reserve_exact(selected.len())
+        .try_reserve_exact(
+            selected
+                .len()
+                .checked_add(file_artifacts.len())
+                .ok_or_else(|| invalid_input("artifact count overflows"))?,
+        )
         .map_err(|_| io::Error::other("manifest artifact allocation failed"))?;
     for selected_artifact in selected {
         let provenance = selected_artifact.provenance();
@@ -232,6 +239,7 @@ pub(super) fn make_manifest<'a>(
             nodes: provenance,
         });
     }
+    append_file_records(&mut published, file_artifacts, sources)?;
     Ok(RefineManifest {
         schema_version: if sources.iter().all(|source| source.sha256.is_some()) {
             1
@@ -242,6 +250,33 @@ pub(super) fn make_manifest<'a>(
         sources,
         artifacts: published,
     })
+}
+
+fn append_file_records<'a>(
+    published: &mut Vec<PublishedArtifactRecord<'a>>,
+    file_artifacts: &'a [FileArtifact],
+    sources: &'a [SourceRecord],
+) -> Result<(), Box<dyn Error>> {
+    for artifact in file_artifacts {
+        let source = sources
+            .get(artifact.source_index)
+            .ok_or_else(|| invalid_input("artifact source index is missing"))?;
+        published.push(PublishedArtifactRecord {
+            file: &artifact.file_name,
+            byte_length: artifact.range.length,
+            sha256: artifact.sha256.clone(),
+            origins: vec![PublishedOriginRecord {
+                source_index: artifact.source_index,
+                source_label: &source.label,
+                artifact_index: artifact.artifact_index,
+                origin: &artifact.origin,
+                validation: artifact.validation,
+                signature_match_count: 0,
+            }],
+            nodes: &artifact.provenance,
+        });
+    }
+    Ok(())
 }
 
 pub(super) fn write_manifest(
@@ -271,6 +306,7 @@ pub(super) fn write_summary_file(staging: &Path, summary: &str) -> Result<(), Bo
 pub(super) fn format_summary(
     destination: &Path,
     selected: &[SelectedArtifact<'_>],
+    file_artifacts: &[FileArtifact],
     sources: &[SourceRecord],
     complete: bool,
 ) -> String {
@@ -279,7 +315,7 @@ pub(super) fn format_summary(
         "Refined artifacts\nDirectory: {}\nSources: {}; files: {}; status: {status}\n",
         destination.display().to_string().escape_debug(),
         sources.len(),
-        selected.len(),
+        selected.len() + file_artifacts.len(),
     );
     for source in sources {
         summary.push_str("Source: ");
@@ -307,6 +343,11 @@ pub(super) fn format_summary(
         summary.push_str(&artifact.provenance().len().to_string());
         summary.push_str(" source reference(s)\n");
     }
+    for artifact in file_artifacts {
+        summary.push_str("  ");
+        summary.push_str(&artifact.file_name);
+        summary.push_str(" <- 1 source reference(s)\n");
+    }
     summary
 }
 
@@ -314,6 +355,7 @@ pub(super) fn write_summary(
     output: &mut impl Write,
     destination: &Path,
     selected: &[SelectedArtifact<'_>],
+    file_artifacts: &[FileArtifact],
     sources: &[SourceRecord],
     complete: bool,
     dry_run: bool,
@@ -326,7 +368,7 @@ pub(super) fn write_summary(
         "{} {} source object(s) into {} artifact file(s) at {}",
         if dry_run { "Would refine" } else { "Refined" },
         sources.len(),
-        selected.len(),
+        selected.len() + file_artifacts.len(),
         destination.display().to_string().escape_debug()
     )?;
     if !complete {

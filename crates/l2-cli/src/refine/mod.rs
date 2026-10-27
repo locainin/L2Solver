@@ -1,9 +1,12 @@
 //! Refine standalone byte files and manifest-listed artifact directories
 
 mod analysis;
+mod file_artifact;
 mod input;
 mod output;
 mod policy;
+mod range_members;
+mod range_zip;
 mod read_budget;
 
 #[cfg(test)]
@@ -224,6 +227,7 @@ fn analyze_and_publish<W: Write>(
     job.start(Phase::Reports, Some(1))?;
     let manifest = output::make_manifest(
         &selected,
+        &analyzed.file_artifacts,
         &analyzed.source_records,
         &analyzed.artifact_records,
         analyzed.complete,
@@ -231,6 +235,7 @@ fn analyze_and_publish<W: Write>(
     let summary = output::format_summary(
         destination,
         &selected,
+        &analyzed.file_artifacts,
         &analyzed.source_records,
         analyzed.complete,
     );
@@ -244,6 +249,7 @@ fn analyze_and_publish<W: Write>(
                 output,
                 destination,
                 &selected,
+                &analyzed.file_artifacts,
                 &analyzed.source_records,
                 analyzed.complete,
                 true,
@@ -255,8 +261,12 @@ fn analyze_and_publish<W: Write>(
     job.check_cancelled()?;
     result_directory.publish(identity, job, |staging| {
         artifact_export::write_artifacts_into(staging, &selected)?;
+        write_file_artifacts(input_set, &analyzed.file_artifacts, staging, job)?;
         output::write_manifest(staging, &manifest)?;
         output::write_summary_file(staging, &summary)?;
+        if !analyzed.file_artifacts.is_empty() {
+            ensure_input_unchanged(input_set, sampled, policy, job)?;
+        }
         Ok(())
     })?;
     if !options.recovery.quiet {
@@ -264,12 +274,25 @@ fn analyze_and_publish<W: Write>(
             output,
             destination,
             &selected,
+            &analyzed.file_artifacts,
             &analyzed.source_records,
             analyzed.complete,
             false,
         )?;
     }
     Ok(analyzed.complete)
+}
+
+fn write_file_artifacts(
+    input: &input::InputSet,
+    artifacts: &[file_artifact::FileArtifact],
+    staging: &std::path::Path,
+    job: &Job,
+) -> Result<(), Box<dyn Error>> {
+    for artifact in artifacts {
+        input.write_file_artifact(artifact, staging, job)?;
+    }
+    Ok(())
 }
 
 fn ensure_input_unchanged(

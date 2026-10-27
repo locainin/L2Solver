@@ -281,12 +281,28 @@ pub enum AnalysisOmission {
         /// Operation-wide source read limit
         maximum: u64,
     },
+    /// A validated file range could not be reread for publication within the source limit
+    SourceRangeOutputReadLimit {
+        /// Exact range length requiring publication
+        length: u64,
+        /// Source read bytes available after required checks
+        remaining: u64,
+        /// Operation-wide source read limit
+        maximum: u64,
+    },
+    /// File-backed structural validation could not complete within its limits
+    SourceRangeValidationLimit {
+        /// Format selected for structural inspection
+        format: AnalysisFormat,
+        /// Reader or metadata limit that stopped validation
+        reason: String,
+    },
     /// The shared evidence Case has no remaining space for another source object
     CaseBlobLimit {
         /// Maximum aggregate bytes retained by the Case
         maximum: usize,
     },
-    /// Range analysis excludes whole-source validation, transforms, and larger objects
+    /// Range discovery has bounded windows and may omit whole-source work or larger objects
     SourceRangeCoverage {
         /// Largest object guaranteed to fit within overlapping source windows
         max_object_bytes: usize,
@@ -399,6 +415,9 @@ pub struct ArtifactAnalysis {
     pub region_transform_reports: Vec<ArtifactRegionTransformReport>,
     /// Accounted byte work consumed by this analysis
     pub work_bytes: usize,
+    /// Declared ZIP member bytes charged, including failed extraction attempts
+    #[serde(default)]
+    pub zip_expanded_work_bytes: usize,
 }
 
 impl ArtifactAnalysis {
@@ -589,7 +608,7 @@ fn validate_and_expand_zip(
                         found,
                         PendingArtifact {
                             bytes: member_bytes,
-                            origin: archive_origin(
+                            origin: archive_member_origin(
                                 context.index,
                                 context.input_bytes.len(),
                                 &entry.metadata,
@@ -983,7 +1002,9 @@ pub fn analyze_artifacts_with_source_sha256(
         report.status = AnalysisStatus::Partial;
         return Ok(report);
     }
-    report.work_bytes = analyze_queue(bytes, options, &mut report)?;
+    let (work_bytes, zip_expanded_work_bytes) = analyze_queue(bytes, options, &mut report)?;
+    report.work_bytes = work_bytes;
+    report.zip_expanded_work_bytes = zip_expanded_work_bytes;
     let has_validated_object = report
         .artifacts
         .iter()
@@ -1005,6 +1026,7 @@ fn empty_analysis_report(source_length: usize, source_sha256: &str) -> ArtifactA
         omissions: Vec::new(),
         region_transform_reports: Vec::new(),
         work_bytes: 0,
+        zip_expanded_work_bytes: 0,
     }
 }
 
@@ -1028,7 +1050,7 @@ fn analyze_queue(
     source_bytes: &[u8],
     options: ArtifactAnalysisOptions,
     report: &mut ArtifactAnalysis,
-) -> Result<usize, AnalyzerError> {
+) -> Result<(usize, usize), AnalyzerError> {
     add_source_artifact(source_bytes, report)?;
     let mut total_output_bytes = source_bytes.len();
     let mut budget = AnalysisBudget::new(options.limits);
@@ -1050,7 +1072,10 @@ fn analyze_queue(
             &mut pending,
         )?;
     }
-    Ok(budget.work.used)
+    Ok((
+        budget.work.used,
+        options.limits.max_zip_expanded_bytes - budget.zip_remaining,
+    ))
 }
 
 fn add_source_artifact(
@@ -1303,7 +1328,9 @@ const fn boundary_label(boundary: ArtifactBoundaryEvidence) -> AnalysisBoundary 
     }
 }
 
-fn archive_origin(
+/// Construct the exact origin of a member extracted by the canonical ZIP parser
+#[must_use]
+pub fn archive_member_origin(
     parent_index: usize,
     archive_length: usize,
     metadata: &super::zip::ZipArtifactEntryMetadata,

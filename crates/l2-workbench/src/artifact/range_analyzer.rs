@@ -307,6 +307,7 @@ impl RangeState {
             }],
             region_transform_reports: Vec::new(),
             work_bytes: self.options.limits.max_total_work_bytes - self.work_remaining,
+            zip_expanded_work_bytes: 0,
         }
     }
 }

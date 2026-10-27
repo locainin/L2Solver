@@ -1,6 +1,7 @@
 //! Bounded artifact analysis, per-input caching, and evidence-case construction
 
 use super::{
+    file_artifact::FileArtifact,
     input::{InputSet, LoadedSource, SourceData},
     invalid_input,
     output::{ArtifactRecord, SourceRecord},
@@ -13,7 +14,7 @@ use l2_workbench::{
         AnalysisStatus, ArtifactAnalysisOptions, ArtifactOrigin, ArtifactValidationState,
         analyze_artifacts_with_source_sha256,
     },
-    evidence::{Case, MAX_NODES},
+    evidence::{Case, MAX_NODES, SourceRange},
     job::{
         CacheFallbackKind, CacheStage, Counter, Job, Phase,
         cache::{Cache, CacheEntry, CacheReadPolicy, Lease, SourceIdentity, StageKey, StageStatus},
@@ -30,7 +31,7 @@ use std::{
     io::{self, Write},
 };
 
-pub(super) const REFINE_ANALYZER_ALGORITHM_VERSION: u32 = 4;
+pub(super) const REFINE_ANALYZER_ALGORITHM_VERSION: u32 = 5;
 pub(super) const CACHE_ANALYSIS_SCHEMA_VERSION: u32 = 1;
 const MAX_CACHE_RECEIPT_BYTES: usize = 8 * 1024 * 1024;
 
@@ -80,7 +81,21 @@ pub(super) fn analyze_sources(
         } else if source.bytes().is_some() {
             analyze_source_cached(source, options, recovery, cache, job)?
         } else {
-            let report = source.analyze_ranges(input_set, source_index, options, job)?;
+            let range = source.analyze_ranges(input_set, source_index, options, job)?;
+            let mut report = range.report;
+            if let Some(archive) = range.archive {
+                let parent_index = report.artifacts.len();
+                if range.retain_source {
+                    analysis.append_file_archive(
+                        source_index,
+                        parent_index,
+                        source,
+                        &report.source_sha256,
+                        archive.entry_count,
+                    )?;
+                }
+                super::range_members::append_members(&mut report, archive, parent_index, options)?;
+            }
             record_analysis_work(job, &report)?;
             report
         };
@@ -112,6 +127,7 @@ fn no_case_space(
         omissions: vec![l2_workbench::artifact::AnalysisOmission::CaseBlobLimit { maximum }],
         region_transform_reports: Vec::new(),
         work_bytes: 0,
+        zip_expanded_work_bytes: 0,
     })
 }
 
@@ -119,6 +135,7 @@ pub(super) struct AnalyzedSources {
     pub(super) case: Case,
     pub(super) source_records: Vec<SourceRecord>,
     pub(super) artifact_records: Vec<ArtifactRecord>,
+    pub(super) file_artifacts: Vec<FileArtifact>,
     pub(super) complete: bool,
 }
 
@@ -132,8 +149,48 @@ impl AnalyzedSources {
             case: Case::with_blob_limit(case_blob_limit)?,
             source_records,
             artifact_records: Vec::new(),
+            file_artifacts: Vec::new(),
             complete: true,
         })
+    }
+
+    fn append_file_archive(
+        &mut self,
+        source_index: usize,
+        artifact_index: usize,
+        source: &LoadedSource,
+        sha256: &str,
+        entry_count: usize,
+    ) -> Result<(), Box<dyn Error>> {
+        let length = u64::try_from(source.length())?;
+        let source_id = self.case.add_source(
+            &format!("refine-source-{source_index}"),
+            "file",
+            length,
+            sha256,
+            None,
+        )?;
+        let node_id = self.case.add_node(
+            "file_range_artifact",
+            None,
+            vec![SourceRange {
+                source: source_id,
+                packet: None,
+                offset: 0,
+                length,
+            }],
+            json!({"source_index":source_index,"artifact_index":artifact_index}),
+        )?;
+        self.file_artifacts.try_reserve(1)?;
+        self.file_artifacts.push(FileArtifact::zip(
+            node_id,
+            source_index,
+            artifact_index,
+            source.length(),
+            sha256.to_owned(),
+            entry_count,
+        ));
+        Ok(())
     }
 
     pub(super) fn analyzer_validation_receipts(
@@ -254,7 +311,7 @@ fn analysis_reason(report: &l2_workbench::artifact::ArtifactAnalysis) -> Option<
     {
         let uncovered_bytes = uncovered_range.map_or(0, |range| range.length);
         return Some(format!(
-            "range analysis searches for embedded PNG and ZIP objects; objects up to {max_object_bytes} bytes fit across windows, subject to budgets; {uncovered_bytes} source bytes lacked complete range coverage, {omitted_candidates} candidates and {signature_scans_omitted} signature scans were omitted; whole-source validation, archive expansion, and transforms were not performed"
+            "range analysis searches for embedded PNG and ZIP objects; objects up to {max_object_bytes} bytes fit across windows, subject to budgets; {uncovered_bytes} source bytes lacked complete range coverage, {omitted_candidates} candidates and {signature_scans_omitted} signature scans were omitted; whole-source transforms were not performed; see artifact validation and member omissions for structural and expansion results"
         ));
     }
     match report.status {

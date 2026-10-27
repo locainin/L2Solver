@@ -69,6 +69,7 @@ fn standalone_zip_uses_the_existing_zip_parser_and_retains_its_member() -> Resul
         zip_support::build_zip(&[zip_support::FixtureEntry::stored(b"member.bin", content)])?;
     let structural = inspect_zip_with_limits(&archive, ZipArtifactLimits::default())?;
     let report = analyze_artifacts(&archive, ArtifactAnalysisOptions::default())?;
+    assert_eq!(report.zip_expanded_work_bytes, content.len());
     let source = report
         .artifacts
         .first()

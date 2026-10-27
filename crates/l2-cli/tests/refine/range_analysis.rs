@@ -67,7 +67,7 @@ fn range_source_admission_and_analysis_read_content_once() -> Result<(), Box<dyn
         serde_json::to_value(identity)?
             .get("value")
             .and_then(serde_json::Value::as_str),
-        Some(report.source_sha256.as_str())
+        Some(report.report.source_sha256.as_str())
     );
     Ok(())
 }

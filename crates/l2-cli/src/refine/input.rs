@@ -13,11 +13,13 @@ use l2_workbench::{
     sha256,
 };
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use std::{
+    cell::Cell,
     collections::HashSet,
     error::Error,
     fs::{self, File, Metadata},
-    io::{self, Read, Seek, SeekFrom},
+    io::{self, Read, Seek, SeekFrom, Write},
     path::{Path, PathBuf},
 };
 
@@ -36,6 +38,8 @@ pub(super) struct InputSet {
     sources: Vec<InputSpec>,
     plans: Vec<SourcePlan>,
     budget: SourceReadBudget,
+    extra_read_bytes: Cell<u64>,
+    publication_recheck_held: Cell<bool>,
     manifest_read_bytes: u64,
     manifest_sha256: Option<String>,
     #[cfg(target_os = "linux")]
@@ -48,6 +52,136 @@ struct SourcePlan {
     length: usize,
     metadata: MetadataFingerprint,
     omission: Option<ReadOmission>,
+}
+
+impl InputSet {
+    pub(super) const fn extra_read_bytes(&self) -> u64 {
+        self.extra_read_bytes.get()
+    }
+
+    fn hold_extra_reads(&self, bytes: u64) -> bool {
+        let Some(remaining) = self.extra_read_bytes.get().checked_sub(bytes) else {
+            return false;
+        };
+        self.extra_read_bytes.set(remaining);
+        true
+    }
+
+    pub(super) fn reserve_extra_reads(&self, bytes: u64) -> Result<bool, Box<dyn Error>> {
+        if !self.hold_extra_reads(bytes) {
+            return Ok(false);
+        }
+        self.budget.reserve(bytes)?;
+        Ok(true)
+    }
+
+    fn publication_recheck_bytes(&self) -> Result<u64, Box<dyn Error>> {
+        let samples = self
+            .plans
+            .iter()
+            .filter(|plan| plan.omission.is_none())
+            .try_fold(0_u64, |sum, plan| {
+                sum.checked_add(SourceFingerprint::sample_read_bytes(
+                    u64::try_from(plan.length).ok()?,
+                ))
+            })
+            .ok_or_else(|| invalid_input("publication source recheck size overflows"))?;
+        samples
+            .checked_add(self.manifest_read_bytes)
+            .ok_or_else(|| invalid_input("publication source recheck size overflows"))
+    }
+
+    fn reserve_source_output(&self, bytes: u64) -> Result<bool, Box<dyn Error>> {
+        let recheck = if self.publication_recheck_held.get() {
+            0
+        } else {
+            self.publication_recheck_bytes()?
+        };
+        let required = bytes
+            .checked_add(recheck)
+            .ok_or_else(|| invalid_input("source output read reservation overflows"))?;
+        if required > self.extra_read_bytes() {
+            return Ok(false);
+        }
+        if recheck > 0 {
+            self.hold_extra_reads(recheck);
+            self.publication_recheck_held.set(true);
+        }
+        self.reserve_extra_reads(bytes)
+    }
+
+    pub(super) fn write_file_artifact(
+        &self,
+        artifact: &super::file_artifact::FileArtifact,
+        staging: &Path,
+        job: &Job,
+    ) -> Result<(), Box<dyn Error>> {
+        if !is_safe_flat_file_name(&artifact.file_name) {
+            return Err(invalid_input("artifact output name is unsafe"));
+        }
+        let spec = self
+            .sources
+            .get(artifact.source_index)
+            .ok_or_else(|| invalid_input("artifact source index is missing"))?;
+        let plan = self
+            .plans
+            .get(artifact.source_index)
+            .ok_or_else(|| invalid_input("artifact source plan is missing"))?;
+        let end = artifact
+            .range
+            .offset
+            .checked_add(artifact.range.length)
+            .ok_or_else(|| invalid_input("artifact range overflows"))?;
+        if end > plan.length {
+            return Err(invalid_input("artifact range exceeds its source"));
+        }
+        let mut source = open_identity_source(self, spec)?;
+        if metadata_fingerprint(&source.metadata()?) != plan.metadata {
+            return Err(invalid_input("input artifact changed before publication"));
+        }
+        source.seek(SeekFrom::Start(u64::try_from(artifact.range.offset)?))?;
+        let mut source = CancellableReader::new(source, job);
+        let mut target = File::options()
+            .write(true)
+            .create_new(true)
+            .open(staging.join(&artifact.file_name))?;
+        let mut digest = Sha256::new();
+        let mut buffer = [0_u8; 16 * 1024];
+        let mut remaining = artifact.range.length;
+        while remaining > 0 {
+            let count = remaining.min(buffer.len());
+            let part = buffer
+                .get_mut(..count)
+                .ok_or_else(|| invalid_input("source output buffer is invalid"))?;
+            source.read_exact(part)?;
+            target.write_all(part)?;
+            digest.update(part);
+            remaining -= count;
+        }
+        if format!("{:x}", digest.finalize()) != artifact.sha256 {
+            return Err(invalid_input(
+                "input artifact changed while it was published",
+            ));
+        }
+        let source = source.into_inner();
+        if metadata_fingerprint(&source.metadata()?) != plan.metadata {
+            return Err(invalid_input(
+                "input artifact changed while it was published",
+            ));
+        }
+        let named = open_identity_source(self, spec)?;
+        if metadata_fingerprint(&named.metadata()?) != plan.metadata {
+            return Err(invalid_input(
+                "input artifact changed while it was published",
+            ));
+        }
+        #[cfg(target_os = "linux")]
+        if let Some(directory) = &self.directory {
+            directory.check_location()?;
+        }
+        target.sync_all()?;
+        Ok(())
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -86,6 +220,12 @@ pub(super) struct RangeSource {
     metadata: MetadataFingerprint,
 }
 
+pub(super) struct RangeAnalysis {
+    pub(super) report: l2_workbench::artifact::ArtifactAnalysis,
+    pub(super) archive: Option<l2_workbench::artifact::zip::ZipArtifactReport>,
+    pub(super) retain_source: bool,
+}
+
 impl LoadedSource {
     pub(super) const fn length(&self) -> usize {
         match &self.data {
@@ -115,7 +255,7 @@ impl LoadedSource {
         source_index: usize,
         options: l2_workbench::artifact::ArtifactAnalysisOptions,
         job: &Job,
-    ) -> Result<l2_workbench::artifact::ArtifactAnalysis, Box<dyn Error>> {
+    ) -> Result<RangeAnalysis, Box<dyn Error>> {
         let SourceData::File(source) = &self.data else {
             return Err(invalid_input("source is not range-backed"));
         };
@@ -129,6 +269,13 @@ impl LoadedSource {
                 "input artifact changed before range analysis",
             ));
         }
+        let zip_candidate = super::range_zip::probe_tail(
+            &mut file,
+            source.length,
+            options.limits.max_input_bytes,
+            input_set,
+            job,
+        )?;
         file.seek(SeekFrom::Start(0))?;
         input_set.budget.reserve(
             u64::try_from(source.length)?
@@ -136,12 +283,16 @@ impl LoadedSource {
                 .ok_or_else(|| invalid_input("source read length overflows"))?,
         )?;
         let mut reader = CancellableReader::new(file, job);
-        let report = l2_workbench::artifact::analyze_artifacts_from_reader(
+        let mut scan_options = options;
+        if zip_candidate {
+            scan_options.limits.max_total_work_bytes -= options.limits.max_total_work_bytes / 2;
+        }
+        let mut report = l2_workbench::artifact::analyze_artifacts_from_reader(
             &mut reader,
             source.length,
-            options,
+            scan_options,
         )?;
-        let file = reader.into_inner();
+        let mut file = reader.into_inner();
         if metadata_fingerprint(&file.metadata()?) != source.metadata {
             return Err(invalid_input(
                 "input artifact changed during range analysis",
@@ -154,19 +305,71 @@ impl LoadedSource {
         {
             return Err(invalid_input("artifact hash does not match its manifest"));
         }
-        // Confirm the name still resolves to the same opened object
-        let named = open_identity_source(input_set, spec)?;
-        if metadata_fingerprint(&named.metadata()?) != source.metadata {
+        let (archive, retain_source) = if zip_candidate {
+            inspect_source_archive(
+                &mut file,
+                source.length,
+                &mut report,
+                options,
+                input_set,
+                job,
+            )?
+        } else {
+            (None, false)
+        };
+        if metadata_fingerprint(&file.metadata()?) != source.metadata {
             return Err(invalid_input(
                 "input artifact changed during range analysis",
             ));
         }
-        #[cfg(target_os = "linux")]
-        if let Some(directory) = &input_set.directory {
-            directory.check_location()?;
-        }
-        Ok(report)
+        confirm_range_source_name(input_set, spec, source)?;
+        Ok(RangeAnalysis {
+            report,
+            archive,
+            retain_source,
+        })
     }
+}
+
+fn confirm_range_source_name(
+    input: &InputSet,
+    spec: &InputSpec,
+    source: &RangeSource,
+) -> Result<(), Box<dyn Error>> {
+    // Confirm the name still resolves to the same opened object
+    let named = open_identity_source(input, spec)?;
+    if metadata_fingerprint(&named.metadata()?) != source.metadata {
+        return Err(invalid_input(
+            "input artifact changed during range analysis",
+        ));
+    }
+    #[cfg(target_os = "linux")]
+    if let Some(directory) = &input.directory {
+        directory.check_location()?;
+    }
+    Ok(())
+}
+
+fn inspect_source_archive(
+    file: &mut File,
+    length: usize,
+    report: &mut l2_workbench::artifact::ArtifactAnalysis,
+    options: l2_workbench::artifact::ArtifactAnalysisOptions,
+    input: &InputSet,
+    job: &Job,
+) -> Result<(Option<l2_workbench::artifact::zip::ZipArtifactReport>, bool), Box<dyn Error>> {
+    let archive = super::range_zip::inspect(file, length, report, options, input, job)?;
+    let retain = archive.is_some() && input.reserve_source_output(u64::try_from(length)?)?;
+    if archive.is_some() && !retain {
+        report.omissions.push(
+            l2_workbench::artifact::AnalysisOmission::SourceRangeOutputReadLimit {
+                length: u64::try_from(length)?,
+                remaining: input.extra_read_bytes(),
+                maximum: input.budget.maximum(),
+            },
+        );
+    }
+    Ok((archive, retain))
 }
 
 pub(super) struct CancellableReader<'a, R> {
@@ -195,6 +398,13 @@ impl<R: Read> Read for CancellableReader<'_, R> {
         let count = self.inner.read(part)?;
         record_source_read(self.job, count)?;
         Ok(count)
+    }
+}
+
+impl<R: Seek> Seek for CancellableReader<'_, R> {
+    fn seek(&mut self, position: SeekFrom) -> io::Result<u64> {
+        self.job.check_cancelled().map_err(io::Error::other)?;
+        self.inner.seek(position)
     }
 }
 
@@ -283,6 +493,8 @@ pub(super) fn prepare_input_set_with_limit(
         manifest_sha256: None,
         plans: Vec::new(),
         budget,
+        extra_read_bytes: Cell::new(0),
+        publication_recheck_held: Cell::new(false),
         manifest_read_bytes: 0,
         #[cfg(target_os = "linux")]
         directory: None,
@@ -351,6 +563,8 @@ fn prepare_export_directory(
         manifest_sha256: Some(manifest_sha256),
         plans: Vec::new(),
         budget,
+        extra_read_bytes: Cell::new(0),
+        publication_recheck_held: Cell::new(false),
         manifest_read_bytes,
         #[cfg(target_os = "linux")]
         directory: Some(directory),
@@ -397,6 +611,7 @@ fn plan_sources(input_set: &mut InputSet) -> Result<(), Box<dyn Error>> {
         });
     }
     input_set.plans = plans;
+    input_set.extra_read_bytes.set(available);
     Ok(())
 }
 
