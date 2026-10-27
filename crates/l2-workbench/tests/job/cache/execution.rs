@@ -181,6 +181,152 @@ fn real_full_filesystem_preserves_the_committed_execution_generation() -> Result
     Ok(())
 }
 
+#[cfg(target_os = "linux")]
+struct OwnedCrashChild(std::process::Child);
+
+#[cfg(target_os = "linux")]
+impl Drop for OwnedCrashChild {
+    fn drop(&mut self) {
+        if matches!(self.0.try_wait(), Ok(None)) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn active_generation_count(path: &std::path::Path) -> io::Result<usize> {
+    let mut count = 0;
+    for entry in std::fs::read_dir(path)? {
+        if entry?.file_name().to_string_lossy().starts_with("active-") {
+            count += 1;
+        }
+    }
+    Ok(count)
+}
+
+#[cfg(target_os = "linux")]
+fn paused_generation_writer(path: &std::path::Path) -> Result<OwnedCrashChild, Box<dyn Error>> {
+    use std::{
+        process::{Command, Stdio},
+        thread,
+        time::{Duration, Instant},
+    };
+
+    let mut child = OwnedCrashChild(
+        Command::new(std::env::current_exe()?)
+            .args([
+                "--exact",
+                "cache::execution::active_generation_crash_child",
+                "--nocapture",
+            ])
+            .env("L2_TEST_GENERATION_CRASH_ROOT", path)
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()?,
+    );
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while !path.join("ready").exists() && Instant::now() < deadline {
+        if child.0.try_wait()?.is_some() {
+            return Err("generation writer exited before the pause".into());
+        }
+        thread::sleep(Duration::from_millis(10));
+    }
+    if !path.join("ready").exists() {
+        return Err("generation writer did not reach the pause".into());
+    }
+    Ok(child)
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn active_generation_crash_child() -> Result<(), Box<dyn Error>> {
+    use std::{
+        fs, thread,
+        time::{Duration, Instant},
+    };
+
+    let Some(base) = std::env::var_os("L2_TEST_GENERATION_CRASH_ROOT") else {
+        return Ok(());
+    };
+    let base = std::path::Path::new(&base);
+    let cache = cache_at(base, 64 * 1024)?;
+    let key = stage_key("pre-pointer-crash")?;
+    let mut lease = cache.lease(&key)?;
+    let snapshot = Job::new("new generation").snapshot()?;
+    lease.save_active(&snapshot, limits(), |writer| {
+        writer.streams().2.write_all(b"new-cursor")?;
+        fs::write(base.join("ready"), b"ready")?;
+        let deadline = Instant::now() + Duration::from_secs(15);
+        while !base.join("release").exists() && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(10));
+        }
+        if !base.join("release").exists() {
+            return Err(io::Error::other("parent did not release the writer").into());
+        }
+        Ok(json!({"generation":2}))
+    })?;
+    Err("generation published before the parent interrupted it".into())
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn killing_after_generation_rename_keeps_the_previous_database_pointer()
+-> Result<(), Box<dyn Error>> {
+    use std::{
+        fs,
+        os::unix::process::ExitStatusExt,
+        thread,
+        time::{Duration, Instant},
+    };
+
+    let temporary = tempfile::tempdir()?;
+    let cache = cache_at(temporary.path(), 64 * 1024)?;
+    let key = stage_key("pre-pointer-crash")?;
+    let first = Job::new("committed generation").snapshot()?;
+    let mut lease = cache.lease(&key)?;
+    lease.save_active(&first, limits(), |writer| {
+        writer.streams().2.write_all(b"first-cursor")?;
+        Ok(json!({"generation":1}))
+    })?;
+    drop(lease);
+    let entries = temporary.path().join("cache/entries").join(key.as_str());
+    assert_eq!(active_generation_count(&entries)?, 1);
+    let mut child = paused_generation_writer(temporary.path())?;
+    let database = rusqlite::Connection::open(temporary.path().join("state/cache.sqlite3"))?;
+    database.execute_batch("BEGIN IMMEDIATE")?;
+    fs::write(temporary.path().join("release"), b"release")?;
+    let deadline = Instant::now() + Duration::from_secs(4);
+    while active_generation_count(&entries)? < 2 && Instant::now() < deadline {
+        if child.0.try_wait()?.is_some() {
+            return Err("generation writer exited before the rename".into());
+        }
+        thread::sleep(Duration::from_millis(10));
+    }
+    if active_generation_count(&entries)? < 2 {
+        return Err("generation writer did not reach the pre-pointer rename".into());
+    }
+    child.0.kill()?;
+    let status = child.0.wait()?;
+    assert!(
+        status.signal().is_some(),
+        "writer was not killed by a signal"
+    );
+    database.execute_batch("ROLLBACK")?;
+    drop(database);
+
+    let reopened = cache.lease(&key)?;
+    let mut active = reopened
+        .load_active(limits())?
+        .ok_or("committed generation disappeared")?;
+    assert_eq!(active.snapshot(), &first);
+    assert_eq!(active.metadata(), &json!({"generation":1}));
+    let mut cursor = Vec::new();
+    active.streams().2.read_to_end(&mut cursor)?;
+    assert_eq!(cursor, b"first-cursor");
+    Ok(())
+}
+
 #[test]
 fn oversized_state_cannot_replace_a_valid_active_generation() -> Result<(), Box<dyn Error>> {
     let temporary = tempfile::tempdir()?;
