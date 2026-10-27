@@ -129,6 +129,31 @@ fn fixture() -> Result<Case, Box<dyn Error>> {
     Ok(case)
 }
 
+fn replace_record_value(
+    encoded: &[u8],
+    kind: &str,
+    pointer: &str,
+    value: Value,
+) -> Result<Vec<u8>, Box<dyn Error>> {
+    let mut records = std::str::from_utf8(encoded)?
+        .lines()
+        .map(serde_json::from_str::<Value>)
+        .collect::<Result<Vec<_>, _>>()?;
+    let record = records
+        .iter_mut()
+        .find(|record| record.get("record").and_then(Value::as_str) == Some(kind))
+        .ok_or("record is missing")?;
+    *record
+        .pointer_mut(pointer)
+        .ok_or("record field is missing")? = value;
+    let mut output = Vec::new();
+    for record in records {
+        serde_json::to_writer(&mut output, &record)?;
+        output.push(b'\n');
+    }
+    Ok(output)
+}
+
 #[test]
 fn normalized_roundtrip_preserves_canonical_bytes_and_case_identity() -> TestResult {
     let case = fixture()?;
@@ -138,7 +163,7 @@ fn normalized_roundtrip_preserves_canonical_bytes_and_case_identity() -> TestRes
     let usage = write_published_case(&case, &scope, 2, &mut normalized)?;
     let mut decoded = Vec::new();
     decode_published_evidence(
-        3,
+        4,
         Cursor::new(&normalized),
         &mut decoded,
         PublishedEvidenceLimits::new(64 * 1024 * 1024, 16 * 1024 * 1024),
@@ -148,6 +173,269 @@ fn normalized_roundtrip_preserves_canonical_bytes_and_case_identity() -> TestRes
         decoded, expected,
         "the canonical v2 graph and ordered edges must be unchanged"
     );
+    Ok(())
+}
+
+#[test]
+fn version_three_fixture_remains_readable_after_compact_node_encoding() -> TestResult {
+    let mut case = Case::new();
+    case.add_node(
+        "candidate",
+        None,
+        Vec::new(),
+        json!({"description":"shared","index":5}),
+    )?;
+    case.add_limitation("kept")?;
+    let (_, expected) = canonical(&case, &json!({"kind":"test"}), 1)?;
+    let mut decoded = Vec::new();
+    decode_published_evidence(
+        3,
+        Cursor::new(include_bytes!("fixtures/published-v3.jsonl")),
+        &mut decoded,
+        PublishedEvidenceLimits::new(100_000, 10_000),
+    )?;
+    assert_eq!(decoded, expected);
+    Ok(())
+}
+
+#[test]
+fn writer_emits_compact_version_four_details_and_preserves_the_canonical_graph() -> TestResult {
+    let case = fixture()?;
+    let scope = json!({"kind":"flow","flow_id":9});
+    let (_, expected) = canonical(&case, &scope, 1)?;
+    let mut encoded = Vec::new();
+    write_published_case(&case, &scope, 1, &mut encoded)?;
+    let records = std::str::from_utf8(&encoded)?
+        .lines()
+        .map(serde_json::from_str::<Value>)
+        .collect::<Result<Vec<_>, _>>()?;
+    let header = records.first().ok_or("header is missing")?;
+    assert_eq!(header.pointer("/value/version"), Some(&json!(4)));
+    let node = records
+        .iter()
+        .find(|record| record.get("record") == Some(&json!("node")))
+        .ok_or("node is missing")?;
+    assert!(node.pointer("/value/4").and_then(Value::as_array).is_some());
+    let mut decoded = Vec::new();
+    decode_published_evidence(
+        4,
+        Cursor::new(encoded),
+        &mut decoded,
+        PublishedEvidenceLimits::new(1_000_000, 100_000),
+    )?;
+    assert_eq!(decoded, expected);
+    Ok(())
+}
+
+#[test]
+fn compact_details_roundtrip_empty_and_non_object_json_values() -> TestResult {
+    let mut case = Case::new();
+    for details in [
+        json!({}),
+        json!(null),
+        json!([0, [1, 2]]),
+        json!("shared"),
+        json!(false),
+    ] {
+        case.add_node("candidate", None, Vec::new(), details)?;
+    }
+    let scope = json!({});
+    let (_, expected) = canonical(&case, &scope, 1)?;
+    let mut encoded = Vec::new();
+    write_published_case(&case, &scope, 1, &mut encoded)?;
+    let mut decoded = Vec::new();
+    decode_published_evidence(
+        4,
+        Cursor::new(encoded),
+        &mut decoded,
+        PublishedEvidenceLimits::new(1_000_000, 100_000),
+    )?;
+    assert_eq!(decoded, expected);
+    Ok(())
+}
+
+#[test]
+fn repeated_receipt_object_shapes_are_shared_and_roundtrip_exactly() -> TestResult {
+    let rows = (0..300)
+        .map(|index| {
+            json!({
+                "source_index": index,
+                "input_range": {"start": index, "end": index + 1},
+                "candidate_description": "one repeated field layout",
+            })
+        })
+        .collect::<Vec<_>>();
+    let payload = serde_json::to_vec(&json!({"assembly":{"groups":rows},"inputs":[{}, {}, null]}))?;
+    let mut case = Case::new();
+    case.add_bytes_node(
+        "record_parse_receipt",
+        &payload,
+        Vec::new(),
+        json!({"representation":"json_blob"}),
+    )?;
+    let scope = json!({});
+    let (_, expected) = canonical(&case, &scope, 1)?;
+    let mut encoded = Vec::new();
+    write_published_case(&case, &scope, 1, &mut encoded)?;
+    assert!(std::str::from_utf8(&encoded)?.contains("\"schema_payload\""));
+    let mut decoded = Vec::new();
+    decode_published_evidence(
+        4,
+        Cursor::new(encoded),
+        &mut decoded,
+        PublishedEvidenceLimits::new(1_000_000, 500_000),
+    )?;
+    assert_eq!(decoded, expected);
+    Ok(())
+}
+
+#[test]
+fn schema_receipts_keep_duplicate_keys_empty_objects_and_scalar_roots() -> TestResult {
+    for payload in [
+        r#"{"z":1,"a":[{},{},{"z":1,"a":2,"z":3}],"z":4}"#,
+        "null",
+        r#""escaped\ntext""#,
+        "[[],{},[null,false,2.5]]",
+    ] {
+        let mut case = Case::new();
+        case.add_bytes_node(
+            "record_parse_receipt",
+            payload.as_bytes(),
+            Vec::new(),
+            json!({"representation":"json_blob"}),
+        )?;
+        let (_, expected) = canonical(&case, &json!({}), 1)?;
+        let mut encoded = Vec::new();
+        write_published_case(&case, &json!({}), 1, &mut encoded)?;
+        let mut decoded = Vec::new();
+        decode_published_evidence(
+            4,
+            Cursor::new(encoded),
+            &mut decoded,
+            PublishedEvidenceLimits::new(1_000_000, 100_000),
+        )?;
+        assert_eq!(decoded, expected, "receipt {payload}");
+    }
+    Ok(())
+}
+
+#[test]
+fn deeply_nested_receipt_uses_inline_payload_and_roundtrips() -> TestResult {
+    let payload = format!("{}0{}", "[".repeat(80), "]".repeat(80));
+    let mut case = Case::new();
+    case.add_bytes_node(
+        "record_parse_receipt",
+        payload.as_bytes(),
+        Vec::new(),
+        json!({"representation":"json_blob"}),
+    )?;
+    let (_, expected) = canonical(&case, &json!({}), 1)?;
+    let mut encoded = Vec::new();
+    write_published_case(&case, &json!({}), 1, &mut encoded)?;
+    assert!(!std::str::from_utf8(&encoded)?.contains("\"schema_payload\""));
+    let mut decoded = Vec::new();
+    decode_published_evidence(
+        4,
+        Cursor::new(encoded),
+        &mut decoded,
+        PublishedEvidenceLimits::new(1_000_000, 100_000),
+    )?;
+    assert_eq!(decoded, expected);
+    Ok(())
+}
+
+#[test]
+fn schema_depth_boundary_and_quoted_brackets_are_handled_correctly() -> TestResult {
+    for (depth, uses_schema) in [(56_usize, true), (57, false)] {
+        let payload = format!(
+            "{}\"[{{\\\"quoted\\\"}}]\"{}",
+            "[".repeat(depth),
+            "]".repeat(depth)
+        );
+        let mut case = Case::new();
+        case.add_bytes_node(
+            "record_parse_receipt",
+            payload.as_bytes(),
+            Vec::new(),
+            json!({"representation":"json_blob"}),
+        )?;
+        let (_, expected) = canonical(&case, &json!({}), 1)?;
+        let mut encoded = Vec::new();
+        write_published_case(&case, &json!({}), 1, &mut encoded)?;
+        assert_eq!(
+            std::str::from_utf8(&encoded)?.contains("\"schema_payload\""),
+            uses_schema
+        );
+        let mut decoded = Vec::new();
+        decode_published_evidence(
+            4,
+            Cursor::new(encoded),
+            &mut decoded,
+            PublishedEvidenceLimits::new(1_000_000, 100_000),
+        )?;
+        assert_eq!(decoded, expected);
+    }
+    Ok(())
+}
+
+#[test]
+fn receipt_shapes_beyond_the_dictionary_cap_remain_inline_and_roundtrip() -> TestResult {
+    let rows = (0..1_100)
+        .map(|index| json!({(format!("field_{index}")):index}))
+        .collect::<Vec<_>>();
+    let payload = serde_json::to_vec(&json!({"rows":rows}))?;
+    let mut case = Case::new();
+    case.add_bytes_node(
+        "record_parse_receipt",
+        &payload,
+        Vec::new(),
+        json!({"representation":"json_blob"}),
+    )?;
+    let (_, expected) = canonical(&case, &json!({}), 1)?;
+    let mut encoded = Vec::new();
+    write_published_case(&case, &json!({}), 1, &mut encoded)?;
+    assert!(
+        std::str::from_utf8(&encoded)?.contains("[2,"),
+        "extra shapes should use inline keys"
+    );
+    let mut decoded = Vec::new();
+    decode_published_evidence(
+        4,
+        Cursor::new(encoded),
+        &mut decoded,
+        PublishedEvidenceLimits::new(1_000_000, 500_000),
+    )?;
+    assert_eq!(decoded, expected);
+    Ok(())
+}
+
+#[test]
+fn decoder_rejects_missing_receipt_schema_and_field_values() -> TestResult {
+    let mut case = Case::new();
+    case.add_bytes_node(
+        "record_parse_receipt",
+        br#"{"rows":[{"x":1}]}"#,
+        Vec::new(),
+        json!({"representation":"json_blob"}),
+    )?;
+    let mut encoded = Vec::new();
+    write_published_case(&case, &json!({}), 1, &mut encoded)?;
+    for (description, root) in [
+        ("missing schema reference", json!([1, 999_999, []])),
+        ("missing field values", json!([1, 0, []])),
+    ] {
+        let invalid = replace_record_value(&encoded, "blob", "/value/schema_payload/root", root)?;
+        assert!(
+            decode_published_evidence(
+                4,
+                Cursor::new(invalid),
+                Vec::new(),
+                PublishedEvidenceLimits::new(1_000_000, 100_000)
+            )
+            .is_err(),
+            "{description}"
+        );
+    }
     Ok(())
 }
 
@@ -206,7 +494,7 @@ fn normalized_nodes_share_repeated_description_strings_without_losing_values() -
     );
     let mut decoded = Vec::new();
     decode_published_evidence(
-        3,
+        4,
         Cursor::new(normalized),
         &mut decoded,
         PublishedEvidenceLimits::new(1_000_000, 100_000),
@@ -230,7 +518,7 @@ fn noncanonical_receipt_json_keeps_the_canonical_v2_identity_and_payload() -> Te
     let usage = write_published_case(&case, &scope, 1, &mut normalized)?;
     let mut decoded = Vec::new();
     decode_published_evidence(
-        3,
+        4,
         Cursor::new(normalized),
         &mut decoded,
         PublishedEvidenceLimits::new(1_000_000, 100_000),
@@ -262,7 +550,7 @@ fn nested_receipt_scalars_and_duplicate_keys_match_legacy_canonical_json() -> Te
         write_published_case(&case, &scope, 1, &mut normalized)?;
         let mut decoded = Vec::new();
         decode_published_evidence(
-            3,
+            4,
             Cursor::new(normalized),
             &mut decoded,
             PublishedEvidenceLimits::new(1_000_000, 100_000),
@@ -280,7 +568,7 @@ fn decoder_rejects_reordered_case_ordinals() -> TestResult {
     write_published_case(&case, &json!({}), 1, &mut encoded)?;
     assert!(
         decode_published_evidence(
-            3,
+            4,
             Cursor::new(encoded),
             Vec::new(),
             PublishedEvidenceLimits::new(1_000_000, 100_000)
@@ -332,7 +620,7 @@ fn decoder_rejects_a_forged_case_with_an_invalid_source_id() -> TestResult {
         serde_json::to_writer(&mut forged, &record)?;
         forged.push(b'\n');
     }
-    assert!(decode_published_evidence(3, Cursor::new(forged), Vec::new(), limits).is_err());
+    assert!(decode_published_evidence(4, Cursor::new(forged), Vec::new(), limits).is_err());
     Ok(())
 }
 
@@ -340,29 +628,12 @@ fn decoder_rejects_a_forged_case_with_an_invalid_source_id() -> TestResult {
 fn decoder_rejects_dangling_references_truncation_and_limits() -> TestResult {
     let mut encoded = Vec::new();
     write_published_case(&fixture()?, &json!({}), 1, &mut encoded)?;
-    let mut records = std::str::from_utf8(&encoded)?
-        .lines()
-        .map(serde_json::from_str::<Value>)
-        .collect::<Result<Vec<_>, _>>()?;
-    let edge = records
-        .iter_mut()
-        .find(|record| record["record"] == "edge")
-        .ok_or("edge missing")?;
-    *edge
-        .get_mut("value")
-        .and_then(Value::as_array_mut)
-        .and_then(|items| items.get_mut(2))
-        .ok_or("edge dictionary reference is missing")? = json!(999_999);
-    let mut invalid = Vec::new();
-    for record in records {
-        serde_json::to_writer(&mut invalid, &record)?;
-        invalid.push(b'\n');
-    }
+    let invalid = replace_record_value(&encoded, "edge", "/value/2", json!(999_999))?;
     let limits = PublishedEvidenceLimits::new(64 * 1024 * 1024, 16 * 1024 * 1024);
-    assert!(decode_published_evidence(3, Cursor::new(invalid), Vec::new(), limits).is_err());
+    assert!(decode_published_evidence(4, Cursor::new(invalid), Vec::new(), limits).is_err());
     assert!(
         decode_published_evidence(
-            3,
+            4,
             Cursor::new(
                 encoded
                     .get(..encoded.len().saturating_sub(1))
@@ -375,10 +646,27 @@ fn decoder_rejects_dangling_references_truncation_and_limits() -> TestResult {
     );
     assert!(
         decode_published_evidence(
-            3,
+            4,
             Cursor::new(&encoded),
             Vec::new(),
             PublishedEvidenceLimits::new(32, 32)
+        )
+        .is_err()
+    );
+    Ok(())
+}
+
+#[test]
+fn decoder_rejects_a_source_range_with_a_missing_source_reference() -> TestResult {
+    let mut encoded = Vec::new();
+    write_published_case(&fixture()?, &json!({}), 1, &mut encoded)?;
+    let invalid = replace_record_value(&encoded, "node", "/value/3/0/0", json!(999_999))?;
+    assert!(
+        decode_published_evidence(
+            4,
+            Cursor::new(invalid),
+            Vec::new(),
+            PublishedEvidenceLimits::new(1_000_000, 100_000)
         )
         .is_err()
     );
@@ -392,7 +680,7 @@ fn decoder_stops_reading_when_the_stream_limit_is_reached() -> TestResult {
     let mut input = Cursor::new(encoded);
     assert!(
         decode_published_evidence(
-            3,
+            4,
             &mut input,
             Vec::new(),
             PublishedEvidenceLimits::new(32, 16 * 1024 * 1024),

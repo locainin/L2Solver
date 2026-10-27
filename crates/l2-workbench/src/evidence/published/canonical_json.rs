@@ -9,7 +9,7 @@ use serde_json::{Value, value::RawValue};
 use std::{fmt, marker::PhantomData};
 
 // Match the default serde_json recursion boundary for previously accepted receipts
-const MAX_DEPTH: usize = 128;
+pub(super) const MAX_DEPTH: usize = 128;
 
 pub(super) struct CanonicalJson<'a>(pub(super) &'a [u8]);
 
@@ -34,16 +34,9 @@ impl Serialize for CanonicalValue<'_> {
         }
         match self.raw.get().as_bytes().first() {
             Some(b'{') => {
-                let mut fields: RawObject<'_> =
-                    serde_json::from_str(self.raw.get()).map_err(serde::ser::Error::custom)?;
-                // Stable ordering retains the last occurrence of each duplicate key
-                fields.0.sort_by(|left, right| left.0.cmp(&right.0));
+                let fields = RawObject::parse(self.raw).map_err(serde::ser::Error::custom)?;
                 let mut map = serializer.serialize_map(None)?;
-                let mut entries = fields.0.iter().peekable();
-                while let Some((key, raw)) = entries.next() {
-                    if entries.peek().is_some_and(|next| next.0 == *key) {
-                        continue;
-                    }
+                for (key, raw) in fields.unique() {
                     map.serialize_entry(
                         key,
                         &CanonicalValue {
@@ -77,7 +70,28 @@ impl Serialize for CanonicalValue<'_> {
     }
 }
 
-struct RawObject<'a>(Vec<(String, &'a RawValue)>);
+pub(super) struct RawObject<'a>(Vec<(String, &'a RawValue)>);
+
+impl<'a> RawObject<'a> {
+    pub(super) fn parse(raw: &'a RawValue) -> serde_json::Result<Self> {
+        let mut fields: Self = serde_json::from_str(raw.get())?;
+        // Stable ordering retains the last occurrence of each duplicate key
+        fields.0.sort_by(|left, right| left.0.cmp(&right.0));
+        Ok(fields)
+    }
+
+    pub(super) fn unique(&self) -> impl Iterator<Item = (&str, &'a RawValue)> {
+        self.0
+            .iter()
+            .enumerate()
+            .filter_map(|(index, (key, value))| {
+                self.0
+                    .get(index + 1)
+                    .is_none_or(|next| next.0 != *key)
+                    .then_some((key.as_str(), *value))
+            })
+    }
+}
 
 impl<'de: 'a, 'a> Deserialize<'de> for RawObject<'a> {
     fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {

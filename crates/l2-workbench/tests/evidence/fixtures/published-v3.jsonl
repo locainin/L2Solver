@@ -1,0 +1,4 @@
+{"record":"header","value":{"version":3,"case_id":"case-c6f4da8e6ecb2df128e308d1ecea01acafaee76ffee915443753f293660612a9","ordinal":1,"scope":{"kind":"test"},"metadata":{"schema_version":1,"collection_complete":true,"blob_byte_limit":null},"strings":["candidate","description","shared","index"],"counts":{"sources":0,"blobs":0,"nodes":1,"edges":0,"limitations":1}}}
+{"record":"node","value":[1,0,null,[],{"kind":"object","value":[[1,{"kind":"text","value":2}],[3,{"kind":"value","value":5}]]}]}
+{"record":"limitation","value":"kept"}
+{"record":"end"}

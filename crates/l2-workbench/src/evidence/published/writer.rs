@@ -6,7 +6,10 @@ use super::{
     canonical::{BlobRecords, CanonicalRecord, CountWriter, HASH_DOMAIN, Metadata, PLACEHOLDER},
     format::{Counts, HeaderRef, MAX_DICTIONARY_BYTES, MAX_STRINGS, VERSION},
 };
-use serde::{Serialize, ser::SerializeSeq};
+use serde::{
+    Serialize,
+    ser::{SerializeSeq, SerializeTuple},
+};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 use std::{
@@ -120,7 +123,7 @@ fn write_graph<W: Write>(
         write_record(output, "source", source)?;
     }
     for blob in canonical.blobs.iter() {
-        write_record(output, "blob", &blob)?;
+        write_record(output, "blob", &blob.normalized())?;
     }
     for node in case.nodes() {
         let ranges = Ranges {
@@ -200,11 +203,26 @@ enum TextRef<'a> {
     Inline(&'a str),
 }
 
-#[derive(Serialize)]
-#[serde(tag = "kind", content = "value", rename_all = "snake_case")]
 enum DetailsRef<'a> {
     Object(DetailEntries<'a>),
     Value(&'a Value),
+}
+
+impl Serialize for DetailsRef<'_> {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        let mut sequence = serializer.serialize_tuple(2)?;
+        match self {
+            Self::Object(fields) => {
+                sequence.serialize_element(&0_u8)?;
+                sequence.serialize_element(fields)?;
+            }
+            Self::Value(value) => {
+                sequence.serialize_element(&1_u8)?;
+                sequence.serialize_element(value)?;
+            }
+        }
+        sequence.end()
+    }
 }
 
 impl<'a> DetailsRef<'a> {
@@ -221,22 +239,17 @@ struct DetailEntries<'a> {
     dictionary: &'a Dictionary<'a>,
 }
 
-#[derive(Serialize)]
-#[serde(tag = "kind", content = "value", rename_all = "snake_case")]
-enum DetailValueRef<'a> {
-    Text(TextRef<'a>),
-    Value(&'a Value),
-}
-
 impl Serialize for DetailEntries<'_> {
     fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
         let mut sequence = serializer.serialize_seq(Some(self.fields.len()))?;
         for (key, value) in self.fields {
-            let value = match value {
-                Value::String(text) => DetailValueRef::Text(self.dictionary.reference(text)),
-                _ => DetailValueRef::Value(value),
-            };
-            sequence.serialize_element(&(self.dictionary.reference(key), value))?;
+            let key = self.dictionary.reference(key);
+            match value {
+                Value::String(text) => {
+                    sequence.serialize_element(&(key, 0_u8, self.dictionary.reference(text)))?;
+                }
+                _ => sequence.serialize_element(&(key, 1_u8, value))?,
+            }
         }
         sequence.end()
     }

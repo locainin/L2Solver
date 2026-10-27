@@ -10,7 +10,7 @@ use super::super::{
 use super::{
     PublishedEvidenceLimits,
     canonical::{CountWriter, HASH_DOMAIN, PLACEHOLDER},
-    format::{Counts, Details, Header, Record, VERSION},
+    format::{Counts, Details, Header, LEGACY_VERSION, Record, VERSION, expand_compact_details},
 };
 use serde::Serialize;
 use sha2::{Digest, Sha256};
@@ -19,9 +19,9 @@ use std::{
     io::{self, BufRead, Read, Write},
 };
 
-/// Decode version-two or version-three records to canonical version-two JSON Lines
+/// Decode supported published records to canonical version-two JSON Lines
 ///
-/// Version three checks record order, references, ranges, declared counts, and Case IDs.
+/// Versions three and four check record order, references, ranges, declared counts, and Case IDs.
 /// Version two is parsed as a stream and copied without changing its bytes. A caller that
 /// persists the output should publish it only after this function succeeds.
 ///
@@ -39,7 +39,7 @@ pub fn decode_published_evidence<R: BufRead, W: Write>(
     }
     match version {
         2 => decode_legacy(input, output, limits.maximum_stream_bytes),
-        VERSION => decode_normalized(input, output, limits),
+        LEGACY_VERSION | VERSION => decode_normalized(input, output, limits, version),
         _ => Err(io::Error::other("unsupported published evidence version")),
     }
 }
@@ -77,6 +77,7 @@ fn decode_normalized<R: BufRead, W: Write>(
     input: R,
     output: W,
     limits: PublishedEvidenceLimits,
+    version: u32,
 ) -> io::Result<()> {
     let mut records = RecordReader {
         input,
@@ -94,7 +95,7 @@ fn decode_normalized<R: BufRead, W: Write>(
             return Err(invalid("evidence Case ordinals are not increasing"));
         }
         previous_ordinal = header.ordinal;
-        read_case(&mut records, &mut output, &header)?;
+        read_case(&mut records, &mut output, &header, version)?;
     }
     Ok(())
 }
@@ -103,8 +104,9 @@ fn read_case<R: BufRead, W: Write>(
     reader: &mut RecordReader<R>,
     output: &mut CountWriter<W>,
     header: &Header,
+    version: u32,
 ) -> io::Result<()> {
-    validate_header(header)?;
+    validate_header(header, version)?;
     let mut canonical = CanonicalWriter::new(output, header.ordinal);
     canonical.write_all(b"{\"case_id\":\"")?;
     canonical.write_id(&header.case_id)?;
@@ -116,7 +118,7 @@ fn read_case<R: BufRead, W: Write>(
     // Ordered sections prevent a reference from arriving before its source table
     let sources = read_sources(reader, &mut canonical, header.counts.sources)?;
     canonical.write_all(b"],\"blobs\":[")?;
-    let blobs = read_blobs(reader, &mut canonical, header.counts.blobs, &sources)?;
+    let blobs = read_blobs(reader, &mut canonical, header, &sources)?;
     canonical.write_all(b"],\"nodes\":[")?;
     read_nodes(reader, &mut canonical, header, &sources, &blobs)?;
     canonical.write_all(b"],\"edges\":[")?;
@@ -169,15 +171,18 @@ fn read_sources<R: BufRead, W: Write>(
 fn read_blobs<R: BufRead, W: Write>(
     reader: &mut RecordReader<R>,
     canonical: &mut CanonicalWriter<'_, W>,
-    count: usize,
+    header: &Header,
     sources: &[Source],
 ) -> io::Result<HashMap<String, usize>> {
-    let mut blobs = HashMap::with_capacity(count);
-    for index in 0..count {
+    let mut blobs = HashMap::with_capacity(header.counts.blobs);
+    for index in 0..header.counts.blobs {
         let Record::Blob(blob) = reader.required()? else {
             return Err(invalid("expected blob record"));
         };
         validate_content_id(&blob.id).map_err(io::Error::other)?;
+        if header.version == LEGACY_VERSION && blob.schema_payload.is_some() {
+            return Err(invalid("version three cannot contain schema payloads"));
+        }
         if blobs.insert(blob.id.clone(), blob.byte_length).is_some() {
             return Err(invalid("duplicate evidence blob"));
         }
@@ -246,8 +251,13 @@ fn read_nodes<R: BufRead, W: Write>(
         if record.4.get().len() > MAX_NODE_DETAILS_BYTES * 16 {
             return Err(invalid("evidence node details exceed their limit"));
         }
-        let details: Details = serde_json::from_str(record.4.get()).map_err(io::Error::other)?;
-        let details = details.expand(&header.strings.0)?;
+        let details = if header.version == LEGACY_VERSION {
+            let details: Details =
+                serde_json::from_str(record.4.get()).map_err(io::Error::other)?;
+            details.expand(&header.strings.0)?
+        } else {
+            expand_compact_details(&record.4, &header.strings.0)?
+        };
         total_details = total_details
             .checked_add(
                 super::super::case::encoded_details_length(&details).map_err(io::Error::other)?,
@@ -315,7 +325,7 @@ fn read_limitations<R: BufRead, W: Write>(
     Ok(())
 }
 
-fn validate_header(header: &Header) -> io::Result<()> {
+fn validate_header(header: &Header, version: u32) -> io::Result<()> {
     let Counts {
         sources,
         blobs,
@@ -323,7 +333,7 @@ fn validate_header(header: &Header) -> io::Result<()> {
         edges,
         limitations,
     } = header.counts;
-    if header.version != VERSION
+    if header.version != version
         || header.metadata.schema_version != SCHEMA_VERSION
         || header.ordinal == 0
         || sources > MAX_SOURCES

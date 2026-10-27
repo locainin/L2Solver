@@ -4,12 +4,13 @@ mod canonical;
 mod canonical_json;
 mod format;
 mod reader;
+mod schema;
 mod writer;
 
 pub use reader::decode_published_evidence;
 pub use writer::write_published_case;
 
-/// Bounds applied independently to the input stream, canonical output, and each v3 record
+/// Bounds applied independently to the input stream, canonical output, and each normalized record
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct PublishedEvidenceLimits {
     maximum_stream_bytes: u64,

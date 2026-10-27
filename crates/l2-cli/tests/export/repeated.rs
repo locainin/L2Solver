@@ -61,6 +61,41 @@ fn older_evidence_compression_policy_does_not_reuse_the_published_result()
 }
 
 #[test]
+fn older_evidence_encoding_remains_owned_and_refreshes_to_version_four()
+-> Result<(), Box<dyn Error>> {
+    let temporary = tempfile::tempdir()?;
+    let root = temporary.path();
+    let capture = root.join("capture.pcap");
+    let destination = root.join("result");
+    fs::write(&capture, capture_with_http_body(BODY)?)?;
+    let first = extraction_command(root, &capture, &destination).output()?;
+    assert!(matches!(first.status.code(), Some(0 | 3)));
+    let manifest_path = destination.join("manifest.json");
+    let mut manifest: serde_json::Value = serde_json::from_slice(&fs::read(&manifest_path)?)?;
+    *manifest
+        .pointer_mut("/l2solver_result/identity/settings/evidence_encoding_version")
+        .ok_or("evidence encoding setting is missing")? = serde_json::json!(2);
+    fs::write(&manifest_path, serde_json::to_vec(&manifest)?)?;
+    let stale = extraction_command(root, &capture, &destination).output()?;
+    assert!(!stale.status.success());
+    assert!(String::from_utf8_lossy(&stale.stderr).contains("policy or algorithm version differs"));
+    let refreshed = extraction_command(root, &capture, &destination)
+        .arg("--refresh")
+        .output()?;
+    assert!(
+        matches!(refreshed.status.code(), Some(0 | 3)),
+        "{}",
+        String::from_utf8_lossy(&refreshed.stderr)
+    );
+    let updated: serde_json::Value = serde_json::from_slice(&fs::read(manifest_path)?)?;
+    assert_eq!(
+        updated.pointer("/evidence/coverage/encoding_version"),
+        Some(&serde_json::json!(4))
+    );
+    Ok(())
+}
+
+#[test]
 fn warm_cached_extraction_matches_cold_and_uncached_outputs() -> Result<(), Box<dyn Error>> {
     let temporary = tempfile::tempdir()?;
     let root = temporary.path();
@@ -365,7 +400,7 @@ fn evidence_jsonl(directory: &Path) -> Result<Vec<u8>, Box<dyn Error>> {
     let decoder = flate2::read::MultiGzDecoder::new(file);
     let mut bytes = Vec::new();
     l2_workbench::evidence::decode_published_evidence(
-        3,
+        4,
         std::io::BufReader::new(decoder),
         &mut bytes,
         l2_workbench::evidence::PublishedEvidenceLimits::new(u64::MAX, 32 * 1024 * 1024),

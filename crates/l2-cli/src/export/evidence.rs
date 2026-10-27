@@ -7,14 +7,14 @@ use serde_json::Value;
 use std::{
     error::Error,
     fs::{self, File},
-    io::{self, BufReader, BufWriter, Write},
+    io::{self, BufWriter, Write},
     path::{Path, PathBuf},
 };
 
 pub(super) const SIDECAR_FILE_NAME: &str = "evidence.jsonl.gz";
-pub(super) const ENCODING_VERSION: u32 = 3;
+pub(super) const ENCODING_VERSION: u32 = 4;
 // Compression can change which whole Cases fit without changing the record format
-pub(super) const COMPRESSION_POLICY_VERSION: u32 = 1;
+pub(super) const COMPRESSION_POLICY_VERSION: u32 = 2;
 // Level 3 reduces repeated evidence while retaining a fast streaming encoder
 const CASE_COMPRESSION_LEVEL: u32 = 3;
 const TEMP_FILE_PREFIX: &str = ".l2solver-evidence-case-";
@@ -99,13 +99,6 @@ impl EvidenceSidecar {
         scope: &Value,
     ) -> Result<EvidenceRecordResult, Box<dyn Error>> {
         self.coverage.selected_cases = evidence_add(self.coverage.selected_cases, 1)?;
-        let spool_path = self.staging.join(format!(
-            "{TEMP_FILE_PREFIX}{}.jsonl",
-            self.coverage.selected_cases
-        ));
-        let usage = write_case_spool(&spool_path, case, scope, self.coverage.selected_cases)?;
-        let case_id = usage.case_id;
-        let encoded_bytes = usage.encoded_bytes;
         let compressed_spool_path = self.staging.join(format!(
             "{TEMP_FILE_PREFIX}{}.member.gz",
             self.coverage.selected_cases
@@ -114,7 +107,15 @@ impl EvidenceSidecar {
             .coverage
             .budget_bytes
             .saturating_sub(self.coverage.retained_bytes);
-        let compressed = compress_spool(&spool_path, &compressed_spool_path, available_bytes)?;
+        let (usage, compressed) = write_case_member(
+            &compressed_spool_path,
+            case,
+            scope,
+            self.coverage.selected_cases,
+            available_bytes,
+        )?;
+        let case_id = usage.case_id;
+        let encoded_bytes = usage.encoded_bytes;
         let retained_end = self
             .coverage
             .retained_bytes
@@ -150,7 +151,6 @@ impl EvidenceSidecar {
                 .checked_add(encoded_bytes)
                 .ok_or("raw evidence omitted byte count overflow")?;
         }
-        fs::remove_file(spool_path)?;
         fs::remove_file(compressed_spool_path)?;
         Ok(EvidenceRecordResult {
             case_id,
@@ -170,25 +170,34 @@ impl EvidenceSidecar {
     }
 }
 
-fn write_case_spool(
+fn write_case_member(
     path: &Path,
     case: &Case,
     scope: &Value,
     ordinal: u64,
-) -> io::Result<l2_workbench::evidence::PublishedCaseUsage> {
+    maximum_stored_bytes: u64,
+) -> io::Result<(l2_workbench::evidence::PublishedCaseUsage, CompressedSpool)> {
     let file = File::options().write(true).create_new(true).open(path)?;
-    let mut spool = BufWriter::with_capacity(RECORD_BUFFER_CAPACITY, file);
-    let result = write_published_case(case, scope, ordinal, &mut spool).and_then(|usage| {
-        spool.flush()?;
-        if spool.get_ref().metadata()?.len() != usage.encoded_bytes {
-            return Err(io::Error::other(
-                "evidence spool length differs from its record count",
-            ));
-        }
-        Ok(usage)
-    });
+    let result = (|| {
+        // Buffer JSON before compression so short serializer writes do not become disk writes
+        let bounded = BoundedSpoolWriter::new(file, maximum_stored_bytes);
+        let encoder = GzEncoder::new(bounded, Compression::new(CASE_COMPRESSION_LEVEL));
+        let mut buffered = BufWriter::with_capacity(RECORD_BUFFER_CAPACITY, encoder);
+        let usage = write_published_case(case, scope, ordinal, &mut buffered)?;
+        let encoder = buffered
+            .into_inner()
+            .map_err(io::IntoInnerError::into_error)?;
+        let mut bounded = encoder.finish()?;
+        bounded.flush()?;
+        Ok((
+            usage,
+            CompressedSpool {
+                total_bytes: bounded.total_bytes,
+                stored_bytes: bounded.stored_bytes,
+            },
+        ))
+    })();
     if result.is_err() {
-        drop(spool);
         fs::remove_file(path)?;
     }
     result
@@ -203,28 +212,6 @@ fn evidence_add(value: u64, increment: u64) -> Result<u64, Box<dyn Error>> {
 struct CompressedSpool {
     total_bytes: u64,
     stored_bytes: u64,
-}
-
-fn compress_spool(
-    raw_path: &Path,
-    compressed_path: &Path,
-    maximum_stored_bytes: u64,
-) -> io::Result<CompressedSpool> {
-    let raw_file = File::open(raw_path)?;
-    let mut raw = BufReader::with_capacity(RECORD_BUFFER_CAPACITY, raw_file);
-    let compressed_file = File::options()
-        .write(true)
-        .create_new(true)
-        .open(compressed_path)?;
-    let bounded_spool = BoundedSpoolWriter::new(compressed_file, maximum_stored_bytes);
-    let mut encoder = GzEncoder::new(bounded_spool, Compression::new(CASE_COMPRESSION_LEVEL));
-    io::copy(&mut raw, &mut encoder)?;
-    let mut bounded_spool = encoder.finish()?;
-    bounded_spool.flush()?;
-    Ok(CompressedSpool {
-        total_bytes: bounded_spool.total_bytes,
-        stored_bytes: bounded_spool.stored_bytes,
-    })
 }
 
 struct BoundedSpoolWriter {

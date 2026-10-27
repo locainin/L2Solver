@@ -256,10 +256,10 @@ fn sidecar_writes_versioned_normalized_records_with_decodable_receipts()
             .ok_or("missing header")?,
     )?;
     assert_eq!(first.get("record"), Some(&json!("header")));
-    assert_eq!(first.pointer("/value/version"), Some(&json!(3)));
+    assert_eq!(first.pointer("/value/version"), Some(&json!(4)));
     let mut decoded = Vec::new();
     l2_workbench::evidence::decode_published_evidence(
-        3,
+        4,
         Cursor::new(raw),
         &mut decoded,
         l2_workbench::evidence::PublishedEvidenceLimits::new(16_000_000, 8_000_000),
@@ -450,6 +450,36 @@ fn evidence_budget_uses_physical_gzip_bytes_and_tracks_raw_bytes() -> Result<(),
     let omitted_path = omitted_directory.path().join(SIDECAR_FILE_NAME);
     assert_eq!(fs::metadata(&omitted_path)?.len(), empty_member_bytes);
     assert!(read_sidecar(&omitted_path)?.is_empty());
+    Ok(())
+}
+
+#[test]
+fn omitting_a_later_case_keeps_the_first_complete_and_verifiable() -> Result<(), Box<dyn Error>> {
+    let first = case_with_receipt(b"first retained artifact")?;
+    let second = repetitive_case()?;
+    let scope = json!({"kind":"flow","flow_id":38});
+    let sizing_dir = tempfile::tempdir()?;
+    let mut sizing = EvidenceSidecar::new(sizing_dir.path(), u64::MAX)?;
+    let first_record = sizing.record_case(&first, &scope)?;
+    sizing.finish()?;
+    let exact_budget = sizing.coverage().retained_bytes;
+    let expected = read_sidecar_bytes(&sizing_dir.path().join(SIDECAR_FILE_NAME))?;
+
+    let output_dir = tempfile::tempdir()?;
+    let mut output = EvidenceSidecar::new(output_dir.path(), exact_budget)?;
+    let retained = output.record_case(&first, &scope)?;
+    let omitted = output.record_case(&second, &scope)?;
+    output.finish()?;
+    assert!(retained.retained);
+    assert!(!omitted.retained);
+    assert_eq!(retained.case_id, first_record.case_id);
+    assert_eq!(output.coverage().retained_cases, 1);
+    assert_eq!(output.coverage().omitted_cases, 1);
+    assert_eq!(output.coverage().retained_bytes, exact_budget);
+    assert_eq!(
+        read_sidecar_bytes(&output_dir.path().join(SIDECAR_FILE_NAME))?,
+        expected
+    );
     Ok(())
 }
 

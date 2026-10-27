@@ -8,7 +8,8 @@ use serde::{
 use serde_json::{Value, value::RawValue};
 use std::{fmt, io};
 
-pub(super) const VERSION: u32 = 3;
+pub(super) const LEGACY_VERSION: u32 = 3;
+pub(super) const VERSION: u32 = 4;
 pub(super) const MAX_STRINGS: usize = 4096;
 pub(super) const MAX_DICTIONARY_BYTES: usize = 512 * 1024;
 
@@ -99,17 +100,42 @@ pub(super) enum Record {
     End,
 }
 
-#[derive(Deserialize, Serialize)]
+#[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(super) struct Blob {
     pub(super) id: String,
     pub(super) byte_length: usize,
-    #[serde(
-        default,
-        skip_serializing_if = "Option::is_none",
-        deserialize_with = "present_raw"
-    )]
+    #[serde(default, deserialize_with = "present_raw")]
     pub(super) inline_payload: Option<Box<RawValue>>,
+    #[serde(default, deserialize_with = "present_raw")]
+    pub(super) schema_payload: Option<Box<RawValue>>,
+}
+
+impl Serialize for Blob {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        use serde::ser::SerializeStruct;
+        let mut output = serializer.serialize_struct(
+            "BlobRecord",
+            if self.inline_payload.is_some() || self.schema_payload.is_some() {
+                3
+            } else {
+                2
+            },
+        )?;
+        output.serialize_field("id", &self.id)?;
+        output.serialize_field("byte_length", &self.byte_length)?;
+        match (&self.inline_payload, &self.schema_payload) {
+            (Some(_), Some(_)) => {
+                return Err(serde::ser::Error::custom("multiple receipt payloads"));
+            }
+            (Some(raw), None) => output.serialize_field("inline_payload", raw)?,
+            (None, Some(raw)) => {
+                output.serialize_field("inline_payload", &super::schema::DecodedSchemaJson(raw))?;
+            }
+            (None, None) => {}
+        }
+        output.end()
+    }
 }
 
 fn present_raw<'de, D: serde::Deserializer<'de>>(
@@ -170,6 +196,52 @@ pub(super) enum Details {
 pub(super) enum DetailValue {
     Text(Text),
     Value(Box<RawValue>),
+}
+
+#[derive(Deserialize)]
+struct CompactField(Text, u8, Box<RawValue>);
+
+struct CompactFields(Vec<CompactField>);
+
+impl<'de> Deserialize<'de> for CompactFields {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        super::super::bounded::deserialize_vec::<
+            D,
+            CompactField,
+            { super::super::MAX_NODE_DETAILS_BYTES },
+        >(deserializer)
+        .map(Self)
+    }
+}
+
+pub(super) fn expand_compact_details(raw: &RawValue, dictionary: &[String]) -> io::Result<Value> {
+    let (kind, contents): (u8, Box<RawValue>) =
+        serde_json::from_str(raw.get()).map_err(io::Error::other)?;
+    match kind {
+        0 => {
+            let fields: CompactFields =
+                serde_json::from_str(contents.get()).map_err(io::Error::other)?;
+            let mut output = serde_json::Map::new();
+            for CompactField(key, kind, value) in fields.0 {
+                let key = key.resolve(dictionary)?;
+                let value = match kind {
+                    0 => Value::String(
+                        serde_json::from_str::<Text>(value.get())
+                            .map_err(io::Error::other)?
+                            .resolve(dictionary)?,
+                    ),
+                    1 => serde_json::from_str(value.get()).map_err(io::Error::other)?,
+                    _ => return Err(io::Error::other("invalid evidence detail field kind")),
+                };
+                if output.insert(key, value).is_some() {
+                    return Err(io::Error::other("duplicate evidence detail field"));
+                }
+            }
+            Ok(Value::Object(output))
+        }
+        1 => serde_json::from_str(contents.get()).map_err(io::Error::other),
+        _ => Err(io::Error::other("invalid evidence details kind")),
+    }
 }
 
 fn deserialize_details<'de, D>(deserializer: D) -> Result<Vec<(Text, DetailValue)>, D::Error>

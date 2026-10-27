@@ -7,7 +7,7 @@ use serde::{
 };
 use serde_json::Value;
 use std::{
-    collections::BTreeSet,
+    collections::BTreeMap,
     io::{self, Write},
 };
 
@@ -49,19 +49,19 @@ pub(super) struct CanonicalRecord<'a> {
 
 pub(super) struct BlobRecords<'a> {
     blobs: &'a [Blob],
-    inline_ids: BTreeSet<&'a str>,
+    inline_ids: BTreeMap<&'a str, bool>,
 }
 
 impl<'a> BlobRecords<'a> {
     pub(super) fn new(case: &'a Case) -> Self {
-        let inline_ids = case
-            .nodes()
-            .iter()
-            .filter(|node| {
-                node.details.get("representation").and_then(Value::as_str) == Some("json_blob")
-            })
-            .filter_map(|node| node.blob.as_deref())
-            .collect();
+        let mut inline_ids = BTreeMap::new();
+        for node in case.nodes() {
+            if node.details.get("representation").and_then(Value::as_str) == Some("json_blob")
+                && let Some(id) = node.blob.as_deref()
+            {
+                *inline_ids.entry(id).or_insert(false) |= node.kind == "record_parse_receipt";
+            }
+        }
         Self {
             blobs: case.blobs(),
             inline_ids,
@@ -69,9 +69,13 @@ impl<'a> BlobRecords<'a> {
     }
 
     pub(super) fn iter(&self) -> impl Iterator<Item = BlobRecord<'_>> {
-        self.blobs.iter().map(|blob| BlobRecord {
-            blob,
-            inline: self.inline_ids.contains(blob.id.as_str()),
+        self.blobs.iter().map(|blob| {
+            let schema = self.inline_ids.get(blob.id.as_str());
+            BlobRecord {
+                blob,
+                inline: schema.is_some(),
+                schema: schema.copied().unwrap_or(false),
+            }
         })
     }
 }
@@ -89,21 +93,50 @@ impl Serialize for BlobRecords<'_> {
 pub(super) struct BlobRecord<'a> {
     blob: &'a Blob,
     inline: bool,
+    schema: bool,
 }
 
-impl Serialize for BlobRecord<'_> {
-    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+impl BlobRecord<'_> {
+    pub(super) const fn normalized(&self) -> NormalizedBlob<'_> {
+        NormalizedBlob(self)
+    }
+
+    fn serialize_with<S: serde::Serializer>(
+        &self,
+        serializer: S,
+        normalized: bool,
+    ) -> Result<S::Ok, S::Error> {
         let mut record =
             serializer.serialize_struct("BlobRecord", if self.inline { 3 } else { 2 })?;
         record.serialize_field("id", &self.blob.id)?;
         record.serialize_field("byte_length", &self.blob.bytes.len())?;
-        if self.inline {
+        if self.inline && self.schema && normalized && super::schema::within_depth(&self.blob.bytes)
+        {
+            record.serialize_field(
+                "schema_payload",
+                &super::schema::SchemaJson(&self.blob.bytes),
+            )?;
+        } else if self.inline {
             record.serialize_field(
                 "inline_payload",
                 &super::canonical_json::CanonicalJson(&self.blob.bytes),
             )?;
         }
         record.end()
+    }
+}
+
+impl Serialize for BlobRecord<'_> {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        self.serialize_with(serializer, false)
+    }
+}
+
+pub(super) struct NormalizedBlob<'a>(&'a BlobRecord<'a>);
+
+impl Serialize for NormalizedBlob<'_> {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        self.0.serialize_with(serializer, true)
     }
 }
 
