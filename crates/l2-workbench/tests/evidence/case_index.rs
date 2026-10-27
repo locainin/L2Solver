@@ -23,7 +23,7 @@ fn edge_index_tracks_large_relation_sets_and_statuses() -> Result<(), EvidenceEr
         reason: "status is part of the relation identity".to_owned(),
     })?;
 
-    assert_eq!(case.edge_index.len(), 65_537);
+    assert_eq!(case.edge_index.len(), 2 * 65_537);
     assert!(case.has_edge(from, to, "relation-65535", EvidenceStatus::Observed));
     assert!(case.has_edge(from, to, "relation-65535", EvidenceStatus::Hypothesis));
     assert!(!case.has_edge(
@@ -33,6 +33,44 @@ fn edge_index_tracks_large_relation_sets_and_statuses() -> Result<(), EvidenceEr
         EvidenceStatus::ConstraintSatisfied
     ));
 
+    Ok(())
+}
+
+#[test]
+fn exact_edge_lookup_checks_text_after_a_hash_collision() -> Result<(), EvidenceError> {
+    let mut case = Case::new();
+    let from = case.add_node("from", None, Vec::new(), serde_json::json!({}))?;
+    let to = case.add_node("to", None, Vec::new(), serde_json::json!({}))?;
+    let first = Edge {
+        from,
+        to,
+        relation: "supports".to_owned(),
+        status: EvidenceStatus::Observed,
+        reason: "first reason".to_owned(),
+    };
+    let second = Edge {
+        reason: "different reason".to_owned(),
+        ..first.clone()
+    };
+    case.add_edge(first.clone())?;
+    case.add_edge(second)?;
+
+    // Put a different edge at the hash head to exercise collision resolution
+    let key = super::edge_index_key(&case.edge_hash, &first, true);
+    case.edge_index.insert(key, 1);
+    let link = case
+        .edge_links
+        .get_mut(1)
+        .ok_or(EvidenceError::InvalidJson)?;
+    link.exact = 1;
+    assert!(case.contains_exact_edge(
+        from,
+        to,
+        "supports",
+        EvidenceStatus::Observed,
+        "first reason"
+    ));
+    assert!(!case.contains_exact_edge(from, to, "supports", EvidenceStatus::Observed, "missing"));
     Ok(())
 }
 

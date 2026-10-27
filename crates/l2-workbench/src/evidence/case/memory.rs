@@ -144,18 +144,23 @@ pub(super) fn grow_map<K: Eq + Hash, V>(
     memory: &mut Option<CaseMemory>,
     values: &mut HashMap<K, V>,
 ) -> Result<(), EvidenceError> {
+    grow_map_for(memory, values, 1)
+}
+
+pub(super) fn grow_map_for<K: Eq + Hash, V>(
+    memory: &mut Option<CaseMemory>,
+    values: &mut HashMap<K, V>,
+    additional: usize,
+) -> Result<(), EvidenceError> {
     let Some(memory) = memory else {
         return Ok(());
     };
-    if values.len() < values.capacity() {
+    let required = values.len().checked_add(additional).ok_or_else(overflow)?;
+    if required <= values.capacity() {
         return Ok(());
     }
     let old_bytes = map_bytes::<K, V>(values.capacity())?;
-    let wanted = values
-        .capacity()
-        .saturating_mul(2)
-        .max(4)
-        .max(values.len().checked_add(1).ok_or_else(overflow)?);
+    let wanted = values.capacity().saturating_mul(2).max(4).max(required);
     let proposed = map_bytes::<K, V>(wanted)?;
     let mut pending = memory
         .graph
@@ -171,7 +176,7 @@ pub(super) fn grow_map<K: Eq + Hash, V>(
     pending
         .try_resize(to_bytes(actual)?)
         .map_err(EvidenceError::Memory)?;
-    // The requested capacity can accept every existing entry and the new one
+    // The requested capacity can accept all existing entries and the planned additions
     grown.extend(values.drain());
     *values = grown;
     memory.graph.absorb(pending);
@@ -213,16 +218,8 @@ pub(super) fn node_payload(
     add(bytes, value_bytes(details)?)
 }
 
-pub(super) fn edge_payload(edge: &Edge, new_index_entry: bool) -> Result<usize, EvidenceError> {
-    let bytes = add(edge.relation.capacity(), edge.reason.capacity())?;
-    add(
-        bytes,
-        if new_index_entry {
-            edge.relation.len()
-        } else {
-            0
-        },
-    )
+pub(super) fn edge_payload(edge: &Edge) -> Result<usize, EvidenceError> {
+    add(edge.relation.capacity(), edge.reason.capacity())
 }
 
 pub(super) fn value_bytes(value: &Value) -> Result<usize, EvidenceError> {
@@ -296,6 +293,10 @@ pub(super) fn graph_bytes(case: &Case) -> Result<usize, EvidenceError> {
     bytes = add(bytes, array_bytes::<super::Edge>(case.edges.capacity())?)?;
     bytes = add(
         bytes,
+        array_bytes::<super::EdgeLinks>(case.edge_links.capacity())?,
+    )?;
+    bytes = add(
+        bytes,
         map_bytes::<super::EdgeIndexKey, usize>(case.edge_index.capacity())?,
     )?;
     for node in &case.nodes {
@@ -311,10 +312,7 @@ pub(super) fn graph_bytes(case: &Case) -> Result<usize, EvidenceError> {
         )?;
     }
     for edge in &case.edges {
-        bytes = add(bytes, edge_payload(edge, false)?)?;
-    }
-    for (_, _, relation, _) in case.edge_index.keys() {
-        bytes = add(bytes, relation.capacity())?;
+        bytes = add(bytes, edge_payload(edge)?)?;
     }
     bytes = add(bytes, array_bytes::<String>(case.limitations.capacity())?)?;
     for limitation in &case.limitations {

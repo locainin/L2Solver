@@ -2,6 +2,8 @@
 mod atomic;
 #[path = "evidence/bounds.rs"]
 mod bounds;
+#[path = "evidence/edge_exact_index.rs"]
+mod edge_exact_index;
 #[path = "evidence/graph.rs"]
 mod graph;
 #[path = "evidence/import_scan.rs"]

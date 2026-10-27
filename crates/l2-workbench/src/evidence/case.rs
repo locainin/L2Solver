@@ -5,7 +5,11 @@ use super::{
 use crate::{job::MemoryBudget, serialization::CountWriter, sha256};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use std::{collections::HashMap, sync::Arc};
+use std::{
+    collections::{HashMap, hash_map::RandomState},
+    hash::BuildHasher,
+    sync::Arc,
+};
 
 #[cfg(test)]
 #[path = "../../tests/evidence/case_index.rs"]
@@ -115,6 +119,10 @@ pub struct Case {
     #[serde(skip)]
     edge_index: HashMap<EdgeIndexKey, usize>,
     #[serde(skip)]
+    edge_links: Vec<EdgeLinks>,
+    #[serde(skip)]
+    edge_hash: RandomState,
+    #[serde(skip)]
     source_index: HashMap<String, usize>,
     #[serde(skip)]
     range_count: usize,
@@ -140,7 +148,6 @@ impl PartialEq for Case {
             && self.blob_bytes == other.blob_bytes
             && self.details_bytes == other.details_bytes
             && self.blob_index == other.blob_index
-            && self.edge_index == other.edge_index
             && self.source_index == other.source_index
             && self.range_count == other.range_count
     }
@@ -148,7 +155,22 @@ impl PartialEq for Case {
 
 impl Eq for Case {}
 
-type EdgeIndexKey = (u64, u64, String, u8);
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+struct EdgeIndexKey {
+    from: u64,
+    to: u64,
+    relation_hash: u64,
+    reason_hash: u64,
+    status: u8,
+    exact: bool,
+}
+
+// Position plus one preserves zero as the end of each collision chain
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct EdgeLinks {
+    coarse: usize,
+    exact: usize,
+}
 
 /// Opaque identity token for one exact retained Case instance
 #[derive(Clone, Debug)]
@@ -187,6 +209,8 @@ impl Case {
             details_bytes: self.details_bytes,
             blob_index: self.blob_index.clone(),
             edge_index: self.edge_index.clone(),
+            edge_links: self.edge_links.clone(),
+            edge_hash: self.edge_hash.clone(),
             source_index: self.source_index.clone(),
             range_count: self.range_count,
             identity: Arc::new(()),
@@ -265,6 +289,8 @@ impl Case {
             details_bytes: 0,
             blob_index: HashMap::new(),
             edge_index: HashMap::new(),
+            edge_links: Vec::new(),
+            edge_hash: RandomState::new(),
             source_index: HashMap::new(),
             range_count: 0,
             identity: Arc::new(()),
@@ -914,21 +940,32 @@ impl Case {
         }
         validate_text(&edge.relation, MAX_RELATION_BYTES, "edge relation")?;
         validate_text(&edge.reason, MAX_REASON_BYTES, "edge reason")?;
-        let key = edge_index_key(&edge);
+        let coarse_key = edge_index_key(&self.edge_hash, &edge, false);
+        let exact_key = edge_index_key(&self.edge_hash, &edge, true);
         if self.memory.is_some() {
-            let new_index_entry = !self.edge_index.contains_key(&key);
-            let payload = memory::edge_payload(&edge, new_index_entry)?;
+            let new_index_entries = usize::from(!self.edge_index.contains_key(&coarse_key))
+                + usize::from(!self.edge_index.contains_key(&exact_key));
+            let payload = memory::edge_payload(&edge)?;
             memory::grow_vec(&mut self.memory, &mut self.edges)?;
-            if new_index_entry {
-                memory::grow_map(&mut self.memory, &mut self.edge_index)?;
-            }
+            memory::grow_vec(&mut self.memory, &mut self.edge_links)?;
+            memory::grow_map_for(&mut self.memory, &mut self.edge_index, new_index_entries)?;
             if let Some(memory) = &mut self.memory {
                 memory.reserve_graph(payload)?;
             }
         }
+        let position = self.edges.len();
+        let links = EdgeLinks {
+            coarse: self
+                .edge_index
+                .get(&coarse_key)
+                .map_or(0, |index| index + 1),
+            exact: self.edge_index.get(&exact_key).map_or(0, |index| index + 1),
+        };
         self.edges.push(edge);
-        // Counts preserve earlier copies when a later duplicate is rolled back
-        *self.edge_index.entry(key).or_default() += 1;
+        self.edge_links.push(links);
+        // Prior positions let rollback restore both lookup paths without cloning edge text
+        self.edge_index.insert(coarse_key, position);
+        self.edge_index.insert(exact_key, position);
         Ok(())
     }
 
@@ -1200,6 +1237,8 @@ impl Case {
             details_bytes,
             blob_index: HashMap::new(),
             edge_index: HashMap::new(),
+            edge_links: Vec::new(),
+            edge_hash: RandomState::new(),
             source_index: HashMap::new(),
             range_count: 0,
             identity: Arc::new(()),
@@ -1278,9 +1317,57 @@ impl Case {
         relation: &str,
         status: EvidenceStatus,
     ) -> bool {
-        // Relation reason is explanatory text and is not part of edge identity
-        self.edge_index
-            .contains_key(&(from, to, relation.to_owned(), status_index(status)))
+        self.find_edge(from, to, relation, status, None)
+    }
+
+    /// Check whether an edge with exactly these fields is retained in the Case
+    ///
+    /// Hash collisions are checked against the original edge text
+    #[must_use]
+    pub fn contains_exact_edge(
+        &self,
+        from: u64,
+        to: u64,
+        relation: &str,
+        status: EvidenceStatus,
+        reason: &str,
+    ) -> bool {
+        self.find_edge(from, to, relation, status, Some(reason))
+    }
+
+    fn find_edge(
+        &self,
+        from: u64,
+        to: u64,
+        relation: &str,
+        status: EvidenceStatus,
+        reason: Option<&str>,
+    ) -> bool {
+        // Hashes narrow the search; original edge fields decide equality
+        let key = edge_lookup_key(&self.edge_hash, from, to, relation, status, reason);
+        let mut position = self.edge_index.get(&key).copied();
+        while let Some(index) = position {
+            let Some(edge) = self.edges.get(index) else {
+                return false;
+            };
+            if edge.from == from
+                && edge.to == to
+                && edge.relation == relation
+                && edge.status == status
+                && reason.is_none_or(|reason| edge.reason == reason)
+            {
+                return true;
+            }
+            let Some(links) = self.edge_links.get(index) else {
+                return false;
+            };
+            position = if reason.is_some() {
+                links.exact.checked_sub(1)
+            } else {
+                links.coarse.checked_sub(1)
+            };
+        }
+        false
     }
 
     pub(super) fn truncate_edges(&mut self, length: usize) {
@@ -1288,15 +1375,13 @@ impl Case {
             let Some(edge) = self.edges.pop() else {
                 break;
             };
-            let key = edge_index_key(&edge);
-            let Some(count) = self.edge_index.get_mut(&key) else {
-                continue;
+            let Some(links) = self.edge_links.pop() else {
+                break;
             };
-            if *count == 1 {
-                self.edge_index.remove(&key);
-            } else {
-                *count -= 1;
-            }
+            let coarse_key = edge_index_key(&self.edge_hash, &edge, false);
+            let exact_key = edge_index_key(&self.edge_hash, &edge, true);
+            restore_edge_head(&mut self.edge_index, coarse_key, links.coarse);
+            restore_edge_head(&mut self.edge_index, exact_key, links.exact);
         }
     }
 
@@ -1344,12 +1429,21 @@ impl Case {
                 return Err(EvidenceError::HashMismatch);
             }
         }
-        let mut edge_index = HashMap::with_capacity(self.edges.len());
-        for edge in &self.edges {
-            *edge_index.entry(edge_index_key(edge)).or_default() += 1;
+        let mut edge_index = HashMap::with_capacity(self.edges.len() * 2);
+        let mut edge_links = Vec::with_capacity(self.edges.len());
+        for (position, edge) in self.edges.iter().enumerate() {
+            let coarse_key = edge_index_key(&self.edge_hash, edge, false);
+            let exact_key = edge_index_key(&self.edge_hash, edge, true);
+            edge_links.push(EdgeLinks {
+                coarse: edge_index.get(&coarse_key).map_or(0, |index| index + 1),
+                exact: edge_index.get(&exact_key).map_or(0, |index| index + 1),
+            });
+            edge_index.insert(coarse_key, position);
+            edge_index.insert(exact_key, position);
         }
         self.blob_index = blob_index;
         self.edge_index = edge_index;
+        self.edge_links = edge_links;
         self.source_index = source_index;
         self.range_count = range_count;
         Ok(())
@@ -1372,13 +1466,41 @@ impl Case {
     }
 }
 
-fn edge_index_key(edge: &Edge) -> EdgeIndexKey {
-    (
+fn edge_index_key(hash: &RandomState, edge: &Edge, exact: bool) -> EdgeIndexKey {
+    edge_lookup_key(
+        hash,
         edge.from,
         edge.to,
-        edge.relation.clone(),
-        status_index(edge.status),
+        &edge.relation,
+        edge.status,
+        exact.then_some(edge.reason.as_str()),
     )
+}
+
+fn edge_lookup_key(
+    hash: &RandomState,
+    from: u64,
+    to: u64,
+    relation: &str,
+    status: EvidenceStatus,
+    reason: Option<&str>,
+) -> EdgeIndexKey {
+    EdgeIndexKey {
+        from,
+        to,
+        relation_hash: hash.hash_one(relation),
+        reason_hash: reason.map_or(0, |reason| hash.hash_one(reason)),
+        status: status_index(status),
+        exact: reason.is_some(),
+    }
+}
+
+fn restore_edge_head(index: &mut HashMap<EdgeIndexKey, usize>, key: EdgeIndexKey, previous: usize) {
+    if let Some(position) = previous.checked_sub(1) {
+        index.insert(key, position);
+    } else {
+        index.remove(&key);
+    }
 }
 
 const fn status_index(status: EvidenceStatus) -> u8 {
