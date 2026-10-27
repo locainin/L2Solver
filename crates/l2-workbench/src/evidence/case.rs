@@ -5,10 +5,7 @@ use super::{
 use crate::{job::MemoryBudget, serialization::CountWriter, sha256};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use std::{
-    collections::{HashMap, HashSet},
-    sync::Arc,
-};
+use std::{collections::HashMap, sync::Arc};
 
 #[cfg(test)]
 #[path = "../../tests/evidence/case_index.rs"]
@@ -21,6 +18,8 @@ mod memory;
 mod snapshot;
 #[path = "transaction.rs"]
 mod transaction;
+#[path = "case/validation.rs"]
+mod validation;
 
 pub use mapping::{CheckedByteMappingCursor, clip_byte_mappings};
 pub use snapshot::{CaseSnapshotLimits, CaseSnapshotUsage};
@@ -988,7 +987,8 @@ impl Case {
         {
             return Err(EvidenceError::HashMismatch);
         }
-        let mut referenced_blobs = HashSet::with_capacity(self.blobs.len());
+        let mut referenced_blobs =
+            validation::BlobReferences::new(self.blobs.len(), self.memory.as_ref())?;
         self.validate_blobs()?;
         self.validate_sources(&mut referenced_blobs)?;
         self.validate_nodes(&mut referenced_blobs)?;
@@ -1006,7 +1006,10 @@ impl Case {
         let mut total_bytes = 0_usize;
         for (index, blob) in self.blobs.iter().enumerate() {
             validate_content_id(&blob.id)?;
-            if format!("sha256:{}", sha256(&blob.bytes)) != blob.id
+            if !blob
+                .id
+                .strip_prefix("sha256:")
+                .is_some_and(|digest| crate::hashing::sha256_matches(&blob.bytes, digest))
                 || self.blob_index.get(&blob.id) != Some(&index)
             {
                 return Err(EvidenceError::HashMismatch);
@@ -1035,7 +1038,10 @@ impl Case {
         Ok(())
     }
 
-    fn validate_sources(&self, referenced_blobs: &mut HashSet<usize>) -> Result<(), EvidenceError> {
+    fn validate_sources(
+        &self,
+        referenced_blobs: &mut validation::BlobReferences,
+    ) -> Result<(), EvidenceError> {
         for (index, source) in self.sources.iter().enumerate() {
             validate_content_id(&source.id)?;
             validate_label(&source.label)?;
@@ -1048,11 +1054,15 @@ impl Case {
                     maximum: MAX_SOURCE_ALIASES,
                 });
             }
-            let mut names = HashSet::with_capacity(source.aliases.len() + 1);
-            names.insert(source.label.as_str());
-            for alias in &source.aliases {
+            for (alias_index, alias) in source.aliases.iter().enumerate() {
                 validate_label(alias)?;
-                if !names.insert(alias.as_str()) {
+                if alias == &source.label
+                    || source
+                        .aliases
+                        .iter()
+                        .take(alias_index)
+                        .any(|previous| previous == alias)
+                {
                     return Err(EvidenceError::InvalidText {
                         field: "duplicate source alias",
                     });
@@ -1073,13 +1083,16 @@ impl Case {
                 {
                     return Err(EvidenceError::SourceMetadataConflict);
                 }
-                referenced_blobs.insert(blob_index);
+                referenced_blobs.insert(blob_index)?;
             }
         }
         Ok(())
     }
 
-    fn validate_nodes(&self, referenced_blobs: &mut HashSet<usize>) -> Result<(), EvidenceError> {
+    fn validate_nodes(
+        &self,
+        referenced_blobs: &mut validation::BlobReferences,
+    ) -> Result<(), EvidenceError> {
         let mut total_details = 0_usize;
         let mut total_ranges = 0_usize;
         for (index, node) in self.nodes.iter().enumerate() {
@@ -1097,7 +1110,7 @@ impl Case {
                     .get(blob_id)
                     .copied()
                     .ok_or(EvidenceError::MissingReference { kind: "blob" })?;
-                referenced_blobs.insert(blob_index);
+                referenced_blobs.insert(blob_index)?;
             }
             if node.ranges.len() > MAX_NODE_RANGES {
                 return Err(EvidenceError::QuotaExceeded {
@@ -1428,7 +1441,11 @@ pub(super) fn validate_content_id(id: &str) -> Result<(), EvidenceError> {
     let digest = id
         .strip_prefix("sha256:")
         .ok_or(EvidenceError::InvalidDigest)?;
-    source_id(digest).map(|_| ())
+    if crate::hashing::is_sha256_digest(digest) {
+        Ok(())
+    } else {
+        Err(EvidenceError::InvalidDigest)
+    }
 }
 
 pub(super) fn validate_label(label: &str) -> Result<(), EvidenceError> {

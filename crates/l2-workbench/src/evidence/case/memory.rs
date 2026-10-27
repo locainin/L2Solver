@@ -38,6 +38,10 @@ impl CaseMemory {
         })
     }
 
+    pub(super) fn try_scratch(&self, bytes: u64) -> Result<MemoryLease, EvidenceError> {
+        self.graph.try_sibling(bytes).map_err(EvidenceError::Memory)
+    }
+
     pub(super) const fn graph_bytes(&self) -> u64 {
         self.graph.bytes()
     }

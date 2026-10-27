@@ -1,4 +1,4 @@
-use crate::hashing::is_sha256_digest;
+use crate::hashing::{is_sha256_digest, sha256_matches};
 
 #[test]
 fn lowercase_digest_hex_format() {
@@ -19,4 +19,16 @@ fn lowercase_digest_hex_format() {
             "accepted invalid digest: {value:?}"
         );
     }
+}
+
+#[test]
+fn digest_matching_checks_exact_bytes_and_canonical_lowercase() {
+    let digest = "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad";
+    assert!(sha256_matches(b"abc", digest));
+    assert!(!sha256_matches(b"abd", digest));
+    assert!(!sha256_matches(b"abc", &digest.to_ascii_uppercase()));
+    assert!(!sha256_matches(
+        b"abc",
+        digest.get(..63).unwrap_or_default()
+    ));
 }

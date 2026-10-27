@@ -317,6 +317,52 @@ fn concurrent_cases_share_one_bound_and_keep_successful_growth_charged() -> Test
 }
 
 #[test]
+fn case_validation_admits_reference_tracking_before_allocating_it() -> TestResult {
+    let budget = MemoryBudget::new(1_000_000);
+    let mut case = Case::with_memory_budget(&budget)?;
+    case.add_bytes_node("content", b"payload", Vec::new(), json!({}))?;
+    let used = budget.snapshot()?.used(MemoryClass::Case);
+    let other = budget.try_reserve(MemoryClass::Executor, 1_000_000 - used)?;
+    let result = case.validate();
+    assert!(matches!(
+        result,
+        Err(EvidenceError::Memory(MemoryError::Limit { .. }))
+    ));
+    assert_eq!(budget.snapshot()?.used(MemoryClass::Case), used);
+    drop(other);
+    case.validate()?;
+    assert_eq!(budget.snapshot()?.used(MemoryClass::Case), used);
+    drop(case);
+    assert_eq!(budget.snapshot()?.used_bytes, 0);
+    Ok(())
+}
+
+#[test]
+fn validation_rejects_duplicate_aliases_in_unsorted_imported_sources() -> TestResult {
+    let mut case = Case::new();
+    case.add_source("source.bin", "file", 0, &sha256(b""), None)?;
+    let mut document = serde_json::to_value(&case)?;
+    let source = document
+        .get_mut("sources")
+        .and_then(serde_json::Value::as_array_mut)
+        .and_then(|sources| sources.first_mut())
+        .ok_or("expected a source")?;
+    let fields = source.as_object_mut().ok_or("expected source fields")?;
+    fields.insert(
+        "aliases".to_owned(),
+        json!(["second.bin", "first.bin", "second.bin"]),
+    );
+    let result = Case::from_json(&serde_json::to_vec(&document)?);
+    assert!(matches!(
+        result,
+        Err(EvidenceError::InvalidText {
+            field: "duplicate source alias"
+        })
+    ));
+    Ok(())
+}
+
+#[test]
 fn checked_case_copy_reserves_a_second_charge_and_has_a_distinct_identity() -> TestResult {
     let budget = MemoryBudget::new(1_000_000);
     let mut case = Case::with_memory_budget(&budget)?;

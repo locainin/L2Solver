@@ -8,6 +8,28 @@ pub fn sha256(bytes: &[u8]) -> String {
     format!("{:x}", Sha256::digest(bytes))
 }
 
+pub fn sha256_matches(bytes: &[u8], digest: &str) -> bool {
+    if !is_sha256_digest(digest) {
+        return false;
+    }
+    let expected = digest.as_bytes();
+    Sha256::digest(bytes)
+        .iter()
+        .zip(expected.chunks_exact(2))
+        .all(|(byte, pair)| {
+            pair.first().copied() == Some(hex_digit(byte >> 4))
+                && pair.get(1).copied() == Some(hex_digit(byte & 0x0f))
+        })
+}
+
+const fn hex_digit(nibble: u8) -> u8 {
+    if nibble < 10 {
+        b'0' + nibble
+    } else {
+        b'a' + nibble - 10
+    }
+}
+
 /// Stored identities use the lowercase spelling produced by the digest writer
 pub fn is_sha256_digest(value: &str) -> bool {
     value.len() == 64
