@@ -20,6 +20,8 @@ use l2_workbench::{
 use serde_json::Value;
 use std::{error::Error, fs, io, io::Write};
 
+type ArtifactFiles = Vec<(String, Vec<u8>)>;
+
 #[path = "case_snapshot.rs"]
 mod case_snapshot_tests;
 #[path = "processing.rs"]
@@ -116,15 +118,18 @@ fn one_two_and_four_workers_keep_charged_case_outputs_in_source_order() -> Resul
 {
     let temporary = tempfile::tempdir()?;
     let capture = temporary.path().join("flows.pcap");
-    fs::write(&capture, four_udp_flows()?)?;
+    fs::write(&capture, four_http_flows()?)?;
 
     let single = recover_indexed_cases(&capture, temporary.path(), 1)?;
+    assert_eq!(single.artifacts.len(), 4);
     for jobs in [2, 4] {
         let parallel = recover_indexed_cases(&capture, temporary.path(), jobs)?;
         assert_eq!(parallel.scopes, single.scopes);
         assert_eq!(parallel.cases, single.cases);
         assert_eq!(parallel.coverage, single.coverage);
         assert_eq!(parallel.source_coverage, single.source_coverage);
+        assert_eq!(parallel.artifact_manifest, single.artifact_manifest);
+        assert_eq!(parallel.artifacts, single.artifacts);
         assert!(parallel.peak_case_bytes > 0);
         assert_eq!(parallel.remaining_live_bytes, 0);
     }
@@ -139,6 +144,8 @@ struct RecoveredCaseSnapshot {
     cases: Vec<Vec<u8>>,
     coverage: Value,
     source_coverage: Value,
+    artifact_manifest: Vec<u8>,
+    artifacts: ArtifactFiles,
     peak_case_bytes: u64,
     remaining_live_bytes: u64,
 }
@@ -167,31 +174,14 @@ fn recover_indexed_cases(
     let mut scopes = Vec::new();
     let mut cases = Vec::new();
     let mut coverage = super::RecoveryCoverage::default();
+    let artifact_directory = tempfile::tempdir_in(temporary_parent)?;
+    let mut artifacts =
+        ArtifactCollection::new(artifact_directory.path(), ArtifactLimits::default())?;
     let mut batch = Vec::with_capacity(worker_count);
     let budget = MemoryBudget::new(SHARED_MEMORY_BYTES);
     let mut peak_case_bytes = 0;
     let mut emit = |case: RecoveredCase| {
-        let RecoveredCase {
-            item,
-            scope,
-            recovery,
-        } = case;
-        let mut encoded_case = Vec::new();
-        match item {
-            crate::workbench::full_source::FullSourceItem::Flow(analysis) => {
-                analysis.result.case.write_json(&mut encoded_case)?;
-            }
-            crate::workbench::full_source::FullSourceItem::FlowPage(page) => {
-                page.result.case.write_json(&mut encoded_case)?;
-            }
-            crate::workbench::full_source::FullSourceItem::Cohort(cohort) => {
-                cohort.result.case.write_json(&mut encoded_case)?;
-            }
-        }
-        coverage.merge(&recovery.coverage)?;
-        scopes.push(scope);
-        cases.push(encoded_case);
-        Ok(())
+        collect_test_case(case, &mut artifacts, &mut coverage, &mut scopes, &mut cases)
     };
     let mut indexed = crate::workbench::full_source::acquire_indexed_source(
         capture,
@@ -217,13 +207,69 @@ fn recover_indexed_cases(
         },
     )?;
     process_case_batch(&mut batch, &pool, &context, &mut emit)?;
+    let (artifact_manifest, artifacts) =
+        artifact_snapshot(&mut artifacts, artifact_directory.path())?;
     Ok(RecoveredCaseSnapshot {
         scopes,
         cases,
         coverage: serde_json::to_value(coverage)?,
         source_coverage: serde_json::to_value(&source.source)?,
+        artifact_manifest,
+        artifacts,
         peak_case_bytes,
         remaining_live_bytes: budget.snapshot()?.used_bytes,
+    })
+}
+
+fn collect_test_case(
+    recovered: RecoveredCase,
+    artifacts: &mut ArtifactCollection,
+    coverage: &mut super::RecoveryCoverage,
+    scopes: &mut Vec<Value>,
+    cases: &mut Vec<Vec<u8>>,
+) -> Result<(), Box<dyn Error>> {
+    let RecoveredCase {
+        item,
+        scope,
+        recovery,
+    } = recovered;
+    let mut encoded = Vec::new();
+    match item {
+        crate::workbench::full_source::FullSourceItem::Flow(analysis) => {
+            collect_test_flow_artifacts(artifacts, &analysis.result.case, &analysis.flow, &scope)?;
+            analysis.result.case.write_json(&mut encoded)?;
+        }
+        crate::workbench::full_source::FullSourceItem::FlowPage(page) => {
+            collect_test_flow_artifacts(artifacts, &page.result.case, &page.flow, &scope)?;
+            page.result.case.write_json(&mut encoded)?;
+        }
+        crate::workbench::full_source::FullSourceItem::Cohort(cohort) => {
+            super::collection::collect_cohort_artifacts(artifacts, &cohort, None, &scope)?;
+            cohort.result.case.write_json(&mut encoded)?;
+        }
+    }
+    coverage.merge(&recovery.coverage)?;
+    scopes.push(scope);
+    cases.push(encoded);
+    Ok(())
+}
+
+fn collect_test_flow_artifacts(
+    artifacts: &mut ArtifactCollection,
+    case: &l2_workbench::evidence::Case,
+    flow: &l2_workbench::store::Flow,
+    scope: &Value,
+) -> Result<(), Box<dyn Error>> {
+    let flow = serde_json::to_value(flow)?;
+    let context = super::provenance::ArtifactSourceContext {
+        flow: Some(flow.clone()),
+        supporting_flows: vec![flow],
+        cohort_scope: None,
+        case_id: None,
+        case_scope: scope.clone(),
+    };
+    super::collection::collect_case_artifacts_with_context(artifacts, case, |_, _| {
+        Ok(context.clone())
     })
 }
 
@@ -231,7 +277,7 @@ struct CollectionSnapshot {
     source_coverage: Value,
     recovery_coverage: Value,
     artifact_manifest: Vec<u8>,
-    artifact_files: Vec<(String, Vec<u8>)>,
+    artifact_files: ArtifactFiles,
 }
 
 fn collect_with_jobs(
@@ -262,23 +308,8 @@ fn collect_with_jobs(
         super::artifact_collection::ArtifactLimits::default(),
         &context,
     )?;
-    let mut artifact_manifest = Vec::new();
-    collected
-        .artifacts
-        .write_manifest_artifacts(&mut artifact_manifest)?;
-    let mut artifact_names = collected
-        .artifacts
-        .file_names()?
-        .into_iter()
-        .collect::<Vec<_>>();
-    artifact_names.sort();
-    let artifact_files = artifact_names
-        .into_iter()
-        .map(|name| {
-            let display_name = name.to_string_lossy().into_owned();
-            Ok((display_name, fs::read(staging.path().join(name))?))
-        })
-        .collect::<Result<Vec<_>, Box<dyn Error>>>()?;
+    let (artifact_manifest, artifact_files) =
+        artifact_snapshot(&mut collected.artifacts, staging.path())?;
 
     Ok(CollectionSnapshot {
         source_coverage: serde_json::to_value(&collected.coverage.source)?,
@@ -286,6 +317,24 @@ fn collect_with_jobs(
         artifact_manifest,
         artifact_files,
     })
+}
+
+fn artifact_snapshot(
+    collection: &mut ArtifactCollection,
+    directory: &std::path::Path,
+) -> Result<(Vec<u8>, ArtifactFiles), Box<dyn Error>> {
+    let mut manifest = Vec::new();
+    collection.write_manifest_artifacts(&mut manifest)?;
+    let mut names = collection.file_names()?.into_iter().collect::<Vec<_>>();
+    names.sort();
+    let files = names
+        .into_iter()
+        .map(|name| {
+            let display = name.to_string_lossy().into_owned();
+            Ok((display, fs::read(directory.join(name))?))
+        })
+        .collect::<Result<Vec<_>, Box<dyn Error>>>()?;
+    Ok((manifest, files))
 }
 
 #[test]
@@ -928,20 +977,60 @@ fn empty_full_source() -> FullSourceCoverage {
 }
 
 fn two_udp_flows() -> Result<Vec<u8>, Box<dyn Error>> {
-    let mut capture = vec![0xd4, 0xc3, 0xb2, 0xa1, 2, 0, 4, 0];
-    capture.extend_from_slice(&[0; 8]);
-    capture.extend_from_slice(&65_535_u32.to_le_bytes());
-    capture.extend_from_slice(&1_u32.to_le_bytes());
+    let mut capture = capture_header();
     append_udp_record(&mut capture, 40_000, b"a")?;
     append_udp_record(&mut capture, 40_001, b"b")?;
     Ok(capture)
 }
 
-fn four_udp_flows() -> Result<Vec<u8>, Box<dyn Error>> {
-    let mut capture = two_udp_flows()?;
-    append_udp_record(&mut capture, 40_002, b"c")?;
-    append_udp_record(&mut capture, 40_003, b"d")?;
+fn capture_header() -> Vec<u8> {
+    let mut capture = vec![0xd4, 0xc3, 0xb2, 0xa1, 2, 0, 4, 0];
+    capture.extend_from_slice(&[0; 8]);
+    capture.extend_from_slice(&65_535_u32.to_le_bytes());
+    capture.extend_from_slice(&1_u32.to_le_bytes());
+    capture
+}
+
+fn four_http_flows() -> Result<Vec<u8>, Box<dyn Error>> {
+    let mut capture = capture_header();
+    for index in 0_u16..4 {
+        let port = 40_000 + index;
+        let body = format!("synthetic-body-{index}");
+        let payload = format!(
+            "POST /upload HTTP/1.1\r\nHost: example.test\r\nContent-Length: {}\r\n\r\n{body}",
+            body.len()
+        );
+        append_tcp_record(&mut capture, port, 100, 0x02, b"")?;
+        append_tcp_record(&mut capture, port, 101, 0x18, payload.as_bytes())?;
+    }
     Ok(capture)
+}
+
+fn append_tcp_record(
+    capture: &mut Vec<u8>,
+    source_port: u16,
+    sequence: u32,
+    flags: u8,
+    payload: &[u8],
+) -> Result<(), Box<dyn Error>> {
+    let ip_length = 40_u16
+        .checked_add(u16::try_from(payload.len())?)
+        .ok_or("TCP frame is too large")?;
+    let mut frame = vec![0_u8; 54];
+    write_frame_bytes(&mut frame, 12, &0x0800_u16.to_be_bytes())?;
+    write_frame_byte(&mut frame, 14, 0x45)?;
+    write_frame_bytes(&mut frame, 16, &ip_length.to_be_bytes())?;
+    write_frame_byte(&mut frame, 22, 64)?;
+    write_frame_byte(&mut frame, 23, 6)?;
+    write_frame_bytes(&mut frame, 26, &[192, 0, 2, 1])?;
+    write_frame_bytes(&mut frame, 30, &[198, 51, 100, 2])?;
+    write_frame_bytes(&mut frame, 34, &source_port.to_be_bytes())?;
+    write_frame_bytes(&mut frame, 36, &80_u16.to_be_bytes())?;
+    write_frame_bytes(&mut frame, 38, &sequence.to_be_bytes())?;
+    write_frame_byte(&mut frame, 46, 0x50)?;
+    write_frame_byte(&mut frame, 47, flags)?;
+    frame.extend_from_slice(payload);
+    append_capture_frame(capture, &frame)
 }
 
 fn append_udp_record(
@@ -970,12 +1059,16 @@ fn append_udp_record(
     write_frame_bytes(&mut frame, 38, &udp_length.to_be_bytes())?;
     frame.truncate(42);
     frame.extend_from_slice(payload);
+    append_capture_frame(capture, &frame)
+}
+
+fn append_capture_frame(capture: &mut Vec<u8>, frame: &[u8]) -> Result<(), Box<dyn Error>> {
     let length = u32::try_from(frame.len())?;
     capture.write_all(&1_u32.to_le_bytes())?;
     capture.write_all(&0_u32.to_le_bytes())?;
     capture.write_all(&length.to_le_bytes())?;
     capture.write_all(&length.to_le_bytes())?;
-    capture.write_all(&frame)?;
+    capture.write_all(frame)?;
     Ok(())
 }
 
