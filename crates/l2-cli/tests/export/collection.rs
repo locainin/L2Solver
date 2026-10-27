@@ -14,7 +14,7 @@ use crate::{
     export::recovery_cache::RecoveryContext,
 };
 use l2_workbench::{
-    job::{Counter, Job, MemoryBudget, MemoryClass, Phase, PhaseState},
+    job::{Counter, Job, MemoryBudget, MemoryClass, MemoryError, Phase, PhaseState},
     reconstruction::Limits,
 };
 use serde_json::Value;
@@ -59,6 +59,111 @@ fn collection_jobs_one_and_two_preserve_logical_output() -> Result<(), Box<dyn E
     assert_eq!(parallel.artifact_manifest, single.artifact_manifest);
     assert_eq!(parallel.artifact_files, single.artifact_files);
     Ok(())
+}
+
+#[test]
+fn collection_preserves_typed_memory_failure_with_capture_context() -> Result<(), Box<dyn Error>> {
+    let temporary = tempfile::tempdir()?;
+    let capture = temporary.path().join("flows.pcap");
+    let (error, budget) = collect_with_insufficient_memory(temporary.path(), &capture)?;
+    assert!(matches!(
+        crate::memory_error::find(error.as_ref()),
+        Some(MemoryError::Limit { .. })
+    ));
+    assert!(error.to_string().contains(&capture.display().to_string()));
+    assert_eq!(budget.snapshot()?.used_bytes, 0);
+    Ok(())
+}
+
+#[cfg(unix)]
+#[test]
+fn collection_error_escapes_capture_path_terminal_controls() -> Result<(), Box<dyn Error>> {
+    let temporary = tempfile::tempdir()?;
+    let capture = temporary.path().join("flow\n\u{1b}[31m.pcap");
+    let (error, _) = collect_with_insufficient_memory(temporary.path(), &capture)?;
+    let message = error.to_string();
+    assert!(message.contains(&capture.display().to_string().escape_debug().to_string()));
+    assert!(!message.contains('\n'));
+    assert!(!message.contains('\u{1b}'));
+    Ok(())
+}
+
+#[test]
+fn real_recovery_worker_preserves_shared_memory_limit_failure() -> Result<(), Box<dyn Error>> {
+    let temporary = tempfile::tempdir()?;
+    let capture = temporary.path().join("http.pcap");
+    fs::write(&capture, four_http_flows()?)?;
+    let mut indexed = crate::workbench::full_source::acquire_indexed_source(
+        &capture,
+        temporary.path(),
+        &crate::workbench::full_source::AcquisitionOptions::default(),
+    )?;
+    let budget = MemoryBudget::new(4 * 1024 * 1024);
+    indexed.store.set_memory_budget(budget.clone())?;
+    let options = RecoveryOptions {
+        profile: RecoveryProfile::Fast,
+        ..RecoveryOptions::default()
+    };
+    let context = RecoveryContext {
+        cache: None,
+        job: None,
+        memory: Some(&budget),
+        options: &options,
+    };
+    let pool = rayon::ThreadPoolBuilder::new().num_threads(1).build()?;
+    let mut observed = None;
+    let analysis = crate::workbench::full_source::analyze_indexed_source_with_context(
+        &indexed.store,
+        &indexed.receipt,
+        crate::workbench::full_source::IndexedAnalysisOptions {
+            limits: Limits::default(),
+            include_cohorts: false,
+        },
+        crate::workbench::full_source::IndexedAnalysisContext::default(),
+        |item| {
+            let mut batch = vec![PendingCase::new(item)?];
+            let snapshot = budget.snapshot()?;
+            let remaining = snapshot.limit_bytes - snapshot.used_bytes;
+            let held = budget.try_reserve(MemoryClass::Base, remaining)?;
+            let error = process_case_batch(&mut batch, &pool, &context, |_| Ok(()))
+                .err()
+                .ok_or("recovery should fail when the shared budget is full")?;
+            observed = crate::memory_error::find(error.as_ref());
+            drop(held);
+            Err(io::Error::other("stop after the first Case").into())
+        },
+    );
+    assert!(analysis.is_err());
+    assert!(matches!(observed, Some(MemoryError::Limit { .. })));
+    assert_eq!(budget.snapshot()?.used_bytes, 0);
+    Ok(())
+}
+
+fn collect_with_insufficient_memory(
+    directory: &std::path::Path,
+    capture: &std::path::Path,
+) -> Result<(Box<dyn Error>, MemoryBudget), Box<dyn Error>> {
+    let staging = directory.join("staging");
+    fs::write(capture, two_udp_flows()?)?;
+    fs::create_dir(&staging)?;
+    let options = ExportOptions {
+        capture: capture.to_owned(),
+        output: None,
+        require_tshark: false,
+        recovery: RecoveryOptions::default(),
+    };
+    let budget = MemoryBudget::new(1);
+    let context = RecoveryContext {
+        cache: None,
+        job: None,
+        memory: Some(&budget),
+        options: &options.recovery,
+    };
+    let error =
+        super::collection::collect_export(&staging, &options, ArtifactLimits::default(), &context)
+            .err()
+            .ok_or("insufficient memory should stop collection")?;
+    Ok((error, budget))
 }
 
 #[test]

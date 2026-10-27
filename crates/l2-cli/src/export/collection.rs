@@ -25,8 +25,8 @@ use l2_workbench::{
 use std::{
     collections::{HashMap, HashSet},
     error::Error,
-    io,
-    path::Path,
+    fmt, io,
+    path::{Path, PathBuf},
 };
 
 const TSHARK_OBJECT_BUDGET: workbench::ObjectExportBudget = workbench::ObjectExportBudget::DEFAULT;
@@ -209,14 +209,35 @@ fn collect_flow_cases(
         process_case_batch(&mut batch, pool, context, &mut collect_case)?;
         Ok(coverage)
     });
-    let coverage = analysis.map_err(|error| {
-        io::Error::new(
-            io::ErrorKind::InvalidData,
-            format!("could not analyze {}: {error}", options.capture.display()),
-        )
+    let coverage = analysis.map_err(|source| CaptureAnalysisError {
+        capture: options.capture.clone(),
+        source,
     })?;
     add_source_limitations(&mut collection.limitations, &coverage.source)?;
     Ok(coverage)
+}
+
+#[derive(Debug)]
+struct CaptureAnalysisError {
+    capture: PathBuf,
+    source: Box<dyn Error>,
+}
+
+impl fmt::Display for CaptureAnalysisError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            formatter,
+            "could not analyze {}: {}",
+            self.capture.display().to_string().escape_debug(),
+            self.source.to_string().escape_debug()
+        )
+    }
+}
+
+impl Error for CaptureAnalysisError {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        Some(self.source.as_ref())
+    }
 }
 
 fn bind_current_source_label(
