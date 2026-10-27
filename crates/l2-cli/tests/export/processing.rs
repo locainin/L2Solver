@@ -1,4 +1,5 @@
-use super::super::processing::process_ordered;
+use super::super::processing::{classify_worker_error, process_ordered};
+use l2_workbench::{evidence::EvidenceError, job::MemoryError};
 use std::{
     error::Error,
     sync::{
@@ -111,7 +112,7 @@ fn ordered_collection_rejects_a_nested_pool_worker_before_starting_tasks() -> Te
             vec![0],
             |index| {
                 started.fetch_add(1, Ordering::SeqCst);
-                Ok(index)
+                Ok::<_, String>(index)
             },
             |_| Ok(()),
         )
@@ -123,5 +124,48 @@ fn ordered_collection_rejects_a_nested_pool_worker_before_starting_tasks() -> Te
         Some("ordered collection cannot run inside its recovery pool")
     );
     assert_eq!(started.load(Ordering::SeqCst), 0);
+    Ok(())
+}
+
+#[test]
+fn worker_error_keeps_the_typed_memory_limit_inside_nested_causes() -> TestResult {
+    let pool = rayon::ThreadPoolBuilder::new().num_threads(2).build()?;
+    let expected = MemoryError::Limit {
+        limit: 12,
+        used: 9,
+        requested: 4,
+    };
+    let nested = std::io::Error::other(EvidenceError::Memory(expected));
+    let classified = classify_worker_error(&nested);
+    let result = process_ordered(&pool, vec![classified], Err::<(), _>, |()| Ok(()));
+    let error = result.err().ok_or("memory pressure should fail")?;
+    assert_eq!(crate::memory_error::find(error.as_ref()), Some(expected));
+    Ok(())
+}
+
+#[test]
+fn memory_cancellation_remains_distinct_from_a_limit_failure() -> TestResult {
+    let nested = std::io::Error::other(EvidenceError::Memory(MemoryError::Cancelled));
+    let classified = classify_worker_error(&nested);
+    let error = classified.source().ok_or("missing cancellation cause")?;
+    assert_eq!(
+        error.downcast_ref::<MemoryError>(),
+        Some(&MemoryError::Cancelled)
+    );
+    assert!(crate::memory_error::find(&std::io::Error::other("limit")).is_none());
+    Ok(())
+}
+
+#[test]
+fn ordered_collection_preserves_typed_worker_failures() -> TestResult {
+    let pool = rayon::ThreadPoolBuilder::new().num_threads(2).build()?;
+    let expected = MemoryError::Limit {
+        limit: 20,
+        used: 14,
+        requested: 7,
+    };
+    let result = process_ordered(&pool, vec![0], |_| Err::<(), _>(expected), |()| Ok(()));
+    let error = result.err().ok_or("memory pressure should fail")?;
+    assert_eq!(error.downcast_ref::<MemoryError>(), Some(&expected));
     Ok(())
 }

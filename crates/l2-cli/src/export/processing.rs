@@ -8,9 +8,9 @@ use super::{
 use crate::workbench;
 use l2_workbench::{
     evidence::Case,
-    job::{Counter, Job, Phase, PhaseOutcome},
+    job::{Counter, Job, MemoryError, Phase, PhaseOutcome},
 };
-use std::{error::Error, io, sync::mpsc};
+use std::{error::Error, fmt, io, sync::mpsc};
 
 // A batch holds one bounded Case and active recovery graph per worker
 const RECOVERY_WORKER_RESERVATION_BYTES: u64 = 128 * 1024 * 1024;
@@ -206,8 +206,8 @@ pub(super) fn process_case_batch(
                 scope,
             } = pending;
             let recovery = recover(case_mut(&mut item), kind, &scope, context)
-                .map_err(|error| error.to_string())?;
-            Ok(RecoveredCase {
+                .map_err(|error| classify_worker_error(error.as_ref()))?;
+            Ok::<_, WorkerFailure>(RecoveredCase {
                 item,
                 scope,
                 recovery,
@@ -218,10 +218,10 @@ pub(super) fn process_case_batch(
 }
 
 /// Run a bounded batch and emit its completed prefix in source order
-pub(super) fn process_ordered<T: Send, U: Send>(
+pub(super) fn process_ordered<T: Send, U: Send, E: Send + Into<Box<dyn Error + Send + Sync>>>(
     pool: &rayon::ThreadPool,
     items: Vec<T>,
-    work: impl Fn(T) -> Result<U, String> + Sync,
+    work: impl Fn(T) -> Result<U, E> + Sync,
     mut emit: impl FnMut(U) -> Result<(), Box<dyn Error>>,
 ) -> Result<(), Box<dyn Error>> {
     // The collector cannot occupy a worker whose result it needs to receive
@@ -257,8 +257,10 @@ pub(super) fn process_ordered<T: Send, U: Send>(
                 *slot = Some(result);
                 // Release each available prefix Case before waiting for later results
                 while let Some(result) = waiting.get_mut(next).and_then(Option::take) {
-                    let result = result
-                        .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+                    let result = result.map_err(|error| {
+                        let error: Box<dyn Error + Send + Sync> = error.into();
+                        error as Box<dyn Error>
+                    })?;
                     emit(result)?;
                     next += 1;
                 }
@@ -268,6 +270,31 @@ pub(super) fn process_ordered<T: Send, U: Send>(
         drop(receiver);
         outcome
     })
+}
+
+#[derive(Debug)]
+pub(super) struct WorkerFailure {
+    message: String,
+    memory: Option<MemoryError>,
+}
+
+impl fmt::Display for WorkerFailure {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(&self.message)
+    }
+}
+
+impl Error for WorkerFailure {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        self.memory.as_ref().map(|error| error as &dyn Error)
+    }
+}
+
+pub(super) fn classify_worker_error(error: &(dyn Error + 'static)) -> WorkerFailure {
+    WorkerFailure {
+        message: error.to_string(),
+        memory: crate::memory_error::find(error),
+    }
 }
 
 fn case_mut(item: &mut workbench::full_source::FullSourceItem) -> &mut Case {

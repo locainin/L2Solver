@@ -18,6 +18,7 @@ mod input;
 mod inspect;
 mod interfaces;
 mod json;
+mod memory_error;
 mod observe;
 mod outcome;
 mod output;
