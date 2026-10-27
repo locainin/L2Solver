@@ -126,6 +126,7 @@ fn warm_cached_extraction_matches_cold_and_uncached_outputs() -> Result<(), Box<
     }
     assert_eq!(warm.status.code(), cold.status.code());
     assert_eq!(uncached.status.code(), cold.status.code());
+    assert_invocation_diagnostics(&cold_destination, &warm_destination, &uncached_destination)?;
 
     assert_export_outputs_match(&cold_destination, &warm_destination)?;
     assert_export_outputs_match(&cold_destination, &uncached_destination)?;
@@ -362,6 +363,56 @@ fn deeper_profile_reuses_the_index_and_keeps_progress_as_json() -> Result<(), Bo
     Ok(())
 }
 
+fn assert_invocation_diagnostics(
+    cold: &Path,
+    warm: &Path,
+    uncached: &Path,
+) -> Result<(), Box<dyn Error>> {
+    for (directory, cache_hit) in [(cold, false), (warm, true), (uncached, false)] {
+        let manifest: serde_json::Value =
+            serde_json::from_slice(&fs::read(directory.join("manifest.json"))?)?;
+        let transitions = manifest
+            .pointer("/l2solver_result/job/recovery_transitions/records")
+            .and_then(serde_json::Value::as_array)
+            .ok_or("recovery transition records are missing")?;
+        let has_stage = |expected| {
+            transitions.iter().any(|item| {
+                item.get("stage").and_then(serde_json::Value::as_str) == Some(expected)
+                    && item
+                        .get("count")
+                        .and_then(serde_json::Value::as_u64)
+                        .is_some_and(|count| count > 0)
+            })
+        };
+        if cache_hit {
+            for stage in [
+                "cohort",
+                "framing",
+                "transform",
+                "schema",
+                "assembly",
+                "validation",
+                "expansion",
+            ] {
+                assert!(
+                    !has_stage(stage),
+                    "terminal Case reuse must not report {stage} as newly executed"
+                );
+            }
+        } else {
+            assert!(
+                has_stage("framing"),
+                "fresh recovery must report observed framing work"
+            );
+            assert!(
+                has_stage("transform"),
+                "fresh recovery must report observed transform work"
+            );
+        }
+    }
+    Ok(())
+}
+
 fn assert_export_outputs_match(expected: &Path, actual: &Path) -> Result<(), Box<dyn Error>> {
     assert_eq!(artifact_contents(expected)?, artifact_contents(actual)?);
     // Decompressed JSONL bytes keep the complete evidence records byte-identical
@@ -453,6 +504,18 @@ fn normalize_job_snapshot(snapshot: &mut serde_json::Value) -> Result<(), Box<dy
     fields.remove("created_at_unix_ms");
     fields.remove("elapsed_ms");
     fields.remove("counters");
+    // Cache fallback errors remain visible even though invocation diagnostics are not semantic output
+    let fallbacks = fields
+        .remove("cache_fallbacks")
+        .ok_or("cache fallback summary is missing")?;
+    let records = fallbacks
+        .get("records")
+        .and_then(serde_json::Value::as_array)
+        .ok_or("cache fallback records are missing")?;
+    assert!(records.is_empty(), "unexpected cache fallback: {records:?}");
+    fields
+        .remove("recovery_transitions")
+        .ok_or("recovery transition summary is missing")?;
     let phases = fields
         .get_mut("phases")
         .and_then(serde_json::Value::as_array_mut)
