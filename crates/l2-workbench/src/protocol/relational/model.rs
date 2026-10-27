@@ -323,6 +323,12 @@ pub struct RelationalCandidateEvaluationReport<T> {
     pub report: RelationalTransformReport,
     /// Evaluations aligned by index with `report.candidates`
     pub evaluations: Vec<RelationalRetainedEvaluation<T>>,
+    /// Previously rejected rules covered without another full replay
+    pub history_reused_rejections: usize,
+    /// Previously published rules covered without another full replay
+    pub history_reused_published: usize,
+    /// Conclusive rejection identities that did not fit in the history
+    pub history_recording_omissions: usize,
     /// Decoded output bytes retained across all candidate evaluations
     pub output_bytes_retained: usize,
     /// Retained candidates whose output bytes could not fit the configured byte bound

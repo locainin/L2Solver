@@ -65,6 +65,18 @@ pub(super) struct ReadyPrefixDiscovery<'a> {
     transform_work_bytes: usize,
 }
 
+// A rejected rule and an unavailable ordering probe have different coverage meanings
+pub(super) enum PrefixPreparation<T> {
+    Ready(T),
+    Contradicted,
+    NotApplicable,
+}
+
+pub(super) enum PrefixAdmission<T> {
+    Ready(T),
+    WorkLimited,
+}
+
 impl<'a> PreparedPrefixDiscovery<'a> {
     pub(super) const fn take_selection_identity(&mut self) -> Option<PrefixSelectionIdentity> {
         self.selection_identity.take()
@@ -77,16 +89,16 @@ impl<'a> PreparedPrefixDiscovery<'a> {
     pub(super) fn within_work_limit(
         self,
         maximum_work_bytes: usize,
-    ) -> Result<Option<ReadyPrefixDiscovery<'a>>, RelationalTransformError> {
+    ) -> Result<PrefixAdmission<ReadyPrefixDiscovery<'a>>, RelationalTransformError> {
         let transform_work_bytes = prefix_transform_work(
             &self.discovery,
             self.common_prefix_length,
             self.operation.counter_width,
         )?;
         if transform_work_bytes > maximum_work_bytes {
-            return Ok(None);
+            return Ok(PrefixAdmission::WorkLimited);
         }
-        Ok(Some(ReadyPrefixDiscovery {
+        Ok(PrefixAdmission::Ready(ReadyPrefixDiscovery {
             prepared: self,
             transform_work_bytes,
         }))
@@ -340,12 +352,12 @@ pub(super) fn prepare_candidate_prefix<'a>(
     rule: &RelationalTransformRule,
     limits: RelationalTransformLimits,
     maximum_prefix_bytes: usize,
-) -> Result<Option<PreparedPrefixDiscovery<'a>>, RelationalTransformError> {
+) -> Result<PrefixPreparation<PreparedPrefixDiscovery<'a>>, RelationalTransformError> {
     if maximum_prefix_bytes == 0 {
-        return Ok(None);
+        return Ok(PrefixPreparation::NotApplicable);
     }
     let operation = rule.operation.sha256_counter_xor();
-    let Some((discovery, common_prefix_length)) = prepare_prefix_discovery(
+    let (discovery, common_prefix_length) = match prepare_prefix_discovery(
         samples,
         discovery_groups,
         rule,
@@ -353,13 +365,14 @@ pub(super) fn prepare_candidate_prefix<'a>(
         maximum_prefix_bytes,
         operation.counter_width,
         operation.initial_counter,
-    )?
-    else {
-        return Ok(None);
+    )? {
+        PrefixPreparation::Ready(prepared) => prepared,
+        PrefixPreparation::Contradicted => return Ok(PrefixPreparation::Contradicted),
+        PrefixPreparation::NotApplicable => return Ok(PrefixPreparation::NotApplicable),
     };
     let selection_identity =
         prefix_selection_identity(discovery_groups, &discovery, common_prefix_length)?;
-    Ok(Some(PreparedPrefixDiscovery {
+    Ok(PrefixPreparation::Ready(PreparedPrefixDiscovery {
         discovery,
         common_prefix_length,
         operation,
@@ -371,22 +384,19 @@ pub(super) fn prepare_candidate_prefix<'a>(
 pub(super) fn transform_prepared_prefix<'a>(
     samples: &[RelationalRecordSample<'a>],
     ready: ReadyPrefixDiscovery<'a>,
-) -> Result<Option<PrefixProbeOutput<'a>>, RelationalTransformError> {
+) -> Result<PrefixProbeOutput<'a>, RelationalTransformError> {
     let prepared = ready.prepared;
     let parameters = prepared.operation;
-    let Some(messages) = transform_prefix_discovery(
+    let messages = transform_prefix_discovery(
         samples,
         prepared.discovery,
         parameters,
         prepared.common_prefix_length,
-    )?
-    else {
-        return Ok(None);
-    };
-    Ok(Some(PrefixProbeOutput {
+    )?;
+    Ok(PrefixProbeOutput {
         messages,
         work_bytes: ready.transform_work_bytes,
-    }))
+    })
 }
 
 fn prefix_selection_identity(
@@ -443,26 +453,37 @@ fn prepare_prefix_discovery<'a>(
     maximum_prefix_bytes: usize,
     counter_width: CounterWidth,
     initial_counter: u64,
-) -> Result<Option<(Vec<PreparedPrefixSession<'a>>, usize)>, RelationalTransformError> {
+) -> Result<PrefixPreparation<(Vec<PreparedPrefixSession<'a>>, usize)>, RelationalTransformError> {
     let mut discovery = Vec::new();
     discovery
         .try_reserve_exact(discovery_groups.len())
         .map_err(|_| RelationalTransformError::AllocationFailed)?;
     let mut common_prefix_length = maximum_prefix_bytes;
+    let mut applicable = true;
 
     for group in discovery_groups {
-        let Some(prepared) =
-            prepare_prefix_session(samples, group, rule, limits, counter_width, initial_counter)?
-        else {
-            return Ok(None);
+        let prepared = match prepare_prefix_session(
+            samples,
+            group,
+            rule,
+            limits,
+            counter_width,
+            initial_counter,
+        )? {
+            PrefixPreparation::Ready(prepared) => prepared,
+            PrefixPreparation::Contradicted => return Ok(PrefixPreparation::Contradicted),
+            PrefixPreparation::NotApplicable => {
+                applicable = false;
+                continue;
+            }
         };
         common_prefix_length = common_prefix_length.min(prepared.payload.bytes.len());
         discovery.push(prepared);
     }
-    if common_prefix_length == 0 {
-        return Ok(None);
+    if !applicable || common_prefix_length == 0 {
+        return Ok(PrefixPreparation::NotApplicable);
     }
-    Ok(Some((discovery, common_prefix_length)))
+    Ok(PrefixPreparation::Ready((discovery, common_prefix_length)))
 }
 
 fn prefix_transform_work(
@@ -490,7 +511,7 @@ fn transform_prefix_discovery<'a>(
     discovery: Vec<PreparedPrefixSession<'a>>,
     parameters: RelationalSha256CounterXor,
     common_prefix_length: usize,
-) -> Result<Option<Vec<PrefixProbeMessage<'a>>>, RelationalTransformError> {
+) -> Result<Vec<PrefixProbeMessage<'a>>, RelationalTransformError> {
     let mut messages = Vec::new();
     messages
         .try_reserve_exact(discovery.len())
@@ -513,7 +534,11 @@ fn transform_prefix_discovery<'a>(
             Err(crate::derivation::StepFailure::AllocationFailed) => {
                 return Err(RelationalTransformError::AllocationFailed);
             }
-            Err(_) => return Ok(None),
+            Err(_) => {
+                return Err(RelationalTransformError::InvalidPlan(
+                    "prefix transform failed after capacity preflight",
+                ));
+            }
         };
         let sample = samples.get(prepared.payload.sample_index).ok_or(
             RelationalTransformError::InvalidInput("prefix probe references a missing sample"),
@@ -537,7 +562,7 @@ fn transform_prefix_discovery<'a>(
             output,
         });
     }
-    Ok(Some(messages))
+    Ok(messages)
 }
 
 fn prepare_prefix_session<'a>(
@@ -547,29 +572,34 @@ fn prepare_prefix_session<'a>(
     limits: RelationalTransformLimits,
     counter_width: CounterWidth,
     initial_counter: u64,
-) -> Result<Option<PreparedPrefixSession<'a>>, RelationalTransformError> {
+) -> Result<PrefixPreparation<PreparedPrefixSession<'a>>, RelationalTransformError> {
     let seed = match replay_seed(samples, group, rule, limits) {
         Ok(seed) => seed,
-        Err(RelationalTransformError::RuleContradicted(_)) => return Ok(None),
+        Err(RelationalTransformError::RuleContradicted(_)) => {
+            return Ok(PrefixPreparation::Contradicted);
+        }
         Err(error) => return Err(error),
     };
     let payloads = match replay_payloads(samples, group, rule, limits, &seed) {
         Ok(payloads) => payloads,
-        Err(RelationalTransformError::RuleContradicted(_)) => return Ok(None),
+        Err(RelationalTransformError::RuleContradicted(_)) => {
+            return Ok(PrefixPreparation::Contradicted);
+        }
         Err(error) => return Err(error),
     };
     // With one payload, continuous and per-message resets have the same prefix state
-    if payloads.len() != 1
-        || !capacity_supports_full_payloads(
-            &payloads,
-            initial_counter,
-            counter_width,
-            rule.counter_reset,
-        )
-    {
-        return Ok(None);
+    if !capacity_supports_full_payloads(
+        &payloads,
+        initial_counter,
+        counter_width,
+        rule.counter_reset,
+    ) {
+        return Ok(PrefixPreparation::Contradicted);
     }
-    Ok(Some(PreparedPrefixSession {
+    if payloads.len() != 1 {
+        return Ok(PrefixPreparation::NotApplicable);
+    }
+    Ok(PrefixPreparation::Ready(PreparedPrefixSession {
         seed,
         payload: payloads
             .into_iter()

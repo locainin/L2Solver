@@ -1,5 +1,6 @@
 use super::super::{Executor, RecoveryExecutionError};
 use super::application::{CandidateApplication, DecodedFrameContext, decoded_payload_frames};
+use super::history::RelationalReplayHistories;
 use super::record_gate::SchemaPlanCache;
 use super::record_gate::{GateResult, SchemaCandidateOptions};
 use super::report::{budget_report, insufficient_sessions_report, report_json};
@@ -14,12 +15,14 @@ use l2_workbench::{
     protocol::{
         HoldoutBasis, RelationalAppliedOutput, RelationalCandidateEvaluation,
         RelationalCandidateEvaluationReport, RelationalParserScope, RelationalRecordSample,
-        RelationalTransformEvaluationOptions, RelationalTransformReport, RelationalTransformStatus,
-        infer_relational_transform_candidates_with_evaluator,
+        RelationalReplayHistory, RelationalTransformEvaluationOptions, RelationalTransformReport,
+        RelationalTransformRule, RelationalTransformStatus,
+        infer_relational_transform_candidates_with_evaluator_and_history,
     },
     recovery::RecoveryError,
 };
 use serde_json::Value;
+use std::collections::{BTreeMap, BTreeSet};
 
 struct CohortSearchResult {
     report_value: Value,
@@ -32,6 +35,7 @@ struct CohortSearchResult {
     outputs: Vec<super::AppliedOutput>,
     decoded_frames: Vec<DecodedFrameOutput>,
     accepted_schemas: Vec<(usize, super::record_gate::AcceptedRecordSchema)>,
+    published_rules: Vec<RelationalTransformRule>,
 }
 
 #[derive(Clone, Copy)]
@@ -43,6 +47,7 @@ struct FinishEvaluationContext<'ctx, 'samples> {
     artifact_validation_policy: ArtifactValidationPolicy,
     job: Option<&'ctx Job>,
     gate: &'ctx CandidateGate<'samples>,
+    history_complete: Option<bool>,
 }
 
 // Gate checks consume the same frozen outputs used by retained candidates
@@ -61,6 +66,7 @@ pub(super) fn prepare_contexts(
     contexts: Vec<RelationalDiscoveryContext>,
     base_plan: &l2_workbench::protocol::RelationalTransformPlan,
     work_remaining: &mut usize,
+    histories: &mut RelationalReplayHistories,
     job: Option<&Job>,
 ) -> Result<Vec<PreparedRelationalCohort>, RecoveryExecutionError> {
     let mut prepared = Vec::new();
@@ -68,7 +74,13 @@ pub(super) fn prepare_contexts(
         if let Some(job) = job {
             job.check_cancelled()?;
         }
-        let cohort = prepare_cohort(executor, context, base_plan, work_remaining)?;
+        let history = if executor.policy.relational_incremental_plan.is_some() {
+            let limits = executor.policy.relational_transform_plan.limits;
+            histories.for_context(&context, limits.max_cohorts, limits.max_total_bytes)
+        } else {
+            None
+        };
+        let cohort = prepare_cohort(executor, context, base_plan, work_remaining, history)?;
         prepared
             .try_reserve(1)
             .map_err(|source| operational("relational report allocation failed", source))?;
@@ -265,6 +277,7 @@ pub(super) fn prepare_cohort(
     context: RelationalDiscoveryContext,
     base_plan: &l2_workbench::protocol::RelationalTransformPlan,
     work_remaining: &mut usize,
+    history: Option<&mut RelationalReplayHistory>,
 ) -> Result<PreparedRelationalCohort, RecoveryExecutionError> {
     let samples = samples_for_context(executor.case, &context)?;
     let sample_bytes = samples.iter().try_fold(0_usize, |total, sample| {
@@ -308,11 +321,18 @@ pub(super) fn prepare_cohort(
             &search_plan,
             cohort_work_budget,
             job,
+            history,
         )?
     };
     let report_bytes = serde_json::to_vec(&result.report_value)
         .map_err(|source| operational("relational report serialization failed", source))?;
-    let spent = sample_bytes
+    // A denied cohort only inspects lengths; it never starts its input scan
+    let admitted_input_bytes = if sample_bytes >= *work_remaining {
+        0
+    } else {
+        sample_bytes
+    };
+    let spent = admitted_input_bytes
         .checked_add(result.used_work)
         .ok_or_else(|| invalid_policy("relational work total overflowed"))?;
     if spent > *work_remaining {
@@ -325,6 +345,7 @@ pub(super) fn prepare_cohort(
         outputs: result.outputs,
         decoded_frames: result.decoded_frames,
         accepted_schemas: result.accepted_schemas,
+        published_rules: result.published_rules,
         report_details_complete: result.report_details_complete,
         search_exhaustive_within_plan: result.exhaustive,
         candidate_limit_remaining: result.candidate_remaining,
@@ -351,6 +372,7 @@ const fn preflight_result(
         outputs: Vec::new(),
         decoded_frames: Vec::new(),
         accepted_schemas: Vec::new(),
+        published_rules: Vec::new(),
     }
 }
 
@@ -361,6 +383,7 @@ fn evaluate_cohort(
     search_plan: &l2_workbench::protocol::RelationalTransformPlan,
     cohort_work_budget: usize,
     job: Option<&Job>,
+    mut history: Option<&mut RelationalReplayHistory>,
 ) -> Result<CohortSearchResult, RecoveryExecutionError> {
     let mut gate = CandidateGate::new(
         samples,
@@ -370,13 +393,14 @@ fn evaluate_cohort(
         executor.policy.artifact_validation_policy,
         job,
     );
-    let evaluation = infer_relational_transform_candidates_with_evaluator(
+    let evaluation = infer_relational_transform_candidates_with_evaluator_and_history(
         samples,
         search_plan,
         job,
         RelationalTransformEvaluationOptions {
             max_retained_output_bytes: search_plan.limits.max_total_bytes,
         },
+        history.as_deref_mut(),
         |evaluation_context, candidate, discovery_outputs, heldout_outputs| {
             gate.evaluate(
                 evaluation_context,
@@ -405,6 +429,7 @@ fn evaluate_cohort(
             ));
         }
     };
+    let history_complete = history.as_deref().map(RelationalReplayHistory::is_complete);
     finish_evaluation(
         FinishEvaluationContext {
             context,
@@ -414,6 +439,7 @@ fn evaluate_cohort(
             artifact_validation_policy: executor.policy.artifact_validation_policy,
             job,
             gate: &gate,
+            history_complete,
         },
         evaluation,
     )
@@ -431,10 +457,14 @@ fn finish_evaluation(
         artifact_validation_policy,
         job,
         gate,
+        history_complete,
     } = context;
     let RelationalCandidateEvaluationReport {
         report,
         evaluations,
+        history_reused_rejections,
+        history_reused_published,
+        history_recording_omissions,
         ..
     } = evaluation;
     let applications = CandidateApplication::new(
@@ -447,7 +477,12 @@ fn finish_evaluation(
         job,
     )?
     .apply(&report, evaluations, gate)?;
-    let report_value = report_json(
+    let published_rules = if history_complete.is_some() {
+        fully_published_rules(&report, &applications.outputs)?
+    } else {
+        Vec::new()
+    };
+    let mut report_value = report_json(
         context,
         &report,
         search_plan,
@@ -456,6 +491,27 @@ fn finish_evaluation(
         &applications.aggregate_parser_checks,
         &applications.application_evidence_checks,
     );
+    if context.lane == super::RelationalLane::Incremental {
+        let fields = report_value
+            .as_object_mut()
+            .ok_or_else(|| invalid_policy("relational report is not an object"))?;
+        fields.insert(
+            "history_reused_rejections".to_owned(),
+            serde_json::json!(history_reused_rejections),
+        );
+        fields.insert(
+            "history_reused_published".to_owned(),
+            serde_json::json!(history_reused_published),
+        );
+        fields.insert(
+            "history_recording_omissions".to_owned(),
+            serde_json::json!(history_recording_omissions),
+        );
+        fields.insert(
+            "history_complete".to_owned(),
+            serde_json::json!(history_complete),
+        );
+    }
     Ok(CohortSearchResult {
         report_value,
         report_details_complete: true,
@@ -467,7 +523,41 @@ fn finish_evaluation(
         outputs: applications.outputs,
         decoded_frames: applications.decoded_frames,
         accepted_schemas: applications.accepted_schemas,
+        published_rules,
     })
+}
+
+fn fully_published_rules(
+    report: &RelationalTransformReport,
+    outputs: &[super::AppliedOutput],
+) -> Result<Vec<RelationalTransformRule>, RecoveryExecutionError> {
+    let sessions = report
+        .discovery_sessions
+        .iter()
+        .chain(&report.heldout_sessions)
+        .map(|session| session.session)
+        .collect::<BTreeSet<_>>();
+    let mut by_candidate = BTreeMap::<usize, BTreeSet<u64>>::new();
+    for output in outputs {
+        by_candidate
+            .entry(output.candidate_index)
+            .or_default()
+            .extend(output.session_ids.iter().copied());
+    }
+    let mut rules = Vec::new();
+    rules
+        .try_reserve_exact(by_candidate.len())
+        .map_err(|source| operational("published relational rule allocation failed", source))?;
+    for (candidate_index, output_sessions) in by_candidate {
+        if !sessions.is_empty() && output_sessions == sessions {
+            let candidate = report
+                .candidates
+                .get(candidate_index)
+                .ok_or(RecoveryError::InvariantFailure)?;
+            rules.push(candidate.rule.clone());
+        }
+    }
+    Ok(rules)
 }
 
 fn samples_for_context<'a>(

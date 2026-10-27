@@ -313,6 +313,56 @@ fn fifo_preserves_task_order() -> Result<(), Box<dyn Error>> {
 }
 
 #[test]
+fn incremental_relational_search_has_a_distinct_work_identity() -> Result<(), Box<dyn Error>> {
+    let mut case = Case::new();
+    let origin = node(&mut case, b"source")?;
+    let mut coordinator = RecoveryCoordinator::new(policy());
+    let normal = queue(
+        &mut coordinator,
+        &case,
+        origin,
+        RecoveryTask::RelationalTransformDiscovery,
+    )?;
+    let incremental = queue(
+        &mut coordinator,
+        &case,
+        origin,
+        RecoveryTask::RelationalTransformDiscoveryIncremental,
+    )?;
+    assert_ne!(normal, incremental);
+    assert_eq!(coordinator.pop_next(), Ok(Some(normal)));
+    assert_eq!(coordinator.pop_next(), Ok(Some(incremental)));
+    Ok(())
+}
+
+#[test]
+fn relational_discovery_can_finish_with_derived_evidence_without_widening_other_tasks()
+-> Result<(), Box<dyn Error>> {
+    for (task, allowed) in [
+        (RecoveryTask::RelationalTransformDiscovery, true),
+        (RecoveryTask::RelationalTransformDiscoveryIncremental, true),
+        (RecoveryTask::TransformDiscovery, false),
+    ] {
+        let mut case = Case::new();
+        let origin = node(&mut case, b"source")?;
+        let receipt = node(&mut case, b"report")?;
+        derived_link(&mut case, receipt, origin)?;
+        let mut coordinator = RecoveryCoordinator::new(policy());
+        let candidate = queue(&mut coordinator, &case, origin, task)?;
+        assert_eq!(coordinator.pop_next(), Ok(Some(candidate)));
+        let result = coordinator.finish(
+            &case,
+            candidate,
+            RecoveryResult::Derived {
+                evidence_node_id: receipt,
+            },
+        );
+        assert_eq!(result.is_ok(), allowed);
+    }
+    Ok(())
+}
+
+#[test]
 fn duplicate_merges_origins() -> Result<(), Box<dyn Error>> {
     let mut case = Case::new();
     let first = node(&mut case, b"same bytes")?;

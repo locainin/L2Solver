@@ -139,8 +139,19 @@ pub(super) fn policy_for_profile(
     }
 
     let mut policy = normal_policy(case)?;
-    policy.relational_transform_plan =
-        relational_plan_for_profile(profile, &mut policy.record_schema_proposal_limits);
+    if profile == RecoveryProfile::Deep {
+        policy.relational_transform_plan = relational_plan_for_profile(
+            RecoveryProfile::Normal,
+            &mut policy.record_schema_proposal_limits,
+        );
+        policy.relational_incremental_plan = Some(relational_plan_for_profile(
+            RecoveryProfile::Deep,
+            &mut policy.record_schema_proposal_limits,
+        ));
+    } else {
+        policy.relational_transform_plan =
+            relational_plan_for_profile(profile, &mut policy.record_schema_proposal_limits);
+    }
     apply_memory_limit(&mut policy, memory_limit);
     Ok(policy)
 }
@@ -210,6 +221,9 @@ fn relational_plan_for_profile(
 
 fn apply_memory_limit(policy: &mut RecoveryExecutionPolicy, memory_limit: usize) {
     limit_relational_plan(&mut policy.relational_transform_plan, memory_limit);
+    if let Some(plan) = &mut policy.relational_incremental_plan {
+        limit_relational_plan(plan, memory_limit);
+    }
     limit_artifact_validation(policy, memory_limit);
     limit_recovery_work(policy, memory_limit);
 }
@@ -396,6 +410,7 @@ fn build_execution_policy(
         record_discovery_snapshot: Some(record_discovery_snapshot),
         record_schema_proposal_limits,
         relational_transform_plan,
+        relational_incremental_plan: None,
         record_phase_work_limit: source_work.record_phase_work,
     })
 }

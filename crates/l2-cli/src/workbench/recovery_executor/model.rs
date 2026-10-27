@@ -73,6 +73,8 @@ pub(super) struct RecoveryExecutionPolicy {
     pub(super) record_schema_proposal_limits: RecordSchemaProposalLimits,
     /// Bounded session-relative transform family tested after record assembly
     pub(super) relational_transform_plan: l2_workbench::protocol::RelationalTransformPlan,
+    /// Additional relational domain searched after the normal recovery work drains
+    pub(super) relational_incremental_plan: Option<l2_workbench::protocol::RelationalTransformPlan>,
     /// Immutable work reservation for the post-framing record phase
     pub(super) record_phase_work_limit: usize,
 }
@@ -635,6 +637,9 @@ const fn task_label(task: &RecoveryTask) -> &'static str {
         RecoveryTask::FramingDiscovery => "framing discovery",
         RecoveryTask::RecordDiscovery => "record discovery",
         RecoveryTask::RelationalTransformDiscovery => "relational transform discovery",
+        RecoveryTask::RelationalTransformDiscoveryIncremental => {
+            "incremental relational transform discovery"
+        }
     }
 }
 

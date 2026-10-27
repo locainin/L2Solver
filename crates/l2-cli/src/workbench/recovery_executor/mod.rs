@@ -55,7 +55,7 @@ use model::{RecoveryExecutionOutcome, RecoveryExecutionPolicy, RecoveryPlan};
 #[cfg(test)]
 use policy::normal_policy;
 use policy::{policy_for_profile, resolve_policy, source_priority};
-use relational::{RelationalDiscoveryContext, RelationalSampleCollections};
+use relational::{RelationalDiscoveryContext, RelationalLane, RelationalSampleCollections};
 use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
 
 pub(super) use super::{decode::service::DecodeBatchLimits, expand::ExpansionLimits};
@@ -300,6 +300,7 @@ fn execute_executor(executor: &mut Executor<'_>) -> Result<(), RecoveryExecution
         // Deferred cohort work can mutate the Case even when the frontier is empty
         executor.check_cancelled()?;
         if evidence_stop.is_some() {
+            executor.omit_unsearched_incremental_cohorts()?;
             break;
         }
         if executor.flush_transform_cohorts()? {
@@ -315,13 +316,17 @@ fn execute_executor(executor: &mut Executor<'_>) -> Result<(), RecoveryExecution
                 continue;
             }
         }
-        if executor.flush_relational_cohorts()? {
+        if executor.flush_relational_cohorts(RelationalLane::Normal)? {
             continue;
         }
         if executor.flush_pending_record_assemblies()? {
             continue;
         }
         if executor.enqueue_deferred_record_discovery()? {
+            continue;
+        }
+        // Deep work cannot consume resources needed by normal recovery or its derived artifacts
+        if executor.flush_relational_cohorts(RelationalLane::Incremental)? {
             continue;
         }
         break;
@@ -646,6 +651,9 @@ const fn task_progress_label(task: &RecoveryTask) -> &'static str {
         RecoveryTask::MaterializeFraming(_) => "materializing frames",
         RecoveryTask::RecordDiscovery => "discovering records",
         RecoveryTask::RelationalTransformDiscovery => "discovering relational transforms",
+        RecoveryTask::RelationalTransformDiscoveryIncremental => {
+            "extending relational transform search"
+        }
         RecoveryTask::AssembleRecords(_) => "assembling records",
         RecoveryTask::EmbeddedDiscovery => "discovering embedded content",
         RecoveryTask::StructuralValidation => "validating structure",
@@ -658,9 +666,9 @@ const fn phase_for_task(task: &RecoveryTask) -> Phase {
         RecoveryTask::FramingDiscovery
         | RecoveryTask::MaterializeFraming(_)
         | RecoveryTask::RecordDiscovery => Phase::FramingRecordDiscovery,
-        RecoveryTask::TransformDiscovery | RecoveryTask::RelationalTransformDiscovery => {
-            Phase::TransformDiscovery
-        }
+        RecoveryTask::TransformDiscovery
+        | RecoveryTask::RelationalTransformDiscovery
+        | RecoveryTask::RelationalTransformDiscoveryIncremental => Phase::TransformDiscovery,
         RecoveryTask::Transform(_)
         | RecoveryTask::AssembleRecords(_)
         | RecoveryTask::EmbeddedDiscovery

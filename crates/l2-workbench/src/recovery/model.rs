@@ -32,6 +32,8 @@ pub enum RecoveryTask {
     RecordDiscovery,
     /// Learn a bounded cross-session transform from source-backed byte views
     RelationalTransformDiscovery,
+    /// Extend an already drained relational search using the wider configured domain
+    RelationalTransformDiscoveryIncremental,
     /// Assemble records with one explicit normalized schema
     AssembleRecords(RecordSchema),
     /// Discover nested or embedded content inside retained bytes
@@ -55,9 +57,9 @@ impl RecoveryTask {
     pub(super) const fn stage(&self) -> RecoveryStage {
         match self {
             Self::Transform(_) => RecoveryStage::Transform,
-            Self::TransformDiscovery | Self::RelationalTransformDiscovery => {
-                RecoveryStage::TransformDiscovery
-            }
+            Self::TransformDiscovery
+            | Self::RelationalTransformDiscovery
+            | Self::RelationalTransformDiscoveryIncremental => RecoveryStage::TransformDiscovery,
             Self::FramingDiscovery => RecoveryStage::FramingDiscovery,
             Self::MaterializeFraming(_) => RecoveryStage::MaterializeFraming,
             Self::RecordDiscovery => RecoveryStage::RecordDiscovery,

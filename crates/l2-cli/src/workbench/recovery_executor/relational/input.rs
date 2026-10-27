@@ -6,8 +6,8 @@ use super::super::framing_discovery::{
 use super::super::peer_cohort::{self, PeerCohort};
 use super::{
     Executor, RAW_RUN_FRAMING_RULE, RawRelationalRunInput, RecordCohortKey, RecordCohortOrigin,
-    RecordFrameInput, RecoveryExecutionError, RelationalCohortKey, SampleCohort, StoredSample,
-    append_framed_samples, invalid_policy, operational,
+    RecordFrameInput, RecoveryExecutionError, RelationalCohortKey, RelationalLane, SampleCohort,
+    StoredSample, admit_sample_views, invalid_policy, operational,
 };
 use l2_workbench::{
     evidence::Case,
@@ -57,7 +57,12 @@ impl Executor<'_> {
             framing_rule_json: RAW_RUN_FRAMING_RULE.to_owned(),
             schema_json: "{\"input\":\"raw_directional_byte_run\"}".to_owned(),
         };
-        let limits = self.policy.relational_transform_plan.limits;
+        let normal_limits = self.policy.relational_transform_plan.limits;
+        let incremental_limits = self
+            .policy
+            .relational_incremental_plan
+            .as_ref()
+            .map(|plan| plan.limits);
         let CollectedRawSamples {
             incoming,
             incomplete_sessions,
@@ -67,29 +72,53 @@ impl Executor<'_> {
             return Ok(());
         }
         let source_eligibility_omissions = plan.source_eligibility_omissions(source_id);
-        let Some(cohort_index) = self.relational_cohort_index(key, runs.len())? else {
-            return Ok(());
+        let normal_index =
+            self.relational_cohort_index(key.clone(), runs.len(), RelationalLane::Normal)?;
+        let incremental_index =
+            self.relational_cohort_index(key, runs.len(), RelationalLane::Incremental)?;
+        let mut normal = match normal_index {
+            Some(index) => Some(
+                self.relational_samples
+                    .cohorts
+                    .get_mut(index)
+                    .ok_or(RecoveryError::InvariantFailure)?,
+            ),
+            None => None,
         };
-        let cohort = self
-            .relational_samples
-            .cohorts
-            .get_mut(cohort_index)
-            .ok_or(RecoveryError::InvariantFailure)?;
-        cohort.input_coverage_complete &=
-            source_eligibility_omissions == 0 && incomplete_sessions.is_empty();
-        cohort.source_eligibility_omissions = cohort
-            .source_eligibility_omissions
-            .max(source_eligibility_omissions);
-        cohort.omitted_samples = cohort
-            .omitted_samples
-            .checked_add(omitted_runs)
-            .ok_or_else(|| invalid_policy("relational raw-run omission overflowed"))?;
-        cohort.omitted_sessions = cohort
-            .omitted_sessions
-            .checked_add(incomplete_sessions.len())
-            .ok_or_else(|| invalid_policy("relational raw-session omission overflowed"))?;
-        cohort.incomplete_sessions.extend(incomplete_sessions);
-        append_framed_samples(self.case, cohort, &incoming, limits)?;
+        let mut incremental = match incremental_index {
+            Some(index) => Some(
+                self.relational_samples
+                    .incremental_cohorts
+                    .get_mut(index)
+                    .ok_or(RecoveryError::InvariantFailure)?,
+            ),
+            None => None,
+        };
+        for cohort in normal.iter_mut().chain(incremental.iter_mut()) {
+            cohort.input_coverage_complete &=
+                source_eligibility_omissions == 0 && incomplete_sessions.is_empty();
+            cohort.source_eligibility_omissions = cohort
+                .source_eligibility_omissions
+                .max(source_eligibility_omissions);
+            cohort.omitted_samples = cohort
+                .omitted_samples
+                .checked_add(omitted_runs)
+                .ok_or_else(|| invalid_policy("relational raw-run omission overflowed"))?;
+            cohort.omitted_sessions = cohort
+                .omitted_sessions
+                .checked_add(incomplete_sessions.len())
+                .ok_or_else(|| invalid_policy("relational raw-session omission overflowed"))?;
+            cohort
+                .incomplete_sessions
+                .extend(incomplete_sessions.iter().copied());
+        }
+        admit_sample_views(
+            self.case,
+            normal,
+            incremental.zip(incremental_limits),
+            &incoming,
+            normal_limits,
+        )?;
         Ok(())
     }
 
@@ -97,33 +126,41 @@ impl Executor<'_> {
         &mut self,
         key: RelationalCohortKey,
         incoming_count: usize,
+        lane: RelationalLane,
     ) -> Result<Option<usize>, RecoveryExecutionError> {
+        let limits = match lane {
+            RelationalLane::Normal => self.policy.relational_transform_plan.limits,
+            RelationalLane::Incremental => match &self.policy.relational_incremental_plan {
+                Some(plan) => plan.limits,
+                None => return Ok(None),
+            },
+        };
         if let Some(index) = self
             .relational_samples
-            .cohorts
+            .cohorts(lane)
             .iter()
             .position(|cohort| cohort.key.as_ref() == Some(&key))
         {
             return Ok(Some(index));
         }
-        if self.relational_samples.cohorts.len()
-            >= self.policy.relational_transform_plan.limits.max_cohorts
-        {
+        if self.relational_samples.cohorts(lane).len() >= limits.max_cohorts {
             self.relational_session_omission(
                 &key.source_id,
                 0,
                 incoming_count,
                 false,
                 "cohort_limit",
+                limits,
             )?;
             return Ok(None);
         }
         self.relational_samples
-            .cohorts
+            .cohorts_mut(lane)
             .try_reserve(1)
             .map_err(|source| operational("relational cohort allocation failed", source))?;
-        let index = self.relational_samples.cohorts.len();
-        self.relational_samples.cohorts.push(SampleCohort::new(key));
+        let cohorts = self.relational_samples.cohorts_mut(lane);
+        let index = cohorts.len();
+        cohorts.push(SampleCohort::new(key));
         Ok(Some(index))
     }
 
@@ -191,22 +228,52 @@ impl Executor<'_> {
             framing_rule_json: frame_key.framing_rule_json.clone(),
             schema_json,
         };
-        let limits = self.policy.relational_transform_plan.limits;
+        let normal_limits = self.policy.relational_transform_plan.limits;
+        let incremental_limits = self
+            .policy
+            .relational_incremental_plan
+            .as_ref()
+            .map(|plan| plan.limits);
         let incoming = stored_frame_samples(self.case, frame_key, peer, &eligible_frames)?;
 
-        let Some(cohort_index) = self.relational_cohort_index(key, eligible_frames.len())? else {
-            return Ok(());
+        let normal_index = self.relational_cohort_index(
+            key.clone(),
+            eligible_frames.len(),
+            RelationalLane::Normal,
+        )?;
+        let incremental_index =
+            self.relational_cohort_index(key, eligible_frames.len(), RelationalLane::Incremental)?;
+        let mut normal = match normal_index {
+            Some(index) => Some(
+                self.relational_samples
+                    .cohorts
+                    .get_mut(index)
+                    .ok_or(RecoveryError::InvariantFailure)?,
+            ),
+            None => None,
         };
-        let cohort = self
-            .relational_samples
-            .cohorts
-            .get_mut(cohort_index)
-            .ok_or(RecoveryError::InvariantFailure)?;
-        cohort.input_coverage_complete &= source_coverage_complete;
-        cohort.source_eligibility_omissions = cohort
-            .source_eligibility_omissions
-            .max(source_eligibility_omissions);
-        append_framed_samples(self.case, cohort, &incoming, limits)?;
+        let mut incremental = match incremental_index {
+            Some(index) => Some(
+                self.relational_samples
+                    .incremental_cohorts
+                    .get_mut(index)
+                    .ok_or(RecoveryError::InvariantFailure)?,
+            ),
+            None => None,
+        };
+        for cohort in normal.iter_mut().chain(incremental.iter_mut()) {
+            cohort.input_coverage_complete &= source_coverage_complete;
+            cohort.source_eligibility_omissions = cohort
+                .source_eligibility_omissions
+                .max(source_eligibility_omissions);
+        }
+        admit_sample_views(
+            self.case,
+            normal,
+            incremental.zip(incremental_limits),
+            &incoming,
+            normal_limits,
+        )?;
         Ok(())
     }
 }

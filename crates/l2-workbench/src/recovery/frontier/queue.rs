@@ -448,7 +448,7 @@ impl RecoveryCoordinator {
         let RecoveryCandidateState::Running(stage) = candidate.state else {
             return Err(RecoveryError::CandidateNotRunning { id });
         };
-        if !result_allowed_at(stage, &result) {
+        if !result_allowed_at(stage, &candidate.task, &result) {
             return Err(RecoveryError::InvalidResultStage);
         }
         let inputs = candidate.inputs.clone();
@@ -463,17 +463,24 @@ impl RecoveryCoordinator {
     }
 }
 
-fn result_allowed_at(stage: RecoveryStage, result: &RecoveryResult) -> bool {
+fn result_allowed_at(stage: RecoveryStage, task: &RecoveryTask, result: &RecoveryResult) -> bool {
     match result {
         RecoveryResult::ObservedValidation { .. } => stage == RecoveryStage::StructuralValidation,
-        RecoveryResult::Derived { .. } => matches!(
-            stage,
-            RecoveryStage::Transform
-                | RecoveryStage::MaterializeFraming
-                | RecoveryStage::AssembleRecords
-                | RecoveryStage::EmbeddedDiscovery
-                | RecoveryStage::RecursiveExpansion
-        ),
+        RecoveryResult::Derived { .. } => {
+            matches!(
+                stage,
+                RecoveryStage::Transform
+                    | RecoveryStage::MaterializeFraming
+                    | RecoveryStage::AssembleRecords
+                    | RecoveryStage::EmbeddedDiscovery
+                    | RecoveryStage::RecursiveExpansion
+            ) || (stage == RecoveryStage::TransformDiscovery
+                && matches!(
+                    task,
+                    RecoveryTask::RelationalTransformDiscovery
+                        | RecoveryTask::RelationalTransformDiscoveryIncremental
+                ))
+        }
         RecoveryResult::Hypothesis { .. }
         | RecoveryResult::Rejected { .. }
         | RecoveryResult::Unsupported

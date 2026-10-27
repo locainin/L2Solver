@@ -468,6 +468,7 @@ fn transform_report(
 
 fn application_context(samples: &[StoredSample]) -> RelationalDiscoveryContext {
     RelationalDiscoveryContext {
+        lane: super::RelationalLane::Normal,
         key: RelationalCohortKey {
             source_id: "sha256:test-source".to_owned(),
             scope_json: "{}".to_owned(),

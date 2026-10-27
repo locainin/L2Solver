@@ -49,6 +49,90 @@ struct CandidateSearchResult {
 }
 
 #[test]
+fn deep_profile_reserves_the_same_normal_admission_before_its_wider_domain() -> TestResult {
+    let fixture = build_session_relative_fixture()?;
+    let normal = policy_for_profile(&fixture.case, RecoveryProfile::Normal, 64 * 1024 * 1024)?;
+    let deep = policy_for_profile(&fixture.case, RecoveryProfile::Deep, 64 * 1024 * 1024)?;
+    assert_eq!(
+        deep.relational_transform_plan, normal.relational_transform_plan,
+        "deep recovery must first use the same cohort, search, and work limits as normal"
+    );
+    let extra = deep
+        .relational_incremental_plan
+        .ok_or("deep recovery omitted its wider second domain")?;
+    assert!(extra.limits.max_sessions > normal.relational_transform_plan.limits.max_sessions);
+    assert!(
+        extra.limits.max_records_per_session
+            > normal
+                .relational_transform_plan
+                .limits
+                .max_records_per_session
+    );
+    assert!(
+        extra.limits.max_locator_candidates
+            > normal
+                .relational_transform_plan
+                .limits
+                .max_locator_candidates
+    );
+    assert!(extra.limits.max_candidates > normal.relational_transform_plan.limits.max_candidates);
+    Ok(())
+}
+
+#[test]
+fn insufficient_coordinator_work_reports_an_omission_without_charging_unread_input() -> TestResult {
+    let mut case = Case::new();
+    let first = case.add_bytes_node("frame", b"first", Vec::new(), serde_json::json!({}))?;
+    let second = case.add_bytes_node("frame", b"second", Vec::new(), serde_json::json!({}))?;
+    let plan = super::super::RecoveryPlan::default();
+    let policy = policy_for_profile(&case, RecoveryProfile::Normal, 64 * 1024 * 1024)?;
+    let executor = super::super::test_support::build_executor(&mut case, &plan, &policy)?;
+    let samples = [(first, 1_u64), (second, 2_u64)].map(|(node_id, session)| StoredSample {
+        node_id,
+        context: MessageContext {
+            source: "source".to_owned(),
+            scope: "scope".to_owned(),
+            session,
+            direction: Direction::FirstToSecond,
+        },
+        session_order: session,
+        direction_node_id: session,
+        episode_node_id: session,
+        stream_offset: 0,
+    });
+    let context = super::RelationalDiscoveryContext {
+        lane: super::RelationalLane::Incremental,
+        key: super::RelationalCohortKey {
+            source_id: "source".to_owned(),
+            scope_json: "scope".to_owned(),
+            endpoints_json: "{}".to_owned(),
+            direction: Direction::FirstToSecond,
+            framing_rule_json: "framed".to_owned(),
+            schema_json: "{}".to_owned(),
+        },
+        sample_node_ids: vec![first, second],
+        samples: samples.to_vec(),
+        sessions_available: 2,
+        omitted_sessions: 0,
+        omitted_samples: 0,
+        source_eligibility_omissions: 0,
+        input_coverage_complete: true,
+    };
+    let mut work_remaining = 1;
+    let result = super::search::prepare_cohort(
+        &executor,
+        context,
+        &policy.relational_transform_plan,
+        &mut work_remaining,
+        None,
+    )?;
+    assert_eq!(result.reason, Some("coordinator_work_limit"));
+    assert_eq!(work_remaining, 1);
+    assert!(result.outputs.is_empty());
+    Ok(())
+}
+
+#[test]
 fn screening_work_is_bounded_and_the_equivalent_rule_is_retained() -> TestResult {
     let fixture = build_session_relative_fixture()?;
     let (owned_samples, stored_samples) = fixture_samples(&fixture.case, &fixture.episode_nodes)?;
@@ -298,7 +382,7 @@ fn decode_length(bytes: &[u8], order: ByteOrder) -> Option<u64> {
     Some(value)
 }
 
-fn expected_session_relative_rule() -> RelationalTransformRule {
+pub(super) fn expected_session_relative_rule() -> RelationalTransformRule {
     RelationalTransformRule {
         seed_locator: locator(vec![0x1a, 0x73], Some(8)),
         payload_locator: locator(vec![0xb2, 0x39], None),

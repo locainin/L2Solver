@@ -1,6 +1,7 @@
 //! Bounded relational transform discovery over strict per-session record candidates
 
 mod application;
+mod history;
 mod input;
 mod publication;
 mod record_gate;
@@ -20,6 +21,10 @@ mod application_fallback_tests;
 #[cfg(test)]
 #[path = "../../../tests/workbench/recovery_relational/search_budget.rs"]
 mod search_budget_tests;
+
+#[cfg(test)]
+#[path = "../../../tests/workbench/recovery_relational/scheduler.rs"]
+mod scheduler_tests;
 
 use super::record_discovery::{RecordCohortKey, RecordCohortOrigin, RecordFrameInput};
 use super::{
@@ -65,6 +70,74 @@ struct StoredSample {
     stream_offset: usize,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct HistorySampleIdentity {
+    node_id: u64,
+    session: u64,
+    session_order: u64,
+    direction_node_id: u64,
+    episode_node_id: u64,
+    stream_offset: usize,
+}
+
+fn history_input_signature(
+    key: &RelationalCohortKey,
+    samples: &[StoredSample],
+    maximum_bytes: usize,
+) -> Option<Vec<HistorySampleIdentity>> {
+    let bytes = samples
+        .len()
+        .checked_mul(std::mem::size_of::<HistorySampleIdentity>())?;
+    if bytes > maximum_bytes {
+        return None;
+    }
+    let mut identities = Vec::new();
+    identities.try_reserve_exact(samples.len()).ok()?;
+    if identities
+        .capacity()
+        .checked_mul(std::mem::size_of::<HistorySampleIdentity>())?
+        > maximum_bytes
+    {
+        return None;
+    }
+    for sample in samples {
+        identities.push(history_sample_identity(key, sample)?);
+    }
+    Some(identities)
+}
+
+fn history_sample_identity(
+    key: &RelationalCohortKey,
+    sample: &StoredSample,
+) -> Option<HistorySampleIdentity> {
+    if sample.context.source != key.source_id
+        || sample.context.scope != key.scope_json
+        || sample.context.direction != key.direction
+    {
+        return None;
+    }
+    Some(HistorySampleIdentity {
+        node_id: sample.node_id,
+        session: sample.context.session,
+        session_order: sample.session_order,
+        direction_node_id: sample.direction_node_id,
+        episode_node_id: sample.episode_node_id,
+        stream_offset: sample.stream_offset,
+    })
+}
+
+fn history_input_matches(
+    key: &RelationalCohortKey,
+    samples: &[StoredSample],
+    expected: &[HistorySampleIdentity],
+) -> bool {
+    samples.len() == expected.len()
+        && samples
+            .iter()
+            .zip(expected)
+            .all(|(sample, identity)| history_sample_identity(key, sample) == Some(*identity))
+}
+
 #[derive(Default)]
 struct SampleCohort {
     key: Option<RelationalCohortKey>,
@@ -72,6 +145,8 @@ struct SampleCohort {
     incomplete_sessions: BTreeSet<u64>,
     omitted_sample_ids: HashSet<u64>,
     scheduled_sample_count: usize,
+    completed_sample_count: usize,
+    evidence_limit_reported: bool,
     omitted_sessions: usize,
     omitted_samples: usize,
     source_eligibility_omissions: usize,
@@ -103,6 +178,30 @@ impl SampleCohort {
 #[derive(Default)]
 pub(super) struct RelationalSampleCollections {
     cohorts: Vec<SampleCohort>,
+    incremental_cohorts: Vec<SampleCohort>,
+    histories: history::RelationalReplayHistories,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum RelationalLane {
+    Normal,
+    Incremental,
+}
+
+impl RelationalSampleCollections {
+    fn cohorts(&self, lane: RelationalLane) -> &[SampleCohort] {
+        match lane {
+            RelationalLane::Normal => &self.cohorts,
+            RelationalLane::Incremental => &self.incremental_cohorts,
+        }
+    }
+
+    const fn cohorts_mut(&mut self, lane: RelationalLane) -> &mut Vec<SampleCohort> {
+        match lane {
+            RelationalLane::Normal => &mut self.cohorts,
+            RelationalLane::Incremental => &mut self.incremental_cohorts,
+        }
+    }
 }
 
 pub(in crate::workbench::recovery_executor) struct RawRelationalRunInput {
@@ -116,6 +215,7 @@ pub(in crate::workbench::recovery_executor) struct RawRelationalRunInput {
 
 #[derive(Clone)]
 pub(super) struct RelationalDiscoveryContext {
+    lane: RelationalLane,
     key: RelationalCohortKey,
     sample_node_ids: Vec<u64>,
     samples: Vec<StoredSample>,
@@ -142,6 +242,7 @@ struct PreparedRelationalCohort {
     outputs: Vec<AppliedOutput>,
     decoded_frames: Vec<DecodedFrameOutput>,
     accepted_schemas: Vec<(usize, AcceptedRecordSchema)>,
+    published_rules: Vec<l2_workbench::protocol::RelationalTransformRule>,
     report_details_complete: bool,
     search_exhaustive_within_plan: bool,
     candidate_limit_remaining: usize,
@@ -205,6 +306,53 @@ struct CommittedRelationalOutputs {
 }
 
 impl Executor<'_> {
+    pub(super) fn omit_unsearched_incremental_cohorts(
+        &mut self,
+    ) -> Result<(), RecoveryExecutionError> {
+        let Some(plan) = &self.policy.relational_incremental_plan else {
+            return Ok(());
+        };
+        self.omissions
+            .try_reserve(self.relational_samples.incremental_cohorts.len())
+            .map_err(|source| operational("relational omission allocation failed", source))?;
+        for cohort in &mut self.relational_samples.incremental_cohorts {
+            let sample_count = cohort.active_samples().count();
+            if sample_count <= cohort.completed_sample_count || cohort.evidence_limit_reported {
+                continue;
+            }
+            let source_id = cohort
+                .key
+                .as_ref()
+                .ok_or(RecoveryError::InvariantFailure)?
+                .source_id
+                .clone();
+            let sessions_available = cohort.active_session_ids().len();
+            self.omissions
+                .push(RecoveryOmission::RelationalTransformAnalysis {
+                    source_id,
+                    sessions_available,
+                    omitted_sessions: cohort.omitted_sessions,
+                    omitted_samples: cohort.omitted_samples,
+                    omitted_rules: 0,
+                    candidate_limit_remaining: plan.limits.max_candidates,
+                    locator_candidate_limit_remaining: plan
+                        .limits
+                        .max_locator_candidates
+                        .saturating_mul(2),
+                    work_bytes_remaining: plan
+                        .limits
+                        .max_work_bytes
+                        .min(self.coordinator.remaining_work_bytes()),
+                    input_coverage_complete: cohort.input_coverage_complete,
+                    search_exhaustive_within_plan: false,
+                    report_details_complete: false,
+                    reason: Some("incremental_evidence_limit"),
+                });
+            cohort.evidence_limit_reported = true;
+        }
+        Ok(())
+    }
+
     fn relational_session_omission(
         &mut self,
         source_id: &str,
@@ -212,8 +360,8 @@ impl Executor<'_> {
         omitted_samples: usize,
         input_coverage_complete: bool,
         reason: &'static str,
+        limits: l2_workbench::protocol::RelationalTransformLimits,
     ) -> Result<(), RecoveryExecutionError> {
-        let limits = self.policy.relational_transform_plan.limits;
         self.omissions
             .try_reserve(1)
             .map_err(|source| operational("relational omission allocation failed", source))?;
@@ -235,14 +383,20 @@ impl Executor<'_> {
         Ok(())
     }
 
-    pub(super) fn flush_relational_cohorts(&mut self) -> Result<bool, RecoveryExecutionError> {
+    pub(super) fn flush_relational_cohorts(
+        &mut self,
+        lane: RelationalLane,
+    ) -> Result<bool, RecoveryExecutionError> {
         let mut scheduled_any = false;
-        let task = RecoveryTask::RelationalTransformDiscovery;
-        for cohort_index in 0..self.relational_samples.cohorts.len() {
+        let task = match lane {
+            RelationalLane::Normal => RecoveryTask::RelationalTransformDiscovery,
+            RelationalLane::Incremental => RecoveryTask::RelationalTransformDiscoveryIncremental,
+        };
+        for cohort_index in 0..self.relational_samples.cohorts(lane).len() {
             let (sample_node_ids, context) = {
                 let cohort = self
                     .relational_samples
-                    .cohorts
+                    .cohorts_mut(lane)
                     .get_mut(cohort_index)
                     .ok_or(RecoveryError::InvariantFailure)?;
                 let key = cohort.key.clone().ok_or(RecoveryError::InvariantFailure)?;
@@ -272,6 +426,7 @@ impl Executor<'_> {
                 (
                     node_ids.clone(),
                     RelationalDiscoveryContext {
+                        lane,
                         key,
                         sample_node_ids: node_ids,
                         samples: active,
@@ -328,47 +483,37 @@ impl Executor<'_> {
             .flat_map(|context| context.sample_node_ids.iter().copied())
             .collect::<Vec<_>>();
         let mut work_remaining = self.coordinator.remaining_work_bytes();
-        let base_plan = self.policy.relational_transform_plan.clone();
-        let job = self.job.as_ref().map(|progress| &progress.job);
-        let prepared =
-            search::prepare_contexts(self, contexts, &base_plan, &mut work_remaining, job)?;
+        let (task, base_plan) = self.relational_task_plan(candidate_id)?;
+        let mut histories = std::mem::take(&mut self.relational_samples.histories);
+        let prepared = {
+            let job = self.job.as_ref().map(|progress| &progress.job);
+            search::prepare_contexts(
+                self,
+                contexts,
+                &base_plan,
+                &mut work_remaining,
+                &mut histories,
+                job,
+            )
+        };
+        self.relational_samples.histories = histories;
+        let prepared = prepared?;
         let total_work = self
             .coordinator
             .remaining_work_bytes()
             .checked_sub(work_remaining)
             .ok_or(RecoveryError::InvariantFailure)?;
-        if !self.charge_work(
-            candidate_id,
-            &RecoveryTask::RelationalTransformDiscovery,
-            &origins,
-            total_work,
-        )? {
+        if !self.charge_work(candidate_id, &task, &origins, total_work)? {
+            self.discard_unpublished_histories(&prepared);
             return Ok(());
         }
-        let report_bytes = prepared.iter().try_fold(0_usize, |total, cohort| {
-            total.checked_add(cohort.report_bytes.len())
-        });
-        let report_bytes = report_bytes
-            .ok_or_else(|| invalid_policy("relational report byte count overflowed"))?;
-        let output_bytes = prepared
-            .iter()
-            .flat_map(|cohort| &cohort.outputs)
-            .try_fold(report_bytes, |total, output| {
-                total.checked_add(output.value.bytes.len())
-            })
-            .and_then(|total| {
-                prepared
-                    .iter()
-                    .flat_map(|cohort| &cohort.decoded_frames)
-                    .try_fold(total, |total, frame| total.checked_add(frame.bytes.len()))
-            })
-            .ok_or_else(|| invalid_policy("relational output byte count overflowed"))?;
         if !self.check_output(
             candidate_id,
-            &RecoveryTask::RelationalTransformDiscovery,
+            &task,
             &origins,
-            output_bytes,
+            prepared_output_bytes(&prepared)?,
         )? {
+            self.discard_unpublished_histories(&prepared);
             return Ok(());
         }
         self.omissions
@@ -377,6 +522,7 @@ impl Executor<'_> {
         let committed = self.case_transaction_and_finish(candidate_id, |case, identities| {
             publication::publish_prepared_cohorts(case, identities, &prepared)
         })?;
+        self.record_committed_cohorts(&prepared);
         self.record_relational_omissions(&prepared);
         for output_node in committed.output_node_ids {
             self.enqueue_root(output_node, OUTPUT_KIND)?;
@@ -388,6 +534,68 @@ impl Executor<'_> {
             self.enqueue_relational_record_discovery(key, frames)?;
         }
         Ok(())
+    }
+
+    fn relational_task_plan(
+        &self,
+        candidate_id: RecoveryCandidateId,
+    ) -> Result<
+        (
+            RecoveryTask,
+            l2_workbench::protocol::RelationalTransformPlan,
+        ),
+        RecoveryExecutionError,
+    > {
+        let task = self
+            .coordinator
+            .candidate(candidate_id)
+            .ok_or(RecoveryError::UnknownCandidate { id: candidate_id })?
+            .task()
+            .clone();
+        let base_plan = match task {
+            RecoveryTask::RelationalTransformDiscovery => {
+                self.policy.relational_transform_plan.clone()
+            }
+            RecoveryTask::RelationalTransformDiscoveryIncremental => self
+                .policy
+                .relational_incremental_plan
+                .clone()
+                .ok_or_else(|| invalid_policy("incremental relational plan is unavailable"))?,
+            _ => return Err(RecoveryError::InvariantFailure.into()),
+        };
+        Ok((task, base_plan))
+    }
+
+    fn discard_unpublished_histories(&mut self, prepared: &[PreparedRelationalCohort]) {
+        for cohort in prepared {
+            self.relational_samples
+                .histories
+                .discard_context(&cohort.context);
+        }
+    }
+
+    fn record_committed_cohorts(&mut self, prepared: &[PreparedRelationalCohort]) {
+        // Only graph-committed rules can suppress their later exact replay
+        for cohort in prepared {
+            if let Some(stored) = self
+                .relational_samples
+                .cohorts_mut(cohort.context.lane)
+                .iter_mut()
+                .find(|stored| stored.key.as_ref() == Some(&cohort.context.key))
+            {
+                stored.completed_sample_count = stored
+                    .completed_sample_count
+                    .max(cohort.context.samples.len());
+            }
+            if let Some(history) = self.relational_samples.histories.published_history(
+                &cohort.context,
+                self.policy.relational_transform_plan.limits.max_total_bytes,
+            ) {
+                for rule in &cohort.published_rules {
+                    history.register_published_rule(rule);
+                }
+            }
+        }
     }
 
     fn record_relational_omissions(&mut self, prepared: &[PreparedRelationalCohort]) {
@@ -428,6 +636,49 @@ impl Executor<'_> {
                 });
         }
     }
+}
+
+fn prepared_output_bytes(
+    prepared: &[PreparedRelationalCohort],
+) -> Result<usize, RecoveryExecutionError> {
+    let report_bytes = prepared
+        .iter()
+        .try_fold(0_usize, |total, cohort| {
+            total.checked_add(cohort.report_bytes.len())
+        })
+        .ok_or_else(|| invalid_policy("relational report byte count overflowed"))?;
+    prepared
+        .iter()
+        .flat_map(|cohort| &cohort.outputs)
+        .try_fold(report_bytes, |total, output| {
+            total.checked_add(output.value.bytes.len())
+        })
+        .and_then(|total| {
+            prepared
+                .iter()
+                .flat_map(|cohort| &cohort.decoded_frames)
+                .try_fold(total, |total, frame| total.checked_add(frame.bytes.len()))
+        })
+        .ok_or_else(|| invalid_policy("relational output byte count overflowed"))
+}
+
+fn admit_sample_views(
+    case: &l2_workbench::evidence::Case,
+    normal: Option<&mut SampleCohort>,
+    incremental: Option<(
+        &mut SampleCohort,
+        l2_workbench::protocol::RelationalTransformLimits,
+    )>,
+    incoming: &[StoredSample],
+    normal_limits: l2_workbench::protocol::RelationalTransformLimits,
+) -> Result<(), RecoveryExecutionError> {
+    if let Some(normal) = normal {
+        append_framed_samples(case, normal, incoming, normal_limits)?;
+    }
+    if let Some((incremental, limits)) = incremental {
+        append_framed_samples(case, incremental, incoming, limits)?;
+    }
+    Ok(())
 }
 
 fn append_framed_samples(

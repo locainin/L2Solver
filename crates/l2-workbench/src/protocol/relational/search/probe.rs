@@ -13,11 +13,19 @@ use crate::protocol::{
 };
 use std::collections::BTreeMap;
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) struct PrefixProbeScore {
     pub(super) novelty: usize,
     pub(super) work_bytes: usize,
-    pub(super) complete: bool,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum PrefixProbeOutcome {
+    Scored(PrefixProbeScore),
+    Contradicted,
+    NotApplicable,
+    WorkLimited { work_bytes: usize },
+    Incomplete { work_bytes: usize },
 }
 
 /// Bound the transform work of one candidate across every selected input message
@@ -65,7 +73,8 @@ pub(super) fn prepare_candidate_prefix<'a>(
     discovery_groups: &[SessionGroup],
     rule: &RelationalTransformRule,
     limits: RelationalTransformLimits,
-) -> Result<Option<replay::PreparedPrefixDiscovery<'a>>, RelationalTransformError> {
+) -> Result<replay::PrefixPreparation<replay::PreparedPrefixDiscovery<'a>>, RelationalTransformError>
+{
     let maximum_prefix_bytes = ObservationLimits::default()
         .max_prefix_offset
         .saturating_add(1);
@@ -84,19 +93,9 @@ pub(super) fn score_prepared_candidate_prefix(
     prepared: replay::ReadyPrefixDiscovery<'_>,
     limits: RelationalTransformLimits,
     maximum_work_bytes: usize,
-) -> Result<Option<PrefixProbeScore>, RelationalTransformError> {
+) -> Result<PrefixProbeOutcome, RelationalTransformError> {
     let observation_limits = ObservationLimits::default();
-    let preview = replay::transform_prepared_prefix(samples, prepared);
-    let preview = match preview {
-        Ok(Some(preview)) => preview,
-        Ok(None)
-        | Err(
-            RelationalTransformError::RuleContradicted(_) | RelationalTransformError::RuleWorkLimit,
-        ) => {
-            return Ok(None);
-        }
-        Err(error) => return Err(error),
-    };
+    let preview = replay::transform_prepared_prefix(samples, prepared)?;
 
     let prefix_length = preview
         .messages
@@ -109,11 +108,16 @@ pub(super) fn score_prepared_candidate_prefix(
         observation_limits.max_region_ranges,
     )?;
     if ranges.is_empty() {
-        return Ok(Some(PrefixProbeScore {
-            novelty: 0,
-            work_bytes: preview.work_bytes,
-            complete: ranges_complete,
-        }));
+        return Ok(if ranges_complete {
+            PrefixProbeOutcome::Scored(PrefixProbeScore {
+                novelty: 0,
+                work_bytes: preview.work_bytes,
+            })
+        } else {
+            PrefixProbeOutcome::Incomplete {
+                work_bytes: preview.work_bytes,
+            }
+        });
     }
 
     score_prefix_observations(
@@ -131,7 +135,7 @@ fn score_prefix_observations(
     prefix_length: usize,
     ranges_complete: bool,
     maximum_work_bytes: usize,
-) -> Result<Option<PrefixProbeScore>, RelationalTransformError> {
+) -> Result<PrefixProbeOutcome, RelationalTransformError> {
     let per_pass_input_bytes = prefix_length.checked_mul(preview.messages.len()).ok_or(
         RelationalTransformError::InvalidPlan("prefix probe observation input size overflowed"),
     )?;
@@ -143,11 +147,9 @@ fn score_prefix_observations(
             ))?;
     let work_after_transform = maximum_work_bytes.saturating_sub(preview.work_bytes);
     if both_passes_input_bytes > work_after_transform {
-        return Ok(Some(PrefixProbeScore {
-            novelty: 0,
+        return Ok(PrefixProbeOutcome::WorkLimited {
             work_bytes: preview.work_bytes,
-            complete: false,
-        }));
+        });
     }
     let observation_units = work_after_transform - both_passes_input_bytes;
     let raw = observe_prefix_stage(
@@ -178,18 +180,16 @@ fn score_prefix_observations(
             "prefix probe work accounting overflowed",
         ))?;
 
-    let complete = ranges_complete && raw.coverage.complete && output.coverage.complete;
-    let novelty = if complete {
-        novel_repeated_bytes(&raw, &output)
+    if raw.coverage.omitted_work_units > 0 || output.coverage.omitted_work_units > 0 {
+        Ok(PrefixProbeOutcome::WorkLimited { work_bytes })
+    } else if !ranges_complete || !raw.coverage.complete || !output.coverage.complete {
+        Ok(PrefixProbeOutcome::Incomplete { work_bytes })
     } else {
-        0
-    };
-
-    Ok(Some(PrefixProbeScore {
-        novelty,
-        work_bytes,
-        complete,
-    }))
+        Ok(PrefixProbeOutcome::Scored(PrefixProbeScore {
+            novelty: novel_repeated_bytes(&raw, &output),
+            work_bytes,
+        }))
+    }
 }
 
 fn observe_prefix_stage(

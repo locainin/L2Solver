@@ -15,6 +15,9 @@ use l2_workbench::{
 };
 use std::error::Error;
 
+#[path = "relational/search/history.rs"]
+mod history;
+
 const SEED_MARKER: u8 = 0x31;
 const PAYLOAD_MARKER: u8 = 0x82;
 const DECOY_MARKER: u8 = 0xee;

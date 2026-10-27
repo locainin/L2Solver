@@ -85,6 +85,9 @@ fn add_cohort_and_membership_fields(
             ),
         ),
     ]);
+    if context.lane == super::RelationalLane::Incremental {
+        fields.insert("search_lane".to_owned(), json!("incremental"));
+    }
 }
 
 fn add_search_counter_fields(fields: &mut Map<String, Value>, report: &RelationalTransformReport) {
@@ -313,7 +316,7 @@ pub(super) fn insufficient_sessions_report(
     context: &RelationalDiscoveryContext,
     plan: &RelationalTransformPlan,
 ) -> Value {
-    json!({
+    let mut report = json!({
         "version":REPORT_VERSION,
         "case_scope":"current_case",
         "claim_scope":"bounded_hypothesis_space",
@@ -332,7 +335,13 @@ pub(super) fn insufficient_sessions_report(
         "work_bytes_remaining":plan.limits.max_work_bytes,
         "search_exhaustive_within_plan":null,
         "retained_rules":[],
-    })
+    });
+    if context.lane == super::RelationalLane::Incremental
+        && let Some(fields) = report.as_object_mut()
+    {
+        fields.insert("search_lane".to_owned(), json!("incremental"));
+    }
+    report
 }
 
 pub(super) fn budget_report(
@@ -340,7 +349,7 @@ pub(super) fn budget_report(
     plan: &RelationalTransformPlan,
     reason: &'static str,
 ) -> Value {
-    json!({
+    let mut report = json!({
         "version":REPORT_VERSION,
         "case_scope":"current_case",
         "claim_scope":"bounded_hypothesis_space",
@@ -353,5 +362,11 @@ pub(super) fn budget_report(
         "work_bytes_remaining":plan.limits.max_work_bytes,
         "search_exhaustive_within_plan":false,
         "retained_rules":[],
-    })
+    });
+    if context.lane == super::RelationalLane::Incremental
+        && let Some(fields) = report.as_object_mut()
+    {
+        fields.insert("search_lane".to_owned(), json!("incremental"));
+    }
+    report
 }

@@ -165,6 +165,7 @@ pub(super) fn task_has_origin_context(task: &RecoveryTask) -> bool {
             | RecoveryTask::MaterializeFraming(_)
             | RecoveryTask::RecordDiscovery
             | RecoveryTask::RelationalTransformDiscovery
+            | RecoveryTask::RelationalTransformDiscoveryIncremental
             | RecoveryTask::AssembleRecords(_)
     ) || matches!(task, RecoveryTask::Transform(recipe) if crate::derivation::has_selected_input_reference(recipe))
 }

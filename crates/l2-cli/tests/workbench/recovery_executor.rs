@@ -4656,6 +4656,7 @@ fn policy() -> RecoveryExecutionPolicy {
         record_schema_proposal_limits: l2_workbench::protocol::RecordSchemaProposalLimits::default(
         ),
         relational_transform_plan: l2_workbench::protocol::RelationalTransformPlan::default(),
+        relational_incremental_plan: None,
         transform_exploration: TransformExplorationBudget {
             proposal_budget: TransformProposalBudget {
                 max_candidates: 7,

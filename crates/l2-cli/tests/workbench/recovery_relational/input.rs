@@ -59,6 +59,183 @@ fn multiple_runs_in_one_session_are_not_joined_across_a_gap() -> Result<(), Box<
 }
 
 #[test]
+fn normal_and_deep_admit_sessions_independently_at_record_limit() -> Result<(), Box<dyn Error>> {
+    let (mut case, run, key) = input(true)?;
+    let second = case.add_bytes_node("tcp_byte_run", b"second", Vec::new(), json!({}))?;
+    let third = case.add_bytes_node("tcp_byte_run", b"third", Vec::new(), json!({}))?;
+    let stored = |node_id, session| StoredSample {
+        node_id,
+        context: MessageContext {
+            source: key.source_id.clone(),
+            scope: key.scope_json.clone(),
+            session,
+            direction: key.direction,
+        },
+        session_order: session,
+        direction_node_id: run.direction_node_id,
+        episode_node_id: session,
+        stream_offset: 0,
+    };
+    let incoming = [
+        stored(run.node_id, run.episode_node_id),
+        stored(second, run.episode_node_id),
+        stored(third, run.episode_node_id + 1),
+    ];
+    let mut normal = SampleCohort::new(key.clone());
+    let mut deep = SampleCohort::new(key);
+    let normal_limits = l2_workbench::protocol::RelationalTransformLimits {
+        max_sessions: 1,
+        max_records_per_session: 1,
+        ..Default::default()
+    };
+    let deep_limits = l2_workbench::protocol::RelationalTransformLimits {
+        max_sessions: 2,
+        max_records_per_session: 2,
+        ..normal_limits
+    };
+
+    super::super::admit_sample_views(
+        &case,
+        Some(&mut normal),
+        Some((&mut deep, deep_limits)),
+        &incoming,
+        normal_limits,
+    )?;
+
+    assert_eq!(
+        normal
+            .active_samples()
+            .map(|sample| sample.node_id)
+            .collect::<Vec<_>>(),
+        vec![third]
+    );
+    assert_eq!(normal.omitted_sessions, 1);
+    assert_eq!(normal.omitted_samples, 2);
+    assert_eq!(
+        deep.active_samples()
+            .map(|sample| sample.node_id)
+            .collect::<Vec<_>>(),
+        vec![run.node_id, second, third]
+    );
+    assert_eq!(deep.omitted_sessions, 0);
+    assert_eq!(deep.omitted_samples, 0);
+    Ok(())
+}
+
+#[test]
+fn normal_and_deep_admit_cohorts_at_their_own_limits() -> Result<(), Box<dyn Error>> {
+    let (mut case, _, key) = input(true)?;
+    let plan = super::super::super::RecoveryPlan::default();
+    let mut policy = super::super::super::normal_policy(&case)?;
+    policy.relational_transform_plan.limits.max_cohorts = 1;
+    let mut extra = policy.relational_transform_plan.clone();
+    extra.limits.max_cohorts = 2;
+    policy.relational_incremental_plan = Some(extra);
+    let mut executor =
+        super::super::super::test_support::build_executor(&mut case, &plan, &policy)?;
+    let mut other = key.clone();
+    other.source_id = "other".to_owned();
+
+    assert_eq!(
+        executor.relational_cohort_index(key.clone(), 1, RelationalLane::Normal)?,
+        Some(0)
+    );
+    assert_eq!(
+        executor.relational_cohort_index(other.clone(), 1, RelationalLane::Normal)?,
+        None
+    );
+    assert_eq!(
+        executor.relational_cohort_index(key, 1, RelationalLane::Incremental)?,
+        Some(0)
+    );
+    assert_eq!(
+        executor.relational_cohort_index(other, 1, RelationalLane::Incremental)?,
+        Some(1)
+    );
+    assert_eq!(
+        executor.omissions.len(),
+        1,
+        "only the normal limit should omit a cohort"
+    );
+    Ok(())
+}
+
+#[test]
+fn replay_history_identity_requires_matching_source_and_record_provenance()
+-> Result<(), Box<dyn Error>> {
+    let (_, run, key) = input(true)?;
+    let sample = StoredSample {
+        node_id: run.node_id,
+        context: MessageContext {
+            source: key.source_id.clone(),
+            scope: key.scope_json.clone(),
+            session: run.episode_node_id,
+            direction: key.direction,
+        },
+        session_order: run.session_order,
+        direction_node_id: run.direction_node_id,
+        episode_node_id: run.episode_node_id,
+        stream_offset: run.stream_offset,
+    };
+    let baseline =
+        super::super::history_input_signature(&key, std::slice::from_ref(&sample), usize::MAX)
+            .ok_or("sample should fit the history limit")?;
+    let mut changed_offset = sample.clone();
+    changed_offset.stream_offset += 1;
+    let changed = super::super::history_input_signature(&key, &[changed_offset], usize::MAX)
+        .ok_or("changed sample should fit the history limit")?;
+    assert_ne!(baseline, changed);
+    let mut changed_source = sample.clone();
+    changed_source.context.source = "other source".to_owned();
+    assert!(super::super::history_input_signature(&key, &[changed_source], usize::MAX).is_none());
+    assert!(super::super::history_input_signature(&key, &[sample], 0).is_none());
+    Ok(())
+}
+
+#[test]
+fn evidence_stop_reports_unsearched_incremental_cohorts_once() -> Result<(), Box<dyn Error>> {
+    let (mut case, run, key) = input(true)?;
+    let other = case.add_bytes_node("tcp_byte_run", b"other", Vec::new(), json!({}))?;
+    let plan = super::super::super::RecoveryPlan::default();
+    let mut policy = super::super::super::normal_policy(&case)?;
+    policy.relational_incremental_plan = Some(policy.relational_transform_plan.clone());
+    let mut executor =
+        super::super::super::test_support::build_executor(&mut case, &plan, &policy)?;
+    let mut cohort = SampleCohort::new(key.clone());
+    for (node_id, session) in [(run.node_id, 1), (other, 2)] {
+        cohort.samples.push(StoredSample {
+            node_id,
+            context: MessageContext {
+                source: key.source_id.clone(),
+                scope: key.scope_json.clone(),
+                session,
+                direction: key.direction,
+            },
+            session_order: session,
+            direction_node_id: session,
+            episode_node_id: session,
+            stream_offset: 0,
+        });
+    }
+    executor.relational_samples.incremental_cohorts.push(cohort);
+    executor.omit_unsearched_incremental_cohorts()?;
+    executor.omit_unsearched_incremental_cohorts()?;
+    assert_eq!(executor.omissions.len(), 1);
+    assert!(matches!(
+        executor.omissions.first(),
+        Some(
+            super::super::RecoveryOmission::RelationalTransformAnalysis {
+                sessions_available: 2,
+                search_exhaustive_within_plan: false,
+                reason: Some("incremental_evidence_limit"),
+                ..
+            }
+        )
+    ));
+    Ok(())
+}
+
+#[test]
 fn fully_covered_native_http_message_skips_redundant_raw_search() -> Result<(), Box<dyn Error>> {
     let (case, run, key) = native_http_input(b"object bytes", None)?;
 

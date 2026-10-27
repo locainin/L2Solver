@@ -996,6 +996,7 @@ fn task_label(task: &RecoveryTask) -> &'static str {
         RecoveryTask::MaterializeFraming(_) => "materialize_framing",
         RecoveryTask::RecordDiscovery => "record_discovery",
         RecoveryTask::RelationalTransformDiscovery => "relational_discovery",
+        RecoveryTask::RelationalTransformDiscoveryIncremental => "relational_discovery_incremental",
         RecoveryTask::AssembleRecords(_) => "assemble_records",
         RecoveryTask::EmbeddedDiscovery => "embedded_discovery",
         RecoveryTask::StructuralValidation => "structural_validation",

@@ -1,5 +1,5 @@
 use super::super::model::{RelationalSha256CounterXor, RelationalTransformError};
-use super::probe::PrefixProbeScore;
+use super::probe::{PrefixProbeOutcome, PrefixProbeScore};
 use crate::derivation::{CounterByteOrder, CounterWidth, SeedCounterOrder};
 use std::{collections::HashMap, mem::size_of};
 
@@ -55,22 +55,22 @@ impl PrefixProbeCache {
         selection: Option<PrefixSelectionIdentity>,
         operation: RelationalSha256CounterXor,
         compute: F,
-    ) -> Result<(Option<PrefixProbeScore>, bool), RelationalTransformError>
+    ) -> Result<(PrefixProbeOutcome, bool), RelationalTransformError>
     where
-        F: FnOnce() -> Result<Option<PrefixProbeScore>, RelationalTransformError>,
+        F: FnOnce() -> Result<PrefixProbeOutcome, RelationalTransformError>,
     {
         let key = selection
             .and_then(|selection| self.intern_selection(selection))
             .map(|selection_id| score_key(selection_id, operation));
         if let Some(score) = key.and_then(|key| self.score(key)) {
-            return Ok((Some(score), true));
+            return Ok((PrefixProbeOutcome::Scored(score), true));
         }
         // A missing entry or full cache always takes the ordinary scoring path
-        let score = compute()?;
-        if let (Some(key), Some(score)) = (key, score) {
+        let outcome = compute()?;
+        if let (Some(key), PrefixProbeOutcome::Scored(score)) = (key, outcome) {
             self.retain_score(key, score);
         }
-        Ok((score, false))
+        Ok((outcome, false))
     }
 
     fn intern_selection(&mut self, selection: PrefixSelectionIdentity) -> Option<usize> {
@@ -98,8 +98,7 @@ impl PrefixProbeCache {
     }
 
     fn retain_score(&mut self, key: PrefixProbeScoreKey, score: PrefixProbeScore) {
-        // A short work allowance must not become a reusable negative result
-        if !score.complete || self.scores.contains_key(&key) {
+        if self.scores.contains_key(&key) {
             return;
         }
         let Some(retained_bytes) = map_entry_budget::<(PrefixProbeScoreKey, PrefixProbeScore)>()

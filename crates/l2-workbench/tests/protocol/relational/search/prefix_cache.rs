@@ -1,7 +1,7 @@
 use super::{PrefixProbeCache, PrefixSelectionIdentity, PrefixSessionSelection};
 use crate::derivation::{CounterByteOrder, CounterWidth, SeedCounterOrder};
 use crate::protocol::relational::model::{RelationalSha256CounterXor, RelationalTransformError};
-use crate::protocol::relational::search::probe::PrefixProbeScore;
+use crate::protocol::relational::search::probe::{PrefixProbeOutcome, PrefixProbeScore};
 
 #[test]
 fn scoring_falls_back_when_selection_or_score_storage_is_full()
@@ -21,10 +21,13 @@ fn scoring_falls_back_when_selection_or_score_storage_is_full()
             let (score, reused) =
                 cache.score_or_compute(Some(selection.clone()), operation(), || {
                     attempts += 1;
-                    Ok(Some(complete_score()))
+                    Ok(PrefixProbeOutcome::Scored(complete_score()))
                 })?;
             assert!(!reused);
-            assert_eq!(score.map(|score| score.novelty), Some(2));
+            assert!(matches!(
+                score,
+                PrefixProbeOutcome::Scored(PrefixProbeScore { novelty: 2, .. })
+            ));
         }
         assert_eq!(
             attempts, 2,
@@ -42,28 +45,27 @@ fn incomplete_scores_are_recomputed_and_complete_scores_are_reused()
     let mut attempts = 0;
     let (score, reused) = cache.score_or_compute(Some(selection.clone()), operation(), || {
         attempts += 1;
-        Ok(Some(PrefixProbeScore {
-            novelty: 0,
-            work_bytes: 1,
-            complete: false,
-        }))
+        Ok(PrefixProbeOutcome::WorkLimited { work_bytes: 1 })
     })?;
     assert!(!reused);
-    assert!(score.is_some_and(|score| !score.complete));
+    assert_eq!(score, PrefixProbeOutcome::WorkLimited { work_bytes: 1 });
 
     let (score, reused) = cache.score_or_compute(Some(selection.clone()), operation(), || {
         attempts += 1;
-        Ok(Some(complete_score()))
+        Ok(PrefixProbeOutcome::Scored(complete_score()))
     })?;
     assert!(!reused);
-    assert!(score.is_some_and(|score| score.complete));
+    assert_eq!(score, PrefixProbeOutcome::Scored(complete_score()));
 
     let (score, reused) = cache.score_or_compute(Some(selection), operation(), || {
         attempts += 1;
-        Ok(None)
+        Ok(PrefixProbeOutcome::NotApplicable)
     })?;
     assert!(reused);
-    assert_eq!(score.map(|score| score.novelty), Some(2));
+    assert!(matches!(
+        score,
+        PrefixProbeOutcome::Scored(PrefixProbeScore { novelty: 2, .. })
+    ));
     assert_eq!(attempts, 2);
     Ok(())
 }
@@ -72,20 +74,52 @@ fn incomplete_scores_are_recomputed_and_complete_scores_are_reused()
 fn empty_or_failed_computations_are_never_cached() -> Result<(), RelationalTransformError> {
     let mut cache = PrefixProbeCache::new(usize::MAX);
     let selection = selection(0, 3);
-    let (score, reused) =
-        cache.score_or_compute(Some(selection.clone()), operation(), || Ok(None))?;
+    let (score, reused) = cache.score_or_compute(Some(selection.clone()), operation(), || {
+        Ok(PrefixProbeOutcome::NotApplicable)
+    })?;
     assert!(!reused);
-    assert!(score.is_none());
+    assert_eq!(score, PrefixProbeOutcome::NotApplicable);
 
     let error = cache.score_or_compute(Some(selection.clone()), operation(), || {
         Err(RelationalTransformError::InvalidPlan("test failure"))
     });
     assert!(error.is_err());
 
-    let (score, reused) =
-        cache.score_or_compute(Some(selection), operation(), || Ok(Some(complete_score())))?;
+    let (score, reused) = cache.score_or_compute(Some(selection), operation(), || {
+        Ok(PrefixProbeOutcome::Scored(complete_score()))
+    })?;
     assert!(!reused);
-    assert_eq!(score.map(|score| score.novelty), Some(2));
+    assert!(matches!(
+        score,
+        PrefixProbeOutcome::Scored(PrefixProbeScore { novelty: 2, .. })
+    ));
+    Ok(())
+}
+
+#[test]
+fn rejected_unavailable_and_incomplete_outcomes_never_replace_a_complete_score()
+-> Result<(), RelationalTransformError> {
+    let mut cache = PrefixProbeCache::new(usize::MAX);
+    let selection = selection(0, 3);
+    for expected in [
+        PrefixProbeOutcome::Contradicted,
+        PrefixProbeOutcome::NotApplicable,
+        PrefixProbeOutcome::Incomplete { work_bytes: 5 },
+        PrefixProbeOutcome::WorkLimited { work_bytes: 7 },
+    ] {
+        let (outcome, reused) =
+            cache.score_or_compute(Some(selection.clone()), operation(), || Ok(expected))?;
+        assert_eq!(outcome, expected);
+        assert!(
+            !reused,
+            "non-score outcomes must not be reused as complete observations"
+        );
+    }
+    let (outcome, reused) = cache.score_or_compute(Some(selection), operation(), || {
+        Ok(PrefixProbeOutcome::Scored(complete_score()))
+    })?;
+    assert!(!reused);
+    assert_eq!(outcome, PrefixProbeOutcome::Scored(complete_score()));
     Ok(())
 }
 
@@ -120,13 +154,15 @@ fn operation_fields_each_separate_cached_scores() -> Result<(), RelationalTransf
     for variant in variants {
         let (score, reused) = cache.score_or_compute(Some(selection.clone()), variant, || {
             attempts += 1;
-            Ok(Some(complete_score()))
+            Ok(PrefixProbeOutcome::Scored(complete_score()))
         })?;
         assert!(!reused);
-        assert!(score.is_some());
+        assert!(matches!(score, PrefixProbeOutcome::Scored(_)));
     }
     assert_eq!(attempts, variants.len());
-    let (_, reused) = cache.score_or_compute(Some(selection), baseline, || Ok(None))?;
+    let (_, reused) = cache.score_or_compute(Some(selection), baseline, || {
+        Ok(PrefixProbeOutcome::NotApplicable)
+    })?;
     assert!(reused);
     Ok(())
 }
@@ -137,16 +173,18 @@ fn full_cache_keeps_existing_scores_and_declines_new_entries()
     let mut cache = PrefixProbeCache::new(usize::MAX);
     let first = selection(0, 3);
     let (_, reused) = cache.score_or_compute(Some(first.clone()), operation(), || {
-        Ok(Some(complete_score()))
+        Ok(PrefixProbeOutcome::Scored(complete_score()))
     })?;
     assert!(!reused);
     cache.maximum_bytes = cache.retained_bytes;
 
     let (_, reused) = cache.score_or_compute(Some(selection(0, 4)), operation(), || {
-        Ok(Some(complete_score()))
+        Ok(PrefixProbeOutcome::Scored(complete_score()))
     })?;
     assert!(!reused);
-    let (_, reused) = cache.score_or_compute(Some(first), operation(), || Ok(None))?;
+    let (_, reused) = cache.score_or_compute(Some(first), operation(), || {
+        Ok(PrefixProbeOutcome::NotApplicable)
+    })?;
     assert!(reused);
     Ok(())
 }
@@ -178,11 +216,14 @@ fn ordered_training_samples_and_ranges_each_separate_cached_scores()
         reversed,
     ];
     for variant in variants {
-        let (_, reused) =
-            cache.score_or_compute(Some(variant), operation(), || Ok(Some(complete_score())))?;
+        let (_, reused) = cache.score_or_compute(Some(variant), operation(), || {
+            Ok(PrefixProbeOutcome::Scored(complete_score()))
+        })?;
         assert!(!reused);
     }
-    let (_, reused) = cache.score_or_compute(Some(first), operation(), || Ok(None))?;
+    let (_, reused) = cache.score_or_compute(Some(first), operation(), || {
+        Ok(PrefixProbeOutcome::NotApplicable)
+    })?;
     assert!(reused);
     Ok(())
 }
@@ -208,7 +249,6 @@ fn complete_score() -> PrefixProbeScore {
     PrefixProbeScore {
         novelty: 2,
         work_bytes: 4,
-        complete: true,
     }
 }
 

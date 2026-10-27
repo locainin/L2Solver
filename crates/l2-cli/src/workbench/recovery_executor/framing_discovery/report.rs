@@ -116,7 +116,7 @@ impl Executor<'_> {
                     )?;
                 }
                 // Raw streams are tested before framing hypotheses create graph outputs
-                self.flush_relational_cohorts()?;
+                self.flush_relational_cohorts(super::super::relational::RelationalLane::Normal)?;
             }
             if self.plan.discover_framing {
                 self.enqueue_framing_cohorts(&plan)?;

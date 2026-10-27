@@ -1532,6 +1532,114 @@ fn default_recovery_learns_and_applies_session_relative_record_transform() -> Te
     assert_session_relative_recovery(&case, &plaintext, &episode_nodes, &summary)
 }
 
+#[test]
+fn deep_recovery_preserves_normal_exact_artifact_and_source_provenance() -> TestResult<()> {
+    let normal_fixture = build_session_relative_fixture()?;
+    let mut normal_case = normal_fixture.case;
+    let normal_summary = recover_case_with_job(
+        &mut normal_case,
+        RecoveryProfile::Normal,
+        64 * 1024 * 1024,
+        None,
+    )?;
+    assert_session_relative_recovery(
+        &normal_case,
+        &normal_fixture.plaintext,
+        &normal_fixture.episode_nodes,
+        &normal_summary,
+    )?;
+    let (_, _, normal_output) =
+        select_session_relative_report(&normal_case, &normal_fixture.plaintext)
+            .ok_or("normal recovery omitted the exact artifact")?;
+
+    let deep_fixture = build_session_relative_fixture()?;
+    let mut deep_case = deep_fixture.case;
+    let deep_summary = recover_case_with_job(
+        &mut deep_case,
+        RecoveryProfile::Deep,
+        64 * 1024 * 1024,
+        None,
+    )?;
+    assert_session_relative_recovery(
+        &deep_case,
+        &deep_fixture.plaintext,
+        &deep_fixture.episode_nodes,
+        &deep_summary,
+    )?;
+    let (_, _, deep_output) = select_session_relative_report(&deep_case, &deep_fixture.plaintext)
+        .ok_or("deep recovery omitted the exact artifact")?;
+    let normal_inputs = relational_output_sources(&normal_case, normal_output)?;
+    assert!(
+        !normal_inputs.is_empty(),
+        "normal output must link its source nodes"
+    );
+    assert_eq!(
+        relational_output_sources(&deep_case, deep_output)?,
+        normal_inputs,
+        "the deep result must retain the same exact source nodes"
+    );
+    let first_incremental_report = deep_case
+        .nodes()
+        .iter()
+        .filter(|node| node.kind == "recovery_relational_transform_report")
+        .find_map(|node| {
+            let blob = node.blob.as_deref().and_then(|id| deep_case.blob(id))?;
+            let report = serde_json::from_slice::<Value>(&blob.bytes).ok()?;
+            (report.get("search_lane").and_then(Value::as_str) == Some("incremental"))
+                .then_some(node.id)
+        });
+    if let Some(first_incremental_report) = first_incremental_report {
+        assert!(
+            first_incremental_report > deep_output,
+            "normal output must be published before incremental search begins"
+        );
+    } else {
+        assert!(
+            deep_summary.omissions.iter().any(|omission| matches!(
+                omission,
+                RecoveryOmission::RelationalTransformAnalysis {
+                    reason: Some("incremental_evidence_limit"),
+                    ..
+                }
+            )),
+            "unsearched deep cohorts must report their evidence limit"
+        );
+    }
+    Ok(())
+}
+
+fn relational_output_sources(case: &Case, output: u64) -> TestResult<Vec<u64>> {
+    let mut nodes = case
+        .edges()
+        .iter()
+        .filter(|edge| edge.from == output && edge.relation == "derived_from")
+        .map(|edge| edge.to)
+        .collect::<Vec<_>>();
+    let output_node = case.node(output).ok_or("missing relational output")?;
+    if let Some(frame_ids) = output_node
+        .details
+        .get("input_frame_node_ids")
+        .and_then(Value::as_array)
+    {
+        for frame_id in frame_ids {
+            let frame_id = frame_id.as_u64().ok_or("invalid decoded frame id")?;
+            let before = nodes.len();
+            nodes.extend(
+                case.edges()
+                    .iter()
+                    .filter(|edge| edge.from == frame_id && edge.relation == "decoded_from")
+                    .map(|edge| edge.to),
+            );
+            if nodes.len() == before {
+                return Err("decoded frame is missing its source links".into());
+            }
+        }
+    }
+    nodes.sort_unstable();
+    nodes.dedup();
+    Ok(nodes)
+}
+
 fn assert_session_relative_recovery(
     case: &Case,
     plaintext: &[u8],

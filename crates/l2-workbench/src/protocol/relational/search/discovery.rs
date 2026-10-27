@@ -7,9 +7,10 @@ use super::super::model::{
     RelationalTransformEvaluationOptions, RelationalTransformLimits, RelationalTransformPlan,
     RelationalTransformReport, RelationalTransformRule, RelationalTransformStatus, Selector,
 };
-use super::probe::maximum_full_candidate_work;
+use super::probe::{PrefixProbeOutcome, maximum_full_candidate_work};
 use super::{
     anchor::{AnchoredPayloadSearch, anchored_payload_locators},
+    history::{RelationalReplayHistory, ReplayDisposition},
     input::{
         SessionGroup, build_selector_indexes, group_sessions, shared_selectors, validate_plan,
     },
@@ -31,9 +32,13 @@ use std::{
     convert::Infallible,
 };
 
-struct SearchState<T> {
+struct SearchState<'history, T> {
     candidates: Vec<RetainedCandidate<T>>,
     candidates_examined: usize,
+    history: Option<&'history mut RelationalReplayHistory>,
+    history_reused_rejections: usize,
+    history_reused_published: usize,
+    history_recording_omissions: usize,
     equivalent_candidate_aliases: usize,
     omitted_candidates: usize,
     omitted_candidates_exact: bool,
@@ -984,11 +989,15 @@ impl<'a> LocatorPairSchedule<'a> {
     }
 }
 
-impl<T> SearchState<T> {
-    const fn new() -> Self {
+impl<'history, T> SearchState<'history, T> {
+    const fn new(history: Option<&'history mut RelationalReplayHistory>) -> Self {
         Self {
             candidates: Vec::new(),
             candidates_examined: 0,
+            history,
+            history_reused_rejections: 0,
+            history_reused_published: 0,
+            history_recording_omissions: 0,
             equivalent_candidate_aliases: 0,
             omitted_candidates: 0,
             omitted_candidates_exact: true,
@@ -1019,6 +1028,41 @@ impl<T> SearchState<T> {
         }
         if !self.search_limits.contains(&limit) {
             self.search_limits.push(limit);
+        }
+    }
+
+    fn record_rejection(
+        &mut self,
+        rule: &RelationalTransformRule,
+    ) -> Result<(), RelationalTransformError> {
+        if let Some(history) = self.history.as_deref_mut()
+            && !history.record_rejection(rule)
+        {
+            self.history_recording_omissions = self
+                .history_recording_omissions
+                .checked_add(1)
+                .ok_or(RelationalTransformError::InvalidPlan(
+                    "relational history omission count overflowed",
+                ))?;
+        }
+        Ok(())
+    }
+
+    fn record_prefix_reuse(&mut self) -> Result<(), RelationalTransformError> {
+        self.prefix_probe_cache_reuses = self.prefix_probe_cache_reuses.checked_add(1).ok_or(
+            RelationalTransformError::InvalidPlan("prefix probe reuse count overflowed"),
+        )?;
+        Ok(())
+    }
+
+    const fn record_probe_completion(&mut self, outcome: PrefixProbeOutcome) {
+        if matches!(
+            outcome,
+            PrefixProbeOutcome::NotApplicable
+                | PrefixProbeOutcome::WorkLimited { .. }
+                | PrefixProbeOutcome::Incomplete { .. }
+        ) {
+            self.prefix_probe_complete = false;
         }
     }
 }
@@ -1074,9 +1118,12 @@ pub fn infer_relational_transform_candidates_with_job(
         samples,
         plan,
         job,
-        RelationalTransformEvaluationOptions::default(),
-        RetentionMode::PerLocatorPair,
-        false,
+        SearchSettings {
+            retention_mode: RetentionMode::PerLocatorPair,
+            max_retained_output_bytes: 0,
+            capture_outputs_for_evaluator: false,
+        },
+        None,
         &mut evaluator,
     ) {
         Ok(evaluated) => Ok(evaluated.report),
@@ -1114,6 +1161,36 @@ pub fn infer_relational_transform_candidates_with_evaluator<T, E, F>(
     plan: &RelationalTransformPlan,
     job: Option<&Job>,
     options: RelationalTransformEvaluationOptions,
+    evaluator: F,
+) -> Result<RelationalCandidateEvaluationReport<T>, RelationalEvaluationError<E>>
+where
+    F: FnMut(
+        &RelationalTransformEvaluationContext<'_>,
+        &RelationalTransformCandidate,
+        &[RelationalAppliedOutput],
+        &[RelationalAppliedOutput],
+    ) -> Result<RelationalCandidateEvaluation<T>, E>,
+{
+    infer_relational_transform_candidates_with_evaluator_and_history(
+        samples, plan, job, options, None, evaluator,
+    )
+}
+
+/// Evaluate candidates while reusing conclusive replay results for the same immutable cohort
+///
+/// A history must be scoped to the exact same input bytes, sample identities, metadata, order,
+/// and discovery/held-out grouping. Use a different history for every changed cohort. Widening
+/// search limits is supported; incomplete or work-limited replays are never recorded.
+/// Successful rules are skipped only when registered after publication.
+///
+/// # Errors
+/// Returns search, callback, or evaluator-budget errors
+pub fn infer_relational_transform_candidates_with_evaluator_and_history<T, E, F>(
+    samples: &[RelationalRecordSample<'_>],
+    plan: &RelationalTransformPlan,
+    job: Option<&Job>,
+    options: RelationalTransformEvaluationOptions,
+    history: Option<&mut RelationalReplayHistory>,
     mut evaluator: F,
 ) -> Result<RelationalCandidateEvaluationReport<T>, RelationalEvaluationError<E>>
 where
@@ -1128,9 +1205,12 @@ where
         samples,
         plan,
         job,
-        options,
-        RetentionMode::EvaluatorPriority,
-        true,
+        SearchSettings {
+            retention_mode: RetentionMode::EvaluatorPriority,
+            max_retained_output_bytes: options.max_retained_output_bytes,
+            capture_outputs_for_evaluator: true,
+        },
+        history,
         &mut evaluator,
     )
 }
@@ -1139,9 +1219,8 @@ fn infer_with_evaluator<T, E, F>(
     samples: &[RelationalRecordSample<'_>],
     plan: &RelationalTransformPlan,
     job: Option<&Job>,
-    options: RelationalTransformEvaluationOptions,
-    retention_mode: RetentionMode,
-    capture_outputs_for_evaluator: bool,
+    settings: SearchSettings,
+    mut history: Option<&mut RelationalReplayHistory>,
     evaluator: &mut F,
 ) -> Result<RelationalCandidateEvaluationReport<T>, RelationalEvaluationError<E>>
 where
@@ -1157,7 +1236,7 @@ where
             .map_err(RelationalTransformError::from)?;
     }
     validate_plan(plan)?;
-    if options.max_retained_output_bytes > plan.limits.max_total_bytes {
+    if settings.max_retained_output_bytes > plan.limits.max_total_bytes {
         return Err(RelationalEvaluationError::Search(
             RelationalTransformError::InvalidPlan(
                 "retained evaluator outputs exceed the aggregate byte limit",
@@ -1165,18 +1244,21 @@ where
         ));
     }
     let mut prepared = prepare_search(samples, plan)?;
-    let search = search_candidates(
+    if let Some(history) = history.as_deref_mut() {
+        history.prepare(plan.limits);
+    }
+    let mut search = search_candidates(
         samples,
         plan,
         job,
         &mut prepared,
-        SearchSettings {
-            retention_mode,
-            max_retained_output_bytes: options.max_retained_output_bytes,
-            capture_outputs_for_evaluator,
-        },
+        settings,
+        history,
         evaluator,
     )?;
+    if let Some(history) = search.history.as_deref_mut() {
+        history.finish();
+    }
     Ok(build_report(search, prepared, plan.limits)?)
 }
 
@@ -1233,14 +1315,15 @@ fn prepare_search(
     })
 }
 
-fn search_candidates<T, E, F>(
+fn search_candidates<'history, T, E, F>(
     samples: &[RelationalRecordSample<'_>],
     plan: &RelationalTransformPlan,
     job: Option<&Job>,
     prepared: &mut PreparedSearch,
     settings: SearchSettings,
+    history: Option<&'history mut RelationalReplayHistory>,
     evaluator: &mut F,
-) -> Result<SearchState<T>, RelationalEvaluationError<E>>
+) -> Result<SearchState<'history, T>, RelationalEvaluationError<E>>
 where
     F: FnMut(
         &RelationalTransformEvaluationContext<'_>,
@@ -1249,7 +1332,7 @@ where
         &[RelationalAppliedOutput],
     ) -> Result<RelationalCandidateEvaluation<T>, E>,
 {
-    let mut search = SearchState::new();
+    let mut search = SearchState::new(history);
     search.prefix_probe_complete = false;
     search.locator_candidates_examined =
         prepared.seed_locators.len() + prepared.payload_locators.len();
@@ -1286,7 +1369,7 @@ struct SearchContext<'a, 'bytes> {
 impl SearchContext<'_, '_> {
     fn prepare_anchored_payloads<T>(
         &mut self,
-        search: &mut SearchState<T>,
+        search: &mut SearchState<'_, T>,
     ) -> Result<(), RelationalTransformError> {
         let observation_work = self.anchor_allowance(search)?;
         let anchored = self.discover_anchored_payloads(observation_work)?;
@@ -1296,7 +1379,7 @@ impl SearchContext<'_, '_> {
 
     fn anchor_allowance<T>(
         &mut self,
-        search: &SearchState<T>,
+        search: &SearchState<'_, T>,
     ) -> Result<usize, RelationalTransformError> {
         let replay_reserve =
             maximum_full_candidate_work(self.samples, self.plan.limits, &self.plan.counter_widths)?;
@@ -1336,7 +1419,7 @@ impl SearchContext<'_, '_> {
 
     fn record_anchored_observation<T>(
         &self,
-        search: &mut SearchState<T>,
+        search: &mut SearchState<'_, T>,
         anchored: &AnchoredPayloadSearch,
     ) -> Result<(), RelationalTransformError> {
         search.work_bytes = search.work_bytes.checked_add(anchored.work_bytes).ok_or(
@@ -1363,7 +1446,7 @@ impl SearchContext<'_, '_> {
 
     fn merge_anchor_locators<T>(
         &mut self,
-        search: &mut SearchState<T>,
+        search: &mut SearchState<'_, T>,
         anchored: AnchoredPayloadSearch,
     ) -> Result<(), RelationalTransformError> {
         let absolute_limit = self
@@ -1417,7 +1500,7 @@ impl SearchContext<'_, '_> {
 
     fn search_all<T, E, F>(
         &mut self,
-        search: &mut SearchState<T>,
+        search: &mut SearchState<'_, T>,
         evaluator: &mut F,
     ) -> Result<(), RelationalEvaluationError<E>>
     where
@@ -1455,7 +1538,7 @@ impl SearchContext<'_, '_> {
 
     fn search_initial_pair_window<T, E, F>(
         &self,
-        search: &mut SearchState<T>,
+        search: &mut SearchState<'_, T>,
         evaluator: &mut F,
     ) -> Result<Option<InitialPairSearch>, RelationalEvaluationError<E>>
     where
@@ -1523,7 +1606,7 @@ impl SearchContext<'_, '_> {
 
     fn search_ranked_anchor_candidates<T, E, F>(
         &self,
-        search: &mut SearchState<T>,
+        search: &mut SearchState<'_, T>,
         pre_evaluated: &mut BTreeSet<CandidateId>,
         evaluator: &mut F,
     ) -> Result<bool, RelationalEvaluationError<E>>
@@ -1576,7 +1659,7 @@ impl SearchContext<'_, '_> {
 
     fn resume_initial_pairs<T, E, F>(
         &self,
-        search: &mut SearchState<T>,
+        search: &mut SearchState<'_, T>,
         initial: &InitialPairSearch,
         evaluator: &mut F,
     ) -> Result<bool, RelationalEvaluationError<E>>
@@ -1601,7 +1684,7 @@ impl SearchContext<'_, '_> {
 
     fn search_remaining_absolute_pairs<T, E, F>(
         &self,
-        search: &mut SearchState<T>,
+        search: &mut SearchState<'_, T>,
         initial: &InitialPairSearch,
         evaluator: &mut F,
     ) -> Result<bool, RelationalEvaluationError<E>>
@@ -1638,7 +1721,7 @@ impl SearchContext<'_, '_> {
 
     fn search_anchored_pairs<T, E, F>(
         &self,
-        search: &mut SearchState<T>,
+        search: &mut SearchState<'_, T>,
         pre_evaluated: &BTreeSet<CandidateId>,
         evaluator: &mut F,
     ) -> Result<(), RelationalEvaluationError<E>>
@@ -1689,7 +1772,7 @@ impl SearchContext<'_, '_> {
 
     fn rank_anchored_candidates<T>(
         &self,
-        search: &mut SearchState<T>,
+        search: &mut SearchState<'_, T>,
     ) -> Result<Vec<RankedAnchoredCandidate>, RelationalTransformError> {
         let replay_reserve =
             maximum_full_candidate_work(self.samples, self.plan.limits, &self.plan.counter_widths)?;
@@ -1723,6 +1806,13 @@ impl SearchContext<'_, '_> {
                 continue;
             };
             for (parameter_index, parameters) in self.candidate_parameters.iter().enumerate() {
+                // Prior exact results do not need another prefix transform for ranking
+                if let Some(history) = search.history.as_deref() {
+                    let rule = make_rule(seed_locator, payload_locator, *parameters, self.plan);
+                    if history.lookup(&rule).is_some() {
+                        continue;
+                    }
+                }
                 if search.prefix_probe_hypotheses_examined >= probe_limit {
                     search.prefix_probe_complete = false;
                     break 'anchors;
@@ -1737,7 +1827,7 @@ impl SearchContext<'_, '_> {
                 if state.stopped {
                     break 'anchors;
                 }
-                let Some(score) = score else {
+                let PrefixProbeOutcome::Scored(score) = score else {
                     state.search_order = state.search_order.saturating_add(1);
                     continue;
                 };
@@ -1788,12 +1878,12 @@ impl SearchContext<'_, '_> {
 
     fn score_anchored_candidate<T>(
         &self,
-        search: &mut SearchState<T>,
+        search: &mut SearchState<'_, T>,
         state: &mut AnchorProbeState,
         seed_locator: &LocatorCandidate,
         payload_locator: &LocatorCandidate,
         parameters: &CandidateParameters,
-    ) -> Result<Option<super::probe::PrefixProbeScore>, RelationalTransformError> {
+    ) -> Result<PrefixProbeOutcome, RelationalTransformError> {
         search.prefix_probe_hypotheses_examined = search
             .prefix_probe_hypotheses_examined
             .checked_add(1)
@@ -1811,29 +1901,32 @@ impl SearchContext<'_, '_> {
             &rule,
             self.plan.limits,
         )?;
-        let Some(mut prepared_prefix) = prepared else {
-            if probe_allowance == 0 {
-                search.prefix_probe_complete = false;
-                state.stopped = true;
-                return Ok(None);
+        let mut prepared_prefix = match prepared {
+            super::replay::PrefixPreparation::Ready(prepared) => prepared,
+            super::replay::PrefixPreparation::Contradicted => {
+                return Ok(PrefixProbeOutcome::Contradicted);
             }
-            search.prefix_probe_complete = false;
-            return Ok(None);
+            super::replay::PrefixPreparation::NotApplicable => {
+                search.prefix_probe_complete = false;
+                return Ok(PrefixProbeOutcome::NotApplicable);
+            }
         };
         let selection = prepared_prefix.take_selection_identity();
         let operation = prepared_prefix.operation();
-        let (score, reused) = state
+        let (outcome, reused) = state
             .score_cache
             .score_or_compute(selection, operation, || {
                 if probe_allowance == 0 {
                     search.prefix_probe_complete = false;
                     state.stopped = true;
-                    return Ok(None);
+                    return Ok(PrefixProbeOutcome::WorkLimited { work_bytes: 0 });
                 }
                 // Count a probe only after its prefix transform fits the remaining allowance
-                let Some(prepared_prefix) = prepared_prefix.within_work_limit(probe_allowance)?
-                else {
-                    return Ok(None);
+                let prepared_prefix = match prepared_prefix.within_work_limit(probe_allowance)? {
+                    super::replay::PrefixAdmission::Ready(prepared) => prepared,
+                    super::replay::PrefixAdmission::WorkLimited => {
+                        return Ok(PrefixProbeOutcome::WorkLimited { work_bytes: 0 });
+                    }
                 };
                 search.prefix_probes_examined =
                     search.prefix_probes_examined.checked_add(1).ok_or(
@@ -1847,19 +1940,18 @@ impl SearchContext<'_, '_> {
                 )
             })?;
         if reused {
-            search.prefix_probe_cache_reuses =
-                search.prefix_probe_cache_reuses.checked_add(1).ok_or(
-                    RelationalTransformError::InvalidPlan("prefix probe reuse count overflowed"),
-                )?;
+            search.record_prefix_reuse()?;
         }
         // A reused score only changes ordering; each ranked rule still receives full replay
-        let Some(score) = score else {
-            search.prefix_probe_complete = false;
-            return Ok(None);
-        };
         if !reused {
-            charge_prefix_probe_work(search, self.job, score.work_bytes, probe_allowance)?;
-            if score.novelty > 0 {
+            let work_bytes = match outcome {
+                PrefixProbeOutcome::Scored(score) => score.work_bytes,
+                PrefixProbeOutcome::WorkLimited { work_bytes }
+                | PrefixProbeOutcome::Incomplete { work_bytes } => work_bytes,
+                PrefixProbeOutcome::Contradicted | PrefixProbeOutcome::NotApplicable => 0,
+            };
+            charge_prefix_probe_work(search, self.job, work_bytes, probe_allowance)?;
+            if matches!(outcome, PrefixProbeOutcome::Scored(score) if score.novelty > 0) {
                 search.prefix_probe_candidates_with_novelty = search
                     .prefix_probe_candidates_with_novelty
                     .checked_add(1)
@@ -1868,15 +1960,13 @@ impl SearchContext<'_, '_> {
                     ))?;
             }
         }
-        if !score.complete {
-            search.prefix_probe_complete = false;
-        }
-        Ok(Some(score))
+        search.record_probe_completion(outcome);
+        Ok(outcome)
     }
 
     fn search_locator_pair<T, E, F>(
         &self,
-        search: &mut SearchState<T>,
+        search: &mut SearchState<'_, T>,
         pair: LocatorPair<'_>,
         pre_evaluated: &BTreeSet<CandidateId>,
         evaluator: &mut F,
@@ -1916,7 +2006,7 @@ impl SearchContext<'_, '_> {
 
     fn search_counter_options<T, E, F>(
         &self,
-        search: &mut SearchState<T>,
+        search: &mut SearchState<'_, T>,
         pair: LocatorPair<'_>,
         options: CounterOptions,
         parameter_index: &mut usize,
@@ -1981,7 +2071,7 @@ impl SearchContext<'_, '_> {
 
     fn try_candidate<T, E, F>(
         &self,
-        search: &mut SearchState<T>,
+        search: &mut SearchState<'_, T>,
         seed_locator: &LocatorCandidate,
         payload_locator: &LocatorCandidate,
         parameters: CandidateParameters,
@@ -1995,6 +2085,27 @@ impl SearchContext<'_, '_> {
             &[RelationalAppliedOutput],
         ) -> Result<RelationalCandidateEvaluation<T>, E>,
     {
+        if let Some(job) = self.job {
+            job.check_cancelled()
+                .map_err(RelationalTransformError::from)?;
+        }
+        let rule = make_rule(seed_locator, payload_locator, parameters, self.plan);
+        if let Some(disposition) = search
+            .history
+            .as_deref()
+            .and_then(|history| history.lookup(&rule))
+        {
+            let count = match disposition {
+                ReplayDisposition::Rejected => &mut search.history_reused_rejections,
+                ReplayDisposition::Published => &mut search.history_reused_published,
+            };
+            *count = count
+                .checked_add(1)
+                .ok_or(RelationalTransformError::InvalidPlan(
+                    "relational history reuse count overflowed",
+                ))?;
+            return Ok(true);
+        }
         if search.candidates_examined >= self.active_candidate_limit {
             if self.active_candidate_limit < self.plan.limits.max_candidates {
                 return Ok(false);
@@ -2009,13 +2120,10 @@ impl SearchContext<'_, '_> {
             return Ok(false);
         }
         if let Some(job) = self.job {
-            job.check_cancelled()
-                .map_err(RelationalTransformError::from)?;
             job.record_work(Phase::TransformDiscovery, Counter::CandidatesExamined, 1)
                 .map_err(RelationalTransformError::from)?;
         }
         search.candidates_examined += 1;
-        let rule = make_rule(seed_locator, payload_locator, parameters, self.plan);
         self.evaluate_candidate(search, rule, evaluator)
     }
 }
@@ -2052,7 +2160,7 @@ fn locator_pair_overlaps(
 }
 
 fn charge_prefix_probe_work<T>(
-    search: &mut SearchState<T>,
+    search: &mut SearchState<'_, T>,
     job: Option<&Job>,
     work_bytes: usize,
     allowance: usize,
@@ -2091,7 +2199,7 @@ fn charge_prefix_probe_work<T>(
 impl SearchContext<'_, '_> {
     fn evaluate_candidate<T, E, F>(
         &self,
-        search: &mut SearchState<T>,
+        search: &mut SearchState<'_, T>,
         rule: RelationalTransformRule,
         evaluator: &mut F,
     ) -> Result<bool, RelationalEvaluationError<E>>
@@ -2115,6 +2223,12 @@ impl SearchContext<'_, '_> {
         let discovery_unresolved_on_budget =
             discovery_evaluation.fit.status == RelationalFitStatus::UnresolvedOnBudget;
         if discovery_evaluation.fit.supported_sessions.is_empty() {
+            if discovery_evaluation.fit.status == RelationalFitStatus::Contradicted
+                && discovery_evaluation.fit.unresolved_sessions.is_empty()
+                && search.work_bytes < self.active_work_limit
+            {
+                search.record_rejection(&rule)?;
+            }
             if discovery_evaluation.fit.status == RelationalFitStatus::Contradicted
                 && let Some(job) = self.job
             {
@@ -2147,7 +2261,7 @@ impl SearchContext<'_, '_> {
 
     fn evaluate_supported_candidate<T, E, F>(
         &self,
-        search: &mut SearchState<T>,
+        search: &mut SearchState<'_, T>,
         rule: RelationalTransformRule,
         discovery_evaluation: EvaluatedSplit,
         evaluator: &mut F,
@@ -2213,6 +2327,16 @@ impl SearchContext<'_, '_> {
                 "relational evaluator work accounting overflowed",
             ),
         )?;
+        if matches!(
+            status,
+            RelationalTransformStatus::DiscoveryContradicted
+                | RelationalTransformStatus::ContradictedByHeldoutSession
+        ) && candidate.discovery.unresolved_sessions.is_empty()
+            && candidate.heldout.unresolved_sessions.is_empty()
+            && search.work_bytes < self.active_work_limit
+        {
+            search.record_rejection(&candidate.rule)?;
+        }
         retain_candidate(
             search,
             CandidateRetention {
@@ -2242,7 +2366,7 @@ impl SearchContext<'_, '_> {
 
     fn count_equivalent_candidate_aliases<T>(
         &self,
-        search: &mut SearchState<T>,
+        search: &mut SearchState<'_, T>,
     ) -> Result<(), RelationalTransformError> {
         for _ in &self.plan.seed_orders {
             for _ in &self.plan.counter_resets {
@@ -2264,7 +2388,7 @@ fn evaluate_heldout<T>(
     samples: &[RelationalRecordSample<'_>],
     limits: RelationalTransformLimits,
     prepared: &PreparedSearch,
-    search: &mut SearchState<T>,
+    search: &mut SearchState<'_, T>,
     rule: &RelationalTransformRule,
     discovery: &RelationalFit,
     capture_outputs: bool,
@@ -2312,7 +2436,7 @@ fn count_rejected_candidate(
 }
 
 fn retain_candidate<T>(
-    search: &mut SearchState<T>,
+    search: &mut SearchState<'_, T>,
     retained: CandidateRetention<T>,
     limits: RelationalTransformLimits,
     settings: SearchSettings,
@@ -2368,7 +2492,7 @@ enum RetentionDecision {
 }
 
 fn retention_decision<T>(
-    search: &SearchState<T>,
+    search: &SearchState<'_, T>,
     candidate: &RelationalTransformCandidate,
     priority: u8,
     limits: RelationalTransformLimits,
@@ -2427,7 +2551,7 @@ fn retention_decision<T>(
 }
 
 fn evict_retained_candidate<T>(
-    search: &mut SearchState<T>,
+    search: &mut SearchState<'_, T>,
     index: usize,
 ) -> Result<(), RelationalTransformError> {
     let removed = search
@@ -2462,7 +2586,7 @@ struct OutputCapture {
 }
 
 fn capture_candidate_outputs<T>(
-    search: &mut SearchState<T>,
+    search: &mut SearchState<'_, T>,
     discovery_outputs: Vec<RelationalAppliedOutput>,
     heldout_outputs: Vec<RelationalAppliedOutput>,
     max_retained_output_bytes: usize,
@@ -2502,7 +2626,9 @@ fn capture_candidate_outputs<T>(
     })
 }
 
-fn omit_retained_candidate<T>(search: &mut SearchState<T>) -> Result<(), RelationalTransformError> {
+fn omit_retained_candidate<T>(
+    search: &mut SearchState<'_, T>,
+) -> Result<(), RelationalTransformError> {
     search.omitted_candidates =
         search
             .omitted_candidates
@@ -2515,7 +2641,7 @@ fn omit_retained_candidate<T>(search: &mut SearchState<T>) -> Result<(), Relatio
 }
 
 fn stop_for_work_limit<T>(
-    search: &mut SearchState<T>,
+    search: &mut SearchState<'_, T>,
     one_candidate_omitted: bool,
 ) -> Result<(), RelationalTransformError> {
     search.stop(RelationalSearchLimit::WorkBytes);
@@ -2529,7 +2655,7 @@ fn stop_for_work_limit<T>(
 }
 
 fn build_report<T>(
-    mut search: SearchState<T>,
+    mut search: SearchState<'_, T>,
     prepared: PreparedSearch,
     limits: RelationalTransformLimits,
 ) -> Result<RelationalCandidateEvaluationReport<T>, RelationalTransformError> {
@@ -2583,6 +2709,9 @@ fn build_report<T>(
             search_limit: search.search_limit,
         },
         evaluations,
+        history_reused_rejections: search.history_reused_rejections,
+        history_reused_published: search.history_reused_published,
+        history_recording_omissions: search.history_recording_omissions,
         output_bytes_retained: search.output_bytes_retained,
         output_capture_omissions: search.output_capture_omissions,
         output_capture_complete: search.output_capture_omissions == 0,

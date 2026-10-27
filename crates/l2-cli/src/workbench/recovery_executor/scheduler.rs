@@ -983,7 +983,11 @@ impl Executor<'_> {
         if task == RecoveryTask::RecordDiscovery {
             return self.run_record_discovery(candidate_id);
         }
-        if task == RecoveryTask::RelationalTransformDiscovery {
+        if matches!(
+            task,
+            RecoveryTask::RelationalTransformDiscovery
+                | RecoveryTask::RelationalTransformDiscoveryIncremental
+        ) {
             return self.run_relational_transform_discovery(candidate_id);
         }
         if let RecoveryTask::AssembleRecords(schema) = &task {
@@ -1129,7 +1133,8 @@ impl Executor<'_> {
                 self.execute_record_candidate(candidate_id, candidate, schema)
             }
             RecoveryTask::RecordDiscovery => self.run_record_discovery(candidate_id),
-            RecoveryTask::RelationalTransformDiscovery => {
+            RecoveryTask::RelationalTransformDiscovery
+            | RecoveryTask::RelationalTransformDiscoveryIncremental => {
                 self.run_relational_transform_discovery(candidate_id)
             }
         }
