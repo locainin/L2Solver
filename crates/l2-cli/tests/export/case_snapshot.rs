@@ -1,10 +1,13 @@
-use crate::case_snapshot::{read_files, write_files};
+use crate::case_snapshot::{read_files, read_streams, write_files, write_streams};
 use l2_workbench::{
     evidence::{Case, CaseSnapshotLimits},
     job::{MemoryBudget, MemoryClass},
 };
 use serde_json::json;
-use std::{error::Error, io::Write};
+use std::{
+    error::Error,
+    io::{Read, Seek, SeekFrom, Write},
+};
 
 type TestResult = Result<(), Box<dyn Error>>;
 
@@ -93,5 +96,33 @@ fn snapshot_writer_rejects_insufficient_scratch_before_writing() -> TestResult {
     assert_eq!(budget.snapshot()?.used_bytes, 0);
     assert_eq!(graph.metadata()?.len(), 0);
     assert_eq!(blobs.metadata()?.len(), 0);
+    Ok(())
+}
+
+#[test]
+fn verified_generation_streams_restore_exact_charged_case() -> TestResult {
+    let directory = tempfile::tempdir()?;
+    let mut graph = tempfile::tempfile_in(directory.path())?;
+    let mut blobs = tempfile::tempfile_in(directory.path())?;
+    let expected = source_case()?;
+    let limits = CaseSnapshotLimits::new(16 * 1024 * 1024, 16 * 1024 * 1024);
+    let budget = MemoryBudget::new(16 * 1024 * 1024);
+    let usage = {
+        let graph_writer: &mut dyn Write = &mut graph;
+        let blob_writer: &mut dyn Write = &mut blobs;
+        write_streams(graph_writer, blob_writer, &expected, limits, Some(&budget))?
+    };
+    assert_eq!(budget.snapshot()?.used_bytes, 0);
+    graph.seek(SeekFrom::Start(0))?;
+    blobs.seek(SeekFrom::Start(0))?;
+    let restored = {
+        let graph_reader: &mut dyn Read = &mut graph;
+        let blob_reader: &mut dyn Read = &mut blobs;
+        read_streams(graph_reader, blob_reader, usage, limits, Some(&budget))?
+    };
+    assert_eq!(restored, expected);
+    assert!(budget.snapshot()?.used(MemoryClass::Case) > 0);
+    drop(restored);
+    assert_eq!(budget.snapshot()?.used_bytes, 0);
     Ok(())
 }

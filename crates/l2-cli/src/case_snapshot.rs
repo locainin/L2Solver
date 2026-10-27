@@ -21,6 +21,8 @@ pub const STORAGE_FORMAT: u32 = 1;
 // Reserve a bounded scratch allowance before either stream is opened
 // The reader separately charges its own buffers; library allocations are not measured
 const CODEC_SCRATCH_BYTES: u64 = 2 * 1024 * 1024;
+const FILE_BUFFER_CAPACITY: usize = 16 * 1024;
+const FILE_BUFFER_BYTES: u64 = 2 * FILE_BUFFER_CAPACITY as u64;
 
 type Result<T> = std::result::Result<T, Box<dyn Error>>;
 
@@ -61,6 +63,26 @@ pub fn read_files<G: SnapshotFile, B: SnapshotFile>(
     limits: CaseSnapshotLimits,
     budget: Option<&MemoryBudget>,
 ) -> Result<Case> {
+    if graph.snapshot_len()? != usage.graph_bytes || blobs.snapshot_len()? != usage.blob_pack_bytes
+    {
+        return Err(invalid(
+            "cached Case snapshot file lengths do not match its metadata",
+        ));
+    }
+    // A previous restore can leave both descriptors at end of file
+    graph.seek(SeekFrom::Start(0))?;
+    blobs.seek(SeekFrom::Start(0))?;
+    read_streams(graph, blobs, usage, limits, budget)
+}
+
+/// Restore an already-verified snapshot stream and check its measured usage
+pub fn read_streams(
+    graph: &mut dyn Read,
+    blobs: &mut dyn Read,
+    usage: CaseSnapshotUsage,
+    limits: CaseSnapshotLimits,
+    budget: Option<&MemoryBudget>,
+) -> Result<Case> {
     let decoded = usage
         .graph_decoded_bytes
         .checked_add(usage.blob_pack_bytes)
@@ -76,19 +98,10 @@ pub fn read_files<G: SnapshotFile, B: SnapshotFile>(
     let _scratch = budget
         .map(|budget| budget.try_reserve(MemoryClass::Cache, CODEC_SCRATCH_BYTES))
         .transpose()?;
-    if graph.snapshot_len()? != usage.graph_bytes || blobs.snapshot_len()? != usage.blob_pack_bytes
-    {
-        return Err(invalid(
-            "cached Case snapshot file lengths do not match its metadata",
-        ));
-    }
-    // A previous restore can leave both descriptors at end of file
-    graph.seek(SeekFrom::Start(0))?;
-    blobs.seek(SeekFrom::Start(0))?;
     let (case, actual) = if let Some(budget) = budget {
-        Case::from_snapshot_with_memory(&mut *graph, &mut *blobs, limits, budget)?
+        Case::from_snapshot_with_memory(graph, blobs, limits, budget)?
     } else {
-        Case::from_snapshot(&mut *graph, &mut *blobs, limits)?
+        Case::from_snapshot(graph, blobs, limits)?
     };
     if actual != usage {
         return Err(invalid(
@@ -120,16 +133,23 @@ pub fn write_files(
     if graph.metadata()?.len() != 0 || blobs.metadata()?.len() != 0 {
         return Err(invalid("Case snapshot destination is not empty"));
     }
-    let _scratch = budget
-        .map(|budget| budget.try_reserve(MemoryClass::Cache, CODEC_SCRATCH_BYTES))
+    let mut buffers = budget
+        .map(|budget| budget.try_reserve(MemoryClass::Cache, FILE_BUFFER_BYTES))
         .transpose()?;
     // Empty files can still have a nonzero seek position
     graph.seek(SeekFrom::Start(0))?;
     blobs.seek(SeekFrom::Start(0))?;
     let usage = {
-        let mut graph_writer = BufWriter::new(&mut *graph);
-        let mut blob_writer = BufWriter::new(&mut *blobs);
-        let usage = case.write_snapshot(&mut graph_writer, &mut blob_writer, limits)?;
+        let mut graph_writer = BufWriter::with_capacity(FILE_BUFFER_CAPACITY, &mut *graph);
+        let mut blob_writer = BufWriter::with_capacity(FILE_BUFFER_CAPACITY, &mut *blobs);
+        if let Some(buffers) = &mut buffers {
+            let actual = graph_writer
+                .capacity()
+                .checked_add(blob_writer.capacity())
+                .ok_or("snapshot writer buffer size overflow")?;
+            buffers.try_resize(u64::try_from(actual)?)?;
+        }
+        let usage = write_streams(&mut graph_writer, &mut blob_writer, case, limits, budget)?;
         graph_writer.flush()?;
         blob_writer.flush()?;
         usage
@@ -137,6 +157,20 @@ pub fn write_files(
     graph.sync_all()?;
     blobs.sync_all()?;
     Ok(usage)
+}
+
+/// Write an exact snapshot to caller-owned bounded streams
+pub fn write_streams(
+    mut graph: &mut dyn Write,
+    mut blobs: &mut dyn Write,
+    case: &Case,
+    limits: CaseSnapshotLimits,
+    budget: Option<&MemoryBudget>,
+) -> Result<CaseSnapshotUsage> {
+    let _scratch = budget
+        .map(|budget| budget.try_reserve(MemoryClass::Cache, CODEC_SCRATCH_BYTES))
+        .transpose()?;
+    Ok(case.write_snapshot(&mut graph, &mut blobs, limits)?)
 }
 
 fn create_file(lease: &Lease, name: &str) -> Result<File> {
