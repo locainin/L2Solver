@@ -362,9 +362,14 @@ pub fn artifact_contents(directory: &Path) -> Result<ArtifactContents, Box<dyn E
 
 fn evidence_jsonl(directory: &Path) -> Result<Vec<u8>, Box<dyn Error>> {
     let file = fs::File::open(directory.join("evidence.jsonl.gz"))?;
-    let mut decoder = flate2::read::MultiGzDecoder::new(file);
+    let decoder = flate2::read::MultiGzDecoder::new(file);
     let mut bytes = Vec::new();
-    decoder.read_to_end(&mut bytes)?;
+    l2_workbench::evidence::decode_published_evidence(
+        3,
+        std::io::BufReader::new(decoder),
+        &mut bytes,
+        l2_workbench::evidence::PublishedEvidenceLimits::new(u64::MAX, 32 * 1024 * 1024),
+    )?;
     Ok(bytes)
 }
 

@@ -1,7 +1,7 @@
 //! Versioned snapshot records and bounded JSON text decoding
 
 use super::super::super::bounded;
-use super::super::super::model::{Edge, EvidenceStatus, Node, Source};
+use super::super::super::model::EvidenceStatus;
 use super::super::{CaseResourceLimits, MAX_NODE_RANGES, MAX_SOURCE_ALIASES};
 use serde::{
     Deserialize, Deserializer, Serialize,
@@ -35,17 +35,6 @@ pub(super) struct SnapshotBlob {
     pub(super) id: String,
     pub(super) offset: u64,
     pub(super) length: u64,
-}
-
-#[derive(Serialize)]
-#[serde(tag = "record", content = "value", rename_all = "snake_case")]
-pub(super) enum SnapshotRecordRef<'a> {
-    Header(&'a SnapshotHeader),
-    Source(&'a Source),
-    Blob(SnapshotBlobRef<'a>),
-    Node(&'a Node),
-    Edge(&'a Edge),
-    Limitation(&'a str),
 }
 
 #[derive(Serialize)]

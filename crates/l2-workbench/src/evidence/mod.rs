@@ -5,7 +5,9 @@ mod case;
 mod error;
 mod model;
 mod preflight;
+mod published;
 mod receipt_verification;
+mod record;
 mod scan;
 
 // Receipt generation and validation use the same reserved kind and selection rule
@@ -23,6 +25,9 @@ pub use case::{
 };
 pub use error::EvidenceError;
 pub use model::{Blob, ByteMapping, Edge, EvidenceStatus, Node, Source, SourceRange};
+pub use published::{
+    PublishedCaseUsage, PublishedEvidenceLimits, decode_published_evidence, write_published_case,
+};
 pub use receipt_verification::{
     IndexFlowSelectionVerification, ReceiptVerificationError, ReceiptVerificationLimits,
     verify_index_flow_selection,

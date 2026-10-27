@@ -12,6 +12,8 @@ mod mapping;
 mod memory;
 #[path = "evidence/preflight.rs"]
 mod preflight;
+#[path = "evidence/published.rs"]
+mod published;
 #[path = "evidence/ranges.rs"]
 mod ranges;
 #[path = "evidence/receipt_verification.rs"]

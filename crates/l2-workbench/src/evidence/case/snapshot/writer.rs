@@ -1,12 +1,10 @@
 //! Bounded snapshot graph and blob-pack encoding
 
+use super::super::super::record::RecordRef;
 use super::super::{Case, EvidenceError};
 use super::{
     CaseSnapshotLimits, CaseSnapshotUsage,
-    format::{
-        MAX_SNAPSHOT_RECORD_BYTES, SNAPSHOT_FORMAT_VERSION, SnapshotBlobRef, SnapshotHeader,
-        SnapshotRecordRef,
-    },
+    format::{MAX_SNAPSHOT_RECORD_BYTES, SNAPSHOT_FORMAT_VERSION, SnapshotBlobRef, SnapshotHeader},
     io::{
         BoundedRecordBuffer, LimitedWriter, RecordBufferFailure, case_too_large, write_error,
         write_limited,
@@ -132,14 +130,20 @@ fn write_snapshot_records<W: Write>(
         encoder,
         decoded_bytes,
         maximum_decoded_bytes,
-        &SnapshotRecordRef::Header(header),
+        &RecordRef {
+            record: "header",
+            value: header,
+        },
     )?;
     for source in &case.sources {
         write_record(
             encoder,
             decoded_bytes,
             maximum_decoded_bytes,
-            &SnapshotRecordRef::Source(source),
+            &RecordRef {
+                record: "source",
+                value: source,
+            },
         )?;
     }
     write_snapshot_blob_records(case, encoder, decoded_bytes, maximum_decoded_bytes)?;
@@ -148,7 +152,10 @@ fn write_snapshot_records<W: Write>(
             encoder,
             decoded_bytes,
             maximum_decoded_bytes,
-            &SnapshotRecordRef::Node(node),
+            &RecordRef {
+                record: "node",
+                value: node,
+            },
         )?;
     }
     for edge in &case.edges {
@@ -156,7 +163,10 @@ fn write_snapshot_records<W: Write>(
             encoder,
             decoded_bytes,
             maximum_decoded_bytes,
-            &SnapshotRecordRef::Edge(edge),
+            &RecordRef {
+                record: "edge",
+                value: edge,
+            },
         )?;
     }
     for limitation in &case.limitations {
@@ -164,7 +174,10 @@ fn write_snapshot_records<W: Write>(
             encoder,
             decoded_bytes,
             maximum_decoded_bytes,
-            &SnapshotRecordRef::Limitation(limitation),
+            &RecordRef {
+                record: "limitation",
+                value: limitation,
+            },
         )?;
     }
     Ok(())
@@ -183,11 +196,14 @@ fn write_snapshot_blob_records<W: Write>(
             encoder,
             decoded_bytes,
             maximum_decoded_bytes,
-            &SnapshotRecordRef::Blob(SnapshotBlobRef {
-                id: &blob.id,
-                offset,
-                length,
-            }),
+            &RecordRef {
+                record: "blob",
+                value: &SnapshotBlobRef {
+                    id: &blob.id,
+                    offset,
+                    length,
+                },
+            },
         )?;
         offset = offset
             .checked_add(length)

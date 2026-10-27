@@ -7,10 +7,41 @@ use l2_workbench::{
 use serde_json::{Value, json};
 use std::{
     error::Error,
-    io::{self, BufRead, Write},
+    io::{self, BufRead, Read, Write},
 };
 
 const LARGE_BLOB_BYTES: usize = 48 * 1024 * 1024;
+
+#[test]
+fn snapshot_graph_keeps_the_existing_record_bytes() -> Result<(), Box<dyn Error>> {
+    let mut case = Case::new();
+    let id = case.add_bytes_node("sample", b"x", Vec::new(), json!({}))?;
+    case.add_edge(l2_workbench::evidence::Edge {
+        from: id,
+        to: id,
+        relation: "supports".into(),
+        status: EvidenceStatus::Observed,
+        reason: "observed once".into(),
+    })?;
+    case.add_limitation("scope")?;
+    let (graph, pack) = encode_snapshot(&case, small_limits())?;
+    assert_eq!(pack, b"x");
+    let mut decoded = String::new();
+    flate2::read::GzDecoder::new(graph.as_slice()).read_to_string(&mut decoded)?;
+    let blob = format!("sha256:{}", sha256(b"x"));
+    let expected = format!(
+        concat!(
+            "{{\"record\":\"header\",\"value\":{{\"format_version\":1,\"schema_version\":1,\"collection_complete\":true,\"resource_limits\":{{\"blob_bytes\":null}},\"source_count\":0,\"blob_count\":1,\"node_count\":1,\"edge_count\":1,\"limitation_count\":1,\"blob_pack_bytes\":1}}}}\n",
+            "{{\"record\":\"blob\",\"value\":{{\"id\":\"{blob}\",\"offset\":0,\"length\":1}}}}\n",
+            "{{\"record\":\"node\",\"value\":{{\"id\":1,\"kind\":\"sample\",\"blob\":\"{blob}\",\"ranges\":[],\"details\":{{}}}}}}\n",
+            "{{\"record\":\"edge\",\"value\":{{\"from\":1,\"to\":1,\"relation\":\"supports\",\"status\":\"observed\",\"reason\":\"observed once\"}}}}\n",
+            "{{\"record\":\"limitation\",\"value\":\"scope\"}}\n"
+        ),
+        blob = blob
+    );
+    assert_eq!(decoded, expected);
+    Ok(())
+}
 
 #[test]
 fn snapshot_roundtrip_preserves_escaped_graph_text() -> Result<(), Box<dyn Error>> {

@@ -280,8 +280,15 @@ fn published_export_contains_one_evidence_sidecar_without_artifact_payloads()
     }));
 
     let compressed = fs::read(destination.join("evidence.jsonl.gz"))?;
+    let mut normalized = Vec::new();
+    flate2::read::MultiGzDecoder::new(compressed.as_slice()).read_to_end(&mut normalized)?;
     let mut evidence = Vec::new();
-    flate2::read::MultiGzDecoder::new(compressed.as_slice()).read_to_end(&mut evidence)?;
+    l2_workbench::evidence::decode_published_evidence(
+        3,
+        std::io::Cursor::new(&normalized),
+        &mut evidence,
+        l2_workbench::evidence::PublishedEvidenceLimits::new(u64::MAX, 32 * 1024 * 1024),
+    )?;
     assert!(!evidence.is_empty());
     assert!(!evidence.windows(BODY.len()).any(|window| window == BODY));
     let body_base64 = base64::Engine::encode(&base64::engine::general_purpose::STANDARD, BODY);
@@ -302,9 +309,9 @@ fn published_export_contains_one_evidence_sidecar_without_artifact_payloads()
     assert_eq!(coverage["retained_bytes"], u64::try_from(compressed.len())?);
     assert_eq!(
         coverage["raw_retained_bytes"],
-        u64::try_from(evidence.len())?
+        u64::try_from(normalized.len())?
     );
-    assert_eq!(coverage["encoding_version"], 2);
+    assert_eq!(coverage["encoding_version"], 3);
     assert_eq!(
         manifest
             .pointer("/evidence/encoding")

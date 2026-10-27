@@ -131,7 +131,15 @@ fn tcp_session_frames(
 fn assert_unknown_transfer_end(destination: &Path, expected: &[u8]) -> Result<(), Box<dyn Error>> {
     use std::io::BufRead;
     let source = fs::File::open(destination.join("evidence.jsonl.gz"))?;
-    let evidence = std::io::BufReader::new(flate2::read::MultiGzDecoder::new(source));
+    let normalized = std::io::BufReader::new(flate2::read::MultiGzDecoder::new(source));
+    let mut canonical = Vec::new();
+    l2_workbench::evidence::decode_published_evidence(
+        3,
+        normalized,
+        &mut canonical,
+        l2_workbench::evidence::PublishedEvidenceLimits::new(u64::MAX, 32 * 1024 * 1024),
+    )?;
+    let evidence = std::io::Cursor::new(canonical);
     let expected_blob = format!("sha256:{}", l2_workbench::sha256(expected));
     let mut found_exact_output = false;
     let mut found_unobserved_end = false;

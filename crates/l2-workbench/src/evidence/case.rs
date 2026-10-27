@@ -1424,14 +1424,14 @@ where
     bounded::deserialize_vec::<D, String, MAX_LIMITATIONS>(deserializer)
 }
 
-fn validate_content_id(id: &str) -> Result<(), EvidenceError> {
+pub(super) fn validate_content_id(id: &str) -> Result<(), EvidenceError> {
     let digest = id
         .strip_prefix("sha256:")
         .ok_or(EvidenceError::InvalidDigest)?;
     source_id(digest).map(|_| ())
 }
 
-fn validate_label(label: &str) -> Result<(), EvidenceError> {
+pub(super) fn validate_label(label: &str) -> Result<(), EvidenceError> {
     validate_text(label, MAX_SOURCE_LABEL_BYTES, "source label")?;
     if matches!(label, "." | "..") || label.contains('/') || label.contains('\\') {
         return Err(EvidenceError::InvalidText {
@@ -1446,7 +1446,11 @@ pub(super) fn validate_import_source_label(label: &str, kind: &str) -> Result<()
     validate_text(kind, 64, "source kind")
 }
 
-fn validate_text(value: &str, maximum: usize, field: &'static str) -> Result<(), EvidenceError> {
+pub(super) fn validate_text(
+    value: &str,
+    maximum: usize,
+    field: &'static str,
+) -> Result<(), EvidenceError> {
     if value.is_empty() || value.len() > maximum || value.chars().any(char::is_control) {
         return Err(EvidenceError::InvalidText { field });
     }

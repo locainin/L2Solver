@@ -240,6 +240,36 @@ fn receipt_payload_edges_and_local_node_ids_are_retained_per_case() -> Result<()
 }
 
 #[test]
+fn sidecar_writes_versioned_normalized_records_with_decodable_receipts()
+-> Result<(), Box<dyn Error>> {
+    let temporary = tempfile::tempdir()?;
+    let mut sidecar = EvidenceSidecar::new(temporary.path(), 1_000_000)?;
+    let case = case_with_receipt(b"normalized source")?;
+    sidecar.record_case(&case, &json!({"kind":"flow","flow_id":4}))?;
+    sidecar.finish()?;
+    let mut raw = Vec::new();
+    MultiGzDecoder::new(fs::File::open(temporary.path().join(SIDECAR_FILE_NAME))?)
+        .read_to_end(&mut raw)?;
+    let first: Value = serde_json::from_slice(
+        raw.split(|byte| *byte == b'\n')
+            .next()
+            .ok_or("missing header")?,
+    )?;
+    assert_eq!(first.get("record"), Some(&json!("header")));
+    assert_eq!(first.pointer("/value/version"), Some(&json!(3)));
+    let mut decoded = Vec::new();
+    l2_workbench::evidence::decode_published_evidence(
+        3,
+        Cursor::new(raw),
+        &mut decoded,
+        l2_workbench::evidence::PublishedEvidenceLimits::new(16_000_000, 8_000_000),
+    )?;
+    let record: Value = serde_json::from_slice(&decoded)?;
+    assert_receipt_case(&record)?;
+    Ok(())
+}
+
+#[test]
 fn same_scope_gets_distinct_case_ids_when_graph_content_differs() -> Result<(), Box<dyn Error>> {
     let temporary = tempfile::tempdir()?;
     let mut sidecar = EvidenceSidecar::new(temporary.path(), 1_000_000)?;
@@ -433,6 +463,8 @@ fn repetitive_evidence_fits_a_tighter_budget_without_changing_the_v2_record()
     let first = sizing.record_case(&case, &scope)?;
     sizing.finish()?;
     let raw = read_sidecar_bytes(&sizing_directory.path().join(SIDECAR_FILE_NAME))?;
+    let normalized =
+        read_normalized_sidecar_bytes(&sizing_directory.path().join(SIDECAR_FILE_NAME))?;
     let mut fast = GzEncoder::new(Vec::new(), Compression::fast());
     io::copy(
         &mut BufReader::with_capacity(64 * 1024, Cursor::new(&raw)),
@@ -455,12 +487,12 @@ fn repetitive_evidence_fits_a_tighter_budget_without_changing_the_v2_record()
         "the complete Case should fit the tighter budget"
     );
     assert_eq!(second.case_id, first.case_id);
-    assert_eq!(second.encoded_bytes, u64::try_from(raw.len())?);
+    assert_eq!(second.encoded_bytes, u64::try_from(normalized.len())?);
     assert_eq!(budgeted.coverage().retained_cases, 1);
     assert_eq!(budgeted.coverage().omitted_cases, 0);
     assert_eq!(
         budgeted.coverage().raw_retained_bytes,
-        u64::try_from(raw.len())?
+        u64::try_from(normalized.len())?
     );
     assert_eq!(
         budgeted.coverage().retained_bytes,
@@ -741,6 +773,18 @@ fn slice_item<'a>(
 }
 
 fn read_sidecar_bytes(path: &Path) -> Result<Vec<u8>, Box<dyn Error>> {
+    let normalized = read_normalized_sidecar_bytes(path)?;
+    let mut canonical = Vec::new();
+    l2_workbench::evidence::decode_published_evidence(
+        ENCODING_VERSION,
+        Cursor::new(normalized),
+        &mut canonical,
+        l2_workbench::evidence::PublishedEvidenceLimits::new(u64::MAX, 32 * 1024 * 1024),
+    )?;
+    Ok(canonical)
+}
+
+fn read_normalized_sidecar_bytes(path: &Path) -> Result<Vec<u8>, Box<dyn Error>> {
     let mut gzip_reader = MultiGzDecoder::new(fs::File::open(path)?);
     let mut jsonl_bytes = Vec::new();
     gzip_reader.read_to_end(&mut jsonl_bytes)?;
