@@ -85,7 +85,7 @@ fn rejected_cache_restore_preserves_the_native_case_and_releases_memory()
         )
         .err()
         .ok_or("memory pressure was treated as an ordinary optional cache failure")?;
-        assert!(super::super::memory_pressure(error.as_ref()));
+        assert!(crate::memory_error::find(error.as_ref()).is_some());
         assert_eq!(original.to_json()?, expected);
         assert_eq!(budget.snapshot()?.used_bytes, 0);
         assert!(budget.snapshot()?.rejected > 0);

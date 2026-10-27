@@ -156,6 +156,7 @@ fn recover_indexed_cases(
     worker_count: usize,
 ) -> Result<RecoveredCaseSnapshot, Box<dyn Error>> {
     const SHARED_MEMORY_BYTES: u64 = 256 * 1024 * 1024;
+    let budget = MemoryBudget::new(SHARED_MEMORY_BYTES);
     let options = RecoveryOptions {
         profile: RecoveryProfile::Fast,
         jobs: Some(worker_count),
@@ -163,7 +164,7 @@ fn recover_indexed_cases(
         ..RecoveryOptions::default()
     };
     let context = RecoveryContext {
-        memory: None,
+        memory: Some(&budget),
         cache: None,
         job: None,
         options: &options,
@@ -178,7 +179,6 @@ fn recover_indexed_cases(
     let mut artifacts =
         ArtifactCollection::new(artifact_directory.path(), ArtifactLimits::default())?;
     let mut batch = Vec::with_capacity(worker_count);
-    let budget = MemoryBudget::new(SHARED_MEMORY_BYTES);
     let mut peak_case_bytes = 0;
     let mut emit = |case: RecoveredCase| {
         collect_test_case(case, &mut artifacts, &mut coverage, &mut scopes, &mut cases)

@@ -149,7 +149,10 @@ pub(super) fn recover(
 
     if let Some(lease) = lease {
         match store_result(lease, case, &result, context.options, context.memory) {
-            Err(error) if context.options.strict_cache || memory_pressure(error.as_ref()) => {
+            Err(error)
+                if context.options.strict_cache
+                    || crate::memory_error::find(error.as_ref()).is_some() =>
+            {
                 return Err(error);
             }
             Ok(()) => {}
@@ -181,7 +184,10 @@ fn lookup_result(
         Ok(Some(entry)) => {
             match cached_result(&entry, source_id, kind, context.options, context.memory) {
                 Ok(result) => return Ok(Some(result)),
-                Err(error) if context.options.strict_cache || memory_pressure(error.as_ref()) => {
+                Err(error)
+                    if context.options.strict_cache
+                        || crate::memory_error::find(error.as_ref()).is_some() =>
+                {
                     return Err(error);
                 }
                 Err(_) => note_cache_fallback(
@@ -191,7 +197,9 @@ fn lookup_result(
                 )?,
             }
         }
-        Err(error) if context.options.strict_cache || memory_pressure(&error) => {
+        Err(error)
+            if context.options.strict_cache || crate::memory_error::find(&error).is_some() =>
+        {
             return Err(error.into());
         }
         Err(_) => note_cache_fallback(
@@ -213,18 +221,6 @@ fn note_cache_fallback(
         job.record_cache_fallback(CacheStage::CaseRecovery, kind, detail)?;
     }
     Ok(())
-}
-
-fn memory_pressure(mut error: &(dyn Error + 'static)) -> bool {
-    loop {
-        if error.is::<l2_workbench::job::MemoryError>() {
-            return true;
-        }
-        let Some(source) = error.source() else {
-            return false;
-        };
-        error = source;
-    }
 }
 
 fn cache_commit_fallback_kind(error: &(dyn Error + 'static)) -> CacheFallbackKind {
