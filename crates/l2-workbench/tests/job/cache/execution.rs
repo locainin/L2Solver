@@ -107,6 +107,80 @@ fn failed_generation_write_keeps_the_previous_committed_cursor() -> Result<(), B
     Ok(())
 }
 
+#[cfg(target_os = "linux")]
+#[test]
+fn real_full_filesystem_preserves_the_committed_execution_generation() -> Result<(), Box<dyn Error>>
+{
+    use std::{fs, io::Write};
+
+    let Some(base) = std::env::var_os("L2_TEST_ENOSPC_ROOT") else {
+        eprintln!("active-generation ENOSPC test needs an isolated small filesystem");
+        return Ok(());
+    };
+    let temporary = tempfile::tempdir_in(base)?;
+    let cache = cache_at(temporary.path(), 4 * 1024 * 1024)?;
+    let key = stage_key("real-full-generation")?;
+    let job = Job::new("active search");
+    let first = job.snapshot()?;
+    let mut lease = cache.lease(&key)?;
+    lease.save_active(&first, limits(), |writer| {
+        writer.streams().2.write_all(b"first-cursor")?;
+        Ok(json!({"generation":1}))
+    })?;
+
+    // Fill only the isolated tmpfs while keeping its filler inode alive
+    let filler_path = temporary.path().join("space-filler");
+    let mut filler = fs::File::create(&filler_path)?;
+    let block = [0_u8; 8 * 1024];
+    let mut full = false;
+    for _ in 0..512 {
+        if let Err(error) = filler.write_all(&block) {
+            assert_eq!(error.kind(), io::ErrorKind::StorageFull);
+            full = true;
+            break;
+        }
+    }
+    assert!(full, "the isolated filesystem did not report ENOSPC");
+    job.increment(Counter::CandidatesExamined, 1)?;
+    let later = job.snapshot()?;
+    let failure = lease.save_active(&later, limits(), |writer| {
+        writer.streams().2.write_all(b"second-cursor")?;
+        Ok(json!({"generation":2}))
+    });
+    let error = failure
+        .err()
+        .ok_or("generation was saved on a full filesystem")?;
+    let storage_failure = match &error {
+        CacheError::Io(error) => error.kind() == io::ErrorKind::StorageFull,
+        CacheError::Database(error) => matches!(
+            error.downcast_ref::<rusqlite::Error>(),
+            Some(rusqlite::Error::SqliteFailure(code, _))
+                if matches!(code.code, rusqlite::ErrorCode::DiskFull | rusqlite::ErrorCode::SystemIoFailure)
+        ),
+        _ => false,
+    };
+    eprintln!("full-filesystem generation result: {error:?}");
+    assert!(
+        storage_failure,
+        "generation failed for a different reason: {error}"
+    );
+    drop(filler);
+    fs::remove_file(filler_path)?;
+    drop(lease);
+
+    // Reopen the lease and read the previous generation after space is freed
+    let reopened = cache.lease(&key)?;
+    let mut active = reopened
+        .load_active(limits())?
+        .ok_or("committed generation disappeared")?;
+    assert_eq!(active.snapshot(), &first);
+    assert_eq!(active.metadata(), &json!({"generation":1}));
+    let mut cursor = Vec::new();
+    active.streams().2.read_to_end(&mut cursor)?;
+    assert_eq!(cursor, b"first-cursor");
+    Ok(())
+}
+
 #[test]
 fn oversized_state_cannot_replace_a_valid_active_generation() -> Result<(), Box<dyn Error>> {
     let temporary = tempfile::tempdir()?;
