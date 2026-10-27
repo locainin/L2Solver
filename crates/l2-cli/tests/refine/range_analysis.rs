@@ -238,7 +238,7 @@ fn large_sparse_input_carves_validated_cross_window_ranges_without_a_source_blob
         source
             .get("reason")
             .and_then(serde_json::Value::as_str)
-            .is_some_and(|reason| reason.contains("ZIP end search covers at most"))
+            .is_some_and(|reason| reason.contains("ZIP end observation is subject to work"))
     );
     let original_identity = l2_workbench::job::cache::SourceIdentity::sha256_file(&input)?;
     let identity = serde_json::to_value(original_identity)?;

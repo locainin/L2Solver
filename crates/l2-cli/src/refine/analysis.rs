@@ -31,7 +31,7 @@ use std::{
     io::{self, Write},
 };
 
-pub(super) const REFINE_ANALYZER_ALGORITHM_VERSION: u32 = 7;
+pub(super) const REFINE_ANALYZER_ALGORITHM_VERSION: u32 = 8;
 pub(super) const CACHE_ANALYSIS_SCHEMA_VERSION: u32 = 1;
 const MAX_CACHE_RECEIPT_BYTES: usize = 8 * 1024 * 1024;
 
@@ -381,7 +381,7 @@ fn analysis_reason(report: &l2_workbench::artifact::ArtifactAnalysis) -> Option<
     {
         let uncovered_bytes = uncovered_range.map_or(0, |range| range.length);
         return Some(format!(
-            "range analysis searches for embedded PNG and ZIP objects; objects up to {max_object_bytes} bytes fit across windows, subject to budgets; ZIP end search covers at most the final 65,557 bytes; {uncovered_bytes} source bytes lacked complete range coverage, {omitted_candidates} candidates and {signature_scans_omitted} signature scans were omitted; whole-source transforms were not performed; see artifact validation and member omissions for structural and expansion results"
+            "range analysis searches for embedded PNG and ZIP objects; objects up to {max_object_bytes} bytes fit across windows, subject to budgets; ZIP end observation is subject to work and candidate limits; {uncovered_bytes} source bytes lacked complete range coverage, {omitted_candidates} candidates and {signature_scans_omitted} signature scans were omitted; whole-source transforms were not performed; see artifact validation and member omissions for structural and expansion results"
         ));
     }
     match report.status {

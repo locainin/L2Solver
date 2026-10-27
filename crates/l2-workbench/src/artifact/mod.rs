@@ -16,6 +16,7 @@ mod png_stream;
 mod r2;
 mod range_analyzer;
 mod signatures;
+mod source_hash;
 mod validator;
 pub mod zip;
 
@@ -65,13 +66,14 @@ pub use png_pixels::{
 pub use png_stream::{PngRangeChunk, PngRangeReport, PngReadError, parse_png_from_reader};
 pub use r2::import_r2_json;
 pub use range_analyzer::{
-    StreamPngAnalysis, StreamPngBoundary, analyze_artifacts_from_reader,
-    analyze_artifacts_with_prefix_checkpoint_from_reader, analyze_png_artifacts_from_reader,
+    StreamPngBoundary, StreamSourceAnalysis, analyze_artifacts_from_reader,
+    analyze_artifacts_observing_zip_ends,
 };
 pub use signatures::{
     FILE_SIGNATURE_RELATION_REASON, FileSignatureCatalogue, FileSignatureEvidence,
     FileSignatureMatch, FileSignatureMatchKind, FileSignatureReport, scan_file_signatures,
 };
+pub use source_hash::{StreamZipEnd, ZipEndObservation, ZipEndScanLimits};
 pub use validator::{
     ArtifactBoundaryEvidence, ArtifactResourceOmissionReason, ArtifactStructure,
     ArtifactValidationFailure, ArtifactValidationFormat, ArtifactValidationOutcome,

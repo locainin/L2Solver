@@ -284,14 +284,10 @@ impl LoadedSource {
                 .ok_or_else(|| invalid_input("source read length overflows"))?,
         )?;
         let mut reader = CancellableReader::new(file, job);
-        let mut scan_options = options;
-        if zip_candidate.is_some() {
-            scan_options.limits.max_total_work_bytes -= options.limits.max_total_work_bytes / 2;
-        }
         let checkpoint = zip_candidate
             .as_ref()
             .and_then(|candidate| (candidate.length < source.length).then_some(candidate.length));
-        let scanned = analyze_source_stream(&mut reader, source.length, scan_options, checkpoint)?;
+        let scanned = analyze_source_stream(&mut reader, source.length, options, checkpoint)?;
         let mut report = scanned.analysis;
         let mut png = scanned.png;
         let mut file = reader.into_inner();
@@ -309,8 +305,11 @@ impl LoadedSource {
         }
         let (archive, retain_source) = inspect_source_archive(
             &mut file,
-            zip_candidate,
-            scanned.prefix_sha256,
+            ObservedArchiveEnds {
+                tail: zip_candidate,
+                prefix_sha256: scanned.prefix_sha256,
+                stream: scanned.zip_observation,
+            },
             &mut report,
             options,
             input_set,
@@ -362,7 +361,7 @@ fn analyze_source_stream(
     length: usize,
     options: l2_workbench::artifact::ArtifactAnalysisOptions,
     checkpoint: Option<usize>,
-) -> Result<l2_workbench::artifact::StreamPngAnalysis, Box<dyn Error>> {
+) -> Result<l2_workbench::artifact::StreamSourceAnalysis, Box<dyn Error>> {
     let mut signature = [0_u8; l2_workbench::artifact::PNG_SIGNATURE.len()];
     let count = length.min(signature.len());
     let prefix = signature
@@ -375,33 +374,39 @@ fn analyze_source_stream(
         .get(..count)
         .ok_or_else(|| invalid_input("source prefix length is invalid"))?;
     let mut complete = io::Cursor::new(prefix).chain(reader);
-    if let Some(offset) = checkpoint {
-        Ok(
-            l2_workbench::artifact::analyze_artifacts_with_prefix_checkpoint_from_reader(
-                &mut complete,
-                length,
-                options,
-                offset,
-                is_png,
-            )?,
-        )
-    } else if is_png {
-        Ok(l2_workbench::artifact::analyze_png_artifacts_from_reader(
+    let mut stream_options = options;
+    // Leave work for canonical ZIP validation after observing source markers
+    let total_work = options.limits.max_total_work_bytes;
+    let zip_work = if total_work >= 1024 * 1024 {
+        (total_work / 8).min(16 * 1024 * 1024)
+    } else {
+        0
+    };
+    stream_options.limits.max_total_work_bytes -= zip_work;
+    let remaining = if is_png && length < stream_options.limits.max_total_work_bytes {
+        stream_options.limits.max_total_work_bytes - length
+    } else {
+        stream_options.limits.max_total_work_bytes
+    };
+    let marker_work = if length <= remaining / 2 {
+        length
+    } else {
+        remaining / 16
+    };
+    let limits = l2_workbench::artifact::ZipEndScanLimits {
+        max_scan_bytes: length.min(marker_work),
+        max_candidates: (options.limits.max_input_bytes / 256).min(64),
+    };
+    Ok(
+        l2_workbench::artifact::analyze_artifacts_observing_zip_ends(
             &mut complete,
             length,
-            options,
-        )?)
-    } else {
-        Ok(l2_workbench::artifact::StreamPngAnalysis {
-            analysis: l2_workbench::artifact::analyze_artifacts_from_reader(
-                &mut complete,
-                length,
-                options,
-            )?,
-            png: None,
-            prefix_sha256: None,
-        })
-    }
+            stream_options,
+            checkpoint,
+            is_png,
+            limits,
+        )?,
+    )
 }
 
 fn confirm_range_source_name(
@@ -423,46 +428,94 @@ fn confirm_range_source_name(
     Ok(())
 }
 
+struct ObservedArchiveEnds {
+    tail: Option<super::range_zip::ZipCandidate>,
+    prefix_sha256: Option<String>,
+    stream: Option<l2_workbench::artifact::ZipEndObservation>,
+}
+
 fn inspect_source_archive(
     file: &mut File,
-    candidate: Option<super::range_zip::ZipCandidate>,
-    prefix_sha256: Option<String>,
+    ends: ObservedArchiveEnds,
     report: &mut l2_workbench::artifact::ArtifactAnalysis,
     options: l2_workbench::artifact::ArtifactAnalysisOptions,
     input: &InputSet,
     job: &Job,
 ) -> Result<(Option<l2_workbench::artifact::zip::ZipArtifactReport>, bool), Box<dyn Error>> {
-    let Some(candidate) = candidate else {
-        return Ok((None, false));
+    let mut candidates = if let Some(observation) = ends.stream {
+        if observation.unscanned_bytes > 0 || observation.omitted_candidates > 0 {
+            report.omissions.push(
+                l2_workbench::artifact::AnalysisOmission::SourceRangeValidationLimit {
+                    format: l2_workbench::artifact::AnalysisFormat::Zip,
+                    reason: format!(
+                        "ZIP end observation left {} bytes unscanned and omitted {} candidates",
+                        observation.unscanned_bytes, observation.omitted_candidates
+                    ),
+                },
+            );
+        }
+        observation.candidates
+    } else {
+        Vec::new()
     };
-    if candidate.multiple_boundaries {
+    let mut multiple = false;
+    if let Some(tail) = ends.tail {
+        multiple = tail.multiple_boundaries;
+        if !candidates
+            .iter()
+            .any(|candidate| candidate.end == tail.length)
+        {
+            let sha256 = if tail.length == report.source_length {
+                report.source_sha256.clone()
+            } else {
+                ends.prefix_sha256
+                    .ok_or_else(|| invalid_input("ZIP boundary digest is missing"))?
+            };
+            candidates.try_reserve(1)?;
+            candidates.push(l2_workbench::artifact::StreamZipEnd {
+                end: tail.length,
+                sha256,
+            });
+        }
+    }
+    if multiple || candidates.len() > 1 {
         report.omissions.push(
             l2_workbench::artifact::AnalysisOmission::SourceRangeValidationLimit {
                 format: l2_workbench::artifact::AnalysisFormat::Zip,
                 reason: String::from(
-                    "multiple ZIP end boundaries were found; only the last was inspected",
+                    "multiple ZIP end boundaries were found; candidates were checked until one validated",
                 ),
             },
         );
     }
-    let digest = if candidate.length == report.source_length {
-        report.source_sha256.clone()
-    } else {
-        prefix_sha256.ok_or_else(|| invalid_input("ZIP boundary digest is missing"))?
-    };
-    let length = candidate.length;
-    let archive = super::range_zip::inspect(file, length, &digest, report, options, input, job)?;
-    let retain = archive.is_some() && input.reserve_source_output(u64::try_from(length)?)?;
-    if archive.is_some() && !retain {
-        report.omissions.push(
-            l2_workbench::artifact::AnalysisOmission::SourceRangeOutputReadLimit {
-                length: u64::try_from(length)?,
-                remaining: input.extra_read_bytes(),
-                maximum: input.budget.maximum(),
-            },
-        );
+    candidates.sort_unstable_by_key(|candidate| std::cmp::Reverse(candidate.end));
+    for candidate in candidates {
+        let Some(archive) = super::range_zip::inspect(
+            file,
+            candidate.end,
+            &candidate.sha256,
+            report,
+            options,
+            input,
+            job,
+        )?
+        else {
+            continue;
+        };
+        let length = u64::try_from(candidate.end)?;
+        let retain = input.reserve_source_output(length)?;
+        if !retain {
+            report.omissions.push(
+                l2_workbench::artifact::AnalysisOmission::SourceRangeOutputReadLimit {
+                    length,
+                    remaining: input.extra_read_bytes(),
+                    maximum: input.budget.maximum(),
+                },
+            );
+        }
+        return Ok((Some(archive), retain));
     }
-    Ok((archive, retain))
+    Ok((None, false))
 }
 
 pub(super) struct CancellableReader<'a, R> {

@@ -4,10 +4,9 @@ use super::{
     AnalysisBoundary, AnalysisFormat, AnalysisOmission, AnalysisStatus, AnalyzedArtifact,
     ArtifactAnalysis, ArtifactAnalysisOptions, ArtifactOrigin, ArtifactValidationState,
     EmbeddedDiscoveryLimits, EmbeddedFormat, EmbeddedValidationEvidence, FileRange, PngLimits,
-    ValidationSummary, discover_embedded_objects_with_work, scan_file_signatures,
-    zip::ZipArtifactLimits,
+    ValidationSummary, ZipEndObservation, ZipEndScanLimits, discover_embedded_objects_with_work,
+    scan_file_signatures, source_hash::SourceHasher, zip::ZipArtifactLimits,
 };
-use sha2::{Digest, Sha256};
 use std::io::{self, Read};
 
 // Two windows fit within the caller's in-memory input budget
@@ -26,13 +25,15 @@ pub struct StreamPngBoundary {
 }
 
 /// Source analysis, an optional PNG boundary, and an optional prefix digest
-pub struct StreamPngAnalysis {
+pub struct StreamSourceAnalysis {
     /// Bounded rolling source analysis and the digest of the complete source
     pub analysis: ArtifactAnalysis,
     /// PNG structure when the source starts with a valid, affordable PNG
     pub png: Option<StreamPngBoundary>,
     /// SHA-256 at a requested prefix boundary, captured during the source pass
     pub prefix_sha256: Option<String>,
+    /// Optional bounded observation of unvalidated ZIP end records
+    pub zip_observation: Option<ZipEndObservation>,
 }
 
 /// Analyze bounded PNG and ZIP ranges while hashing the complete source stream
@@ -50,52 +51,70 @@ pub fn analyze_artifacts_from_reader(
     source_length: usize,
     options: ArtifactAnalysisOptions,
 ) -> io::Result<ArtifactAnalysis> {
-    let mut reader = ScannedReader::new(reader, source_length, options, None)?;
+    let mut reader = ScannedReader::new(reader, source_length, options, None, None)?;
     reader.drain_source()?;
     Ok(reader.finish()?.0)
 }
 
-/// Capture a prefix digest while analyzing the source and optionally validating PNG
+/// Observe possible ZIP ends while performing the same source pass and optional PNG scan
 ///
-/// The checkpoint must be within the declared source length. The reader is consumed once,
-/// and the returned full-source and prefix hashes come from the same SHA-256 state.
+/// Observed markers are candidates only. The caller must validate every selected range
+/// with the canonical ZIP parser. Observation work is charged to the shared work limit.
 ///
 /// # Errors
-/// Returns an I/O or policy error if the checkpoint or reader is invalid
-pub fn analyze_artifacts_with_prefix_checkpoint_from_reader(
+/// Returns an I/O or policy error if the work allowance or reader is invalid
+pub fn analyze_artifacts_observing_zip_ends(
     reader: &mut impl Read,
     source_length: usize,
     options: ArtifactAnalysisOptions,
-    checkpoint: usize,
+    checkpoint: Option<usize>,
     scan_png: bool,
-) -> io::Result<StreamPngAnalysis> {
-    if scan_png {
-        return analyze_png_inner(reader, source_length, options, Some(checkpoint));
-    }
-    let mut reader = ScannedReader::new(reader, source_length, options, Some(checkpoint))?;
-    reader.drain_source()?;
-    let (analysis, prefix_sha256) = reader.finish()?;
-    Ok(StreamPngAnalysis {
-        analysis,
-        png: None,
-        prefix_sha256,
-    })
-}
-
-/// Validate a source-start PNG while the same bytes feed the rolling analyzer
-///
-/// The canonical PNG scanner checks chunk boundaries and CRCs. Its work is reserved from
-/// the shared byte-work allowance before reading, and a PNG is returned only after IEND.
-/// A file with additional bytes keeps a separate digest for the complete source.
-///
-/// # Errors
-/// Returns an I/O or policy error if the source changes, reading fails, or storage fails
-pub fn analyze_png_artifacts_from_reader(
-    reader: &mut impl Read,
-    source_length: usize,
-    options: ArtifactAnalysisOptions,
-) -> io::Result<StreamPngAnalysis> {
-    analyze_png_inner(reader, source_length, options, None)
+    limits: ZipEndScanLimits,
+) -> io::Result<StreamSourceAnalysis> {
+    let scan_work = source_length.min(limits.max_scan_bytes);
+    let mut scan_options = options;
+    scan_options.limits.max_total_work_bytes = options
+        .limits
+        .max_total_work_bytes
+        .checked_sub(scan_work)
+        .filter(|remaining| *remaining > 0)
+        .ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "ZIP observation exceeds the byte-work limit",
+            )
+        })?;
+    let mut result = if scan_png {
+        analyze_png_inner(
+            reader,
+            source_length,
+            scan_options,
+            checkpoint,
+            Some(limits),
+        )?
+    } else {
+        let mut reader = ScannedReader::new(
+            reader,
+            source_length,
+            scan_options,
+            checkpoint,
+            Some(limits),
+        )?;
+        reader.drain_source()?;
+        let (analysis, prefix_sha256, zip_observation) = reader.finish()?;
+        StreamSourceAnalysis {
+            analysis,
+            png: None,
+            prefix_sha256,
+            zip_observation,
+        }
+    };
+    result.analysis.work_bytes = result
+        .analysis
+        .work_bytes
+        .checked_add(scan_work)
+        .ok_or_else(|| io::Error::other("ZIP observation work overflows"))?;
+    Ok(result)
 }
 
 fn analyze_png_inner(
@@ -103,27 +122,31 @@ fn analyze_png_inner(
     source_length: usize,
     options: ArtifactAnalysisOptions,
     checkpoint: Option<usize>,
-) -> io::Result<StreamPngAnalysis> {
+    zip_limits: Option<ZipEndScanLimits>,
+) -> io::Result<StreamSourceAnalysis> {
     if source_length >= options.limits.max_total_work_bytes {
-        let mut reader = ScannedReader::new(reader, source_length, options, checkpoint)?;
+        let mut reader =
+            ScannedReader::new(reader, source_length, options, checkpoint, zip_limits)?;
         reader.drain_source()?;
-        let (mut analysis, prefix_sha256) = reader.finish()?;
+        let (mut analysis, prefix_sha256, zip_observation) = reader.finish()?;
         analysis
             .omissions
             .push(AnalysisOmission::SourceRangeValidationLimit {
                 format: AnalysisFormat::Png,
                 reason: String::from("PNG validation exceeds the remaining byte-work limit"),
             });
-        return Ok(StreamPngAnalysis {
+        return Ok(StreamSourceAnalysis {
             analysis,
             png: None,
             prefix_sha256,
+            zip_observation,
         });
     }
     let mut scan_options = options;
     // Reserve the worst-case PNG scan before the rolling scanner spends work
     scan_options.limits.max_total_work_bytes -= source_length;
-    let mut reader = ScannedReader::new(reader, source_length, scan_options, checkpoint)?;
+    let mut reader =
+        ScannedReader::new(reader, source_length, scan_options, checkpoint, zip_limits)?;
     // Keep chunk metadata within the caller's bounded input allowance
     let metadata_bytes = std::mem::size_of::<super::PngRangeChunk>().max(1);
     let limits = PngLimits {
@@ -134,6 +157,8 @@ fn analyze_png_inner(
     };
     let result = super::parse_png_from_reader(&mut reader, source_length, limits);
     let consumed = reader.scanned.read_bytes;
+    // Unused PNG work remains available to later rolling windows
+    reader.scanned.state.refund_work(source_length - consumed)?;
     let (png, omission) = match result {
         Ok(report) => {
             let length = report.bytes_after_iend_range.offset;
@@ -146,7 +171,7 @@ fn analyze_png_inner(
             (
                 Some(StreamPngBoundary {
                     range: FileRange { offset: 0, length },
-                    sha256: format!("{:x}", reader.scanned.hasher.clone().finalize()),
+                    sha256: reader.scanned.hasher.current_digest(),
                     chunk_count: report.chunks.len(),
                 }),
                 None,
@@ -159,7 +184,7 @@ fn analyze_png_inner(
         Err(super::PngReadError::Format(_)) => (None, None),
     };
     reader.drain_source()?;
-    let (mut analysis, prefix_sha256) = reader.finish()?;
+    let (mut analysis, prefix_sha256, zip_observation) = reader.finish()?;
     analysis.work_bytes = analysis
         .work_bytes
         .checked_add(consumed)
@@ -172,10 +197,11 @@ fn analyze_png_inner(
                 reason,
             });
     }
-    Ok(StreamPngAnalysis {
+    Ok(StreamSourceAnalysis {
         analysis,
         png,
         prefix_sha256,
+        zip_observation,
     })
 }
 
@@ -190,10 +216,11 @@ impl<'a, R: Read> ScannedReader<'a, R> {
         source_length: usize,
         options: ArtifactAnalysisOptions,
         checkpoint: Option<usize>,
+        zip_limits: Option<ZipEndScanLimits>,
     ) -> io::Result<Self> {
         Ok(Self {
             inner: reader,
-            scanned: RangeCollector::new(source_length, options, checkpoint)?,
+            scanned: RangeCollector::new(source_length, options, checkpoint, zip_limits)?,
         })
     }
 
@@ -221,7 +248,7 @@ impl<'a, R: Read> ScannedReader<'a, R> {
         Ok(())
     }
 
-    fn finish(self) -> io::Result<(ArtifactAnalysis, Option<String>)> {
+    fn finish(self) -> io::Result<(ArtifactAnalysis, Option<String>, Option<ZipEndObservation>)> {
         self.scanned.finish()
     }
 }
@@ -255,9 +282,7 @@ struct RangeCollector {
     step: usize,
     window_capacity: usize,
     window: Vec<u8>,
-    hasher: Sha256,
-    checkpoint: Option<usize>,
-    prefix_sha256: Option<String>,
+    hasher: SourceHasher,
     stopped: bool,
 }
 
@@ -266,13 +291,8 @@ impl RangeCollector {
         source_length: usize,
         options: ArtifactAnalysisOptions,
         checkpoint: Option<usize>,
+        zip_limits: Option<ZipEndScanLimits>,
     ) -> io::Result<Self> {
-        if checkpoint.is_some_and(|offset| offset > source_length) {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "source hash checkpoint exceeds its length",
-            ));
-        }
         // A full Case may leave no output space while the source still needs hashing
         let mut validation_limits = options.limits;
         validation_limits.max_total_output_bytes = validation_limits.max_total_output_bytes.max(1);
@@ -300,29 +320,13 @@ impl RangeCollector {
             step,
             window_capacity,
             window,
-            hasher: Sha256::new(),
-            checkpoint,
-            prefix_sha256: checkpoint
-                .filter(|offset| *offset == 0)
-                .map(|_| format!("{:x}", Sha256::new().finalize())),
+            hasher: SourceHasher::new(source_length, checkpoint, zip_limits)?,
             stopped: false,
         })
     }
 
     fn accept(&mut self, bytes: &[u8]) -> io::Result<()> {
-        if let Some(split) = self
-            .checkpoint
-            .and_then(|offset| offset.checked_sub(self.read_bytes))
-            .filter(|split| *split > 0 && *split <= bytes.len())
-        {
-            let (before, after) = bytes.split_at(split);
-            self.hasher.update(before);
-            self.prefix_sha256 = Some(format!("{:x}", self.hasher.clone().finalize()));
-            self.hasher.update(after);
-            self.checkpoint = None;
-        } else {
-            self.hasher.update(bytes);
-        }
+        self.hasher.accept(bytes)?;
         self.read_bytes += bytes.len();
         if self.stopped || bytes.is_empty() {
             return Ok(());
@@ -350,14 +354,17 @@ impl RangeCollector {
         Ok(())
     }
 
-    fn finish(mut self) -> io::Result<(ArtifactAnalysis, Option<String>)> {
+    fn finish(
+        mut self,
+    ) -> io::Result<(ArtifactAnalysis, Option<String>, Option<ZipEndObservation>)> {
         while !self.stopped && !self.window.is_empty() {
             self.inspect_window()?;
         }
+        let hashes = self.hasher.finish()?;
         Ok((
-            self.state
-                .finish(format!("{:x}", self.hasher.finalize()), self.step),
-            self.prefix_sha256,
+            self.state.finish(hashes.source_sha256, self.step),
+            hashes.prefix_sha256,
+            hashes.zip_observation,
         ))
     }
 }
@@ -378,6 +385,20 @@ struct RangeState {
 }
 
 impl RangeState {
+    fn refund_work(&mut self, bytes: usize) -> io::Result<()> {
+        self.work_remaining = self
+            .work_remaining
+            .checked_add(bytes)
+            .ok_or_else(|| io::Error::other("range work allowance overflows"))?;
+        self.options.limits.max_total_work_bytes = self
+            .options
+            .limits
+            .max_total_work_bytes
+            .checked_add(bytes)
+            .ok_or_else(|| io::Error::other("range work limit overflows"))?;
+        Ok(())
+    }
+
     const fn new(options: ArtifactAnalysisOptions, source_length: usize) -> Self {
         let limits = options.limits;
         Self {

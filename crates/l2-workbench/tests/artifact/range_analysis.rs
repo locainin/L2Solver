@@ -6,16 +6,182 @@ use std::{
 use super::{image_support::structural_png, zip_support};
 use l2_workbench::artifact::{
     AnalysisOmission, AnalysisStatus, ArtifactAnalysisOptions, ArtifactOrigin,
-    ArtifactValidationState, EmbeddedFormat, FileRange, analyze_artifacts_from_reader,
-    analyze_artifacts_with_prefix_checkpoint_from_reader, analyze_png_artifacts_from_reader,
+    ArtifactValidationState, EmbeddedFormat, FileRange, ZipEndScanLimits,
+    analyze_artifacts_from_reader, analyze_artifacts_observing_zip_ends,
 };
+
+fn analyze_with_checkpoint(
+    reader: &mut impl Read,
+    length: usize,
+    settings: ArtifactAnalysisOptions,
+    checkpoint: usize,
+    scan_png: bool,
+) -> io::Result<l2_workbench::artifact::StreamSourceAnalysis> {
+    analyze_artifacts_observing_zip_ends(
+        reader,
+        length,
+        settings,
+        Some(checkpoint),
+        scan_png,
+        ZipEndScanLimits {
+            max_scan_bytes: 0,
+            max_candidates: 0,
+        },
+    )
+}
+
+fn analyze_png_only(
+    reader: &mut impl Read,
+    length: usize,
+    settings: ArtifactAnalysisOptions,
+) -> io::Result<l2_workbench::artifact::StreamSourceAnalysis> {
+    analyze_artifacts_observing_zip_ends(
+        reader,
+        length,
+        settings,
+        None,
+        true,
+        ZipEndScanLimits {
+            max_scan_bytes: 0,
+            max_candidates: 0,
+        },
+    )
+}
+
+#[test]
+fn zip_end_observation_crosses_short_reads_and_captures_the_prefix_hash()
+-> Result<(), Box<dyn Error>> {
+    struct ShortReader<'a> {
+        source: Cursor<&'a [u8]>,
+        bytes: usize,
+    }
+    impl Read for ShortReader<'_> {
+        fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+            let count = buffer.len().min(3);
+            let read = self.source.read(
+                buffer
+                    .get_mut(..count)
+                    .ok_or_else(|| io::Error::other("invalid test buffer"))?,
+            )?;
+            self.bytes += read;
+            Ok(read)
+        }
+    }
+    let mut source = b"prefix".to_vec();
+    source.extend_from_slice(b"PK\x05\x06");
+    source.extend_from_slice(&[0_u8; 18]);
+    let boundary = source.len();
+    source.extend_from_slice(&[9_u8; 300]);
+    let mut reader = ShortReader {
+        source: Cursor::new(&source),
+        bytes: 0,
+    };
+    let result = analyze_artifacts_observing_zip_ends(
+        &mut reader,
+        source.len(),
+        options(),
+        None,
+        false,
+        ZipEndScanLimits {
+            max_scan_bytes: source.len(),
+            max_candidates: 4,
+        },
+    )?;
+    let observation = result.zip_observation.ok_or("ZIP observation missing")?;
+    assert_eq!(observation.candidates.len(), 1);
+    let candidate = observation.candidates.first().ok_or("candidate missing")?;
+    assert_eq!(candidate.end, boundary);
+    assert_eq!(
+        candidate.sha256,
+        l2_workbench::sha256(source.get(..boundary).ok_or("prefix missing")?)
+    );
+    assert_eq!(reader.bytes, source.len());
+    assert_eq!(result.analysis.source_sha256, l2_workbench::sha256(&source));
+    Ok(())
+}
+
+#[test]
+fn zip_end_observation_reports_candidate_and_scan_limits() -> Result<(), Box<dyn Error>> {
+    let mut source = Vec::new();
+    for _ in 0..3 {
+        source.extend_from_slice(b"PK\x05\x06");
+        source.extend_from_slice(&[0_u8; 18]);
+    }
+    let result = analyze_artifacts_observing_zip_ends(
+        &mut Cursor::new(&source),
+        source.len(),
+        options(),
+        None,
+        false,
+        ZipEndScanLimits {
+            max_scan_bytes: source.len(),
+            max_candidates: 1,
+        },
+    )?;
+    let observed = result.zip_observation.ok_or("ZIP observation missing")?;
+    assert_eq!(observed.candidates.len(), 1);
+    assert_eq!(observed.omitted_candidates, 2);
+    let result = analyze_artifacts_observing_zip_ends(
+        &mut Cursor::new(&source),
+        source.len(),
+        options(),
+        None,
+        false,
+        ZipEndScanLimits {
+            max_scan_bytes: 10,
+            max_candidates: 4,
+        },
+    )?;
+    let observed = result.zip_observation.ok_or("ZIP observation missing")?;
+    assert_eq!(observed.scanned_bytes, 10);
+    assert!(observed.candidates.is_empty());
+    assert_eq!(observed.unscanned_bytes, source.len());
+    Ok(())
+}
+
+#[test]
+fn png_iend_and_zip_end_hashes_remain_exact_with_shared_lookahead() -> Result<(), Box<dyn Error>> {
+    let png = structural_png(&[])?;
+    let mut source = png.clone();
+    source.extend_from_slice(b"PK\x05\x06");
+    let mut fields = [0_u8; 18];
+    *fields.get_mut(16).ok_or("comment length missing")? = 7;
+    source.extend_from_slice(&fields);
+    source.extend_from_slice(b"comment");
+    let zip_end = source.len();
+    source.extend_from_slice(b"after ZIP");
+    let result = analyze_artifacts_observing_zip_ends(
+        &mut Cursor::new(&source),
+        source.len(),
+        options(),
+        Some(zip_end),
+        true,
+        ZipEndScanLimits {
+            max_scan_bytes: source.len(),
+            max_candidates: 4,
+        },
+    )?;
+    assert_eq!(
+        result.png.ok_or("PNG missing")?.sha256,
+        l2_workbench::sha256(&png)
+    );
+    let observation = result.zip_observation.ok_or("ZIP observation missing")?;
+    let end = observation.candidates.first().ok_or("ZIP end missing")?;
+    assert_eq!(end.end, zip_end);
+    assert_eq!(
+        end.sha256,
+        l2_workbench::sha256(source.get(..zip_end).ok_or("ZIP prefix missing")?)
+    );
+    assert_eq!(result.prefix_sha256.as_deref(), Some(end.sha256.as_str()));
+    Ok(())
+}
 
 #[test]
 fn prefix_checkpoint_and_full_source_hash_share_one_reader_pass() -> Result<(), Box<dyn Error>> {
     let source = structural_png(&[])?;
     let checkpoint = 17;
     for scan_png in [false, true] {
-        let result = analyze_artifacts_with_prefix_checkpoint_from_reader(
+        let result = analyze_with_checkpoint(
             &mut Cursor::new(&source),
             source.len(),
             options(),
@@ -36,14 +202,8 @@ fn prefix_checkpoint_and_full_source_hash_share_one_reader_pass() -> Result<(), 
 fn prefix_checkpoint_outside_the_source_is_rejected() {
     let source = [0_u8; 8];
     assert!(
-        analyze_artifacts_with_prefix_checkpoint_from_reader(
-            &mut Cursor::new(&source),
-            source.len(),
-            options(),
-            9,
-            false
-        )
-        .is_err()
+        analyze_with_checkpoint(&mut Cursor::new(&source), source.len(), options(), 9, false)
+            .is_err()
     );
 }
 
@@ -69,7 +229,7 @@ fn streamed_png_and_source_are_hashed_in_one_pass_with_exact_iend_range()
     };
     let mut settings = options();
     settings.limits.max_input_bytes = 256;
-    let result = analyze_png_artifacts_from_reader(&mut reader, source.len(), settings)?;
+    let result = analyze_png_only(&mut reader, source.len(), settings)?;
     let boundary = result.png.ok_or("valid PNG was not identified")?;
     assert_eq!(
         boundary.range,
@@ -93,8 +253,7 @@ fn streamed_png_and_source_are_hashed_in_one_pass_with_exact_iend_range()
 fn streamed_png_crc_failure_never_claims_a_validated_boundary() -> Result<(), Box<dyn Error>> {
     let mut source = structural_png(&[])?;
     *source.last_mut().ok_or("PNG is empty")? ^= 1;
-    let result =
-        analyze_png_artifacts_from_reader(&mut Cursor::new(&source), source.len(), options())?;
+    let result = analyze_png_only(&mut Cursor::new(&source), source.len(), options())?;
     assert!(result.png.is_none());
     assert_eq!(result.analysis.source_sha256, l2_workbench::sha256(&source));
     Ok(())
@@ -106,8 +265,7 @@ fn streamed_png_validation_work_limit_is_explicit_and_source_is_still_hashed()
     let source = structural_png(&[])?;
     let mut settings = options();
     settings.limits.max_total_work_bytes = 8;
-    let result =
-        analyze_png_artifacts_from_reader(&mut Cursor::new(&source), source.len(), settings)?;
+    let result = analyze_png_only(&mut Cursor::new(&source), source.len(), settings)?;
     assert!(result.png.is_none());
     assert!(result.analysis.omissions.iter().any(|omission| matches!(
         omission,

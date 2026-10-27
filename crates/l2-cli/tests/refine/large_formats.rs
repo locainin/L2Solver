@@ -419,6 +419,68 @@ fn multiple_plausible_zip_end_boundaries_are_reported_as_partial() -> Result<(),
 }
 
 #[test]
+fn zip_before_a_large_overlay_is_found_during_the_source_pass() -> Result<(), Box<dyn Error>> {
+    let directory = tempfile::tempdir()?;
+    let input = directory.path().join("archive-with-overlay.bin");
+    let output = directory.path().join("result");
+    write_archive_blocks(&input, 5, &super::structural_png()?, 70 * 64)?;
+    let archive_length = fs::metadata(&input)?.len();
+    let archive_digest = serde_json::to_value(SourceIdentity::sha256_file(&input)?)?
+        .get("value")
+        .and_then(serde_json::Value::as_str)
+        .ok_or("archive digest missing")?
+        .to_owned();
+    let mut source = fs::OpenOptions::new().append(true).open(&input)?;
+    for _ in 0..64 {
+        source.write_all(&[0_u8; 16 * 1024])?;
+    }
+    source.sync_all()?;
+    let source_length = fs::metadata(&input)?.len();
+    let options = RefineOptions {
+        input,
+        output: Some(output.clone()),
+        dry_run: false,
+        salvage: false,
+        recovery: RecoveryOptions {
+            no_cache: true,
+            memory_limit: 192 * 1024 * 1024,
+            source_read_limit: 160 * 1024 * 1024,
+            ..RecoveryOptions::default()
+        },
+    };
+    let job = Job::new("large ZIP overlay");
+    assert!(!super::run_with_job(&options, &mut Vec::new(), &job)?);
+    let reads = job
+        .snapshot()?
+        .counters
+        .get(&Counter::SourceReadBytes)
+        .copied()
+        .ok_or("read counter missing")?;
+    assert!(
+        reads >= source_length + archive_length
+            && reads <= source_length + archive_length + 1024 * 1024
+    );
+    let manifest: serde_json::Value =
+        serde_json::from_slice(&fs::read(output.join("manifest.json"))?)?;
+    let artifact = manifest
+        .get("artifacts")
+        .and_then(serde_json::Value::as_array)
+        .ok_or("artifacts missing")?
+        .iter()
+        .find(|item| {
+            item.get("sha256").and_then(serde_json::Value::as_str) == Some(archive_digest.as_str())
+        })
+        .ok_or("ZIP before large overlay was missed")?;
+    assert_eq!(
+        artifact
+            .get("byte_length")
+            .and_then(serde_json::Value::as_u64),
+        Some(archive_length)
+    );
+    Ok(())
+}
+
+#[test]
 #[expect(
     clippy::too_many_lines,
     reason = "the end-to-end assertions share one source and result"
