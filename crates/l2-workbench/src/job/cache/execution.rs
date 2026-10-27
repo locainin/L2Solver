@@ -20,9 +20,10 @@ use super::{
     error::{CacheError, Result},
     filesystem::HeldDirectory,
     key::StageKey,
-    manager::{now_ns, remove_generation},
+    manager::now_ns,
     manifest::safe_entry_path,
     model::{CheckpointStatus, JOB_SNAPSHOT_VERSION, supports_job_snapshot_version},
+    retired,
 };
 
 const ENVELOPE_VERSION: u32 = 1;
@@ -346,7 +347,7 @@ impl Lease {
         )?;
         if let Some(old) = old {
             // The new pointer is durable before the old generation can be removed
-            let _ = remove_generation(&self.cache.inner.entries, self.key.as_str(), &old);
+            let _ = retired::cleanup(&self.cache.inner, self.key.as_str(), &old);
         }
         Ok(())
     }
@@ -582,16 +583,13 @@ fn publish(
     let mut connection =
         database::open_connection(&lease.cache.inner.state_root, Durability::Checkpoint)?;
     let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
-    let old = transaction
-        .query_row(
-            "SELECT relative_path FROM executions WHERE key = ?1",
-            [lease.key.as_str()],
-            |row| row.get::<_, String>(0),
-        )
-        .optional()?;
-    if let Some(old) = &old {
-        safe_entry_path(lease.cache.inner.entries.path(), lease.key.as_str(), old)?;
-    }
+    let old = retired::record_current(
+        &transaction,
+        &lease.cache.inner.entries,
+        retired::Current::Execution,
+        lease.key.as_str(),
+        relative,
+    )?;
     transaction.execute(
         "INSERT INTO executions(key, relative_path, envelope_json, bytes) VALUES (?1, ?2, ?3, ?4)
          ON CONFLICT(key) DO UPDATE SET relative_path = excluded.relative_path, envelope_json = excluded.envelope_json, bytes = excluded.bytes",

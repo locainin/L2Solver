@@ -94,7 +94,7 @@ pub struct Checkpoint {
 pub struct CacheStats {
     /// Number of indexed stage results
     pub entries: u64,
-    /// Indexed stage and active execution bytes plus in-flight reservations
+    /// Stage, active, retired, and in-flight reserved bytes
     pub entry_bytes: u64,
     /// Bytes above the configured limit because leases or checkpoints prevent eviction
     pub over_limit_bytes: u64,
@@ -114,6 +114,6 @@ pub struct PruneReport {
     pub skipped_locked: u64,
     /// Entries retained by active durable checkpoints
     pub skipped_checkpoints: u64,
-    /// Stage, active execution, and reserved bytes remaining after pruning
+    /// Stage, active, retired, and reserved bytes remaining after pruning
     pub remaining_bytes: u64,
 }

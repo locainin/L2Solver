@@ -6,7 +6,10 @@ use std::{
     time::{Duration, Instant},
 };
 
-use super::error::{CacheError, Result};
+use super::{
+    error::{CacheError, Result},
+    manifest::{MAX_TREE_DEPTH, MAX_TREE_ITEMS},
+};
 
 const INTERNAL_LOCK_WAIT: Duration = Duration::from_secs(5);
 const INTERNAL_LOCK_RETRY: Duration = Duration::from_millis(10);
@@ -27,6 +30,48 @@ impl HeldDirectory {
         self.check_location()?;
         self.file.sync_all()?;
         self.check_location()
+    }
+
+    pub(super) fn sync_tree(&self) -> Result<()> {
+        let mut items = 0;
+        self.sync_tree_at(0, &mut items)
+    }
+
+    fn sync_tree_at(&self, depth: usize, items: &mut usize) -> Result<()> {
+        if depth > MAX_TREE_DEPTH {
+            return Err(CacheError::InvalidInput(
+                "cache entry directory tree is too deep",
+            ));
+        }
+        self.check_location()?;
+        for item in fs::read_dir(self.path())? {
+            let item = item?;
+            *items = items.checked_add(1).ok_or(CacheError::SizeOverflow)?;
+            if *items > MAX_TREE_ITEMS {
+                return Err(CacheError::InvalidInput(
+                    "cache entry contains too many files",
+                ));
+            }
+            let name = item.file_name();
+            let name = name
+                .to_str()
+                .ok_or(CacheError::InvalidInput("cache entry path is not UTF-8"))?;
+            let metadata = fs::symlink_metadata(item.path())?;
+            if metadata.file_type().is_symlink() {
+                return Err(CacheError::UnsafePath("cache entry contains a symlink"));
+            }
+            if metadata.is_dir() {
+                self.open_child_inner(name, false)?
+                    .sync_tree_at(depth + 1, items)?;
+            } else if metadata.is_file() {
+                self.open_file(name)?.sync_all()?;
+            } else {
+                return Err(CacheError::UnsafePath(
+                    "cache entry contains a non-regular file",
+                ));
+            }
+        }
+        self.sync()
     }
 
     pub(super) fn create_private_child(&self, prefix: &str) -> Result<(String, Self)> {
@@ -225,6 +270,10 @@ impl HeldDirectory {
     }
 
     pub(super) fn open_child(&self, name: &str) -> Result<Self> {
+        self.open_child_inner(name, true)
+    }
+
+    fn open_child_inner(&self, name: &str, restrict_mode: bool) -> Result<Self> {
         self.check_location()?;
         validate_component(name)?;
         let path = self.path.join(name);
@@ -258,7 +307,9 @@ impl HeldDirectory {
                 "cache directory changed while opening",
             ));
         }
-        set_private_directory_mode(&file)?;
+        if restrict_mode {
+            set_private_directory_mode(&file)?;
+        }
 
         Ok(Self { file, path })
     }

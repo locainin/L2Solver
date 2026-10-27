@@ -21,6 +21,7 @@ use super::{
     key::StageKey,
     manifest::safe_entry_path,
     model::{CacheReadPolicy, CacheStats, Checkpoint, CheckpointStatus, PruneReport, StageStatus},
+    retired,
 };
 
 const KEY_LOCK_SUFFIX: &str = ".lock";
@@ -104,6 +105,16 @@ impl CacheInner {
             .map_err(Into::into)
     }
 
+    // The quota lock is held while this reservation is created
+    pub(super) fn reserve_stage(&self, key: &StageKey, token: &str, bytes: i64) -> Result<()> {
+        let connection = database::open_connection(&self.state_root, Durability::Checkpoint)?;
+        connection.execute(
+            "INSERT INTO execution_reservations(token, key, bytes) VALUES (?1, ?2, ?3)",
+            params![token, key.as_str(), bytes],
+        )?;
+        Ok(())
+    }
+
     pub(super) fn record_entry(
         &self,
         key: &StageKey,
@@ -112,20 +123,28 @@ impl CacheInner {
         metadata_json: &str,
         manifest_json: &str,
         bytes: i64,
-    ) -> Result<Option<String>> {
+    ) -> Result<()> {
         let mut connection = database::open_connection(&self.state_root, Durability::Checkpoint)?;
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        // Publish the directory pointer and receipt together after the stage tree has been renamed
-        let old_relative = transaction
-            .query_row(
-                "SELECT relative_path FROM entries WHERE key = ?1",
-                [key.as_str()],
-                |row| row.get::<_, String>(0),
-            )
-            .optional()?;
-        if let Some(path) = &old_relative {
-            safe_entry_path(self.entries.path(), key.as_str(), path)?;
-        }
+        // Keep old bytes counted in the transaction that switches the live pointer
+        let old_stage = retired::record_current(
+            &transaction,
+            &self.entries,
+            retired::Current::Stage,
+            key.as_str(),
+            relative_path,
+        )?;
+        let old_execution = if status == StageStatus::Complete {
+            retired::record_current(
+                &transaction,
+                &self.entries,
+                retired::Current::Execution,
+                key.as_str(),
+                relative_path,
+            )?
+        } else {
+            None
+        };
         let now = now_ns();
         transaction.execute(
             "INSERT INTO entries (key, stage, status, relative_path, metadata_json, manifest_json, bytes, created_ns, accessed_ns)
@@ -150,6 +169,13 @@ impl CacheInner {
                 now,
             ],
         )?;
+        if transaction.execute(
+            "DELETE FROM execution_reservations WHERE token = ?1 AND key = ?2",
+            params![relative_path, key.as_str()],
+        )? != 1
+        {
+            return Err(CacheError::CorruptDatabase);
+        }
         if status == StageStatus::Complete {
             // Keep the terminal result and cursor retirement in the same transaction
             transaction.execute("DELETE FROM executions WHERE key = ?1", [key.as_str()])?;
@@ -159,7 +185,11 @@ impl CacheInner {
             )?;
         }
         transaction.commit()?;
-        Ok(old_relative)
+        for old in [old_stage, old_execution].into_iter().flatten() {
+            // Cleanup failure cannot undo a committed result or release its old quota
+            let _ = retired::cleanup(self, key.as_str(), &old);
+        }
+        Ok(())
     }
 
     pub(super) fn record_checkpoint(
@@ -346,6 +376,7 @@ impl Cache {
         {
             let _quota_lock = self.inner.quota_lock()?;
             self.clear_stale_execution(key.as_str())?;
+            retired::cleanup_key(&self.inner, key.as_str())?;
         }
         let staging_key = self.inner.staging.open_child_or_create(key.as_str())?;
         let active_checkpoint = self.inner.active_checkpoint(key.as_str())?;
@@ -453,7 +484,8 @@ impl Cache {
                  (SELECT count(*) FROM entries),
                  (SELECT COALESCE(sum(bytes), 0) FROM (
                     SELECT bytes FROM entries UNION ALL SELECT bytes FROM executions
-                    UNION ALL SELECT bytes FROM execution_reservations)),
+                    UNION ALL SELECT bytes FROM execution_reservations
+                    UNION ALL SELECT bytes FROM retired_generations)),
                  (SELECT count(*) FROM checkpoints)",
             [],
             |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
@@ -523,7 +555,7 @@ impl Cache {
             });
         }
 
-        let plan = self.capacity_plan(key, incoming_bytes, true)?;
+        let plan = self.capacity_plan(key, incoming_bytes)?;
         self.remove_capacity_candidates(&plan)?;
         drop(plan);
         Ok(quota_lock)
@@ -558,7 +590,7 @@ impl Cache {
         self.inner.check_locations()?;
         // Speculative reservation credit never causes an unrelated result to be evicted
         if evict {
-            let plan = self.capacity_plan(key, incoming_bytes, false)?;
+            let plan = self.capacity_plan(key, incoming_bytes)?;
             self.remove_capacity_candidates(&plan)?;
         } else {
             let required_bytes = self
@@ -591,22 +623,9 @@ impl Cache {
         Ok(())
     }
 
-    fn capacity_plan(
-        &self,
-        key: &StageKey,
-        incoming_bytes: u64,
-        replace_entry: bool,
-    ) -> Result<CapacityPlan> {
+    fn capacity_plan(&self, key: &StageKey, incoming_bytes: u64) -> Result<CapacityPlan> {
         let snapshot = self.eviction_snapshot()?;
-        let replaced_bytes = snapshot
-            .rows
-            .iter()
-            .find(|(candidate, _)| replace_entry && candidate == key.as_str())
-            .map_or(0, |(_, bytes)| *bytes);
-        let base_bytes = snapshot
-            .total_bytes
-            .checked_sub(replaced_bytes)
-            .ok_or(CacheError::CorruptDatabase)?;
+        let base_bytes = snapshot.total_bytes;
         let mut required_bytes = base_bytes
             .checked_add(incoming_bytes)
             .ok_or(CacheError::SizeOverflow)?;
@@ -693,11 +712,17 @@ impl Cache {
                     |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?)),
                 )
                 .optional()?;
-            let Some((relative_path, bytes)) = current else {
+            let Some((relative_path, stored_bytes)) = current else {
                 continue;
             };
-            let bytes = nonnegative(bytes)?;
-            safe_entry_path(self.inner.entries.path(), &candidate.key, &relative_path)?;
+            let bytes = nonnegative(stored_bytes)?;
+            retired::record(
+                &transaction,
+                &self.inner.entries,
+                &candidate.key,
+                &relative_path,
+                stored_bytes,
+            )?;
             if transaction.execute("DELETE FROM entries WHERE key = ?1", [&candidate.key])? == 1 {
                 remaining_bytes = remaining_bytes
                     .checked_sub(bytes)
@@ -713,7 +738,7 @@ impl Cache {
         }
         transaction.commit()?;
         for (candidate_key, relative_path) in removed {
-            remove_generation(&self.inner.entries, &candidate_key, &relative_path)?;
+            retired::cleanup(&self.inner, &candidate_key, &relative_path)?;
         }
         Ok(())
     }
@@ -734,6 +759,7 @@ impl Cache {
         let _quota_lock = self.inner.quota_lock()?;
         self.inner.check_locations()?;
         self.cleanup_stale_reservations()?;
+        self.cleanup_retired_generations()?;
         let snapshot = self.eviction_snapshot()?;
         self.cleanup_stale_staging(&snapshot.active_checkpoints)?;
         self.cleanup_orphan_generations()?;
@@ -808,24 +834,55 @@ impl Cache {
                 |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?)),
             )
             .optional()?;
-        let Some((relative_path, bytes)) = current else {
+        let Some((relative_path, stored_bytes)) = current else {
             *remaining = remaining.saturating_sub(snapshot_bytes);
             return Ok(());
         };
-        let bytes = nonnegative(bytes)?;
+        let bytes = nonnegative(stored_bytes)?;
         *remaining = remaining
             .saturating_sub(snapshot_bytes)
             .checked_add(bytes)
             .ok_or(CacheError::SizeOverflow)?;
-        safe_entry_path(self.inner.entries.path(), key, &relative_path)?;
+        retired::record(
+            &transaction,
+            &self.inner.entries,
+            key,
+            &relative_path,
+            stored_bytes,
+        )?;
         transaction.execute("DELETE FROM entries WHERE key = ?1", [key])?;
         transaction.commit()?;
 
-        remove_generation(&self.inner.entries, key, &relative_path)?;
+        retired::cleanup(&self.inner, key, &relative_path)?;
         *remaining = remaining.saturating_sub(bytes);
         report.removed_entries = report.removed_entries.saturating_add(1);
         report.removed_bytes = report.removed_bytes.saturating_add(bytes);
         drop(lock);
+        Ok(())
+    }
+
+    fn cleanup_retired_generations(&self) -> Result<()> {
+        let connection = database::open_connection(&self.inner.state_root, Durability::Checkpoint)?;
+        let mut statement = connection.prepare("SELECT DISTINCT key FROM retired_generations")?;
+        let keys = statement
+            .query_map([], |row| row.get::<_, String>(0))?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        for key in keys {
+            if !is_sha256_digest(&key) {
+                return Err(CacheError::CorruptDatabase);
+            }
+            let lock = match self
+                .inner
+                .locks
+                .lock(&format!("{key}{KEY_LOCK_SUFFIX}"), true)
+            {
+                Ok(lock) => lock,
+                Err(CacheError::LockBusy) => continue,
+                Err(error) => return Err(error),
+            };
+            retired::cleanup_key(&self.inner, &key)?;
+            drop(lock);
+        }
         Ok(())
     }
 
@@ -857,7 +914,8 @@ impl Cache {
 
     pub(super) fn clear_execution_debris(&self, key: &str) -> Result<()> {
         let _quota_lock = self.inner.quota_lock()?;
-        self.clear_stale_execution(key)
+        self.clear_stale_execution(key)?;
+        retired::cleanup_key(&self.inner, key)
     }
 
     fn clear_stale_execution(&self, key: &str) -> Result<()> {
@@ -892,7 +950,8 @@ impl Cache {
         let connection = database::open_connection(&self.inner.state_root, Durability::Checkpoint)?;
         let mut statement = connection.prepare(
             "SELECT relative_path FROM entries WHERE key = ?1 UNION ALL
-             SELECT relative_path FROM executions WHERE key = ?1",
+             SELECT relative_path FROM executions WHERE key = ?1 UNION ALL
+             SELECT relative_path FROM retired_generations WHERE key = ?1",
         )?;
         let current = statement
             .query_map([key], |row| row.get::<_, String>(0))?
@@ -909,7 +968,9 @@ impl Cache {
                     let name = name
                         .to_str()
                         .ok_or(CacheError::UnsafePath("generation name is invalid"))?;
-                    if !name.starts_with("active-") || current.contains(&format!("{key}/{name}")) {
+                    if !(name.starts_with("active-") || name.starts_with("lease-"))
+                        || current.contains(&format!("{key}/{name}"))
+                    {
                         continue;
                     }
                     let metadata = fs::symlink_metadata(item.path())?;
@@ -996,7 +1057,8 @@ impl Cache {
                 database::open_connection(&self.inner.state_root, Durability::Recomputable)?;
             let mut statement = connection.prepare(
                 "SELECT relative_path FROM entries WHERE key = ?1 UNION ALL
-                 SELECT relative_path FROM executions WHERE key = ?1",
+                 SELECT relative_path FROM executions WHERE key = ?1 UNION ALL
+             SELECT relative_path FROM retired_generations WHERE key = ?1",
             )?;
             let current = statement
                 .query_map([&key], |row| row.get::<_, String>(0))?
@@ -1048,7 +1110,8 @@ impl Cache {
             keys.push((key, bytes));
         }
         let mut statement = connection.prepare(
-            "SELECT bytes FROM executions UNION ALL SELECT bytes FROM execution_reservations",
+            "SELECT bytes FROM executions UNION ALL SELECT bytes FROM execution_reservations
+             UNION ALL SELECT bytes FROM retired_generations",
         )?;
         let protected_bytes = statement.query_map([], |row| row.get::<_, i64>(0))?;
         for bytes in protected_bytes {

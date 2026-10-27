@@ -198,43 +198,33 @@ impl Lease {
             .inner
             .entries
             .open_child_or_create(self.key.as_str())?;
-        let entry_root_path = entry_root.path().to_path_buf();
-        let destination = entry_root_path.join(&generation);
-
-        // A new generation keeps the previous indexed result available until the rename completes
-        if let Err(error) = fs::rename(&staging_path, &destination) {
-            return Err(error.into());
-        }
-        self.cleanup_on_drop = false;
-
+        let staging_key = self.cache.inner.staging.open_child(self.key.as_str())?;
         let relative_path = format!("{}/{generation}", self.key.as_str());
-        let old_relative = match self.cache.inner.record_entry(
+        self.cache
+            .inner
+            .reserve_stage(&self.key, &relative_path, bytes)?;
+        // Make every output file and directory durable before publishing the new pointer
+        self.directory.sync_tree()?;
+        if Manifest::scan(self.directory.path())? != manifest {
+            return Err(CacheError::CorruptEntry(
+                "stage changed while syncing".to_owned(),
+            ));
+        }
+        self.cache.inner.entries.sync()?;
+        staging_key.rename_child_to(&generation, &entry_root)?;
+        self.cleanup_on_drop = false;
+        // An uncertain rename or commit remains reserved for exclusive-key recovery
+        staging_key.sync()?;
+        entry_root.sync()?;
+
+        self.cache.inner.record_entry(
             &self.key,
             status,
             &relative_path,
             &metadata_json,
             &manifest_json,
             bytes,
-        ) {
-            Ok(old_relative) => old_relative,
-            Err(error) => {
-                let _ = fs::remove_dir_all(&destination);
-                return Err(error);
-            }
-        };
-
-        if let Some(old_relative) = old_relative {
-            let old_path = safe_entry_path(
-                self.cache.inner.entries.path(),
-                self.key.as_str(),
-                &old_relative,
-            )?;
-            if old_path != destination && old_path.exists() {
-                // The active database row already points at the new generation
-                // A failed best-effort removal leaves an unindexed directory for pruning
-                let _ = fs::remove_dir_all(old_path);
-            }
-        }
+        )?;
 
         entry_root.check_location()?;
         let final_directory = entry_root.open_child(&generation)?;

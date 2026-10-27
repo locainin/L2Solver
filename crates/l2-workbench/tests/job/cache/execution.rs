@@ -384,7 +384,7 @@ fn version_one_cache_migrates_without_losing_stage_or_checkpoint() -> Result<(),
     drop(cache);
     let database = rusqlite::Connection::open(temporary.path().join("state/cache.sqlite3"))?;
     database.execute_batch(
-        "DROP TABLE execution_reservations; DROP TABLE executions; PRAGMA user_version = 1;",
+        "DROP TABLE retired_generations; DROP TABLE execution_reservations; DROP TABLE executions; PRAGMA user_version = 1;",
     )?;
     drop(database);
     let migrated = cache_at(temporary.path(), 64 * 1024)?;
@@ -405,7 +405,7 @@ fn version_one_cache_migrates_without_losing_stage_or_checkpoint() -> Result<(),
     );
     let database = rusqlite::Connection::open(temporary.path().join("state/cache.sqlite3"))?;
     let version: u32 = database.pragma_query_value(None, "user_version", |row| row.get(0))?;
-    assert_eq!(version, 2);
+    assert_eq!(version, 3);
     Ok(())
 }
 
@@ -415,7 +415,7 @@ fn failed_version_one_migration_leaves_schema_and_version_unchanged() -> Result<
     let temporary = tempfile::tempdir()?;
     drop(cache_at(temporary.path(), 64 * 1024)?);
     let database = rusqlite::Connection::open(temporary.path().join("state/cache.sqlite3"))?;
-    database.execute_batch("DROP TABLE execution_reservations; DROP TABLE executions; CREATE TABLE executions (key TEXT); PRAGMA user_version = 1;")?;
+    database.execute_batch("DROP TABLE retired_generations; DROP TABLE execution_reservations; DROP TABLE executions; CREATE TABLE executions (key TEXT); PRAGMA user_version = 1;")?;
     drop(database);
     assert!(cache_at(temporary.path(), 64 * 1024).is_err());
     let database = rusqlite::Connection::open(temporary.path().join("state/cache.sqlite3"))?;
@@ -829,6 +829,276 @@ fn replacing_a_written_component_is_rejected_even_when_bytes_match() -> Result<(
             .ok_or("prior generation is missing")?
             .metadata(),
         &json!({"generation": 1})
+    );
+    Ok(())
+}
+
+#[test]
+fn terminal_commit_accounts_for_retired_bytes_until_cleanup_finishes() -> Result<(), Box<dyn Error>>
+{
+    let temporary = tempfile::tempdir()?;
+    let cache = cache_at(temporary.path(), 64 * 1024)?;
+    let key = stage_key("terminal-retirement-usage")?;
+    let snapshot = Job::new("terminal cleanup").snapshot()?;
+    let mut lease = cache.lease(&key)?;
+    lease.save_active(&snapshot, limits(), |writer| {
+        writer.streams().2.write_all(b"pending state")?;
+        Ok(json!({}))
+    })?;
+    let active_bytes = cache.stats()?.entry_bytes;
+    let database = rusqlite::Connection::open(temporary.path().join("state/cache.sqlite3"))?;
+    database.execute_batch("CREATE TRIGGER reject_cleanup BEFORE DELETE ON retired_generations BEGIN SELECT RAISE(ABORT, 'injected failure'); END;")?;
+    std::fs::write(lease.directory().join("result"), b"final")?;
+    drop(lease.commit(StageStatus::Complete, json!({}))?);
+    assert!(cache.stats()?.entry_bytes >= active_bytes + 5);
+    let reopened = cache_at(temporary.path(), 64 * 1024)?;
+    let result = reopened.lookup(
+        &key,
+        l2_workbench::job::cache::CacheReadPolicy::CompleteOnly,
+    )?;
+    assert!(result.is_some());
+    drop(result);
+    drop(reopened);
+    database.execute_batch("DROP TRIGGER reject_cleanup;")?;
+    cache.prune()?;
+    assert_eq!(cache.stats()?.entry_bytes, 5);
+    let lease = cache.lease(&key)?;
+    assert!(lease.load_active(limits())?.is_none());
+    Ok(())
+}
+
+#[test]
+fn terminal_commit_removes_the_retired_generation_after_publication() -> Result<(), Box<dyn Error>>
+{
+    let temporary = tempfile::tempdir()?;
+    let cache = cache_at(temporary.path(), 64 * 1024)?;
+    let key = stage_key("terminal-retired-files")?;
+    let mut lease = cache.lease(&key)?;
+    lease.save_active(
+        &Job::new("terminal cleanup").snapshot()?,
+        limits(),
+        |writer| {
+            writer.streams().2.write_all(b"pending")?;
+            Ok(json!({}))
+        },
+    )?;
+    let database = rusqlite::Connection::open(temporary.path().join("state/cache.sqlite3"))?;
+    let relative: String = database.query_row(
+        "SELECT relative_path FROM executions WHERE key = ?1",
+        [key.as_str()],
+        |row| row.get(0),
+    )?;
+    let retired = temporary.path().join("cache/entries").join(relative);
+    std::fs::write(lease.directory().join("result"), b"final")?;
+    drop(lease.commit(StageStatus::Complete, json!({}))?);
+    assert!(!retired.exists());
+    assert_eq!(cache.stats()?.entry_bytes, 5);
+    Ok(())
+}
+
+#[test]
+fn superseded_active_bytes_remain_counted_when_retirement_cleanup_fails()
+-> Result<(), Box<dyn Error>> {
+    let temporary = tempfile::tempdir()?;
+    let cache = cache_at(temporary.path(), 64 * 1024)?;
+    let key = stage_key("active-retirement-usage")?;
+    let snapshot = Job::new("active retirement").snapshot()?;
+    let mut lease = cache.lease(&key)?;
+    lease.save_active(&snapshot, limits(), |writer| {
+        writer.streams().2.write_all(b"first")?;
+        Ok(json!({"generation": 1}))
+    })?;
+    let prior_bytes = cache.stats()?.entry_bytes;
+    let database = rusqlite::Connection::open(temporary.path().join("state/cache.sqlite3"))?;
+    database.execute_batch("CREATE TRIGGER reject_cleanup BEFORE DELETE ON retired_generations BEGIN SELECT RAISE(ABORT, 'injected failure'); END;")?;
+    lease.save_active(&snapshot, limits(), |writer| {
+        writer.streams().2.write_all(b"later")?;
+        Ok(json!({"generation": 2}))
+    })?;
+    assert_eq!(cache.stats()?.entry_bytes, prior_bytes * 2);
+    assert_eq!(
+        lease
+            .load_active(limits())?
+            .ok_or("latest generation is missing")?
+            .metadata(),
+        &json!({"generation": 2})
+    );
+    drop(lease);
+    database.execute_batch("DROP TRIGGER reject_cleanup;")?;
+    cache.prune()?;
+    assert_eq!(cache.stats()?.entry_bytes, prior_bytes);
+    Ok(())
+}
+
+#[test]
+fn superseded_stage_bytes_remain_counted_when_retirement_cleanup_fails()
+-> Result<(), Box<dyn Error>> {
+    let temporary = tempfile::tempdir()?;
+    let cache = cache_at(temporary.path(), 64 * 1024)?;
+    let key = stage_key("stage-retirement-usage")?;
+    super::write_entry(&cache, &key, b"first")?;
+    let database = rusqlite::Connection::open(temporary.path().join("state/cache.sqlite3"))?;
+    database.execute_batch("CREATE TRIGGER reject_cleanup BEFORE DELETE ON retired_generations BEGIN SELECT RAISE(ABORT, 'injected failure'); END;")?;
+    super::write_entry(&cache, &key, b"latest")?;
+    assert_eq!(cache.stats()?.entry_bytes, 11);
+    database.execute_batch("DROP TRIGGER reject_cleanup;")?;
+    cache.prune()?;
+    assert_eq!(cache.stats()?.entry_bytes, 6);
+    Ok(())
+}
+
+#[test]
+fn version_two_cache_migrates_without_losing_active_generation() -> Result<(), Box<dyn Error>> {
+    let temporary = tempfile::tempdir()?;
+    let cache = cache_at(temporary.path(), 64 * 1024)?;
+    let key = stage_key("version-two-active-migration")?;
+    let snapshot = Job::new("migrated active").snapshot()?;
+    let mut lease = cache.lease(&key)?;
+    lease.save_active(&snapshot, limits(), |writer| {
+        writer.streams().2.write_all(b"cursor")?;
+        Ok(json!({"version": 2}))
+    })?;
+    drop(lease);
+    drop(cache);
+    let database = rusqlite::Connection::open(temporary.path().join("state/cache.sqlite3"))?;
+    database.execute_batch("DROP TABLE retired_generations; PRAGMA user_version = 2;")?;
+    drop(database);
+    let migrated = cache_at(temporary.path(), 64 * 1024)?;
+    let lease = migrated.lease(&key)?;
+    let mut active = lease
+        .load_active(limits())?
+        .ok_or("active generation was lost")?;
+    assert_eq!(active.snapshot(), &snapshot);
+    assert_eq!(active.metadata(), &json!({"version": 2}));
+    let mut bytes = Vec::new();
+    active.streams().2.read_to_end(&mut bytes)?;
+    assert_eq!(bytes, b"cursor");
+    Ok(())
+}
+
+#[test]
+fn stage_replacement_must_fit_while_the_previous_stage_is_still_present()
+-> Result<(), Box<dyn Error>> {
+    let temporary = tempfile::tempdir()?;
+    let cache = cache_at(temporary.path(), 8)?;
+    let key = stage_key("stage-replacement-peak-quota")?;
+    super::write_entry(&cache, &key, b"first")?;
+    let lease = cache.lease(&key)?;
+    std::fs::write(lease.directory().join("result"), b"latest")?;
+    assert!(matches!(
+        lease.commit(StageStatus::Complete, json!({})),
+        Err(CacheError::QuotaExceeded { .. })
+    ));
+    let prior = cache
+        .lookup(
+            &key,
+            l2_workbench::job::cache::CacheReadPolicy::CompleteOnly,
+        )?
+        .ok_or("prior stage was lost")?;
+    assert_eq!(
+        std::fs::read(prior.directory().join("result.bin"))?,
+        b"first"
+    );
+    Ok(())
+}
+
+#[cfg(unix)]
+#[test]
+fn terminal_commit_rejects_hardlinked_stage_files_and_preserves_prior_results()
+-> Result<(), Box<dyn Error>> {
+    let temporary = tempfile::tempdir()?;
+    let cache = cache_at(temporary.path(), 64 * 1024)?;
+    let key = stage_key("terminal-hardlink")?;
+    super::write_entry(&cache, &key, b"previous")?;
+    let snapshot = Job::new("hardlinked output").snapshot()?;
+    let mut lease = cache.lease(&key)?;
+    lease.save_active(&snapshot, limits(), |writer| {
+        writer.streams().2.write_all(b"cursor")?;
+        Ok(json!({}))
+    })?;
+    let outside = temporary.path().join("outside");
+    std::fs::write(&outside, b"new")?;
+    std::fs::hard_link(&outside, lease.directory().join("result"))?;
+    assert!(lease.commit(StageStatus::Complete, json!({})).is_err());
+    assert_eq!(std::fs::read(outside)?, b"new");
+    let prior = cache
+        .lookup(
+            &key,
+            l2_workbench::job::cache::CacheReadPolicy::CompleteOnly,
+        )?
+        .ok_or("prior stage was lost")?;
+    assert_eq!(
+        std::fs::read(prior.directory().join("result.bin"))?,
+        b"previous"
+    );
+    drop(prior);
+    assert!(cache.lease(&key)?.load_active(limits())?.is_some());
+    Ok(())
+}
+
+#[test]
+fn terminal_commit_syncs_nested_stage_directories_without_changing_their_contents()
+-> Result<(), Box<dyn Error>> {
+    let temporary = tempfile::tempdir()?;
+    let cache = cache_at(temporary.path(), 64 * 1024)?;
+    let key = stage_key("nested-terminal")?;
+    let lease = cache.lease(&key)?;
+    let nested = lease.directory().join("nested/child");
+    std::fs::create_dir_all(&nested)?;
+    std::fs::write(nested.join("result"), b"nested result")?;
+    let entry = lease.commit(StageStatus::Complete, json!({}))?;
+    assert_eq!(
+        std::fs::read(entry.directory().join("nested/child/result"))?,
+        b"nested result"
+    );
+    Ok(())
+}
+
+#[test]
+fn failed_terminal_publication_keeps_renamed_output_counted_until_recovery()
+-> Result<(), Box<dyn Error>> {
+    let temporary = tempfile::tempdir()?;
+    let cache = cache_at(temporary.path(), 64 * 1024)?;
+    let key = stage_key("terminal-ambiguous-publication")?;
+    super::write_entry(&cache, &key, b"previous")?;
+    let snapshot = Job::new("ambiguous publication").snapshot()?;
+    let mut lease = cache.lease(&key)?;
+    lease.save_active(&snapshot, limits(), |writer| {
+        writer.streams().2.write_all(b"cursor")?;
+        Ok(json!({}))
+    })?;
+    let baseline = cache.stats()?.entry_bytes;
+    let generation = lease
+        .directory()
+        .file_name()
+        .ok_or("stage generation is missing")?
+        .to_owned();
+    let destination = temporary
+        .path()
+        .join("cache/entries")
+        .join(key.as_str())
+        .join(generation);
+    std::fs::write(lease.directory().join("result"), b"new")?;
+    let database = rusqlite::Connection::open(temporary.path().join("state/cache.sqlite3"))?;
+    database.execute_batch("CREATE TRIGGER reject_result BEFORE INSERT ON entries BEGIN SELECT RAISE(ABORT, 'injected failure'); END;")?;
+    assert!(lease.commit(StageStatus::Complete, json!({})).is_err());
+    assert!(destination.exists());
+    assert_eq!(cache.stats()?.entry_bytes, baseline + 3);
+    database.execute_batch("DROP TRIGGER reject_result;")?;
+    let lease = cache.lease(&key)?;
+    assert!(!destination.exists());
+    assert_eq!(cache.stats()?.entry_bytes, baseline);
+    assert!(lease.load_active(limits())?.is_some());
+    drop(lease);
+    let prior = cache
+        .lookup(
+            &key,
+            l2_workbench::job::cache::CacheReadPolicy::CompleteOnly,
+        )?
+        .ok_or("prior stage was lost")?;
+    assert_eq!(
+        std::fs::read(prior.directory().join("result.bin"))?,
+        b"previous"
     );
     Ok(())
 }

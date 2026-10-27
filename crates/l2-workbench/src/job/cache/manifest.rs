@@ -10,8 +10,8 @@ use super::{
     fingerprint::FileTimestamp,
 };
 
-const MAX_TREE_ITEMS: usize = 100_000;
-const MAX_TREE_DEPTH: usize = 64;
+pub(super) const MAX_TREE_ITEMS: usize = 100_000;
+pub(super) const MAX_TREE_DEPTH: usize = 64;
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub(super) struct Manifest {

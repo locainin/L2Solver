@@ -10,6 +10,7 @@ mod key;
 mod manager;
 mod manifest;
 mod model;
+mod retired;
 
 pub use entry::{CacheEntry, Lease};
 pub use error::{CacheError, Result};

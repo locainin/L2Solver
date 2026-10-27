@@ -8,7 +8,7 @@ use super::{
 };
 
 pub(super) const DATABASE_NAME: &str = "cache.sqlite3";
-const SCHEMA_VERSION: u32 = 2;
+const SCHEMA_VERSION: u32 = 3;
 const APPLICATION_ID: i64 = 0x4c32_5343;
 const INITIALIZATION_LOCK: &str = "cache-init.lock";
 
@@ -37,10 +37,16 @@ pub(super) fn initialize(state: &HeldDirectory, locks: &HeldDirectory) -> Result
         return Err(CacheError::IncompatibleDatabase);
     }
     let version = u32::try_from(version).map_err(|_| CacheError::IncompatibleDatabase)?;
-    if version == 1 {
+    if matches!(version, 1 | 2) {
         validate_stage_schema(&connection)?;
+        if version == 2 {
+            validate_execution_schema(&connection)?;
+        }
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        create_execution_schema(&transaction)?;
+        if version == 1 {
+            create_execution_schema(&transaction)?;
+        }
+        create_retirement_schema(&transaction)?;
         validate_schema(&transaction)?;
         transaction.pragma_update(None, "user_version", SCHEMA_VERSION)?;
         transaction.commit()?;
@@ -110,6 +116,7 @@ fn create_schema(connection: &mut Connection) -> Result<()> {
          PRAGMA application_id = 1278366531;",
     )?;
     create_execution_schema(&transaction)?;
+    create_retirement_schema(&transaction)?;
     validate_schema(&transaction)?;
     transaction.pragma_update(None, "user_version", SCHEMA_VERSION)?;
     transaction.commit()?;
@@ -118,6 +125,18 @@ fn create_schema(connection: &mut Connection) -> Result<()> {
 
 fn validate_schema(connection: &Connection) -> Result<()> {
     validate_stage_schema(connection)?;
+    validate_execution_schema(connection)?;
+    if !has_columns(
+        connection,
+        "retired_generations",
+        &["key", "relative_path", "bytes"],
+    )? {
+        return Err(CacheError::IncompatibleSchema(SCHEMA_VERSION));
+    }
+    Ok(())
+}
+
+fn validate_execution_schema(connection: &Connection) -> Result<()> {
     if !has_columns(
         connection,
         "executions",
@@ -146,6 +165,18 @@ fn create_execution_schema(connection: &Connection) -> Result<()> {
              bytes INTEGER NOT NULL CHECK(bytes >= 0)
          );
          CREATE INDEX IF NOT EXISTS execution_reservations_key ON execution_reservations(key);",
+    )?;
+    Ok(())
+}
+
+fn create_retirement_schema(connection: &Connection) -> Result<()> {
+    connection.execute_batch(
+        "CREATE TABLE IF NOT EXISTS retired_generations (
+             key TEXT NOT NULL CHECK(length(key) = 64),
+             relative_path TEXT NOT NULL,
+             bytes INTEGER NOT NULL CHECK(bytes >= 0),
+             PRIMARY KEY(key, relative_path)
+         );",
     )?;
     Ok(())
 }
