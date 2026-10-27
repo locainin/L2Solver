@@ -40,6 +40,79 @@ impl Default for ZipArtifactLimits {
     }
 }
 
+/// Resource limits for seekable ZIP metadata and member inspection
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ZipReaderLimits {
+    /// Archive, entry, expansion, and depth ceilings
+    pub archive: ZipArtifactLimits,
+    /// Largest combined directory and ZIP64 end metadata accepted before allocation
+    pub max_directory_bytes: usize,
+}
+
+impl Default for ZipReaderLimits {
+    fn default() -> Self {
+        Self {
+            archive: ZipArtifactLimits::default(),
+            max_directory_bytes: 16 * 1024 * 1024,
+        }
+    }
+}
+
+/// Remaining read and expansion work shared across seekable ZIP inspections
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ZipReaderBudget {
+    /// Bytes available for all source reads, including repeated range reads
+    pub read_bytes_remaining: usize,
+    /// Expanded member bytes available to the entire operation
+    pub expanded_bytes_remaining: usize,
+}
+
+/// Structural, resource, or I/O failure while inspecting a seekable ZIP source
+#[derive(Debug)]
+pub enum ZipReadError {
+    /// ZIP structure or configured archive limits were rejected
+    Format(ZipArtifactError),
+    /// A reader operation failed or the source ended early
+    Io(std::io::Error),
+    /// The source digest is not a lowercase SHA-256 value
+    InvalidSourceDigest,
+    /// ZIP directory and end metadata exceed their separate allowance
+    DirectoryLimit { length: u64, maximum: usize },
+    /// A random read would exceed the aggregate byte-work allowance
+    WorkLimit { requested: usize, remaining: usize },
+}
+
+impl fmt::Display for ZipReadError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Format(error) => error.fmt(formatter),
+            Self::Io(error) => error.fmt(formatter),
+            Self::InvalidSourceDigest => formatter.write_str("invalid ZIP source digest"),
+            Self::DirectoryLimit { length, maximum } => write!(
+                formatter,
+                "ZIP metadata has {length} bytes; maximum is {maximum}"
+            ),
+            Self::WorkLimit {
+                requested,
+                remaining,
+            } => write!(
+                formatter,
+                "ZIP read needs {requested} bytes; {remaining} remain"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for ZipReadError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Format(error) => Some(error),
+            Self::Io(error) => Some(error),
+            _ => None,
+        }
+    }
+}
+
 /// Why a ZIP entry was recorded without expanded bytes
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]

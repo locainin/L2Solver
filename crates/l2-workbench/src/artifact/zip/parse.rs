@@ -1,16 +1,16 @@
-use std::{
-    borrow::Cow,
-    io::{Cursor, Read},
-};
+use std::io::{Cursor, Read, Seek};
 
 use crc32fast::hash as crc32;
 use flate2::read::DeflateDecoder;
+use zip::read::{ArchiveOffset, Config};
 use zip::{ZipArchive, ZipReadOptions};
 
 use super::model::{
     ZipArtifactEntry, ZipArtifactEntryMetadata, ZipArtifactError, ZipArtifactLimits,
     ZipArtifactOmission, ZipArtifactOmissionReason, ZipArtifactReport, ZipEntryDataFailure,
+    ZipReadError, ZipReaderBudget, ZipReaderLimits,
 };
+use super::view::{Patch, Reader, View, ViewFailure};
 
 const STORED_METHOD: u16 = 0;
 const DEFLATE_METHOD: u16 = 8;
@@ -25,6 +25,7 @@ const EOCD_FIXED_SIZE: usize = 22;
 const ZIP64_LOCATOR_SIZE: usize = 20;
 const ZIP64_EOCD_MIN_SIZE: u64 = 44;
 const MAX_EOCD_COMMENT_SIZE: usize = 65_535;
+const ZIP64_SCAN_BLOCK_BYTES: usize = 64 * 1024;
 
 /// Inspect one ZIP archive using the default bounded limits
 ///
@@ -51,7 +52,8 @@ pub fn inspect_zip_with_limits(
 /// stub without treating an unrelated embedded `PK` marker as a complete archive.
 #[must_use]
 pub fn has_zip_end_record(bytes: &[u8]) -> bool {
-    !matches!(find_eocd(bytes), EocdSelection::None)
+    let view = View::new(Cursor::new(bytes), bytes.len(), usize::MAX);
+    !matches!(find_eocd(&view), EocdSelection::None)
 }
 
 /// Inspect a ZIP archive at a known nested depth
@@ -83,58 +85,142 @@ pub fn inspect_zip_at_depth_with_operation_budget(
     inspect_zip_at_depth_inner(bytes, limits, depth, Some(operation_budget_remaining))
 }
 
+/// Inspect a stable seekable archive using its already verified source digest
+///
+/// The source remains unchanged throughout this call. Metadata reads, directory bytes,
+/// expanded output and archive depth are subject to separate caller-selected limits.
+///
+/// # Errors
+/// Returns a structural, resource, digest, or source I/O failure
+pub fn inspect_zip_from_reader_with_source_sha256(
+    reader: &mut (impl Read + Seek),
+    source_length: usize,
+    source_sha256: &str,
+    limits: ZipReaderLimits,
+    depth: usize,
+    budget: &mut ZipReaderBudget,
+) -> Result<ZipArtifactReport, ZipReadError> {
+    if !crate::hashing::is_sha256_digest(source_sha256) {
+        return Err(ZipReadError::InvalidSourceDigest);
+    }
+    let view = View::new(reader, source_length, budget.read_bytes_remaining);
+    let result = inspect_view(
+        &view,
+        source_sha256,
+        limits.archive,
+        depth,
+        Some(&mut budget.expanded_bytes_remaining),
+        limits.max_directory_bytes,
+    );
+    budget.read_bytes_remaining = view.remaining();
+    if let Some(failure) = view.take_failure() {
+        return Err(match failure {
+            ViewFailure::Io(error) => ZipReadError::Io(error),
+            ViewFailure::WorkLimit {
+                requested,
+                remaining,
+            } => ZipReadError::WorkLimit {
+                requested,
+                remaining,
+            },
+            ViewFailure::Allocation => ZipReadError::Format(ZipArtifactError::AllocationFailure),
+        });
+    }
+    result
+}
+
 fn inspect_zip_at_depth_inner(
     bytes: &[u8],
     limits: ZipArtifactLimits,
     depth: usize,
-    mut operation_budget_remaining: Option<&mut usize>,
+    operation_budget_remaining: Option<&mut usize>,
 ) -> Result<ZipArtifactReport, ZipArtifactError> {
-    validate_limits(limits)?;
+    let view = View::new(Cursor::new(bytes), bytes.len(), usize::MAX);
+    let result = inspect_view(
+        &view,
+        &crate::sha256(bytes),
+        limits,
+        depth,
+        operation_budget_remaining,
+        usize::MAX,
+    );
+    if view.take_failure().is_some() {
+        return Err(ZipArtifactError::AllocationFailure);
+    }
+    result.map_err(|error| match error {
+        ZipReadError::Format(error) => error,
+        _ => ZipArtifactError::InvalidArchive,
+    })
+}
+
+fn inspect_view<R: Read + Seek>(
+    bytes: &View<R>,
+    source_sha256: &str,
+    limits: ZipArtifactLimits,
+    depth: usize,
+    mut operation_budget_remaining: Option<&mut usize>,
+    max_directory_bytes: usize,
+) -> Result<ZipArtifactReport, ZipReadError> {
+    validate_limits(limits).map_err(ZipReadError::Format)?;
     if bytes.len() > limits.max_archive_bytes {
-        return Err(ZipArtifactError::ArchiveTooLarge {
+        return Err(ZipReadError::Format(ZipArtifactError::ArchiveTooLarge {
             length: bytes.len(),
             maximum: limits.max_archive_bytes,
-        });
+        }));
     }
-
-    // Check the declared count against the caller budget before ZipArchive allocates directory records
-    let declared_entry_count = declared_entry_count(bytes)?;
+    // The declared count is checked before the ZIP library allocates records
+    let declared_entry_count = declared_entry_count(bytes).map_err(ZipReadError::Format)?;
     let entry_count = usize::try_from(declared_entry_count).map_err(|_| {
-        ZipArtifactError::EntryCountOutOfRange {
+        ZipReadError::Format(ZipArtifactError::EntryCountOutOfRange {
             count: declared_entry_count,
-        }
+        })
     })?;
-
     if depth > limits.max_depth {
         return limited_report(
             bytes,
+            source_sha256,
             depth,
             entry_count,
             ZipArtifactOmissionReason::DepthLimit,
-        );
+        )
+        .map_err(ZipReadError::Format);
     }
     if entry_count > limits.max_entries {
         return limited_report(
             bytes,
+            source_sha256,
             depth,
             entry_count,
             ZipArtifactOmissionReason::EntryCountLimit,
-        );
+        )
+        .map_err(ZipReadError::Format);
     }
-
-    let directory = declared_directory_layout(bytes, entry_count)?;
+    let directory = declared_directory_layout(bytes, entry_count).map_err(ZipReadError::Format)?;
+    let zip64_metadata = directory.zip64_record_offset.map_or(0, |start| {
+        directory
+            .eocd_offset
+            .saturating_sub(ZIP64_LOCATOR_SIZE)
+            .saturating_sub(start)
+    });
+    let metadata_bytes = directory
+        .size
+        .saturating_add(u64::try_from(zip64_metadata).unwrap_or(u64::MAX));
+    if metadata_bytes > u64::try_from(max_directory_bytes).unwrap_or(u64::MAX) {
+        return Err(ZipReadError::DirectoryLimit {
+            length: metadata_bytes,
+            maximum: max_directory_bytes,
+        });
+    }
     let PreparedArchive {
         mut archive,
         metadata_entries,
         member_failures,
-    } = prepare_archive(bytes, entry_count, directory)?;
-
-    let mut report = empty_report(bytes, depth, entry_count);
-    // Reserve only after the entry count has passed the caller's budget
+    } = prepare_archive(bytes, entry_count, directory).map_err(ZipReadError::Format)?;
+    let mut report = empty_report(bytes, source_sha256, depth, entry_count);
     report
         .entries
         .try_reserve_exact(entry_count)
-        .map_err(|_| ZipArtifactError::AllocationFailure)?;
+        .map_err(|_| ZipReadError::Format(ZipArtifactError::AllocationFailure))?;
     for (index, metadata) in metadata_entries.into_iter().enumerate() {
         inspect_member(
             &mut archive,
@@ -143,14 +229,14 @@ fn inspect_zip_at_depth_inner(
             limits,
             &mut report,
             &mut operation_budget_remaining,
-        )?;
+        )
+        .map_err(ZipReadError::Format)?;
     }
-
     Ok(report)
 }
 
 fn inspect_member(
-    archive: &mut ZipArchive<Cursor<Cow<'_, [u8]>>>,
+    archive: &mut ZipArchive<impl Read + Seek>,
     metadata: ZipArtifactEntryMetadata,
     structural_failure: Option<ZipEntryDataFailure>,
     limits: ZipArtifactLimits,
@@ -204,8 +290,8 @@ fn inspect_member(
     Ok(())
 }
 
-struct PreparedArchive<'a> {
-    archive: ZipArchive<Cursor<Cow<'a, [u8]>>>,
+struct PreparedArchive<'a, R> {
+    archive: ZipArchive<Reader<'a, R>>,
     metadata_entries: Vec<ZipArtifactEntryMetadata>,
     member_failures: Vec<Option<ZipEntryDataFailure>>,
 }
@@ -219,14 +305,22 @@ struct DirectoryLayout {
     zip64_record_offset: Option<usize>,
 }
 
-fn prepare_archive(
-    bytes: &[u8],
+fn prepare_archive<R: Read + Seek>(
+    bytes: &View<R>,
     entry_count: usize,
     directory: DirectoryLayout,
-) -> Result<PreparedArchive<'_>, ZipArtifactError> {
-    let reader_bytes = normalized_reader_bytes(bytes, directory)?;
-    let mut archive =
-        ZipArchive::new(Cursor::new(reader_bytes)).map_err(|_| ZipArtifactError::InvalidArchive)?;
+) -> Result<PreparedArchive<'_, R>, ZipArtifactError> {
+    let patches = normalized_reader_patches(bytes, directory)?;
+    // The checked directory already fixes the archive prefix, avoiding a full-source search
+    let archive_offset = directory
+        .start
+        .checked_sub(directory.relative_offset)
+        .ok_or(ZipArtifactError::InvalidArchive)?;
+    let config = Config {
+        archive_offset: ArchiveOffset::Known(archive_offset),
+    };
+    let mut archive = ZipArchive::with_config(config, Reader::new(bytes, patches))
+        .map_err(|_| ZipArtifactError::InvalidArchive)?;
     if archive.len() != entry_count {
         return Err(ZipArtifactError::InvalidArchive);
     }
@@ -275,7 +369,7 @@ fn prepare_archive(
 }
 
 fn validate_central_directory(
-    bytes: &[u8],
+    bytes: &View<impl Read + Seek>,
     directory_start: u64,
     directory_size: u64,
     expected_entries: usize,
@@ -325,7 +419,10 @@ fn validate_central_directory(
     Ok(())
 }
 
-fn central_file_header_size(bytes: &[u8], offset: usize) -> Result<usize, ZipArtifactError> {
+fn central_file_header_size(
+    bytes: &View<impl Read + Seek>,
+    offset: usize,
+) -> Result<usize, ZipArtifactError> {
     let name_length = read_u16(
         bytes,
         offset
@@ -358,7 +455,7 @@ fn central_file_header_size(bytes: &[u8], offset: usize) -> Result<usize, ZipArt
 }
 
 fn central_variable_record_size(
-    bytes: &[u8],
+    bytes: &View<impl Read + Seek>,
     offset: usize,
     fixed_size: usize,
     length_offset: usize,
@@ -393,9 +490,14 @@ fn validate_limits(limits: ZipArtifactLimits) -> Result<(), ZipArtifactError> {
     Ok(())
 }
 
-fn empty_report(bytes: &[u8], depth: usize, entry_count: usize) -> ZipArtifactReport {
+fn empty_report(
+    bytes: &View<impl Read + Seek>,
+    source_sha256: &str,
+    depth: usize,
+    entry_count: usize,
+) -> ZipArtifactReport {
     ZipArtifactReport {
-        archive_sha256: crate::sha256(bytes),
+        archive_sha256: source_sha256.to_owned(),
         archive_size: bytes.len(),
         depth,
         entry_count,
@@ -409,17 +511,18 @@ fn empty_report(bytes: &[u8], depth: usize, entry_count: usize) -> ZipArtifactRe
 }
 
 fn limited_report(
-    bytes: &[u8],
+    bytes: &View<impl Read + Seek>,
+    source_sha256: &str,
     depth: usize,
     entry_count: usize,
     reason: ZipArtifactOmissionReason,
 ) -> Result<ZipArtifactReport, ZipArtifactError> {
-    let mut report = empty_report(bytes, depth, entry_count);
+    let mut report = empty_report(bytes, source_sha256, depth, entry_count);
     record_omission(&mut report, reason, entry_count)?;
     Ok(report)
 }
 
-fn declared_entry_count(bytes: &[u8]) -> Result<u64, ZipArtifactError> {
+fn declared_entry_count(bytes: &View<impl Read + Seek>) -> Result<u64, ZipArtifactError> {
     let eocd_offset = match find_eocd(bytes) {
         EocdSelection::None => return Err(ZipArtifactError::InvalidArchive),
         EocdSelection::Ambiguous => return Err(ZipArtifactError::AmbiguousEndRecords),
@@ -461,7 +564,7 @@ fn declared_entry_count(bytes: &[u8]) -> Result<u64, ZipArtifactError> {
 }
 
 fn declared_directory_layout(
-    bytes: &[u8],
+    bytes: &View<impl Read + Seek>,
     entry_count: usize,
 ) -> Result<DirectoryLayout, ZipArtifactError> {
     let eocd_offset = match find_eocd(bytes) {
@@ -517,73 +620,59 @@ fn declared_directory_layout(
     selected.ok_or(ZipArtifactError::InvalidArchive)
 }
 
-fn normalized_reader_bytes(
-    bytes: &[u8],
+fn normalized_reader_patches(
+    bytes: &View<impl Read + Seek>,
     directory: DirectoryLayout,
-) -> Result<Cow<'_, [u8]>, ZipArtifactError> {
+) -> Result<Vec<Patch>, ZipArtifactError> {
     let start = usize::try_from(directory.start).map_err(|_| ZipArtifactError::InvalidArchive)?;
     if read_u32(bytes, start) != Some(CENTRAL_ARCHIVE_EXTRA_SIGNATURE) {
-        return Ok(Cow::Borrowed(bytes));
+        return Ok(Vec::new());
     }
-    let extra_size = central_variable_record_size(bytes, start, 8, 4, true)?;
-    let extra_size = u64::try_from(extra_size).map_err(|_| ZipArtifactError::InvalidArchive)?;
-    let normalized_size = directory
+    let extra_size = u64::try_from(central_variable_record_size(bytes, start, 8, 4, true)?)
+        .map_err(|_| ZipArtifactError::InvalidArchive)?;
+    let size = directory
         .size
         .checked_sub(extra_size)
         .ok_or(ZipArtifactError::InvalidArchive)?;
-    let normalized_offset = directory
+    let offset = directory
         .relative_offset
         .checked_add(extra_size)
         .ok_or(ZipArtifactError::InvalidArchive)?;
-    let mut normalized = Vec::new();
-    normalized
-        .try_reserve_exact(bytes.len())
-        .map_err(|_| ZipArtifactError::AllocationFailure)?;
-    normalized.extend_from_slice(bytes);
-
     let fields =
         read_eocd_fields(bytes, directory.eocd_offset).ok_or(ZipArtifactError::InvalidArchive)?;
+    let mut patches = Vec::new();
+    patches
+        .try_reserve_exact(4)
+        .map_err(|_| ZipArtifactError::AllocationFailure)?;
     if fields.directory_size != u32::MAX {
-        replace_u32(
-            &mut normalized,
-            directory.eocd_offset + 12,
-            u32::try_from(normalized_size).map_err(|_| ZipArtifactError::InvalidArchive)?,
-        )?;
+        patches.push(Patch {
+            offset: directory.eocd_offset + 12,
+            bytes: u32::try_from(size)
+                .map_err(|_| ZipArtifactError::InvalidArchive)?
+                .to_le_bytes()
+                .to_vec(),
+        });
     }
     if fields.directory_offset != u32::MAX {
-        replace_u32(
-            &mut normalized,
-            directory.eocd_offset + 16,
-            u32::try_from(normalized_offset).map_err(|_| ZipArtifactError::InvalidArchive)?,
-        )?;
+        patches.push(Patch {
+            offset: directory.eocd_offset + 16,
+            bytes: u32::try_from(offset)
+                .map_err(|_| ZipArtifactError::InvalidArchive)?
+                .to_le_bytes()
+                .to_vec(),
+        });
     }
     if let Some(record_offset) = directory.zip64_record_offset {
-        replace_u64(&mut normalized, record_offset + 40, normalized_size)?;
-        replace_u64(&mut normalized, record_offset + 48, normalized_offset)?;
+        patches.push(Patch {
+            offset: record_offset + 40,
+            bytes: size.to_le_bytes().to_vec(),
+        });
+        patches.push(Patch {
+            offset: record_offset + 48,
+            bytes: offset.to_le_bytes().to_vec(),
+        });
     }
-    Ok(Cow::Owned(normalized))
-}
-
-fn replace_u32(bytes: &mut [u8], offset: usize, value: u32) -> Result<(), ZipArtifactError> {
-    let end = offset
-        .checked_add(4)
-        .ok_or(ZipArtifactError::InvalidArchive)?;
-    bytes
-        .get_mut(offset..end)
-        .ok_or(ZipArtifactError::InvalidArchive)?
-        .copy_from_slice(&value.to_le_bytes());
-    Ok(())
-}
-
-fn replace_u64(bytes: &mut [u8], offset: usize, value: u64) -> Result<(), ZipArtifactError> {
-    let end = offset
-        .checked_add(8)
-        .ok_or(ZipArtifactError::InvalidArchive)?;
-    bytes
-        .get_mut(offset..end)
-        .ok_or(ZipArtifactError::InvalidArchive)?
-        .copy_from_slice(&value.to_le_bytes());
-    Ok(())
+    Ok(patches)
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -593,12 +682,12 @@ enum EocdSelection {
     Ambiguous,
 }
 
-fn find_eocd(bytes: &[u8]) -> EocdSelection {
+fn find_eocd(bytes: &View<impl Read + Seek>) -> EocdSelection {
     let Some(max_scan_size) = EOCD_FIXED_SIZE.checked_add(MAX_EOCD_COMMENT_SIZE) else {
         return EocdSelection::None;
     };
     let scan_start = bytes.len().saturating_sub(max_scan_size);
-    let Some(scan) = bytes.get(scan_start..) else {
+    let Some(scan) = bytes.get(scan_start..bytes.len()) else {
         return EocdSelection::None;
     };
 
@@ -635,7 +724,7 @@ fn find_eocd(bytes: &[u8]) -> EocdSelection {
     selected.map_or(EocdSelection::None, EocdSelection::Unique)
 }
 
-fn plausible_eocd(bytes: &[u8], offset: usize) -> bool {
+fn plausible_eocd(bytes: &View<impl Read + Seek>, offset: usize) -> bool {
     let Some(fields) = read_eocd_fields(bytes, offset) else {
         return false;
     };
@@ -657,7 +746,7 @@ struct EocdFields {
     directory_offset: u32,
 }
 
-fn read_eocd_fields(bytes: &[u8], offset: usize) -> Option<EocdFields> {
+fn read_eocd_fields(bytes: &View<impl Read + Seek>, offset: usize) -> Option<EocdFields> {
     let disk_number = read_u16(bytes, offset.checked_add(4)?)?;
     let directory_disk = read_u16(bytes, offset.checked_add(6)?)?;
     if disk_number != 0 || directory_disk != 0 {
@@ -672,7 +761,7 @@ fn read_eocd_fields(bytes: &[u8], offset: usize) -> Option<EocdFields> {
 }
 
 fn plausible_directory_fields(
-    bytes: &[u8],
+    bytes: &View<impl Read + Seek>,
     eocd_offset: usize,
     fields: EocdFields,
 ) -> Option<(u64, u64)> {
@@ -697,7 +786,7 @@ fn plausible_directory_fields(
 }
 
 fn zip64_directory_fields(
-    bytes: &[u8],
+    bytes: &View<impl Read + Seek>,
     eocd_offset: usize,
     fields: EocdFields,
 ) -> Option<(u64, u64)> {
@@ -725,25 +814,37 @@ fn zip64_directory_fields(
     ))
 }
 
-fn find_zip64_record_offset(bytes: &[u8], locator_offset: usize) -> Option<usize> {
+fn find_zip64_record_offset(
+    bytes: &View<impl Read + Seek>,
+    locator_offset: usize,
+) -> Option<usize> {
     let direct = read_u64(bytes, locator_offset.checked_add(8)?)
         .and_then(|offset| usize::try_from(offset).ok())
         .filter(|offset| zip64_record_entry_count(bytes, *offset, locator_offset).is_some());
-    direct.or_else(|| {
-        bytes
-            .get(..locator_offset)?
-            .windows(ZIP64_EOCD_SIGNATURE.len())
-            .enumerate()
-            .rev()
-            .find_map(|(offset, signature)| {
-                (signature == ZIP64_EOCD_SIGNATURE
-                    && zip64_record_entry_count(bytes, offset, locator_offset).is_some())
-                .then_some(offset)
-            })
-    })
+    if direct.is_some() {
+        return direct;
+    }
+    let mut end = locator_offset;
+    while end > 0 {
+        let start = end.saturating_sub(ZIP64_SCAN_BLOCK_BYTES);
+        let scan = bytes.get(start..end)?;
+        for (relative, signature) in scan.windows(ZIP64_EOCD_SIGNATURE.len()).enumerate().rev() {
+            let offset = start.checked_add(relative)?;
+            if signature == ZIP64_EOCD_SIGNATURE
+                && zip64_record_entry_count(bytes, offset, locator_offset).is_some()
+            {
+                return Some(offset);
+            }
+        }
+        if start == 0 {
+            break;
+        }
+        end = start.checked_add(ZIP64_EOCD_SIGNATURE.len() - 1)?;
+    }
+    None
 }
 
-fn zip64_record_before_eocd(bytes: &[u8], eocd_offset: usize) -> Option<usize> {
+fn zip64_record_before_eocd(bytes: &View<impl Read + Seek>, eocd_offset: usize) -> Option<usize> {
     let locator_offset = eocd_offset.checked_sub(ZIP64_LOCATOR_SIZE)?;
     if bytes.get(locator_offset..locator_offset.checked_add(4)?)? != ZIP64_LOCATOR_SIGNATURE {
         return None;
@@ -756,14 +857,17 @@ fn zip64_record_before_eocd(bytes: &[u8], eocd_offset: usize) -> Option<usize> {
     find_zip64_record_offset(bytes, locator_offset)
 }
 
-fn zip64_entry_count(bytes: &[u8], eocd_offset: usize) -> Result<u64, ZipArtifactError> {
+fn zip64_entry_count(
+    bytes: &View<impl Read + Seek>,
+    eocd_offset: usize,
+) -> Result<u64, ZipArtifactError> {
     let record_offset =
         zip64_record_before_eocd(bytes, eocd_offset).ok_or(ZipArtifactError::InvalidArchive)?;
     read_u64(bytes, record_offset + 32).ok_or(ZipArtifactError::InvalidArchive)
 }
 
 fn zip64_record_entry_count(
-    bytes: &[u8],
+    bytes: &View<impl Read + Seek>,
     record_offset: usize,
     locator_offset: usize,
 ) -> Option<u64> {
@@ -795,7 +899,7 @@ struct MemberLayout {
 }
 
 fn member_layout(
-    bytes: &[u8],
+    bytes: &View<impl Read + Seek>,
     metadata: &ZipArtifactEntryMetadata,
     directory_start: u64,
 ) -> Option<MemberLayout> {
@@ -839,7 +943,7 @@ fn member_layout(
     })
 }
 
-fn local_extra_has_zip64(bytes: &[u8], mut offset: usize, length: usize) -> bool {
+fn local_extra_has_zip64(bytes: &View<impl Read + Seek>, mut offset: usize, length: usize) -> bool {
     let Some(extra_end) = offset.checked_add(length) else {
         return false;
     };
@@ -868,7 +972,7 @@ fn local_extra_has_zip64(bytes: &[u8], mut offset: usize, length: usize) -> bool
 }
 
 fn descriptor_boundary(
-    bytes: &[u8],
+    bytes: &View<impl Read + Seek>,
     offset: usize,
     metadata: &ZipArtifactEntryMetadata,
     zip64: bool,
@@ -905,7 +1009,7 @@ fn descriptor_boundary(
 }
 
 fn descriptor_matches(
-    bytes: &[u8],
+    bytes: &View<impl Read + Seek>,
     offset: usize,
     metadata: &ZipArtifactEntryMetadata,
     zip64: bool,
@@ -969,26 +1073,20 @@ fn flag_descriptor_overlaps(
     }
 }
 
-fn read_u16(bytes: &[u8], offset: usize) -> Option<u16> {
-    let end = offset.checked_add(2)?;
-    let raw: [u8; 2] = bytes.get(offset..end)?.try_into().ok()?;
-    Some(u16::from_le_bytes(raw))
+fn read_u16(bytes: &View<impl Read + Seek>, offset: usize) -> Option<u16> {
+    bytes.array(offset).map(u16::from_le_bytes)
 }
 
-fn read_u32(bytes: &[u8], offset: usize) -> Option<u32> {
-    let end = offset.checked_add(4)?;
-    let raw: [u8; 4] = bytes.get(offset..end)?.try_into().ok()?;
-    Some(u32::from_le_bytes(raw))
+fn read_u32(bytes: &View<impl Read + Seek>, offset: usize) -> Option<u32> {
+    bytes.array(offset).map(u32::from_le_bytes)
 }
 
-fn read_u64(bytes: &[u8], offset: usize) -> Option<u64> {
-    let end = offset.checked_add(8)?;
-    let raw: [u8; 8] = bytes.get(offset..end)?.try_into().ok()?;
-    Some(u64::from_le_bytes(raw))
+fn read_u64(bytes: &View<impl Read + Seek>, offset: usize) -> Option<u64> {
+    bytes.array(offset).map(u64::from_le_bytes)
 }
 
 fn archive_entry_metadata(
-    archive: &mut ZipArchive<Cursor<Cow<'_, [u8]>>>,
+    archive: &mut ZipArchive<impl Read + Seek>,
     index: usize,
 ) -> Result<ZipArtifactEntryMetadata, ZipArtifactError> {
     let file = archive
@@ -1049,7 +1147,7 @@ fn omission_reason(
 }
 
 fn extract_entry(
-    archive: &mut ZipArchive<Cursor<Cow<'_, [u8]>>>,
+    archive: &mut ZipArchive<impl Read + Seek>,
     metadata: &ZipArtifactEntryMetadata,
     structural_failure: Option<ZipEntryDataFailure>,
 ) -> Result<Vec<u8>, ZipEntryDataFailure> {
