@@ -1,8 +1,10 @@
 #![cfg(target_os = "linux")]
 
 use std::{
-    env, io,
-    path::Path,
+    env,
+    ffi::OsStr,
+    io,
+    os::unix::ffi::OsStrExt,
     process::{Command, Stdio},
 };
 
@@ -16,15 +18,20 @@ const CHILD_SOCKET_ENV: &str = "L2SOLVER_HELPER_TEST_SOCKET";
 
 #[test]
 fn different_peer_snapshots_are_rejected() -> Result<(), Box<dyn std::error::Error>> {
-    if let Some(path) = env::var_os(CHILD_SOCKET_ENV) {
-        return connect_child(Path::new(&path));
+    if let Some(name) = env::var_os(CHILD_SOCKET_ENV) {
+        return connect_child(&name);
     }
 
     let socket_dir = tempfile::Builder::new()
         .prefix("l2solver-helper-peer-")
         .tempdir()?;
-    let socket_path = socket_dir.path().join("peer.sock");
-    let address = SocketAddrUnix::new(&socket_path)?;
+    // The random basename keeps the address short even under a deeply nested temporary root
+    let socket_name = socket_dir
+        .path()
+        .file_name()
+        .ok_or_else(|| io::Error::other("temporary directory has no basename"))?
+        .to_os_string();
+    let address = SocketAddrUnix::new_abstract_name(socket_name.as_os_str().as_bytes())?;
     let listener = socket_with(
         AddressFamily::UNIX,
         SocketType::SEQPACKET,
@@ -42,7 +49,7 @@ fn different_peer_snapshots_are_rejected() -> Result<(), Box<dyn std::error::Err
             "different_peer_snapshots_are_rejected",
             "--nocapture",
         ])
-        .env(CHILD_SOCKET_ENV, &socket_path)
+        .env(CHILD_SOCKET_ENV, &socket_name)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
@@ -67,13 +74,16 @@ fn different_peer_snapshots_are_rejected() -> Result<(), Box<dyn std::error::Err
     Ok(())
 }
 
-fn connect_child(path: &Path) -> Result<(), Box<dyn std::error::Error>> {
+fn connect_child(name: &OsStr) -> Result<(), Box<dyn std::error::Error>> {
     let socket = socket_with(
         AddressFamily::UNIX,
         SocketType::SEQPACKET,
         SocketFlags::CLOEXEC,
         None,
     )?;
-    connect(&socket, &SocketAddrUnix::new(path)?)?;
+    connect(
+        &socket,
+        &SocketAddrUnix::new_abstract_name(name.as_bytes())?,
+    )?;
     Ok(())
 }
