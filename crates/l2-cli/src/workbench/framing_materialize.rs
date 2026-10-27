@@ -10,7 +10,9 @@ mod service;
 pub(super) use service::FramingOutcome;
 pub(super) use service::PreparedFraming;
 pub(super) use service::commit_recovery;
-pub(super) use service::{FramingSelectionBasis, apply, apply_with_basis};
+pub(super) use service::{
+    FRAME_SCHEMA_VERSION, FramingSelectionBasis, apply, apply_with_basis, frame_stream_range,
+};
 pub(super) use service::{prepare_recovery_with_basis, validate_cli_discovered_rule};
 
 use super::load;

@@ -1157,9 +1157,15 @@ fn frames_for_one_view(case: &Case, view_id: u64) -> Vec<&Node> {
         .filter(|node| {
             node.kind == "custom_protocol_frame"
                 && node.details.get("input_node").and_then(Value::as_u64) == Some(view_id)
-                && node.details.get("framing_rule").is_some_and(|rule| {
-                    rule.get("kind").and_then(Value::as_str) == Some("delimiter")
-                        && rule.get("byte").and_then(Value::as_u64) == Some(0xff)
+                && case.edges().iter().any(|edge| {
+                    edge.to == node.id
+                        && edge.relation == "materialized"
+                        && case.node(edge.from).is_some_and(|receipt| {
+                            receipt.details.get("framing_rule").is_some_and(|rule| {
+                                rule.get("kind").and_then(Value::as_str) == Some("delimiter")
+                                    && rule.get("byte").and_then(Value::as_u64) == Some(0xff)
+                            })
+                        })
                 })
         })
         .collect()

@@ -7,13 +7,14 @@ use l2_workbench::{
     protocol::{self, BoundaryStatus, ByteRange, FrameBoundary, FramingKind},
 };
 use serde::{Deserialize, Serialize};
-use serde_json::json;
+use serde_json::{Value, json};
 use std::{error::Error, ops::Range};
 
 const FRAMING_LIMITATION: &str = "Materialized frame boundaries remain a selected hypothesis and do not establish an application grammar";
 const FRAMED_REASON: &str = "This exact byte interval follows the selected rule; the rule does not establish an application message boundary";
 const TAIL_REASON: &str =
     "These exact remaining bytes follow the selected rule's incomplete or invalid boundary result";
+pub(in crate::workbench) const FRAME_SCHEMA_VERSION: u32 = 2;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(in crate::workbench) struct FramingOutcome {
@@ -78,8 +79,6 @@ struct MaterializedFrames {
 struct MaterializationContext<'a> {
     input_node: u64,
     selection: &'a Selection,
-    rule: &'a FramingKind,
-    basis: FramingSelectionBasis,
 }
 
 #[derive(Serialize)]
@@ -168,7 +167,7 @@ pub(in crate::workbench) fn commit_recovery(
     } = prepared;
     case.transaction(|case| {
         validate_selection_basis(case, basis)?;
-        let materialized = materialize(case, input_node, &selection, &rule, basis)?;
+        let materialized = materialize(case, input_node, &selection, &rule)?;
         let receipt_node = add_receipt(case, input_node, &selection, &rule, basis, &materialized)?;
         link_receipt(case, input_node, receipt_node, basis, &materialized)?;
         case.add_limitation(FRAMING_LIMITATION)?;
@@ -191,7 +190,7 @@ fn add_receipt(
 ) -> Result<u64, Box<dyn Error>> {
     let input_sha256 = l2_workbench::sha256(&selection.input_bytes);
     let receipt = FramingReceipt {
-        schema_version: 1,
+        schema_version: FRAME_SCHEMA_VERSION,
         input_node,
         input_kind: &selection.input_kind,
         input_blob: &selection.input_blob,
@@ -211,7 +210,7 @@ fn add_receipt(
         Vec::new(),
         json!({
             "representation":"json_blob",
-            "receipt_schema_version":1,
+            "receipt_schema_version":FRAME_SCHEMA_VERSION,
             "input_node":input_node,
             "input_length":selection.input_bytes.len(),
             "input_sha256":input_sha256,
@@ -289,13 +288,10 @@ fn materialize(
     input_node: u64,
     selection: &Selection,
     rule: &FramingKind,
-    basis: FramingSelectionBasis,
 ) -> Result<MaterializedFrames, Box<dyn Error>> {
     let context = MaterializationContext {
         input_node,
         selection,
-        rule,
-        basis,
     };
     let mut result = MaterializedFrames {
         nodes: Vec::new(),
@@ -336,11 +332,11 @@ fn add_frame(
         bytes,
         &mappings,
         json!({
+            "framing_schema_version":FRAME_SCHEMA_VERSION,
             "input_node":context.input_node,
             "frame_index":frame_index,
-            "stream_range":range,
-            "framing_rule":context.rule,
-            "selection_basis":context.basis,
+            "stream_start":range.start,
+            "stream_end":range.end,
             "sha256":l2_workbench::sha256(bytes),
         }),
     )?;
@@ -368,10 +364,10 @@ fn add_tail(
         bytes,
         &mappings,
         json!({
+            "framing_schema_version":FRAME_SCHEMA_VERSION,
             "input_node":context.input_node,
-            "stream_range":range,
-            "framing_rule":context.rule,
-            "selection_basis":context.basis,
+            "stream_start":range.start,
+            "stream_end":range.end,
             "status":status,
             "issue_offset":range.start,
             "sha256":l2_workbench::sha256(bytes),
@@ -385,6 +381,25 @@ fn add_tail(
         reason: TAIL_REASON.to_owned(),
     })?;
     Ok(tail)
+}
+
+/// Read the exact stored range from a compact or legacy materialized frame
+pub(in crate::workbench) fn frame_stream_range(details: &Value) -> Option<ByteRange> {
+    match details.get("framing_schema_version") {
+        None if details.get("stream_start").is_none() && details.get("stream_end").is_none() => {
+            serde_json::from_value(details.get("stream_range")?.clone()).ok()
+        }
+        Some(version) if version.as_u64() == Some(u64::from(FRAME_SCHEMA_VERSION)) => {
+            if details.get("stream_range").is_some() {
+                return None;
+            }
+            Some(ByteRange {
+                start: usize::try_from(details.get("stream_start")?.as_u64()?).ok()?,
+                end: usize::try_from(details.get("stream_end")?.as_u64()?).ok()?,
+            })
+        }
+        _ => None,
+    }
 }
 
 fn validate_selection_basis(

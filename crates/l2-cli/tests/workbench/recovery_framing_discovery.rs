@@ -1834,8 +1834,9 @@ fn default_recovery_uses_typed_framing_survivors_when_report_details_are_compact
     assert!(case.nodes().iter().any(|node| {
         node.kind == "custom_protocol_frame"
             && node.details.get("input_node") == Some(&json!(input_node))
-            && node.details.get("framing_rule") == Some(&expected_rule)
-            && node.details.get("selection_basis") == Some(&expected_basis)
+            && case.edges().iter().any(|edge| {
+                edge.from == receipt.id && edge.to == node.id && edge.relation == "materialized"
+            })
     }));
     Ok(())
 }

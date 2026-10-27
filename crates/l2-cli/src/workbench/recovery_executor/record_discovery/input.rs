@@ -1,6 +1,8 @@
 use super::super::RecoveryExecutionError;
 use super::super::tcp_ancestry::{TcpAncestry, TcpAncestryError, TcpAncestryIndex};
-use crate::workbench::framing_materialize::FramingSelectionBasis;
+use crate::workbench::framing_materialize::{
+    FRAME_SCHEMA_VERSION, FramingSelectionBasis, frame_stream_range,
+};
 use l2_workbench::{
     evidence::{Case, EvidenceStatus, Node},
     protocol::{ByteRange, Direction, FramingKind, RecordSchemaProposalLimits},
@@ -221,6 +223,7 @@ struct FrameDescriptor<'a> {
     input_node_id: u64,
     frame_index: usize,
     stream_range: ByteRange,
+    schema_version: u32,
     framing_rule: FramingKind,
     normalized_rule: String,
     selection_basis: FramingSelectionBasis,
@@ -515,7 +518,7 @@ fn collect_frame<'a>(
     digest_cache: &mut HashMap<&'a str, String>,
     receipt_cache: &mut HashMap<&'a str, Result<Value, OmissionKind>>,
 ) -> Result<ResolvedFrame, Omission> {
-    let descriptor = inspect_frame(frame, blobs, sources, digest_cache)?;
+    let descriptor = inspect_frame(frame, nodes, blobs, sources, edges, digest_cache)?;
     let materialization = validate_materialization(
         frame,
         &descriptor,
@@ -643,8 +646,10 @@ fn relational_hypothesis(
 
 fn inspect_frame<'a>(
     frame: &'a Node,
+    nodes: &HashMap<u64, &'a Node>,
     blobs: &HashMap<&'a str, &'a l2_workbench::evidence::Blob>,
     sources: &HashSet<&'a str>,
+    edges: &EdgeIndex,
     digest_cache: &mut HashMap<&'a str, String>,
 ) -> Result<FrameDescriptor<'a>, Omission> {
     let source_id = exact_source(frame).map_err(|reason| (None, reason))?;
@@ -687,29 +692,10 @@ fn inspect_frame<'a>(
         .and_then(Value::as_u64)
         .and_then(|value| usize::try_from(value).ok())
         .ok_or_else(|| reject(OmissionKind::InvalidFrame))?;
-    let stream_range: ByteRange = serde_json::from_value(
-        frame
-            .details
-            .get("stream_range")
-            .cloned()
-            .ok_or_else(|| reject(OmissionKind::InvalidFrame))?,
-    )
-    .map_err(|_| reject(OmissionKind::InvalidFrame))?;
-    let framing_rule: FramingKind = serde_json::from_value(
-        frame
-            .details
-            .get("framing_rule")
-            .cloned()
-            .ok_or_else(|| reject(OmissionKind::InvalidFrame))?,
-    )
-    .map_err(|_| reject(OmissionKind::InvalidFrame))?;
-    if frame.details.get("framing_rule") != Some(&json!(framing_rule)) {
-        return Err(reject(OmissionKind::InvalidFrame));
-    }
-    let normalized_rule =
-        serde_json::to_string(&framing_rule).map_err(|_| reject(OmissionKind::InvalidFrame))?;
-    let selection_basis =
-        parse_selection_basis(frame.details.get("selection_basis")).map_err(reject)?;
+    let stream_range =
+        frame_stream_range(&frame.details).ok_or_else(|| reject(OmissionKind::InvalidFrame))?;
+    let (schema_version, framing_rule, normalized_rule, selection_basis) =
+        framing_identity(frame, &source_id, nodes, edges)?;
 
     Ok(FrameDescriptor {
         source_id,
@@ -719,10 +705,59 @@ fn inspect_frame<'a>(
         input_node_id,
         frame_index,
         stream_range,
+        schema_version,
         framing_rule,
         normalized_rule,
         selection_basis,
     })
+}
+
+fn framing_identity(
+    frame: &Node,
+    source_id: &str,
+    nodes: &HashMap<u64, &Node>,
+    edges: &EdgeIndex,
+) -> Result<(u32, FramingKind, String, FramingSelectionBasis), Omission> {
+    let reject = |reason| (Some(source_id.to_owned()), reason);
+    let schema_version = match frame.details.get("framing_schema_version") {
+        None => 1,
+        Some(value) if value.as_u64() == Some(u64::from(FRAME_SCHEMA_VERSION)) => {
+            FRAME_SCHEMA_VERSION
+        }
+        Some(_) => return Err(reject(OmissionKind::InvalidFrame)),
+    };
+    let framing_details = if schema_version == FRAME_SCHEMA_VERSION {
+        if frame.details.get("framing_rule").is_some()
+            || frame.details.get("selection_basis").is_some()
+        {
+            return Err(reject(OmissionKind::InvalidFrame));
+        }
+        // The single observed materialization edge is the compact receipt reference
+        let (_, receipt) = materialization_receipt_node(frame.id, source_id, nodes, edges)?;
+        &receipt.details
+    } else {
+        &frame.details
+    };
+    let framing_rule: FramingKind = serde_json::from_value(
+        framing_details
+            .get("framing_rule")
+            .cloned()
+            .ok_or_else(|| reject(OmissionKind::InvalidFrame))?,
+    )
+    .map_err(|_| reject(OmissionKind::InvalidFrame))?;
+    if framing_details.get("framing_rule") != Some(&json!(framing_rule)) {
+        return Err(reject(OmissionKind::InvalidFrame));
+    }
+    let normalized_rule =
+        serde_json::to_string(&framing_rule).map_err(|_| reject(OmissionKind::InvalidFrame))?;
+    let selection_basis =
+        parse_selection_basis(framing_details.get("selection_basis")).map_err(reject)?;
+    Ok((
+        schema_version,
+        framing_rule,
+        normalized_rule,
+        selection_basis,
+    ))
 }
 
 fn validate_materialization<'a>(
@@ -774,25 +809,8 @@ fn materialization_receipt<'case, 'cache>(
     receipt_cache: &'cache mut HashMap<&'case str, Result<Value, OmissionKind>>,
 ) -> Result<(u64, &'case Node, &'cache Value), Omission> {
     let reject = |reason| (Some(descriptor.source_id.clone()), reason);
-    let receipts = edges
-        .receipt_parents_by_frame
-        .get(&frame_id)
-        .map_or(&[][..], Vec::as_slice);
-    let [receipt_edge] = receipts else {
-        return Err(reject(if receipts.is_empty() {
-            OmissionKind::MissingReceipt
-        } else {
-            OmissionKind::AmbiguousReceipt
-        }));
-    };
-    if receipt_edge.1 != EvidenceStatus::Observed {
-        return Err(reject(OmissionKind::InvalidReceipt));
-    }
-    let receipt_node_id = receipt_edge.0;
-    let receipt_node = *nodes
-        .get(&receipt_node_id)
-        .filter(|node| node.kind == "custom_protocol_framing_receipt")
-        .ok_or_else(|| reject(OmissionKind::InvalidReceipt))?;
+    let (receipt_node_id, receipt_node) =
+        materialization_receipt_node(frame_id, &descriptor.source_id, nodes, edges)?;
     let receipt_blob_id = receipt_node
         .blob
         .as_deref()
@@ -821,6 +839,35 @@ fn materialization_receipt<'case, 'cache>(
     validate_selection_provenance(descriptor.selection_basis, receipt_node_id, nodes, edges)
         .map_err(reject)?;
     Ok((receipt_node_id, receipt_node, receipt))
+}
+
+fn materialization_receipt_node<'case>(
+    frame_id: u64,
+    source_id: &str,
+    nodes: &HashMap<u64, &'case Node>,
+    edges: &EdgeIndex,
+) -> Result<(u64, &'case Node), Omission> {
+    let reject = |reason| (Some(source_id.to_owned()), reason);
+    let receipts = edges
+        .receipt_parents_by_frame
+        .get(&frame_id)
+        .map_or(&[][..], Vec::as_slice);
+    let [receipt_edge] = receipts else {
+        return Err(reject(if receipts.is_empty() {
+            OmissionKind::MissingReceipt
+        } else {
+            OmissionKind::AmbiguousReceipt
+        }));
+    };
+    if receipt_edge.1 != EvidenceStatus::Observed {
+        return Err(reject(OmissionKind::InvalidReceipt));
+    }
+    let receipt_node_id = receipt_edge.0;
+    let receipt_node = *nodes
+        .get(&receipt_node_id)
+        .filter(|node| node.kind == "custom_protocol_framing_receipt")
+        .ok_or_else(|| reject(OmissionKind::InvalidReceipt))?;
+    Ok((receipt_node_id, receipt_node))
 }
 
 fn validate_selection_provenance(
@@ -904,9 +951,10 @@ fn validate_materialized_input<'a>(
             .bytes
             .get(descriptor.stream_range.start..descriptor.stream_range.end)
             != Some(descriptor.bytes)
-        || receipt_node.details.get("receipt_schema_version") != Some(&json!(1))
+        || receipt_node.details.get("receipt_schema_version")
+            != Some(&json!(descriptor.schema_version))
         || receipt_node.details.get("representation") != Some(&json!("json_blob"))
-        || receipt.get("schema_version") != Some(&json!(1))
+        || receipt.get("schema_version") != Some(&json!(descriptor.schema_version))
         || receipt.get("input_node").and_then(Value::as_u64) != Some(descriptor.input_node_id)
         || receipt.get("input_kind") != Some(&json!("tcp_byte_run"))
         || receipt.get("input_blob") != Some(&json!(input_blob_id))

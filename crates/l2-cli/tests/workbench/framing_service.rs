@@ -40,13 +40,26 @@ fn returns_created_frames() -> Result<(), Box<dyn Error>> {
     let receipt_json: serde_json::Value = serde_json::from_slice(&receipt_blob.bytes)?;
     assert_eq!(receipt_json.get("selection_basis"), Some(&caller_basis));
     assert!(receipt_json.get("interpretation").is_none());
-    for frame_id in &outcome.frame_nodes {
+    for (index, frame_id) in outcome.frame_nodes.iter().enumerate() {
         let frame = case
             .nodes()
             .iter()
             .find(|node| node.id == *frame_id)
             .ok_or("materialized frame is missing")?;
-        assert_eq!(frame.details.get("selection_basis"), Some(&caller_basis));
+        assert_eq!(frame.details.get("framing_schema_version"), Some(&json!(2)));
+        assert_eq!(frame.details.get("stream_start"), Some(&json!(index * 2)));
+        assert_eq!(
+            frame.details.get("stream_end"),
+            Some(&json!((index + 1) * 2))
+        );
+        assert!(frame.details.get("framing_rule").is_none());
+        assert!(frame.details.get("selection_basis").is_none());
+        assert!(case.edges().iter().any(|edge| {
+            edge.from == outcome.receipt_node
+                && edge.to == *frame_id
+                && edge.relation == "materialized"
+                && edge.status == EvidenceStatus::Observed
+        }));
         assert!(frame.details.get("interpretation").is_none());
     }
     Ok(())
@@ -150,7 +163,13 @@ fn discovered_selection_is_related_to_report_without_making_it_a_byte_parent()
             .iter()
             .find(|node| node.id == *frame_id)
             .ok_or("materialized frame is missing")?;
-        assert_eq!(frame.details.get("selection_basis"), Some(&basis));
+        assert!(frame.details.get("selection_basis").is_none());
+        assert!(frame.details.get("framing_rule").is_none());
+        assert!(case.edges().iter().any(|edge| {
+            edge.from == outcome.receipt_node
+                && edge.to == *frame_id
+                && edge.relation == "materialized"
+        }));
         assert_eq!(frame.details.get("input_node"), Some(&json!(input)));
         assert!(
             !case
@@ -216,7 +235,13 @@ fn caller_and_discovered_basis_keeps_report_as_selection_provenance_only()
             .iter()
             .find(|node| node.id == frame_id)
             .ok_or("materialized frame is missing")?;
-        assert_eq!(frame.details.get("selection_basis"), Some(&encoded_basis));
+        assert!(frame.details.get("selection_basis").is_none());
+        assert!(frame.details.get("framing_rule").is_none());
+        assert!(case.edges().iter().any(|edge| {
+            edge.from == outcome.receipt_node
+                && edge.to == frame_id
+                && edge.relation == "materialized"
+        }));
         assert_eq!(frame.details.get("input_node"), Some(&json!(input)));
         assert!(
             case.edges()

@@ -20,6 +20,9 @@ mod record_handoff;
 #[path = "recovery_record_discovery_application.rs"]
 mod bounded_application;
 
+#[path = "recovery_record_discovery_compact.rs"]
+mod compact;
+
 const REPORT_KIND: &str = "recovery_record_discovery_report";
 type TestResult<T> = Result<T, Box<dyn Error>>;
 type AcceptedFrameMember = (u64, u64, u64, u64, u64, String);
@@ -3361,8 +3364,12 @@ fn assert_report_inputs(
         .iter()
         .find(|node| node.id == first_frame_id && node.kind == "custom_protocol_frame")
         .ok_or("first report frame does not resolve")?;
+    assert!(first_frame.details.get("selection_basis").is_none());
+    let first_receipt = case
+        .node(*receipts.first().ok_or("first receipt id is missing")?)
+        .ok_or("first frame receipt does not resolve")?;
     assert_eq!(
-        first_frame.details.get("selection_basis"),
+        first_receipt.details.get("selection_basis"),
         Some(&json!({"kind":"caller_supplied"}))
     );
     assert!(
@@ -3597,16 +3604,19 @@ fn combined_selection_basis_retains_its_exact_report_receipt_path() -> TestResul
     });
     assert_report_frame_references(&case, &report, report_node_id, &session.frame_nodes)?;
     assert!(input_refs.iter().all(|reference| {
-        reference
+        let frame_id = reference
             .as_array()
             .and_then(|fields| fields.first())
-            .and_then(Value::as_u64)
-            .and_then(|frame_id| {
-                case.nodes()
-                    .iter()
-                    .find(|node| node.id == frame_id && node.kind == "custom_protocol_frame")
+            .and_then(Value::as_u64);
+        frame_id.is_some_and(|frame_id| {
+            case.edges().iter().any(|edge| {
+                edge.to == frame_id
+                    && edge.relation == "materialized"
+                    && case.node(edge.from).is_some_and(|receipt| {
+                        receipt.details.get("selection_basis") == Some(&expected_basis)
+                    })
             })
-            .is_some_and(|frame| frame.details.get("selection_basis") == Some(&expected_basis))
+        })
     }));
     for receipt_node in session.receipt_nodes {
         let mut selection_edges = case.edges().iter().filter(|edge| {

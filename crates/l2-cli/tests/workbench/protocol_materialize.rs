@@ -297,10 +297,13 @@ fn incomplete_tail_is_materialized() -> Result<(), Box<dyn Error>> {
         .iter()
         .find(|node| node.kind == "custom_protocol_framing_tail")
         .ok_or("framing tail is missing")?;
-    assert_eq!(
-        tail.details.get("selection_basis"),
-        Some(&json!({"kind":"caller_supplied"}))
-    );
+    assert!(materialized_case.edges().iter().any(|edge| {
+        edge.to == tail.id
+            && edge.relation == "materialized"
+            && materialized_case.node(edge.from).is_some_and(|receipt| {
+                receipt.details.get("selection_basis") == Some(&json!({"kind":"caller_supplied"}))
+            })
+    }));
     let input_mappings = l2_workbench::carrier::discovery::mapped_node(&input_case, run_id)?
         .mappings
         .into_iter()

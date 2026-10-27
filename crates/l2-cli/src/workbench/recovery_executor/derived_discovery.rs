@@ -390,21 +390,8 @@ impl DerivedDiscovery {
         let Some(blob_id) = frame.blob.clone() else {
             return Ok(None);
         };
-        let byte_length = frame
-            .details
-            .get("stream_range")
-            .and_then(|value| value.get("end"))
-            .and_then(Value::as_u64)
-            .and_then(|value| usize::try_from(value).ok())
-            .zip(
-                frame
-                    .details
-                    .get("stream_range")
-                    .and_then(|value| value.get("start"))
-                    .and_then(Value::as_u64)
-                    .and_then(|value| usize::try_from(value).ok()),
-            )
-            .and_then(|(end, start)| end.checked_sub(start))
+        let byte_length = crate::workbench::framing_materialize::frame_stream_range(&frame.details)
+            .and_then(|range| range.end.checked_sub(range.start))
             .ok_or(l2_workbench::recovery::RecoveryError::InvariantFailure)?;
         if case
             .blob(&blob_id)
@@ -588,15 +575,8 @@ fn record_frame_input(
         .and_then(Value::as_u64)
         .and_then(|index| usize::try_from(index).ok())
         .ok_or(l2_workbench::recovery::RecoveryError::InvariantFailure)?;
-    let stream_range = frame
-        .details
-        .get("stream_range")
-        .cloned()
-        .ok_or(l2_workbench::recovery::RecoveryError::InvariantFailure)
-        .and_then(|range| {
-            serde_json::from_value(range)
-                .map_err(|_| l2_workbench::recovery::RecoveryError::InvariantFailure)
-        })?;
+    let stream_range = crate::workbench::framing_materialize::frame_stream_range(&frame.details)
+        .ok_or(l2_workbench::recovery::RecoveryError::InvariantFailure)?;
     let blob_id = frame
         .blob
         .clone()
