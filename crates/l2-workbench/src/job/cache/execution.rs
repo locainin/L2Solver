@@ -95,7 +95,7 @@ impl Budget {
                     .checked_add(block)
                     .ok_or(CacheError::SizeOverflow)?;
             }
-            Err(CacheError::QuotaExceeded { .. }) if block != needed => {
+            Err(CacheError::QuotaExceeded { .. }) => {
                 self.cache
                     .reserve_execution_capacity(&self.key, &self.token, needed)?;
                 self.available = self

@@ -485,3 +485,32 @@ fn small_checkpoint_does_not_evict_results_for_unused_reservation_space()
     );
     Ok(())
 }
+
+#[test]
+fn large_checkpoint_evicts_unpinned_results_when_its_actual_bytes_need_space()
+-> Result<(), Box<dyn Error>> {
+    let temporary = tempfile::tempdir()?;
+    let cache = cache_at(temporary.path(), 12_000)?;
+    let existing = stage_key("large-reservation-existing")?;
+    super::write_entry(&cache, &existing, &vec![1; 8_000])?;
+    let key = stage_key("large-reservation-incoming")?;
+    let mut lease = cache.lease(&key)?;
+    let caps = ExecutionCheckpointLimits {
+        max_encoded_bytes: 8_000,
+        ..limits()
+    };
+    lease.save_active(&Job::new("large").snapshot()?, caps, |writer| {
+        writer.streams().0.write_all(&vec![2; 5_000])?;
+        Ok(json!({}))
+    })?;
+    assert!(
+        cache
+            .lookup(
+                &existing,
+                l2_workbench::job::cache::CacheReadPolicy::CompleteOnly
+            )?
+            .is_none()
+    );
+    assert!(lease.load_active(caps)?.is_some());
+    Ok(())
+}
