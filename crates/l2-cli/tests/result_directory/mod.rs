@@ -9,6 +9,7 @@ type TestResult<T = ()> = Result<T, Box<dyn Error>>;
 
 mod publication_transition;
 mod publish;
+mod snapshot;
 
 struct Fixture {
     _root: TempDir,
@@ -446,7 +447,7 @@ fn result_receipt_rejects_individually_oversized_settings_strings() -> TestResul
 }
 
 #[test]
-fn result_receipt_rejects_phase_arrays_over_the_snapshot_budget() -> TestResult {
+fn result_receipt_rejects_sixty_five_duplicate_phases() -> TestResult {
     let fixture = Fixture::new()?;
     fixture.publish("complete", b"artifact-content")?;
     let mut manifest = read_manifest(&fixture.output)?;
@@ -458,7 +459,7 @@ fn result_receipt_rejects_phase_arrays_over_the_snapshot_budget() -> TestResult 
     )?;
     write_manifest(&fixture.output, &manifest)?;
 
-    assert_manifest_limit_error(&fixture.output, ResultKind::Extract)
+    assert_invalid_snapshot_error(&fixture.output)
 }
 
 #[test]
@@ -543,6 +544,15 @@ fn assert_manifest_limit_error(path: &std::path::Path, kind: ResultKind) -> Test
     };
     let message = error.to_string();
     assert!(message.contains("limit"), "{message}");
+    Ok(())
+}
+
+fn assert_invalid_snapshot_error(path: &std::path::Path) -> TestResult {
+    let Err(error) = ResultDirectory::inspect(path, ResultKind::Extract) else {
+        return Err("invalid job phase topology should be rejected".into());
+    };
+    let message = error.to_string();
+    assert!(message.contains("phase"), "{message}");
     Ok(())
 }
 

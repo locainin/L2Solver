@@ -429,7 +429,13 @@ where
     D: Deserializer<'de>,
 {
     let value = deserialize_bounded_value(deserializer, JOB_SNAPSHOT_LIMITS)?;
-    serde_json::from_value(value).map_err(de::Error::custom)
+    let snapshot: JobSnapshot = serde_json::from_value(value).map_err(de::Error::custom)?;
+    if !snapshot.is_valid_checkpoint() {
+        return Err(de::Error::custom(
+            "job phase topology or progress is invalid",
+        ));
+    }
+    Ok(snapshot)
 }
 
 fn deserialize_bounded_value<'de, D>(

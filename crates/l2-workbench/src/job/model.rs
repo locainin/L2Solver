@@ -317,7 +317,9 @@ pub struct JobSnapshot {
 }
 
 impl JobSnapshot {
-    pub(super) fn is_valid_checkpoint(&self) -> bool {
+    /// Check the phase topology and progress values required for a saved job snapshot
+    #[must_use]
+    pub fn is_valid_checkpoint(&self) -> bool {
         // Restoration needs exactly one entry for every known phase
         self.phases.len() == Phase::ALL.len()
             && Phase::ALL.iter().all(|phase| {
