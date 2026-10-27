@@ -14,6 +14,8 @@ use super::{
     read_sources, result_identity, run_with_job,
 };
 
+mod early_reuse;
+
 fn run(options: &RefineOptions, output: &mut impl Write) -> Result<bool, Box<dyn Error>> {
     let job = l2_workbench::job::Job::new("refine test");
     run_with_job(options, output, &job)

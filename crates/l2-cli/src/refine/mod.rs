@@ -46,35 +46,39 @@ pub fn run_with_job(
     let input_set = input::prepare_input_set(&options.input)?;
     let policy = RefinePolicy::new(&options.recovery, options.salvage)?;
 
-    // The verified snapshots establish the same source identity used by analysis and reuse
+    // A bounded sample locates a likely result without loading complete source files
+    let sampled = input::fingerprint_sources(
+        &input_set,
+        policy.total_input_limit,
+        policy.per_file_limit,
+        job,
+    )?;
+    let reuse_identity =
+        output::result_identity_with_source(sampled.identity.clone(), &options.recovery, &policy)?;
+
+    if let Some(complete) = try_reuse(ReuseContext {
+        options,
+        output,
+        job,
+        destination: &destination,
+        result_directory: &result_directory,
+        input_set: &input_set,
+        sampled: &sampled,
+        policy: &policy,
+        identity: &reuse_identity,
+    })? {
+        return Ok(complete);
+    }
+
+    // Cold analysis keeps immutable bytes and a strong source identity for checkpoints
     let sources = input::read_sources(
         &input_set,
         policy.total_input_limit,
         policy.per_file_limit,
         job,
     )?;
+    ensure_input_unchanged(&input_set, &sampled, &policy, job)?;
     let identity = output::result_identity(&sources, &options.recovery, &policy)?;
-
-    if !options.recovery.refresh
-        && let Some(reused) =
-            result_directory.reuse(&identity, None, options.recovery.strict_cache)?
-    {
-        skip_file_irrelevant_phases(job)?;
-        record_source_counters(job, &sources)?;
-        start_input_phases(job, &sources)?;
-        skip_refinement_work_phases(job)?;
-        job.increment(Counter::CacheHits, 1)?;
-        if !options.recovery.quiet {
-            output::write_reused_summary(
-                output,
-                &destination,
-                reused.complete,
-                reused.artifacts.len(),
-                options.dry_run,
-            )?;
-        }
-        return Ok(reused.complete);
-    }
 
     let cache = open_cache(options, job)?;
     // A restored checkpoint must precede every phase transition in this run
@@ -91,8 +95,8 @@ pub fn run_with_job(
         .transpose()?;
 
     skip_file_irrelevant_phases(job)?;
-    record_source_counters(job, &sources)?;
-    start_input_phases(job, &sources)?;
+    record_source_counters(job, &sampled)?;
+    start_input_phases(job, sampled.labels.len())?;
     job.start(Phase::Expansion, None)?;
     job.start(
         Phase::TransformDiscovery,
@@ -105,7 +109,7 @@ pub fn run_with_job(
         job,
         destination: &destination,
         result_directory,
-        identity: &identity,
+        identity: &reuse_identity,
         policy: &policy,
         sources: &sources,
         cache: cache.as_ref(),
@@ -114,6 +118,67 @@ pub fn run_with_job(
         checkpoint.finish(result.is_ok() && !job.is_cancelled())?;
     }
     result
+}
+
+struct ReuseContext<'a, W: Write> {
+    options: &'a RefineOptions,
+    output: &'a mut W,
+    job: &'a Job,
+    destination: &'a Path,
+    result_directory: &'a ResultDirectory,
+    input_set: &'a input::InputSet,
+    sampled: &'a input::FingerprintedSources,
+    policy: &'a RefinePolicy,
+    identity: &'a crate::result_directory::ResultIdentity,
+}
+
+fn try_reuse<W: Write>(context: ReuseContext<'_, W>) -> Result<Option<bool>, Box<dyn Error>> {
+    let ReuseContext {
+        options,
+        output,
+        job,
+        destination,
+        result_directory,
+        input_set,
+        sampled,
+        policy,
+        identity,
+    } = context;
+    if options.recovery.refresh {
+        return Ok(None);
+    }
+    let Some(reused) = result_directory.reuse_refinement(
+        identity,
+        &sampled.labels,
+        options.recovery.strict_cache,
+        || {
+            input::strong_source_identity(
+                input_set,
+                policy.total_input_limit,
+                policy.per_file_limit,
+                job,
+            )
+        },
+    )?
+    else {
+        return Ok(None);
+    };
+    ensure_input_unchanged(input_set, sampled, policy, job)?;
+    skip_file_irrelevant_phases(job)?;
+    record_source_counters(job, sampled)?;
+    start_input_phases(job, sampled.labels.len())?;
+    skip_refinement_work_phases(job)?;
+    job.increment(Counter::CacheHits, 1)?;
+    if !options.recovery.quiet {
+        output::write_reused_summary(
+            output,
+            destination,
+            reused.complete,
+            reused.artifacts.len(),
+            options.dry_run,
+        )?;
+    }
+    Ok(Some(reused.complete))
 }
 
 fn open_cache(options: &RefineOptions, job: &Job) -> Result<Option<Cache>, Box<dyn Error>> {
@@ -221,18 +286,37 @@ fn analyze_and_publish<W: Write>(
     Ok(analyzed.complete)
 }
 
-fn record_source_counters(job: &Job, sources: &[LoadedSource]) -> Result<(), Box<dyn Error>> {
-    for source in sources {
-        job.increment(Counter::Files, 1)?;
-        job.increment(Counter::Bytes, u64::try_from(source.bytes.len())?)?;
+fn ensure_input_unchanged(
+    input_set: &input::InputSet,
+    expected: &input::FingerprintedSources,
+    policy: &RefinePolicy,
+    job: &Job,
+) -> Result<(), Box<dyn Error>> {
+    let actual = input::fingerprint_sources(
+        input_set,
+        policy.total_input_limit,
+        policy.per_file_limit,
+        job,
+    )?;
+    if actual.identity != expected.identity || actual.labels != expected.labels {
+        return Err(invalid_input("input artifact changed during refinement"));
     }
     Ok(())
 }
 
-fn start_input_phases(job: &Job, sources: &[LoadedSource]) -> Result<(), Box<dyn Error>> {
+fn record_source_counters(
+    job: &Job,
+    sources: &input::FingerprintedSources,
+) -> Result<(), Box<dyn Error>> {
+    job.increment(Counter::Files, u64::try_from(sources.labels.len())?)?;
+    job.increment(Counter::Bytes, sources.total_bytes)?;
+    Ok(())
+}
+
+fn start_input_phases(job: &Job, source_count: usize) -> Result<(), Box<dyn Error>> {
     complete_phase(job, Phase::Preparation, Some(1))?;
-    job.start(Phase::Ingestion, Some(u64::try_from(sources.len())?))?;
-    for _ in sources {
+    job.start(Phase::Ingestion, Some(u64::try_from(source_count)?))?;
+    for _ in 0..source_count {
         job.advance(Phase::Ingestion, 1)?;
     }
     job.finish(Phase::Ingestion, PhaseOutcome::Completed)?;

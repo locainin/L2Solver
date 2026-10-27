@@ -3,6 +3,47 @@ use std::{error::Error, fs};
 use l2_workbench::{job::cache::SourceFingerprint, sha256};
 
 #[test]
+fn opened_file_identity_reads_from_start_and_matches_the_source_bytes() -> Result<(), Box<dyn Error>>
+{
+    use l2_workbench::job::cache::SourceIdentity;
+    use std::io::{Seek, SeekFrom};
+
+    let temporary = tempfile::tempdir()?;
+    let source = temporary.path().join("source.bin");
+    let bytes = vec![42_u8; 300_000];
+    fs::write(&source, &bytes)?;
+    let mut file = fs::File::open(&source)?;
+    file.seek(SeekFrom::Start(99))?;
+
+    let fingerprint = SourceFingerprint::fast_open_file(&mut file)?;
+    assert_eq!(fingerprint, SourceFingerprint::fast(&source)?);
+    file.seek(SeekFrom::Start(99))?;
+    assert_eq!(
+        SourceIdentity::sha256_open_file(&mut file)?,
+        SourceIdentity::from_sha256(sha256(&bytes))?
+    );
+    Ok(())
+}
+
+#[cfg(unix)]
+#[test]
+fn opened_file_identity_rejects_non_regular_and_unreadable_handles() -> Result<(), Box<dyn Error>> {
+    use l2_workbench::job::cache::SourceIdentity;
+    use std::io::Write;
+
+    let temporary = tempfile::tempdir()?;
+    let mut directory = fs::File::open(temporary.path())?;
+    assert!(SourceFingerprint::fast_open_file(&mut directory).is_err());
+    assert!(SourceIdentity::sha256_open_file(&mut directory).is_err());
+    let source = temporary.path().join("write-only.bin");
+    let mut write_only = fs::File::create(source)?;
+    write_only.write_all(b"x")?;
+    assert!(SourceFingerprint::fast_open_file(&mut write_only).is_err());
+    assert!(SourceIdentity::sha256_open_file(&mut write_only).is_err());
+    Ok(())
+}
+
+#[test]
 fn whole_file_fingerprints_cross_the_read_buffer_boundary_without_changing_digest_format()
 -> Result<(), Box<dyn Error>> {
     let temporary = tempfile::tempdir()?;

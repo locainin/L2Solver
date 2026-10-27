@@ -2,8 +2,14 @@
 
 use super::invalid_input;
 use crate::safe_filename::is_safe_flat_file_name;
-use l2_workbench::{job::Job, sha256};
-use serde::Deserialize;
+use l2_workbench::{
+    job::{
+        Job,
+        cache::{SourceFingerprint, SourceIdentity},
+    },
+    sha256,
+};
+use serde::{Deserialize, Serialize};
 use std::{
     collections::HashSet,
     error::Error,
@@ -44,6 +50,21 @@ pub(super) struct LoadedSource {
     pub(super) label: String,
     pub(super) bytes: Vec<u8>,
     pub(super) sha256: String,
+}
+
+/// A bounded local hint; only the ordered full digest proves source content identity
+pub(super) struct FingerprintedSources {
+    pub(super) identity: SourceIdentity,
+    pub(super) labels: Vec<String>,
+    pub(super) total_bytes: u64,
+}
+
+#[derive(Serialize)]
+struct SampledSource<'a> {
+    label: &'a str,
+    expected_length: Option<usize>,
+    expected_sha256: Option<&'a str>,
+    fingerprint: SourceFingerprint,
 }
 
 #[derive(Deserialize)]
@@ -155,14 +176,7 @@ pub(super) fn read_sources(
     for spec in &input_set.sources {
         job.check_cancelled()?;
         let (bytes, digest) = read_source(input_set, spec, per_file_limit)?;
-        total_bytes = total_bytes
-            .checked_add(bytes.len())
-            .ok_or_else(|| invalid_input("input source byte total overflows"))?;
-        if total_bytes > total_limit {
-            return Err(invalid_input(
-                "manifest input bytes exceed the configured recovery memory limit",
-            ));
-        }
+        total_bytes = checked_total(total_bytes, bytes.len(), total_limit)?;
         sources.push(LoadedSource {
             label: spec.label.clone(),
             bytes,
@@ -170,6 +184,148 @@ pub(super) fn read_sources(
         });
     }
     Ok(sources)
+}
+
+pub(super) fn fingerprint_sources(
+    input_set: &InputSet,
+    total_limit: usize,
+    per_file_limit: usize,
+    job: &Job,
+) -> Result<FingerprintedSources, Box<dyn Error>> {
+    let mut sampled = Vec::new();
+    let mut labels = Vec::new();
+    sampled.try_reserve_exact(input_set.sources.len())?;
+    labels.try_reserve_exact(input_set.sources.len())?;
+    let mut total = 0_usize;
+    for spec in &input_set.sources {
+        job.check_cancelled()?;
+        let mut file = open_identity_source(input_set, spec)?;
+        let length = checked_source_length(&file, spec, per_file_limit)?;
+        total = checked_total(total, length, total_limit)?;
+        let fingerprint = SourceFingerprint::fast_open_file(&mut file)?;
+        if fingerprint.size_bytes != u64::try_from(length)? {
+            return Err(invalid_input(
+                "input artifact changed while it was fingerprinted",
+            ));
+        }
+        sampled.push(SampledSource {
+            label: &spec.label,
+            expected_length: spec.expected_length,
+            expected_sha256: spec.expected_sha256.as_deref(),
+            fingerprint,
+        });
+        labels.push(spec.label.clone());
+    }
+
+    let mut fingerprint = sampled
+        .first()
+        .ok_or_else(|| invalid_input("input has no sources"))?
+        .fingerprint
+        .sample_hint();
+    fingerprint.size_bytes = u64::try_from(total)?;
+    // The set hint binds ordering, labels, declarations, metadata, and bounded samples
+    fingerprint.sample_sha256 = sha256(&serde_json::to_vec(&(
+        "l2solver-refine-sample-set-v1",
+        &sampled,
+    ))?);
+    Ok(FingerprintedSources {
+        identity: SourceIdentity::Fast(fingerprint),
+        labels,
+        total_bytes: u64::try_from(total)?,
+    })
+}
+
+pub(super) fn strong_source_identity(
+    input_set: &InputSet,
+    total_limit: usize,
+    per_file_limit: usize,
+    job: &Job,
+) -> Result<SourceIdentity, Box<dyn Error>> {
+    let mut digests = Vec::new();
+    digests.try_reserve_exact(input_set.sources.len())?;
+    let mut total = 0_usize;
+    for spec in &input_set.sources {
+        job.check_cancelled()?;
+        let mut file = open_identity_source(input_set, spec)?;
+        let length = checked_source_length(&file, spec, per_file_limit)?;
+        total = checked_total(total, length, total_limit)?;
+        let SourceIdentity::Sha256(digest) = SourceIdentity::sha256_open_file(&mut file)? else {
+            return Err(invalid_input("source digest is unavailable"));
+        };
+        if spec
+            .expected_sha256
+            .as_ref()
+            .is_some_and(|expected| expected != &digest)
+        {
+            return Err(invalid_input("artifact hash does not match its manifest"));
+        }
+        if checked_source_length(&file, spec, per_file_limit)? != length {
+            return Err(invalid_input("input artifact changed while it was hashed"));
+        }
+        digests.push((u64::try_from(length)?, digest));
+    }
+    let digest = super::output::refine_source_identity_sha256(
+        digests
+            .iter()
+            .map(|(length, digest)| (*length, digest.as_str())),
+    )?;
+    Ok(SourceIdentity::from_sha256(digest)?)
+}
+
+fn checked_source_length(
+    file: &File,
+    spec: &InputSpec,
+    maximum: usize,
+) -> Result<usize, Box<dyn Error>> {
+    checked_length(&file.metadata()?, spec.expected_length, maximum)
+}
+
+fn checked_length(
+    metadata: &Metadata,
+    expected_length: Option<usize>,
+    maximum: usize,
+) -> Result<usize, Box<dyn Error>> {
+    if !metadata.is_file() {
+        return Err(invalid_input("input artifact is not a regular file"));
+    }
+    let length = usize::try_from(metadata.len())?;
+    if length > maximum {
+        return Err(invalid_input(
+            "input artifact exceeds the configured analysis file limit",
+        ));
+    }
+    if expected_length.is_some_and(|expected| expected != length) {
+        return Err(invalid_input("artifact length does not match its manifest"));
+    }
+    Ok(length)
+}
+
+fn checked_total(total: usize, length: usize, maximum: usize) -> Result<usize, Box<dyn Error>> {
+    let total = total
+        .checked_add(length)
+        .ok_or_else(|| invalid_input("input source byte total overflows"))?;
+    if total > maximum {
+        return Err(invalid_input(
+            "manifest input bytes exceed the configured recovery memory limit",
+        ));
+    }
+    Ok(total)
+}
+
+fn open_identity_source(input_set: &InputSet, spec: &InputSpec) -> Result<File, Box<dyn Error>> {
+    match &spec.path {
+        InputPath::Direct(path) => Ok(crate::input::regular_no_follow(path)?.into_inner()),
+        InputPath::ManifestMember(name) => {
+            #[cfg(target_os = "linux")]
+            {
+                read_directory_file(input_set, name)
+            }
+            #[cfg(not(target_os = "linux"))]
+            {
+                Ok(read_directory_file(input_set, name)?.into_inner())
+            }
+        }
+    }
 }
 
 fn read_source(
@@ -204,18 +360,7 @@ pub(super) fn read_snapshot(
     expected_sha256: Option<&str>,
 ) -> Result<(Vec<u8>, String), Box<dyn Error>> {
     let before = file.file_metadata()?;
-    if !before.is_file() {
-        return Err(invalid_input("input artifact is not a regular file"));
-    }
-    let length = usize::try_from(before.len())?;
-    if length > maximum {
-        return Err(invalid_input(
-            "input artifact exceeds the configured analysis file limit",
-        ));
-    }
-    if expected_length.is_some_and(|expected| expected != length) {
-        return Err(invalid_input("artifact length does not match its manifest"));
-    }
+    let length = checked_length(&before, expected_length, maximum)?;
 
     let mut bytes = Vec::new();
     bytes

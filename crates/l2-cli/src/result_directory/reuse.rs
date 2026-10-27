@@ -29,12 +29,66 @@ pub(super) fn reuse(
     ensure_policy_matches(directory, identity, receipt)?;
     verify_source(identity, receipt, current_input, strict)?;
 
+    verified_result(prepared, manifest, receipt, strict).map(Some)
+}
+
+pub(super) fn reuse_refinement(
+    directory: &ResultDirectory,
+    identity: &ResultIdentity,
+    labels: &[String],
+    strict: bool,
+    strong_source: impl FnOnce() -> Result<SourceIdentity, Box<dyn Error>>,
+) -> Result<Option<ReusedResult>, Box<dyn Error>> {
+    let (prepared, manifest, receipt) = match &directory.state {
+        DirectoryState::Missing => return Ok(None),
+        DirectoryState::Legacy { .. } => {
+            return Err(
+                actionable_conflict("legacy extraction has no reusable result receipt").into(),
+            );
+        }
+        DirectoryState::Owned {
+            prepared,
+            manifest,
+            receipt,
+        } => (prepared, manifest, receipt),
+    };
+    prepared.check_location()?;
+    ensure_policy_matches(directory, identity, receipt)?;
+    if manifest.source_labels.len() != labels.len()
+        || manifest
+            .source_labels
+            .iter()
+            .zip(labels)
+            .any(|(stored, current)| stored.as_deref() != Some(current.as_str()))
+    {
+        return Err(actionable_conflict(
+            "refinement source labels differ from the existing result",
+        )
+        .into());
+    }
+    if !matches!(identity.source, SourceIdentity::Fast(_)) {
+        return Err(invalid_source("refinement source hint is not a fast identity").into());
+    }
+    if strict || identity.source != receipt.identity.source {
+        // Old strong receipts and changed metadata require the full ordered source digest
+        let mut strong_identity = identity.clone();
+        strong_identity.source = strong_source()?;
+        verify_source(&strong_identity, receipt, None, true)?;
+    }
+    verified_result(prepared, manifest, receipt, strict).map(Some)
+}
+
+fn verified_result(
+    prepared: &crate::publish::PreparedDirectoryReplacement,
+    manifest: &super::manifest::OwnedManifest,
+    receipt: &super::manifest::ResultReceipt,
+    strict: bool,
+) -> Result<ReusedResult, Box<dyn Error>> {
     for output in &receipt.output_files {
         output.verify(prepared, strict)?;
     }
     prepared.check_location()?;
-
-    Ok(Some(ReusedResult {
+    Ok(ReusedResult {
         complete: manifest.complete,
         artifacts: manifest
             .artifacts
@@ -47,7 +101,7 @@ pub(super) fn reuse(
                     .cloned()
             })
             .collect(),
-    }))
+    })
 }
 
 fn ensure_policy_matches(

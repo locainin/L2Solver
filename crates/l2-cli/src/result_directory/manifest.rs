@@ -58,6 +58,8 @@ pub(super) struct OwnedManifest {
     pub source_sha256s: Vec<String>,
     /// Strong identity for the complete ordered source set
     pub source_identity_sha256: String,
+    /// Ordered refinement labels bind reused output provenance to the input names
+    pub source_labels: Vec<Option<String>>,
 }
 
 /// One declared artifact from an extract or refine manifest
@@ -138,6 +140,11 @@ struct RawSourceIdentity {
 
 #[derive(Deserialize)]
 struct RawSource {
+    #[serde(
+        default,
+        deserialize_with = "bounded::deserialize_optional_source_label"
+    )]
+    label: Option<String>,
     byte_length: u64,
     #[serde(deserialize_with = "bounded::deserialize_sha256")]
     sha256: String,
@@ -202,6 +209,7 @@ fn inspect_prepared(
     let manifest = OwnedManifest {
         complete,
         evidence_file: evidence_file(&raw, kind)?,
+        source_labels: source_labels(&raw),
         artifacts: validate_artifacts(raw.artifacts)?,
         source_sha256s,
         source_identity_sha256,
@@ -246,6 +254,7 @@ pub(super) fn parse_staged_manifest(
     let manifest = OwnedManifest {
         complete,
         evidence_file: evidence_file(&raw, kind)?,
+        source_labels: source_labels(&raw),
         artifacts: validate_artifacts(raw.artifacts)?,
         source_sha256s,
         source_identity_sha256,
@@ -259,6 +268,7 @@ pub(super) fn validate_staged_receipt(path: &Path, kind: ResultKind) -> Result<(
     let manifest = OwnedManifest {
         complete,
         evidence_file: evidence_file(&raw, kind)?,
+        source_labels: source_labels(&raw),
         artifacts: validate_artifacts(raw.artifacts)?,
         source_sha256s,
         source_identity_sha256,
@@ -270,6 +280,12 @@ pub(super) fn validate_staged_receipt(path: &Path, kind: ResultKind) -> Result<(
     validate_receipt(receipt, &manifest, kind)?;
     validate_staged_entries(path, kind, &manifest, Some(receipt))?;
     Ok(())
+}
+
+fn source_labels(raw: &RawManifest) -> Vec<Option<String>> {
+    raw.sources.as_ref().map_or_else(Vec::new, |sources| {
+        sources.iter().map(|source| source.label.clone()).collect()
+    })
 }
 
 pub(super) fn staged_output_files(

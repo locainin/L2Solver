@@ -80,10 +80,24 @@ impl SourceFingerprint {
     /// # Errors
     /// Returns an error for non-regular, symlinked, unreadable, or changing files
     pub fn fast(path: impl AsRef<Path>) -> Result<Self> {
-        let file = open_source(path.as_ref())?;
+        let mut file = open_source(path.as_ref())?;
+        Self::fast_open_file(&mut file)
+    }
+
+    /// Fingerprint an already opened regular file using bounded content samples
+    ///
+    /// The caller must open the file with the required path and symlink protections.
+    /// This operation changes its cursor and requires exclusive use of that cursor.
+    ///
+    /// # Errors
+    /// Returns an error for non-regular, unreadable, or changing files
+    pub fn fast_open_file(file: &mut File) -> Result<Self> {
         let before = file.metadata()?;
+        if !before.is_file() {
+            return Err(CacheError::UnsafePath("source is not a regular file"));
+        }
         let identity = metadata_identity(&before);
-        let sample_sha256 = sample_digest(file.try_clone()?, identity.size_bytes)?;
+        let sample_sha256 = sample_digest(&mut *file, identity.size_bytes)?;
         let after = file.metadata()?;
         if identity != metadata_identity(&after) {
             return Err(CacheError::SourceChanged);
@@ -136,10 +150,25 @@ impl SourceIdentity {
     /// # Errors
     /// Returns an error for non-regular, symlinked, unreadable, or changing files
     pub fn sha256_file(path: impl AsRef<Path>) -> Result<Self> {
-        let file = open_source(path.as_ref())?;
+        let mut file = open_source(path.as_ref())?;
+        Self::sha256_open_file(&mut file)
+    }
+
+    /// Calculate the full digest of an already opened regular file
+    ///
+    /// The caller must open the file with the required path and symlink protections.
+    /// This operation changes its cursor and requires exclusive use of that cursor.
+    ///
+    /// # Errors
+    /// Returns an error for non-regular, unreadable, or changing files
+    pub fn sha256_open_file(file: &mut File) -> Result<Self> {
         let before = file.metadata()?;
+        if !before.is_file() {
+            return Err(CacheError::UnsafePath("source is not a regular file"));
+        }
         let identity = metadata_identity(&before);
-        let digest = full_digest(file.try_clone()?)?;
+        file.seek(SeekFrom::Start(0))?;
+        let digest = full_digest(&mut *file)?;
         let after = file.metadata()?;
         if identity != metadata_identity(&after) {
             return Err(CacheError::SourceChanged);
@@ -189,7 +218,7 @@ fn open_source(path: &Path) -> Result<File> {
     Ok(file)
 }
 
-fn sample_digest(mut file: File, size_bytes: u64) -> Result<String> {
+fn sample_digest(file: &mut File, size_bytes: u64) -> Result<String> {
     // Fixed ranges keep large source reads bounded and repeatable
     let ranges = sample_ranges(size_bytes);
     let mut hasher = Sha256::new();
@@ -232,7 +261,7 @@ fn sample_ranges(size_bytes: u64) -> Vec<(u64, u64)> {
     ]
 }
 
-fn full_digest(mut file: File) -> Result<String> {
+fn full_digest(file: &mut File) -> Result<String> {
     let mut hasher = Sha256::new();
     let mut buffer = vec![0_u8; READ_BUFFER_BYTES].into_boxed_slice();
     loop {

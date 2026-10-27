@@ -500,6 +500,15 @@ where
     LimitedString::<MAX_SOURCE_ID_BYTES>::deserialize(deserializer).map(|source| source.0)
 }
 
+pub(super) fn deserialize_optional_source_label<'de, D>(
+    deserializer: D,
+) -> Result<Option<String>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    Option::<LimitedString<1024>>::deserialize(deserializer).map(|label| label.map(|label| label.0))
+}
+
 pub(super) fn deserialize_sha256<'de, D>(deserializer: D) -> Result<String, D::Error>
 where
     D: Deserializer<'de>,

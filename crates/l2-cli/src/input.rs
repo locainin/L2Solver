@@ -61,6 +61,10 @@ impl<R> InputFile<R> {
     const fn new(inner: R, path: PathBuf) -> Self {
         Self { inner, path }
     }
+
+    pub(crate) fn into_inner(self) -> R {
+        self.inner
+    }
 }
 
 impl<R: Read> Read for InputFile<R> {

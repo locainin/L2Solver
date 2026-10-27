@@ -84,6 +84,16 @@ impl ResultDirectory {
         reuse::reuse(self, identity, current_input, strict)
     }
 
+    pub(crate) fn reuse_refinement(
+        &self,
+        identity: &ResultIdentity,
+        labels: &[String],
+        strict: bool,
+        strong_source: impl FnOnce() -> Result<SourceIdentity, Box<dyn Error>>,
+    ) -> Result<Option<ReusedResult>, Box<dyn Error>> {
+        reuse::reuse_refinement(self, identity, labels, strict, strong_source)
+    }
+
     /// Write a result into a private staging directory and atomically publish it
     ///
     /// The callback builds all user-visible files. A receipt is appended to the staged manifest

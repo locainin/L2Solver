@@ -90,6 +90,14 @@ pub(super) fn result_identity(
         .map(|source| Ok((u64::try_from(source.bytes.len())?, source.sha256.as_str())))
         .collect::<Result<Vec<_>, Box<dyn Error>>>()?;
     let source = SourceIdentity::from_sha256(refine_source_identity_sha256(input_identities)?)?;
+    result_identity_with_source(source, recovery, policy)
+}
+
+pub(super) fn result_identity_with_source(
+    source: SourceIdentity,
+    recovery: &RecoveryOptions,
+    policy: &RefinePolicy,
+) -> Result<ResultIdentity, Box<dyn Error>> {
     Ok(ResultIdentity {
         kind: ResultKind::Refine,
         algorithm_version: REFINE_ALGORITHM_VERSION,
