@@ -612,6 +612,16 @@ impl JobProgress {
         self.job.increment(Counter::ExpandedMembers, member_count)?;
         Ok(())
     }
+
+    fn parsed_records_committed(&self, record_count: usize) -> Result<(), RecoveryExecutionError> {
+        if record_count == 0 {
+            return Ok(());
+        }
+        let record_count =
+            u64::try_from(record_count).map_err(|_| RecoveryError::InvariantFailure)?;
+        self.job.increment(Counter::Records, record_count)?;
+        Ok(())
+    }
 }
 
 const fn task_progress_label(task: &RecoveryTask) -> &'static str {

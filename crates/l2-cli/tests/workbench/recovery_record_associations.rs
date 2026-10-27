@@ -1,8 +1,10 @@
 use super::{
-    Executor, RecoveryExecutionOutcome, RecoveryPlan, finish_executor, normal_policy, test_support,
+    Executor, JobProgress, RecoveryExecutionOutcome, RecoveryPlan, finish_executor, normal_policy,
+    test_support,
 };
 use l2_workbench::{
     evidence::{Case, Edge, EvidenceStatus},
+    job::{Counter, Job},
     protocol::RecordSchema,
     recovery::{
         EnqueueOutcome, RecoveryCandidateId, RecoveryCandidateState, RecoveryResult, RecoveryTask,
@@ -18,11 +20,13 @@ fn run_record_with_reports(
     input_node_id: u64,
     report_node_ids: &[u64],
     late_report_node_id: Option<u64>,
+    job: Option<&Job>,
 ) -> TestResult<RecoveryExecutionOutcome> {
     let plan = RecoveryPlan::default();
     let policy = normal_policy(case)?;
     let schema = test_support::test_schema();
     let mut executor = test_support::build_executor(case, &plan, &policy)?;
+    executor.job = job.cloned().map(JobProgress::new);
     let candidate_id =
         enqueue_reported_schema(&mut executor, input_node_id, &schema, report_node_ids)?;
     if executor.coordinator.pop_next()? != Some(candidate_id) {
@@ -92,8 +96,13 @@ fn multiple_and_late_reports_link_to_one_shared_assembly_receipt() -> TestResult
         test_support::add_report(&mut case, "second report")?,
         test_support::add_report(&mut case, "late report")?,
     ];
-    let outcome =
-        run_record_with_reports(&mut case, input_node_id, &reports[..2], Some(reports[2]))?;
+    let outcome = run_record_with_reports(
+        &mut case,
+        input_node_id,
+        &reports[..2],
+        Some(reports[2]),
+        None,
+    )?;
     let candidate = selected_record_candidate(&outcome, &test_support::test_schema())?;
     let receipt_node_id = match candidate.state() {
         RecoveryCandidateState::Finished {
@@ -115,13 +124,33 @@ fn multiple_and_late_reports_link_to_one_shared_assembly_receipt() -> TestResult
     Ok(())
 }
 
+#[test]
+fn committed_record_assembly_counts_each_strictly_parsed_record() -> TestResult<()> {
+    let (mut case, input_node_id) = test_support::record_case()?;
+    let job = Job::new("committed record assembly progress");
+
+    run_without_reports(&mut case, input_node_id, Some(&job))?;
+
+    assert_eq!(
+        job.snapshot()?
+            .counters
+            .get(&Counter::Records)
+            .copied()
+            .unwrap_or(0),
+        1
+    );
+    Ok(())
+}
+
 fn run_without_reports(
     case: &mut Case,
     input_node_id: u64,
+    job: Option<&Job>,
 ) -> TestResult<RecoveryExecutionOutcome> {
     let plan = RecoveryPlan::default();
     let policy = normal_policy(case)?;
     let mut executor = test_support::build_executor(case, &plan, &policy)?;
+    executor.job = job.cloned().map(JobProgress::new);
     let task = RecoveryTask::AssembleRecords(test_support::test_schema());
     let enqueue =
         executor
@@ -195,7 +224,7 @@ fn assert_edge_quota_failure(
 fn edge_quota_rolls_back_assembly_and_all_report_association_links() -> TestResult<()> {
     let (mut baseline, baseline_input) = test_support::record_case()?;
     let before_edges = baseline.edges().len();
-    run_without_reports(&mut baseline, baseline_input)?;
+    run_without_reports(&mut baseline, baseline_input, None)?;
     let assembly_edge_work = baseline
         .edges()
         .len()
@@ -215,6 +244,16 @@ fn edge_quota_rolls_back_assembly_and_all_report_association_links() -> TestResu
         .ok_or("record assembly edge allowance exceeds Case quota")?;
     fill_edges_to(&mut case, edge_target)?;
     let before = case.clone();
-    let outcome = run_record_with_reports(&mut case, input_node_id, &reports, None)?;
-    assert_edge_quota_failure(&case, &before, &outcome, input_node_id)
+    let job = Job::new("rolled back record assembly progress");
+    let outcome = run_record_with_reports(&mut case, input_node_id, &reports, None, Some(&job))?;
+    assert_edge_quota_failure(&case, &before, &outcome, input_node_id)?;
+    assert_eq!(
+        job.snapshot()?
+            .counters
+            .get(&Counter::Records)
+            .copied()
+            .unwrap_or(0),
+        0
+    );
+    Ok(())
 }

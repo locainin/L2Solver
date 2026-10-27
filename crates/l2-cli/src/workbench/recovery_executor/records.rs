@@ -264,6 +264,7 @@ impl Executor<'_> {
         schema: &RecordSchema,
         prepared: record_service::service::PreparedRecordService,
     ) -> Result<(), RecoveryExecutionError> {
+        let parsed_record_count = prepared.parsed_record_count();
         let report_nodes = self
             .record_schema_report_links
             .get(&candidate_id)
@@ -287,6 +288,9 @@ impl Executor<'_> {
             }
             Err(error) => return Err(error),
         };
+        if let Some(progress) = &self.job {
+            progress.parsed_records_committed(parsed_record_count)?;
+        }
         if let Some(links) = self.record_schema_report_links.get_mut(&candidate_id) {
             links.mark_linked(committed.receipt_node_id);
         }

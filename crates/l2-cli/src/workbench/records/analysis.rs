@@ -64,10 +64,17 @@ pub(in crate::workbench) struct RejectedInput {
     pub(in crate::workbench) error: RecordError,
 }
 
+struct ParsedInputSlots {
+    parses: Vec<Option<RecordParseReport>>,
+    rejected_inputs: Vec<RejectedInput>,
+    record_count: usize,
+}
+
 pub(super) struct Analysis {
     pub(super) inputs: Vec<InputDescriptor>,
     pub(super) assembly_input_indexes: Vec<usize>,
     pub(super) assembly: RecordAssemblyOutcome,
+    pub(super) parsed_record_count: usize,
     pub(super) receipt: Vec<u8>,
     pub(super) rejected_inputs: Vec<RejectedInput>,
 }
@@ -89,7 +96,8 @@ pub(super) fn analyze(
     let selected_inputs = load_selected_inputs(case, selected_node_ids)?;
     enforce_aggregate_input_limit(&selected_inputs, limits)?;
     let count_sources = decode_count_sources(case, count_source_options)?;
-    let parses = parse_inputs(&selected_inputs, &count_sources, schema, limits)?;
+    let (parses, parsed_record_count) =
+        parse_inputs(&selected_inputs, &count_sources, schema, limits)?;
     let assembly_inputs = selected_inputs
         .iter()
         .zip(&parses)
@@ -111,6 +119,7 @@ pub(super) fn analyze(
         inputs: descriptors,
         assembly_input_indexes,
         assembly,
+        parsed_record_count,
         receipt,
         rejected_inputs: Vec::new(),
     })
@@ -127,8 +136,11 @@ pub(super) fn analyze_recovery(
     let selected_inputs = load_selected_inputs(case, selected_node_ids)?;
     enforce_aggregate_input_limit(&selected_inputs, limits)?;
     let count_sources = decode_count_sources(case, count_source_options)?;
-    let (parses, rejected_inputs) =
-        parse_input_slots(&selected_inputs, &count_sources, schema, limits, true)?;
+    let ParsedInputSlots {
+        parses,
+        rejected_inputs,
+        record_count: parsed_record_count,
+    } = parse_input_slots(&selected_inputs, &count_sources, schema, limits, true)?;
     let mut assembly_inputs = Vec::new();
     let mut assembly_input_indexes = Vec::new();
     assembly_inputs
@@ -157,6 +169,7 @@ pub(super) fn analyze_recovery(
         inputs: descriptors,
         assembly_input_indexes,
         assembly,
+        parsed_record_count,
         receipt,
         rejected_inputs,
     })
@@ -167,12 +180,17 @@ fn parse_inputs(
     count_sources: &[CountSourceReceipt],
     schema: &RecordSchema,
     limits: RecordLimits,
-) -> Result<Vec<RecordParseReport>, RecordError> {
-    let (parses, _) = parse_input_slots(inputs, count_sources, schema, limits, false)?;
-    parses
+) -> Result<(Vec<RecordParseReport>, usize), RecordError> {
+    let ParsedInputSlots {
+        parses,
+        record_count: parsed_record_count,
+        ..
+    } = parse_input_slots(inputs, count_sources, schema, limits, false)?;
+    let parses = parses
         .into_iter()
         .map(|parse| parse.ok_or(RecordError::InvalidReport))
-        .collect()
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok((parses, parsed_record_count))
 }
 
 fn parse_input_slots(
@@ -181,7 +199,7 @@ fn parse_input_slots(
     schema: &RecordSchema,
     limits: RecordLimits,
     continue_after_structural_rejection: bool,
-) -> Result<(Vec<Option<RecordParseReport>>, Vec<RejectedInput>), RecordError> {
+) -> Result<ParsedInputSlots, RecordError> {
     // Parse each source independently so bytes cannot spill into another part
     let mut parses = Vec::new();
     parses
@@ -191,15 +209,12 @@ fn parse_input_slots(
     let mut records_used = 0_usize;
     let mut report_bytes_used = 0_usize;
     for (input_index, input) in inputs.iter().enumerate() {
-        let bytes = input.bytes;
-        let has_records = part_has_records(bytes, schema, count_sources.get(input_index));
+        let has_records = part_has_records(input.bytes, schema, count_sources.get(input_index));
         if records_used >= limits.max_records && has_records != Some(false) {
-            return Err(RecordError::TooManyRecords {
-                count: u64::try_from(records_used)
-                    .unwrap_or(u64::MAX)
-                    .saturating_add(1),
-                maximum: limits.max_records,
-            });
+            return Err(too_many_records(
+                records_used.saturating_add(1),
+                limits.max_records,
+            ));
         }
         if report_bytes_used >= limits.max_report_bytes && has_records != Some(false) {
             return Err(RecordError::ReportTooLarge {
@@ -215,24 +230,25 @@ fn parse_input_slots(
             };
         }
         let part_limits = remaining_parse_limits(limits, records_used, report_bytes_used);
-        let parse = match protocol::parse_records_with_limits(bytes, &part_schema, part_limits) {
-            Ok(parse) => parse,
-            Err(error)
-                if continue_after_structural_rejection && is_structural_rejection(&error) =>
-            {
-                rejected_inputs
-                    .try_reserve(1)
-                    .map_err(|_| RecordError::AllocationFailed)?;
-                rejected_inputs.push(RejectedInput {
-                    input_index,
-                    input_node_id: input.node,
-                    error,
-                });
-                parses.push(None);
-                continue;
-            }
-            Err(error) => return Err(error),
-        };
+        let parse =
+            match protocol::parse_records_with_limits(input.bytes, &part_schema, part_limits) {
+                Ok(parse) => parse,
+                Err(error)
+                    if continue_after_structural_rejection && is_structural_rejection(&error) =>
+                {
+                    rejected_inputs
+                        .try_reserve(1)
+                        .map_err(|_| RecordError::AllocationFailed)?;
+                    rejected_inputs.push(RejectedInput {
+                        input_index,
+                        input_node_id: input.node,
+                        error,
+                    });
+                    parses.push(None);
+                    continue;
+                }
+                Err(error) => return Err(error),
+            };
         records_used =
             records_used
                 .checked_add(parse.records().len())
@@ -241,10 +257,7 @@ fn parse_input_slots(
                     maximum: limits.max_records,
                 })?;
         if records_used > limits.max_records {
-            return Err(RecordError::TooManyRecords {
-                count: u64::try_from(records_used).unwrap_or(u64::MAX),
-                maximum: limits.max_records,
-            });
+            return Err(too_many_records(records_used, limits.max_records));
         }
         report_bytes_used = report_bytes_used
             .checked_add(parse.metadata_bytes())
@@ -260,7 +273,18 @@ fn parse_input_slots(
         }
         parses.push(Some(parse));
     }
-    Ok((parses, rejected_inputs))
+    Ok(ParsedInputSlots {
+        parses,
+        rejected_inputs,
+        record_count: records_used,
+    })
+}
+
+fn too_many_records(count: usize, maximum: usize) -> RecordError {
+    RecordError::TooManyRecords {
+        count: u64::try_from(count).unwrap_or(u64::MAX),
+        maximum,
+    }
 }
 
 const fn is_structural_rejection(error: &RecordError) -> bool {

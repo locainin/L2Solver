@@ -2,6 +2,7 @@ use super::{
     AcquisitionOptions, IndexedAnalysisContext, IndexedAnalysisOptions, acquire_indexed_source,
     analyze_indexed_source, analyze_indexed_source_with_context, source_coverage,
 };
+use l2_pcap::CaptureSource;
 use l2_workbench::{
     job::{
         Counter, Job, Phase, PhaseState,
@@ -142,6 +143,14 @@ fn warm_cached_capture_index_skips_ingestion() -> Result<(), Box<dyn Error>> {
             .map(|phase| phase.completed),
         Some(0)
     );
+    assert_eq!(
+        snapshot
+            .counters
+            .get(&Counter::Packets)
+            .copied()
+            .unwrap_or(0),
+        0
+    );
     assert!(
         snapshot
             .counters
@@ -149,6 +158,54 @@ fn warm_cached_capture_index_skips_ingestion() -> Result<(), Box<dyn Error>> {
             .copied()
             .unwrap_or(0)
             > 0
+    );
+    Ok(())
+}
+
+#[test]
+fn fresh_lldp_tcp_capture_counts_packets_and_warm_cache_reuse_counts_none()
+-> Result<(), Box<dyn Error>> {
+    let directory = tempfile::tempdir()?;
+    let capture_path = directory.path().join("mixed.pcap");
+    fs::write(&capture_path, capture_with_lldp_and_tcp()?)?;
+    let cache = open_test_cache(directory.path())?;
+    let job = Job::new("mixed capture acquisition");
+    let options = AcquisitionOptions {
+        cache: Some(&cache),
+        job: Some(&job),
+        ..AcquisitionOptions::default()
+    };
+
+    let indexed = acquire_indexed_source(&capture_path, directory.path(), &options)?;
+    assert_eq!(indexed.receipt.packets, 2);
+    assert_eq!(indexed.receipt.transport_packets, 1);
+    assert_eq!(indexed.receipt.unsupported_transport_packets, 1);
+    assert_eq!(
+        job.snapshot()?
+            .counters
+            .get(&Counter::Packets)
+            .copied()
+            .unwrap_or(0),
+        2
+    );
+    drop(indexed);
+
+    let warm_job = Job::new("warm mixed capture acquisition");
+    let options = AcquisitionOptions {
+        cache: Some(&cache),
+        job: Some(&warm_job),
+        ..AcquisitionOptions::default()
+    };
+    let reused = acquire_indexed_source(&capture_path, directory.path(), &options)?;
+    assert_eq!(reused.receipt.packets, 2);
+    assert_eq!(
+        warm_job
+            .snapshot()?
+            .counters
+            .get(&Counter::Packets)
+            .copied()
+            .unwrap_or(0),
+        0
     );
     Ok(())
 }
@@ -627,4 +684,20 @@ fn single_flow_capture() -> Vec<u8> {
     capture.extend_from_slice(&54_u32.to_le_bytes());
     capture.extend_from_slice(&frame);
     capture
+}
+
+fn capture_with_lldp_and_tcp() -> Result<Vec<u8>, Box<dyn Error>> {
+    let mut lldp_source = CaptureSource::new(Cursor::new(LLDP_CAPTURE))?;
+    let lldp = lldp_source
+        .next_packet()?
+        .ok_or("LLDP packet fixture is empty")?;
+    let frame = lldp.bytes();
+    let length = u32::try_from(frame.len())?;
+    let mut capture = single_flow_capture();
+    capture.extend_from_slice(&2_u32.to_le_bytes());
+    capture.extend_from_slice(&0_u32.to_le_bytes());
+    capture.extend_from_slice(&length.to_le_bytes());
+    capture.extend_from_slice(&length.to_le_bytes());
+    capture.extend_from_slice(frame);
+    Ok(capture)
 }

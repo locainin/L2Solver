@@ -397,6 +397,7 @@ fn ingest_capture_then<T>(
             .ingest(label(path, "capture"), reader)
             .map_err(|error| input::boxed_capture_error(path, error))?;
         if let Some(job) = job {
+            job.increment(Counter::Packets, receipt.packets)?;
             job.check_cancelled()?;
         }
         complete(store, receipt)

@@ -81,7 +81,9 @@ pub enum Counter {
     Files,
     /// Bytes read or written
     Bytes,
-    /// Packets processed
+    /// Packet records indexed during a fresh capture ingestion
+    ///
+    /// Reusing a cached index does not add packet work
     Packets,
     /// Flows reconstructed
     Flows,
@@ -103,7 +105,9 @@ pub enum Counter {
     CacheHits,
     /// Results computed without a persistent cache entry
     CacheMisses,
-    /// Records discovered
+    /// Strictly parsed records in committed record assemblies
+    ///
+    /// Failed or rolled-back assemblies do not add record work
     Records,
     /// Transformations discovered
     Transforms,

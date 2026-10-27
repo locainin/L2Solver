@@ -51,6 +51,10 @@ pub(in crate::workbench) struct PreparedRecordService {
 }
 
 impl PreparedRecordService {
+    pub(in crate::workbench) const fn parsed_record_count(&self) -> usize {
+        self.analysis.parsed_record_count
+    }
+
     /// Sum the exact receipt and group candidate bytes that commit will retain
     pub(in crate::workbench) fn retained_output_bytes(&self) -> Result<usize, RecordError> {
         self.analysis
