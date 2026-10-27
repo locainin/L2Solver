@@ -344,7 +344,7 @@ fn unsupported_file_is_preserved_and_marked_incomplete() -> Result<(), Box<dyn E
 }
 
 #[test]
-fn per_input_cache_ignores_version_9_and_reuses_version_10() -> Result<(), Box<dyn Error>> {
+fn per_input_cache_ignores_version_10_and_reuses_version_11() -> Result<(), Box<dyn Error>> {
     let directory = tempfile::tempdir()?;
     let cache = l2_workbench::job::cache::Cache::open_at(
         directory.path().join("cache"),
@@ -376,7 +376,7 @@ fn per_input_cache_ignores_version_9_and_reuses_version_10() -> Result<(), Box<d
     let previous_key = l2_workbench::job::cache::StageKey::new(
         "file_artifact_analysis",
         1,
-        "l2_artifact_analyzer_v9",
+        "l2_artifact_analyzer_v10",
         &previous_policy,
         &identity,
         &[],
@@ -506,10 +506,10 @@ fn result_identity_uses_ordered_content_hashes_and_analysis_settings() -> Result
     let recovery = RecoveryOptions::default();
     let policy = RefinePolicy::new(&recovery, false)?;
     let identity = result_identity(&sources, &recovery, &policy)?;
-    assert_eq!(identity.algorithm_version, 10);
+    assert_eq!(identity.algorithm_version, 11);
     assert_eq!(
         identity.settings.get("analyzer_algorithm_version"),
-        Some(&json!(10))
+        Some(&json!(11))
     );
     assert_eq!(
         identity.settings.get("analysis_receipt_schema_version"),
@@ -594,12 +594,12 @@ fn matching_result_directory_is_reused_before_artifact_analysis() -> Result<(), 
 }
 
 #[test]
-fn version_9_analyzer_result_is_not_reused() -> Result<(), Box<dyn Error>> {
+fn version_10_analyzer_result_is_not_reused() -> Result<(), Box<dyn Error>> {
     rejects_prior_result_version(StaleResultVersion::Analyzer)
 }
 
 #[test]
-fn version_9_publication_result_is_not_reused() -> Result<(), Box<dyn Error>> {
+fn version_10_publication_result_is_not_reused() -> Result<(), Box<dyn Error>> {
     rejects_prior_result_version(StaleResultVersion::Publication)
 }
 
@@ -640,21 +640,21 @@ fn rejects_prior_result_version(version: StaleResultVersion) -> Result<(), Box<d
         .ok_or("result identity is missing")?;
     match version {
         StaleResultVersion::Publication => {
-            identity.insert("algorithm_version".to_owned(), json!(9));
+            identity.insert("algorithm_version".to_owned(), json!(10));
         }
         StaleResultVersion::Analyzer => {
             let settings = identity
                 .get_mut("settings")
                 .and_then(serde_json::Value::as_object_mut)
                 .ok_or("result settings are missing")?;
-            settings.insert("analyzer_algorithm_version".to_owned(), json!(9));
+            settings.insert("analyzer_algorithm_version".to_owned(), json!(10));
         }
     }
     fs::write(&manifest_path, serde_json::to_vec(&manifest)?)?;
 
     let error = run(&options, &mut Vec::new())
         .err()
-        .ok_or("version 9 result was reused under version 10")?;
+        .ok_or("version 10 result was reused under version 11")?;
     assert!(
         error
             .to_string()

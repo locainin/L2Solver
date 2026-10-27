@@ -97,3 +97,49 @@ fn temporary_cache_pressure_fails_without_publication_and_retry_keeps_the_same_a
     assert_eq!(first.get("sources"), second.get("sources"));
     Ok(())
 }
+
+#[test]
+fn range_scanner_scratch_shares_the_job_budget_and_fails_before_publication()
+-> Result<(), Box<dyn Error>> {
+    let directory = tempfile::tempdir()?;
+    let input = directory.path().join("large.bin");
+    let output = directory.path().join("result");
+    fs::File::create(&input)?.set_len(5 * 1024 * 1024)?;
+    let options = RefineOptions {
+        input,
+        output: Some(output.clone()),
+        dry_run: false,
+        salvage: false,
+        recovery: RecoveryOptions {
+            no_cache: true,
+            memory_limit: 8 * 1024 * 1024,
+            ..RecoveryOptions::default()
+        },
+    };
+    let budget = MemoryBudget::new(options.recovery.memory_limit);
+    let held = budget.try_reserve(MemoryClass::Cache, 4 * 1024 * 1024)?;
+    let error = crate::refine::run_with_memory_budget(
+        &options,
+        &mut Vec::new(),
+        &Job::new("blocked range scan"),
+        &budget,
+    )
+    .err()
+    .ok_or("range scan ignored shared pressure")?;
+    assert!(matches!(
+        error.downcast_ref::<MemoryError>(),
+        Some(MemoryError::Limit { .. })
+    ));
+    assert!(!output.exists());
+    drop(held);
+    assert!(!crate::refine::run_with_memory_budget(
+        &options,
+        &mut Vec::new(),
+        &Job::new("range scan retry"),
+        &budget
+    )?);
+    let snapshot = budget.snapshot()?;
+    assert!(snapshot.peak_bytes > 4 * 1024 * 1024 && snapshot.peak_bytes <= snapshot.limit_bytes);
+    assert_eq!(snapshot.used_bytes, 0);
+    Ok(())
+}

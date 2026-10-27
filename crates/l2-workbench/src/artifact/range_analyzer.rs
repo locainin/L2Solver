@@ -7,6 +7,7 @@ use super::{
     ValidationSummary, ZipEndObservation, ZipEndScanLimits, discover_embedded_objects_with_work,
     scan_file_signatures, source_hash::SourceHasher, zip::ZipArtifactLimits,
 };
+use crate::job::MemoryLease;
 use std::io::{self, Read};
 
 // Two windows fit within the caller's in-memory input budget
@@ -70,6 +71,7 @@ pub fn analyze_artifacts_observing_zip_ends(
     checkpoint: Option<usize>,
     scan_png: bool,
     limits: ZipEndScanLimits,
+    memory: Option<&mut MemoryLease>,
 ) -> io::Result<StreamSourceAnalysis> {
     let scan_work = source_length.min(limits.max_scan_bytes);
     let mut scan_options = options;
@@ -91,6 +93,7 @@ pub fn analyze_artifacts_observing_zip_ends(
             scan_options,
             checkpoint,
             Some(limits),
+            memory,
         )?
     } else {
         let mut reader = ScannedReader::new(
@@ -123,24 +126,10 @@ fn analyze_png_inner(
     options: ArtifactAnalysisOptions,
     checkpoint: Option<usize>,
     zip_limits: Option<ZipEndScanLimits>,
+    mut memory: Option<&mut MemoryLease>,
 ) -> io::Result<StreamSourceAnalysis> {
     if source_length >= options.limits.max_total_work_bytes {
-        let mut reader =
-            ScannedReader::new(reader, source_length, options, checkpoint, zip_limits)?;
-        reader.drain_source()?;
-        let (mut analysis, prefix_sha256, zip_observation) = reader.finish()?;
-        analysis
-            .omissions
-            .push(AnalysisOmission::SourceRangeValidationLimit {
-                format: AnalysisFormat::Png,
-                reason: String::from("PNG validation exceeds the remaining byte-work limit"),
-            });
-        return Ok(StreamSourceAnalysis {
-            analysis,
-            png: None,
-            prefix_sha256,
-            zip_observation,
-        });
+        return png_work_omitted(reader, source_length, options, checkpoint, zip_limits);
     }
     let mut scan_options = options;
     // Reserve the worst-case PNG scan before the rolling scanner spends work
@@ -155,7 +144,12 @@ fn analyze_png_inner(
             .max_chunks
             .min((options.limits.max_input_bytes / metadata_bytes).max(1)),
     };
-    let result = super::parse_png_from_reader(&mut reader, source_length, limits);
+    let before = memory.as_ref().map(|lease| lease.bytes());
+    let result = if let Some(lease) = memory.as_deref_mut() {
+        super::parse_png_from_reader_with_memory(&mut reader, source_length, limits, lease)
+    } else {
+        super::parse_png_from_reader(&mut reader, source_length, limits)
+    };
     let consumed = reader.scanned.read_bytes;
     // Unused PNG work remains available to later rolling windows
     reader.scanned.state.refund_work(source_length - consumed)?;
@@ -178,11 +172,15 @@ fn analyze_png_inner(
             )
         }
         Err(super::PngReadError::Io(error)) => return Err(error),
+        Err(super::PngReadError::Memory(error)) => return Err(io::Error::other(error)),
         Err(super::PngReadError::Format(
             error @ (super::PngError::TooManyChunks { .. } | super::PngError::AllocationFailure),
         )) => (None, Some(error.to_string())),
         Err(super::PngReadError::Format(_)) => (None, None),
     };
+    if let (Some(lease), Some(before)) = (memory, before) {
+        lease.try_resize(before).map_err(io::Error::other)?;
+    }
     reader.drain_source()?;
     let (mut analysis, prefix_sha256, zip_observation) = reader.finish()?;
     analysis.work_bytes = analysis
@@ -200,6 +198,30 @@ fn analyze_png_inner(
     Ok(StreamSourceAnalysis {
         analysis,
         png,
+        prefix_sha256,
+        zip_observation,
+    })
+}
+
+fn png_work_omitted(
+    reader: &mut impl Read,
+    source_length: usize,
+    options: ArtifactAnalysisOptions,
+    checkpoint: Option<usize>,
+    zip_limits: Option<ZipEndScanLimits>,
+) -> io::Result<StreamSourceAnalysis> {
+    let mut reader = ScannedReader::new(reader, source_length, options, checkpoint, zip_limits)?;
+    reader.drain_source()?;
+    let (mut analysis, prefix_sha256, zip_observation) = reader.finish()?;
+    analysis
+        .omissions
+        .push(AnalysisOmission::SourceRangeValidationLimit {
+            format: AnalysisFormat::Png,
+            reason: String::from("PNG validation exceeds the remaining byte-work limit"),
+        });
+    Ok(StreamSourceAnalysis {
+        analysis,
+        png: None,
         prefix_sha256,
         zip_observation,
     })

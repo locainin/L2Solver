@@ -1,6 +1,7 @@
 //! Refine standalone byte files and manifest-listed artifact directories
 
 mod analysis;
+mod analysis_memory;
 mod file_artifact;
 mod input;
 mod output;

@@ -6,7 +6,53 @@ use std::{
 
 use l2_workbench::artifact::{
     FileRange, PNG_SIGNATURE, PngError, PngLimits, PngReadError, parse_png, parse_png_from_reader,
+    parse_png_from_reader_with_memory,
 };
+
+#[test]
+fn png_chunk_metadata_uses_the_shared_live_memory_lease() -> Result<(), Box<dyn Error>> {
+    use l2_workbench::job::{MemoryBudget, MemoryClass, MemoryError};
+    let mut bytes = PNG_SIGNATURE.to_vec();
+    write_chunk(
+        &mut bytes,
+        *b"IHDR",
+        &[0, 0, 0, 1, 0, 0, 0, 1, 8, 2, 0, 0, 0],
+    )?;
+    write_chunk(&mut bytes, *b"IEND", &[])?;
+    let small = MemoryBudget::new(1);
+    let mut lease = small.try_reserve(MemoryClass::Executor, 0)?;
+    let result = parse_png_from_reader_with_memory(
+        &mut Cursor::new(&bytes),
+        bytes.len(),
+        PngLimits::default(),
+        &mut lease,
+    );
+    assert!(matches!(
+        result,
+        Err(PngReadError::Memory(MemoryError::Limit { .. }))
+    ));
+    assert_eq!(lease.bytes(), 0);
+    let budget = MemoryBudget::new(4096);
+    let mut lease = budget.try_reserve(MemoryClass::Executor, 0)?;
+    let report = parse_png_from_reader_with_memory(
+        &mut Cursor::new(&bytes),
+        bytes.len(),
+        PngLimits::default(),
+        &mut lease,
+    )?;
+    assert_eq!(report.chunks.len(), 2);
+    assert!(
+        lease.bytes()
+            >= u64::try_from(
+                report.chunks.capacity()
+                    * std::mem::size_of::<l2_workbench::artifact::PngRangeChunk>()
+            )?
+    );
+    drop(report);
+    drop(lease);
+    assert_eq!(budget.snapshot()?.used_bytes, 0);
+    Ok(())
+}
 
 #[test]
 fn streaming_png_validates_large_chunk_with_bounded_reads_and_exact_ranges()

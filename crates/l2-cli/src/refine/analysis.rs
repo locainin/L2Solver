@@ -16,7 +16,7 @@ use l2_workbench::{
     },
     evidence::{Case, MAX_NODES, SourceRange},
     job::{
-        CacheFallbackKind, CacheStage, Counter, Job, MemoryBudget, Phase,
+        CacheFallbackKind, CacheStage, Counter, Job, MemoryBudget, MemoryLease, Phase,
         cache::{Cache, CacheEntry, CacheReadPolicy, Lease, SourceIdentity, StageKey, StageStatus},
     },
     recovery::proposals::TRANSFORM_PROPOSAL_FORMAT_VERSION,
@@ -31,7 +31,7 @@ use std::{
     io::{self, Write},
 };
 
-pub(super) const REFINE_ANALYZER_ALGORITHM_VERSION: u32 = 10;
+pub(super) const REFINE_ANALYZER_ALGORITHM_VERSION: u32 = 11;
 pub(super) const CACHE_ANALYSIS_SCHEMA_VERSION: u32 = 1;
 const MAX_CACHE_RECEIPT_BYTES: usize = 8 * 1024 * 1024;
 
@@ -77,12 +77,24 @@ pub(super) fn analyze_sources(
         let mut options = policy.analyzer;
         options.limits.max_total_output_bytes =
             options.limits.max_total_output_bytes.min(remaining);
-        let report = if source.bytes().is_some() && remaining == 0 {
-            no_case_space(source, policy.case_blob_limit)?
+        let (report, _report_memory) = if source.bytes().is_some() && remaining == 0 {
+            (no_case_space(source, policy.case_blob_limit)?, None)
         } else if source.bytes().is_some() {
-            analyze_source_cached(source, options, recovery, cache, job)?
+            (
+                analyze_source_cached(source, options, recovery, cache, job)?,
+                None,
+            )
         } else {
-            analyze_file_source(&mut analysis, input_set, source_index, source, options, job)?
+            let (report, lease) = analyze_file_source(
+                &mut analysis,
+                input_set,
+                source_index,
+                source,
+                options,
+                job,
+                memory,
+            )?;
+            (report, Some(lease))
         };
         let expanded_members = report
             .artifacts
@@ -104,8 +116,10 @@ fn analyze_file_source(
     source: &LoadedSource,
     options: ArtifactAnalysisOptions,
     job: &Job,
-) -> Result<l2_workbench::artifact::ArtifactAnalysis, Box<dyn Error>> {
-    let range = source.analyze_ranges(input, source_index, options, job)?;
+    memory: &MemoryBudget,
+) -> Result<(l2_workbench::artifact::ArtifactAnalysis, MemoryLease), Box<dyn Error>> {
+    let range = source.analyze_ranges(input, source_index, options, job, memory)?;
+    let report_memory = range.report_memory;
     let mut report = range.report;
     let mut next_file_index = report.artifacts.len();
     if let Some(archive) = range.archive {
@@ -138,7 +152,7 @@ fn analyze_file_source(
         )?;
     }
     record_analysis_work(job, &report)?;
-    Ok(report)
+    Ok((report, report_memory))
 }
 
 fn no_case_space(

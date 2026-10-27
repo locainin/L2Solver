@@ -53,10 +53,13 @@ fn range_source_admission_and_analysis_read_content_once() -> Result<(), Box<dyn
     let mut options = ArtifactAnalysisOptions::default();
     options.limits.max_input_bytes = 1024;
     options.limits.max_total_work_bytes = 1024;
-    let report = sources
-        .first()
-        .ok_or("source missing")?
-        .analyze_ranges(&set, 0, options, &job)?;
+    let report = sources.first().ok_or("source missing")?.analyze_ranges(
+        &set,
+        0,
+        options,
+        &job,
+        &l2_workbench::job::MemoryBudget::new(u64::MAX),
+    )?;
     let bytes_read = process_read_bytes()? - before;
     assert!(
         bytes_read < LENGTH + 1024 * 1024,
@@ -155,11 +158,11 @@ fn large_manifest_member_with_wrong_digest_is_never_published() -> Result<(), Bo
     let input = directory.path().join("input");
     let destination = directory.path().join("result");
     fs::create_dir(&input)?;
-    fs::write(input.join("member.bin"), vec![7_u8; 16 * 1024])?;
+    fs::write(input.join("member.bin"), vec![7_u8; 512 * 1024])?;
     fs::write(
         input.join("manifest.json"),
         serde_json::to_vec(&serde_json::json!({
-            "schema_version": 1, "artifacts": [{"file": "member.bin", "byte_length": 16 * 1024, "sha256": "0".repeat(64)}]
+            "schema_version": 1, "artifacts": [{"file": "member.bin", "byte_length": 512 * 1024, "sha256": "0".repeat(64)}]
         }))?,
     )?;
     let options = RefineOptions {
@@ -169,7 +172,7 @@ fn large_manifest_member_with_wrong_digest_is_never_published() -> Result<(), Bo
         salvage: false,
         recovery: RecoveryOptions {
             no_cache: true,
-            memory_limit: 32 * 1024,
+            memory_limit: 1024 * 1024,
             ..RecoveryOptions::default()
         },
     };
@@ -348,7 +351,8 @@ fn changing_a_range_source_before_reopening_rejects_analysis() -> Result<(), Box
                 &set,
                 0,
                 ArtifactAnalysisOptions::default(),
-                &Job::new("analyze")
+                &Job::new("analyze"),
+                &l2_workbench::job::MemoryBudget::new(u64::MAX)
             )
             .is_err(),
         "changed source was analyzed"
@@ -401,6 +405,7 @@ fn many_range_sources_fit_a_small_process_descriptor_limit() -> Result<(), Box<d
             index,
             l2_workbench::artifact::ArtifactAnalysisOptions::default(),
             &job,
+            &l2_workbench::job::MemoryBudget::new(u64::MAX),
         )?;
     }
     Ok(())

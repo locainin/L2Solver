@@ -9,7 +9,7 @@ use l2_workbench::{
             inspect_zip_from_reader_with_source_sha256,
         },
     },
-    job::Job,
+    job::{Job, MemoryBudget, MemoryClass},
 };
 use std::{
     error::Error,
@@ -30,11 +30,13 @@ pub(super) fn probe_tail(
     max_buffer: usize,
     input: &InputSet,
     job: &Job,
+    memory: &MemoryBudget,
 ) -> Result<Option<ZipCandidate>, Box<dyn Error>> {
     let count = length.min(ZIP_END_SCAN_BYTES).min(max_buffer);
     if count < 22 || !input.reserve_extra_reads(u64::try_from(count)?)? {
         return Ok(None);
     }
+    let _scratch = memory.try_reserve(MemoryClass::Executor, u64::try_from(count)?)?;
     let mut tail = Vec::new();
     tail.try_reserve_exact(count)?;
     tail.resize(count, 0);

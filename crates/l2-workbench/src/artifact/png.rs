@@ -170,6 +170,7 @@ pub fn parse_png(bytes: &[u8], limits: PngLimits) -> Result<PngReport<'_>, PngEr
         .map_err(|error| match error {
             super::png_stream::PngReadError::Format(error) => error,
             super::png_stream::PngReadError::Io(_) => PngError::TruncatedChunk,
+            super::png_stream::PngReadError::Memory(_) => PngError::AllocationFailure,
         })?;
     let mut chunks = Vec::new();
     chunks

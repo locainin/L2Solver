@@ -27,6 +27,7 @@ fn analyze_with_checkpoint(
             max_scan_bytes: 0,
             max_candidates: 0,
         },
+        None,
     )
 }
 
@@ -45,6 +46,7 @@ fn analyze_png_only(
             max_scan_bytes: 0,
             max_candidates: 0,
         },
+        None,
     )
 }
 
@@ -86,6 +88,7 @@ fn zip_end_observation_crosses_short_reads_and_captures_the_prefix_hash()
             max_scan_bytes: source.len(),
             max_candidates: 4,
         },
+        None,
     )?;
     let observation = result.zip_observation.ok_or("ZIP observation missing")?;
     assert_eq!(observation.candidates.len(), 1);
@@ -117,6 +120,7 @@ fn zip_end_observation_reports_candidate_and_scan_limits() -> Result<(), Box<dyn
             max_scan_bytes: source.len(),
             max_candidates: 1,
         },
+        None,
     )?;
     let observed = result.zip_observation.ok_or("ZIP observation missing")?;
     assert_eq!(observed.candidates.len(), 1);
@@ -131,6 +135,7 @@ fn zip_end_observation_reports_candidate_and_scan_limits() -> Result<(), Box<dyn
             max_scan_bytes: 10,
             max_candidates: 4,
         },
+        None,
     )?;
     let observed = result.zip_observation.ok_or("ZIP observation missing")?;
     assert_eq!(observed.scanned_bytes, 10);
@@ -160,6 +165,7 @@ fn png_iend_and_zip_end_hashes_remain_exact_with_shared_lookahead() -> Result<()
             max_scan_bytes: source.len(),
             max_candidates: 4,
         },
+        None,
     )?;
     assert_eq!(
         result.png.ok_or("PNG missing")?.sha256,

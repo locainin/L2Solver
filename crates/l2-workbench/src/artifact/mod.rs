@@ -63,7 +63,10 @@ pub use png_pixels::{
     MAX_PNG_PIXEL_WORK_BYTES, MAX_PNG_PIXELS, PngPixel, PngPixelDecodeError, PngPixelImage,
     PngPixelLimits, decode_png_pixels,
 };
-pub use png_stream::{PngRangeChunk, PngRangeReport, PngReadError, parse_png_from_reader};
+pub use png_stream::{
+    PngRangeChunk, PngRangeReport, PngReadError, parse_png_from_reader,
+    parse_png_from_reader_with_memory,
+};
 pub use r2::import_r2_json;
 pub use range_analyzer::{
     StreamPngBoundary, StreamSourceAnalysis, analyze_artifacts_from_reader,

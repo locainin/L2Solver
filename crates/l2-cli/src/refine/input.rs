@@ -7,7 +7,7 @@ use super::{
 use crate::safe_filename::is_safe_flat_file_name;
 use l2_workbench::{
     job::{
-        Counter, Job, MemoryBudget, MemoryClass, MemoryLease,
+        Counter, Job, MemoryBudget, MemoryClass, MemoryError, MemoryLease,
         cache::{SourceFingerprint, SourceIdentity},
     },
     sha256,
@@ -229,6 +229,7 @@ pub(super) struct RangeAnalysis {
     pub(super) archive: Option<l2_workbench::artifact::zip::ZipArtifactReport>,
     pub(super) retain_source: bool,
     pub(super) png: Option<l2_workbench::artifact::StreamPngBoundary>,
+    pub(super) report_memory: MemoryLease,
 }
 
 impl LoadedSource {
@@ -260,6 +261,7 @@ impl LoadedSource {
         source_index: usize,
         options: l2_workbench::artifact::ArtifactAnalysisOptions,
         job: &Job,
+        memory: &MemoryBudget,
     ) -> Result<RangeAnalysis, Box<dyn Error>> {
         let SourceData::File(source) = &self.data else {
             return Err(invalid_input("source is not range-backed"));
@@ -280,6 +282,7 @@ impl LoadedSource {
             options.limits.max_input_bytes,
             input_set,
             job,
+            memory,
         )?;
         file.seek(SeekFrom::Start(0))?;
         input_set.budget.reserve(
@@ -291,7 +294,8 @@ impl LoadedSource {
         let checkpoint = zip_candidate
             .as_ref()
             .and_then(|candidate| (candidate.length < source.length).then_some(candidate.length));
-        let scanned = analyze_source_stream(&mut reader, source.length, options, checkpoint)?;
+        let (scanned, report_memory) =
+            analyze_source_stream(&mut reader, source.length, options, checkpoint, memory)?;
         let mut report = scanned.analysis;
         let mut png = scanned.png;
         let mut file = reader.into_inner();
@@ -331,6 +335,7 @@ impl LoadedSource {
             archive,
             retain_source,
             png,
+            report_memory,
         })
     }
 }
@@ -365,7 +370,8 @@ fn analyze_source_stream(
     length: usize,
     options: l2_workbench::artifact::ArtifactAnalysisOptions,
     checkpoint: Option<usize>,
-) -> Result<l2_workbench::artifact::StreamSourceAnalysis, Box<dyn Error>> {
+    memory: &MemoryBudget,
+) -> Result<(l2_workbench::artifact::StreamSourceAnalysis, MemoryLease), Box<dyn Error>> {
     let mut signature = [0_u8; l2_workbench::artifact::PNG_SIGNATURE.len()];
     let count = length.min(signature.len());
     let prefix = signature
@@ -374,6 +380,7 @@ fn analyze_source_stream(
     reader.read_exact(prefix)?;
     // Feed the already-read prefix to the analyzer without reopening the source
     let is_png = count == signature.len() && signature == l2_workbench::artifact::PNG_SIGNATURE;
+    let (scratch, retained) = super::analysis_memory::reserve(memory, length, options, is_png)?;
     let prefix = signature
         .get(..count)
         .ok_or_else(|| invalid_input("source prefix length is invalid"))?;
@@ -401,16 +408,30 @@ fn analyze_source_stream(
         max_scan_bytes: length.min(marker_work),
         max_candidates: (options.limits.max_input_bytes / 256).min(64),
     };
-    Ok(
-        l2_workbench::artifact::analyze_artifacts_observing_zip_ends(
-            &mut complete,
-            length,
-            stream_options,
-            checkpoint,
-            is_png,
-            limits,
-        )?,
+    let mut png_metadata = memory.try_reserve(MemoryClass::Executor, 0)?;
+    let result = l2_workbench::artifact::analyze_artifacts_observing_zip_ends(
+        &mut complete,
+        length,
+        stream_options,
+        checkpoint,
+        is_png,
+        limits,
+        Some(&mut png_metadata),
     )
+    .map_err(stream_error)?;
+    drop(scratch);
+    Ok((result, retained))
+}
+
+fn stream_error(error: io::Error) -> Box<dyn Error> {
+    if let Some(memory) = error
+        .get_ref()
+        .and_then(|source| source.downcast_ref::<MemoryError>())
+    {
+        Box::new(*memory)
+    } else {
+        Box::new(error)
+    }
 }
 
 fn confirm_range_source_name(

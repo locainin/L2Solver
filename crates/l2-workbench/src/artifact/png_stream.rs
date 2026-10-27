@@ -6,6 +6,7 @@ use std::{
 };
 
 use super::{FileRange, PNG_SIGNATURE, PngError, PngLimits};
+use crate::job::{MemoryError, MemoryLease};
 
 const READ_BUFFER_BYTES: usize = 16 * 1024;
 const IHDR_LENGTH: usize = 13;
@@ -45,6 +46,8 @@ pub enum PngReadError {
     Format(PngError),
     /// The reader failed or ended before the declared input length
     Io(io::Error),
+    /// Shared live-memory admission prevented retaining chunk metadata
+    Memory(MemoryError),
 }
 
 impl fmt::Display for PngReadError {
@@ -52,6 +55,7 @@ impl fmt::Display for PngReadError {
         match self {
             Self::Format(error) => error.fmt(formatter),
             Self::Io(error) => error.fmt(formatter),
+            Self::Memory(error) => error.fmt(formatter),
         }
     }
 }
@@ -61,6 +65,7 @@ impl std::error::Error for PngReadError {
         match self {
             Self::Format(error) => Some(error),
             Self::Io(error) => Some(error),
+            Self::Memory(error) => Some(error),
         }
     }
 }
@@ -89,6 +94,36 @@ pub fn parse_png_from_reader(
     reader: &mut impl Read,
     source_length: usize,
     limits: PngLimits,
+) -> Result<PngRangeReport, PngReadError> {
+    parse_png_inner(reader, source_length, limits, None, 0)
+}
+
+/// Validate a PNG while charging retained chunk metadata to a shared lease
+///
+/// The caller keeps the lease alive while the returned chunk vector is retained.
+///
+/// # Errors
+/// Returns a structural, reader, allocation, or shared-memory admission failure
+pub fn parse_png_from_reader_with_memory(
+    reader: &mut impl Read,
+    source_length: usize,
+    limits: PngLimits,
+    memory: &mut MemoryLease,
+) -> Result<PngRangeReport, PngReadError> {
+    let before = memory.bytes();
+    let result = parse_png_inner(reader, source_length, limits, Some(memory), before);
+    if result.is_err() {
+        memory.try_resize(before).map_err(PngReadError::Memory)?;
+    }
+    result
+}
+
+fn parse_png_inner(
+    reader: &mut impl Read,
+    source_length: usize,
+    limits: PngLimits,
+    mut memory: Option<&mut MemoryLease>,
+    before: u64,
 ) -> Result<PngRangeReport, PngReadError> {
     if limits.max_input_bytes == 0 || limits.max_chunks == 0 {
         return Err(PngError::InvalidLimits.into());
@@ -130,9 +165,12 @@ pub fn parse_png_from_reader(
             &mut buffer,
         )?;
         let is_iend = chunk.type_code == *b"IEND";
-        chunks
-            .try_reserve(1)
-            .map_err(|_| PngError::AllocationFailure)?;
+        reserve_chunk(
+            &mut chunks,
+            limits.max_chunks,
+            memory.as_deref_mut(),
+            before,
+        )?;
         chunks.push(chunk);
         if is_iend {
             return Ok(PngRangeReport {
@@ -145,6 +183,40 @@ pub fn parse_png_from_reader(
         }
         cursor = end;
     }
+}
+
+fn reserve_chunk(
+    chunks: &mut Vec<PngRangeChunk>,
+    maximum: usize,
+    memory: Option<&mut MemoryLease>,
+    before: u64,
+) -> Result<(), PngReadError> {
+    if chunks.len() < chunks.capacity() {
+        return Ok(());
+    }
+    let next = chunks.capacity().saturating_mul(2).max(4).min(maximum);
+    let bytes = next
+        .checked_mul(std::mem::size_of::<PngRangeChunk>())
+        .and_then(|bytes| u64::try_from(bytes).ok())
+        .and_then(|bytes| before.checked_add(bytes))
+        .ok_or(PngError::AllocationFailure)?;
+    let mut memory = memory;
+    if let Some(lease) = memory.as_deref_mut() {
+        lease.try_resize(bytes).map_err(PngReadError::Memory)?;
+    }
+    chunks
+        .try_reserve_exact(next - chunks.len())
+        .map_err(|_| PngError::AllocationFailure)?;
+    if let Some(lease) = memory {
+        let actual = chunks
+            .capacity()
+            .checked_mul(std::mem::size_of::<PngRangeChunk>())
+            .and_then(|bytes| u64::try_from(bytes).ok())
+            .and_then(|bytes| before.checked_add(bytes))
+            .ok_or(PngError::AllocationFailure)?;
+        lease.try_resize(actual).map_err(PngReadError::Memory)?;
+    }
+    Ok(())
 }
 
 fn read_chunk(
