@@ -25,12 +25,14 @@ pub struct StreamPngBoundary {
     pub chunk_count: usize,
 }
 
-/// Source analysis and an optional independently validated PNG boundary
+/// Source analysis, an optional PNG boundary, and an optional prefix digest
 pub struct StreamPngAnalysis {
     /// Bounded rolling source analysis and the digest of the complete source
     pub analysis: ArtifactAnalysis,
     /// PNG structure when the source starts with a valid, affordable PNG
     pub png: Option<StreamPngBoundary>,
+    /// SHA-256 at a requested prefix boundary, captured during the source pass
+    pub prefix_sha256: Option<String>,
 }
 
 /// Analyze bounded PNG and ZIP ranges while hashing the complete source stream
@@ -48,9 +50,36 @@ pub fn analyze_artifacts_from_reader(
     source_length: usize,
     options: ArtifactAnalysisOptions,
 ) -> io::Result<ArtifactAnalysis> {
-    let mut reader = ScannedReader::new(reader, source_length, options)?;
+    let mut reader = ScannedReader::new(reader, source_length, options, None)?;
     reader.drain_source()?;
-    reader.finish()
+    Ok(reader.finish()?.0)
+}
+
+/// Capture a prefix digest while analyzing the source and optionally validating PNG
+///
+/// The checkpoint must be within the declared source length. The reader is consumed once,
+/// and the returned full-source and prefix hashes come from the same SHA-256 state.
+///
+/// # Errors
+/// Returns an I/O or policy error if the checkpoint or reader is invalid
+pub fn analyze_artifacts_with_prefix_checkpoint_from_reader(
+    reader: &mut impl Read,
+    source_length: usize,
+    options: ArtifactAnalysisOptions,
+    checkpoint: usize,
+    scan_png: bool,
+) -> io::Result<StreamPngAnalysis> {
+    if scan_png {
+        return analyze_png_inner(reader, source_length, options, Some(checkpoint));
+    }
+    let mut reader = ScannedReader::new(reader, source_length, options, Some(checkpoint))?;
+    reader.drain_source()?;
+    let (analysis, prefix_sha256) = reader.finish()?;
+    Ok(StreamPngAnalysis {
+        analysis,
+        png: None,
+        prefix_sha256,
+    })
 }
 
 /// Validate a source-start PNG while the same bytes feed the rolling analyzer
@@ -66,8 +95,19 @@ pub fn analyze_png_artifacts_from_reader(
     source_length: usize,
     options: ArtifactAnalysisOptions,
 ) -> io::Result<StreamPngAnalysis> {
+    analyze_png_inner(reader, source_length, options, None)
+}
+
+fn analyze_png_inner(
+    reader: &mut impl Read,
+    source_length: usize,
+    options: ArtifactAnalysisOptions,
+    checkpoint: Option<usize>,
+) -> io::Result<StreamPngAnalysis> {
     if source_length >= options.limits.max_total_work_bytes {
-        let mut analysis = analyze_artifacts_from_reader(reader, source_length, options)?;
+        let mut reader = ScannedReader::new(reader, source_length, options, checkpoint)?;
+        reader.drain_source()?;
+        let (mut analysis, prefix_sha256) = reader.finish()?;
         analysis
             .omissions
             .push(AnalysisOmission::SourceRangeValidationLimit {
@@ -77,12 +117,13 @@ pub fn analyze_png_artifacts_from_reader(
         return Ok(StreamPngAnalysis {
             analysis,
             png: None,
+            prefix_sha256,
         });
     }
     let mut scan_options = options;
     // Reserve the worst-case PNG scan before the rolling scanner spends work
     scan_options.limits.max_total_work_bytes -= source_length;
-    let mut reader = ScannedReader::new(reader, source_length, scan_options)?;
+    let mut reader = ScannedReader::new(reader, source_length, scan_options, checkpoint)?;
     // Keep chunk metadata within the caller's bounded input allowance
     let metadata_bytes = std::mem::size_of::<super::PngRangeChunk>().max(1);
     let limits = PngLimits {
@@ -118,7 +159,7 @@ pub fn analyze_png_artifacts_from_reader(
         Err(super::PngReadError::Format(_)) => (None, None),
     };
     reader.drain_source()?;
-    let mut analysis = reader.finish()?;
+    let (mut analysis, prefix_sha256) = reader.finish()?;
     analysis.work_bytes = analysis
         .work_bytes
         .checked_add(consumed)
@@ -131,7 +172,11 @@ pub fn analyze_png_artifacts_from_reader(
                 reason,
             });
     }
-    Ok(StreamPngAnalysis { analysis, png })
+    Ok(StreamPngAnalysis {
+        analysis,
+        png,
+        prefix_sha256,
+    })
 }
 
 struct ScannedReader<'a, R> {
@@ -144,10 +189,11 @@ impl<'a, R: Read> ScannedReader<'a, R> {
         reader: &'a mut R,
         source_length: usize,
         options: ArtifactAnalysisOptions,
+        checkpoint: Option<usize>,
     ) -> io::Result<Self> {
         Ok(Self {
             inner: reader,
-            scanned: RangeCollector::new(source_length, options)?,
+            scanned: RangeCollector::new(source_length, options, checkpoint)?,
         })
     }
 
@@ -175,7 +221,7 @@ impl<'a, R: Read> ScannedReader<'a, R> {
         Ok(())
     }
 
-    fn finish(self) -> io::Result<ArtifactAnalysis> {
+    fn finish(self) -> io::Result<(ArtifactAnalysis, Option<String>)> {
         self.scanned.finish()
     }
 }
@@ -210,11 +256,23 @@ struct RangeCollector {
     window_capacity: usize,
     window: Vec<u8>,
     hasher: Sha256,
+    checkpoint: Option<usize>,
+    prefix_sha256: Option<String>,
     stopped: bool,
 }
 
 impl RangeCollector {
-    fn new(source_length: usize, options: ArtifactAnalysisOptions) -> io::Result<Self> {
+    fn new(
+        source_length: usize,
+        options: ArtifactAnalysisOptions,
+        checkpoint: Option<usize>,
+    ) -> io::Result<Self> {
+        if checkpoint.is_some_and(|offset| offset > source_length) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "source hash checkpoint exceeds its length",
+            ));
+        }
         // A full Case may leave no output space while the source still needs hashing
         let mut validation_limits = options.limits;
         validation_limits.max_total_output_bytes = validation_limits.max_total_output_bytes.max(1);
@@ -243,12 +301,28 @@ impl RangeCollector {
             window_capacity,
             window,
             hasher: Sha256::new(),
+            checkpoint,
+            prefix_sha256: checkpoint
+                .filter(|offset| *offset == 0)
+                .map(|_| format!("{:x}", Sha256::new().finalize())),
             stopped: false,
         })
     }
 
     fn accept(&mut self, bytes: &[u8]) -> io::Result<()> {
-        self.hasher.update(bytes);
+        if let Some(split) = self
+            .checkpoint
+            .and_then(|offset| offset.checked_sub(self.read_bytes))
+            .filter(|split| *split > 0 && *split <= bytes.len())
+        {
+            let (before, after) = bytes.split_at(split);
+            self.hasher.update(before);
+            self.prefix_sha256 = Some(format!("{:x}", self.hasher.clone().finalize()));
+            self.hasher.update(after);
+            self.checkpoint = None;
+        } else {
+            self.hasher.update(bytes);
+        }
         self.read_bytes += bytes.len();
         if self.stopped || bytes.is_empty() {
             return Ok(());
@@ -276,13 +350,15 @@ impl RangeCollector {
         Ok(())
     }
 
-    fn finish(mut self) -> io::Result<ArtifactAnalysis> {
+    fn finish(mut self) -> io::Result<(ArtifactAnalysis, Option<String>)> {
         while !self.stopped && !self.window.is_empty() {
             self.inspect_window()?;
         }
-        Ok(self
-            .state
-            .finish(format!("{:x}", self.hasher.finalize()), self.step))
+        Ok((
+            self.state
+                .finish(format!("{:x}", self.hasher.finalize()), self.step),
+            self.prefix_sha256,
+        ))
     }
 }
 

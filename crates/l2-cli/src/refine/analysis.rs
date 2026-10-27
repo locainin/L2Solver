@@ -31,7 +31,7 @@ use std::{
     io::{self, Write},
 };
 
-pub(super) const REFINE_ANALYZER_ALGORITHM_VERSION: u32 = 6;
+pub(super) const REFINE_ANALYZER_ALGORITHM_VERSION: u32 = 7;
 pub(super) const CACHE_ANALYSIS_SCHEMA_VERSION: u32 = 1;
 const MAX_CACHE_RECEIPT_BYTES: usize = 8 * 1024 * 1024;
 
@@ -116,7 +116,7 @@ fn analyze_file_source(
                 parent_index,
                 source,
                 &report.source_sha256,
-                archive.entry_count,
+                &archive,
             )?;
         }
         super::range_members::append_members(&mut report, archive, parent_index, options)?;
@@ -187,22 +187,23 @@ impl AnalyzedSources {
         source_index: usize,
         artifact_index: usize,
         source: &LoadedSource,
-        sha256: &str,
-        entry_count: usize,
+        source_sha256: &str,
+        archive: &l2_workbench::artifact::zip::ZipArtifactReport,
     ) -> Result<(), Box<dyn Error>> {
         let range = l2_workbench::artifact::FileRange {
             offset: 0,
-            length: source.length(),
+            length: archive.archive_size,
         };
-        let node_id = self.append_file_node(source_index, artifact_index, source, sha256, range)?;
+        let node_id =
+            self.append_file_node(source_index, artifact_index, source, source_sha256, range)?;
         self.file_artifacts.try_reserve(1)?;
         self.file_artifacts.push(FileArtifact::zip(
             node_id,
             source_index,
             artifact_index,
-            source.length(),
-            sha256.to_owned(),
-            entry_count,
+            archive.archive_size,
+            archive.archive_sha256.clone(),
+            archive.entry_count,
         ));
         Ok(())
     }
@@ -380,7 +381,7 @@ fn analysis_reason(report: &l2_workbench::artifact::ArtifactAnalysis) -> Option<
     {
         let uncovered_bytes = uncovered_range.map_or(0, |range| range.length);
         return Some(format!(
-            "range analysis searches for embedded PNG and ZIP objects; objects up to {max_object_bytes} bytes fit across windows, subject to budgets; {uncovered_bytes} source bytes lacked complete range coverage, {omitted_candidates} candidates and {signature_scans_omitted} signature scans were omitted; whole-source transforms were not performed; see artifact validation and member omissions for structural and expansion results"
+            "range analysis searches for embedded PNG and ZIP objects; objects up to {max_object_bytes} bytes fit across windows, subject to budgets; ZIP end search covers at most the final 65,557 bytes; {uncovered_bytes} source bytes lacked complete range coverage, {omitted_candidates} candidates and {signature_scans_omitted} signature scans were omitted; whole-source transforms were not performed; see artifact validation and member omissions for structural and expansion results"
         ));
     }
     match report.status {

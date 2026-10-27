@@ -19,16 +19,21 @@ use std::{
 
 const ZIP_END_SCAN_BYTES: usize = 65_535 + 22;
 
+pub(super) struct ZipCandidate {
+    pub(super) length: usize,
+    pub(super) multiple_boundaries: bool,
+}
+
 pub(super) fn probe_tail(
     file: &mut File,
     length: usize,
     max_buffer: usize,
     input: &InputSet,
     job: &Job,
-) -> Result<bool, Box<dyn Error>> {
+) -> Result<Option<ZipCandidate>, Box<dyn Error>> {
     let count = length.min(ZIP_END_SCAN_BYTES).min(max_buffer);
     if count < 22 || !input.reserve_extra_reads(u64::try_from(count)?)? {
-        return Ok(false);
+        return Ok(None);
     }
     let mut tail = Vec::new();
     tail.try_reserve_exact(count)?;
@@ -36,26 +41,44 @@ pub(super) fn probe_tail(
     file.seek(SeekFrom::Start(u64::try_from(length - count)?))?;
     CancellableReader::new(file, job).read_exact(&mut tail)?;
     // A marker only selects the canonical parser; it does not establish validity
-    Ok(tail.windows(4).enumerate().any(|(offset, marker)| {
+    let mut candidate: Option<ZipCandidate> = None;
+    for (offset, marker) in tail.windows(4).enumerate() {
         if marker != b"PK\x05\x06" {
-            return false;
+            continue;
         }
         let Some(field) = tail.get(offset.saturating_add(20)..offset.saturating_add(22)) else {
-            return false;
+            continue;
         };
         let Ok(raw) = <[u8; 2]>::try_from(field) else {
-            return false;
+            continue;
         };
-        offset
+        let Some(end) = offset
             .checked_add(22)
             .and_then(|end| end.checked_add(usize::from(u16::from_le_bytes(raw))))
-            == Some(tail.len())
-    }))
+        else {
+            continue;
+        };
+        if end > tail.len() {
+            continue;
+        }
+        let boundary = length - count + end;
+        if let Some(current) = &mut candidate {
+            current.multiple_boundaries |= current.length != boundary;
+            current.length = current.length.max(boundary);
+        } else {
+            candidate = Some(ZipCandidate {
+                length: boundary,
+                multiple_boundaries: false,
+            });
+        }
+    }
+    Ok(candidate)
 }
 
 pub(super) fn inspect(
     file: &mut File,
     length: usize,
+    source_sha256: &str,
     report: &mut ArtifactAnalysis,
     options: ArtifactAnalysisOptions,
     input: &InputSet,
@@ -107,7 +130,7 @@ pub(super) fn inspect(
     let result = inspect_zip_from_reader_with_source_sha256(
         &mut reader,
         length,
-        &report.source_sha256,
+        source_sha256,
         limits,
         0,
         &mut budget,

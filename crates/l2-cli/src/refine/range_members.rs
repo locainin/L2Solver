@@ -26,6 +26,7 @@ pub(super) fn append_members(
         report,
         options,
         parent_index,
+        archive_length: archive.archive_size,
         next_index: parent_index
             .checked_add(1)
             .ok_or("artifact index overflows")?,
@@ -48,6 +49,7 @@ struct MemberMerger<'a> {
     report: &'a mut ArtifactAnalysis,
     options: ArtifactAnalysisOptions,
     parent_index: usize,
+    archive_length: usize,
     next_index: usize,
     zip_remaining: usize,
     signature_remaining: usize,
@@ -100,11 +102,7 @@ impl MemberMerger<'_> {
             });
             return Ok(());
         }
-        let origin = archive_member_origin(
-            self.parent_index,
-            self.report.source_length,
-            &entry.metadata,
-        );
+        let origin = archive_member_origin(self.parent_index, self.archive_length, &entry.metadata);
         if self.options.limits.max_depth == 0
             || bytes.len() > self.options.limits.max_input_bytes
             || self.signature_remaining == 0

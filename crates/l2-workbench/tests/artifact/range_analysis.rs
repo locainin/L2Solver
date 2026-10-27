@@ -7,8 +7,45 @@ use super::{image_support::structural_png, zip_support};
 use l2_workbench::artifact::{
     AnalysisOmission, AnalysisStatus, ArtifactAnalysisOptions, ArtifactOrigin,
     ArtifactValidationState, EmbeddedFormat, FileRange, analyze_artifacts_from_reader,
-    analyze_png_artifacts_from_reader,
+    analyze_artifacts_with_prefix_checkpoint_from_reader, analyze_png_artifacts_from_reader,
 };
+
+#[test]
+fn prefix_checkpoint_and_full_source_hash_share_one_reader_pass() -> Result<(), Box<dyn Error>> {
+    let source = structural_png(&[])?;
+    let checkpoint = 17;
+    for scan_png in [false, true] {
+        let result = analyze_artifacts_with_prefix_checkpoint_from_reader(
+            &mut Cursor::new(&source),
+            source.len(),
+            options(),
+            checkpoint,
+            scan_png,
+        )?;
+        assert_eq!(
+            result.prefix_sha256.as_deref(),
+            Some(l2_workbench::sha256(source.get(..checkpoint).ok_or("prefix missing")?).as_str())
+        );
+        assert_eq!(result.analysis.source_sha256, l2_workbench::sha256(&source));
+        assert_eq!(result.png.is_some(), scan_png);
+    }
+    Ok(())
+}
+
+#[test]
+fn prefix_checkpoint_outside_the_source_is_rejected() {
+    let source = [0_u8; 8];
+    assert!(
+        analyze_artifacts_with_prefix_checkpoint_from_reader(
+            &mut Cursor::new(&source),
+            source.len(),
+            options(),
+            9,
+            false
+        )
+        .is_err()
+    );
+}
 
 #[test]
 fn streamed_png_and_source_are_hashed_in_one_pass_with_exact_iend_range()

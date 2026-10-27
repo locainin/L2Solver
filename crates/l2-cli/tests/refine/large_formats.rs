@@ -1,4 +1,9 @@
-use std::{error::Error, fs, io::Write, path::Path};
+use std::{
+    error::Error,
+    fs,
+    io::{self, Write},
+    path::Path,
+};
 
 use crate::arguments::{RecoveryOptions, RefineOptions};
 use l2_workbench::job::{Counter, Job, cache::SourceIdentity};
@@ -273,6 +278,143 @@ fn archive_above_sixty_four_mib_keeps_its_exact_boundary_and_small_member()
         |item| item.get("sha256").and_then(serde_json::Value::as_str)
             == Some(l2_workbench::sha256(&png).as_str())
     ));
+    Ok(())
+}
+
+#[test]
+#[expect(
+    clippy::too_many_lines,
+    reason = "the source range and member provenance are one end-to-end scenario"
+)]
+fn prefixed_archive_with_overlay_keeps_exact_zip_range_and_member_origin()
+-> Result<(), Box<dyn Error>> {
+    let directory = tempfile::tempdir()?;
+    let archive_path = directory.path().join("archive.zip");
+    let input = directory.path().join("prefixed-with-overlay.bin");
+    let output = directory.path().join("result");
+    let png = super::structural_png()?;
+    write_archive_blocks(&archive_path, 3, &png, 70 * 64)?;
+    let mut source = fs::File::create(&input)?;
+    source.write_all(b"executable prefix")?;
+    io::copy(&mut fs::File::open(archive_path)?, &mut source)?;
+    source.sync_all()?;
+    let archive_length = fs::metadata(&input)?.len();
+    let archive_hash = serde_json::to_value(SourceIdentity::sha256_file(&input)?)?
+        .get("value")
+        .and_then(serde_json::Value::as_str)
+        .ok_or("archive digest missing")?
+        .to_owned();
+    source.write_all(b"overlay after ZIP boundary")?;
+    source.sync_all()?;
+    let options = RefineOptions {
+        input,
+        output: Some(output.clone()),
+        dry_run: false,
+        salvage: false,
+        recovery: RecoveryOptions {
+            no_cache: true,
+            memory_limit: 8 * 1024 * 1024,
+            source_read_limit: 160 * 1024 * 1024,
+            ..RecoveryOptions::default()
+        },
+    };
+    assert!(!super::run(&options, &mut Vec::new())?);
+    let manifest: serde_json::Value =
+        serde_json::from_slice(&fs::read(output.join("manifest.json"))?)?;
+    let artifacts = manifest
+        .get("artifacts")
+        .and_then(serde_json::Value::as_array)
+        .ok_or("artifacts missing")?;
+    let archive = artifacts
+        .iter()
+        .find(|item| {
+            item.get("sha256").and_then(serde_json::Value::as_str) == Some(archive_hash.as_str())
+        })
+        .ok_or("exact ZIP range missing")?;
+    assert_eq!(
+        archive
+            .get("byte_length")
+            .and_then(serde_json::Value::as_u64),
+        Some(archive_length)
+    );
+    assert_eq!(
+        archive
+            .pointer("/origins/0/origin/range/length")
+            .and_then(serde_json::Value::as_u64),
+        Some(archive_length)
+    );
+    let name = archive
+        .get("file")
+        .and_then(serde_json::Value::as_str)
+        .ok_or("archive filename missing")?;
+    assert_eq!(
+        serde_json::to_value(SourceIdentity::sha256_file(output.join(name))?)?
+            .get("value")
+            .and_then(serde_json::Value::as_str),
+        Some(archive_hash.as_str())
+    );
+    assert_ne!(
+        manifest
+            .pointer("/sources/0/sha256")
+            .and_then(serde_json::Value::as_str),
+        Some(archive_hash.as_str())
+    );
+    let member = artifacts
+        .iter()
+        .find(|item| {
+            item.get("sha256").and_then(serde_json::Value::as_str)
+                == Some(l2_workbench::sha256(&png).as_str())
+        })
+        .ok_or("validated member missing")?;
+    assert_eq!(
+        member
+            .pointer("/origins/0/origin/archive_range/length")
+            .and_then(serde_json::Value::as_u64),
+        Some(archive_length)
+    );
+    Ok(())
+}
+
+#[test]
+fn multiple_plausible_zip_end_boundaries_are_reported_as_partial() -> Result<(), Box<dyn Error>> {
+    let directory = tempfile::tempdir()?;
+    let input = directory.path().join("ambiguous.zip");
+    let output = directory.path().join("result");
+    write_large_archive(&input, 4, &super::structural_png()?)?;
+    let mut source = fs::OpenOptions::new().append(true).open(&input)?;
+    source.write_all(b"PK\x05\x06")?;
+    source.write_all(&[0_u8; 18])?;
+    source.sync_all()?;
+    let options = RefineOptions {
+        input,
+        output: Some(output.clone()),
+        dry_run: false,
+        salvage: false,
+        recovery: RecoveryOptions {
+            no_cache: true,
+            memory_limit: 8 * 1024 * 1024,
+            source_read_limit: 16 * 1024 * 1024,
+            ..RecoveryOptions::default()
+        },
+    };
+    assert!(!super::run(&options, &mut Vec::new())?);
+    let manifest: serde_json::Value =
+        serde_json::from_slice(&fs::read(output.join("manifest.json"))?)?;
+    assert!(
+        manifest
+            .pointer("/sources/0/omissions")
+            .and_then(serde_json::Value::as_array)
+            .ok_or("omissions missing")?
+            .iter()
+            .any(|item| {
+                item.get("kind").and_then(serde_json::Value::as_str)
+                    == Some("source_range_validation_limit")
+                    && item
+                        .get("reason")
+                        .and_then(serde_json::Value::as_str)
+                        .is_some_and(|reason| reason.contains("multiple ZIP end boundaries"))
+            })
+    );
     Ok(())
 }
 

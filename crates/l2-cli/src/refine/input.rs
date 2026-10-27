@@ -285,11 +285,15 @@ impl LoadedSource {
         )?;
         let mut reader = CancellableReader::new(file, job);
         let mut scan_options = options;
-        if zip_candidate {
+        if zip_candidate.is_some() {
             scan_options.limits.max_total_work_bytes -= options.limits.max_total_work_bytes / 2;
         }
-        let (mut report, mut png) =
-            analyze_source_stream(&mut reader, source.length, scan_options)?;
+        let checkpoint = zip_candidate
+            .as_ref()
+            .and_then(|candidate| (candidate.length < source.length).then_some(candidate.length));
+        let scanned = analyze_source_stream(&mut reader, source.length, scan_options, checkpoint)?;
+        let mut report = scanned.analysis;
+        let mut png = scanned.png;
         let mut file = reader.into_inner();
         if metadata_fingerprint(&file.metadata()?) != source.metadata {
             return Err(invalid_input(
@@ -303,18 +307,15 @@ impl LoadedSource {
         {
             return Err(invalid_input("artifact hash does not match its manifest"));
         }
-        let (archive, retain_source) = if zip_candidate {
-            inspect_source_archive(
-                &mut file,
-                source.length,
-                &mut report,
-                options,
-                input_set,
-                job,
-            )?
-        } else {
-            (None, false)
-        };
+        let (archive, retain_source) = inspect_source_archive(
+            &mut file,
+            zip_candidate,
+            scanned.prefix_sha256,
+            &mut report,
+            options,
+            input_set,
+            job,
+        )?;
         png = retain_png_range(png, &mut report, input_set)?;
         if metadata_fingerprint(&file.metadata()?) != source.metadata {
             return Err(invalid_input(
@@ -360,13 +361,8 @@ fn analyze_source_stream(
     reader: &mut impl Read,
     length: usize,
     options: l2_workbench::artifact::ArtifactAnalysisOptions,
-) -> Result<
-    (
-        l2_workbench::artifact::ArtifactAnalysis,
-        Option<l2_workbench::artifact::StreamPngBoundary>,
-    ),
-    Box<dyn Error>,
-> {
+    checkpoint: Option<usize>,
+) -> Result<l2_workbench::artifact::StreamPngAnalysis, Box<dyn Error>> {
     let mut signature = [0_u8; l2_workbench::artifact::PNG_SIGNATURE.len()];
     let count = length.min(signature.len());
     let prefix = signature
@@ -379,18 +375,32 @@ fn analyze_source_stream(
         .get(..count)
         .ok_or_else(|| invalid_input("source prefix length is invalid"))?;
     let mut complete = io::Cursor::new(prefix).chain(reader);
-    if is_png {
-        let result = l2_workbench::artifact::analyze_png_artifacts_from_reader(
+    if let Some(offset) = checkpoint {
+        Ok(
+            l2_workbench::artifact::analyze_artifacts_with_prefix_checkpoint_from_reader(
+                &mut complete,
+                length,
+                options,
+                offset,
+                is_png,
+            )?,
+        )
+    } else if is_png {
+        Ok(l2_workbench::artifact::analyze_png_artifacts_from_reader(
             &mut complete,
             length,
             options,
-        )?;
-        Ok((result.analysis, result.png))
+        )?)
     } else {
-        Ok((
-            l2_workbench::artifact::analyze_artifacts_from_reader(&mut complete, length, options)?,
-            None,
-        ))
+        Ok(l2_workbench::artifact::StreamPngAnalysis {
+            analysis: l2_workbench::artifact::analyze_artifacts_from_reader(
+                &mut complete,
+                length,
+                options,
+            )?,
+            png: None,
+            prefix_sha256: None,
+        })
     }
 }
 
@@ -415,13 +425,33 @@ fn confirm_range_source_name(
 
 fn inspect_source_archive(
     file: &mut File,
-    length: usize,
+    candidate: Option<super::range_zip::ZipCandidate>,
+    prefix_sha256: Option<String>,
     report: &mut l2_workbench::artifact::ArtifactAnalysis,
     options: l2_workbench::artifact::ArtifactAnalysisOptions,
     input: &InputSet,
     job: &Job,
 ) -> Result<(Option<l2_workbench::artifact::zip::ZipArtifactReport>, bool), Box<dyn Error>> {
-    let archive = super::range_zip::inspect(file, length, report, options, input, job)?;
+    let Some(candidate) = candidate else {
+        return Ok((None, false));
+    };
+    if candidate.multiple_boundaries {
+        report.omissions.push(
+            l2_workbench::artifact::AnalysisOmission::SourceRangeValidationLimit {
+                format: l2_workbench::artifact::AnalysisFormat::Zip,
+                reason: String::from(
+                    "multiple ZIP end boundaries were found; only the last was inspected",
+                ),
+            },
+        );
+    }
+    let digest = if candidate.length == report.source_length {
+        report.source_sha256.clone()
+    } else {
+        prefix_sha256.ok_or_else(|| invalid_input("ZIP boundary digest is missing"))?
+    };
+    let length = candidate.length;
+    let archive = super::range_zip::inspect(file, length, &digest, report, options, input, job)?;
     let retain = archive.is_some() && input.reserve_source_output(u64::try_from(length)?)?;
     if archive.is_some() && !retain {
         report.omissions.push(
