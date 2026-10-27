@@ -83,6 +83,9 @@ fn terminal_fsync_failure_keeps_previous_entry_and_active_generation() -> Result
         trace.contains("EIO") && trace.contains("INJECTED"),
         "sync injection did not fire: {trace}"
     );
+    for line in trace.lines().filter(|line| line.contains("INJECTED")) {
+        eprintln!("targeted staged-file fsync: {line}");
+    }
 
     let entry = cache
         .lookup(&key, CacheReadPolicy::CompleteOnly)?
