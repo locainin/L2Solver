@@ -104,18 +104,28 @@ impl SourceFingerprint {
     /// # Errors
     /// Returns an error for non-regular, unreadable, or changing files
     pub fn fast_open_file(file: &mut File) -> Result<Self> {
-        Self::fast_open_file_inner(file, None)
+        Self::fast_open_file_inner(file, None, |_| Ok(()))
     }
 
     /// Fingerprint an open file only if its length matches an admitted read reservation
     ///
+    /// The observer receives each number of bytes actually returned by a source read
+    ///
     /// # Errors
     /// Returns an error for a non-regular, unreadable, changing, or differently sized source
-    pub fn fast_open_file_with_expected_length(file: &mut File, length: u64) -> Result<Self> {
-        Self::fast_open_file_inner(file, Some(length))
+    pub fn fast_open_file_with_expected_length_and_observer(
+        file: &mut File,
+        length: u64,
+        observe: impl FnMut(usize) -> std::io::Result<()>,
+    ) -> Result<Self> {
+        Self::fast_open_file_inner(file, Some(length), observe)
     }
 
-    fn fast_open_file_inner(file: &mut File, expected_length: Option<u64>) -> Result<Self> {
+    fn fast_open_file_inner(
+        file: &mut File,
+        expected_length: Option<u64>,
+        mut observe: impl FnMut(usize) -> std::io::Result<()>,
+    ) -> Result<Self> {
         let before = file.metadata()?;
         if !before.is_file() {
             return Err(CacheError::UnsafePath("source is not a regular file"));
@@ -124,7 +134,13 @@ impl SourceFingerprint {
         if expected_length.is_some_and(|length| length != identity.size_bytes) {
             return Err(CacheError::SourceChanged);
         }
-        let sample_sha256 = sample_digest(&mut *file, identity.size_bytes)?;
+        let sample_sha256 = sample_digest(
+            &mut ObservedReader {
+                inner: &mut *file,
+                observe: &mut observe,
+            },
+            identity.size_bytes,
+        )?;
         let after = file.metadata()?;
         if identity != metadata_identity(&after) {
             return Err(CacheError::SourceChanged);
@@ -203,10 +219,12 @@ impl SourceIdentity {
         file: &mut File,
         check: impl FnMut() -> std::io::Result<()>,
     ) -> Result<Self> {
-        Self::sha256_open_file_inner(file, None, check)
+        Self::sha256_open_file_inner(file, None, check, |_| Ok(()))
     }
 
     /// Hash an open file only if its length matches an admitted read reservation
+    ///
+    /// The observer receives each number of bytes actually returned by a source read
     ///
     /// # Errors
     /// Returns an error for a non-regular, unreadable, changing, cancelled, or differently sized source
@@ -214,14 +232,16 @@ impl SourceIdentity {
         file: &mut File,
         length: u64,
         check: impl FnMut() -> std::io::Result<()>,
+        observe: impl FnMut(usize) -> std::io::Result<()>,
     ) -> Result<Self> {
-        Self::sha256_open_file_inner(file, Some(length), check)
+        Self::sha256_open_file_inner(file, Some(length), check, observe)
     }
 
     fn sha256_open_file_inner(
         file: &mut File,
         expected_length: Option<u64>,
         mut check: impl FnMut() -> std::io::Result<()>,
+        mut observe: impl FnMut(usize) -> std::io::Result<()>,
     ) -> Result<Self> {
         let before = file.metadata()?;
         if !before.is_file() {
@@ -232,7 +252,14 @@ impl SourceIdentity {
             return Err(CacheError::SourceChanged);
         }
         file.seek(SeekFrom::Start(0))?;
-        let digest = full_digest(&mut *file, identity.size_bytes, &mut check)?;
+        let digest = full_digest(
+            &mut ObservedReader {
+                inner: &mut *file,
+                observe: &mut observe,
+            },
+            identity.size_bytes,
+            &mut check,
+        )?;
         let after = file.metadata()?;
         if identity != metadata_identity(&after) {
             return Err(CacheError::SourceChanged);
@@ -285,7 +312,26 @@ fn open_source(path: &Path) -> Result<File> {
     Ok(file)
 }
 
-fn sample_digest(file: &mut File, size_bytes: u64) -> Result<String> {
+struct ObservedReader<'a, R, O> {
+    inner: &'a mut R,
+    observe: &'a mut O,
+}
+
+impl<R: Read, O: FnMut(usize) -> std::io::Result<()>> Read for ObservedReader<'_, R, O> {
+    fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+        let count = self.inner.read(buffer)?;
+        (self.observe)(count)?;
+        Ok(count)
+    }
+}
+
+impl<R: Seek, O> Seek for ObservedReader<'_, R, O> {
+    fn seek(&mut self, position: SeekFrom) -> std::io::Result<u64> {
+        self.inner.seek(position)
+    }
+}
+
+fn sample_digest(file: &mut (impl Read + Seek), size_bytes: u64) -> Result<String> {
     // Fixed ranges keep large source reads bounded and repeatable
     let ranges = sample_ranges(size_bytes);
     let mut hasher = Sha256::new();
@@ -329,7 +375,7 @@ fn sample_ranges(size_bytes: u64) -> Vec<(u64, u64)> {
 }
 
 fn full_digest(
-    file: &mut File,
+    file: &mut impl Read,
     length: u64,
     check: &mut impl FnMut() -> std::io::Result<()>,
 ) -> Result<String> {

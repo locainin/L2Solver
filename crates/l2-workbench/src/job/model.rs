@@ -89,9 +89,9 @@ pub enum Counter {
     Files,
     /// Bytes read or written
     Bytes,
-    /// Source and manifest read bytes reserved during the current invocation
+    /// Source and manifest bytes actually returned by reads during this invocation
     SourceReadBytes,
-    /// Source read bytes reserved by earlier invocations of the restored job
+    /// Source read bytes observed in earlier invocations of the restored job
     PriorSourceReadBytes,
     /// Packet records indexed during a fresh capture ingestion
     ///

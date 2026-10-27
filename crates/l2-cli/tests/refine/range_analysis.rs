@@ -408,12 +408,14 @@ fn many_range_sources_fit_a_small_process_descriptor_limit() -> Result<(), Box<d
 
 #[test]
 fn streamed_range_reader_checks_job_cancellation_between_reads() -> Result<(), Box<dyn Error>> {
-    use crate::refine::input::CancellableReader;
+    use crate::refine::{input::CancellableReader, read_budget::SourceReadBudget};
     use l2_workbench::{
         artifact::{ArtifactAnalysisOptions, analyze_artifacts_from_reader},
-        job::Job,
+        job::{Counter, Job},
     };
     use std::io;
+
+    const LENGTH: u64 = 1024 * 1024 * 1024;
 
     struct CancelAfterRead<'a> {
         job: &'a Job,
@@ -428,6 +430,8 @@ fn streamed_range_reader_checks_job_cancellation_between_reads() -> Result<(), B
         }
     }
     let job = Job::new("cancel range read");
+    let budget = SourceReadBudget::new(LENGTH + 1);
+    budget.reserve(LENGTH + 1)?;
     let inner = CancelAfterRead {
         job: &job,
         reads: 0,
@@ -435,10 +439,37 @@ fn streamed_range_reader_checks_job_cancellation_between_reads() -> Result<(), B
     let mut reader = CancellableReader::new(inner, &job);
     let mut options = ArtifactAnalysisOptions::default();
     options.limits.max_input_bytes = 512;
-    let error = analyze_artifacts_from_reader(&mut reader, 4096, options)
+    let error = analyze_artifacts_from_reader(&mut reader, usize::try_from(LENGTH)?, options)
         .err()
         .ok_or("cancelled range scan completed")?;
     assert!(error.to_string().contains("cancellation"));
+    assert_eq!(
+        job.snapshot()?.counters.get(&Counter::SourceReadBytes),
+        Some(&512)
+    );
+    Ok(())
+}
+
+#[test]
+fn short_source_read_counts_only_bytes_actually_returned() -> Result<(), Box<dyn Error>> {
+    use crate::refine::{input::CancellableReader, read_budget::SourceReadBudget};
+    use l2_workbench::{
+        artifact::{ArtifactAnalysisOptions, analyze_artifacts_from_reader},
+        job::{Counter, Job},
+    };
+
+    let job = Job::new("short read");
+    let budget = SourceReadBudget::new(4097);
+    budget.reserve(4097)?;
+    let mut reader = CancellableReader::new(std::io::Cursor::new(vec![1_u8; 17]), &job);
+    assert!(
+        analyze_artifacts_from_reader(&mut reader, 4096, ArtifactAnalysisOptions::default())
+            .is_err()
+    );
+    assert_eq!(
+        job.snapshot()?.counters.get(&Counter::SourceReadBytes),
+        Some(&17)
+    );
     Ok(())
 }
 

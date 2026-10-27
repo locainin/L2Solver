@@ -7,7 +7,7 @@ use super::{
 use crate::safe_filename::is_safe_flat_file_name;
 use l2_workbench::{
     job::{
-        Job,
+        Counter, Job,
         cache::{SourceFingerprint, SourceIdentity},
     },
     sha256,
@@ -130,11 +130,10 @@ impl LoadedSource {
             ));
         }
         file.seek(SeekFrom::Start(0))?;
-        input_set.budget.charge(
+        input_set.budget.reserve(
             u64::try_from(source.length)?
                 .checked_add(1)
                 .ok_or_else(|| invalid_input("source read length overflows"))?,
-            job,
         )?;
         let mut reader = CancellableReader::new(file, job);
         let report = l2_workbench::artifact::analyze_artifacts_from_reader(
@@ -193,8 +192,18 @@ impl<R: Read> Read for CancellableReader<'_, R> {
         let part = buffer
             .get_mut(..length)
             .ok_or_else(|| io::Error::other("input read buffer is invalid"))?;
-        self.inner.read(part)
+        let count = self.inner.read(part)?;
+        record_source_read(self.job, count)?;
+        Ok(count)
     }
+}
+
+fn record_source_read(job: &Job, count: usize) -> io::Result<()> {
+    job.increment(
+        Counter::SourceReadBytes,
+        u64::try_from(count).map_err(io::Error::other)?,
+    )
+    .map_err(io::Error::other)
 }
 
 impl<R: MetadataReader> MetadataReader for CancellableReader<'_, R> {
@@ -410,7 +419,7 @@ pub(super) fn ensure_manifest_unchanged(
         .len()
         .checked_add(1)
         .ok_or_else(|| invalid_input("manifest read length overflows"))?;
-    input_set.budget.charge(manifest_read_bytes, job)?;
+    input_set.budget.reserve(manifest_read_bytes)?;
     let (_, digest) = read_snapshot(
         CancellableReader::new(file, job),
         MAX_MANIFEST_BYTES,
@@ -471,11 +480,10 @@ pub(super) fn read_sources(
             });
         } else {
             total_bytes = checked_total(total_bytes, length, total_limit)?;
-            input_set.budget.charge(
+            input_set.budget.reserve(
                 u64::try_from(length)?
                     .checked_add(1)
                     .ok_or_else(|| invalid_input("source read length overflows"))?,
-                job,
             )?;
             let (bytes, digest) = read_snapshot(
                 CancellableReader::new(file, job),
@@ -522,13 +530,13 @@ pub(super) fn fingerprint_sources(
             .checked_add(u64::try_from(length)?)
             .ok_or_else(|| invalid_input("input source byte total overflows"))?;
         let fingerprint = if plan.omission.is_none() {
-            input_set.budget.charge(
-                SourceFingerprint::sample_read_bytes(u64::try_from(length)?),
-                job,
-            )?;
-            let fingerprint = SourceFingerprint::fast_open_file_with_expected_length(
+            input_set
+                .budget
+                .reserve(SourceFingerprint::sample_read_bytes(u64::try_from(length)?))?;
+            let fingerprint = SourceFingerprint::fast_open_file_with_expected_length_and_observer(
                 &mut file,
                 u64::try_from(length)?,
+                |count| record_source_read(job, count),
             )?;
             if fingerprint.size_bytes != u64::try_from(length)? {
                 return Err(invalid_input(
@@ -598,17 +606,17 @@ pub(super) fn strong_source_identity(
         if length <= per_file_limit {
             total = checked_total(total, length, total_limit)?;
         }
-        input_set.budget.charge(
+        input_set.budget.reserve(
             u64::try_from(length)?
                 .checked_add(1)
                 .ok_or_else(|| invalid_input("source read length overflows"))?,
-            job,
         )?;
         let SourceIdentity::Sha256(digest) =
             SourceIdentity::sha256_open_file_with_expected_length_and_check(
                 &mut file,
                 u64::try_from(length)?,
                 || job.check_cancelled().map_err(io::Error::other),
+                |count| record_source_read(job, count),
             )?
         else {
             return Err(invalid_input("source digest is unavailable"));
@@ -824,11 +832,10 @@ fn read_directory_member(
 ) -> Result<(Vec<u8>, String), Box<dyn Error>> {
     let file = open_directory_member(directory, name)?;
     let length = checked_length(&file.metadata()?, None, maximum)?;
-    budget.charge(
+    budget.reserve(
         u64::try_from(length)?
             .checked_add(1)
             .ok_or_else(|| invalid_input("manifest read length overflows"))?,
-        job,
     )?;
     read_snapshot(
         CancellableReader::new(file, job),
@@ -849,11 +856,10 @@ fn read_directory_member(
     let path = directory.join(name);
     let file = crate::input::regular_no_follow(&path)?;
     let length = checked_length(&file.metadata()?, None, maximum)?;
-    budget.charge(
+    budget.reserve(
         u64::try_from(length)?
             .checked_add(1)
             .ok_or_else(|| invalid_input("manifest read length overflows"))?,
-        job,
     )?;
     read_snapshot(
         CancellableReader::new(file, job),

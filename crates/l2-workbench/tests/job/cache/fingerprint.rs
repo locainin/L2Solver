@@ -12,14 +12,24 @@ fn expected_length_blocks_fingerprinting_and_hashing_before_any_content_read()
     let source = directory.path().join("source.bin");
     fs::write(&source, vec![3_u8; 256 * 1024])?;
     let mut file = fs::File::open(source)?;
-    assert!(SourceFingerprint::fast_open_file_with_expected_length(&mut file, 1).is_err());
+    assert!(
+        SourceFingerprint::fast_open_file_with_expected_length_and_observer(&mut file, 1, |_| Ok(
+            ()
+        ))
+        .is_err()
+    );
     assert_eq!(file.stream_position()?, 0);
     let mut checks = 0;
     assert!(
-        SourceIdentity::sha256_open_file_with_expected_length_and_check(&mut file, 1, || {
-            checks += 1;
-            Ok(())
-        })
+        SourceIdentity::sha256_open_file_with_expected_length_and_check(
+            &mut file,
+            1,
+            || {
+                checks += 1;
+                Ok(())
+            },
+            |_| Ok(())
+        )
         .is_err()
     );
     assert_eq!(checks, 0);
@@ -42,6 +52,57 @@ fn fingerprint_read_reservation_matches_whole_and_three_range_samples() {
             "source length {length}"
         );
     }
+}
+
+#[test]
+fn fingerprint_observer_reports_actual_sample_reads() -> Result<(), Box<dyn Error>> {
+    let temporary = tempfile::tempdir()?;
+    let source = temporary.path().join("source.bin");
+    fs::write(&source, vec![0_u8; 256 * 1024])?;
+    let mut file = fs::File::open(source)?;
+    let mut observed = 0_usize;
+    SourceFingerprint::fast_open_file_with_expected_length_and_observer(
+        &mut file,
+        256 * 1024,
+        |count| {
+            observed += count;
+            Ok(())
+        },
+    )?;
+    assert_eq!(observed, 3 * 64 * 1024);
+    Ok(())
+}
+
+#[test]
+fn cancelled_full_hash_observer_reports_only_successful_reads() -> Result<(), Box<dyn Error>> {
+    use l2_workbench::job::cache::SourceIdentity;
+    use std::io;
+
+    let temporary = tempfile::tempdir()?;
+    let source = temporary.path().join("source.bin");
+    fs::write(&source, vec![0_u8; 256 * 1024])?;
+    let mut file = fs::File::open(source)?;
+    let mut checks = 0;
+    let mut observed = 0_usize;
+    let result = SourceIdentity::sha256_open_file_with_expected_length_and_check(
+        &mut file,
+        256 * 1024,
+        || {
+            checks += 1;
+            if checks == 2 {
+                Err(io::Error::other("cancelled"))
+            } else {
+                Ok(())
+            }
+        },
+        |count| {
+            observed += count;
+            Ok(())
+        },
+    );
+    assert!(result.is_err());
+    assert_eq!(observed, 64 * 1024);
+    Ok(())
 }
 
 #[test]

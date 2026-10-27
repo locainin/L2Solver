@@ -1,7 +1,7 @@
 //! Operation-wide reservation for source and manifest reads
 
 use super::invalid_input;
-use l2_workbench::job::{Counter, Job, cache::SourceFingerprint};
+use l2_workbench::job::cache::SourceFingerprint;
 use std::{cell::Cell, error::Error};
 
 pub(super) struct SourceReadBudget {
@@ -25,14 +25,13 @@ impl SourceReadBudget {
         self.remaining.get()
     }
 
-    pub(super) fn charge(&self, bytes: u64, job: &Job) -> Result<(), Box<dyn Error>> {
+    pub(super) fn reserve(&self, bytes: u64) -> Result<(), Box<dyn Error>> {
         let remaining = self
             .remaining
             .get()
             .checked_sub(bytes)
             .ok_or_else(|| invalid_input("source read limit is exhausted"))?;
         self.remaining.set(remaining);
-        job.increment(Counter::SourceReadBytes, bytes)?;
         Ok(())
     }
 }
