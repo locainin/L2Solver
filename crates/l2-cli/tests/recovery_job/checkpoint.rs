@@ -84,6 +84,122 @@ fn interrupted_job_restores_cumulative_work_and_replays_cached_stages() -> Resul
     Ok(())
 }
 
+#[test]
+fn checkpoint_restores_saved_work_while_live_preparation_stays_visible()
+-> Result<(), Box<dyn Error>> {
+    let temporary = tempfile::tempdir()?;
+    let cache = Cache::open_at(
+        temporary.path().join("cache"),
+        temporary.path().join("state"),
+        1024 * 1024,
+    )?;
+    let identity = ResultIdentity {
+        kind: ResultKind::Extract,
+        algorithm_version: 2,
+        source: SourceIdentity::from_sha256("4".repeat(64))?,
+        settings: json!({}),
+    };
+    let saved = Job::new("saved job");
+    let writer = CheckpointWriter::start(&cache, &identity, &saved, false)?;
+    saved.start(Phase::TransformDiscovery, None)?;
+    saved.increment(Counter::CandidatesExamined, 17)?;
+    writer.finish(false)?;
+
+    let live = Job::new("live job");
+    live.start(Phase::Preparation, Some(5))?;
+    live.set_current(Phase::Preparation, "opening cache")?;
+    live.advance(Phase::Preparation, 2)?;
+    live.increment(Counter::CacheHits, 3)?;
+    std::thread::sleep(Duration::from_millis(10));
+    let before = live.snapshot()?;
+    let writer = CheckpointWriter::start(&cache, &identity, &live, false)?;
+    let minimum_elapsed = before
+        .phase(Phase::Preparation)
+        .ok_or("preparation is missing")?
+        .elapsed_ms;
+    assert_checkpoint_preparation(&live.snapshot()?, minimum_elapsed)?;
+    let connection = rusqlite::Connection::open(temporary.path().join("state/cache.sqlite3"))?;
+    let persisted: String =
+        connection.query_row("SELECT snapshot_json FROM checkpoints", [], |row| {
+            row.get(0)
+        })?;
+    let persisted: l2_workbench::job::JobSnapshot = serde_json::from_str(&persisted)?;
+    assert_checkpoint_preparation(&persisted, minimum_elapsed)?;
+    writer.finish(false)?;
+    Ok(())
+}
+
+fn assert_checkpoint_preparation(
+    snapshot: &l2_workbench::job::JobSnapshot,
+    minimum_elapsed: u64,
+) -> Result<(), Box<dyn Error>> {
+    let preparation = snapshot
+        .phase(Phase::Preparation)
+        .ok_or("preparation is missing")?;
+    assert_eq!(snapshot.current_phase, Some(Phase::Preparation));
+    assert_eq!(preparation.state, PhaseState::InProgress);
+    assert_eq!(preparation.completed, 2);
+    assert_eq!(preparation.total, Some(5));
+    assert_eq!(preparation.message.as_deref(), Some("opening cache"));
+    assert!(preparation.elapsed_ms >= minimum_elapsed);
+    assert_eq!(snapshot.counters.get(&Counter::CacheHits), Some(&3));
+    assert_eq!(
+        snapshot.counters.get(&Counter::CandidatesExamined),
+        Some(&17)
+    );
+    assert_eq!(
+        snapshot
+            .phase(Phase::TransformDiscovery)
+            .map(|phase| phase.state),
+        Some(PhaseState::Pending)
+    );
+    Ok(())
+}
+
+#[test]
+fn fresh_checkpoint_rejects_discovery_or_scoped_work_before_cache_start()
+-> Result<(), Box<dyn Error>> {
+    for scoped in [false, true] {
+        let temporary = tempfile::tempdir()?;
+        let state_root = temporary.path().join("state");
+        let cache = Cache::open_at(temporary.path().join("cache"), &state_root, 1024 * 1024)?;
+        let identity = ResultIdentity {
+            kind: ResultKind::Extract,
+            algorithm_version: 2,
+            source: SourceIdentity::from_sha256("5".repeat(64))?,
+            settings: json!({}),
+        };
+        let live = Job::new("live job");
+        let worker = if scoped {
+            live.start(Phase::Preparation, None)?;
+            let worker = live.work_scope(&"a".repeat(64))?;
+            worker.increment(Counter::CandidatesExamined, 3)?;
+            Some(worker)
+        } else {
+            live.start(Phase::TransformDiscovery, None)?;
+            None
+        };
+        assert!(matches!(
+            CheckpointWriter::start(&cache, &identity, &live, false),
+            Err(CheckpointError::Job(JobError::RestoreAfterStart))
+        ));
+        let connection = rusqlite::Connection::open(state_root.join("cache.sqlite3"))?;
+        let count: u64 =
+            connection.query_row("SELECT COUNT(*) FROM checkpoints", [], |row| row.get(0))?;
+        assert_eq!(count, 0);
+        if let Some(worker) = worker {
+            assert_eq!(
+                worker
+                    .snapshot()?
+                    .counters
+                    .get(&Counter::CandidatesExamined),
+                Some(&3)
+            );
+        }
+    }
+    Ok(())
+}
+
 #[cfg(unix)]
 #[test]
 fn background_checkpoint_write_failure_remains_a_cache_error() -> Result<(), Box<dyn Error>> {
@@ -124,77 +240,172 @@ fn background_checkpoint_write_failure_remains_a_cache_error() -> Result<(), Box
 }
 
 #[cfg(target_os = "linux")]
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum CheckpointRace {
+    Cancel,
+    Discovery,
+    Preparation,
+}
+
+#[cfg(target_os = "linux")]
 #[test]
-fn worker_stops_if_live_job_changes_after_checkpoint_preview() -> Result<(), Box<dyn Error>> {
-    for cancel in [false, true] {
-        let temporary = tempfile::tempdir()?;
-        let state_root = temporary.path().join("state");
-        let cache = Cache::open_at(temporary.path().join("cache"), &state_root, 1024 * 1024)?;
-        let identity = ResultIdentity {
-            kind: ResultKind::Extract,
-            algorithm_version: 2,
-            source: SourceIdentity::from_sha256("3".repeat(64))?,
-            settings: json!({}),
+fn checkpoint_preview_preserves_preparation_but_rejects_live_discovery_and_cancellation()
+-> Result<(), Box<dyn Error>> {
+    for (action, active_checkpoint) in [
+        (CheckpointRace::Cancel, false),
+        (CheckpointRace::Cancel, true),
+        (CheckpointRace::Discovery, false),
+        (CheckpointRace::Discovery, true),
+        (CheckpointRace::Preparation, false),
+        (CheckpointRace::Preparation, true),
+    ] {
+        exercise_checkpoint_start_race(action, active_checkpoint)?;
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn exercise_checkpoint_start_race(
+    action: CheckpointRace,
+    active_checkpoint: bool,
+) -> Result<(), Box<dyn Error>> {
+    let temporary = tempfile::tempdir()?;
+    let state_root = temporary.path().join("state");
+    let cache = Cache::open_at(temporary.path().join("cache"), &state_root, 1024 * 1024)?;
+    let identity = ResultIdentity {
+        kind: ResultKind::Extract,
+        algorithm_version: 2,
+        source: SourceIdentity::from_sha256("3".repeat(64))?,
+        settings: json!({}),
+    };
+    let saved = Job::new("saved job");
+    saved.increment(Counter::CacheHits, 5)?;
+    CheckpointWriter::start(&cache, &identity, &saved, false)?.finish(!active_checkpoint)?;
+
+    let connection = rusqlite::Connection::open(state_root.join("cache.sqlite3"))?;
+    let key: String = connection.query_row("SELECT key FROM checkpoints", [], |row| row.get(0))?;
+    let checkpoint_lock = std::fs::canonicalize(&state_root)?
+        .join("locks")
+        .join(format!("{key}.lock"));
+    connection.execute_batch("BEGIN IMMEDIATE")?;
+    let live = Job::new("live job");
+    if action == CheckpointRace::Cancel {
+        live.start(Phase::Preparation, None)?;
+        live.set_current(Phase::Preparation, "opening cache")?;
+    }
+    let (result_sender, result_receiver) = std::sync::mpsc::channel();
+    let test_cache = cache;
+    let test_identity = identity;
+    let test_job = live.clone();
+    let thread = std::thread::spawn(move || {
+        let result = CheckpointWriter::start(&test_cache, &test_identity, &test_job, false);
+        let outcome = match result {
+            Err(CheckpointError::Job(error)) => Err(Some(error)),
+            Err(_) => Err(None),
+            Ok(writer) => writer.finish(false).map_err(|_| None),
         };
-        let saved = Job::new("saved job");
-        CheckpointWriter::start(&cache, &identity, &saved, false)?.finish(false)?;
+        let _ = result_sender.send(outcome);
+    });
+    wait_for_checkpoint_write(&checkpoint_lock)?;
+    let expected = apply_checkpoint_race(action, &live)?;
+    connection.execute_batch("COMMIT")?;
+    assert_eq!(
+        result_receiver.recv_timeout(Duration::from_secs(10))?,
+        expected
+    );
+    thread
+        .join()
+        .map_err(|_| "checkpoint startup thread panicked")?;
+    assert_checkpoint_race_result(action, active_checkpoint, &live)?;
+    Ok(())
+}
 
-        let connection = rusqlite::Connection::open(state_root.join("cache.sqlite3"))?;
-        let key: String =
-            connection.query_row("SELECT key FROM checkpoints", [], |row| row.get(0))?;
-        let checkpoint_lock = std::fs::canonicalize(&state_root)?
-            .join("locks")
-            .join(format!("{key}.lock"));
-        connection.execute_batch("BEGIN IMMEDIATE")?;
-        let live = Job::new("live job");
-        let (result_sender, result_receiver) = std::sync::mpsc::channel();
-        let test_cache = cache.clone();
-        let test_identity = identity.clone();
-        let test_job = live.clone();
-        let thread = std::thread::spawn(move || {
-            let result = CheckpointWriter::start(&test_cache, &test_identity, &test_job, false);
-            let outcome = match result {
-                Err(CheckpointError::Job(error)) => Some(error),
-                Err(_) => None,
-                Ok(writer) => {
-                    let _ = writer.finish(false);
-                    None
-                }
-            };
-            let _ = result_sender.send(outcome);
-        });
+#[cfg(target_os = "linux")]
+fn wait_for_checkpoint_write(checkpoint_lock: &std::path::Path) -> Result<(), Box<dyn Error>> {
+    // The open key lock shows that preview finished and the database write is waiting
+    let deadline = std::time::Instant::now() + Duration::from_secs(4);
+    while std::time::Instant::now() < deadline {
+        let waiting = std::fs::read_dir("/proc/self/fd")?
+            .filter_map(Result::ok)
+            .filter_map(|entry| std::fs::read_link(entry.path()).ok())
+            .any(|path| path == checkpoint_lock);
+        if waiting {
+            return Ok(());
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    Err("checkpoint writer did not reach the locked database".into())
+}
 
-        // The open key lock shows that preview finished and the database write is waiting
-        let deadline = std::time::Instant::now() + Duration::from_secs(4);
-        let mut waiting = false;
-        while std::time::Instant::now() < deadline {
-            waiting = std::fs::read_dir("/proc/self/fd")?
-                .filter_map(Result::ok)
-                .filter_map(|entry| std::fs::read_link(entry.path()).ok())
-                .any(|path| path == checkpoint_lock);
-            if waiting {
-                break;
-            }
-            std::thread::sleep(Duration::from_millis(10));
-        }
-        if !waiting {
-            connection.execute_batch("ROLLBACK")?;
-            return Err("checkpoint writer did not reach the locked database".into());
-        }
-        let expected = if cancel {
+#[cfg(target_os = "linux")]
+fn apply_checkpoint_race(
+    action: CheckpointRace,
+    live: &Job,
+) -> Result<Result<(), Option<JobError>>, Box<dyn Error>> {
+    match action {
+        CheckpointRace::Cancel => {
             live.request_cancel();
-            JobError::Cancelled
-        } else {
-            live.start(Phase::Preparation, None)?;
-            JobError::RestoreAfterStart
-        };
-        connection.execute_batch("COMMIT")?;
-        let actual = result_receiver.recv_timeout(Duration::from_secs(10))?;
-        assert_eq!(actual, Some(expected));
-        thread
-            .join()
-            .map_err(|_| "checkpoint startup thread panicked")?;
-        assert_eq!(live.snapshot()?.label, "live job");
+            Ok(Err(Some(JobError::Cancelled)))
+        }
+        CheckpointRace::Discovery => {
+            live.start(Phase::TransformDiscovery, None)?;
+            Ok(Err(Some(JobError::RestoreAfterStart)))
+        }
+        CheckpointRace::Preparation => {
+            live.start(Phase::Preparation, Some(3))?;
+            live.set_current(Phase::Preparation, "opening cache")?;
+            live.advance(Phase::Preparation, 1)?;
+            live.increment(Counter::CacheHits, 2)?;
+            let visible = live.snapshot()?;
+            assert_eq!(
+                visible.phase(Phase::Preparation).map(|phase| phase.state),
+                Some(PhaseState::InProgress)
+            );
+            assert_eq!(
+                visible
+                    .phase(Phase::Preparation)
+                    .and_then(|phase| phase.message.as_deref()),
+                Some("opening cache")
+            );
+            Ok(Ok(()))
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn assert_checkpoint_race_result(
+    action: CheckpointRace,
+    active_checkpoint: bool,
+    live: &Job,
+) -> Result<(), Box<dyn Error>> {
+    let after = live.snapshot()?;
+    if action == CheckpointRace::Preparation {
+        assert_eq!(
+            after.label,
+            if active_checkpoint {
+                "saved job"
+            } else {
+                "live job"
+            }
+        );
+        assert_eq!(after.current_phase, Some(Phase::Preparation));
+        assert_eq!(
+            after.phase(Phase::Preparation).map(|phase| phase.completed),
+            Some(1)
+        );
+        assert_eq!(
+            after.counters.get(&Counter::CacheHits),
+            Some(if active_checkpoint { &7 } else { &2 })
+        );
+    } else {
+        assert_eq!(after.label, "live job");
+    }
+    if action == CheckpointRace::Cancel {
+        assert!(after.cancel_requested);
+        assert_eq!(
+            after.phase(Phase::Preparation).map(|phase| phase.state),
+            Some(PhaseState::InProgress)
+        );
     }
     Ok(())
 }

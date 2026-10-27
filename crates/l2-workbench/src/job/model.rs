@@ -378,7 +378,7 @@ pub enum JobError {
     CounterOverflow(Counter),
     /// A phase work count would overflow its stored value
     PhaseOverflow(Phase),
-    /// Snapshot restoration was requested after live work started
+    /// Checkpoint preparation conflicts with other pipeline or scoped work
     RestoreAfterStart,
     /// A work scope must have a lowercase SHA-256 identity
     InvalidWorkIdentity,
@@ -408,9 +408,8 @@ impl fmt::Display for JobError {
             Self::PhaseOverflow(phase) => {
                 write!(formatter, "{} phase count overflowed", phase.label())
             }
-            Self::RestoreAfterStart => {
-                formatter.write_str("job snapshot cannot be restored after live work started")
-            }
+            Self::RestoreAfterStart => formatter
+                .write_str("job checkpoint cannot be prepared after other live work started"),
             Self::Cancelled => formatter.write_str("job cancellation was requested"),
             Self::InvalidWorkIdentity => {
                 formatter.write_str("work identity must be a SHA-256 digest")
@@ -755,53 +754,48 @@ impl Job {
     /// Restores a saved snapshot into this shared job handle
     ///
     /// Interrupted stages return to pending while their completed counts and elapsed times
-    /// remain available. Counters collected during the current invocation are added to saved
-    /// totals, and the live cancellation flag remains owned by this handle
+    /// remain available. A live preparation stage keeps its clock, work and message. Counters
+    /// collected during the current invocation are added to saved totals, and the live
+    /// cancellation flag remains owned by this handle
     ///
     /// # Errors
-    /// Returns [`JobError::LockPoisoned`], [`JobError::CounterOverflow`], or
-    /// [`JobError::RestoreAfterStart`] when the snapshot cannot be applied safely
-    pub fn restore(&self, mut snapshot: JobSnapshot) -> Result<(), JobError> {
+    /// Returns an error if shared state is unavailable, a measurement overflows, or other live
+    /// pipeline work or scoped work has already started
+    pub fn restore(&self, snapshot: JobSnapshot) -> Result<(), JobError> {
         let mut state = self.lock_state()?;
-        let no_live_phase_started = state.snapshot.current_phase.is_none()
-            && state
-                .snapshot
-                .phases
-                .iter()
-                .all(|phase| phase.state == PhaseState::Pending)
-            && state.work.is_empty();
-        if !no_live_phase_started {
-            return Err(JobError::RestoreAfterStart);
-        }
-
-        // Cache lookups can happen before restoration, so their counters remain part of this run
-        for (counter, value) in &state.snapshot.counters {
-            let restored_value = snapshot.counters.entry(*counter).or_insert(0);
-            *restored_value = restored_value
-                .checked_add(*value)
-                .ok_or(JobError::CounterOverflow(*counter))?;
-        }
-
-        // Cache fallback counts are cumulative, just like the counters above
-        let current_cache_fallbacks = std::mem::take(&mut state.snapshot.cache_fallbacks);
-        snapshot.cache_fallbacks.merge(current_cache_fallbacks);
-        let transitions = std::mem::take(&mut state.snapshot.recovery_transitions);
-        snapshot.recovery_transitions.merge(transitions);
-
-        // A prior process cancellation does not cancel this run, but a signal during lookup does
-        snapshot.cancel_requested = self.is_cancelled();
-        for phase in &mut snapshot.phases {
-            if phase.state == PhaseState::InProgress {
-                phase.state = PhaseState::Pending;
-                phase.refresh_measurements();
-            }
-        }
-
+        let snapshot = restored_snapshot(&state, snapshot, self.is_cancelled())?;
         state.elapsed_base_ms = snapshot.elapsed_ms;
         state.snapshot = snapshot;
-        state.phase_started_at.clear();
+        // Preparation retains its original runtime clock through the restore
+        state
+            .phase_started_at
+            .retain(|phase, _| *phase == Phase::Preparation);
         drop(state);
         Ok(())
+    }
+
+    /// Computes a safe checkpoint before an optional restore without changing the live job
+    ///
+    /// Preparation elapsed time includes the current invocation. Both a fresh checkpoint and
+    /// a restored checkpoint reject live discovery stages and scoped work
+    ///
+    /// # Errors
+    /// Returns an error if shared state is unavailable, a measurement overflows, or other live
+    /// pipeline work or scoped work has already started
+    pub fn preview_checkpoint(&self, saved: Option<&JobSnapshot>) -> Result<JobSnapshot, JobError> {
+        let state = self.lock_state()?;
+        let cancel_requested = self.is_cancelled();
+        let snapshot = if let Some(saved) = saved {
+            let mut snapshot = restored_snapshot(&state, saved.clone(), cancel_requested)?;
+            let elapsed_base_ms = snapshot.elapsed_ms;
+            apply_timing(&state, &mut snapshot, elapsed_base_ms);
+            snapshot
+        } else {
+            live_preparation(&state)?;
+            timed_snapshot(&state, cancel_requested)
+        };
+        drop(state);
+        Ok(snapshot)
     }
 
     /// Requests cooperative cancellation for every clone of this job handle
@@ -831,13 +825,79 @@ impl Job {
     }
 }
 
+fn live_preparation(state: &State) -> Result<Option<&PhaseSnapshot>, JobError> {
+    let preparation = state
+        .snapshot
+        .phase(Phase::Preparation)
+        .filter(|phase| phase.state == PhaseState::InProgress);
+    let expected_current = preparation.map(|_| Phase::Preparation);
+    let phases_are_restorable = state.snapshot.current_phase == expected_current
+        && state.snapshot.phases.iter().all(|phase| {
+            phase.state == PhaseState::Pending
+                || (phase.phase == Phase::Preparation && phase.state == PhaseState::InProgress)
+        })
+        && state.work.is_empty();
+    if phases_are_restorable {
+        Ok(preparation)
+    } else {
+        Err(JobError::RestoreAfterStart)
+    }
+}
+
+fn restored_snapshot(
+    state: &State,
+    mut snapshot: JobSnapshot,
+    cancel_requested: bool,
+) -> Result<JobSnapshot, JobError> {
+    let preparation = live_preparation(state)?;
+
+    // Cache lookups may have recorded work before restoration
+    for (counter, value) in &state.snapshot.counters {
+        let restored_value = snapshot.counters.entry(*counter).or_insert(0);
+        *restored_value = restored_value
+            .checked_add(*value)
+            .ok_or(JobError::CounterOverflow(*counter))?;
+    }
+    snapshot
+        .cache_fallbacks
+        .merge(state.snapshot.cache_fallbacks.clone());
+    snapshot
+        .recovery_transitions
+        .merge(state.snapshot.recovery_transitions.clone());
+    snapshot.cancel_requested = cancel_requested;
+    for phase in &mut snapshot.phases {
+        if phase.state == PhaseState::InProgress {
+            phase.state = PhaseState::Pending;
+            phase.refresh_measurements();
+        }
+    }
+
+    if let Some(preparation) = preparation {
+        let saved = find_phase_mut(&mut snapshot.phases, Phase::Preparation)
+            .ok_or(JobError::RestoreAfterStart)?;
+        let completed =
+            next_phase_value(saved.completed, Phase::Preparation, preparation.completed)?;
+        let elapsed_ms = saved.elapsed_ms.saturating_add(preparation.elapsed_ms);
+        // Keep the live state and message while retaining previously observed work
+        *saved = preparation.clone();
+        saved.completed = completed;
+        saved.elapsed_ms = elapsed_ms;
+        saved.refresh_measurements();
+        snapshot.current_phase = Some(Phase::Preparation);
+    }
+    Ok(snapshot)
+}
+
 fn timed_snapshot(state: &State, cancel_requested: bool) -> JobSnapshot {
     let mut snapshot = state.snapshot.clone();
-    snapshot.elapsed_ms = state
-        .elapsed_base_ms
-        .saturating_add(duration_millis(state.created_at.elapsed()));
     snapshot.cancel_requested = cancel_requested;
+    apply_timing(state, &mut snapshot, state.elapsed_base_ms);
+    snapshot
+}
 
+fn apply_timing(state: &State, snapshot: &mut JobSnapshot, elapsed_base_ms: u64) {
+    snapshot.elapsed_ms =
+        elapsed_base_ms.saturating_add(duration_millis(state.created_at.elapsed()));
     // Runtime clocks stay outside the serialized model and are applied only to this copy
     for phase in &mut snapshot.phases {
         if let Some(started_at) = state.phase_started_at.get(&phase.phase) {
@@ -847,7 +907,6 @@ fn timed_snapshot(state: &State, cancel_requested: bool) -> JobSnapshot {
             phase.refresh_measurements();
         }
     }
-    snapshot
 }
 
 fn find_phase_mut(phases: &mut [PhaseSnapshot], phase: Phase) -> Option<&mut PhaseSnapshot> {

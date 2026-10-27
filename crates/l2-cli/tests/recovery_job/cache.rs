@@ -1,7 +1,8 @@
 use super::*;
 use crate::result_directory::ResultKind;
 use l2_workbench::job::{
-    CacheFallbackKind, CacheStage, Counter, JobError, Phase, cache::SourceIdentity,
+    CacheFallbackKind, CacheStage, Counter, JobError, Phase, PhaseOutcome, PhaseState,
+    cache::SourceIdentity,
 };
 use serde_json::json;
 #[cfg(unix)]
@@ -117,6 +118,43 @@ fn checkpoint_finish_failure_respects_strict_mode_and_preserves_operation_error(
 }
 
 #[test]
+fn reopening_cache_keeps_preparation_visible_and_restores_saved_counters()
+-> Result<(), Box<dyn Error>> {
+    let temporary = tempfile::tempdir()?;
+    let cache_root = temporary.path().join("cache");
+    let state_root = temporary.path().join("state");
+    let original_cache = Cache::open_at(&cache_root, &state_root, 1024 * 1024)?;
+    let saved = Job::new("saved recovery");
+    saved.increment(Counter::Records, 9)?;
+    CheckpointWriter::start(&original_cache, &identity()?, &saved, false)?.finish(false)?;
+    drop(original_cache);
+
+    let live = Job::new("resuming recovery");
+    live.start(Phase::Preparation, None)?;
+    live.set_current(Phase::Preparation, "opening cache")?;
+    live.increment(Counter::CacheMisses, 1)?;
+    let visible = live.snapshot()?;
+    assert_eq!(
+        visible.phase(Phase::Preparation).map(|phase| phase.state),
+        Some(PhaseState::InProgress)
+    );
+    let cache = Cache::open_at(&cache_root, &state_root, 1024 * 1024)?;
+    let session =
+        RecoveryCache::from_cache(cache, &identity()?, &RecoveryOptions::default(), &live)?;
+    let restored = live.snapshot()?;
+    let preparation = restored
+        .phase(Phase::Preparation)
+        .ok_or("preparation is missing")?;
+    assert_eq!(preparation.state, PhaseState::InProgress);
+    assert_eq!(preparation.message.as_deref(), Some("opening cache"));
+    assert_eq!(restored.counters.get(&Counter::Records), Some(&9));
+    assert_eq!(restored.counters.get(&Counter::CacheMisses), Some(&1));
+    live.finish(Phase::Preparation, PhaseOutcome::Completed)?;
+    session.finish(Ok(()), &live)?;
+    Ok(())
+}
+
+#[test]
 fn checkpoint_restoration_cannot_hide_a_job_state_error() -> Result<(), Box<dyn Error>> {
     for strict in [false, true] {
         let temporary = tempfile::tempdir()?;
@@ -137,7 +175,7 @@ fn checkpoint_restoration_cannot_hide_a_job_state_error() -> Result<(), Box<dyn 
         let checkpoint = CheckpointWriter::start(&cache, &identity, &original, false)?;
         checkpoint.finish(false)?;
         let running = Job::new("running job");
-        running.start(Phase::Preparation, None)?;
+        running.start(Phase::TransformDiscovery, None)?;
         let Err(error) = RecoveryCache::from_cache(cache, &identity, &options, &running) else {
             return Err("restoring over live job state should fail".into());
         };

@@ -2,7 +2,7 @@
 
 use crate::result_directory::ResultIdentity;
 use l2_workbench::job::{
-    Job, JobError, JobSnapshot, PhaseState,
+    Job, JobError, PhaseState,
     cache::{Cache, CacheError, CheckpointStatus, StageKey},
 };
 use serde_json::json;
@@ -115,7 +115,7 @@ impl CheckpointWriter {
             snapshot.current_phase = None;
             snapshot
         });
-        let initial_snapshot = preview_snapshot(job, saved_snapshot.as_ref())?;
+        let initial_snapshot = job.preview_checkpoint(saved_snapshot.as_ref())?;
         let (stop, receiver) = mpsc::channel();
         let worker_cache = cache.clone();
         let worker_key = key.clone();
@@ -159,6 +159,9 @@ impl CheckpointWriter {
         job.check_cancelled()?;
         if let Some(snapshot) = saved_snapshot {
             job.restore(snapshot)?;
+        } else {
+            // A fresh checkpoint still rejects workers that started during the write
+            job.preview_checkpoint(None)?;
         }
         stop.send(WorkerCommand::Start)
             .map_err(|_| CheckpointError::WorkerPanicked)?;
@@ -192,32 +195,6 @@ impl CheckpointWriter {
         }
         Ok(())
     }
-}
-
-fn preview_snapshot(
-    job: &Job,
-    saved: Option<&JobSnapshot>,
-) -> Result<JobSnapshot, CheckpointError> {
-    let current = job.checkpoint_snapshot()?;
-    let Some(saved) = saved else {
-        return Ok(current);
-    };
-    // Match the live restore precondition before constructing a detached preview
-    if current.current_phase.is_some()
-        || current
-            .phases
-            .iter()
-            .any(|phase| phase.state != PhaseState::Pending)
-    {
-        return Err(JobError::RestoreAfterStart.into());
-    }
-    let preview = Job::new("checkpoint preview");
-    if current.cancel_requested {
-        preview.request_cancel();
-    }
-    preview.restore(current)?;
-    preview.restore(saved.clone())?;
-    Ok(preview.checkpoint_snapshot()?)
 }
 
 impl Drop for CheckpointWriter {

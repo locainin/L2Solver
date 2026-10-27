@@ -7,6 +7,8 @@ use l2_workbench::job::{
     Counter, Job, JobError, JobSnapshot, Phase, PhaseOutcome, PhaseSnapshot, PhaseState,
 };
 
+#[path = "job/model.rs"]
+mod model;
 #[path = "job/work.rs"]
 mod work;
 
@@ -212,12 +214,12 @@ fn setting_current_selects_the_phase_reported_in_the_snapshot() -> TestResult {
 #[test]
 fn restore_rejects_replacing_live_phase_progress() -> TestResult {
     let job = Job::new("active recovery");
-    job.start(Phase::Preparation, Some(2))?;
+    job.start(Phase::TransformDiscovery, Some(2))?;
     let snapshot = job.snapshot()?;
 
     assert_eq!(job.restore(snapshot), Err(JobError::RestoreAfterStart));
     assert_eq!(
-        phase(&job.snapshot()?, Phase::Preparation)?.state,
+        phase(&job.snapshot()?, Phase::TransformDiscovery)?.state,
         PhaseState::InProgress
     );
     Ok(())
