@@ -1,6 +1,9 @@
 //! Deterministic fixed-point execution over retained evidence bytes
 
 #[cfg(test)]
+#[path = "../../../tests/workbench/recovery_executor_cancel_boundary.rs"]
+mod cancel_boundary_tests;
+#[cfg(test)]
 #[path = "../../../tests/workbench/recovery_case_index.rs"]
 mod case_index_tests;
 mod case_scan;
@@ -283,6 +286,7 @@ fn execute_internal(
 }
 
 fn execute_executor(executor: &mut Executor<'_>) -> Result<(), RecoveryExecutionError> {
+    executor.check_cancelled()?;
     executor.enqueue_framing_discovery_if_enabled()?;
     let seed_nodes = executor.initialize_case_index()?;
     for (node_id, kind) in seed_nodes {
@@ -293,6 +297,8 @@ fn execute_executor(executor: &mut Executor<'_>) -> Result<(), RecoveryExecution
     let mut evidence_stop_reported = false;
     loop {
         drain_candidate_frontier(executor, &mut evidence_stop, &mut evidence_stop_reported)?;
+        // Deferred cohort work can mutate the Case even when the frontier is empty
+        executor.check_cancelled()?;
         if evidence_stop.is_some() {
             break;
         }
@@ -330,13 +336,15 @@ fn drain_candidate_frontier(
     evidence_stop_reported: &mut bool,
 ) -> Result<(), RecoveryExecutionError> {
     loop {
+        // Check before admitting deferred work or removing the next candidate
+        executor.check_cancelled()?;
         if evidence_stop.is_none()
             && !executor.pending_record_assemblies.is_empty()
             && !executor.next_candidate_precedes_deferred_assembly()
         {
             executor.flush_pending_record_assemblies()?;
         }
-        let Some(candidate_id) = executor.coordinator.pop_next()? else {
+        let Some(candidate_id) = executor.coordinator.peek_next_id() else {
             break;
         };
         if evidence_stop.is_none() {
@@ -347,6 +355,22 @@ fn drain_candidate_frontier(
                 .task();
             *evidence_stop = evidence::saturated_case_evidence(executor.case, task);
         }
+        // Keep the candidate queued when cancellation arrives during progress setup
+        if evidence_stop.is_none() {
+            let candidate_task = executor
+                .coordinator
+                .candidate(candidate_id)
+                .ok_or(RecoveryError::UnknownCandidate { id: candidate_id })?
+                .task();
+            if let Some(progress) = &executor.job {
+                progress.begin_candidate(candidate_task)?;
+            }
+        } else {
+            executor.check_cancelled()?;
+        }
+        if executor.coordinator.pop_next()? != Some(candidate_id) {
+            return Err(RecoveryError::InvariantFailure.into());
+        }
         if let Some(stop) = *evidence_stop {
             executor.stop_candidate_for_case_evidence(
                 candidate_id,
@@ -356,17 +380,7 @@ fn drain_candidate_frontier(
             *evidence_stop_reported = true;
             continue;
         }
-
         let omission_start = executor.omissions.len();
-        let candidate_task = executor
-            .coordinator
-            .candidate(candidate_id)
-            .ok_or(RecoveryError::UnknownCandidate { id: candidate_id })?
-            .task()
-            .clone();
-        if let Some(progress) = &executor.job {
-            progress.begin_candidate(&candidate_task)?;
-        }
         if let Err(error) = executor.execute_candidate(candidate_id) {
             *evidence_stop = Some(executor.stop_after_case_evidence_error(candidate_id, error)?);
             *evidence_stop_reported = true;
@@ -656,6 +670,13 @@ const fn phase_for_task(task: &RecoveryTask) -> Phase {
 }
 
 impl Executor<'_> {
+    fn check_cancelled(&self) -> Result<(), RecoveryExecutionError> {
+        if let Some(progress) = &self.job {
+            progress.job.check_cancelled()?;
+        }
+        Ok(())
+    }
+
     fn initialize_case_index(&mut self) -> Result<Vec<(u64, String)>, RecoveryExecutionError> {
         self.case_index.initialize(self.case)
     }
