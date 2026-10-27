@@ -1,10 +1,23 @@
-use super::{Case, CaseMemory, graph_bytes};
+use super::{Case, CaseMemory, graph_bytes, value_bytes};
 use crate::{
     evidence::{CaseSnapshotLimits, Edge, EvidenceError, EvidenceStatus, SourceRange},
     job::MemoryBudget,
     sha256,
 };
 use serde_json::json;
+
+#[test]
+fn json_object_charge_covers_a_btree_node_for_each_nested_object() -> Result<(), EvidenceError> {
+    let empty = json!({});
+    let nested = json!({"outer":{"inner":1}});
+    let node_floor =
+        11 * std::mem::size_of::<(String, serde_json::Value)>() + 2 * std::mem::size_of::<usize>();
+
+    // An empty map can keep its root after the last field is removed
+    assert!(value_bytes(&empty)? >= node_floor);
+    assert!(value_bytes(&nested)? >= 2 * node_floor + "outer".len() + "inner".len());
+    Ok(())
+}
 
 fn assert_charges_match_case(case: &Case) -> Result<(), EvidenceError> {
     let memory: &CaseMemory = case.memory.as_ref().ok_or(EvidenceError::InvalidJson)?;

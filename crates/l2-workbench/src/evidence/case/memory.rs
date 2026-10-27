@@ -2,8 +2,8 @@
 //!
 //! Vector charges use observed capacity. Hash indexes charge one logical entry plus
 //! one control byte per reported entry capacity; actual allocator bucket overhead
-//! is outside this model. JSON object charges count entries and owned text, not
-//! private map-node allocation overhead
+//! is outside this model. JSON objects use a conservative model of the current
+//! `serde_json` `BTreeMap` nodes, not a promise about allocator overhead or future Rust layouts
 
 #[cfg(test)]
 #[path = "../../../tests/evidence/case_memory_internal.rs"]
@@ -237,17 +237,36 @@ pub(super) fn value_bytes(value: &Value) -> Result<usize, EvidenceError> {
             Ok(bytes)
         }
         Value::Object(fields) => {
-            // Map node overhead is allocator-specific; entries and owned text are logical bytes
-            let mut bytes = fields
-                .len()
-                .checked_mul(size_of::<(String, Value)>())
-                .ok_or_else(overflow)?;
+            let mut bytes = json_object_nodes(fields.len())?;
             for (key, value) in fields {
                 bytes = add(add(bytes, key.capacity())?, value_bytes(value)?)?;
             }
             Ok(bytes)
         }
     }
+}
+
+fn json_object_nodes(entries: usize) -> Result<usize, EvidenceError> {
+    // The v1 model follows serde_json's BTreeMap and Rust 1.96 node layout
+    // This model must be reviewed when serde_json map features or the Rust toolchain change
+    // Rust 1.96 uses 11 key/value slots per node without the preserve_order feature
+    // Each non-root node has at least 5 entries after rebalancing
+    let nodes = if entries < 11 {
+        1
+    } else {
+        (entries - 1) / 5 + 1
+    };
+    // Charge every node as an internal node with 12 child pointers and a padded header
+    // An emptied map can retain a root node after its final entry is removed
+    let slots = 11_usize
+        .checked_mul(size_of::<(String, Value)>())
+        .ok_or_else(overflow)?;
+    let header_and_children = 14_usize
+        .checked_mul(size_of::<usize>())
+        .ok_or_else(overflow)?;
+    nodes
+        .checked_mul(add(slots, header_and_children)?)
+        .ok_or_else(overflow)
 }
 
 pub(super) fn graph_bytes(case: &Case) -> Result<usize, EvidenceError> {
