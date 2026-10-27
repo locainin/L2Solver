@@ -2,15 +2,15 @@ use std::{
     collections::HashSet,
     env, fs, io,
     path::{Path, PathBuf},
-    sync::Arc,
+    sync::{Arc, OnceLock},
     time::{SystemTime, UNIX_EPOCH},
 };
 
-use rusqlite::{OptionalExtension, TransactionBehavior, params};
+use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
 use tempfile::Builder;
 
 use crate::hashing::is_sha256_digest;
-use crate::job::JobSnapshot;
+use crate::job::{JobSnapshot, MemoryBudget, MemoryLease};
 
 use super::{
     database::{self, Durability},
@@ -20,6 +20,7 @@ use super::{
     fingerprint::SourceFingerprint,
     key::StageKey,
     manifest::safe_entry_path,
+    memory,
     model::{CacheReadPolicy, CacheStats, Checkpoint, CheckpointStatus, PruneReport, StageStatus},
     retired,
 };
@@ -40,6 +41,7 @@ pub(super) struct CacheInner {
     pub(super) staging: HeldDirectory,
     locks: HeldDirectory,
     pub(super) max_bytes: u64,
+    memory_budget: OnceLock<Option<MemoryBudget>>,
 }
 
 struct EvictionSnapshot {
@@ -78,6 +80,26 @@ impl CacheInner {
         self.staging.check_location()?;
         self.locks.check_location()?;
         Ok(())
+    }
+
+    pub(super) fn memory_budget(&self) -> Option<&MemoryBudget> {
+        self.memory_budget.get_or_init(|| None).as_ref()
+    }
+
+    pub(super) fn encode_checkpoint(
+        &self,
+        snapshot: &JobSnapshot,
+    ) -> Result<(String, Option<MemoryLease>)> {
+        let budget = self.memory_budget();
+        let charge = if budget.is_some() {
+            memory::reserve(
+                budget,
+                memory::checkpoint_charge(memory::json_size(snapshot)?)?,
+            )?
+        } else {
+            None
+        };
+        Ok((serde_json::to_string(snapshot)?, charge))
     }
 
     fn lock(&self, key: &StageKey, exclusive: bool) -> Result<LockGuard> {
@@ -256,6 +278,7 @@ impl Cache {
             staging,
             locks,
             max_bytes,
+            memory_budget: OnceLock::new(),
         });
         inner.check_locations()?;
         database::initialize(&inner.state_root, &inner.locks)?;
@@ -286,6 +309,26 @@ impl Cache {
         )
     }
 
+    /// Attaches the shared live-memory budget before the first cache data operation
+    ///
+    /// Cache clones share this one-time choice. Lookup and commit keep the metadata charge while
+    /// the returned entry lives; checkpoint snapshot charges cover decoding only
+    ///
+    /// Lookup reserves 128 logical bytes per encoded metadata byte plus 256 bytes for the retained
+    /// value. Its temporary allowance reserves 128 per encoded manifest byte, twice the encoded
+    /// row string sizes, and 64 KiB for traversal. These are logical estimates rather than exact
+    /// allocator or process RSS limits. `SQLite` connection and page-cache allocations are not
+    /// included, and callers must account for metadata or checkpoint snapshots they clone
+    ///
+    /// # Errors
+    /// Returns an error if a budget was already attached or cache data was already accessed
+    pub fn attach_memory_budget(&self, budget: MemoryBudget) -> Result<()> {
+        self.inner
+            .memory_budget
+            .set(Some(budget))
+            .map_err(|_| CacheError::InvalidInput("cache memory budget is already fixed"))
+    }
+
     /// Returns the configured maximum size in bytes
     #[must_use]
     pub fn max_bytes(&self) -> u64 {
@@ -311,28 +354,19 @@ impl Cache {
         key.validate()?;
         self.inner.check_locations()?;
         let lock = self.inner.lock(key, false)?;
-        // Keep the directory pinned while its metadata and relative files are checked
-        let connection =
+        // The database snapshot and OS lock keep lengths and their row contents consistent
+        let budget = self.inner.memory_budget();
+        let mut connection =
             database::open_connection(&self.inner.state_root, Durability::Recomputable)?;
-        let row = connection
+        let transaction = connection.transaction()?;
+        let header = transaction
             .query_row(
-                "SELECT stage, status, relative_path, metadata_json, manifest_json, bytes
-                 FROM entries WHERE key = ?1",
+                "SELECT rowid, status FROM entries WHERE key = ?1",
                 [key.as_str()],
-                |row| {
-                    Ok((
-                        row.get::<_, String>(0)?,
-                        row.get::<_, i64>(1)?,
-                        row.get::<_, String>(2)?,
-                        row.get::<_, String>(3)?,
-                        row.get::<_, String>(4)?,
-                        row.get::<_, i64>(5)?,
-                    ))
-                },
+                |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?)),
             )
             .optional()?;
-        let Some((stage, status_value, relative_path, metadata_json, manifest_json, bytes)) = row
-        else {
+        let Some((rowid, status_value)) = header else {
             return Ok(None);
         };
         let status = StageStatus::from_database(status_value)
@@ -340,21 +374,42 @@ impl Cache {
         if status == StageStatus::Partial && policy == CacheReadPolicy::CompleteOnly {
             return Ok(None);
         }
-
+        // Reserve before fetching any column into a Rust String or decoding either JSON value
+        let (retained, transient) = if budget.is_some() {
+            let lengths = entry_lengths(&transaction, rowid)?;
+            (
+                memory::reserve(budget, memory::metadata_charge(lengths.metadata)?)?,
+                memory::reserve(
+                    budget,
+                    memory::lookup_transient_charge(
+                        lengths.metadata,
+                        lengths.manifest,
+                        lengths.stage,
+                        lengths.path,
+                    )?,
+                )?,
+            )
+        } else {
+            (None, None)
+        };
+        let record = transaction.query_row(
+            "SELECT stage, relative_path, metadata_json, manifest_json, bytes FROM entries WHERE rowid = ?1",
+            [rowid], |row| Ok(EntryRecord {
+                stage: row.get(0)?, status, relative_path: row.get(1)?,
+                metadata_json: row.get(2)?, manifest_json: row.get(3)?, bytes: row.get(4)?,
+            }),
+        )?;
         let entry = read_entry(
             &self.inner.cache_root,
             &self.inner.entries,
             key,
-            &EntryRecord {
-                stage,
-                status,
-                relative_path,
-                metadata_json,
-                manifest_json,
-                bytes,
-            },
+            &record,
             lock,
+            retained,
         )?;
+        drop(record);
+        drop(transient);
+        transaction.commit()?;
         connection.execute(
             "UPDATE entries SET accessed_ns = MAX(?1, accessed_ns + 1) WHERE key = ?2",
             params![now_ns(), key.as_str()],
@@ -423,52 +478,75 @@ impl Cache {
         self.inner.check_locations()?;
         // Shared ownership prevents pruning until the full-synchronous checkpoint commits
         let _pin = self.inner.lock(key, false)?;
-        let snapshot_json = serde_json::to_string(snapshot)?;
-        self.inner.record_checkpoint(key, status, &snapshot_json)
+        let (snapshot_json, charge) = self.inner.encode_checkpoint(snapshot)?;
+        let result = self.inner.record_checkpoint(key, status, &snapshot_json);
+        drop(snapshot_json);
+        drop(charge);
+        result
     }
 
     /// Reads a durable snapshot together with its stable key and saved status
+    ///
+    /// The cache charges serialized input and decoding while reading. The returned snapshot and
+    /// any later clones belong to the caller and are outside this temporary cache charge
     ///
     /// # Errors
     /// Returns an error when the row is corrupt or cannot be decoded as a job snapshot
     pub fn read_checkpoint(&self, key: &StageKey) -> Result<Option<Checkpoint>> {
         key.validate()?;
         self.inner.check_locations()?;
-        let connection = database::open_connection(&self.inner.state_root, Durability::Checkpoint)?;
-        let row = connection
+        let budget = self.inner.memory_budget();
+        let mut connection =
+            database::open_connection(&self.inner.state_root, Durability::Checkpoint)?;
+        let transaction = connection.transaction()?;
+        let header = transaction
             .query_row(
-                "SELECT status, snapshot_version, snapshot_json FROM checkpoints WHERE key = ?1",
+                "SELECT rowid, status, snapshot_version FROM checkpoints WHERE key = ?1",
                 [key.as_str()],
                 |row| {
                     Ok((
                         row.get::<_, i64>(0)?,
                         row.get::<_, i64>(1)?,
-                        row.get::<_, String>(2)?,
+                        row.get::<_, i64>(2)?,
                     ))
                 },
             )
             .optional()?;
-        row.map(|(status, snapshot_version, snapshot_json)| {
-            let snapshot_version =
-                u32::try_from(snapshot_version).map_err(|_| CacheError::CorruptCheckpoint)?;
-            if !super::model::supports_job_snapshot_version(snapshot_version) {
-                return Err(CacheError::CorruptCheckpoint);
-            }
-            let status =
-                CheckpointStatus::from_database(status).ok_or(CacheError::CorruptCheckpoint)?;
-            let snapshot: JobSnapshot =
-                serde_json::from_str(&snapshot_json).map_err(|_| CacheError::CorruptCheckpoint)?;
-            if !snapshot.is_valid_checkpoint() {
-                return Err(CacheError::CorruptCheckpoint);
-            }
-            Ok(Checkpoint {
-                key: key.clone(),
-                status,
-                snapshot_version,
-                snapshot,
-            })
-        })
-        .transpose()
+        let Some((rowid, status, version)) = header else {
+            return Ok(None);
+        };
+        let snapshot_version = u32::try_from(version).map_err(|_| CacheError::CorruptCheckpoint)?;
+        if !super::model::supports_job_snapshot_version(snapshot_version) {
+            return Err(CacheError::CorruptCheckpoint);
+        }
+        let status =
+            CheckpointStatus::from_database(status).ok_or(CacheError::CorruptCheckpoint)?;
+        let charge = if budget.is_some() {
+            let size = column_length(&transaction, "checkpoints", "snapshot_json", rowid)?;
+            memory::reserve(budget, memory::checkpoint_charge(size)?)?
+        } else {
+            None
+        };
+        let snapshot_json: String = transaction.query_row(
+            "SELECT snapshot_json FROM checkpoints WHERE rowid = ?1",
+            [rowid],
+            |row| row.get(0),
+        )?;
+        transaction.commit()?;
+        let snapshot: JobSnapshot =
+            serde_json::from_str(&snapshot_json).map_err(|_| CacheError::CorruptCheckpoint)?;
+        if !snapshot.is_valid_checkpoint() {
+            return Err(CacheError::CorruptCheckpoint);
+        }
+        drop(snapshot_json);
+        // The returned snapshot and its clones are owned and accounted for by the caller
+        drop(charge);
+        Ok(Some(Checkpoint {
+            key: key.clone(),
+            status,
+            snapshot_version,
+            snapshot,
+        }))
     }
 
     /// Reports indexed entry usage, checkpoints, and bytes retained above the configured limit
@@ -1131,6 +1209,28 @@ impl Cache {
             active_checkpoints,
         })
     }
+}
+
+struct EntryLengths {
+    stage: u64,
+    path: u64,
+    metadata: u64,
+    manifest: u64,
+}
+
+fn entry_lengths(connection: &Connection, rowid: i64) -> Result<EntryLengths> {
+    Ok(EntryLengths {
+        stage: column_length(connection, "entries", "stage", rowid)?,
+        path: column_length(connection, "entries", "relative_path", rowid)?,
+        metadata: column_length(connection, "entries", "metadata_json", rowid)?,
+        manifest: column_length(connection, "entries", "manifest_json", rowid)?,
+    })
+}
+
+fn column_length(connection: &Connection, table: &str, column: &str, rowid: i64) -> Result<u64> {
+    // Incremental blob handles expose encoded length without materializing the column
+    let blob = connection.blob_open("main", table, column, rowid, true)?;
+    u64::try_from(blob.len()).map_err(|_| CacheError::SizeOverflow)
 }
 
 fn xdg_path(name: &str, fallback: &Path) -> Result<PathBuf> {

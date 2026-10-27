@@ -32,6 +32,23 @@ struct ManifestItem {
 
 impl Manifest {
     pub(super) fn scan(directory: &Path) -> Result<Self> {
+        Self::scan_with_limits(directory, MAX_TREE_ITEMS, usize::MAX)
+    }
+
+    pub(super) fn scan_for_validation(directory: &Path, expected: &Self) -> Result<Self> {
+        if expected.items.len() > MAX_TREE_ITEMS {
+            return Err(CacheError::InvalidInput(
+                "cache entry contains too many files",
+            ));
+        }
+        let path_bytes = expected.items.iter().try_fold(0_usize, |sum, item| {
+            sum.checked_add(item.relative_path.len())
+                .ok_or(CacheError::SizeOverflow)
+        })?;
+        Self::scan_with_limits(directory, expected.items.len(), path_bytes)
+    }
+
+    fn scan_with_limits(directory: &Path, max_items: usize, max_path_bytes: usize) -> Result<Self> {
         // File identity and change times detect replacement without hashing every cached byte
         let metadata = fs::symlink_metadata(directory)?;
         if metadata.file_type().is_symlink() || !metadata.is_dir() {
@@ -42,7 +59,19 @@ impl Manifest {
 
         let mut items = Vec::new();
         let mut total_bytes = 0_u64;
-        visit(directory, directory, 0, &mut items, &mut total_bytes)?;
+        let mut limits = ScanLimits {
+            max_items,
+            max_path_bytes,
+            path_bytes: 0,
+        };
+        visit(
+            directory,
+            directory,
+            0,
+            &mut items,
+            &mut total_bytes,
+            &mut limits,
+        )?;
         items.sort_by(|left, right| left.relative_path.cmp(&right.relative_path));
         Ok(Self { items, total_bytes })
     }
@@ -52,12 +81,19 @@ impl Manifest {
     }
 }
 
+struct ScanLimits {
+    max_items: usize,
+    max_path_bytes: usize,
+    path_bytes: usize,
+}
+
 fn visit(
     root: &Path,
     directory: &Path,
     depth: usize,
     items: &mut Vec<ManifestItem>,
     total_bytes: &mut u64,
+    limits: &mut ScanLimits,
 ) -> Result<()> {
     if depth > MAX_TREE_DEPTH {
         return Err(CacheError::InvalidInput(
@@ -76,12 +112,21 @@ fn visit(
             ));
         }
 
-        if items.len() >= MAX_TREE_ITEMS {
+        if items.len() >= limits.max_items {
             return Err(CacheError::InvalidInput(
                 "cache entry contains too many files",
             ));
         }
         let relative_path = relative_path(root, &path)?;
+        limits.path_bytes = limits
+            .path_bytes
+            .checked_add(relative_path.len())
+            .ok_or(CacheError::SizeOverflow)?;
+        if limits.path_bytes > limits.max_path_bytes {
+            return Err(CacheError::InvalidInput(
+                "cache entry paths exceed the stored manifest",
+            ));
+        }
         let identity = metadata_identity(&metadata);
         items.push(ManifestItem {
             relative_path,
@@ -94,7 +139,7 @@ fn visit(
         });
 
         if is_directory {
-            visit(root, &path, depth + 1, items, total_bytes)?;
+            visit(root, &path, depth + 1, items, total_bytes, limits)?;
         } else {
             *total_bytes = total_bytes
                 .checked_add(metadata.len())

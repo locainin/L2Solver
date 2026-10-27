@@ -1,9 +1,13 @@
 use std::{error::Error, fmt, io};
 
+use crate::job::MemoryError;
+
 /// Errors returned by persistent cache operations
 #[derive(Debug)]
 #[non_exhaustive]
 pub enum CacheError {
+    /// The shared live-memory budget could not admit cache work
+    Memory(MemoryError),
     /// The filesystem rejected a cache operation
     Io(io::Error),
     /// `SQLite` rejected a cache operation
@@ -51,6 +55,7 @@ pub enum CacheError {
 impl fmt::Display for CacheError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::Memory(error) => write!(formatter, "cache memory admission failed: {error}"),
             Self::Io(error) => write!(formatter, "cache filesystem error: {error}"),
             Self::Database(error) => write!(formatter, "cache database error: {error}"),
             Self::Json(error) => write!(formatter, "cache metadata error: {error}"),
@@ -92,6 +97,7 @@ impl fmt::Display for CacheError {
 impl Error for CacheError {
     fn source(&self) -> Option<&(dyn Error + 'static)> {
         match self {
+            Self::Memory(error) => Some(error),
             Self::Io(error) => Some(error),
             Self::Database(error) | Self::Json(error) => Some(error.as_ref()),
             _ => None,
@@ -129,3 +135,9 @@ impl From<rusqlite::Error> for CacheError {
 
 /// Result type for persistent cache operations
 pub type Result<T> = std::result::Result<T, CacheError>;
+
+impl From<MemoryError> for CacheError {
+    fn from(error: MemoryError) -> Self {
+        Self::Memory(error)
+    }
+}

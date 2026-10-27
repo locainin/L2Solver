@@ -23,6 +23,9 @@ mod fingerprint;
 #[path = "cache/execution.rs"]
 mod execution;
 
+#[path = "cache/memory.rs"]
+mod memory;
+
 fn cache_at(directory: &Path, max_bytes: u64) -> Result<Cache, CacheError> {
     Cache::open_at(directory.join("cache"), directory.join("state"), max_bytes)
 }

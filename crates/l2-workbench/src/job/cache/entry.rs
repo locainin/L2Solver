@@ -3,7 +3,7 @@ use std::{
     path::{Path, PathBuf},
 };
 
-use crate::job::JobSnapshot;
+use crate::job::{JobSnapshot, MemoryLease};
 use serde_json::Value;
 
 use super::{
@@ -12,6 +12,7 @@ use super::{
     filesystem::{HeldDirectory, LockGuard},
     key::StageKey,
     manifest::{Manifest, safe_entry_path},
+    memory,
     model::StageStatus,
 };
 
@@ -24,6 +25,7 @@ pub struct CacheEntry {
     metadata: Value,
     directory: HeldDirectory,
     _lock: LockGuard,
+    _memory: Option<MemoryLease>,
 }
 
 /// An exclusive work area for one stable stage key
@@ -73,6 +75,7 @@ impl CacheEntry {
         metadata: Value,
         directory: HeldDirectory,
         lock: LockGuard,
+        memory: Option<MemoryLease>,
     ) -> Self {
         Self {
             key,
@@ -80,6 +83,7 @@ impl CacheEntry {
             metadata,
             directory,
             _lock: lock,
+            _memory: memory,
         }
     }
 
@@ -96,6 +100,9 @@ impl CacheEntry {
     }
 
     /// Returns the validated metadata receipt stored with this entry
+    ///
+    /// The entry keeps its budget charge for this value; copies made by the caller need their own
+    /// accounting
     #[must_use]
     pub const fn metadata(&self) -> &Value {
         &self.metadata
@@ -148,14 +155,16 @@ impl Lease {
     pub fn preserve(mut self, snapshot: &JobSnapshot) -> Result<()> {
         self.cache.inner.check_locations()?;
         self.directory.check_location()?;
-        let snapshot_json = serde_json::to_string(snapshot)?;
+        let (snapshot_json, memory) = self.cache.inner.encode_checkpoint(snapshot)?;
         self.cleanup_on_drop = false;
-        self.cache.inner.record_checkpoint(
+        let result = self.cache.inner.record_checkpoint(
             &self.key,
             super::model::CheckpointStatus::Active,
             &snapshot_json,
-        )?;
-        Ok(())
+        );
+        drop(snapshot_json);
+        drop(memory);
+        result
     }
 
     /// Atomically seals the work directory and publishes its metadata
@@ -170,6 +179,11 @@ impl Lease {
     pub fn commit(mut self, status: StageStatus, metadata: Value) -> Result<CacheEntry> {
         self.cache.inner.check_locations()?;
         self.directory.check_location()?;
+        let (metadata_memory, transient_memory) = memory::reserve_metadata(
+            self.cache.inner.memory_budget(),
+            &metadata,
+            MAX_METADATA_BYTES,
+        )?;
         let metadata_json = serde_json::to_string(&metadata)?;
         if metadata_json.len() > MAX_METADATA_BYTES {
             return Err(CacheError::MetadataTooLarge {
@@ -234,12 +248,17 @@ impl Lease {
             .ok_or(CacheError::InvalidInput("lease has no OS lock"))?;
         lock.downgrade()?;
 
+        drop(metadata_json);
+        drop(manifest_json);
+        drop(manifest);
+        drop(transient_memory);
         Ok(CacheEntry::new(
             self.key.clone(),
             status,
             metadata,
             final_directory,
             lock,
+            metadata_memory,
         ))
     }
 }
@@ -258,6 +277,7 @@ pub(super) fn read_entry(
     key: &StageKey,
     record: &EntryRecord,
     lock: LockGuard,
+    memory: Option<MemoryLease>,
 ) -> Result<CacheEntry> {
     if record.stage != key.stage() {
         return Err(CacheError::CorruptEntry(
@@ -279,7 +299,7 @@ pub(super) fn read_entry(
         .map_err(|_| CacheError::CorruptEntry("entry metadata is not valid JSON".to_owned()))?;
     let expected: Manifest = serde_json::from_str(&record.manifest_json)
         .map_err(|_| CacheError::CorruptEntry("entry manifest is not valid JSON".to_owned()))?;
-    let actual = Manifest::scan(directory.path())
+    let actual = Manifest::scan_for_validation(directory.path(), &expected)
         .map_err(|_| CacheError::CorruptEntry("entry files are missing or unsafe".to_owned()))?;
     let recorded_bytes = u64::try_from(record.bytes)
         .map_err(|_| CacheError::CorruptEntry("entry size is invalid".to_owned()))?;
@@ -296,5 +316,6 @@ pub(super) fn read_entry(
         metadata,
         directory,
         lock,
+        memory,
     ))
 }

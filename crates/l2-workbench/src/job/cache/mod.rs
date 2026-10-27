@@ -9,6 +9,7 @@ mod fingerprint;
 mod key;
 mod manager;
 mod manifest;
+mod memory;
 mod model;
 mod retired;
 
