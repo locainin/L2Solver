@@ -21,6 +21,20 @@ pub struct WorkSnapshot {
     counts: WorkCounts,
 }
 
+impl WorkSnapshot {
+    /// Returns this contribution's observed count for one measurement
+    #[must_use]
+    pub fn counter(&self, counter: Counter) -> u64 {
+        self.counts.counter(counter)
+    }
+
+    /// Returns work observed while the selected phase was active
+    #[must_use]
+    pub fn phase_work(&self, phase: Phase) -> u64 {
+        self.counts.phase(phase)
+    }
+}
+
 #[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 struct WorkCounts {

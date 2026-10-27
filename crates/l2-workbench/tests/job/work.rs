@@ -19,6 +19,7 @@ fn work_restore_replaces_only_its_own_counters() -> TestResult {
     let second = job.work_scope(&"b".repeat(64))?;
     first.increment(Counter::CandidatesExamined, 5)?;
     let first_committed = first.work_snapshot()?;
+    assert_eq!(first_committed.counter(Counter::CandidatesExamined), 5);
     first.increment(Counter::CandidatesExamined, 100)?;
     second.increment(Counter::CandidatesExamined, 11)?;
     first.restore_work(first_committed.clone())?;
@@ -143,6 +144,7 @@ fn phase_work_restore_preserves_other_workers_and_base_progress() -> TestResult 
     let second = job.work_scope(&"4".repeat(64))?;
     first.record_work(Phase::TransformDiscovery, Counter::CandidatesExamined, 7)?;
     let committed = first.work_snapshot()?;
+    assert_eq!(committed.phase_work(Phase::TransformDiscovery), 7);
     first.record_work(Phase::TransformDiscovery, Counter::CandidatesExamined, 100)?;
     second.record_work(Phase::TransformDiscovery, Counter::CandidatesExamined, 11)?;
     first.restore_work(committed)?;
