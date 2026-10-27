@@ -15,6 +15,7 @@ mod signatures;
 mod support;
 mod validator;
 mod zip;
+mod zip_memory;
 mod zip_limits;
 mod zip_stream;
 mod zip_support;

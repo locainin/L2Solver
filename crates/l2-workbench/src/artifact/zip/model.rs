@@ -14,7 +14,7 @@ pub const MAX_ZIP_TOTAL_EXPANDED_BYTES: usize = 64 * 1024 * 1024;
 pub const MAX_ZIP_DEPTH: usize = 4;
 
 /// Caller-selected resource budgets for parsing one ZIP archive
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
 pub struct ZipArtifactLimits {
     /// Maximum bytes in the supplied compressed archive
     pub max_archive_bytes: usize,
@@ -80,6 +80,8 @@ pub enum ZipReadError {
     DirectoryLimit { length: u64, maximum: usize },
     /// A random read would exceed the aggregate byte-work allowance
     WorkLimit { requested: usize, remaining: usize },
+    /// Shared live-memory admission prevented ZIP inspection
+    Memory(crate::job::MemoryError),
 }
 
 impl fmt::Display for ZipReadError {
@@ -99,6 +101,7 @@ impl fmt::Display for ZipReadError {
                 formatter,
                 "ZIP read needs {requested} bytes; {remaining} remain"
             ),
+            Self::Memory(error) => write!(formatter, "ZIP memory admission failed: {error}"),
         }
     }
 }
@@ -108,7 +111,35 @@ impl std::error::Error for ZipReadError {
         match self {
             Self::Format(error) => Some(error),
             Self::Io(error) => Some(error),
+            Self::Memory(error) => Some(error),
             _ => None,
+        }
+    }
+}
+
+/// Failure to inspect an in-memory ZIP with a shared output-memory lease
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum ZipMemoryError {
+    /// The archive or parser limits are invalid
+    Archive(ZipArtifactError),
+    /// Shared live-memory admission prevented member expansion
+    Memory(crate::job::MemoryError),
+}
+
+impl fmt::Display for ZipMemoryError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Archive(error) => error.fmt(formatter),
+            Self::Memory(error) => write!(formatter, "ZIP memory admission failed: {error}"),
+        }
+    }
+}
+
+impl std::error::Error for ZipMemoryError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Archive(error) => Some(error),
+            Self::Memory(error) => Some(error),
         }
     }
 }

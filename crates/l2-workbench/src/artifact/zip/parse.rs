@@ -1,14 +1,16 @@
 use std::io::{Cursor, Read, Seek};
 
+use crate::job::MemoryLease;
 use crc32fast::hash as crc32;
 use flate2::read::DeflateDecoder;
 use zip::read::{ArchiveOffset, Config};
 use zip::{ZipArchive, ZipReadOptions};
 
+use super::admission::ZipAdmission;
 use super::model::{
     ZipArtifactEntry, ZipArtifactEntryMetadata, ZipArtifactError, ZipArtifactLimits,
     ZipArtifactOmission, ZipArtifactOmissionReason, ZipArtifactReport, ZipEntryDataFailure,
-    ZipReadError, ZipReaderBudget, ZipReaderLimits,
+    ZipMemoryError, ZipReadError, ZipReaderBudget, ZipReaderLimits,
 };
 use super::view::{Patch, Reader, View, ViewFailure};
 
@@ -85,6 +87,34 @@ pub fn inspect_zip_at_depth_with_operation_budget(
     inspect_zip_at_depth_inner(bytes, limits, depth, Some(operation_budget_remaining))
 }
 
+/// Inspect a ZIP while reserving member output in a caller-owned live-memory lease
+///
+/// The lease must outlive the returned report and every moved member buffer
+/// Parser-owned buffers are charged; ZIP library metadata and decoder backend allocations are not
+///
+/// # Errors
+/// Returns archive, allocation, or shared-memory admission failures
+pub fn inspect_zip_at_depth_with_memory(
+    bytes: &[u8],
+    limits: ZipArtifactLimits,
+    depth: usize,
+    operation_budget_remaining: &mut usize,
+    memory: &mut MemoryLease,
+) -> Result<ZipArtifactReport, ZipMemoryError> {
+    inspect_zip_slice(
+        bytes,
+        limits,
+        depth,
+        Some(operation_budget_remaining),
+        Some(memory),
+    )
+    .map_err(|error| match error {
+        ZipReadError::Memory(error) => ZipMemoryError::Memory(error),
+        ZipReadError::Format(error) => ZipMemoryError::Archive(error),
+        _ => ZipMemoryError::Archive(ZipArtifactError::InvalidArchive),
+    })
+}
+
 /// Inspect a stable seekable archive using its already verified source digest
 ///
 /// The source remains unchanged throughout this call. Metadata reads, directory bytes,
@@ -100,9 +130,57 @@ pub fn inspect_zip_from_reader_with_source_sha256(
     depth: usize,
     budget: &mut ZipReaderBudget,
 ) -> Result<ZipArtifactReport, ZipReadError> {
+    inspect_zip_reader(
+        reader,
+        source_length,
+        source_sha256,
+        limits,
+        depth,
+        budget,
+        None,
+    )
+}
+
+/// Inspect a seekable ZIP while reserving member output against one shared lease
+///
+/// The lease must outlive the returned report and every moved member buffer
+/// Parser-owned buffers are charged; ZIP library metadata and decoder backend allocations are not
+///
+/// # Errors
+/// Returns source, archive, work, allocation, or shared-memory admission failures
+pub fn inspect_zip_from_reader_with_source_sha256_and_memory(
+    reader: &mut (impl Read + Seek),
+    source_length: usize,
+    source_sha256: &str,
+    limits: ZipReaderLimits,
+    depth: usize,
+    budget: &mut ZipReaderBudget,
+    memory: &mut MemoryLease,
+) -> Result<ZipArtifactReport, ZipReadError> {
+    inspect_zip_reader(
+        reader,
+        source_length,
+        source_sha256,
+        limits,
+        depth,
+        budget,
+        Some(memory),
+    )
+}
+
+fn inspect_zip_reader(
+    reader: &mut (impl Read + Seek),
+    source_length: usize,
+    source_sha256: &str,
+    limits: ZipReaderLimits,
+    depth: usize,
+    budget: &mut ZipReaderBudget,
+    memory: Option<&mut MemoryLease>,
+) -> Result<ZipArtifactReport, ZipReadError> {
     if !crate::hashing::is_sha256_digest(source_sha256) {
         return Err(ZipReadError::InvalidSourceDigest);
     }
+    let mut admission = ZipAdmission::new(memory, scan_scratch_bytes(source_length))?;
     let view = View::new(reader, source_length, budget.read_bytes_remaining);
     let result = inspect_view(
         &view,
@@ -111,10 +189,11 @@ pub fn inspect_zip_from_reader_with_source_sha256(
         depth,
         Some(&mut budget.expanded_bytes_remaining),
         limits.max_directory_bytes,
+        &mut admission,
     );
     budget.read_bytes_remaining = view.remaining();
     if let Some(failure) = view.take_failure() {
-        return Err(match failure {
+        let error = match failure {
             ViewFailure::Io(error) => ZipReadError::Io(error),
             ViewFailure::WorkLimit {
                 requested,
@@ -124,9 +203,11 @@ pub fn inspect_zip_from_reader_with_source_sha256(
                 remaining,
             },
             ViewFailure::Allocation => ZipReadError::Format(ZipArtifactError::AllocationFailure),
-        });
+        };
+        drop(result);
+        return admission.finish(Err(error));
     }
-    result
+    admission.finish(result)
 }
 
 fn inspect_zip_at_depth_inner(
@@ -135,6 +216,22 @@ fn inspect_zip_at_depth_inner(
     depth: usize,
     operation_budget_remaining: Option<&mut usize>,
 ) -> Result<ZipArtifactReport, ZipArtifactError> {
+    inspect_zip_slice(bytes, limits, depth, operation_budget_remaining, None).map_err(|error| {
+        match error {
+            ZipReadError::Format(error) => error,
+            _ => ZipArtifactError::InvalidArchive,
+        }
+    })
+}
+
+fn inspect_zip_slice(
+    bytes: &[u8],
+    limits: ZipArtifactLimits,
+    depth: usize,
+    operation_budget_remaining: Option<&mut usize>,
+    memory: Option<&mut MemoryLease>,
+) -> Result<ZipArtifactReport, ZipReadError> {
+    let mut admission = ZipAdmission::new(memory, scan_scratch_bytes(bytes.len()))?;
     let view = View::new(Cursor::new(bytes), bytes.len(), usize::MAX);
     let result = inspect_view(
         &view,
@@ -143,14 +240,15 @@ fn inspect_zip_at_depth_inner(
         depth,
         operation_budget_remaining,
         usize::MAX,
+        &mut admission,
     );
     if view.take_failure().is_some() {
-        return Err(ZipArtifactError::AllocationFailure);
+        drop(result);
+        return admission.finish(Err(ZipReadError::Format(
+            ZipArtifactError::AllocationFailure,
+        )));
     }
-    result.map_err(|error| match error {
-        ZipReadError::Format(error) => error,
-        _ => ZipArtifactError::InvalidArchive,
-    })
+    admission.finish(result)
 }
 
 fn inspect_view<R: Read + Seek>(
@@ -160,6 +258,7 @@ fn inspect_view<R: Read + Seek>(
     depth: usize,
     mut operation_budget_remaining: Option<&mut usize>,
     max_directory_bytes: usize,
+    admission: &mut ZipAdmission<'_>,
 ) -> Result<ZipArtifactReport, ZipReadError> {
     validate_limits(limits).map_err(ZipReadError::Format)?;
     if bytes.len() > limits.max_archive_bytes {
@@ -211,11 +310,21 @@ fn inspect_view<R: Read + Seek>(
             maximum: max_directory_bytes,
         });
     }
+    admission.reserve_metadata(entry_count, metadata_bytes)?;
     let PreparedArchive {
         mut archive,
         metadata_entries,
         member_failures,
     } = prepare_archive(bytes, entry_count, directory).map_err(ZipReadError::Format)?;
+    // Reserve eligible output before member extraction consumes operation work
+    if admission.is_active() {
+        let (output_bytes, uses_deflate) = planned_member_outputs(
+            &metadata_entries,
+            limits,
+            operation_budget_remaining.as_deref().copied(),
+        )?;
+        admission.reserve_output(output_bytes, uses_deflate)?;
+    }
     let mut report = empty_report(bytes, source_sha256, depth, entry_count);
     report
         .entries
@@ -233,6 +342,32 @@ fn inspect_view<R: Read + Seek>(
         .map_err(ZipReadError::Format)?;
     }
     Ok(report)
+}
+
+fn scan_scratch_bytes(length: usize) -> usize {
+    length.min((MAX_EOCD_COMMENT_SIZE + EOCD_FIXED_SIZE).max(ZIP64_SCAN_BLOCK_BYTES))
+}
+
+fn planned_member_outputs(
+    entries: &[ZipArtifactEntryMetadata],
+    limits: ZipArtifactLimits,
+    mut remaining: Option<usize>,
+) -> Result<(usize, bool), ZipReadError> {
+    let mut total = 0_usize;
+    let mut uses_deflate = false;
+    for metadata in entries {
+        if omission_reason(metadata, limits, total, remaining).is_some() {
+            continue;
+        }
+        let bytes = usize::try_from(metadata.expanded_size)
+            .map_err(|_| ZipReadError::Format(ZipArtifactError::InvalidArchive))?;
+        total += bytes;
+        uses_deflate |= metadata.compression_method == DEFLATE_METHOD;
+        if let Some(remaining) = &mut remaining {
+            *remaining -= bytes;
+        }
+    }
+    Ok((total, uses_deflate))
 }
 
 fn inspect_member(
