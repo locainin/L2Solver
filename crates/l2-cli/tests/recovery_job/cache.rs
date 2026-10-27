@@ -323,6 +323,68 @@ fn cancellation_is_preserved_when_checkpoint_finish_fails() -> Result<(), Box<dy
     Ok(())
 }
 
+#[cfg(target_os = "linux")]
+#[test]
+fn real_full_filesystem_preserves_prior_checkpoint_and_respects_strict_mode()
+-> Result<(), Box<dyn Error>> {
+    use std::io::Write;
+
+    let Some(base) = std::env::var_os("L2_TEST_ENOSPC_ROOT") else {
+        eprintln!("checkpoint ENOSPC test needs an isolated small filesystem");
+        return Ok(());
+    };
+    for strict in [false, true] {
+        let temporary = tempfile::tempdir_in(&base)?;
+        let cache = Cache::open_at(
+            temporary.path().join("cache"),
+            temporary.path().join("state"),
+            1024 * 1024,
+        )?;
+        let identity = identity()?;
+        let saved = Job::new("saved progress");
+        saved.increment(Counter::Files, 11)?;
+        CheckpointWriter::start(&cache, &identity, &saved, false)?.finish(false)?;
+
+        // Fill only the isolated tmpfs and keep the file open during the failed write
+        let filler_path = temporary.path().join("space-filler");
+        let mut filler = fs::File::create(&filler_path)?;
+        let block = [0_u8; 8 * 1024];
+        let mut full = false;
+        for _ in 0..512 {
+            if let Err(error) = filler.write_all(&block) {
+                assert_eq!(error.raw_os_error(), Some(libc::ENOSPC));
+                full = true;
+                break;
+            }
+        }
+        assert!(full, "the isolated filesystem did not report ENOSPC");
+        let live = Job::new("fresh progress");
+        let options = RecoveryOptions {
+            strict_cache: strict,
+            ..RecoveryOptions::default()
+        };
+        let result = RecoveryCache::from_cache(cache.clone(), &identity, &options, &live);
+        if strict {
+            assert!(result.is_err(), "strict mode accepted a full filesystem");
+        } else {
+            let session = result?;
+            assert!(session.cache().is_none(), "full cache was not disabled");
+            assert_checkpoint_fallback(&live)?;
+            session.finish(Ok(()), &live)?;
+        }
+        assert_eq!(live.snapshot()?.counters.get(&Counter::Files), Some(&0));
+        drop(filler);
+        fs::remove_file(filler_path)?;
+
+        // Once space is freed, the last committed checkpoint must still load
+        let resumed = Job::new("resumed progress");
+        let writer = CheckpointWriter::start(&cache, &identity, &resumed, false)?;
+        assert_eq!(resumed.snapshot()?.counters.get(&Counter::Files), Some(&11));
+        writer.finish(false)?;
+    }
+    Ok(())
+}
+
 fn identity() -> Result<ResultIdentity, Box<dyn Error>> {
     Ok(ResultIdentity {
         kind: ResultKind::Extract,
