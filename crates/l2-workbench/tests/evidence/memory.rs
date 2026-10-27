@@ -16,6 +16,34 @@ use std::thread;
 type TestResult = Result<(), Box<dyn Error>>;
 
 #[test]
+fn case_applies_blob_policy_and_shared_memory_pressure_together() -> TestResult {
+    let budget = MemoryBudget::new(100_000);
+    assert!(matches!(
+        Case::with_blob_limit_and_memory_budget(0, &budget),
+        Err(EvidenceError::InvalidResourceLimit { field: "blob bytes" })
+    ));
+    let mut case = Case::with_blob_limit_and_memory_budget(4, &budget)?;
+    assert_eq!(case.blob_byte_limit(), Some(4));
+    case.add_blob(b"four")?;
+    assert!(matches!(
+        case.add_blob(b"other"),
+        Err(EvidenceError::QuotaExceeded { field: "blob bytes", .. })
+    ));
+    assert!(budget.snapshot()?.used(MemoryClass::Case) >= 4);
+    drop(case);
+    assert_eq!(budget.snapshot()?.used_bytes, 0);
+
+    let exhausted = MemoryBudget::new(0);
+    let mut case = Case::with_blob_limit_and_memory_budget(4, &exhausted)?;
+    assert!(matches!(
+        case.add_blob(b"one"),
+        Err(EvidenceError::Memory(MemoryError::Limit { .. }))
+    ));
+    assert!(case.blobs().is_empty());
+    Ok(())
+}
+
+#[test]
 fn case_growth_rejects_pressure_before_retaining_new_blob() -> TestResult {
     let budget = MemoryBudget::new(1_000_000);
     let mut case = Case::with_memory_budget(&budget)?;

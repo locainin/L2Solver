@@ -300,6 +300,19 @@ impl Case {
         Ok(case)
     }
 
+    /// Create a Case with both a blob-retention policy and shared live-memory admission
+    ///
+    /// # Errors
+    /// Returns an error for a zero blob limit or a failed shared-memory lease
+    pub fn with_blob_limit_and_memory_budget(
+        maximum: usize,
+        budget: &MemoryBudget,
+    ) -> Result<Self, EvidenceError> {
+        let mut case = Self::with_blob_limit(maximum)?;
+        case.memory = Some(memory::CaseMemory::new(budget)?);
+        Ok(case)
+    }
+
     /// Return the optional caller-selected aggregate blob-retention budget
     #[must_use]
     pub const fn blob_byte_limit(&self) -> Option<usize> {
