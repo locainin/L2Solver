@@ -11,7 +11,7 @@ use l2_workbench::{
 use std::{
     error::Error,
     fs::{File, OpenOptions},
-    io::{self, BufWriter, Write},
+    io::{self, BufWriter, Read, Seek, SeekFrom, Write},
 };
 
 pub const GRAPH_FILE: &str = "case.graph.gz";
@@ -24,8 +24,39 @@ const CODEC_SCRATCH_BYTES: u64 = 2 * 1024 * 1024;
 
 type Result<T> = std::result::Result<T, Box<dyn Error>>;
 
+/// A checked file whose size can be read from the same open descriptor
+pub trait SnapshotFile: Read + Seek {
+    fn snapshot_len(&self) -> io::Result<u64>;
+}
+
+impl SnapshotFile for File {
+    fn snapshot_len(&self) -> io::Result<u64> {
+        Ok(self.metadata()?.len())
+    }
+}
+
+impl SnapshotFile for input::InputFile {
+    fn snapshot_len(&self) -> io::Result<u64> {
+        Ok(self.metadata()?.len())
+    }
+}
+
 pub fn read(
     entry: &CacheEntry,
+    usage: CaseSnapshotUsage,
+    limits: CaseSnapshotLimits,
+    budget: Option<&MemoryBudget>,
+) -> Result<Case> {
+    // Open each descriptor once so a later path replacement cannot redirect the read
+    let mut graph = input::regular_no_follow(&entry.directory().join(GRAPH_FILE))?;
+    let mut blobs = input::regular_no_follow(&entry.directory().join(BLOB_PACK_FILE))?;
+    read_files(&mut graph, &mut blobs, usage, limits, budget)
+}
+
+/// Validate and restore a snapshot from already-open seekable file descriptors
+pub fn read_files<G: SnapshotFile, B: SnapshotFile>(
+    graph: &mut G,
+    blobs: &mut B,
     usage: CaseSnapshotUsage,
     limits: CaseSnapshotLimits,
     budget: Option<&MemoryBudget>,
@@ -45,20 +76,19 @@ pub fn read(
     let _scratch = budget
         .map(|budget| budget.try_reserve(MemoryClass::Cache, CODEC_SCRATCH_BYTES))
         .transpose()?;
-    // Keep the checked descriptors for the whole read so path replacement cannot redirect it
-    let graph = input::regular_no_follow(&entry.directory().join(GRAPH_FILE))?;
-    let blobs = input::regular_no_follow(&entry.directory().join(BLOB_PACK_FILE))?;
-    if graph.metadata()?.len() != usage.graph_bytes
-        || blobs.metadata()?.len() != usage.blob_pack_bytes
+    if graph.snapshot_len()? != usage.graph_bytes || blobs.snapshot_len()? != usage.blob_pack_bytes
     {
         return Err(invalid(
             "cached Case snapshot file lengths do not match its metadata",
         ));
     }
+    // A previous restore can leave both descriptors at end of file
+    graph.seek(SeekFrom::Start(0))?;
+    blobs.seek(SeekFrom::Start(0))?;
     let (case, actual) = if let Some(budget) = budget {
-        Case::from_snapshot_with_memory(graph, blobs, limits, budget)?
+        Case::from_snapshot_with_memory(&mut *graph, &mut *blobs, limits, budget)?
     } else {
-        Case::from_snapshot(graph, blobs, limits)?
+        Case::from_snapshot(&mut *graph, &mut *blobs, limits)?
     };
     if actual != usage {
         return Err(invalid(
@@ -74,14 +104,38 @@ pub fn write(
     limits: CaseSnapshotLimits,
     budget: Option<&MemoryBudget>,
 ) -> Result<CaseSnapshotUsage> {
+    let mut graph = create_file(lease, GRAPH_FILE)?;
+    let mut blobs = create_file(lease, BLOB_PACK_FILE)?;
+    write_files(&mut graph, &mut blobs, case, limits, budget)
+}
+
+/// Write an exact snapshot to fresh owned file descriptors
+pub fn write_files(
+    graph: &mut File,
+    blobs: &mut File,
+    case: &Case,
+    limits: CaseSnapshotLimits,
+    budget: Option<&MemoryBudget>,
+) -> Result<CaseSnapshotUsage> {
+    if graph.metadata()?.len() != 0 || blobs.metadata()?.len() != 0 {
+        return Err(invalid("Case snapshot destination is not empty"));
+    }
     let _scratch = budget
         .map(|budget| budget.try_reserve(MemoryClass::Cache, CODEC_SCRATCH_BYTES))
         .transpose()?;
-    let mut graph = BufWriter::new(create_file(lease, GRAPH_FILE)?);
-    let mut blobs = BufWriter::new(create_file(lease, BLOB_PACK_FILE)?);
-    let usage = case.write_snapshot(&mut graph, &mut blobs, limits)?;
-    sync_file(graph)?;
-    sync_file(blobs)?;
+    // Empty files can still have a nonzero seek position
+    graph.seek(SeekFrom::Start(0))?;
+    blobs.seek(SeekFrom::Start(0))?;
+    let usage = {
+        let mut graph_writer = BufWriter::new(&mut *graph);
+        let mut blob_writer = BufWriter::new(&mut *blobs);
+        let usage = case.write_snapshot(&mut graph_writer, &mut blob_writer, limits)?;
+        graph_writer.flush()?;
+        blob_writer.flush()?;
+        usage
+    };
+    graph.sync_all()?;
+    blobs.sync_all()?;
     Ok(usage)
 }
 
@@ -90,15 +144,6 @@ fn create_file(lease: &Lease, name: &str) -> Result<File> {
         .write(true)
         .create_new(true)
         .open(lease.directory().join(name))?)
-}
-
-fn sync_file(mut writer: BufWriter<File>) -> Result<()> {
-    writer.flush()?;
-    writer
-        .into_inner()
-        .map_err(io::IntoInnerError::into_error)?
-        .sync_all()?;
-    Ok(())
 }
 
 fn invalid(message: &'static str) -> Box<dyn Error> {

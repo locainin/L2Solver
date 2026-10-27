@@ -20,6 +20,8 @@ use l2_workbench::{
 use serde_json::Value;
 use std::{error::Error, fs, io, io::Write};
 
+#[path = "case_snapshot.rs"]
+mod case_snapshot_tests;
 #[path = "processing.rs"]
 mod processing_tests;
 
