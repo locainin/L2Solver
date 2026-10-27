@@ -368,6 +368,92 @@ fn merged_completion_promotion_stops_at_lineage_budget_without_repeating() -> Te
     Ok(())
 }
 
+#[test]
+fn merged_completion_promotion_charges_near_tail_shift_exactly() -> TestResult {
+    let mut case = Case::new();
+    let inputs = completion_priority_inputs(&mut case)?;
+    let mut resources = policy(8, 5);
+    resources.max_lineage_work = 7;
+    let mut coordinator = RecoveryCoordinator::new(resources);
+    let (ordinary_parent, priority_parent) = completion_parents(&mut coordinator, &case, &inputs)?;
+
+    let first_blocker_input = case.add_bytes_node(
+        "recovery_input",
+        b"blocker one",
+        Vec::new(),
+        serde_json::json!({}),
+    )?;
+    let second_blocker_input = case.add_bytes_node(
+        "recovery_input",
+        b"blocker two",
+        Vec::new(),
+        serde_json::json!({}),
+    )?;
+    let third_blocker_input = case.add_bytes_node(
+        "recovery_input",
+        b"blocker three",
+        Vec::new(),
+        serde_json::json!({}),
+    )?;
+    let first_blocker = queued_id(coordinator.enqueue(
+        &case,
+        first_blocker_input,
+        RecoveryTask::EmbeddedDiscovery,
+    )?)?;
+    let second_blocker = queued_id(coordinator.enqueue(
+        &case,
+        second_blocker_input,
+        RecoveryTask::RecordDiscovery,
+    )?)?;
+    let third_blocker = queued_id(coordinator.enqueue(
+        &case,
+        third_blocker_input,
+        RecoveryTask::FramingDiscovery,
+    )?)?;
+    let assembly_task = RecoveryTask::AssembleRecords(test_schema());
+    let target = coordinator.enqueue_derived(
+        ordinary_parent,
+        &case,
+        &[inputs.ordinary_child],
+        assembly_task.clone(),
+    )?;
+    let target_id = queued_id(target)?;
+    let tail_input = case.add_bytes_node(
+        "recovery_input",
+        b"tail input",
+        Vec::new(),
+        serde_json::json!({}),
+    )?;
+    let tail_id =
+        queued_id(coordinator.enqueue(&case, tail_input, RecoveryTask::EmbeddedDiscovery)?)?;
+
+    assert_eq!(coordinator.candidate_count(), 7);
+    assert_eq!(coordinator.lineage_work_charged(), 2);
+    assert_eq!(coordinator.peek_next_id(), Some(first_blocker));
+    let merged = coordinator.enqueue_derived(
+        priority_parent,
+        &case,
+        &[inputs.ordinary_child],
+        assembly_task,
+    )?;
+    assert_eq!(merged, EnqueueOutcome::Merged(target_id));
+
+    coordinator.prioritize_queued_from_parent(&merged, priority_parent)?;
+
+    assert_eq!(coordinator.lineage_work_charged(), 7);
+    assert_eq!(coordinator.remaining_lineage_work(), 0);
+    assert_eq!(coordinator.peek_next_id(), Some(target_id));
+    assert!(candidate_has_priority(&coordinator, target_id)?);
+    assert_eq!(coordinator.pop_next(), Ok(Some(target_id)));
+    assert_eq!(coordinator.pop_next(), Ok(Some(first_blocker)));
+    assert_eq!(coordinator.pop_next(), Ok(Some(second_blocker)));
+    assert_eq!(coordinator.pop_next(), Ok(Some(third_blocker)));
+    assert_eq!(coordinator.pop_next(), Ok(Some(tail_id)));
+    assert_eq!(coordinator.pop_next(), Ok(None));
+
+    Ok(())
+}
+
 const fn test_schema() -> RecordSchema {
     RecordSchema {
         records_offset: 0,
