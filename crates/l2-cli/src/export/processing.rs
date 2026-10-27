@@ -10,8 +10,7 @@ use l2_workbench::{
     evidence::Case,
     job::{Counter, Job, Phase, PhaseOutcome},
 };
-use rayon::prelude::*;
-use std::{error::Error, io};
+use std::{error::Error, io, sync::mpsc};
 
 // A batch holds one bounded Case and active recovery graph per worker
 const RECOVERY_WORKER_RESERVATION_BYTES: u64 = 128 * 1024 * 1024;
@@ -108,7 +107,6 @@ pub(super) struct PendingCase {
     item: workbench::full_source::FullSourceItem,
     kind: RecoveryCaseKind,
     scope: serde_json::Value,
-    recovery: Option<CachedRecovery>,
 }
 
 impl PendingCase {
@@ -160,12 +158,7 @@ impl PendingCase {
                 )
             }
         };
-        Ok(Self {
-            item,
-            kind,
-            scope,
-            recovery: None,
-        })
+        Ok(Self { item, kind, scope })
     }
 
     pub(super) const fn progress_counter(&self) -> Option<Counter> {
@@ -189,7 +182,7 @@ pub(super) fn process_case_batch(
     batch: &mut Vec<PendingCase>,
     pool: &rayon::ThreadPool,
     context: &RecoveryContext<'_>,
-    mut emit: impl FnMut(RecoveredCase) -> Result<(), Box<dyn Error>>,
+    emit: impl FnMut(RecoveredCase) -> Result<(), Box<dyn Error>>,
 ) -> Result<(), Box<dyn Error>> {
     if batch.is_empty() {
         return Ok(());
@@ -201,32 +194,80 @@ pub(super) fn process_case_batch(
         )
         .into());
     }
-    // Only Case recovery runs in parallel; evidence and artifact output stays ordered
-    pool.install(|| {
-        batch.par_iter_mut().try_for_each(|pending| {
+    // Send finished Cases to the collector while later recovery work is still active
+    let items = std::mem::take(batch);
+    process_ordered(
+        pool,
+        items,
+        |pending| {
             let PendingCase {
-                item,
+                mut item,
                 kind,
                 scope,
-                recovery,
             } = pending;
-            recover(case_mut(item), *kind, scope, context)
-                .map(|result| *recovery = Some(result))
-                .map_err(|error| error.to_string())
-        })
-    })
-    .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
-    for pending in batch.drain(..) {
-        let recovery = pending
-            .recovery
-            .ok_or("case recovery was not completed before collection")?;
-        emit(RecoveredCase {
-            item: pending.item,
-            scope: pending.scope,
-            recovery,
-        })?;
+            let recovery = recover(case_mut(&mut item), kind, &scope, context)
+                .map_err(|error| error.to_string())?;
+            Ok(RecoveredCase {
+                item,
+                scope,
+                recovery,
+            })
+        },
+        emit,
+    )
+}
+
+/// Run a bounded batch and emit its completed prefix in source order
+pub(super) fn process_ordered<T: Send, U: Send>(
+    pool: &rayon::ThreadPool,
+    items: Vec<T>,
+    work: impl Fn(T) -> Result<U, String> + Sync,
+    mut emit: impl FnMut(U) -> Result<(), Box<dyn Error>>,
+) -> Result<(), Box<dyn Error>> {
+    // The collector cannot occupy a worker whose result it needs to receive
+    if pool.current_thread_index().is_some() {
+        return Err(
+            io::Error::other("ordered collection cannot run inside its recovery pool").into(),
+        );
     }
-    Ok(())
+    let count = items.len();
+    let mut waiting = std::iter::repeat_with(|| None)
+        .take(count)
+        .collect::<Vec<_>>();
+    let (sender, receiver) = mpsc::sync_channel(count);
+    pool.in_place_scope_fifo(|scope| {
+        for (index, item) in items.into_iter().enumerate() {
+            let sender = sender.clone();
+            let work = &work;
+            scope.spawn_fifo(move |_| {
+                // Dropping the receiver ends collection after an error
+                let _ = sender.send((index, work(item)));
+            });
+        }
+        drop(sender);
+        let outcome = (|| {
+            let mut next = 0;
+            for _ in 0..count {
+                let (index, result) = receiver.recv().map_err(|_| {
+                    io::Error::other("recovery worker stopped before producing all results")
+                })?;
+                let slot = waiting.get_mut(index).ok_or_else(|| {
+                    io::Error::other("recovery worker returned an invalid result index")
+                })?;
+                *slot = Some(result);
+                // Release each available prefix Case before waiting for later results
+                while let Some(result) = waiting.get_mut(next).and_then(Option::take) {
+                    let result = result
+                        .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+                    emit(result)?;
+                    next += 1;
+                }
+            }
+            Ok(())
+        })();
+        drop(receiver);
+        outcome
+    })
 }
 
 fn case_mut(item: &mut workbench::full_source::FullSourceItem) -> &mut Case {

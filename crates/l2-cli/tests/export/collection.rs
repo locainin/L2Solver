@@ -14,11 +14,14 @@ use crate::{
     export::recovery_cache::RecoveryContext,
 };
 use l2_workbench::{
-    job::{Counter, Job, Phase, PhaseState},
+    job::{Counter, Job, MemoryBudget, MemoryClass, Phase, PhaseState},
     reconstruction::Limits,
 };
 use serde_json::Value;
 use std::{error::Error, fs, io, io::Write};
+
+#[path = "processing.rs"]
+mod processing_tests;
 
 #[test]
 fn recovery_worker_count_respects_cpu_and_memory_bounds() {
@@ -107,18 +110,25 @@ fn collection_phases_cover_indexed_analysis_and_optional_tshark() -> Result<(), 
 }
 
 #[test]
-fn parallel_case_recovery_preserves_serial_event_order() -> Result<(), Box<dyn Error>> {
+fn one_two_and_four_workers_keep_charged_case_outputs_in_source_order() -> Result<(), Box<dyn Error>>
+{
     let temporary = tempfile::tempdir()?;
     let capture = temporary.path().join("flows.pcap");
-    fs::write(&capture, two_udp_flows()?)?;
+    fs::write(&capture, four_udp_flows()?)?;
 
     let single = recover_indexed_cases(&capture, temporary.path(), 1)?;
-    let parallel = recover_indexed_cases(&capture, temporary.path(), 2)?;
+    for jobs in [2, 4] {
+        let parallel = recover_indexed_cases(&capture, temporary.path(), jobs)?;
+        assert_eq!(parallel.scopes, single.scopes);
+        assert_eq!(parallel.cases, single.cases);
+        assert_eq!(parallel.coverage, single.coverage);
+        assert_eq!(parallel.source_coverage, single.source_coverage);
+        assert!(parallel.peak_case_bytes > 0);
+        assert_eq!(parallel.remaining_live_bytes, 0);
+    }
 
-    assert_eq!(parallel.scopes, single.scopes);
-    assert_eq!(parallel.cases, single.cases);
-    assert_eq!(parallel.coverage, single.coverage);
-    assert_eq!(parallel.source_coverage, single.source_coverage);
+    assert!(single.peak_case_bytes > 0);
+    assert_eq!(single.remaining_live_bytes, 0);
     Ok(())
 }
 
@@ -127,6 +137,8 @@ struct RecoveredCaseSnapshot {
     cases: Vec<Vec<u8>>,
     coverage: Value,
     source_coverage: Value,
+    peak_case_bytes: u64,
+    remaining_live_bytes: u64,
 }
 
 fn recover_indexed_cases(
@@ -134,9 +146,11 @@ fn recover_indexed_cases(
     temporary_parent: &std::path::Path,
     worker_count: usize,
 ) -> Result<RecoveredCaseSnapshot, Box<dyn Error>> {
+    const SHARED_MEMORY_BYTES: u64 = 256 * 1024 * 1024;
     let options = RecoveryOptions {
         profile: RecoveryProfile::Fast,
         jobs: Some(worker_count),
+        memory_limit: SHARED_MEMORY_BYTES,
         ..RecoveryOptions::default()
     };
     let context = RecoveryContext {
@@ -152,6 +166,8 @@ fn recover_indexed_cases(
     let mut cases = Vec::new();
     let mut coverage = super::RecoveryCoverage::default();
     let mut batch = Vec::with_capacity(worker_count);
+    let budget = MemoryBudget::new(SHARED_MEMORY_BYTES);
+    let mut peak_case_bytes = 0;
     let mut emit = |case: RecoveredCase| {
         let RecoveredCase {
             item,
@@ -175,11 +191,22 @@ fn recover_indexed_cases(
         cases.push(encoded_case);
         Ok(())
     };
-    let source = crate::workbench::full_source::acquire_full_source_with_cohorts_in(
+    let mut indexed = crate::workbench::full_source::acquire_indexed_source(
         capture,
         temporary_parent,
-        Limits::default(),
+        &crate::workbench::full_source::AcquisitionOptions::default(),
+    )?;
+    indexed.store.set_memory_budget(budget.clone())?;
+    let source = crate::workbench::full_source::analyze_indexed_source_with_context(
+        &indexed.store,
+        &indexed.receipt,
+        crate::workbench::full_source::IndexedAnalysisOptions {
+            limits: Limits::default(),
+            include_cohorts: true,
+        },
+        crate::workbench::full_source::IndexedAnalysisContext::default(),
         |item| {
+            peak_case_bytes = peak_case_bytes.max(budget.snapshot()?.used(MemoryClass::Case));
             batch.push(PendingCase::new(item)?);
             if batch.len() == worker_count {
                 process_case_batch(&mut batch, &pool, &context, &mut emit)?;
@@ -193,6 +220,8 @@ fn recover_indexed_cases(
         cases,
         coverage: serde_json::to_value(coverage)?,
         source_coverage: serde_json::to_value(&source.source)?,
+        peak_case_bytes,
+        remaining_live_bytes: budget.snapshot()?.used_bytes,
     })
 }
 
@@ -903,6 +932,13 @@ fn two_udp_flows() -> Result<Vec<u8>, Box<dyn Error>> {
     capture.extend_from_slice(&1_u32.to_le_bytes());
     append_udp_record(&mut capture, 40_000, b"a")?;
     append_udp_record(&mut capture, 40_001, b"b")?;
+    Ok(capture)
+}
+
+fn four_udp_flows() -> Result<Vec<u8>, Box<dyn Error>> {
+    let mut capture = two_udp_flows()?;
+    append_udp_record(&mut capture, 40_002, b"c")?;
+    append_udp_record(&mut capture, 40_003, b"d")?;
     Ok(capture)
 }
 
