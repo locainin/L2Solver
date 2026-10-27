@@ -4,6 +4,7 @@ mod anchor;
 mod discovery;
 mod input;
 mod locator;
+mod prefix_cache;
 mod probe;
 mod replay;
 

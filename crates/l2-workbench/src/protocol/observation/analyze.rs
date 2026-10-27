@@ -20,6 +20,12 @@ use crate::measurement::ByteOrder;
 use crate::protocol::ByteRange;
 use std::mem::size_of;
 
+#[derive(Clone, Copy)]
+enum ObservationScope {
+    Full,
+    RegionsOnly,
+}
+
 #[derive(Default)]
 struct SampleIndexes {
     facts: Vec<(ByteRange, usize)>,
@@ -38,11 +44,35 @@ pub fn observe(
     inputs: &[ObservationInput<'_>],
     plan: &ObservationPlan,
 ) -> Result<ObservationReport, ObservationError> {
+    observe_with_scope(inputs, plan, ObservationScope::Full)
+}
+
+/// Collect requested byte regions through the canonical observer without generating length facts
+pub(in crate::protocol) fn observe_regions(
+    inputs: &[ObservationInput<'_>],
+    plan: &ObservationPlan,
+) -> Result<ObservationReport, ObservationError> {
+    observe_with_scope(inputs, plan, ObservationScope::RegionsOnly)
+}
+
+fn observe_with_scope(
+    inputs: &[ObservationInput<'_>],
+    plan: &ObservationPlan,
+    scope: ObservationScope,
+) -> Result<ObservationReport, ObservationError> {
     validate_limits(plan.limits)?;
     let mut report = new_report();
     let accepted = admit_inputs(inputs, plan.limits, &mut report.coverage)?;
-    let hypotheses = length_hypotheses(plan.limits, &mut report.coverage)?;
-    let field_ranges = length_field_ranges(&hypotheses)?;
+    let hypotheses = if matches!(scope, ObservationScope::Full) {
+        Some(length_hypotheses(plan.limits, &mut report.coverage)?)
+    } else {
+        None
+    };
+    let field_ranges = hypotheses
+        .as_deref()
+        .map(length_field_ranges)
+        .transpose()?
+        .unwrap_or_default();
     let region_ranges = normalized_region_ranges(plan, &mut report.coverage)?;
     let mut region_records = Vec::new();
     region_records
@@ -67,13 +97,15 @@ pub fn observe(
             &mut report.coverage,
             &mut region_records,
         )?;
-        observe_sample_constraints(
-            input,
-            &hypotheses,
-            &sample_indexes.interpretations,
-            plan.limits,
-            &mut report,
-        )?;
+        if let Some(hypotheses) = hypotheses.as_deref() {
+            observe_sample_constraints(
+                input,
+                hypotheses,
+                &sample_indexes.interpretations,
+                plan.limits,
+                &mut report,
+            )?;
+        }
     }
 
     account_unadmitted_region_ranges(&accepted, &region_ranges, &mut report.coverage)?;

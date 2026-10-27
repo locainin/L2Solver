@@ -7,7 +7,7 @@ use super::super::model::{
     RelationalTransformEvaluationOptions, RelationalTransformLimits, RelationalTransformPlan,
     RelationalTransformReport, RelationalTransformRule, RelationalTransformStatus, Selector,
 };
-use super::probe::{maximum_full_candidate_work, score_candidate_prefix};
+use super::probe::maximum_full_candidate_work;
 use super::{
     anchor::{AnchoredPayloadSearch, anchored_payload_locators},
     input::{
@@ -17,16 +17,17 @@ use super::{
         LocatorCandidate, locator_ranges_overlap, locator_start_rank, payload_locators,
         seed_locators,
     },
+    prefix_cache::PrefixProbeCache,
     replay::{EvaluatedSplit, candidate_status, empty_fit, evaluate_split},
 };
 use crate::{
-    derivation::{CounterByteOrder, CounterWidth, SeedCounterOrder},
+    derivation::CounterWidth,
     job::{Counter, Job, Phase},
     protocol::{HoldoutBasis, RelationalSessionId},
 };
 use std::{
     cmp::Reverse,
-    collections::{BTreeSet, BinaryHeap, HashMap},
+    collections::{BTreeSet, BinaryHeap},
     convert::Infallible,
 };
 
@@ -143,16 +144,6 @@ struct CandidateId {
     parameter: usize,
 }
 
-#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
-struct PrefixProbeKey {
-    seed_index: usize,
-    payload_index: usize,
-    initial_counter: u64,
-    counter_width_bytes: u8,
-    counter_byte_order: u8,
-    seed_order: u8,
-}
-
 struct RankedAnchoredCandidate {
     id: CandidateId,
     novelty: usize,
@@ -162,7 +153,7 @@ struct RankedAnchoredCandidate {
 
 struct AnchorProbeState {
     ranked: Vec<RankedAnchoredCandidate>,
-    score_cache: HashMap<PrefixProbeKey, Option<super::probe::PrefixProbeScore>>,
+    score_cache: PrefixProbeCache,
     replay_reserve: usize,
     search_order: usize,
     last_progress_update: usize,
@@ -1713,7 +1704,9 @@ impl SearchContext<'_, '_> {
             );
         let mut state = AnchorProbeState {
             ranked: Vec::new(),
-            score_cache: HashMap::new(),
+            score_cache: PrefixProbeCache::new(
+                crate::protocol::observation::ObservationLimits::default().max_report_bytes,
+            ),
             replay_reserve,
             search_order: 0,
             last_progress_update: 0,
@@ -1737,11 +1730,6 @@ impl SearchContext<'_, '_> {
                 let score = self.score_anchored_candidate(
                     search,
                     &mut state,
-                    CandidateId {
-                        seed: seed_index,
-                        payload: payload_index,
-                        parameter: parameter_index,
-                    },
                     seed_locator,
                     payload_locator,
                     parameters,
@@ -1775,25 +1763,14 @@ impl SearchContext<'_, '_> {
         Ok(state.ranked)
     }
 
-    fn score_anchored_candidate<T>(
+    fn update_anchor_probe_progress(
         &self,
-        search: &mut SearchState<T>,
         state: &mut AnchorProbeState,
-        candidate_id: CandidateId,
-        seed_locator: &LocatorCandidate,
-        payload_locator: &LocatorCandidate,
-        parameters: &CandidateParameters,
-    ) -> Result<Option<super::probe::PrefixProbeScore>, RelationalTransformError> {
-        search.prefix_probe_hypotheses_examined = search
-            .prefix_probe_hypotheses_examined
-            .checked_add(1)
-            .ok_or(RelationalTransformError::InvalidPlan(
-                "prefix probe hypothesis count overflowed",
-            ))?;
+        hypotheses: usize,
+    ) -> Result<(), RelationalTransformError> {
         if let Some(job) = self.job {
             job.check_cancelled()
                 .map_err(RelationalTransformError::from)?;
-            let hypotheses = search.prefix_probe_hypotheses_examined;
             if hypotheses == 1 || hypotheses.saturating_sub(state.last_progress_update) >= 256 {
                 match job.set_current(
                     Phase::TransformDiscovery,
@@ -1806,42 +1783,76 @@ impl SearchContext<'_, '_> {
                 }
             }
         }
+        Ok(())
+    }
+
+    fn score_anchored_candidate<T>(
+        &self,
+        search: &mut SearchState<T>,
+        state: &mut AnchorProbeState,
+        seed_locator: &LocatorCandidate,
+        payload_locator: &LocatorCandidate,
+        parameters: &CandidateParameters,
+    ) -> Result<Option<super::probe::PrefixProbeScore>, RelationalTransformError> {
+        search.prefix_probe_hypotheses_examined = search
+            .prefix_probe_hypotheses_examined
+            .checked_add(1)
+            .ok_or(RelationalTransformError::InvalidPlan(
+                "prefix probe hypothesis count overflowed",
+            ))?;
+        self.update_anchor_probe_progress(state, search.prefix_probe_hypotheses_examined)?;
         let remaining_work = self.anchor_work_limit.saturating_sub(search.work_bytes);
         let probe_allowance = remaining_work.saturating_sub(state.replay_reserve);
-        let key = prefix_probe_key(candidate_id.seed, candidate_id.payload, parameters);
-        let (score, reused) = if let Some(score) = state.score_cache.get(&key).copied() {
-            (score, true)
-        } else {
+        // Resolve each rule before a cache lookup so selector contradictions stay local
+        let rule = make_rule(seed_locator, payload_locator, *parameters, self.plan);
+        let prepared = super::probe::prepare_candidate_prefix(
+            self.samples,
+            &self.prepared.discovery_groups,
+            &rule,
+            self.plan.limits,
+        )?;
+        let Some(mut prepared_prefix) = prepared else {
             if probe_allowance == 0 {
                 search.prefix_probe_complete = false;
                 state.stopped = true;
                 return Ok(None);
             }
-            let rule = make_rule(seed_locator, payload_locator, *parameters, self.plan);
-            let score = score_candidate_prefix(
-                self.samples,
-                &self.prepared.discovery_groups,
-                &rule,
-                self.plan.limits,
-                probe_allowance,
-            )?;
-            state
-                .score_cache
-                .try_reserve(1)
-                .map_err(|_| RelationalTransformError::AllocationFailed)?;
-            state.score_cache.insert(key, score);
-            (score, false)
+            search.prefix_probe_complete = false;
+            return Ok(None);
         };
+        let selection = prepared_prefix.take_selection_identity();
+        let operation = prepared_prefix.operation();
+        let (score, reused) = state
+            .score_cache
+            .score_or_compute(selection, operation, || {
+                if probe_allowance == 0 {
+                    search.prefix_probe_complete = false;
+                    state.stopped = true;
+                    return Ok(None);
+                }
+                // Count a probe only after its prefix transform fits the remaining allowance
+                let Some(prepared_prefix) = prepared_prefix.within_work_limit(probe_allowance)?
+                else {
+                    return Ok(None);
+                };
+                search.prefix_probes_examined =
+                    search.prefix_probes_examined.checked_add(1).ok_or(
+                        RelationalTransformError::InvalidPlan("prefix probe count overflowed"),
+                    )?;
+                super::probe::score_prepared_candidate_prefix(
+                    self.samples,
+                    prepared_prefix,
+                    self.plan.limits,
+                    probe_allowance,
+                )
+            })?;
         if reused {
             search.prefix_probe_cache_reuses =
                 search.prefix_probe_cache_reuses.checked_add(1).ok_or(
                     RelationalTransformError::InvalidPlan("prefix probe reuse count overflowed"),
                 )?;
-        } else {
-            search.prefix_probes_examined = search.prefix_probes_examined.checked_add(1).ok_or(
-                RelationalTransformError::InvalidPlan("prefix probe count overflowed"),
-            )?;
         }
+        // A reused score only changes ordering; each ranked rule still receives full replay
         let Some(score) = score else {
             search.prefix_probe_complete = false;
             return Ok(None);
@@ -2075,33 +2086,6 @@ fn charge_prefix_probe_work<T>(
         .map_err(RelationalTransformError::from)?;
     }
     Ok(())
-}
-
-const fn prefix_probe_key(
-    seed_index: usize,
-    payload_index: usize,
-    parameters: &CandidateParameters,
-) -> PrefixProbeKey {
-    let operation = parameters.operation;
-    PrefixProbeKey {
-        seed_index,
-        payload_index,
-        initial_counter: operation.initial_counter,
-        counter_width_bytes: match operation.counter_width {
-            CounterWidth::OneByte => 1,
-            CounterWidth::TwoBytes => 2,
-            CounterWidth::FourBytes => 4,
-            CounterWidth::EightBytes => 8,
-        },
-        counter_byte_order: match operation.counter_byte_order {
-            CounterByteOrder::BigEndian => 0,
-            CounterByteOrder::LittleEndian => 1,
-        },
-        seed_order: match operation.seed_order {
-            SeedCounterOrder::SeedThenCounter => 0,
-            SeedCounterOrder::CounterThenSeed => 1,
-        },
-    }
 }
 
 impl SearchContext<'_, '_> {

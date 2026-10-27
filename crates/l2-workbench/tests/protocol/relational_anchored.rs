@@ -6,11 +6,13 @@ use l2_workbench::{
     },
     protocol::{
         ByteOrder, Direction, MessageContext, RelationalByteRangeLocator,
-        RelationalCoordinateBasis, RelationalCounterReset, RelationalFitStatus,
-        RelationalLengthField, RelationalOperationTemplate, RelationalParserScope,
-        RelationalRecordSample, RelationalSha256CounterXor, RelationalTransformLimits,
-        RelationalTransformPlan, RelationalTransformRule, apply_relational_transform_rule,
+        RelationalCandidateEvaluation, RelationalCoordinateBasis, RelationalCounterReset,
+        RelationalFitStatus, RelationalLengthField, RelationalOperationTemplate,
+        RelationalParserScope, RelationalRecordSample, RelationalSha256CounterXor,
+        RelationalTransformEvaluationOptions, RelationalTransformLimits, RelationalTransformPlan,
+        RelationalTransformRule, apply_relational_transform_rule,
         infer_relational_transform_candidates,
+        infer_relational_transform_candidates_with_evaluator,
     },
 };
 use std::error::Error;
@@ -228,6 +230,101 @@ fn anchored_locator_is_learned_from_training_and_held_out_marker_changes_contrad
 }
 
 #[test]
+fn prefix_score_alias_reuse_keeps_each_heldout_selector_check() -> TestResult<()> {
+    let mut plan = anchored_search_plan();
+    // Keep the valid one-byte family after an unrelated width family
+    plan.counter_widths = vec![CounterWidth::TwoBytes, CounterWidth::OneByte];
+    let report = infer_anchored_sessions_with_plan(true, &plan)?;
+    let full_marker = report
+        .candidates
+        .iter()
+        .find(|candidate| is_expected_anchored_rule(candidate))
+        .ok_or("the full-marker rule was not retained")?;
+    let short_marker = report
+        .candidates
+        .iter()
+        .find(|candidate| is_short_marker_alias(candidate, &full_marker.rule))
+        .ok_or("the equivalent short-marker rule was not retained")?;
+
+    assert_eq!(
+        full_marker.discovery.status,
+        RelationalFitStatus::ConstraintsSatisfied
+    );
+    assert_eq!(
+        full_marker.heldout.status,
+        RelationalFitStatus::Contradicted
+    );
+    assert_eq!(
+        short_marker.discovery.status,
+        RelationalFitStatus::ConstraintsSatisfied
+    );
+    assert_eq!(
+        short_marker.heldout.status,
+        RelationalFitStatus::ConstraintsSatisfied,
+        "the short marker remains present in held-out messages"
+    );
+    assert!(
+        report.prefix_probe_cache_reuses > 0,
+        "equivalent training ranges did not reuse a prefix score"
+    );
+    Ok(())
+}
+
+#[test]
+fn capacity_rejected_prefix_hypotheses_do_not_count_as_transform_attempts() -> TestResult<()> {
+    let plaintext = [0x55; 64];
+    let mut records = Vec::new();
+    for session in 1_u8..=4 {
+        let seed = [session, session + 1, session + 2, session + 3];
+        records.push((u64::from(session), source_run(seed, &plaintext)?));
+    }
+    let samples = samples_from_records(&records, 501)?;
+    let mut plan = anchored_search_plan();
+    plan.limits.max_seed_bytes = 4;
+    plan.initial_counters = vec![u64::from(u8::MAX)];
+    let latest_payload_start = plan.limits.max_locator_offset * 2 + plan.limits.max_seed_bytes;
+    assert!(
+        samples
+            .iter()
+            .all(|sample| sample.bytes.len().saturating_sub(latest_payload_start) > 32),
+        "every admitted seed-relative payload must exceed the last counter block"
+    );
+
+    let report = infer_relational_transform_candidates(&samples, &plan)?;
+
+    assert!(
+        report.prefix_probe_hypotheses_examined > 0,
+        "the fixture must reach anchored prefix hypotheses"
+    );
+    assert_eq!(
+        report.prefix_probes_examined, 0,
+        "one remaining counter block cannot cover any selected full payload"
+    );
+    assert_eq!(report.prefix_probe_cache_reuses, 0);
+    assert!(report.work_bytes <= plan.limits.max_work_bytes);
+    Ok(())
+}
+
+fn is_short_marker_alias(
+    candidate: &l2_workbench::protocol::RelationalTransformCandidate,
+    full_marker_rule: &RelationalTransformRule,
+) -> bool {
+    candidate.rule.seed_locator == full_marker_rule.seed_locator
+        && candidate.rule.operation == full_marker_rule.operation
+        && candidate.rule.counter_reset == full_marker_rule.counter_reset
+        && candidate.rule.payload_locator.coordinate_basis
+            == full_marker_rule.payload_locator.coordinate_basis
+        && candidate.rule.payload_locator.direction == full_marker_rule.payload_locator.direction
+        && candidate.rule.payload_locator.marker_offset == 8
+        && candidate.rule.payload_locator.marker == [0x19]
+        && candidate.rule.payload_locator.value_offset == 12
+        && candidate.rule.payload_locator.value_length
+            == full_marker_rule.payload_locator.value_length
+        && candidate.rule.payload_locator.declared_length
+            == full_marker_rule.payload_locator.declared_length
+}
+
+#[test]
 fn bounded_search_ranks_a_new_decoded_prefix_before_the_absolute_locator_domain() -> TestResult<()>
 {
     let mut plan = anchored_search_plan();
@@ -252,6 +349,152 @@ fn bounded_search_ranks_a_new_decoded_prefix_before_the_absolute_locator_domain(
     assert!(report.prefix_probe_work_bytes <= report.work_bytes);
     assert!(report.work_bytes <= work_limit);
     Ok(())
+}
+
+#[test]
+fn widened_search_still_retains_a_supported_seed_relative_candidate() -> TestResult<()> {
+    let mut narrow_plan = anchored_search_plan();
+    narrow_plan.counter_widths = vec![CounterWidth::FourBytes];
+    assert_narrow_profile_replays_candidate(&narrow_plan)?;
+    let wide_plan = widened_anchored_plan();
+
+    let wide_records = anchored_session_records(9, 24, 17, true, false, CounterWidth::FourBytes)?;
+    let wide_fixture = samples_from_records(&wide_records, 201)?;
+    assert_wide_profile_replays_candidate(&wide_fixture, &wide_plan)
+}
+
+fn assert_narrow_profile_replays_candidate(plan: &RelationalTransformPlan) -> TestResult<()> {
+    let report = infer_anchored_sessions_with_seed_shape(
+        false,
+        plan,
+        9,
+        24,
+        17,
+        true,
+        CounterWidth::FourBytes,
+    )?;
+    let candidate = report
+        .candidates
+        .iter()
+        .find(|candidate| {
+            is_expected_anchored_rule_for_width(candidate, 9, 24, CounterWidth::FourBytes)
+        })
+        .ok_or_else(|| {
+            std::io::Error::other(format!(
+                "the narrow profile did not retain its supported anchored rule: candidates={}, locators={}, hypotheses={}, probes={}, novelty={}, work={}, limit={:?}",
+                report.candidates_examined,
+                report.locator_candidates_examined,
+                report.prefix_probe_hypotheses_examined,
+                report.prefix_probes_examined,
+                report.prefix_probe_candidates_with_novelty,
+                report.work_bytes,
+                report.search_limit,
+            ))
+        })?;
+    assert_eq!(
+        candidate.status,
+        l2_workbench::protocol::RelationalTransformStatus::HeldoutConstraintsSatisfied
+    );
+    Ok(())
+}
+
+fn widened_anchored_plan() -> RelationalTransformPlan {
+    let mut plan = anchored_search_plan();
+    let defaults = RelationalTransformPlan::default();
+    plan.limits.max_marker_bytes = 4;
+    plan.limits.max_marker_offset = 16;
+    plan.limits.max_locator_offset = 16;
+    plan.limits.max_seed_bytes = 64;
+    plan.limits.max_locator_candidates = 32_768;
+    plan.limits.max_candidates = 262_144;
+    plan.limits.max_retained_candidates = 128;
+    plan.limits.max_work_bytes = 256 * 1024 * 1024;
+    plan.counter_widths.clone_from(&defaults.counter_widths);
+    plan.counter_byte_orders
+        .clone_from(&defaults.counter_byte_orders);
+    plan.seed_orders.clone_from(&defaults.seed_orders);
+    plan.initial_counters.clone_from(&defaults.initial_counters);
+    plan.counter_resets.clone_from(&defaults.counter_resets);
+    plan
+}
+
+fn assert_wide_profile_replays_candidate(
+    samples: &[RelationalRecordSample<'_>],
+    plan: &RelationalTransformPlan,
+) -> TestResult<()> {
+    let mut exact_candidate_reached = false;
+    let wide_evaluation = infer_relational_transform_candidates_with_evaluator(
+        samples,
+        plan,
+        None,
+        RelationalTransformEvaluationOptions::default(),
+        |_, candidate, discovery_outputs, heldout_outputs| {
+            let matches_target =
+                is_expected_anchored_rule_for_width(candidate, 9, 24, CounterWidth::FourBytes);
+            let exact_bytes = matches_target
+                && discovery_outputs.len() + heldout_outputs.len() == 17
+                && discovery_outputs
+                    .iter()
+                    .chain(heldout_outputs)
+                    .all(expected_der_output);
+            let exact_acceptance = exact_bytes
+                && candidate.status
+                    == l2_workbench::protocol::RelationalTransformStatus::HeldoutConstraintsSatisfied;
+            exact_candidate_reached |= exact_acceptance;
+            Ok::<_, std::convert::Infallible>(RelationalCandidateEvaluation {
+                priority: u8::from(exact_acceptance) * 3,
+                work_bytes: 0,
+                assessment: exact_acceptance,
+            })
+        },
+    )?;
+    let wide_report = &wide_evaluation.report;
+    assert!(
+        exact_candidate_reached,
+        "the widened search did not replay the exact seed-relative candidate: candidates={}, locators={}, hypotheses={}, probes={}, novelty={}, probe_work={}, work={}, complete={}, exhaustive={}, limit={:?}",
+        wide_report.candidates_examined,
+        wide_report.locator_candidates_examined,
+        wide_report.prefix_probe_hypotheses_examined,
+        wide_report.prefix_probes_examined,
+        wide_report.prefix_probe_candidates_with_novelty,
+        wide_report.prefix_probe_work_bytes,
+        wide_report.work_bytes,
+        wide_report.prefix_probe_complete,
+        wide_report.search_exhaustive_within_plan,
+        wide_report.search_limit,
+    );
+    assert!(
+        wide_report.prefix_probe_hypotheses_examined > 0,
+        "the widened case did not reach anchor scoring: locators={}, candidates={}, limit={:?}",
+        wide_report.locator_candidates_examined,
+        wide_report.candidates_examined,
+        wide_report.search_limit,
+    );
+    let supported = wide_report.candidates.iter().find(|candidate| {
+        is_expected_anchored_rule_for_width(candidate, 9, 24, CounterWidth::FourBytes)
+    });
+
+    assert!(
+        supported.is_some(),
+        "the widened evaluator did not retain its independently supported exact rule: candidates={}, locators={}, hypotheses={}, probes={}, novelty={}, work={}, limit={:?}",
+        wide_report.candidates_examined,
+        wide_report.locator_candidates_examined,
+        wide_report.prefix_probe_hypotheses_examined,
+        wide_report.prefix_probes_examined,
+        wide_report.prefix_probe_candidates_with_novelty,
+        wide_report.work_bytes,
+        wide_report.search_limit,
+    );
+    assert!(wide_report.candidates_examined <= plan.limits.max_candidates);
+    assert!(wide_report.work_bytes <= plan.limits.max_work_bytes);
+    Ok(())
+}
+
+fn expected_der_output(output: &l2_workbench::protocol::RelationalAppliedOutput) -> bool {
+    let Ok(session) = u8::try_from(output.session.session) else {
+        return false;
+    };
+    output.bytes.as_slice() == [0x04, 0x03, session, 0x11, 0x22]
 }
 
 #[test]
@@ -497,31 +740,85 @@ fn infer_anchored_sessions_with_plan(
     change_heldout_markers: bool,
     plan: &RelationalTransformPlan,
 ) -> TestResult<l2_workbench::protocol::RelationalTransformReport> {
+    infer_anchored_sessions_with_seed_shape(
+        change_heldout_markers,
+        plan,
+        9,
+        4,
+        4,
+        false,
+        CounterWidth::OneByte,
+    )
+}
+
+fn infer_anchored_sessions_with_seed_shape(
+    change_heldout_markers: bool,
+    plan: &RelationalTransformPlan,
+    seed_value_offset: usize,
+    seed_length: usize,
+    session_count: u8,
+    stable_prefix: bool,
+    counter_width: CounterWidth,
+) -> TestResult<l2_workbench::protocol::RelationalTransformReport> {
+    let records = anchored_session_records(
+        seed_value_offset,
+        seed_length,
+        session_count,
+        stable_prefix,
+        change_heldout_markers,
+        counter_width,
+    )?;
+    let samples = samples_from_records(&records, 201)?;
+    infer_relational_transform_candidates(&samples, plan).map_err(Into::into)
+}
+
+fn anchored_session_records(
+    seed_value_offset: usize,
+    seed_length: usize,
+    session_count: u8,
+    stable_prefix: bool,
+    change_heldout_markers: bool,
+    counter_width: CounterWidth,
+) -> TestResult<Vec<(u64, Vec<u8>)>> {
     let mut records = Vec::new();
-    for session in 1_u8..=4 {
-        let seed = [
-            session.wrapping_mul(3),
-            session.wrapping_mul(5),
-            session.wrapping_mul(7),
-            session.wrapping_mul(11),
-        ];
+    for session in 1_u8..=session_count {
+        let mut seed = Vec::with_capacity(seed_length);
+        for index in 0..seed_length {
+            let index_byte = u8::try_from(index)?;
+            seed.push(
+                session
+                    .wrapping_mul(index_byte.wrapping_add(3))
+                    .wrapping_add(index_byte),
+            );
+        }
         let plaintext = [0x04, 0x03, session, 0x11, 0x22];
-        let mut bytes = source_run(seed, &plaintext)?;
+        let mut bytes = source_run_with_seed(&seed, &plaintext, seed_value_offset, counter_width)?;
+        if stable_prefix {
+            for (offset, byte) in bytes.iter_mut().enumerate().take(8).skip(2) {
+                *byte = 0x40_u8.wrapping_add(u8::try_from(offset)?);
+            }
+        }
         if change_heldout_markers && session > 2 {
             let marker = bytes
-                .get_mut(9 + seed.len() + 7)
+                .get_mut(seed_value_offset + seed.len() + 7)
                 .ok_or("the held-out relative marker is missing")?;
             *marker ^= 0xff;
         }
         records.push((u64::from(session), bytes));
     }
+    Ok(records)
+}
 
+fn samples_from_records(
+    records: &[(u64, Vec<u8>)],
+    first_sample: u64,
+) -> TestResult<Vec<RelationalRecordSample<'_>>> {
     let samples = records
         .iter()
         .enumerate()
         .map(|(index, (session, bytes))| {
             Ok(RelationalRecordSample {
-                sample: 201_u64
+                sample: first_sample
                     .checked_add(u64::try_from(index)?)
                     .ok_or("the synthetic sample identity overflowed")?,
                 context: context(*session),
@@ -530,7 +827,7 @@ fn infer_anchored_sessions_with_plan(
             })
         })
         .collect::<TestResult<Vec<_>>>()?;
-    infer_relational_transform_candidates(&samples, plan).map_err(Into::into)
+    Ok(samples)
 }
 
 fn anchored_search_plan() -> RelationalTransformPlan {
@@ -558,9 +855,18 @@ fn anchored_search_plan() -> RelationalTransformPlan {
 fn is_expected_anchored_rule(
     candidate: &l2_workbench::protocol::RelationalTransformCandidate,
 ) -> bool {
+    is_expected_anchored_rule_for_width(candidate, 9, 4, CounterWidth::OneByte)
+}
+
+fn is_expected_anchored_rule_for_width(
+    candidate: &l2_workbench::protocol::RelationalTransformCandidate,
+    seed_value_offset: usize,
+    seed_length: usize,
+    counter_width: CounterWidth,
+) -> bool {
     candidate.rule.seed_locator.coordinate_basis == RelationalCoordinateBasis::MessageStartV1
-        && candidate.rule.seed_locator.value_offset == 9
-        && candidate.rule.seed_locator.value_length == Some(4)
+        && candidate.rule.seed_locator.value_offset == seed_value_offset
+        && candidate.rule.seed_locator.value_length == Some(seed_length)
         && candidate.rule.seed_locator.declared_length
             == Some(RelationalLengthField {
                 offset: 8,
@@ -572,6 +878,15 @@ fn is_expected_anchored_rule(
         && candidate.rule.payload_locator.marker_offset == 7
         && candidate.rule.payload_locator.marker == [0x57, 0x19]
         && candidate.rule.payload_locator.value_offset == 12
+        && matches!(
+            candidate.rule.operation,
+            RelationalOperationTemplate::Sha256CounterXor(operation)
+                if operation.initial_counter == 1
+                    && operation.counter_width == counter_width
+                    && operation.counter_byte_order == CounterByteOrder::BigEndian
+                    && operation.seed_order == SeedCounterOrder::SeedThenCounter
+        )
+        && candidate.rule.counter_reset == RelationalCounterReset::Continuous
 }
 
 fn anchored_rule() -> RelationalTransformRule {
@@ -611,11 +926,20 @@ fn anchored_rule() -> RelationalTransformRule {
 }
 
 fn source_run(seed: [u8; 4], plaintext: &[u8]) -> TestResult<Vec<u8>> {
+    source_run_with_seed(&seed, plaintext, 9, CounterWidth::OneByte)
+}
+
+fn source_run_with_seed(
+    seed: &[u8],
+    plaintext: &[u8],
+    seed_value_offset: usize,
+    counter_width: CounterWidth,
+) -> TestResult<Vec<u8>> {
     let recipe = Recipe {
         steps: vec![Operation::Sha256CounterXor {
             seed: seed.to_vec().into(),
             initial_counter: 1,
-            counter_width: CounterWidth::OneByte,
+            counter_width,
             counter_byte_order: CounterByteOrder::BigEndian,
             seed_order: SeedCounterOrder::SeedThenCounter,
         }],
@@ -637,12 +961,12 @@ fn source_run(seed: [u8; 4], plaintext: &[u8]) -> TestResult<Vec<u8>> {
     *bytes
         .get_mut(8)
         .ok_or("the synthetic seed length field is missing")? = u8::try_from(seed.len())?;
-    bytes.resize(9 + seed.len(), 0);
+    bytes.resize(seed_value_offset + seed.len(), 0);
     bytes
-        .get_mut(9..9 + seed.len())
+        .get_mut(seed_value_offset..seed_value_offset + seed.len())
         .ok_or("the synthetic seed range is missing")?
-        .copy_from_slice(&seed);
-    let seed_end = 9 + seed.len();
+        .copy_from_slice(seed);
+    let seed_end = seed_value_offset + seed.len();
     bytes.resize(seed_end + 12, 0);
     for offset in 0..12 {
         if (7..9).contains(&offset) {

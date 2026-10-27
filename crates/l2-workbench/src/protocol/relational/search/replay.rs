@@ -6,7 +6,10 @@ use super::super::model::{
     RelationalSha256CounterXor, RelationalTransformError, RelationalTransformLimits,
     RelationalTransformRule, RelationalTransformStatus, Selector,
 };
-use super::input::{SelectorIndex, SessionGroup, group_sessions};
+use super::{
+    input::{SelectorIndex, SessionGroup, group_sessions},
+    prefix_cache::{PrefixSelectionIdentity, PrefixSessionSelection},
+};
 use crate::{
     artifact::{ArtifactValidationOutcome, ArtifactValidator},
     derivation::{
@@ -18,6 +21,10 @@ use crate::{
 };
 
 type SessionCheckResult<T> = Result<Result<T, RelationalSessionCheck>, RelationalTransformError>;
+
+#[cfg(test)]
+#[path = "../../../../tests/protocol/relational/search/replay.rs"]
+mod prefix_work_tests;
 
 struct LocatedPayload<'a> {
     sample: u64,
@@ -44,6 +51,46 @@ pub(super) struct PrefixProbeMessage<'a> {
 pub(super) struct PrefixProbeOutput<'a> {
     pub(super) messages: Vec<PrefixProbeMessage<'a>>,
     pub(super) work_bytes: usize,
+}
+
+pub(super) struct PreparedPrefixDiscovery<'a> {
+    discovery: Vec<PreparedPrefixSession<'a>>,
+    common_prefix_length: usize,
+    operation: RelationalSha256CounterXor,
+    selection_identity: Option<PrefixSelectionIdentity>,
+}
+
+pub(super) struct ReadyPrefixDiscovery<'a> {
+    prepared: PreparedPrefixDiscovery<'a>,
+    transform_work_bytes: usize,
+}
+
+impl<'a> PreparedPrefixDiscovery<'a> {
+    pub(super) const fn take_selection_identity(&mut self) -> Option<PrefixSelectionIdentity> {
+        self.selection_identity.take()
+    }
+
+    pub(super) const fn operation(&self) -> RelationalSha256CounterXor {
+        self.operation
+    }
+
+    pub(super) fn within_work_limit(
+        self,
+        maximum_work_bytes: usize,
+    ) -> Result<Option<ReadyPrefixDiscovery<'a>>, RelationalTransformError> {
+        let transform_work_bytes = prefix_transform_work(
+            &self.discovery,
+            self.common_prefix_length,
+            self.operation.counter_width,
+        )?;
+        if transform_work_bytes > maximum_work_bytes {
+            return Ok(None);
+        }
+        Ok(Some(ReadyPrefixDiscovery {
+            prepared: self,
+            transform_work_bytes,
+        }))
+    }
 }
 
 struct PreparedPrefixSession<'a> {
@@ -286,45 +333,106 @@ fn replay_payloads<'a>(
     Ok(payloads)
 }
 
-/// Preview the same bounded prefix from every discovery session after checking full ranges
-pub(super) fn preview_candidate_prefix<'a>(
+/// Resolve the rule's training selections and operation-dependent capacity checks
+pub(super) fn prepare_candidate_prefix<'a>(
     samples: &[RelationalRecordSample<'a>],
     discovery_groups: &[SessionGroup],
     rule: &RelationalTransformRule,
     limits: RelationalTransformLimits,
     maximum_prefix_bytes: usize,
-    maximum_work_bytes: usize,
-) -> Result<Option<PrefixProbeOutput<'a>>, RelationalTransformError> {
+) -> Result<Option<PreparedPrefixDiscovery<'a>>, RelationalTransformError> {
     if maximum_prefix_bytes == 0 {
         return Ok(None);
     }
-    let parameters = rule.operation.sha256_counter_xor();
+    let operation = rule.operation.sha256_counter_xor();
     let Some((discovery, common_prefix_length)) = prepare_prefix_discovery(
         samples,
         discovery_groups,
         rule,
         limits,
         maximum_prefix_bytes,
-        parameters.counter_width,
-        parameters.initial_counter,
+        operation.counter_width,
+        operation.initial_counter,
     )?
     else {
         return Ok(None);
     };
-    let transform_prefix_work =
-        prefix_transform_work(&discovery, common_prefix_length, parameters.counter_width)?;
-    if transform_prefix_work > maximum_work_bytes {
-        return Ok(None);
-    }
-    let Some(messages) =
-        transform_prefix_discovery(samples, discovery, parameters, common_prefix_length)?
+    let selection_identity =
+        prefix_selection_identity(discovery_groups, &discovery, common_prefix_length)?;
+    Ok(Some(PreparedPrefixDiscovery {
+        discovery,
+        common_prefix_length,
+        operation,
+        selection_identity,
+    }))
+}
+
+/// Transform the already validated bounded training prefixes
+pub(super) fn transform_prepared_prefix<'a>(
+    samples: &[RelationalRecordSample<'a>],
+    ready: ReadyPrefixDiscovery<'a>,
+) -> Result<Option<PrefixProbeOutput<'a>>, RelationalTransformError> {
+    let prepared = ready.prepared;
+    let parameters = prepared.operation;
+    let Some(messages) = transform_prefix_discovery(
+        samples,
+        prepared.discovery,
+        parameters,
+        prepared.common_prefix_length,
+    )?
     else {
         return Ok(None);
     };
     Ok(Some(PrefixProbeOutput {
         messages,
-        work_bytes: transform_prefix_work,
+        work_bytes: ready.transform_work_bytes,
     }))
+}
+
+fn prefix_selection_identity(
+    groups: &[SessionGroup],
+    discovery: &[PreparedPrefixSession<'_>],
+    common_prefix_length: usize,
+) -> Result<Option<PrefixSelectionIdentity>, RelationalTransformError> {
+    if groups.len() != discovery.len() {
+        return Err(RelationalTransformError::InvalidInput(
+            "prefix selections do not match discovery sessions",
+        ));
+    }
+    let identity_bytes = discovery
+        .len()
+        .checked_mul(std::mem::size_of::<PrefixSessionSelection>());
+    if identity_bytes.is_none_or(|bytes| {
+        bytes > crate::protocol::observation::ObservationLimits::default().max_report_bytes
+    }) {
+        return Ok(None);
+    }
+    let mut selections = Vec::new();
+    if selections.try_reserve_exact(discovery.len()).is_err() {
+        return Ok(None);
+    }
+    for (session_index, prepared) in discovery.iter().enumerate() {
+        // Sample indexes and ranges refer to the immutable inputs of this ranking pass
+        let prefix_end = prepared
+            .payload
+            .source_range
+            .start
+            .checked_add(common_prefix_length)
+            .ok_or(RelationalTransformError::InvalidInput(
+                "prefix selection range overflowed",
+            ))?;
+        selections.push(PrefixSessionSelection {
+            session_index,
+            seed_sample_index: prepared.seed.sample_index,
+            seed_start: prepared.seed.range.start,
+            seed_end: prepared.seed.range.end,
+            payload_sample_index: prepared.payload.sample_index,
+            payload_start: prepared.payload.source_range.start,
+            payload_end: prepared.payload.source_range.end,
+            prefix_end,
+        });
+    }
+    Ok(Some(PrefixSelectionIdentity(selections)))
 }
 
 fn prepare_prefix_discovery<'a>(
@@ -450,6 +558,7 @@ fn prepare_prefix_session<'a>(
         Err(RelationalTransformError::RuleContradicted(_)) => return Ok(None),
         Err(error) => return Err(error),
     };
+    // With one payload, continuous and per-message resets have the same prefix state
     if payloads.len() != 1
         || !capacity_supports_full_payloads(
             &payloads,

@@ -13,7 +13,12 @@ mod provenance;
 mod regions;
 mod validation;
 
+#[cfg(test)]
+#[path = "../../../tests/protocol/observation/analyze_region_only.rs"]
+mod region_only_tests;
+
 pub use analyze::observe;
+pub(super) use analyze::observe_regions;
 pub use error::ObservationError;
 pub use model::{
     ByteObservation, ConstraintOutcome, IntegerInterpretation, ObservationCohort,

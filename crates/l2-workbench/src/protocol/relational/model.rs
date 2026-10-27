@@ -579,11 +579,11 @@ pub struct RelationalTransformReport {
     pub locator_candidates_examined: usize,
     /// Number of anchored candidate configurations considered for prefix ordering
     pub prefix_probe_hypotheses_examined: usize,
-    /// Number of distinct canonical prefix transforms evaluated for candidate ordering
+    /// Number of prefix probes that started a transform, including retries
     pub prefix_probes_examined: usize,
     /// Number of parameter hypotheses reusing an equivalent prefix score
     pub prefix_probe_cache_reuses: usize,
-    /// Number of distinct prefix probes finding repeated bytes absent at the same input ranges
+    /// Number of prefix probe attempts finding repeated bytes absent at the same input ranges
     pub prefix_probe_candidates_with_novelty: usize,
     /// Canonical transform and observation work charged to prefix probes
     pub prefix_probe_work_bytes: usize,

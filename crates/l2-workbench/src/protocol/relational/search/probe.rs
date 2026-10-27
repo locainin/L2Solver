@@ -8,7 +8,7 @@ use crate::protocol::{
     ByteRange, MessageRole, MessageSample,
     observation::{
         ObservationCohort, ObservationInput, ObservationLimits, ObservationPlan,
-        ObservationProvenance, ObservationReport, RegionObservation, SampleRange, observe,
+        ObservationProvenance, ObservationReport, RegionObservation, SampleRange, observe_regions,
     },
 };
 use std::collections::BTreeMap;
@@ -60,23 +60,33 @@ pub(super) fn maximum_full_candidate_work(
 }
 
 /// Rank one frozen candidate from training prefixes without accepting or rejecting it
-pub(super) fn score_candidate_prefix(
-    samples: &[RelationalRecordSample<'_>],
+pub(super) fn prepare_candidate_prefix<'a>(
+    samples: &[RelationalRecordSample<'a>],
     discovery_groups: &[SessionGroup],
     rule: &RelationalTransformRule,
     limits: RelationalTransformLimits,
-    maximum_work_bytes: usize,
-) -> Result<Option<PrefixProbeScore>, RelationalTransformError> {
-    let observation_limits = ObservationLimits::default();
-    let maximum_prefix_bytes = observation_limits.max_prefix_offset.saturating_add(1);
-    let preview = replay::preview_candidate_prefix(
+) -> Result<Option<replay::PreparedPrefixDiscovery<'a>>, RelationalTransformError> {
+    let maximum_prefix_bytes = ObservationLimits::default()
+        .max_prefix_offset
+        .saturating_add(1);
+    replay::prepare_candidate_prefix(
         samples,
         discovery_groups,
         rule,
         limits,
         maximum_prefix_bytes,
-        maximum_work_bytes,
-    );
+    )
+}
+
+/// Score prepared training ranges without applying a full rule or held-out check
+pub(super) fn score_prepared_candidate_prefix(
+    samples: &[RelationalRecordSample<'_>],
+    prepared: replay::ReadyPrefixDiscovery<'_>,
+    limits: RelationalTransformLimits,
+    maximum_work_bytes: usize,
+) -> Result<Option<PrefixProbeScore>, RelationalTransformError> {
+    let observation_limits = ObservationLimits::default();
+    let preview = replay::transform_prepared_prefix(samples, prepared);
     let preview = match preview {
         Ok(Some(preview)) => preview,
         Ok(None)
@@ -200,7 +210,7 @@ fn observe_prefix_stage(
         input_bytes,
         maximum_work_units,
     );
-    observe(&inputs, &plan).map_err(|_| {
+    observe_regions(&inputs, &plan).map_err(|_| {
         let message = if transformed {
             "decoded prefix observation failed"
         } else {

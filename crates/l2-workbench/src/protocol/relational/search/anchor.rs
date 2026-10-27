@@ -13,7 +13,7 @@ use crate::{
         ByteRange, MessageRole, MessageSample,
         observation::{
             ObservationInput, ObservationLimits, ObservationPlan, ObservationProvenance,
-            RegionObservation, SampleRange, observe,
+            RegionObservation, SampleRange, observe_regions,
         },
     },
 };
@@ -613,13 +613,11 @@ fn observe_seed_tails(
     observation_limits.max_total_bytes = defaults
         .max_total_bytes
         .min(span.saturating_mul(views.len()));
-    observation_limits.max_prefix_offset = 0;
-    observation_limits.max_hypotheses = 14;
     observation_limits.max_work_units = defaults.max_work_units.min(observation_work_limit);
     observation_limits.max_region_width = defaults.max_region_width.min(marker_width);
     let inputs = observation_inputs(views)?;
     let (region_ranges, ranges_complete) = seed_tail_ranges(views, limits, marker_width, job)?;
-    let report = observe(
+    let report = observe_regions(
         &inputs,
         &ObservationPlan {
             region_ranges,
