@@ -17,6 +17,7 @@ use super::{
 
 mod early_reuse;
 mod large_formats;
+mod memory;
 mod range_analysis;
 mod read_budget;
 
@@ -343,7 +344,7 @@ fn unsupported_file_is_preserved_and_marked_incomplete() -> Result<(), Box<dyn E
 }
 
 #[test]
-fn per_input_cache_ignores_version_7_and_reuses_version_8() -> Result<(), Box<dyn Error>> {
+fn per_input_cache_ignores_version_8_and_reuses_version_9() -> Result<(), Box<dyn Error>> {
     let directory = tempfile::tempdir()?;
     let cache = l2_workbench::job::cache::Cache::open_at(
         directory.path().join("cache"),
@@ -356,6 +357,7 @@ fn per_input_cache_ignores_version_7_and_reuses_version_8() -> Result<(), Box<dy
         data: SourceData::Memory {
             bytes: bytes.clone(),
             sha256: l2_workbench::sha256(&bytes),
+            _memory: None,
         },
     };
     let recovery = RecoveryOptions::default();
@@ -374,7 +376,7 @@ fn per_input_cache_ignores_version_7_and_reuses_version_8() -> Result<(), Box<dy
     let previous_key = l2_workbench::job::cache::StageKey::new(
         "file_artifact_analysis",
         1,
-        "l2_artifact_analyzer_v7",
+        "l2_artifact_analyzer_v8",
         &previous_policy,
         &identity,
         &[],
@@ -445,6 +447,7 @@ fn per_input_cache_hit_does_not_repeat_analysis_progress_counters() -> Result<()
         &recovery,
         Some(&cache),
         &first_job,
+        &l2_workbench::job::MemoryBudget::new(u64::MAX),
     )?;
 
     let second_job = l2_workbench::job::Job::new("refine cached analysis");
@@ -457,6 +460,7 @@ fn per_input_cache_hit_does_not_repeat_analysis_progress_counters() -> Result<()
         &recovery,
         Some(&cache),
         &second_job,
+        &l2_workbench::job::MemoryBudget::new(u64::MAX),
     )?;
     let first = first_job.snapshot()?;
     let second = second_job.snapshot()?;
@@ -502,10 +506,10 @@ fn result_identity_uses_ordered_content_hashes_and_analysis_settings() -> Result
     let recovery = RecoveryOptions::default();
     let policy = RefinePolicy::new(&recovery, false)?;
     let identity = result_identity(&sources, &recovery, &policy)?;
-    assert_eq!(identity.algorithm_version, 8);
+    assert_eq!(identity.algorithm_version, 9);
     assert_eq!(
         identity.settings.get("analyzer_algorithm_version"),
-        Some(&json!(8))
+        Some(&json!(9))
     );
     assert_eq!(
         identity.settings.get("analysis_receipt_schema_version"),
@@ -590,12 +594,12 @@ fn matching_result_directory_is_reused_before_artifact_analysis() -> Result<(), 
 }
 
 #[test]
-fn version_7_analyzer_result_is_not_reused() -> Result<(), Box<dyn Error>> {
+fn version_8_analyzer_result_is_not_reused() -> Result<(), Box<dyn Error>> {
     rejects_prior_result_version(StaleResultVersion::Analyzer)
 }
 
 #[test]
-fn version_7_publication_result_is_not_reused() -> Result<(), Box<dyn Error>> {
+fn version_8_publication_result_is_not_reused() -> Result<(), Box<dyn Error>> {
     rejects_prior_result_version(StaleResultVersion::Publication)
 }
 
@@ -636,21 +640,21 @@ fn rejects_prior_result_version(version: StaleResultVersion) -> Result<(), Box<d
         .ok_or("result identity is missing")?;
     match version {
         StaleResultVersion::Publication => {
-            identity.insert("algorithm_version".to_owned(), json!(7));
+            identity.insert("algorithm_version".to_owned(), json!(8));
         }
         StaleResultVersion::Analyzer => {
             let settings = identity
                 .get_mut("settings")
                 .and_then(serde_json::Value::as_object_mut)
                 .ok_or("result settings are missing")?;
-            settings.insert("analyzer_algorithm_version".to_owned(), json!(7));
+            settings.insert("analyzer_algorithm_version".to_owned(), json!(8));
         }
     }
     fs::write(&manifest_path, serde_json::to_vec(&manifest)?)?;
 
     let error = run(&options, &mut Vec::new())
         .err()
-        .ok_or("version 7 result was reused under version 8")?;
+        .ok_or("version 8 result was reused under version 9")?;
     assert!(
         error
             .to_string()
@@ -842,6 +846,7 @@ fn loaded_source(label: &str, bytes: &[u8]) -> LoadedSource {
         data: SourceData::Memory {
             bytes: bytes.to_vec(),
             sha256: l2_workbench::sha256(bytes),
+            _memory: None,
         },
     }
 }

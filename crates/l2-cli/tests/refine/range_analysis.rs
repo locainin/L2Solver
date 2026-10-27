@@ -20,7 +20,7 @@ pub(super) fn process_read_bytes() -> Result<u64, Box<dyn Error>> {
 #[cfg(target_os = "linux")]
 #[test]
 fn range_source_admission_and_analysis_read_content_once() -> Result<(), Box<dyn Error>> {
-    use crate::refine::input::{prepare_input_set, read_sources};
+    use crate::refine::input::{prepare_input_set, read_sources_with_test_budget as read_sources};
     use l2_workbench::{artifact::ArtifactAnalysisOptions, job::Job};
     use std::process::Command;
 
@@ -329,7 +329,7 @@ fn assert_carved_artifacts(
 
 #[test]
 fn changing_a_range_source_before_reopening_rejects_analysis() -> Result<(), Box<dyn Error>> {
-    use crate::refine::input::{prepare_input_set, read_sources};
+    use crate::refine::input::{prepare_input_set, read_sources_with_test_budget as read_sources};
     use l2_workbench::{artifact::ArtifactAnalysisOptions, job::Job};
 
     let directory = tempfile::tempdir()?;
@@ -359,7 +359,7 @@ fn changing_a_range_source_before_reopening_rejects_analysis() -> Result<(), Box
 #[cfg(target_os = "linux")]
 #[test]
 fn many_range_sources_fit_a_small_process_descriptor_limit() -> Result<(), Box<dyn Error>> {
-    use crate::refine::input::{prepare_input_set, read_sources};
+    use crate::refine::input::{prepare_input_set, read_sources_with_test_budget as read_sources};
     use l2_workbench::job::Job;
     use std::process::Command;
 
@@ -474,6 +474,10 @@ fn short_source_read_counts_only_bytes_actually_returned() -> Result<(), Box<dyn
 }
 
 #[test]
+#[expect(
+    clippy::too_many_lines,
+    reason = "the sources and their shared-budget omissions form one scenario"
+)]
 fn range_and_memory_sources_share_the_case_blob_budget_and_report_partial()
 -> Result<(), Box<dyn Error>> {
     let directory = tempfile::tempdir()?;
@@ -525,19 +529,26 @@ fn range_and_memory_sources_share_the_case_blob_budget_and_report_partial()
             .map(Vec::len),
         Some(3)
     );
-    assert_eq!(
-        manifest
-            .get("artifacts")
+    let retained = manifest
+        .get("artifacts")
+        .and_then(serde_json::Value::as_array)
+        .ok_or("artifacts missing")?;
+    assert!(retained.len() < 3, "retained {} artifacts", retained.len());
+    let sources = manifest
+        .get("sources")
+        .and_then(serde_json::Value::as_array)
+        .ok_or("sources missing")?;
+    assert!(sources.iter().any(|source| {
+        source
+            .get("omissions")
             .and_then(serde_json::Value::as_array)
-            .map(Vec::len),
-        Some(3)
-    );
-    assert!(
-        manifest
-            .pointer("/sources/1/omissions/0/omitted_candidates")
-            .and_then(serde_json::Value::as_u64)
-            .is_some_and(|count| count > 0)
-    );
+            .is_some_and(|omissions| {
+                omissions.iter().any(|item| {
+                    item.get("kind").and_then(serde_json::Value::as_str)
+                        == Some("case_memory_limit")
+                })
+            })
+    }));
     assert_eq!(
         manifest
             .pointer("/sources/2/status")
@@ -578,7 +589,15 @@ fn exhausted_case_marks_a_later_memory_source_partial() -> Result<(), Box<dyn Er
     let job = Job::new("case limit");
     job.start(Phase::Expansion, None)?;
     job.start(Phase::TransformDiscovery, Some(2))?;
-    let report = analyze_sources(&sources, &set, &policy, &recovery, None, &job)?;
+    let report = analyze_sources(
+        &sources,
+        &set,
+        &policy,
+        &recovery,
+        None,
+        &job,
+        &l2_workbench::job::MemoryBudget::new(u64::MAX),
+    )?;
     let later = report.source_records.get(1).ok_or("later source missing")?;
     assert!(later.omissions.iter().any(|omission| matches!(omission, AnalysisOmission::CaseBlobLimit { maximum } if *maximum == png.len())));
     assert!(!report.complete);

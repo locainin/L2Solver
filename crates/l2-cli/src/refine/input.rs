@@ -7,7 +7,7 @@ use super::{
 use crate::safe_filename::is_safe_flat_file_name;
 use l2_workbench::{
     job::{
-        Counter, Job,
+        Counter, Job, MemoryBudget, MemoryClass, MemoryError, MemoryLease,
         cache::{SourceFingerprint, SourceIdentity},
     },
     sha256,
@@ -210,9 +210,19 @@ pub(super) struct LoadedSource {
 }
 
 pub(super) enum SourceData {
-    Memory { bytes: Vec<u8>, sha256: String },
+    Memory {
+        bytes: Vec<u8>,
+        sha256: String,
+        _memory: Option<MemoryLease>,
+    },
     File(RangeSource),
     Skipped(ReadOmission),
+    MemorySkipped {
+        length: usize,
+        requested: u64,
+        used: u64,
+        maximum: u64,
+    },
 }
 
 pub(super) struct RangeSource {
@@ -233,20 +243,21 @@ impl LoadedSource {
             SourceData::Memory { bytes, .. } => bytes.len(),
             SourceData::File(source) => source.length,
             SourceData::Skipped(omission) => omission.length,
+            SourceData::MemorySkipped { length, .. } => *length,
         }
     }
 
     pub(super) fn bytes(&self) -> Option<&[u8]> {
         match &self.data {
             SourceData::Memory { bytes, .. } => Some(bytes),
-            SourceData::File(_) | SourceData::Skipped(_) => None,
+            SourceData::File(_) | SourceData::Skipped(_) | SourceData::MemorySkipped { .. } => None,
         }
     }
 
     pub(super) fn digest(&self) -> Option<&str> {
         match &self.data {
             SourceData::Memory { sha256, .. } => Some(sha256),
-            SourceData::File(_) | SourceData::Skipped(_) => None,
+            SourceData::File(_) | SourceData::Skipped(_) | SourceData::MemorySkipped { .. } => None,
         }
     }
 
@@ -805,6 +816,7 @@ pub(super) fn read_sources(
     total_limit: usize,
     per_file_limit: usize,
     job: &Job,
+    memory: &MemoryBudget,
 ) -> Result<Vec<LoadedSource>, Box<dyn Error>> {
     let mut sources = Vec::new();
     sources
@@ -840,28 +852,92 @@ pub(super) fn read_sources(
                 }),
             });
         } else {
-            total_bytes = checked_total(total_bytes, length, total_limit)?;
-            input_set.budget.reserve(
-                u64::try_from(length)?
-                    .checked_add(1)
-                    .ok_or_else(|| invalid_input("source read length overflows"))?,
-            )?;
-            let (bytes, digest) = read_snapshot(
-                CancellableReader::new(file, job),
-                per_file_limit,
-                Some(length),
-                spec.expected_sha256.as_deref(),
-            )?;
-            sources.push(LoadedSource {
-                label: spec.label.clone(),
-                data: SourceData::Memory {
-                    bytes,
-                    sha256: digest,
-                },
-            });
+            let next_total = checked_total(total_bytes, length, total_limit)?;
+            let loaded =
+                read_memory_source(input_set, spec, file, length, per_file_limit, job, memory)?;
+            if loaded.bytes().is_some() {
+                total_bytes = next_total;
+            }
+            sources.push(loaded);
         }
     }
     Ok(sources)
+}
+
+fn read_memory_source(
+    input: &InputSet,
+    spec: &InputSpec,
+    file: File,
+    length: usize,
+    per_file_limit: usize,
+    job: &Job,
+    memory: &MemoryBudget,
+) -> Result<LoadedSource, Box<dyn Error>> {
+    let mut lease = match memory.try_reserve(MemoryClass::Base, u64::try_from(length)?) {
+        Ok(lease) => lease,
+        Err(error) => return skipped_for_memory(spec, length, error),
+    };
+    input.budget.reserve(
+        u64::try_from(length)?
+            .checked_add(1)
+            .ok_or_else(|| invalid_input("source read length overflows"))?,
+    )?;
+    let (bytes, sha256) = read_snapshot(
+        CancellableReader::new(file, job),
+        per_file_limit,
+        Some(length),
+        spec.expected_sha256.as_deref(),
+    )?;
+    if let Err(error) = lease.try_resize(u64::try_from(bytes.capacity())?) {
+        return skipped_for_memory(spec, length, error);
+    }
+    Ok(LoadedSource {
+        label: spec.label.clone(),
+        data: SourceData::Memory {
+            bytes,
+            sha256,
+            _memory: Some(lease),
+        },
+    })
+}
+
+fn skipped_for_memory(
+    spec: &InputSpec,
+    length: usize,
+    error: MemoryError,
+) -> Result<LoadedSource, Box<dyn Error>> {
+    match error {
+        MemoryError::Limit {
+            limit,
+            used,
+            requested,
+        } => Ok(LoadedSource {
+            label: spec.label.clone(),
+            data: SourceData::MemorySkipped {
+                length,
+                requested,
+                used,
+                maximum: limit,
+            },
+        }),
+        other => Err(other.into()),
+    }
+}
+
+#[cfg(test)]
+pub(super) fn read_sources_with_test_budget(
+    input_set: &InputSet,
+    total_limit: usize,
+    per_file_limit: usize,
+    job: &Job,
+) -> Result<Vec<LoadedSource>, Box<dyn Error>> {
+    read_sources(
+        input_set,
+        total_limit,
+        per_file_limit,
+        job,
+        &MemoryBudget::new(u64::MAX),
+    )
 }
 
 pub(super) fn fingerprint_sources(
@@ -1071,11 +1147,17 @@ pub(super) fn read_snapshot(
     bytes
         .try_reserve_exact(length)
         .map_err(|_| io::Error::other("input artifact allocation failed"))?;
-    let sentinel = u64::try_from(length)?
-        .checked_add(1)
-        .ok_or_else(|| invalid_input("input artifact length exceeds the supported range"))?;
-    (&mut file).take(sentinel).read_to_end(&mut bytes)?;
-    if bytes.len() != length {
+    bytes.resize(length, 0);
+    if let Err(error) = file.read_exact(&mut bytes) {
+        if error.kind() != io::ErrorKind::UnexpectedEof {
+            return Err(error.into());
+        }
+        return Err(invalid_input(
+            "input artifact length changed while it was read",
+        ));
+    }
+    let mut extra = [0_u8; 1];
+    if file.read(&mut extra)? != 0 {
         return Err(invalid_input(
             "input artifact length changed while it was read",
         ));

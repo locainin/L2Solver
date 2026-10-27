@@ -13,7 +13,7 @@ mod read_budget;
 use analysis::analyze_source_cached;
 use input::LoadedSource;
 #[cfg(test)]
-use input::{prepare_input_set, read_sources};
+use input::{prepare_input_set, read_sources_with_test_budget as read_sources};
 pub use output::refine_source_identity_sha256;
 #[cfg(test)]
 use output::{default_output_path, result_identity};
@@ -25,7 +25,9 @@ use crate::{
     result_directory::{ResultDirectory, ResultKind},
     workbench::artifact_export,
 };
-use l2_workbench::job::{CacheStage, Counter, Job, Phase, PhaseOutcome, cache::Cache};
+use l2_workbench::job::{
+    CacheStage, Counter, Job, MemoryBudget, Phase, PhaseOutcome, cache::Cache,
+};
 use policy::RefinePolicy;
 use std::{
     error::Error,
@@ -38,6 +40,16 @@ pub fn run_with_job(
     options: &RefineOptions,
     output: &mut impl Write,
     job: &Job,
+) -> Result<bool, Box<dyn Error>> {
+    let memory = MemoryBudget::new(options.recovery.memory_limit);
+    run_with_memory_budget(options, output, job, &memory)
+}
+
+fn run_with_memory_budget(
+    options: &RefineOptions,
+    output: &mut impl Write,
+    job: &Job,
+    memory: &MemoryBudget,
 ) -> Result<bool, Box<dyn Error>> {
     job.check_cancelled()?;
     let destination = options
@@ -79,7 +91,9 @@ pub fn run_with_job(
         policy.total_input_limit,
         policy.per_file_limit,
         job,
+        memory,
     )?;
+    let publication_identity = identity_after_admission(reuse_identity, &sources);
     ensure_input_unchanged(&input_set, &sampled, &policy, job)?;
     // A checkpoint cannot use a sample as proof of a range source's identity
     let cache = if options.dry_run || sources.iter().any(|source| source.digest().is_none()) {
@@ -110,15 +124,29 @@ pub fn run_with_job(
             job,
             destination: &destination,
             result_directory,
-            identity: &reuse_identity,
+            identity: &publication_identity,
             policy: &policy,
             sources: &sources,
             input_set: &input_set,
             sampled: &sampled,
             cache: cache.cache(),
+            memory,
         })
     })();
     cache.finish(result, job)
+}
+
+fn identity_after_admission(
+    mut identity: crate::result_directory::ResultIdentity,
+    sources: &[LoadedSource],
+) -> crate::result_directory::ResultIdentity {
+    if sources
+        .iter()
+        .any(|source| matches!(&source.data, input::SourceData::MemorySkipped { .. }))
+    {
+        identity.source = l2_workbench::job::cache::SourceIdentity::Unavailable;
+    }
+    identity
 }
 
 struct ReuseContext<'a, W: Write> {
@@ -194,6 +222,7 @@ struct AnalysisPublishContext<'a, W: Write> {
     input_set: &'a input::InputSet,
     sampled: &'a input::FingerprintedSources,
     cache: Option<&'a Cache>,
+    memory: &'a MemoryBudget,
 }
 
 fn analyze_and_publish<W: Write>(
@@ -211,10 +240,18 @@ fn analyze_and_publish<W: Write>(
         input_set,
         sampled,
         cache,
+        memory,
     } = context;
     job.check_cancelled()?;
-    let analyzed =
-        analysis::analyze_sources(sources, input_set, policy, &options.recovery, cache, job)?;
+    let analyzed = analysis::analyze_sources(
+        sources,
+        input_set,
+        policy,
+        &options.recovery,
+        cache,
+        job,
+        memory,
+    )?;
     ensure_input_unchanged(input_set, sampled, policy, job)?;
     job.finish(Phase::TransformDiscovery, PhaseOutcome::Completed)?;
     job.finish(Phase::Expansion, PhaseOutcome::Completed)?;
@@ -244,31 +281,19 @@ fn analyze_and_publish<W: Write>(
 
     if options.dry_run {
         job.finish(Phase::Publication, PhaseOutcome::Skipped)?;
-        if !options.recovery.quiet {
-            output::write_summary(
-                output,
-                destination,
-                &selected,
-                &analyzed.file_artifacts,
-                &analyzed.source_records,
-                analyzed.complete,
-                true,
-            )?;
-        }
-        return Ok(analyzed.complete);
+    } else {
+        job.check_cancelled()?;
+        result_directory.publish(identity, job, |staging| {
+            artifact_export::write_artifacts_into(staging, &selected)?;
+            write_file_artifacts(input_set, &analyzed.file_artifacts, staging, job)?;
+            output::write_manifest(staging, &manifest)?;
+            output::write_summary_file(staging, &summary)?;
+            if !analyzed.file_artifacts.is_empty() {
+                ensure_input_unchanged(input_set, sampled, policy, job)?;
+            }
+            Ok(())
+        })?;
     }
-
-    job.check_cancelled()?;
-    result_directory.publish(identity, job, |staging| {
-        artifact_export::write_artifacts_into(staging, &selected)?;
-        write_file_artifacts(input_set, &analyzed.file_artifacts, staging, job)?;
-        output::write_manifest(staging, &manifest)?;
-        output::write_summary_file(staging, &summary)?;
-        if !analyzed.file_artifacts.is_empty() {
-            ensure_input_unchanged(input_set, sampled, policy, job)?;
-        }
-        Ok(())
-    })?;
     if !options.recovery.quiet {
         output::write_summary(
             output,
@@ -277,7 +302,7 @@ fn analyze_and_publish<W: Write>(
             &analyzed.file_artifacts,
             &analyzed.source_records,
             analyzed.complete,
-            false,
+            options.dry_run,
         )?;
     }
     Ok(analyzed.complete)

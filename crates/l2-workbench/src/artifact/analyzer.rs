@@ -270,6 +270,26 @@ pub enum AnalysisStatus {
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum AnalysisOmission {
+    /// Shared live-memory admission prevented retaining this source for analysis
+    SourceMemoryLimit {
+        /// Source bytes that were not loaded
+        length: u64,
+        /// Bytes requested for this source
+        requested: u64,
+        /// Bytes already charged to the shared job budget
+        used: u64,
+        /// Aggregate live-memory limit
+        maximum: u64,
+    },
+    /// The shared job budget prevented retaining an evidence artifact
+    CaseMemoryLimit {
+        /// Additional bytes requested from the shared budget
+        requested: u64,
+        /// Bytes already charged at the time of admission
+        used: u64,
+        /// Aggregate live-memory limit
+        maximum: u64,
+    },
     /// The operation-wide source read limit prevented opening this source for analysis
     SourceReadLimit {
         /// Source bytes that were not read
