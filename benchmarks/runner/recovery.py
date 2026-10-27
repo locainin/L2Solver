@@ -113,6 +113,27 @@ def _decode_progress_event(line):
     return event
 
 
+def _idle_placeholder(event, identity):
+    return (
+        event.get("created_at_unix_ms") == identity
+        and type(event.get("elapsed_ms")) is int
+        and event["elapsed_ms"] >= 0
+        and event.get("current_phase") is None
+        and bool(event["phases"])
+        and all(
+            isinstance(phase, dict)
+            and phase.get("state") == "pending"
+            and type(phase.get("completed")) is int
+            and phase["completed"] == 0
+            for phase in event["phases"]
+        )
+        and bool(event["counters"])
+        and all(
+            type(value) is int and value == 0 for value in event["counters"].values()
+        )
+    )
+
+
 def read_progress_log(path, maximum_bytes=DEFAULT_MAX_LOG_BYTES):
     if type(maximum_bytes) is not int or maximum_bytes <= 0:
         raise ValueError("progress log budget must be a positive integer")
@@ -174,30 +195,19 @@ def read_progress_log(path, maximum_bytes=DEFAULT_MAX_LOG_BYTES):
 
     pending_initial_job = None
     if len(job_identity_transitions) > 1:
-        # Resume emits one unstarted placeholder before restoring the checkpoint id
-        initial = events[0] if events else None
-        pending_start = (
-            len(job_identity_transitions) == 2
-            and initial is not None
-            and initial.get("created_at_unix_ms") == job_identity_transitions[0]
-            and type(initial.get("elapsed_ms")) is int
-            and initial["elapsed_ms"] == 0
-            and initial.get("current_phase") is None
-            and bool(initial["phases"])
-            and all(
-                isinstance(phase, dict)
-                and phase.get("state") == "pending"
-                and type(phase.get("completed")) is int
-                and phase["completed"] == 0
-                for phase in initial["phases"]
-            )
-            and bool(initial["counters"])
-            and all(
-                type(value) is int and value == 0
-                for value in initial["counters"].values()
-            )
+        # Elapsed wall time can grow while the placeholder remains entirely idle
+        if len(job_identity_transitions) != 2:
+            raise ValueError("progress log contains multiple job identities")
+        initial_identity, restored_identity = job_identity_transitions
+        first_restored = next(
+            index
+            for index, event in enumerate(events)
+            if event.get("created_at_unix_ms") == restored_identity
         )
-        if not pending_start:
+        placeholders = events[:first_restored]
+        if not placeholders or not all(
+            _idle_placeholder(event, initial_identity) for event in placeholders
+        ):
             raise ValueError("progress log contains multiple job identities")
         pending_initial_job = job_identity_transitions[0]
 
