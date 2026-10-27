@@ -17,6 +17,9 @@ use std::error::Error;
 #[path = "recovery_record_handoff.rs"]
 mod record_handoff;
 
+#[path = "recovery_record_discovery_application.rs"]
+mod bounded_application;
+
 const REPORT_KIND: &str = "recovery_record_discovery_report";
 type TestResult<T> = Result<T, Box<dyn Error>>;
 type AcceptedFrameMember = (u64, u64, u64, u64, u64, String);
@@ -1872,7 +1875,11 @@ fn assert_receipt_uses_accepted_schema(
         .ok_or("record receipt omitted its full input list")?;
     assert_eq!(inputs.len(), expected_members.len());
     assert_receipt_input_members(case, inputs, schema, expected_members)?;
-    assert_receipt_contains_exact_artifact(&receipt, expected_sha256, expected_length)
+    assert!(
+        receipt_has_exact_artifact(&receipt, expected_sha256, expected_length),
+        "record receipt omitted the exact expected artifact group"
+    );
+    Ok(())
 }
 
 fn assert_receipt_input_members(
@@ -1942,21 +1949,17 @@ fn accepted_frame_member(
     ))
 }
 
-fn assert_receipt_contains_exact_artifact(
-    receipt: &Value,
-    expected_sha256: &str,
-    expected_length: usize,
-) -> TestResult<()> {
-    let groups = receipt
+fn receipt_has_exact_artifact(receipt: &Value, expected_sha256: &str, length: usize) -> bool {
+    receipt
         .pointer("/assembly/groups")
         .and_then(Value::as_array)
-        .ok_or("final assembly receipt omitted its group mappings")?;
-    assert!(groups.iter().any(|group| {
-        group.get("output_sha256").and_then(Value::as_str) == Some(expected_sha256)
-            && group.get("output_length").and_then(Value::as_u64)
-                == u64::try_from(expected_length).ok()
-    }));
-    Ok(())
+        .is_some_and(|groups| {
+            groups.iter().any(|group| {
+                group.get("output_sha256").and_then(Value::as_str) == Some(expected_sha256)
+                    && group.get("output_length").and_then(Value::as_u64)
+                        == u64::try_from(length).ok()
+            })
+        })
 }
 
 fn assert_decoded_frames_feed_record_parser(case: &Case, record_diagnostics: &[Value]) {
