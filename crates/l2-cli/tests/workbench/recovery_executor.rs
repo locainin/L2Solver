@@ -4469,7 +4469,7 @@ fn stored_zip(name: &[u8], content: &[u8]) -> Result<Vec<u8>, Box<dyn Error>> {
     stored_zip_entries(&[(name, content)])
 }
 
-fn stored_zip_entries(entries: &[(&[u8], &[u8])]) -> Result<Vec<u8>, Box<dyn Error>> {
+pub(super) fn stored_zip_entries(entries: &[(&[u8], &[u8])]) -> Result<Vec<u8>, Box<dyn Error>> {
     let entry_count = u16::try_from(entries.len())?;
     let mut archive = Vec::new();
     let mut central_directory = Vec::new();
@@ -4885,7 +4885,7 @@ fn png(chunks: &[([u8; 4], &[u8])]) -> Result<Vec<u8>, Box<dyn Error>> {
     Ok(bytes)
 }
 
-fn tiny_png() -> Result<Vec<u8>, Box<dyn Error>> {
+pub(super) fn tiny_png() -> Result<Vec<u8>, Box<dyn Error>> {
     let mut bytes = Vec::new();
     {
         let mut encoder = png::Encoder::new(&mut bytes, 1, 1);

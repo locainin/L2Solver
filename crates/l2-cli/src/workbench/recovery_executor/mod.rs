@@ -594,6 +594,24 @@ impl JobProgress {
         }
         Ok(())
     }
+
+    fn validated_artifact_committed(&self) -> Result<(), RecoveryExecutionError> {
+        self.job.increment(Counter::ValidatedArtifacts, 1)?;
+        Ok(())
+    }
+
+    fn expanded_members_committed(
+        &self,
+        member_count: usize,
+    ) -> Result<(), RecoveryExecutionError> {
+        if member_count == 0 {
+            return Ok(());
+        }
+        let member_count =
+            u64::try_from(member_count).map_err(|_| RecoveryError::InvariantFailure)?;
+        self.job.increment(Counter::ExpandedMembers, member_count)?;
+        Ok(())
+    }
 }
 
 const fn task_progress_label(task: &RecoveryTask) -> &'static str {

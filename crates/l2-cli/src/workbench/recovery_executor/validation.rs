@@ -381,7 +381,12 @@ impl Executor<'_> {
             exact_bytes: retained.exact_bytes,
             relational_record_artifact,
         })?;
-        self.validated_artifacts.insert(retained.blob_id);
+        // The set and progress count only exact artifacts whose evidence transaction committed
+        if self.validated_artifacts.insert(retained.blob_id)
+            && let Some(progress) = &self.job
+        {
+            progress.validated_artifact_committed()?;
+        }
         self.enqueue_validation_expansion(candidate_id, artifact.format, expansion_node)?;
         Ok(())
     }

@@ -91,9 +91,13 @@ pub enum Counter {
     CandidatesExamined,
     /// Candidate work items rejected
     CandidatesRejected,
-    /// Artifacts that passed validation
+    /// Validated artifact objects committed by one Case recovery or source-analysis pass
+    ///
+    /// Objects are unique within that pass; separate passes may count the same bytes again
     ValidatedArtifacts,
-    /// Members found while expanding containers
+    /// Archive member entries retained by one Case recovery or source-analysis pass
+    ///
+    /// Different entries count separately even when they contain the same bytes
     ExpandedMembers,
     /// Results reused from the persistent cache
     CacheHits,

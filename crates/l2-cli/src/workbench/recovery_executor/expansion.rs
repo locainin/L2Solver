@@ -16,6 +16,7 @@ use serde_json::json;
 struct ExpansionCommit {
     complete: bool,
     created_node_count: usize,
+    committed_member_count: usize,
     enqueue_children: bool,
     children: Vec<u64>,
 }
@@ -61,6 +62,10 @@ impl Executor<'_> {
                 return Ok(());
             }
         };
+        // Expansion members count only after the case transaction commits
+        if let Some(progress) = &self.job {
+            progress.expanded_members_committed(commit.committed_member_count)?;
+        }
         if !commit.complete {
             self.omissions.push(RecoveryOmission::ArtifactExpansion {
                 input_node_id: input_node,
@@ -155,7 +160,7 @@ fn probe_expansion(
         BudgetCheck::WithinBudget => {}
         BudgetCheck::Exhausted { .. } => return Err(RecoveryError::InvariantFailure.into()),
     }
-    let (children, result) = record_expansion(
+    let (children, committed_member_count, result) = record_expansion(
         case,
         identities,
         request.input_node,
@@ -168,6 +173,7 @@ fn probe_expansion(
         ExpansionCommit {
             complete: expansion.complete,
             created_node_count: expansion.created_nodes.len(),
+            committed_member_count,
             enqueue_children,
             children,
         },
@@ -208,6 +214,7 @@ fn reject_probe(
         ExpansionCommit {
             complete: true,
             created_node_count: 0,
+            committed_member_count: 0,
             enqueue_children: false,
             children: Vec::new(),
         },
@@ -222,7 +229,7 @@ fn record_expansion(
     depth: usize,
     origins: &[u64],
     expansion: &expand::ExpansionOutcome,
-) -> Result<(Vec<u64>, RecoveryResult), RecoveryExecutionError> {
+) -> Result<(Vec<u64>, usize, RecoveryResult), RecoveryExecutionError> {
     let (output_nodes, archive_child_count, supported_structure_count) =
         collect_expansion_outputs(case, expansion);
     let root_rejection = expansion
@@ -294,7 +301,7 @@ fn record_expansion(
             evidence_node_id: receipt,
         }
     };
-    Ok((output_nodes, result))
+    Ok((output_nodes, archive_child_count, result))
 }
 
 fn collect_expansion_outputs(
