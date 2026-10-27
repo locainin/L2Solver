@@ -1044,7 +1044,7 @@ mod framing_discovery_tests;
 mod record_association_tests;
 #[cfg(test)]
 #[path = "../../../tests/workbench/recovery_record_discovery.rs"]
-mod record_discovery_tests;
+pub(super) mod record_discovery_tests;
 #[cfg(test)]
 #[path = "../../../tests/workbench/recovery_record_work_budget.rs"]
 mod record_work_budget_tests;

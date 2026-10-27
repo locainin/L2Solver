@@ -132,6 +132,7 @@ impl LearningMessageContents<'_> {
     }
 }
 
+#[cfg(test)]
 pub(super) fn build_schema_plan(
     frames: &[DecodedFrameOutput],
     report: &RelationalTransformReport,
@@ -208,6 +209,7 @@ fn build_schema_plan_with_scope<'frames>(
         artifact_policy,
         work_limit,
         job,
+        ..
     } = options;
     let discovery = session_ids(&report.discovery_sessions);
     let heldout = session_ids(&report.heldout_sessions);

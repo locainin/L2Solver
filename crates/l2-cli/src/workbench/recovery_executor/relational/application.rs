@@ -3,8 +3,9 @@ use super::record_gate::{
 };
 use super::search::CandidateGate;
 use super::{
-    AppliedOutput, DecodedFrameOutput, GateAssessment, RelationalDiscoveryContext,
-    RetainedRelationalRule, StoredSample, checked_output_sha256, invalid_policy, operational,
+    AppliedOutput, DecodedFrameOutput, GateAssessment, MAX_RETAINED_RELATIONAL_APPLICATIONS,
+    RelationalDiscoveryContext, RetainedRelationalRule, StoredSample, checked_output_sha256,
+    invalid_policy, operational,
 };
 use l2_workbench::{
     artifact::{ArtifactStructure, ArtifactValidationOutcome, ArtifactValidationPolicy},
@@ -101,7 +102,10 @@ impl<'a> CandidateApplication<'a> {
         report: &RelationalTransformReport,
         job: Option<&'a Job>,
     ) -> Result<Self, super::RecoveryExecutionError> {
-        let maximum_materialized_rules = search_plan.limits.max_retained_candidates.min(8);
+        let maximum_materialized_rules = search_plan
+            .limits
+            .max_retained_candidates
+            .min(MAX_RETAINED_RELATIONAL_APPLICATIONS);
         let supported_rules = report
             .candidates
             .iter()

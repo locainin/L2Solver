@@ -24,7 +24,7 @@ mod screening_tests;
 use self::{
     header::HeaderSchemaPlan,
     key::{SchemaHeaderKey, SchemaLayoutKey, schema_header_key, schema_layout_key},
-    plan::{build_full_schema_plan, build_schema_plan, build_schema_plan_with_inputs},
+    plan::{build_full_schema_plan, build_schema_plan_with_inputs},
     screen::{screen_with_header_plan, screen_with_schema_plan},
 };
 use super::super::RecoveryExecutionError;
@@ -137,14 +137,6 @@ impl SchemaPlanCache {
         report: &RelationalTransformReport,
         options: SchemaCandidateOptions<'_>,
     ) -> Result<GateResult, RecoveryExecutionError> {
-        let key = schema_layout_key(
-            frames,
-            report,
-            options.parser_format,
-            options.artifact_policy,
-            options.schema_limits,
-            options.work_limit,
-        )?;
         let header_key = schema_header_key(
             frames,
             report,
@@ -157,6 +149,14 @@ impl SchemaPlanCache {
                 .record_limits
                 .max_report_bytes
                 .min(MAX_CACHED_HEADER_PLAN_BYTES),
+        )?;
+        let key = schema_layout_key(
+            frames,
+            report,
+            options.parser_format,
+            options.artifact_policy,
+            options.schema_limits,
+            options.work_limit,
         )?;
         // Reuse plans only when their complete cache keys match
         if let Some(plan) = self.plans.get(&key) {
@@ -186,19 +186,8 @@ impl SchemaPlanCache {
         header_key: Option<&SchemaHeaderKey>,
     ) -> Result<Arc<SchemaPlan>, RecoveryExecutionError> {
         let header_inputs = header_key.map(|_| record_inputs(frames)).transpose()?;
-        let mut built_plan = if let Some(inputs) = header_inputs.as_deref() {
-            build_schema_plan_with_inputs(frames, report, options, Some(inputs))?
-        } else {
-            build_schema_plan(
-                frames,
-                report,
-                options.schema_limits,
-                options.work_limit,
-                options.parser_format,
-                options.artifact_policy,
-                options.job,
-            )?
-        };
+        let mut built_plan =
+            build_schema_plan_with_inputs(frames, report, options, header_inputs.as_deref())?;
         let header_cache_has_slot = header_key.is_some()
             && self.plans.len().saturating_add(self.header_plans.len()) < MAX_CACHED_SCHEMA_PLANS;
         let header_plan_maximum = if header_cache_has_slot {

@@ -1557,20 +1557,35 @@ fn assert_session_relative_recovery(
         summary.omissions.iter().take(8).collect::<Vec<_>>(),
     );
 
-    let Some((relational_report_node_id, relational_report)) = select_session_relative_report(case)
+    let Some((relational_report_node_id, relational_report, relational_output_node_id)) =
+        select_session_relative_report(case, plaintext)
     else {
-        return Err("relational report bytes are unavailable after scheduling".into());
+        let output_count = case
+            .nodes()
+            .iter()
+            .filter(|node| node.kind == "relational_transform_output")
+            .count();
+        let details = format!(
+            "no relational report is linked to the exact expected output; reports={}, output_nodes={output_count}; diagnostics={:#?}",
+            relational_reports.len(),
+            session_relative_transform_diagnostics(case)
+        );
+        let snapshot =
+            save_case_snapshot(case, "l2-session-relative-unlinked-output-", Some(&details))?;
+        return Err(format!("{details}; snapshot={snapshot:?}").into());
     };
-    let first_record_receipt_id = case
-        .nodes()
-        .iter()
-        .find(|node| node.kind == "record_parse_receipt")
-        .map(|node| node.id)
-        .ok_or("no record parse receipt was retained")?;
-    assert!(
-        relational_report_node_id < first_record_receipt_id,
-        "session-relative transform evidence should be tried before raw schema assemblies"
-    );
+    assert_selected_report_precedes_its_receipts(
+        case,
+        relational_report_node_id,
+        &relational_report,
+    )?;
+    assert_report_links_exact_output(
+        case,
+        relational_report_node_id,
+        relational_output_node_id,
+        &relational_report,
+        plaintext,
+    )?;
 
     let report_summary =
         session_relative_report_summary(relational_report_node_id, &relational_report);
@@ -2170,46 +2185,144 @@ fn session_relative_candidate_parents(case: &Case) -> Vec<Value> {
         .collect()
 }
 
-fn select_session_relative_report(case: &Case) -> Option<(u64, Value)> {
+fn select_session_relative_report(
+    case: &Case,
+    expected_output: &[u8],
+) -> Option<(u64, Value, u64)> {
     case.nodes()
         .iter()
         .filter(|node| node.kind == "recovery_relational_transform_report")
-        .filter_map(|node| {
-            node.blob
+        .find_map(|node| {
+            let report = node
+                .blob
                 .as_deref()
                 .and_then(|blob_id| case.blob(blob_id))
-                .and_then(|blob| serde_json::from_slice::<Value>(&blob.bytes).ok())
-                .map(|report| (node.id, report))
+                .and_then(|blob| serde_json::from_slice::<Value>(&blob.bytes).ok())?;
+            let exact_output = case.edges().iter().find_map(|edge| {
+                if edge.from != node.id || edge.relation != "supports_relational_output" {
+                    return None;
+                }
+                let output = case.node(edge.to)?;
+                if output.kind != "relational_transform_output"
+                    || output.details.get("report_node_id").and_then(Value::as_u64) != Some(node.id)
+                {
+                    return None;
+                }
+                output
+                    .blob
+                    .as_deref()
+                    .and_then(|blob_id| case.blob(blob_id))
+                    .is_some_and(|blob| blob.bytes.as_slice() == expected_output)
+                    .then_some(output.id)
+            });
+            exact_output.map(|output_id| (node.id, report, output_id))
         })
-        .max_by_key(|(node_id, report)| {
-            (
-                report
-                    .get("application_evidence_checks")
-                    .and_then(Value::as_array)
-                    .is_some_and(|checks| {
-                        checks.iter().any(|check| {
-                            check.get("artifact_validated") == Some(&Value::Bool(true))
-                        })
-                    }),
-                report
-                    .pointer("/output_application/applied_rules")
-                    .and_then(Value::as_u64)
-                    .unwrap_or_default(),
-                report
-                    .get("input_sample_node_ids")
-                    .and_then(Value::as_array)
-                    .map_or(0, Vec::len),
-                report
-                    .get("candidate_count_examined")
-                    .and_then(Value::as_u64)
-                    .unwrap_or_default(),
-                report
-                    .get("application_evidence_checks")
-                    .and_then(Value::as_array)
-                    .map_or(0, Vec::len),
-                *node_id,
-            )
+}
+
+fn assert_selected_report_precedes_its_receipts(
+    case: &Case,
+    report_node_id: u64,
+    report: &Value,
+) -> TestResult<()> {
+    let selected_receipts = selected_record_receipt_ids(case, report_node_id);
+    if selected_receipts.is_empty() {
+        let summary = session_relative_report_summary(report_node_id, report);
+        let details = format!(
+            "selected report has no record receipts\nreport={summary:#?}\nrecord_diagnostics={:#?}",
+            session_relative_record_diagnostics(case)
+        );
+        let snapshot = save_case_snapshot(
+            case,
+            "l2-session-relative-missing-selected-receipts-",
+            Some(&details),
+        )?;
+        return Err(format!("{details}; snapshot={snapshot:?}").into());
+    }
+    assert!(
+        selected_receipts
+            .iter()
+            .all(|receipt_id| *receipt_id > report_node_id),
+        "the accepted relational report must precede its own selected assembly receipts: report={report_node_id}; receipts={selected_receipts:?}"
+    );
+    Ok(())
+}
+
+fn assert_report_links_exact_output(
+    case: &Case,
+    report_node_id: u64,
+    output_node_id: u64,
+    report: &Value,
+    expected_output: &[u8],
+) -> TestResult<()> {
+    assert!(
+        case.edges().iter().any(|edge| {
+            edge.from == report_node_id
+                && edge.to == output_node_id
+                && edge.relation == "supports_relational_output"
+        }),
+        "the selected exact output is not linked to its report"
+    );
+    let output = case
+        .node(output_node_id)
+        .filter(|node| node.kind == "relational_transform_output")
+        .ok_or("the selected exact output node is missing")?;
+    assert_eq!(
+        output.details.get("report_node_id").and_then(Value::as_u64),
+        Some(report_node_id),
+        "the linked output must name its supporting report"
+    );
+    let candidate_index = output
+        .details
+        .get("candidate_index")
+        .and_then(Value::as_u64)
+        .ok_or("the linked output omitted its candidate identity")?;
+    let accepted_check = report
+        .get("application_evidence_checks")
+        .and_then(Value::as_array)
+        .and_then(|checks| {
+            checks.iter().find(|check| {
+                check.get("candidate_index").and_then(Value::as_u64) == Some(candidate_index)
+                    && check.get("artifact_validated") == Some(&Value::Bool(true))
+            })
         })
+        .ok_or("the report omitted exact validation for the linked candidate")?;
+    let accepted_artifact = accepted_check
+        .pointer("/accepted_record_schema/artifact_receipt")
+        .ok_or("the linked candidate omitted its accepted artifact receipt")?;
+    let expected_sha256 = l2_workbench::sha256(expected_output);
+    assert_eq!(
+        accepted_artifact
+            .get("output_sha256")
+            .and_then(Value::as_str),
+        Some(expected_sha256.as_str())
+    );
+    assert_eq!(
+        accepted_artifact
+            .get("output_length")
+            .and_then(Value::as_u64),
+        u64::try_from(expected_output.len()).ok()
+    );
+    assert_eq!(
+        output.details.get("sha256").and_then(Value::as_str),
+        Some(expected_sha256.as_str())
+    );
+    assert_eq!(
+        output.details.get("length").and_then(Value::as_u64),
+        u64::try_from(expected_output.len()).ok()
+    );
+    let blob_id = output
+        .blob
+        .as_deref()
+        .ok_or("the linked relational output has no bytes")?;
+    let blob = case
+        .blob(blob_id)
+        .ok_or("the linked relational output bytes are missing")?;
+    assert_eq!(
+        blob.bytes.as_slice(),
+        expected_output,
+        "the selected relational report must link the exact expected PNG bytes"
+    );
+    Ok(())
 }
 
 fn session_relative_transform_diagnostics(case: &Case) -> Vec<Value> {

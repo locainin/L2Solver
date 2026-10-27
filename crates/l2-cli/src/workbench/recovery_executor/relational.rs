@@ -17,6 +17,10 @@ mod materialization_tests;
 #[path = "../../../tests/workbench/recovery_relational/application_fallback.rs"]
 mod application_fallback_tests;
 
+#[cfg(test)]
+#[path = "../../../tests/workbench/recovery_relational/search_budget.rs"]
+mod search_budget_tests;
+
 use super::record_discovery::{RecordCohortKey, RecordCohortOrigin, RecordFrameInput};
 use super::{
     Executor, RecoveryCandidateId, RecoveryExecutionError, RecoveryOmission, RecoveryStage,
@@ -33,6 +37,7 @@ use std::collections::{BTreeSet, HashSet};
 const REPORT_KIND: &str = "recovery_relational_transform_report";
 const REPORT_VERSION: u16 = 2;
 const OUTPUT_KIND: &str = "relational_transform_output";
+pub(super) const MAX_RETAINED_RELATIONAL_APPLICATIONS: usize = 8;
 pub(super) const DECODED_FRAME_KIND: &str = "relational_decoded_frame";
 const OUTPUT_REASON: &str = "This exact output was produced by a frozen session-relative rule that passed its parser checks";
 const DECODED_FRAME_REASON: &str = "This frame preserves its observed header while replacing only the range transformed by the frozen relational rule";

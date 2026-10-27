@@ -4,8 +4,9 @@ use super::record_gate::SchemaPlanCache;
 use super::record_gate::{GateResult, SchemaCandidateOptions};
 use super::report::{budget_report, insufficient_sessions_report, report_json};
 use super::{
-    DecodedFrameOutput, GateAssessment, PreparedRelationalCohort, RelationalDiscoveryContext,
-    StoredSample, invalid_policy, operational,
+    DecodedFrameOutput, GateAssessment, MAX_RETAINED_RELATIONAL_APPLICATIONS,
+    PreparedRelationalCohort, RelationalDiscoveryContext, StoredSample, invalid_policy,
+    operational,
 };
 use l2_workbench::{
     artifact::ArtifactValidationPolicy,
@@ -118,6 +119,12 @@ impl<'a> CandidateGate<'a> {
         }
         let frames = self.frames_for_candidate(candidate, discovery_outputs, heldout_outputs)?;
         let report = empty_gate_report(evaluation_context);
+        // Framed-message screens share the cohort budget; raw directional runs keep their allocation
+        let screen_work_limit = if self.raw_directional_run {
+            evaluation_context.work_bytes_remaining
+        } else {
+            evaluation_context.work_bytes_remaining / MAX_RETAINED_RELATIONAL_APPLICATIONS
+        };
         let gate = self.schema_plan_cache.screen_candidate(
             &frames,
             &report,
@@ -125,7 +132,7 @@ impl<'a> CandidateGate<'a> {
                 parser_format: candidate.rule.parser_format,
                 schema_limits: self.schema_limits,
                 artifact_policy: self.artifact_policy,
-                work_limit: evaluation_context.work_bytes_remaining,
+                work_limit: screen_work_limit,
                 job: self.job,
             },
         )?;
