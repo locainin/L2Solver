@@ -56,7 +56,7 @@ pub(super) fn collect_export(
 ) -> Result<CollectedExport, Box<dyn Error>> {
     let mut collection = CaseCollection {
         artifacts: ArtifactCollection::new(staging, limits)?,
-        evidence: EvidenceSidecar::new(staging, limits.evidence_bytes)?,
+        evidence: EvidenceSidecar::new(staging, limits.evidence_bytes, None)?,
         limitations: LimitationSpool::new(staging)?,
         recovery: RecoveryCoverage::default(),
     };

@@ -14,11 +14,55 @@ use std::{
     path::Path,
 };
 
+fn sidecar_with_budget(path: &Path, bytes: u64) -> io::Result<EvidenceSidecar> {
+    EvidenceSidecar::new(path, bytes, None)
+}
+
+#[test]
+fn publication_memory_pressure_keeps_the_prior_member_and_reports_typed_error()
+-> Result<(), Box<dyn Error>> {
+    use l2_workbench::job::{MemoryBudget, MemoryClass, MemoryError};
+    let directory = tempfile::tempdir()?;
+    let budget = MemoryBudget::new(4 * 1024 * 1024);
+    let mut sidecar = EvidenceSidecar::new(directory.path(), u64::MAX, Some(&budget))?;
+    let case = case_with_receipt(b"retained bytes")?;
+    let scope = json!({"kind":"flow", "flow_id":1});
+    sidecar.record_case(&case, &scope)?;
+    sidecar.finish()?;
+    let before = fs::read(directory.path().join(SIDECAR_FILE_NAME))?;
+    let coverage = sidecar.coverage();
+    let held = budget.try_reserve(MemoryClass::Case, 3 * 1024 * 1024)?;
+    let error = sidecar
+        .record_case(&case, &scope)
+        .err()
+        .ok_or("pressure unexpectedly admitted publication")?;
+    assert!(
+        error
+            .downcast_ref::<io::Error>()
+            .and_then(io::Error::get_ref)
+            .is_some_and(|cause| cause.downcast_ref::<MemoryError>().is_some())
+    );
+    assert_eq!(sidecar.coverage().selected_cases, coverage.selected_cases);
+    assert_eq!(sidecar.coverage().retained_cases, coverage.retained_cases);
+    assert_eq!(sidecar.coverage().omitted_cases, coverage.omitted_cases);
+    assert_eq!(fs::read(directory.path().join(SIDECAR_FILE_NAME))?, before);
+    assert_eq!(budget.snapshot()?.used(MemoryClass::Publication), 0);
+    assert!(
+        fs::read_dir(directory.path())?.all(|entry| entry.is_ok_and(|entry| !entry
+            .file_name()
+            .to_string_lossy()
+            .starts_with(".l2solver-evidence-case-")))
+    );
+    drop(held);
+    sidecar.record_case(&case, &scope)?;
+    Ok(())
+}
+
 #[test]
 fn shared_artifact_keeps_resolvable_origins_from_distinct_cases() -> Result<(), Box<dyn Error>> {
     let temporary = tempfile::tempdir()?;
     let mut sidecar =
-        EvidenceSidecar::new(temporary.path(), ArtifactLimits::default().evidence_bytes)?;
+        sidecar_with_budget(temporary.path(), ArtifactLimits::default().evidence_bytes)?;
     let mut artifacts = ArtifactCollection::new(temporary.path(), ArtifactLimits::default())?;
     let mut expected = Vec::new();
 
@@ -90,7 +134,7 @@ fn identical_exportable_nodes_keep_case_qualified_provenance_once_each()
 
     let scope = json!({"kind": "flow", "flow_id": 12});
     let mut sidecar =
-        EvidenceSidecar::new(temporary.path(), ArtifactLimits::default().evidence_bytes)?;
+        sidecar_with_budget(temporary.path(), ArtifactLimits::default().evidence_bytes)?;
     let record = sidecar.record_case(&case, &scope)?;
     assert!(record.retained);
     let case_id = record.case_id;
@@ -172,7 +216,7 @@ fn omitted_case_evidence_does_not_leave_export_node_references() -> Result<(), B
         json!({"status": "complete", "framing_complete": true}),
     )?;
     let scope = json!({"kind": "flow", "flow_id": 13});
-    let mut sidecar = EvidenceSidecar::new(temporary.path(), 1)?;
+    let mut sidecar = sidecar_with_budget(temporary.path(), 1)?;
     let record = sidecar.record_case(&case, &scope)?;
     assert!(!record.retained);
 
@@ -219,7 +263,7 @@ fn omitted_case_evidence_does_not_leave_export_node_references() -> Result<(), B
 #[test]
 fn receipt_payload_edges_and_local_node_ids_are_retained_per_case() -> Result<(), Box<dyn Error>> {
     let temporary = tempfile::tempdir()?;
-    let mut sidecar = EvidenceSidecar::new(temporary.path(), 1_000_000)?;
+    let mut sidecar = sidecar_with_budget(temporary.path(), 1_000_000)?;
     let first = case_with_receipt(b"private artifact payload")?;
     let second = case_with_receipt(b"private artifact payload")?;
     let first_result = sidecar.record_case(&first, &json!({"kind": "flow", "flow_id": 1}))?;
@@ -243,7 +287,7 @@ fn receipt_payload_edges_and_local_node_ids_are_retained_per_case() -> Result<()
 fn sidecar_writes_versioned_normalized_records_with_decodable_receipts()
 -> Result<(), Box<dyn Error>> {
     let temporary = tempfile::tempdir()?;
-    let mut sidecar = EvidenceSidecar::new(temporary.path(), 1_000_000)?;
+    let mut sidecar = sidecar_with_budget(temporary.path(), 1_000_000)?;
     let case = case_with_receipt(b"normalized source")?;
     sidecar.record_case(&case, &json!({"kind":"flow","flow_id":4}))?;
     sidecar.finish()?;
@@ -272,7 +316,7 @@ fn sidecar_writes_versioned_normalized_records_with_decodable_receipts()
 #[test]
 fn same_scope_gets_distinct_case_ids_when_graph_content_differs() -> Result<(), Box<dyn Error>> {
     let temporary = tempfile::tempdir()?;
-    let mut sidecar = EvidenceSidecar::new(temporary.path(), 1_000_000)?;
+    let mut sidecar = sidecar_with_budget(temporary.path(), 1_000_000)?;
     let first = case_with_receipt(b"first artifact")?;
     let second = case_with_receipt(b"second artifact")?;
     let scope = json!({"kind": "flow", "flow_id": 5});
@@ -292,7 +336,7 @@ fn case_id_matches_the_digest_of_its_persisted_record() -> Result<(), Box<dyn Er
     let temporary = tempfile::tempdir()?;
     let case = case_with_receipt(b"persisted record identity")?;
     let scope = json!({"kind": "flow", "flow_id": 11});
-    let mut sidecar = EvidenceSidecar::new(temporary.path(), 1_000_000)?;
+    let mut sidecar = sidecar_with_budget(temporary.path(), 1_000_000)?;
     let record = sidecar.record_case(&case, &scope)?;
     assert!(record.retained);
     sidecar.finish()?;
@@ -326,7 +370,7 @@ fn case_id_matches_the_digest_of_its_persisted_record() -> Result<(), Box<dyn Er
 #[test]
 fn gzip_sidecar_appends_valid_members_and_checks_each_member_crc() -> Result<(), Box<dyn Error>> {
     let temporary = tempfile::tempdir()?;
-    let mut sidecar = EvidenceSidecar::new(temporary.path(), 1_000_000)?;
+    let mut sidecar = sidecar_with_budget(temporary.path(), 1_000_000)?;
     let empty_member_bytes = sidecar.coverage().retained_bytes;
     assert!(empty_member_bytes > 0);
     let first = case_with_receipt(b"first compressed case")?;
@@ -388,7 +432,7 @@ fn gzip_sidecar_appends_valid_members_and_checks_each_member_crc() -> Result<(),
 #[test]
 fn empty_sidecar_is_valid_gzip_when_its_physical_member_fits() -> Result<(), Box<dyn Error>> {
     let temporary = tempfile::tempdir()?;
-    let mut sidecar = EvidenceSidecar::new(temporary.path(), 1_000_000)?;
+    let mut sidecar = sidecar_with_budget(temporary.path(), 1_000_000)?;
     let coverage = sidecar.coverage();
     assert_eq!(coverage.selected_cases, 0);
     assert_eq!(coverage.retained_cases, 0);
@@ -402,7 +446,7 @@ fn empty_sidecar_is_valid_gzip_when_its_physical_member_fits() -> Result<(), Box
     assert!(read_sidecar_bytes(&path)?.is_empty());
 
     let zero_budget_directory = tempfile::tempdir()?;
-    let mut zero_budget = EvidenceSidecar::new(zero_budget_directory.path(), 0)?;
+    let mut zero_budget = sidecar_with_budget(zero_budget_directory.path(), 0)?;
     assert_eq!(zero_budget.coverage().retained_bytes, 0);
     zero_budget.finish()?;
     assert!(fs::read(zero_budget_directory.path().join(SIDECAR_FILE_NAME))?.is_empty());
@@ -414,7 +458,7 @@ fn evidence_budget_uses_physical_gzip_bytes_and_tracks_raw_bytes() -> Result<(),
     let case = case_with_receipt(b"budgeted compressed record")?;
     let scope = json!({"kind": "flow", "flow_id": 31});
     let sizing_directory = tempfile::tempdir()?;
-    let mut sizing_sidecar = EvidenceSidecar::new(sizing_directory.path(), u64::MAX)?;
+    let mut sizing_sidecar = sidecar_with_budget(sizing_directory.path(), u64::MAX)?;
     let sized_record = sizing_sidecar.record_case(&case, &scope)?;
     assert!(sized_record.retained);
     let compressed_bytes = sized_record.compressed_bytes;
@@ -431,7 +475,7 @@ fn evidence_budget_uses_physical_gzip_bytes_and_tracks_raw_bytes() -> Result<(),
     assert_eq!(sizing_coverage.raw_retained_bytes, raw_bytes);
 
     let exact_directory = tempfile::tempdir()?;
-    let mut exact_sidecar = EvidenceSidecar::new(exact_directory.path(), physical_bytes)?;
+    let mut exact_sidecar = sidecar_with_budget(exact_directory.path(), physical_bytes)?;
     let exact_record = exact_sidecar.record_case(&case, &scope)?;
     assert!(exact_record.retained);
     assert_eq!(exact_sidecar.coverage().retained_bytes, physical_bytes);
@@ -440,7 +484,7 @@ fn evidence_budget_uses_physical_gzip_bytes_and_tracks_raw_bytes() -> Result<(),
         .checked_sub(1)
         .ok_or("a gzip member must have a non-zero encoded length")?;
     let omitted_directory = tempfile::tempdir()?;
-    let mut omitted_sidecar = EvidenceSidecar::new(omitted_directory.path(), below_budget)?;
+    let mut omitted_sidecar = sidecar_with_budget(omitted_directory.path(), below_budget)?;
     let omitted_record = omitted_sidecar.record_case(&case, &scope)?;
     let omitted_coverage = omitted_sidecar.coverage();
     assert!(!omitted_record.retained);
@@ -459,14 +503,14 @@ fn omitting_a_later_case_keeps_the_first_complete_and_verifiable() -> Result<(),
     let second = repetitive_case()?;
     let scope = json!({"kind":"flow","flow_id":38});
     let sizing_dir = tempfile::tempdir()?;
-    let mut sizing = EvidenceSidecar::new(sizing_dir.path(), u64::MAX)?;
+    let mut sizing = sidecar_with_budget(sizing_dir.path(), u64::MAX)?;
     let first_record = sizing.record_case(&first, &scope)?;
     sizing.finish()?;
     let exact_budget = sizing.coverage().retained_bytes;
     let expected = read_sidecar_bytes(&sizing_dir.path().join(SIDECAR_FILE_NAME))?;
 
     let output_dir = tempfile::tempdir()?;
-    let mut output = EvidenceSidecar::new(output_dir.path(), exact_budget)?;
+    let mut output = sidecar_with_budget(output_dir.path(), exact_budget)?;
     let retained = output.record_case(&first, &scope)?;
     let omitted = output.record_case(&second, &scope)?;
     output.finish()?;
@@ -489,7 +533,7 @@ fn repetitive_evidence_fits_a_tighter_budget_without_changing_the_v2_record()
     let case = repetitive_case()?;
     let scope = json!({"kind": "flow", "flow_id": 32});
     let sizing_directory = tempfile::tempdir()?;
-    let mut sizing = EvidenceSidecar::new(sizing_directory.path(), u64::MAX)?;
+    let mut sizing = sidecar_with_budget(sizing_directory.path(), u64::MAX)?;
     let first = sizing.record_case(&case, &scope)?;
     sizing.finish()?;
     let raw = read_sidecar_bytes(&sizing_directory.path().join(SIDECAR_FILE_NAME))?;
@@ -509,7 +553,7 @@ fn repetitive_evidence_fits_a_tighter_budget_without_changing_the_v2_record()
     let empty_member_bytes = sizing.coverage().retained_bytes - first.compressed_bytes;
     let budget = empty_member_bytes + fast_bytes - 1;
     let budget_directory = tempfile::tempdir()?;
-    let mut budgeted = EvidenceSidecar::new(budget_directory.path(), budget)?;
+    let mut budgeted = sidecar_with_budget(budget_directory.path(), budget)?;
     let second = budgeted.record_case(&case, &scope)?;
     budgeted.finish()?;
     assert!(
@@ -561,7 +605,7 @@ fn evidence_budget_omits_a_whole_case_and_leaves_no_artifact_node_reference()
 -> Result<(), Box<dyn Error>> {
     let temporary = tempfile::tempdir()?;
     let case = case_with_receipt(b"retained artifact")?;
-    let mut sidecar = EvidenceSidecar::new(temporary.path(), 1)?;
+    let mut sidecar = sidecar_with_budget(temporary.path(), 1)?;
     let result = sidecar.record_case(&case, &json!({"kind": "flow", "flow_id": 7}))?;
     let coverage = sidecar.coverage();
     let record = artifact_provenance(

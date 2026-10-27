@@ -1,13 +1,14 @@
 //! Canonical version-two records shared by identity and publication
 
 use super::super::{Blob, Case, Edge, Node, Source};
+use super::scratch::Scratch;
 use serde::{
     Serialize,
     ser::{SerializeSeq, SerializeStruct},
 };
 use serde_json::Value;
 use std::{
-    collections::BTreeMap,
+    collections::HashMap,
     io::{self, Write},
 };
 
@@ -49,23 +50,30 @@ pub(super) struct CanonicalRecord<'a> {
 
 pub(super) struct BlobRecords<'a> {
     blobs: &'a [Blob],
-    inline_ids: BTreeMap<&'a str, bool>,
+    inline_ids: HashMap<&'a str, bool>,
+    scratch: &'a Scratch,
 }
 
 impl<'a> BlobRecords<'a> {
-    pub(super) fn new(case: &'a Case) -> Self {
-        let mut inline_ids = BTreeMap::new();
+    pub(super) fn new(case: &'a Case, scratch: &'a Scratch) -> io::Result<Self> {
+        let mut inline_ids = HashMap::new();
         for node in case.nodes() {
             if node.details.get("representation").and_then(Value::as_str) == Some("json_blob")
                 && let Some(id) = node.blob.as_deref()
             {
+                if !inline_ids.contains_key(id) {
+                    // Each entry charge covers table capacity and resize overhead
+                    scratch.grow(256, false)?;
+                    inline_ids.try_reserve(1).map_err(io::Error::other)?;
+                }
                 *inline_ids.entry(id).or_insert(false) |= node.kind == "record_parse_receipt";
             }
         }
-        Self {
+        Ok(Self {
             blobs: case.blobs(),
             inline_ids,
-        }
+            scratch,
+        })
     }
 
     pub(super) fn iter(&self) -> impl Iterator<Item = BlobRecord<'_>> {
@@ -75,6 +83,7 @@ impl<'a> BlobRecords<'a> {
                 blob,
                 inline: schema.is_some(),
                 schema: schema.copied().unwrap_or(false),
+                scratch: self.scratch,
             }
         })
     }
@@ -94,6 +103,7 @@ pub(super) struct BlobRecord<'a> {
     blob: &'a Blob,
     inline: bool,
     schema: bool,
+    scratch: &'a Scratch,
 }
 
 impl BlobRecord<'_> {
@@ -114,12 +124,18 @@ impl BlobRecord<'_> {
         {
             record.serialize_field(
                 "schema_payload",
-                &super::schema::SchemaJson(&self.blob.bytes),
+                &super::schema::SchemaJson {
+                    bytes: &self.blob.bytes,
+                    scratch: self.scratch,
+                },
             )?;
         } else if self.inline {
             record.serialize_field(
                 "inline_payload",
-                &super::canonical_json::CanonicalJson(&self.blob.bytes),
+                &super::canonical_json::CanonicalJson {
+                    bytes: &self.blob.bytes,
+                    scratch: self.scratch,
+                },
             )?;
         }
         record.end()

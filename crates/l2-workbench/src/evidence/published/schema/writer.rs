@@ -1,13 +1,14 @@
 //! Encode repeated receipt object shapes without retaining decoded arrays
 
-use super::super::canonical_json::{MAX_DEPTH, RawObject};
+use super::super::canonical_json::{MAX_DEPTH, RawObject, parser_workspace, serialize_scalar};
+use super::super::scratch::{Charge, Scratch};
 use super::{MAX_SCHEMA_BYTES, MAX_SCHEMA_FIELDS, MAX_SCHEMAS};
 use serde::{
     Deserializer, Serialize, Serializer,
     de::{self, SeqAccess, Visitor},
     ser::{SerializeSeq, SerializeStruct, SerializeTuple},
 };
-use serde_json::{Value, value::RawValue};
+use serde_json::value::RawValue;
 use std::{
     collections::{HashMap, hash_map::DefaultHasher},
     fmt,
@@ -15,14 +16,18 @@ use std::{
     io,
 };
 
-pub(in crate::evidence::published) struct SchemaJson<'a>(
-    pub(in crate::evidence::published) &'a [u8],
-);
+pub(in crate::evidence::published) struct SchemaJson<'a> {
+    pub(in crate::evidence::published) bytes: &'a [u8],
+    pub(in crate::evidence::published) scratch: &'a Scratch,
+}
 
 impl Serialize for SchemaJson<'_> {
     fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
-        let root: &RawValue = serde_json::from_slice(self.0).map_err(serde::ser::Error::custom)?;
-        let mut schemas = Schemas::default();
+        let _workspace =
+            parser_workspace(self.bytes, self.scratch).map_err(serde::ser::Error::custom)?;
+        let root: &RawValue =
+            serde_json::from_slice(self.bytes).map_err(serde::ser::Error::custom)?;
+        let mut schemas = Schemas::new(self.scratch).map_err(serde::ser::Error::custom)?;
         schemas
             .collect(root, 0)
             .map_err(serde::ser::Error::custom)?;
@@ -40,21 +45,35 @@ impl Serialize for SchemaJson<'_> {
     }
 }
 
-#[derive(Default)]
-struct Schemas {
+struct Schemas<'a> {
     shapes: Vec<Vec<String>>,
     lookup: HashMap<u64, Vec<usize>>,
     bytes: usize,
+    full: bool,
+    scratch: &'a Scratch,
+    // Shapes and lookup storage must be released before the lease
+    charge: Charge<'a>,
 }
 
-impl Schemas {
+impl<'a> Schemas<'a> {
+    fn new(scratch: &'a Scratch) -> io::Result<Self> {
+        Ok(Self {
+            shapes: Vec::new(),
+            lookup: HashMap::new(),
+            bytes: 0,
+            full: false,
+            scratch,
+            charge: scratch.claim(0)?,
+        })
+    }
+
     fn collect(&mut self, raw: &RawValue, depth: usize) -> io::Result<()> {
         if depth > MAX_DEPTH {
             return Err(io::Error::other("receipt nesting exceeds its limit"));
         }
         match raw.get().as_bytes().first() {
             Some(b'{') => {
-                let fields = RawObject::parse(raw).map_err(io::Error::other)?;
+                let fields = RawObject::parse(raw, self.scratch)?;
                 self.add(&fields)?;
                 for (_, value) in fields.unique() {
                     self.collect(value, depth + 1)?;
@@ -94,7 +113,7 @@ impl Schemas {
     }
 
     fn add(&mut self, fields: &RawObject<'_>) -> io::Result<()> {
-        if self.find(fields).is_some() || self.shapes.len() == MAX_SCHEMAS {
+        if self.full || self.find(fields).is_some() || self.shapes.len() == MAX_SCHEMAS {
             return Ok(());
         }
         let count = fields.unique().count();
@@ -110,6 +129,21 @@ impl Schemas {
             .checked_add(bytes)
             .ok_or_else(|| io::Error::other("receipt schema size overflow"))?;
         if next > MAX_SCHEMA_BYTES {
+            return Ok(());
+        }
+        let cost = u64::try_from(count)
+            .ok()
+            .and_then(|n| n.checked_mul(128))
+            .and_then(|n| {
+                u64::try_from(bytes)
+                    .ok()
+                    .and_then(|bytes| n.checked_add(bytes))
+            })
+            .and_then(|n| n.checked_add(512))
+            .ok_or_else(|| io::Error::other("receipt schema size overflow"))?;
+        // Unindexed shapes remain inline when the shared budget is exhausted
+        if !self.charge.grow(cost, true)? {
+            self.full = true;
             return Ok(());
         }
         let mut shape = Vec::new();
@@ -141,11 +175,11 @@ fn shape_hash(fields: &RawObject<'_>) -> u64 {
     hasher.finish()
 }
 
-struct CollectArray<'a> {
-    schemas: &'a mut Schemas,
+struct CollectArray<'a, 's> {
+    schemas: &'a mut Schemas<'s>,
     depth: usize,
 }
-impl<'de> Visitor<'de> for CollectArray<'_> {
+impl<'de> Visitor<'de> for CollectArray<'_, '_> {
     type Value = ();
     fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter.write_str("a receipt array")
@@ -162,7 +196,7 @@ impl<'de> Visitor<'de> for CollectArray<'_> {
 
 struct EncodedValue<'a> {
     raw: &'a RawValue,
-    schemas: &'a Schemas,
+    schemas: &'a Schemas<'a>,
     depth: usize,
 }
 
@@ -175,7 +209,8 @@ impl Serialize for EncodedValue<'_> {
         }
         match self.raw.get().as_bytes().first() {
             Some(b'{') => {
-                let fields = RawObject::parse(self.raw).map_err(serde::ser::Error::custom)?;
+                let fields = RawObject::parse(self.raw, self.schemas.scratch)
+                    .map_err(serde::ser::Error::custom)?;
                 if let Some(index) = self.schemas.find(&fields) {
                     let mut tuple = serializer.serialize_tuple(3)?;
                     tuple.serialize_element(&1_u8)?;
@@ -208,11 +243,7 @@ impl Serialize for EncodedValue<'_> {
                 })?;
                 tuple.end()
             }
-            Some(_) => {
-                let value: Value =
-                    serde_json::from_str(self.raw.get()).map_err(serde::ser::Error::custom)?;
-                value.serialize(serializer)
-            }
+            Some(_) => serialize_scalar(self.raw, self.schemas.scratch, serializer),
             None => Err(serde::ser::Error::custom("empty receipt JSON")),
         }
     }
@@ -220,7 +251,7 @@ impl Serialize for EncodedValue<'_> {
 
 struct FieldValues<'a> {
     fields: &'a RawObject<'a>,
-    schemas: &'a Schemas,
+    schemas: &'a Schemas<'a>,
     depth: usize,
 }
 impl Serialize for FieldValues<'_> {
@@ -239,7 +270,7 @@ impl Serialize for FieldValues<'_> {
 
 struct FieldEntries<'a> {
     fields: &'a RawObject<'a>,
-    schemas: &'a Schemas,
+    schemas: &'a Schemas<'a>,
     depth: usize,
 }
 impl Serialize for FieldEntries<'_> {
@@ -261,7 +292,7 @@ impl Serialize for FieldEntries<'_> {
 
 struct ArrayValues<'a> {
     raw: &'a RawValue,
-    schemas: &'a Schemas,
+    schemas: &'a Schemas<'a>,
     depth: usize,
 }
 impl Serialize for ArrayValues<'_> {
@@ -281,7 +312,7 @@ impl Serialize for ArrayValues<'_> {
 }
 struct EncodeArray<'a, S> {
     output: S,
-    schemas: &'a Schemas,
+    schemas: &'a Schemas<'a>,
     depth: usize,
 }
 impl<'de, S: SerializeSeq> Visitor<'de> for EncodeArray<'_, S> {

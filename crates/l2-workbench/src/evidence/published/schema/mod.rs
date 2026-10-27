@@ -15,36 +15,5 @@ const MAX_SCHEMA_FIELDS: usize = 4096;
 const MAX_SCHEMA_SOURCE_DEPTH: usize = 56;
 
 pub(super) fn within_depth(bytes: &[u8]) -> bool {
-    let mut depth = 0_usize;
-    let mut quoted = false;
-    let mut escaped = false;
-    for &byte in bytes {
-        if quoted {
-            if escaped {
-                escaped = false;
-            } else if byte == b'\\' {
-                escaped = true;
-            } else if byte == b'"' {
-                quoted = false;
-            }
-        } else {
-            match byte {
-                b'"' => quoted = true,
-                b'[' | b'{' => {
-                    depth += 1;
-                    if depth > MAX_SCHEMA_SOURCE_DEPTH {
-                        return false;
-                    }
-                }
-                b']' | b'}' => {
-                    let Some(next) = depth.checked_sub(1) else {
-                        return false;
-                    };
-                    depth = next;
-                }
-                _ => {}
-            }
-        }
-    }
-    !quoted && depth == 0
+    super::canonical_json::nesting_depth(bytes, MAX_SCHEMA_SOURCE_DEPTH).is_some()
 }

@@ -1,13 +1,25 @@
 use l2_workbench::evidence::{
-    Case, Edge, EvidenceStatus, PublishedEvidenceLimits, SourceRange, decode_published_evidence,
-    write_published_case,
+    Case, Edge, EvidenceStatus, PublishedCaseUsage, PublishedEvidenceLimits, SourceRange,
+    decode_published_evidence, write_published_case as write_case_with_budget,
 };
 use serde::Serialize;
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
-use std::{error::Error, io::Cursor};
+use std::{
+    error::Error,
+    io::{self, Cursor, Write},
+};
 
 type TestResult = Result<(), Box<dyn Error>>;
+
+fn write_published_case<W: Write>(
+    case: &Case,
+    scope: &Value,
+    ordinal: u64,
+    writer: W,
+) -> io::Result<PublishedCaseUsage> {
+    write_case_with_budget(case, scope, ordinal, writer, None)
+}
 
 #[derive(Serialize)]
 struct Metadata {
@@ -293,6 +305,7 @@ fn repeated_receipt_object_shapes_are_shared_and_roundtrip_exactly() -> TestResu
 fn schema_receipts_keep_duplicate_keys_empty_objects_and_scalar_roots() -> TestResult {
     for payload in [
         r#"{"z":1,"a":[{},{},{"z":1,"a":2,"z":3}],"z":4}"#,
+        r#"{"a":1,"\u0061":2,"quote\"}x":[{"inner":"escaped\\value"}],"sp ace":{"\n":"brace } string"}}"#,
         "null",
         r#""escaped\ntext""#,
         "[[],{},[null,false,2.5]]",
@@ -706,5 +719,137 @@ fn legacy_version_two_records_remain_stream_readable() -> TestResult {
         PublishedEvidenceLimits::new(64 * 1024 * 1024, 16 * 1024 * 1024),
     )?;
     assert_eq!(decoded, legacy);
+    Ok(())
+}
+
+#[test]
+fn publication_scratch_uses_shared_lease_and_reports_pressure() -> TestResult {
+    use l2_workbench::job::{MemoryBudget, MemoryClass, MemoryError};
+    let case = fixture()?;
+    let tight = MemoryBudget::new(1);
+    let error = l2_workbench::evidence::write_published_case(
+        &case,
+        &json!({}),
+        1,
+        Vec::new(),
+        Some(&tight),
+    )
+    .err()
+    .ok_or("a too-small shared budget unexpectedly admitted publication")?;
+    assert!(
+        error
+            .get_ref()
+            .is_some_and(|cause| cause.downcast_ref::<MemoryError>().is_some())
+    );
+    assert_eq!(tight.snapshot()?.used(MemoryClass::Publication), 0);
+
+    let budget = MemoryBudget::new(8 * 1024 * 1024);
+    let mut encoded = Vec::new();
+    l2_workbench::evidence::write_published_case(
+        &case,
+        &json!({}),
+        1,
+        &mut encoded,
+        Some(&budget),
+    )?;
+    let usage = budget.snapshot()?;
+    assert!(
+        usage.peak_bytes > 0,
+        "publication scratch must be charged while it is live"
+    );
+    assert_eq!(
+        usage.used(MemoryClass::Publication),
+        0,
+        "all scratch leases must be released"
+    );
+    Ok(())
+}
+
+#[test]
+fn dictionary_pressure_falls_back_to_inline_text_without_losing_graph_data() -> TestResult {
+    use l2_workbench::job::{MemoryBudget, MemoryClass};
+    let mut case = Case::new();
+    let node = case.add_node("candidate", None, Vec::new(), json!({}))?;
+    for index in 0..80 {
+        case.add_edge(Edge {
+            from: node,
+            to: node,
+            relation: "supports".into(),
+            status: EvidenceStatus::Observed,
+            reason: format!("distinct finding {index}"),
+        })?;
+    }
+    let scope = json!({"kind":"test"});
+    let (_, expected) = canonical(&case, &scope, 1)?;
+    let budget = MemoryBudget::new(2_048);
+    let mut encoded = Vec::new();
+    l2_workbench::evidence::write_published_case(&case, &scope, 1, &mut encoded, Some(&budget))?;
+    let header: Value = serde_json::from_slice(
+        encoded
+            .split(|byte| *byte == b'\n')
+            .next()
+            .ok_or("header missing")?,
+    )?;
+    assert!(
+        header
+            .pointer("/value/strings")
+            .and_then(Value::as_array)
+            .is_some_and(|strings| strings.len() < 80)
+    );
+    assert!(budget.snapshot()?.rejected > 0);
+    assert_eq!(budget.snapshot()?.used(MemoryClass::Publication), 0);
+    let mut decoded = Vec::new();
+    decode_published_evidence(
+        4,
+        Cursor::new(encoded),
+        &mut decoded,
+        PublishedEvidenceLimits::new(1_000_000, 100_000),
+    )?;
+    assert_eq!(decoded, expected);
+    Ok(())
+}
+
+#[test]
+fn schema_pressure_falls_back_to_inline_shapes_without_losing_receipts() -> TestResult {
+    use l2_workbench::job::{MemoryBudget, MemoryClass};
+    let rows = (0..80)
+        .map(|index| json!({(format!("field_{index}")):index}))
+        .collect::<Vec<_>>();
+    let payload = serde_json::to_vec(&json!({"rows":rows}))?;
+    let mut case = Case::new();
+    case.add_bytes_node(
+        "record_parse_receipt",
+        &payload,
+        Vec::new(),
+        json!({"representation":"json_blob"}),
+    )?;
+    let scope = json!({});
+    let (_, expected) = canonical(&case, &scope, 1)?;
+    let budget = MemoryBudget::new(12_000);
+    let mut encoded = Vec::new();
+    l2_workbench::evidence::write_published_case(&case, &scope, 1, &mut encoded, Some(&budget))?;
+    let records = std::str::from_utf8(&encoded)?
+        .lines()
+        .map(serde_json::from_str::<Value>)
+        .collect::<Result<Vec<_>, _>>()?;
+    let blob = records
+        .iter()
+        .find(|record| record.get("record") == Some(&json!("blob")))
+        .ok_or("blob missing")?;
+    assert!(
+        blob.pointer("/value/schema_payload/schemas")
+            .and_then(Value::as_array)
+            .is_some_and(|schemas| schemas.len() < 80)
+    );
+    assert!(budget.snapshot()?.rejected > 0);
+    assert_eq!(budget.snapshot()?.used(MemoryClass::Publication), 0);
+    let mut decoded = Vec::new();
+    decode_published_evidence(
+        4,
+        Cursor::new(encoded),
+        &mut decoded,
+        PublishedEvidenceLimits::new(1_000_000, 100_000),
+    )?;
+    assert_eq!(decoded, expected);
     Ok(())
 }

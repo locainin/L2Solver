@@ -2,6 +2,7 @@
 
 use flate2::{Compression, write::GzEncoder};
 use l2_workbench::evidence::{Case, write_published_case};
+use l2_workbench::job::{MemoryBudget, MemoryClass};
 use serde::Serialize;
 use serde_json::Value;
 use std::{
@@ -19,6 +20,8 @@ pub(super) const COMPRESSION_POLICY_VERSION: u32 = 2;
 const CASE_COMPRESSION_LEVEL: u32 = 3;
 const TEMP_FILE_PREFIX: &str = ".l2solver-evidence-case-";
 const RECORD_BUFFER_CAPACITY: usize = 64 * 1024;
+// Reserve compressor state and both live 64 KiB buffers for each active member
+const COMPRESSOR_MEMORY_BYTES: u64 = 2 * 1024 * 1024;
 /// Exact aggregate selection, retention, omission, and byte totals for Case evidence
 #[derive(Clone, Copy, Debug, Serialize)]
 pub(super) struct EvidenceCoverage {
@@ -69,10 +72,19 @@ pub(super) struct EvidenceSidecar {
     staging: PathBuf,
     file: File,
     coverage: EvidenceCoverage,
+    memory: Option<MemoryBudget>,
 }
 
 impl EvidenceSidecar {
-    pub(super) fn new(staging: &Path, budget_bytes: u64) -> io::Result<Self> {
+    pub(super) fn new(
+        staging: &Path,
+        budget_bytes: u64,
+        memory: Option<&MemoryBudget>,
+    ) -> io::Result<Self> {
+        let _lease = memory
+            .map(|budget| budget.try_reserve(MemoryClass::Publication, COMPRESSOR_MEMORY_BYTES))
+            .transpose()
+            .map_err(io::Error::other)?;
         let path = staging.join(SIDECAR_FILE_NAME);
         let mut file = File::options().write(true).create_new(true).open(&path)?;
         let empty_member = GzEncoder::new(Vec::new(), Compression::fast()).finish()?;
@@ -90,6 +102,7 @@ impl EvidenceSidecar {
             staging: staging.to_owned(),
             file,
             coverage,
+            memory: memory.cloned(),
         })
     }
 
@@ -98,11 +111,10 @@ impl EvidenceSidecar {
         case: &Case,
         scope: &Value,
     ) -> Result<EvidenceRecordResult, Box<dyn Error>> {
-        self.coverage.selected_cases = evidence_add(self.coverage.selected_cases, 1)?;
-        let compressed_spool_path = self.staging.join(format!(
-            "{TEMP_FILE_PREFIX}{}.member.gz",
-            self.coverage.selected_cases
-        ));
+        let selected_cases = evidence_add(self.coverage.selected_cases, 1)?;
+        let compressed_spool_path = self
+            .staging
+            .join(format!("{TEMP_FILE_PREFIX}{selected_cases}.member.gz"));
         let available_bytes = self
             .coverage
             .budget_bytes
@@ -111,9 +123,11 @@ impl EvidenceSidecar {
             &compressed_spool_path,
             case,
             scope,
-            self.coverage.selected_cases,
+            selected_cases,
             available_bytes,
+            self.memory.as_ref(),
         )?;
+        self.coverage.selected_cases = selected_cases;
         let case_id = usage.case_id;
         let encoded_bytes = usage.encoded_bytes;
         let retained_end = self
@@ -176,14 +190,19 @@ fn write_case_member(
     scope: &Value,
     ordinal: u64,
     maximum_stored_bytes: u64,
+    memory: Option<&MemoryBudget>,
 ) -> io::Result<(l2_workbench::evidence::PublishedCaseUsage, CompressedSpool)> {
+    let _lease = memory
+        .map(|budget| budget.try_reserve(MemoryClass::Publication, COMPRESSOR_MEMORY_BYTES))
+        .transpose()
+        .map_err(io::Error::other)?;
     let file = File::options().write(true).create_new(true).open(path)?;
     let result = (|| {
         // Buffer JSON before compression so short serializer writes do not become disk writes
         let bounded = BoundedSpoolWriter::new(file, maximum_stored_bytes);
         let encoder = GzEncoder::new(bounded, Compression::new(CASE_COMPRESSION_LEVEL));
         let mut buffered = BufWriter::with_capacity(RECORD_BUFFER_CAPACITY, encoder);
-        let usage = write_published_case(case, scope, ordinal, &mut buffered)?;
+        let usage = write_published_case(case, scope, ordinal, &mut buffered, memory)?;
         let encoder = buffered
             .into_inner()
             .map_err(io::IntoInnerError::into_error)?;
@@ -198,7 +217,8 @@ fn write_case_member(
         ))
     })();
     if result.is_err() {
-        fs::remove_file(path)?;
+        // Keep the original typed failure while the caller discards the staging directory
+        let _ = fs::remove_file(path);
     }
     result
 }

@@ -5,7 +5,9 @@ use super::{
     PublishedCaseUsage,
     canonical::{BlobRecords, CanonicalRecord, CountWriter, HASH_DOMAIN, Metadata, PLACEHOLDER},
     format::{Counts, HeaderRef, MAX_DICTIONARY_BYTES, MAX_STRINGS, VERSION},
+    scratch::Scratch,
 };
+use crate::job::MemoryBudget;
 use serde::{
     Serialize,
     ser::{SerializeSeq, SerializeTuple},
@@ -20,7 +22,9 @@ use std::{
 /// Write one normalized, independently complete Case and return its canonical identity
 ///
 /// The selected ordinal is one-based and includes Cases omitted by the storage budget.
-/// The caller must keep or discard the entire stream as one unit.
+/// The caller must keep or discard the entire stream as one unit
+/// A supplied budget must be shared with the enclosing recovery job
+/// A memory rejection remains available through `io::Error::get_ref`
 ///
 /// # Errors
 /// Returns an error for an invalid ordinal, invalid receipt JSON, or a failed write
@@ -29,11 +33,13 @@ pub fn write_published_case<W: Write>(
     scope: &Value,
     ordinal: u64,
     writer: W,
+    budget: Option<&MemoryBudget>,
 ) -> io::Result<PublishedCaseUsage> {
     if ordinal == 0 {
         return Err(io::Error::other("evidence ordinal must be one-based"));
     }
-    let blobs = BlobRecords::new(case);
+    let scratch = Scratch::new(budget)?;
+    let blobs = BlobRecords::new(case, &scratch)?;
     let canonical = CanonicalRecord {
         case_id: PLACEHOLDER,
         scope,
@@ -45,11 +51,11 @@ pub fn write_published_case<W: Write>(
         limitations: case.limitations(),
     };
     let mut hash = HashWriter::new(ordinal);
-    serde_json::to_writer(&mut hash, &canonical).map_err(io::Error::other)?;
+    serde_json::to_writer(&mut hash, &canonical).map_err(|error| scratch.error(error))?;
     hash.write_all(b"\n")?;
     let case_id = format!("case-{:x}", hash.digest.finalize());
 
-    let dictionary = build_dictionary(case);
+    let dictionary = build_dictionary(case, &scratch)?;
     let mut output = CountWriter::new(writer, u64::MAX);
     write_graph(
         &mut output,
@@ -58,40 +64,42 @@ pub fn write_published_case<W: Write>(
         ordinal,
         &case_id,
         &dictionary,
-    )?;
+    )
+    .map_err(|error| scratch.error(error))?;
+    scratch.check()?;
     Ok(PublishedCaseUsage {
         case_id,
         encoded_bytes: output.written,
     })
 }
 
-fn build_dictionary(case: &Case) -> Dictionary<'_> {
+fn build_dictionary<'a>(case: &'a Case, scratch: &Scratch) -> io::Result<Dictionary<'a>> {
     // Borrow existing strings so the dictionary does not duplicate graph contents
     let mut dictionary = Dictionary::default();
     // Keep graph kinds and relationship text ahead of less frequently repeated details
     for node in case.nodes() {
-        dictionary.add(&node.kind);
+        dictionary.add(&node.kind, scratch)?;
     }
     for edge in case.edges() {
-        dictionary.add(&edge.relation);
-        dictionary.add(&edge.reason);
+        dictionary.add(&edge.relation, scratch)?;
+        dictionary.add(&edge.reason, scratch)?;
     }
     for node in case.nodes() {
         if let Value::Object(fields) = &node.details {
             for (key, value) in fields {
-                dictionary.add(key);
+                dictionary.add(key, scratch)?;
                 if let Value::String(text) = value {
                     // Digests are usually unique and would crowd useful shared descriptions out
                     if !(text.starts_with("sha256:")
                         || text.len() == 64 && text.bytes().all(|byte| byte.is_ascii_hexdigit()))
                     {
-                        dictionary.add(text);
+                        dictionary.add(text, scratch)?;
                     }
                 }
             }
         }
     }
-    dictionary
+    Ok(dictionary)
 }
 
 fn write_graph<W: Write>(
@@ -170,22 +178,31 @@ struct Dictionary<'a> {
     indexes: HashMap<&'a str, usize>,
     values: Vec<&'a str>,
     bytes: usize,
+    full: bool,
 }
 
 impl<'a> Dictionary<'a> {
-    fn add(&mut self, value: &'a str) {
-        if self.indexes.contains_key(value) || self.values.len() == MAX_STRINGS {
-            return;
+    fn add(&mut self, value: &'a str, scratch: &Scratch) -> io::Result<()> {
+        if self.full || self.indexes.contains_key(value) || self.values.len() == MAX_STRINGS {
+            return Ok(());
         }
         let Some(next) = self.bytes.checked_add(value.len()) else {
-            return;
+            return Ok(());
         };
         if next > MAX_DICTIONARY_BYTES {
-            return;
+            return Ok(());
         }
+        // Further strings remain inline when the shared budget cannot grow the index
+        if !scratch.grow(256, true)? {
+            self.full = true;
+            return Ok(());
+        }
+        self.indexes.try_reserve(1).map_err(io::Error::other)?;
+        self.values.try_reserve(1).map_err(io::Error::other)?;
         self.indexes.insert(value, self.values.len());
         self.values.push(value);
         self.bytes = next;
+        Ok(())
     }
 
     fn reference(&self, value: &'a str) -> TextRef<'a> {

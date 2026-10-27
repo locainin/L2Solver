@@ -5,6 +5,7 @@ mod canonical_json;
 mod format;
 mod reader;
 mod schema;
+mod scratch;
 mod writer;
 
 pub use reader::decode_published_evidence;
