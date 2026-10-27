@@ -26,6 +26,7 @@ fn extract_help_describes_recovery_and_optional_enrichment()
         "Matching owned output is reused",
         "--refresh atomically replaces owned output, even when its previous input differs",
         "Standard input",
+        "Use -- before a filename starting with -",
         "Incomplete native analysis",
         "TShark is missing",
         "object export fails",

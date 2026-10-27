@@ -35,16 +35,15 @@ Exit status:
 const DEV_HELP: &str =
     "Developer:\n  l2solver dev --help       Internal diagnostics and fixture tooling";
 
-const EXTRACT_HELP: &str = r"The default is CAPTURE.export. Matching owned output is reused. --refresh atomically replaces owned output, even when its previous input differs. Unrelated destinations are refused. Standard input requires --output and skips TShark.
+const EXTRACT_HELP: &str = r"The default is CAPTURE.export. Matching owned output is reused. --refresh atomically replaces owned output, even when its previous input differs. Unrelated destinations are refused. Standard input requires --output and skips TShark. Use -- before a filename starting with -.
 
 Progress defaults to automatic terminal detection. --refresh recomputes results, --no-cache skips reads and writes, and --strict-cache checks cached content in full.
 
-TShark enrichment is optional. If TShark is missing or object export fails, available artifacts are still published. --require-tshark requires successful enrichment. Incomplete native analysis or a required TShark failure returns status 3. Packets outside discovery scope are reported without failing extraction. summary.txt shows native and TShark status separately.
+TShark enrichment is optional. If TShark is missing or object export fails, available artifacts are still published. Incomplete native analysis or a required TShark failure returns status 3. Packets outside discovery scope are reported without failing extraction. summary.txt shows native and TShark status separately.
 
 Examples:
   l2solver extract traffic.pcapng -o recovered/
-  l2solver extract traffic.pcapng --profile deep --progress json
-  l2solver extract traffic.pcapng --strict-cache --memory-limit 1GiB";
+  l2solver extract traffic.pcapng --profile deep --progress json";
 
 #[derive(Debug, Parser)]
 #[command(
@@ -74,7 +73,7 @@ enum TopCommand {
     Extract(ExportArgs),
     /// Refine an ordinary file or export directory without requiring a capture
     #[command(
-        long_about = "Analyze an ordinary file or export directory, including .bin files, without requiring a PCAP or PCAPNG input. Refinement writes immutable artifacts, a manifest, and a summary into a result directory. Small inputs may be retained; larger inputs stay in place while bounded PNG and ZIP ranges may be published with partial coverage. By default the directory is INPUT.refined; use --output to select another directory. Use --dry-run to report planned work without writing a result. --salvage enables recovery of supported partial archive members; it does not repair arbitrary damaged files. An existing matching owned result is reused. On reuse, --strict-cache verifies complete source and output bytes. --refresh recomputes and atomically replaces that owned result. Unrelated existing paths are refused. Shared search, progress, cache, worker, and memory controls are available through the recovery options."
+        long_about = "Analyze an ordinary file or export directory, including .bin files, without requiring a PCAP or PCAPNG input. Use -- before a filename starting with -. Refinement writes immutable artifacts, a manifest, and a summary into a result directory. Small inputs may be retained; larger inputs stay in place while bounded PNG and ZIP ranges may be published with partial coverage. By default the directory is INPUT.refined; use --output to select another directory. Use --dry-run to report planned work without writing a result. --salvage enables recovery of supported partial archive members; it does not repair arbitrary damaged files. An existing matching owned result is reused. On reuse, --strict-cache verifies complete source and output bytes. --refresh recomputes and atomically replaces that owned result. Unrelated existing paths are refused. Shared search, progress, cache, worker, and memory controls are available through the recovery options."
     )]
     Refine(RefineArgs),
     /// Inspect or manage persistent recovery results
@@ -152,7 +151,7 @@ struct CapturePath {
 
 #[derive(Debug, Args)]
 struct ExportArgs {
-    #[arg(value_name = "CAPTURE", allow_hyphen_values = true)]
+    #[arg(value_name = "CAPTURE")]
     capture: PathBuf,
     /// Write to DIRECTORY instead of CAPTURE.export; reuse matching owned results
     #[arg(short, long, value_name = "DIRECTORY")]
@@ -167,7 +166,7 @@ struct ExportArgs {
 #[derive(Debug, Args)]
 struct RefineArgs {
     /// Input file or export directory to refine
-    #[arg(value_name = "INPUT", allow_hyphen_values = true)]
+    #[arg(value_name = "INPUT")]
     input: PathBuf,
     /// Write the refined result to this directory instead of INPUT.refined
     #[arg(short, long, value_name = "DIRECTORY")]

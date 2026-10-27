@@ -5,6 +5,57 @@ use l2_cli::arguments::{
 use std::path::Path;
 
 #[test]
+fn recovery_commands_reject_unknown_options_before_an_input() {
+    let kinds = ["extract", "export", "refine"].map(|command| {
+        parse_from(["l2solver", command, "--bogus"])
+            .err()
+            .map(|error| error.kind())
+    });
+    assert_eq!(kinds, [Some(clap::error::ErrorKind::UnknownArgument); 3]);
+}
+
+#[test]
+fn recovery_commands_identify_unknown_options_when_an_input_follows()
+-> Result<(), Box<dyn std::error::Error>> {
+    for command in ["extract", "export", "refine"] {
+        let error = parse_from(["l2solver", command, "--bogus", "input.bin"])
+            .err()
+            .ok_or("the unknown option was accepted")?;
+        assert_eq!(error.kind(), clap::error::ErrorKind::UnknownArgument);
+        assert!(error.to_string().contains("--bogus"), "{command}: {error}");
+    }
+    Ok(())
+}
+
+#[test]
+fn extraction_accepts_standard_input_for_both_command_names()
+-> Result<(), Box<dyn std::error::Error>> {
+    for name in ["extract", "export"] {
+        let Command::Export(options) = parse_from(["l2solver", name, "-", "-o", "results"])? else {
+            return Err(format!("{name} did not select capture extraction").into());
+        };
+        assert_eq!(options.capture, Path::new("-"), "{name}");
+        assert_eq!(options.output.as_deref(), Some(Path::new("results")));
+    }
+    Ok(())
+}
+
+#[test]
+fn recovery_commands_accept_hyphenated_input_names_after_separator()
+-> Result<(), Box<dyn std::error::Error>> {
+    for name in ["extract", "export", "refine"] {
+        let parsed = parse_from(["l2solver", name, "--", "-input.bin"])?;
+        let path = match &parsed {
+            Command::Export(options) => &options.capture,
+            Command::Refine(options) => &options.input,
+            _ => return Err(format!("{name} selected an unexpected command").into()),
+        };
+        assert_eq!(path, Path::new("-input.bin"), "{name}");
+    }
+    Ok(())
+}
+
+#[test]
 fn extraction_uses_shared_recovery_defaults() -> Result<(), Box<dyn std::error::Error>> {
     let Command::Export(options) = parse_from(["l2solver", "extract", "traffic.pcapng"])? else {
         return Err("extract did not select capture extraction".into());
