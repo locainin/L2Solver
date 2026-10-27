@@ -4,7 +4,11 @@ use l2_workbench::job::{
     cache::{CacheError, ExecutionCheckpointLimits, StageStatus},
 };
 use serde_json::json;
-use std::{error::Error, io};
+use std::{
+    error::Error,
+    io,
+    path::{Path, PathBuf},
+};
 
 const fn limits() -> ExecutionCheckpointLimits {
     ExecutionCheckpointLimits {
@@ -12,6 +16,22 @@ const fn limits() -> ExecutionCheckpointLimits {
         max_executor_bytes: 1_024,
         max_metadata_bytes: 8_192,
     }
+}
+
+fn active_staging_directory(parent: &Path) -> io::Result<PathBuf> {
+    let mut active = None;
+    for item in std::fs::read_dir(parent)? {
+        let item = item?;
+        if item
+            .file_name()
+            .to_str()
+            .is_some_and(|name| name.starts_with("active-"))
+            && active.replace(item.path()).is_some()
+        {
+            return Err(io::Error::other("multiple active staging directories"));
+        }
+    }
+    active.ok_or_else(|| io::Error::other("active staging directory is missing"))
 }
 
 #[test]
@@ -687,5 +707,128 @@ fn four_simultaneous_writers_cannot_reserve_more_than_the_global_quota()
     assert_eq!(accepted, 3);
     assert_eq!(reserved, 18_000);
     assert!(cache.stats()?.entry_bytes <= 20_000);
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn saving_a_large_component_does_not_read_back_its_contents() -> Result<(), Box<dyn Error>> {
+    fn thread_bytes_read() -> Result<u64, Box<dyn Error>> {
+        let io = std::fs::read_to_string("/proc/thread-self/io")?;
+        let value = io
+            .lines()
+            .find_map(|line| line.strip_prefix("rchar: "))
+            .ok_or("rchar is missing")?;
+        Ok(value.trim().parse()?)
+    }
+
+    let temporary = tempfile::tempdir()?;
+    let cache = cache_at(temporary.path(), 32 * 1024 * 1024)?;
+    let key = stage_key("streaming-save-io")?;
+    let mut lease = cache.lease(&key)?;
+    let snapshot = Job::new("large streaming save").snapshot()?;
+    let data = vec![0x5a; 8 * 1024 * 1024];
+    let caps = ExecutionCheckpointLimits {
+        max_encoded_bytes: 16 * 1024 * 1024,
+        ..limits()
+    };
+    let before = thread_bytes_read()?;
+    lease.save_active(&snapshot, caps, |writer| {
+        writer.streams().0.write_all(&data)?;
+        Ok(json!({}))
+    })?;
+    let read_bytes = thread_bytes_read()?
+        .checked_sub(before)
+        .ok_or("thread I/O counter moved backwards")?;
+    assert!(
+        read_bytes < u64::try_from(data.len() / 2)?,
+        "saving read {read_bytes} bytes for an {}-byte component",
+        data.len()
+    );
+    Ok(())
+}
+
+#[test]
+fn failed_no_replace_rename_keeps_debris_reserved_until_exclusive_recovery()
+-> Result<(), Box<dyn Error>> {
+    let temporary = tempfile::tempdir()?;
+    let cache = cache_at(temporary.path(), 64 * 1024)?;
+    let key = stage_key("rename-collision")?;
+    let snapshot = Job::new("rename collision").snapshot()?;
+    let mut lease = cache.lease(&key)?;
+    lease.save_active(&snapshot, limits(), |writer| {
+        writer.streams().2.write_all(b"committed")?;
+        Ok(json!({"generation": 1}))
+    })?;
+    let baseline = cache.stats()?.entry_bytes;
+    let staging_key = lease
+        .directory()
+        .parent()
+        .ok_or("staging parent is missing")?
+        .to_path_buf();
+    let entry_root = temporary.path().join("cache/entries").join(key.as_str());
+    let failed = lease.save_active(&snapshot, limits(), |writer| {
+        writer.streams().2.write_all(b"uncommitted")?;
+        let active = active_staging_directory(&staging_key)?;
+        let name = active
+            .file_name()
+            .ok_or(CacheError::InvalidInput("active name is missing"))?;
+        std::fs::create_dir(entry_root.join(name))?;
+        Ok(json!({"generation": 2}))
+    });
+    assert!(failed.is_err());
+    let with_debris = cache.stats()?.entry_bytes;
+    assert!(with_debris > baseline);
+    cache.prune()?;
+    assert_eq!(cache.stats()?.entry_bytes, with_debris);
+    assert_eq!(
+        lease
+            .load_active(limits())?
+            .ok_or("prior generation is missing")?
+            .metadata(),
+        &json!({"generation": 1})
+    );
+    drop(lease);
+    let lease = cache.lease(&key)?;
+    assert_eq!(cache.stats()?.entry_bytes, baseline);
+    assert_eq!(
+        lease
+            .load_active(limits())?
+            .ok_or("prior generation is missing after recovery")?
+            .metadata(),
+        &json!({"generation": 1})
+    );
+    Ok(())
+}
+
+#[test]
+fn replacing_a_written_component_is_rejected_even_when_bytes_match() -> Result<(), Box<dyn Error>> {
+    let temporary = tempfile::tempdir()?;
+    let cache = cache_at(temporary.path(), 64 * 1024)?;
+    let key = stage_key("component-replacement")?;
+    let snapshot = Job::new("replacement").snapshot()?;
+    let mut lease = cache.lease(&key)?;
+    lease.save_active(&snapshot, limits(), |_| Ok(json!({"generation": 1})))?;
+    let staging_key = lease
+        .directory()
+        .parent()
+        .ok_or("staging parent is missing")?
+        .to_path_buf();
+    let result = lease.save_active(&snapshot, limits(), |writer| {
+        writer.streams().0.write_all(b"same")?;
+        let active = active_staging_directory(&staging_key)?;
+        let graph = active.join("graph");
+        std::fs::remove_file(&graph)?;
+        std::fs::write(graph, b"same")?;
+        Ok(json!({"generation": 2}))
+    });
+    assert!(result.is_err());
+    assert_eq!(
+        lease
+            .load_active(limits())?
+            .ok_or("prior generation is missing")?
+            .metadata(),
+        &json!({"generation": 1})
+    );
     Ok(())
 }

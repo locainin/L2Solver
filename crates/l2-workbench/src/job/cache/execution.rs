@@ -251,13 +251,13 @@ struct PendingGeneration {
     cache: Cache,
     token: String,
     path: PathBuf,
-    renamed: bool,
+    rename_attempted: bool,
 }
 
 impl Drop for PendingGeneration {
     fn drop(&mut self) {
         // A failed rename or commit can be ambiguous, so recovery inspects the pointer first
-        if self.renamed {
+        if self.rename_attempted {
             return;
         }
         match fs::remove_dir_all(&self.path) {
@@ -308,7 +308,7 @@ impl Lease {
             cache: self.cache.clone(),
             token: token.clone(),
             path: directory.path().to_path_buf(),
-            renamed: false,
+            rename_attempted: false,
         };
         self.cache
             .reserve_execution_capacity(&self.key, &token, 0)?;
@@ -331,7 +331,7 @@ impl Lease {
             .open_child_or_create(self.key.as_str())?;
         self.cache.inner.entries.sync()?;
         // Once rename is attempted, leave uncertain outcomes for lock-protected recovery
-        pending.renamed = true;
+        pending.rename_attempted = true;
         staging_key.rename_child_to(&name, &entry_root)?;
         staging_key.sync()?;
         entry_root.sync()?;
@@ -463,11 +463,11 @@ where
         blobs,
         executor,
     } = writer;
-    let components = [
-        finish_component(graph)?,
-        finish_component(blobs)?,
-        finish_component(executor)?,
-    ];
+    let (graph, graph_file) = finish_component(graph)?;
+    let (blobs, blobs_file) = finish_component(blobs)?;
+    let (executor, executor_file) = finish_component(executor)?;
+    let components = [graph, blobs, executor];
+    let written_files = [graph_file, blobs_file, executor_file];
     let envelope = EnvelopeRef {
         version: ENVELOPE_VERSION,
         snapshot_version: JOB_SNAPSHOT_VERSION,
@@ -484,8 +484,16 @@ where
         budget.available -= envelope_bytes;
     }
     let snapshot_json = serde_json::to_string(snapshot)?;
-    for (name, expected) in COMPONENT_NAMES.iter().zip(&components) {
-        let _ = verified_component(directory, name, expected)?;
+    for ((name, expected), written) in COMPONENT_NAMES.iter().zip(&components).zip(&written_files) {
+        // The open writer and named file must still identify the same synced object
+        let held = written.file.metadata()?;
+        let named = directory.open_file(name)?.metadata()?;
+        if held.len() != expected.bytes
+            || !same_content_identity(&written.synced_metadata, &held)
+            || !same_content_identity(&held, &named)
+        {
+            return Err(corrupt());
+        }
     }
     directory.sync()?;
     let total = components.iter().try_fold(envelope_bytes, |sum, item| {
@@ -494,13 +502,34 @@ where
     Ok((envelope_json, snapshot_json, total))
 }
 
-fn finish_component(mut component: ComponentWriter) -> Result<Component> {
+struct WrittenFile {
+    file: File,
+    synced_metadata: Metadata,
+}
+
+fn finish_component(mut component: ComponentWriter) -> Result<(Component, WrittenFile)> {
     component.file.flush()?;
+    let before = component.file.get_ref().metadata()?;
     component.file.get_ref().sync_all()?;
-    Ok(Component {
+    let synced_metadata = component.file.get_ref().metadata()?;
+    if before.len() != component.bytes || !same_content_identity(&before, &synced_metadata) {
+        return Err(corrupt());
+    }
+    let file = component
+        .file
+        .into_inner()
+        .map_err(io::IntoInnerError::into_error)?;
+    let digest = Component {
         bytes: component.bytes,
         sha256: format!("{:x}", component.hash.finalize()),
-    })
+    };
+    Ok((
+        digest,
+        WrittenFile {
+            file,
+            synced_metadata,
+        },
+    ))
 }
 
 struct BoundedBytes {
