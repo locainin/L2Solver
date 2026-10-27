@@ -329,3 +329,172 @@ fn commit_admits_manifest_growth_before_recording_a_large_stage_tree() -> Result
     assert_eq!(budget.snapshot()?.used_bytes, 0);
     Ok(())
 }
+
+const fn execution_limits() -> l2_workbench::job::cache::ExecutionCheckpointLimits {
+    l2_workbench::job::cache::ExecutionCheckpointLimits {
+        max_encoded_bytes: 4_096,
+        max_executor_bytes: 4_096,
+        max_metadata_bytes: 8_192,
+    }
+}
+
+#[test]
+fn active_writer_buffers_are_charged_and_released_after_publication() -> Result<(), Box<dyn Error>>
+{
+    let temporary = tempfile::tempdir()?;
+    let key = stage_key("memory-active-writer")?;
+    let cache = cache_at(temporary.path(), 64 * 1024)?;
+    let budget = MemoryBudget::new(8 * 1024 * 1024);
+    cache.attach_memory_budget(budget.clone())?;
+    let mut lease = cache.lease(&key)?;
+    lease.save_active(
+        &l2_workbench::job::Job::new("writer").snapshot()?,
+        execution_limits(),
+        |writer| {
+            assert!(budget.snapshot()?.used(MemoryClass::Cache) >= 3 * 8 * 1024);
+            writer.streams().2.write_all(b"cursor")?;
+            Ok(json!({}))
+        },
+    )?;
+    assert_eq!(budget.snapshot()?.used(MemoryClass::Cache), 0);
+    Ok(())
+}
+
+#[test]
+fn active_generation_keeps_its_envelope_charge_until_reader_drop() -> Result<(), Box<dyn Error>> {
+    let temporary = tempfile::tempdir()?;
+    let key = stage_key("memory-active-reader")?;
+    let producer = cache_at(temporary.path(), 64 * 1024)?;
+    let mut writer = producer.lease(&key)?;
+    writer.save_active(
+        &l2_workbench::job::Job::new("reader").snapshot()?,
+        execution_limits(),
+        |writer| {
+            writer.streams().2.write_all(b"cursor")?;
+            Ok(json!({"payload": "x".repeat(1_024)}))
+        },
+    )?;
+    drop(writer);
+    drop(producer);
+    let cache = cache_at(temporary.path(), 64 * 1024)?;
+    let budget = MemoryBudget::new(8 * 1024 * 1024);
+    cache.attach_memory_budget(budget.clone())?;
+    let lease = cache.lease(&key)?;
+    let active = lease
+        .load_active(execution_limits())?
+        .ok_or("active generation is missing")?;
+    let current = budget.snapshot()?;
+    assert!(current.used(MemoryClass::Cache) > 0);
+    assert!(current.peak_bytes > current.used_bytes);
+    assert_eq!(
+        active.metadata()["payload"].as_str().map(str::len),
+        Some(1_024)
+    );
+    assert_eq!(active.executor_bytes(), 6);
+    drop(active);
+    assert_eq!(budget.snapshot()?.used(MemoryClass::Cache), 0);
+    Ok(())
+}
+
+#[test]
+fn active_save_memory_pressure_keeps_the_previous_generation() -> Result<(), Box<dyn Error>> {
+    let temporary = tempfile::tempdir()?;
+    let key = stage_key("memory-active-save-pressure")?;
+    let producer = cache_at(temporary.path(), 64 * 1024)?;
+    let snapshot = l2_workbench::job::Job::new("active pressure").snapshot()?;
+    let mut writer = producer.lease(&key)?;
+    writer.save_active(&snapshot, execution_limits(), |_| {
+        Ok(json!({"generation": 1}))
+    })?;
+    drop(writer);
+    drop(producer);
+    let cache = cache_at(temporary.path(), 64 * 1024)?;
+    let mut lease = cache.lease(&key)?;
+    let budget = MemoryBudget::new(100 * 1024);
+    cache.attach_memory_budget(budget.clone())?;
+    let result = lease.save_active(&snapshot, execution_limits(), |_| {
+        Ok(json!({"generation": 2}))
+    });
+    assert!(matches!(
+        result,
+        Err(CacheError::Memory(MemoryError::Limit { .. }))
+    ));
+    assert_eq!(budget.snapshot()?.used_bytes, 0);
+    drop(lease);
+    drop(cache);
+    let unbudgeted = cache_at(temporary.path(), 64 * 1024)?;
+    assert_eq!(
+        unbudgeted
+            .lease(&key)?
+            .load_active(execution_limits())?
+            .ok_or("prior generation was lost")?
+            .metadata(),
+        &json!({"generation": 1})
+    );
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn denied_active_load_does_not_read_the_large_envelope_column() -> Result<(), Box<dyn Error>> {
+    let temporary = tempfile::tempdir()?;
+    let key = stage_key("memory-active-envelope-io")?;
+    let producer = cache_at(temporary.path(), 4 * 1024 * 1024)?;
+    let mut lease = producer.lease(&key)?;
+    let caps = l2_workbench::job::cache::ExecutionCheckpointLimits {
+        max_metadata_bytes: 2 * 1024 * 1024,
+        ..execution_limits()
+    };
+    lease.save_active(
+        &l2_workbench::job::Job::new("large envelope").snapshot()?,
+        caps,
+        |_| Ok(json!({"payload": "x".repeat(LARGE_METADATA_BYTES)})),
+    )?;
+    drop(lease);
+    drop(producer);
+    let cache = cache_at(temporary.path(), 4 * 1024 * 1024)?;
+    let lease = cache.lease(&key)?;
+    cache.attach_memory_budget(MemoryBudget::new(1))?;
+    let before = thread_read_bytes()?;
+    assert!(matches!(
+        lease.load_active(caps),
+        Err(CacheError::Memory(MemoryError::Limit { .. }))
+    ));
+    let delta = thread_read_bytes()?
+        .checked_sub(before)
+        .ok_or("thread I/O counter moved backwards")?;
+    assert!(
+        delta < u64::try_from(LARGE_METADATA_BYTES / 4)?,
+        "denied active load read {delta} bytes"
+    );
+    Ok(())
+}
+
+#[test]
+fn denied_active_writer_admission_does_not_invoke_the_callback_or_create_a_generation()
+-> Result<(), Box<dyn Error>> {
+    use std::cell::Cell;
+    let temporary = tempfile::tempdir()?;
+    let key = stage_key("memory-denied-active-writer")?;
+    let cache = cache_at(temporary.path(), 64 * 1024)?;
+    let mut lease = cache.lease(&key)?;
+    cache.attach_memory_budget(MemoryBudget::new(1))?;
+    let called = Cell::new(false);
+    let result = lease.save_active(
+        &l2_workbench::job::Job::new("denied writer").snapshot()?,
+        execution_limits(),
+        |_| {
+            called.set(true);
+            Ok(json!({}))
+        },
+    );
+    assert!(matches!(
+        result,
+        Err(CacheError::Memory(MemoryError::Limit { .. }))
+    ));
+    assert!(!called.get());
+    let database = rusqlite::Connection::open(temporary.path().join("state/cache.sqlite3"))?;
+    let count: i64 = database.query_row("SELECT count(*) FROM executions", [], |row| row.get(0))?;
+    assert_eq!(count, 0);
+    Ok(())
+}

@@ -12,7 +12,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 
-use crate::job::JobSnapshot;
+use crate::job::{JobSnapshot, MemoryBudget, MemoryLease};
 
 use super::{
     Cache, Lease,
@@ -20,8 +20,9 @@ use super::{
     error::{CacheError, Result},
     filesystem::HeldDirectory,
     key::StageKey,
-    manager::now_ns,
+    manager::{column_length, now_ns},
     manifest::safe_entry_path,
+    memory,
     model::{CheckpointStatus, JOB_SNAPSHOT_VERSION, supports_job_snapshot_version},
     retired,
 };
@@ -30,6 +31,10 @@ const ENVELOPE_VERSION: u32 = 1;
 const COMPONENT_NAMES: [&str; 3] = ["graph", "blobs", "executor"];
 const MAX_RELATIVE_PATH_BYTES: i64 = 256;
 const RESERVATION_BLOCK: u64 = 4096;
+const STREAM_BUFFER_BYTES: usize = 8 * 1024;
+const WRITER_MEMORY_BYTES: u64 = 3 * 8 * 1024 + 4096;
+const HASH_BUFFER_BYTES: usize = 16 * 1024;
+const HASH_MEMORY_BYTES: u64 = 16 * 1024 + 4096;
 
 /// Bounds for the encoded case streams, executor stream, and complete JSON envelope
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -212,13 +217,17 @@ impl Write for ComponentWriter {
 }
 
 /// A verified execution generation pinned by its exclusive lease
+///
+/// When a memory budget is attached, the decoded snapshot and metadata remain charged until drop
 pub struct ActiveExecution<'lease> {
     snapshot: JobSnapshot,
     metadata: Value,
     graph: File,
     blobs: File,
     executor: File,
+    executor_bytes: u64,
     _lease: PhantomData<&'lease Lease>,
+    _memory: Option<MemoryLease>,
 }
 
 impl std::fmt::Debug for ActiveExecution<'_> {
@@ -240,6 +249,12 @@ impl ActiveExecution<'_> {
     #[must_use]
     pub const fn metadata(&self) -> &Value {
         &self.metadata
+    }
+
+    /// Returns the executor stream size verified for this generation
+    #[must_use]
+    pub const fn executor_bytes(&self) -> u64 {
+        self.executor_bytes
     }
 
     /// Returns graph, blob, and executor readers in that order
@@ -281,9 +296,10 @@ impl Lease {
     /// Saves all execution streams and the snapshot as one durable generation
     ///
     /// The caller must validate recipes and exclude secret material before invoking this method
+    /// The caller also accounts for metadata while constructing it inside the callback
     ///
     /// # Errors
-    /// Returns an error for quota, I/O, integrity, serialization, or database failures
+    /// Returns an error for memory admission, quota, I/O, integrity, serialization, or database failures
     pub fn save_active<F>(
         &mut self,
         snapshot: &JobSnapshot,
@@ -297,6 +313,9 @@ impl Lease {
             return Err(CacheError::CorruptCheckpoint);
         }
         self.cache.inner.check_locations()?;
+        let memory_budget = self.cache.inner.memory_budget();
+        // These buffers are owned by the cache, independently of the caller's codecs
+        let _writer_memory = memory::reserve(memory_budget, WRITER_MEMORY_BYTES)?;
         self.cache.clear_execution_debris(self.key.as_str())?;
         let staging_key = self
             .cache
@@ -323,8 +342,8 @@ impl Lease {
             available: 0,
             failure: None,
         }));
-        let (envelope_json, snapshot_json, total) =
-            write_generation(&directory, &budget, snapshot, limits, write)?;
+        let prepared =
+            write_generation(&directory, &budget, snapshot, limits, memory_budget, write)?;
         let entry_root = self
             .cache
             .inner
@@ -341,9 +360,9 @@ impl Lease {
             self,
             &token,
             &relative,
-            &envelope_json,
-            &snapshot_json,
-            total,
+            &prepared.envelope_json,
+            &prepared.snapshot_json,
+            prepared.bytes,
         )?;
         if let Some(old) = old {
             // The new pointer is durable before the old generation can be removed
@@ -355,32 +374,45 @@ impl Lease {
     /// Opens only the committed generation and verifies all component hashes before returning
     ///
     /// # Errors
-    /// Returns an error when limits, paths, metadata, or component integrity checks fail
+    /// Returns an error when memory admission, limits, paths, metadata, or integrity checks fail
     pub fn load_active(
         &self,
         limits: ExecutionCheckpointLimits,
     ) -> Result<Option<ActiveExecution<'_>>> {
         self.cache.inner.check_locations()?;
+        let memory_budget = self.cache.inner.memory_budget();
         let mut connection =
             database::open_connection(&self.cache.inner.state_root, Durability::Checkpoint)?;
         let transaction = connection.transaction()?;
-        let lengths = transaction.query_row(
-            "SELECT length(CAST(relative_path AS BLOB)), length(CAST(envelope_json AS BLOB)), bytes FROM executions WHERE key = ?1",
-            [self.key.as_str()], |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?, row.get::<_, i64>(2)?)),
-        ).optional()?;
-        let Some((path_len, envelope_len, recorded_bytes)) = lengths else {
+        let rowid = transaction
+            .query_row(
+                "SELECT rowid FROM executions WHERE key = ?1",
+                [self.key.as_str()],
+                |row| row.get::<_, i64>(0),
+            )
+            .optional()?;
+        let Some(rowid) = rowid else {
             return Ok(None);
         };
-        let envelope_size = u64::try_from(envelope_len).map_err(|_| corrupt())?;
-        if !(1..=MAX_RELATIVE_PATH_BYTES).contains(&path_len)
+        let path_len = column_length(&transaction, "executions", "relative_path", rowid)?;
+        let envelope_size = column_length(&transaction, "executions", "envelope_json", rowid)?;
+        if path_len == 0
+            || path_len > u64::try_from(MAX_RELATIVE_PATH_BYTES).map_err(|_| corrupt())?
             || envelope_size > limits.max_metadata_bytes
         {
             return Err(corrupt());
         }
-        let (relative, json): (String, String) = transaction.query_row(
-            "SELECT relative_path, envelope_json FROM executions WHERE key = ?1",
-            [self.key.as_str()],
-            |row| Ok((row.get(0)?, row.get(1)?)),
+        // Admit the retained decoded envelope and temporary strings before retrieving either
+        let retained = memory::reserve(memory_budget, memory::metadata_charge(envelope_size)?)?;
+        let transient_bytes = memory::serialized_charge(envelope_size)?
+            .checked_add(path_len.checked_mul(2).ok_or(CacheError::SizeOverflow)?)
+            .ok_or(CacheError::SizeOverflow)?;
+        let transient = memory::reserve(memory_budget, transient_bytes)?;
+        let scratch = memory::reserve(memory_budget, HASH_MEMORY_BYTES)?;
+        let (relative, json, recorded_bytes): (String, String, i64) = transaction.query_row(
+            "SELECT relative_path, envelope_json, bytes FROM executions WHERE rowid = ?1",
+            [rowid],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
         )?;
         let envelope: Envelope = serde_json::from_str(&json).map_err(|_| corrupt())?;
         if envelope.version != ENVELOPE_VERSION
@@ -389,45 +421,90 @@ impl Lease {
         {
             return Err(corrupt());
         }
-        let [graph, blobs, executor] = &envelope.components;
-        let encoded = graph.bytes.checked_add(blobs.bytes).ok_or_else(corrupt)?;
-        let total = encoded
-            .checked_add(executor.bytes)
-            .and_then(|size| size.checked_add(envelope_size))
-            .ok_or_else(corrupt)?;
-        if encoded > limits.max_encoded_bytes
-            || executor.bytes > limits.max_executor_bytes
-            || u64::try_from(recorded_bytes).ok() != Some(total)
-        {
-            return Err(corrupt());
-        }
-        let path = safe_entry_path(
-            self.cache.inner.entries.path(),
-            self.key.as_str(),
+        let streams = verify_streams(
+            self,
             &relative,
+            &envelope,
+            envelope_size,
+            recorded_bytes,
+            limits,
         )?;
-        let generation = path
-            .file_name()
-            .and_then(|name| name.to_str())
-            .ok_or_else(corrupt)?;
-        if !generation.starts_with("active-") {
-            return Err(corrupt());
-        }
-        let root = self.cache.inner.entries.open_child(self.key.as_str())?;
-        let directory = root.open_child(generation)?;
-        let graph = verified_component(&directory, COMPONENT_NAMES[0], graph)?;
-        let blobs = verified_component(&directory, COMPONENT_NAMES[1], blobs)?;
-        let executor = verified_component(&directory, COMPONENT_NAMES[2], executor)?;
         transaction.commit()?;
+        drop(json);
+        drop(relative);
+        drop(transient);
+        drop(scratch);
         Ok(Some(ActiveExecution {
             snapshot: envelope.snapshot,
             metadata: envelope.metadata,
-            graph,
-            blobs,
-            executor,
+            graph: streams.graph,
+            blobs: streams.blobs,
+            executor: streams.executor,
+            executor_bytes: streams.executor_bytes,
             _lease: PhantomData,
+            _memory: retained,
         }))
     }
+}
+
+struct VerifiedStreams {
+    graph: File,
+    blobs: File,
+    executor: File,
+    executor_bytes: u64,
+}
+
+fn verify_streams(
+    lease: &Lease,
+    relative: &str,
+    envelope: &Envelope,
+    envelope_size: u64,
+    recorded_bytes: i64,
+    limits: ExecutionCheckpointLimits,
+) -> Result<VerifiedStreams> {
+    let [graph, blobs, executor] = &envelope.components;
+    let encoded = graph.bytes.checked_add(blobs.bytes).ok_or_else(corrupt)?;
+    let total = encoded
+        .checked_add(executor.bytes)
+        .and_then(|size| size.checked_add(envelope_size))
+        .ok_or_else(corrupt)?;
+    if encoded > limits.max_encoded_bytes
+        || executor.bytes > limits.max_executor_bytes
+        || u64::try_from(recorded_bytes).ok() != Some(total)
+    {
+        return Err(corrupt());
+    }
+    let path = safe_entry_path(
+        lease.cache.inner.entries.path(),
+        lease.key.as_str(),
+        relative,
+    )?;
+    let generation = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or_else(corrupt)?;
+    if !generation.starts_with("active-") {
+        return Err(corrupt());
+    }
+    let root = lease.cache.inner.entries.open_child(lease.key.as_str())?;
+    let directory = root.open_child(generation)?;
+    let graph = verified_component(&directory, COMPONENT_NAMES[0], graph)?;
+    let blobs = verified_component(&directory, COMPONENT_NAMES[1], blobs)?;
+    let executor_bytes = executor.bytes;
+    let executor = verified_component(&directory, COMPONENT_NAMES[2], executor)?;
+    Ok(VerifiedStreams {
+        graph,
+        blobs,
+        executor,
+        executor_bytes,
+    })
+}
+
+struct PreparedGeneration {
+    envelope_json: String,
+    snapshot_json: String,
+    bytes: u64,
+    _memory: Option<MemoryLease>,
 }
 
 fn write_generation<F>(
@@ -435,14 +512,15 @@ fn write_generation<F>(
     budget: &Rc<RefCell<Budget>>,
     snapshot: &JobSnapshot,
     limits: ExecutionCheckpointLimits,
+    memory_budget: Option<&MemoryBudget>,
     write: F,
-) -> Result<(String, String, u64)>
+) -> Result<PreparedGeneration>
 where
     F: FnOnce(&mut ExecutionWriter) -> Result<Value>,
 {
     let component = |name: &str, executor| -> Result<ComponentWriter> {
         Ok(ComponentWriter {
-            file: BufWriter::new(directory.create_new_file(name)?),
+            file: BufWriter::with_capacity(STREAM_BUFFER_BYTES, directory.create_new_file(name)?),
             hash: Sha256::new(),
             bytes: 0,
             executor,
@@ -476,6 +554,18 @@ where
         metadata: &metadata,
         components: &components,
     };
+    let envelope_memory = if memory_budget.is_some() {
+        let encoded = memory::json_size(&envelope)?;
+        if encoded > limits.max_metadata_bytes {
+            return Err(CacheError::MetadataTooLarge {
+                limit_bytes: usize::try_from(limits.max_metadata_bytes).unwrap_or(usize::MAX),
+                actual_bytes: usize::try_from(encoded).unwrap_or(usize::MAX),
+            });
+        }
+        memory::reserve(memory_budget, memory::checkpoint_charge(encoded)?)?
+    } else {
+        None
+    };
     let envelope_json = encode_envelope(&envelope, limits.max_metadata_bytes)?;
     let envelope_bytes =
         u64::try_from(envelope_json.len()).map_err(|_| CacheError::SizeOverflow)?;
@@ -500,7 +590,12 @@ where
     let total = components.iter().try_fold(envelope_bytes, |sum, item| {
         sum.checked_add(item.bytes).ok_or(CacheError::SizeOverflow)
     })?;
-    Ok((envelope_json, snapshot_json, total))
+    Ok(PreparedGeneration {
+        envelope_json,
+        snapshot_json,
+        bytes: total,
+        _memory: envelope_memory,
+    })
 }
 
 struct WrittenFile {
@@ -621,7 +716,7 @@ fn verified_component(directory: &HeldDirectory, name: &str, expected: &Componen
         return Err(corrupt());
     }
     let mut hasher = Sha256::new();
-    let mut buffer = [0_u8; 16 * 1024];
+    let mut buffer = [0_u8; HASH_BUFFER_BYTES];
     let mut remaining = expected.bytes;
     while remaining > 0 {
         let capacity =

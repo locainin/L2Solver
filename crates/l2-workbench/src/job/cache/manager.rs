@@ -1336,7 +1336,12 @@ fn entry_lengths(connection: &Connection, rowid: i64) -> Result<EntryLengths> {
     })
 }
 
-fn column_length(connection: &Connection, table: &str, column: &str, rowid: i64) -> Result<u64> {
+pub(super) fn column_length(
+    connection: &Connection,
+    table: &str,
+    column: &str,
+    rowid: i64,
+) -> Result<u64> {
     // Incremental blob handles expose encoded length without materializing the column
     let blob = connection.blob_open("main", table, column, rowid, true)?;
     u64::try_from(blob.len()).map_err(|_| CacheError::SizeOverflow)
