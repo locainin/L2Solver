@@ -187,6 +187,19 @@ fn database_failure_does_not_replace_the_committed_generation_or_snapshot()
             .snapshot,
         first
     );
+    drop(active);
+    database.execute_batch("DROP TRIGGER reject_execution_update;")?;
+    lease.save_active(&later, limits(), |writer| {
+        writer.streams().2.write_all(b"second")?;
+        Ok(json!({"generation": 2}))
+    })?;
+    assert_eq!(
+        lease
+            .load_active(limits())?
+            .ok_or("retry did not commit")?
+            .snapshot(),
+        &later
+    );
     Ok(())
 }
 
@@ -317,6 +330,8 @@ fn pending_writes_share_the_global_quota() -> Result<(), Box<dyn Error>> {
         })
     });
     written_rx.recv()?;
+    assert!(cache.stats()?.entry_bytes >= 12_000);
+    cache.prune()?;
     assert!(cache.stats()?.entry_bytes >= 12_000);
     let mut second = cache.lease(&second_key)?;
     let caps = ExecutionCheckpointLimits {
@@ -512,5 +527,165 @@ fn large_checkpoint_evicts_unpinned_results_when_its_actual_bytes_need_space()
             .is_none()
     );
     assert!(lease.load_active(caps)?.is_some());
+    Ok(())
+}
+
+#[cfg(unix)]
+#[test]
+fn symlinked_checkpoint_component_is_rejected_without_touching_its_target()
+-> Result<(), Box<dyn Error>> {
+    let temporary = tempfile::tempdir()?;
+    let cache = cache_at(temporary.path(), 64 * 1024)?;
+    let key = stage_key("symlink-component")?;
+    let mut lease = cache.lease(&key)?;
+    lease.save_active(&Job::new("symlink").snapshot()?, limits(), |writer| {
+        writer.streams().2.write_all(b"original")?;
+        Ok(json!({}))
+    })?;
+    let database = rusqlite::Connection::open(temporary.path().join("state/cache.sqlite3"))?;
+    let relative: String = database.query_row(
+        "SELECT relative_path FROM executions WHERE key = ?1",
+        [key.as_str()],
+        |row| row.get(0),
+    )?;
+    let component = temporary
+        .path()
+        .join("cache/entries")
+        .join(relative)
+        .join("executor");
+    let target = temporary.path().join("outside");
+    std::fs::write(&target, b"original")?;
+    std::fs::remove_file(&component)?;
+    std::os::unix::fs::symlink(&target, &component)?;
+    assert!(lease.load_active(limits()).is_err());
+    assert_eq!(std::fs::read(target)?, b"original");
+    Ok(())
+}
+
+#[test]
+fn oversized_metadata_does_not_replace_the_committed_generation() -> Result<(), Box<dyn Error>> {
+    let temporary = tempfile::tempdir()?;
+    let cache = cache_at(temporary.path(), 64 * 1024)?;
+    let key = stage_key("oversized-execution-metadata")?;
+    let mut lease = cache.lease(&key)?;
+    let snapshot = Job::new("bounded metadata").snapshot()?;
+    lease.save_active(&snapshot, limits(), |_| Ok(json!({"generation": 1})))?;
+    let result = lease.save_active(&snapshot, limits(), |_| {
+        Ok(json!({"huge": "x".repeat(10_000)}))
+    });
+    assert!(matches!(result, Err(CacheError::MetadataTooLarge { .. })));
+    assert_eq!(
+        lease
+            .load_active(limits())?
+            .ok_or("generation was lost")?
+            .metadata(),
+        &json!({"generation": 1})
+    );
+    Ok(())
+}
+
+#[test]
+fn active_execution_keeps_its_stage_pinned_even_if_the_legacy_checkpoint_is_completed()
+-> Result<(), Box<dyn Error>> {
+    let temporary = tempfile::tempdir()?;
+    let cache = cache_at(temporary.path(), 64 * 1024)?;
+    let key = stage_key("execution-pins-stage")?;
+    super::write_entry(&cache, &key, b"prior stage")?;
+    let snapshot = Job::new("pinned").snapshot()?;
+    let mut lease = cache.lease(&key)?;
+    lease.save_active(&snapshot, limits(), |_| Ok(json!({})))?;
+    drop(lease);
+    cache.write_checkpoint(
+        &key,
+        &snapshot,
+        l2_workbench::job::cache::CheckpointStatus::Complete,
+    )?;
+    cache.clear()?;
+    assert!(
+        cache
+            .lookup(
+                &key,
+                l2_workbench::job::cache::CacheReadPolicy::CompleteOnly
+            )?
+            .is_some()
+    );
+    assert!(cache.lease(&key)?.load_active(limits())?.is_some());
+    Ok(())
+}
+
+#[test]
+fn four_simultaneous_writers_cannot_reserve_more_than_the_global_quota()
+-> Result<(), Box<dyn Error>> {
+    use std::sync::{Arc, Condvar, Mutex, mpsc};
+    use std::time::Duration;
+
+    let temporary = tempfile::tempdir()?;
+    let cache = cache_at(temporary.path(), 20_000)?;
+    let gate = Arc::new((Mutex::new(false), Condvar::new()));
+    let (events_tx, events_rx) = mpsc::channel();
+    let mut threads = Vec::new();
+    for number in 0_u8..4 {
+        let cache = cache.clone();
+        let key = stage_key(&format!("four-writers-{number}"))?;
+        let gate = Arc::clone(&gate);
+        let events = events_tx.clone();
+        threads.push(std::thread::spawn(move || -> Result<(), CacheError> {
+            let mut lease = cache.lease(&key)?;
+            let snapshot = Job::new("concurrent")
+                .snapshot()
+                .map_err(|_| CacheError::InvalidInput("snapshot failed"))?;
+            let caps = ExecutionCheckpointLimits {
+                max_encoded_bytes: 8_000,
+                ..limits()
+            };
+            lease.save_active(&snapshot, caps, |writer| {
+                let written = writer.streams().0.write_all(&vec![number; 6_000]);
+                events
+                    .send(written.is_ok())
+                    .map_err(|_| CacheError::InvalidInput("coordination failed"))?;
+                written?;
+                let (lock, wake) = &*gate;
+                let mut released = lock
+                    .lock()
+                    .map_err(|_| CacheError::InvalidInput("coordination failed"))?;
+                while !*released {
+                    released = wake
+                        .wait(released)
+                        .map_err(|_| CacheError::InvalidInput("coordination failed"))?;
+                }
+                drop(released);
+                Ok(json!({}))
+            })
+        }));
+    }
+    drop(events_tx);
+    let mut accepted = 0;
+    let mut event_error = None;
+    for _ in 0..4 {
+        match events_rx.recv_timeout(Duration::from_secs(20)) {
+            Ok(true) => accepted += 1,
+            Ok(false) => {}
+            Err(error) => {
+                event_error = Some(error);
+                break;
+            }
+        }
+    }
+    let reserved = cache.stats()?.entry_bytes;
+    let (lock, wake) = &*gate;
+    *lock.lock().map_err(|_| "coordination lock poisoned")? = true;
+    wake.notify_all();
+    for thread in threads {
+        match thread.join().map_err(|_| "writer thread panicked")? {
+            Ok(()) | Err(CacheError::QuotaExceeded { .. }) => {}
+            Err(error) => return Err(error.into()),
+        }
+    }
+    if let Some(error) = event_error {
+        return Err(error.into());
+    }
+    assert_eq!(accepted, 3);
+    assert_eq!(reserved, 18_000);
+    assert!(cache.stats()?.entry_bytes <= 20_000);
     Ok(())
 }
