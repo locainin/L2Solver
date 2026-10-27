@@ -25,6 +25,7 @@ fn range_source_admission_and_analysis_read_content_once() -> Result<(), Box<dyn
     use std::process::Command;
 
     const CHILD_MARKER: &str = "L2_TEST_SINGLE_RANGE_PASS_CHILD";
+    const LENGTH: u64 = 70 * 1024 * 1024;
     if std::env::var_os(CHILD_MARKER).is_none() {
         let output = Command::new(std::env::current_exe()?)
             .args(["refine::tests::range_analysis::range_source_admission_and_analysis_read_content_once", "--exact"])
@@ -44,7 +45,6 @@ fn range_source_admission_and_analysis_read_content_once() -> Result<(), Box<dyn
         .write(true)
         .create_new(true)
         .open(&input)?;
-    const LENGTH: u64 = 70 * 1024 * 1024;
     file.set_len(LENGTH)?;
     let set = prepare_input_set(&input)?;
     let job = Job::new("single range pass");
