@@ -268,7 +268,7 @@ pub struct RecoveryOptions {
     /// Select the search effort: fast, normal, or deep
     #[arg(long, value_enum, default_value = "normal")]
     pub profile: RecoveryProfile,
-    /// Recompute cached recovery results before using them
+    /// Recompute and atomically replace owned output
     #[arg(long)]
     pub refresh: bool,
     /// Skip recovery cache reads and writes

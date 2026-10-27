@@ -35,9 +35,9 @@ Exit status:
 const DEV_HELP: &str =
     "Developer:\n  l2solver dev --help       Internal diagnostics and fixture tooling";
 
-const EXTRACT_HELP: &str = r"The default is CAPTURE.export. Matching owned output is reused; --refresh replaces it atomically. Unrelated destinations are refused. Standard input requires --output and skips TShark.
+const EXTRACT_HELP: &str = r"The default is CAPTURE.export. Matching owned output is reused. --refresh atomically replaces owned output, even when its previous input differs. Unrelated destinations are refused. Standard input requires --output and skips TShark.
 
-Profile defaults to normal. Progress defaults to automatic terminal detection. Cached work is reused. --refresh recomputes results, --no-cache skips reads and writes, and --strict-cache checks cached content in full.
+Progress defaults to automatic terminal detection. --refresh recomputes results, --no-cache skips reads and writes, and --strict-cache checks cached content in full.
 
 TShark enrichment is optional. If TShark is missing or object export fails, available artifacts are still published. --require-tshark requires successful enrichment. Incomplete native analysis or a required TShark failure returns status 3. Packets outside discovery scope are reported without failing extraction. summary.txt shows native and TShark status separately.
 

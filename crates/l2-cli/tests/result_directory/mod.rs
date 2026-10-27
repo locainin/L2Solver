@@ -7,6 +7,8 @@ use crate::result_directory::{ResultDirectory, ResultIdentity, ResultKind};
 
 type TestResult<T = ()> = Result<T, Box<dyn Error>>;
 
+mod publish;
+
 struct Fixture {
     _root: TempDir,
     input: PathBuf,

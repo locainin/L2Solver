@@ -24,7 +24,7 @@ fn extract_help_describes_recovery_and_optional_enrichment()
         "CAPTURE.export",
         "--output",
         "Matching owned output is reused",
-        "--refresh replaces it atomically",
+        "--refresh atomically replaces owned output, even when its previous input differs",
         "Standard input",
         "Incomplete native analysis",
         "TShark is missing",
