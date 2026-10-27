@@ -6,6 +6,10 @@ mod publish;
 mod directory;
 
 #[cfg(target_os = "linux")]
+#[path = "publish/faults.rs"]
+mod faults;
+
+#[cfg(target_os = "linux")]
 mod linux {
     use super::publish::{
         self,
