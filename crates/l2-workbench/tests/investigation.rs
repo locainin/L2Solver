@@ -14,6 +14,8 @@ mod ftp;
 mod large_runs;
 #[path = "investigation/link_type.rs"]
 mod link_type;
+#[path = "investigation/memory.rs"]
+mod memory;
 #[path = "investigation/parser_validity.rs"]
 mod parser_validity;
 #[path = "investigation/provenance.rs"]

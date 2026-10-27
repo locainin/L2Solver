@@ -1,7 +1,10 @@
 use super::{Result, Store, invalid, packets};
 use crate::{
     evidence::{FLOW_SELECTION_KIND, FLOW_SELECTION_PREDICATE},
-    investigation::{BuildInput, BuildResult, Record, build_selected_with_limits},
+    investigation::{
+        BuildInput, BuildResult, Record, build_selected_with_limits,
+        build_selected_with_limits_and_memory,
+    },
     reconstruction::{Limits, Reconstructor, RecordRetentionLimit, RecordRetentionStatus},
 };
 use serde::Serialize;
@@ -61,21 +64,18 @@ impl Store {
             self.retain_flow_cohort(&selection.source, &selection.flow_ids, limits)?;
         let retained = u64::try_from(records.len())?;
         let omitted = total - retained;
-        let mut result = build_selected_with_limits(
-            BuildInput {
-                label: &selection.source.label,
-                length: selection.source.bytes,
-                sha256_hex: selection
-                    .source
-                    .source_id
-                    .strip_prefix("sha256:")
-                    .ok_or_else(|| invalid("invalid indexed source hash"))?,
-                records: &records,
-                frames_seen: selection.source.packets,
-            },
-            total,
-            limits,
-        )?;
+        let input = BuildInput {
+            label: &selection.source.label,
+            length: selection.source.bytes,
+            sha256_hex: selection
+                .source
+                .source_id
+                .strip_prefix("sha256:")
+                .ok_or_else(|| invalid("invalid indexed source hash"))?,
+            records: &records,
+            frames_seen: selection.source.packets,
+        };
+        let mut result = build_selected_for_store(input, total, limits, self.memory_budget())?;
         crate::capture_collection::apply_to_case(
             &mut result,
             &selection.source.source_id,
@@ -324,15 +324,7 @@ fn visit_flow_page_tail(
             .pages
             .checked_add(1)
             .ok_or_else(|| invalid("flow page count overflowed"))?;
-        let page = build_flow_page(
-            request.source,
-            request.flow,
-            request.total_records,
-            request.prefix_records,
-            page_index,
-            &records,
-            request.limits,
-        )?;
+        let page = build_flow_page(request, page_index, &records, store.memory_budget())?;
         coverage.pages = page_index;
         coverage.retained_records = coverage
             .retained_records
@@ -469,30 +461,25 @@ fn flow_page_fits(
 }
 
 fn build_flow_page(
-    source: &super::Source,
-    flow: i64,
-    total_records: u64,
-    prefix_records: u64,
+    request: FlowPageRequest<'_>,
     page_index: u64,
     records: &[Record],
-    limits: Limits,
+    budget: Option<&crate::job::MemoryBudget>,
 ) -> Result<super::FlowPageAnalysis> {
+    let source = request.source;
     let selected_records = u64::try_from(records.len())?;
     let (first_packet, last_packet) = flow_page_bounds(records)?;
-    let mut result = build_selected_with_limits(
-        BuildInput {
-            label: &source.label,
-            length: source.bytes,
-            sha256_hex: source
-                .source_id
-                .strip_prefix("sha256:")
-                .ok_or_else(|| invalid("invalid indexed source hash"))?,
-            records,
-            frames_seen: source.packets,
-        },
-        selected_records,
-        limits,
-    )?;
+    let input = BuildInput {
+        label: &source.label,
+        length: source.bytes,
+        sha256_hex: source
+            .source_id
+            .strip_prefix("sha256:")
+            .ok_or_else(|| invalid("invalid indexed source hash"))?,
+        records,
+        frames_seen: source.packets,
+    };
+    let mut result = build_selected_for_store(input, selected_records, request.limits, budget)?;
     crate::capture_collection::apply_to_case(
         &mut result,
         &source.source_id,
@@ -508,12 +495,12 @@ fn build_flow_page(
         .checked_sub(retained_records)
         .ok_or_else(|| invalid("flow page retained more records than selected"))?;
     let metadata = FlowPageMetadata {
-        flow,
+        flow: request.flow,
         page_index,
         first_packet,
         last_packet,
-        flow_selected_records: total_records,
-        prefix_records_skipped: prefix_records,
+        flow_selected_records: request.total_records,
+        prefix_records_skipped: request.prefix_records,
         selected_records,
         retained_records,
         omitted_records,
@@ -534,6 +521,18 @@ fn build_flow_page(
         omitted_records,
         result,
     })
+}
+
+fn build_selected_for_store(
+    input: BuildInput<'_>,
+    selected_records: u64,
+    limits: Limits,
+    budget: Option<&crate::job::MemoryBudget>,
+) -> Result<BuildResult> {
+    budget.map_or_else(
+        || build_selected_with_limits(input, selected_records, limits),
+        |budget| build_selected_with_limits_and_memory(input, selected_records, limits, budget),
+    )
 }
 
 fn flow_page_bounds(records: &[Record]) -> Result<(u32, u32)> {

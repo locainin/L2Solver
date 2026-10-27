@@ -28,6 +28,9 @@ mod flow_frames;
 #[path = "store/multi_flow.rs"]
 mod multi_flow;
 
+#[path = "store/memory.rs"]
+mod memory;
+
 #[path = "store/scopes.rs"]
 mod scopes;
 

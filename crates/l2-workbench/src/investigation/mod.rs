@@ -14,6 +14,7 @@ use scope::Scope;
 
 use crate::{
     evidence::{Case, EvidenceError},
+    job::MemoryBudget,
     reconstruction::{InputSelection, Limits, ReconstructionReport, Reconstructor},
 };
 use l2_capture::CapturedFrame;
@@ -57,7 +58,7 @@ pub fn build_with_limits(
     input: BuildInput<'_>,
     limits: Limits,
 ) -> Result<BuildResult, Box<dyn Error>> {
-    build_scoped(input, Scope::capture(input.frames_seen), limits)
+    build_scoped(input, Scope::capture(input.frames_seen), limits, None)
 }
 
 /// Analyze a complete selected record window while preserving original record numbers
@@ -68,7 +69,12 @@ pub fn build_window(
     input: BuildInput<'_>,
     window: RecordWindow,
 ) -> Result<BuildResult, Box<dyn Error>> {
-    build_scoped(input, Scope::window(input, window)?, Limits::default())
+    build_scoped(
+        input,
+        Scope::window(input, window)?,
+        Limits::default(),
+        None,
+    )
 }
 
 /// Analyze explicitly selected records while keeping their original packet numbers
@@ -95,15 +101,45 @@ pub fn build_selected_with_limits(
     selected_frames: u64,
     limits: Limits,
 ) -> Result<BuildResult, Box<dyn Error>> {
-    build_scoped(input, Scope::selection(input, selected_frames)?, limits)
+    build_scoped(
+        input,
+        Scope::selection(input, selected_frames)?,
+        limits,
+        None,
+    )
+}
+
+/// Analyze selected records with a shared budget for the retained evidence Case
+///
+/// Reconstruction inputs, reports, and parser scratch require their own charges
+///
+/// # Errors
+/// Returns an admission error or any selected-record and reconstruction error
+pub fn build_selected_with_limits_and_memory(
+    input: BuildInput<'_>,
+    selected_frames: u64,
+    limits: Limits,
+    budget: &MemoryBudget,
+) -> Result<BuildResult, Box<dyn Error>> {
+    build_scoped(
+        input,
+        Scope::selection(input, selected_frames)?,
+        limits,
+        Some(budget),
+    )
 }
 
 fn build_scoped(
     input: BuildInput<'_>,
     scope: Scope,
     limits: Limits,
+    budget: Option<&MemoryBudget>,
 ) -> Result<BuildResult, Box<dyn Error>> {
-    let mut case = Case::new();
+    let mut case = if let Some(budget) = budget {
+        Case::with_memory_budget(budget)?
+    } else {
+        Case::new()
+    };
     let source = case.add_source(input.label, "capture", input.length, input.sha256_hex, None)?;
     let mut reconstruction = Reconstructor::with_limits_at(limits, scope.first)?;
     let mut records = BTreeMap::new();

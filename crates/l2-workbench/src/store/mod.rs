@@ -15,6 +15,7 @@ mod scopes;
 mod shared;
 mod verify;
 
+use crate::job::MemoryBudget;
 pub use model::{
     Flow, FlowCohortAnalysis, FlowCohortCoverage, FlowPageAnalysis, FlowPageCoverage,
     FlowPageError, IngestReceipt, Inventory, Options, Packet, Relationship, SharedFactKind,
@@ -39,6 +40,7 @@ pub struct Store {
     connection: Connection,
     directory: paths::Directory,
     sources: paths::Directory,
+    memory_budget: Option<MemoryBudget>,
 }
 
 impl Store {
@@ -66,6 +68,7 @@ impl Store {
             connection,
             directory,
             sources,
+            memory_budget: None,
         })
     }
 
@@ -91,7 +94,26 @@ impl Store {
             connection,
             directory,
             sources,
+            memory_budget: None,
         })
+    }
+
+    /// Attach the shared budget used by subsequently constructed evidence Cases
+    ///
+    /// # Errors
+    /// Returns an error if a budget has already been attached to this Store
+    pub fn set_memory_budget(&mut self, budget: MemoryBudget) -> Result<()> {
+        if self.memory_budget.is_some() {
+            return Err(invalid("store memory budget is already set"));
+        }
+        self.memory_budget = Some(budget);
+        Ok(())
+    }
+
+    /// Return the budget used for evidence Cases, if one was attached
+    #[must_use]
+    pub const fn memory_budget(&self) -> Option<&MemoryBudget> {
+        self.memory_budget.as_ref()
     }
 }
 
