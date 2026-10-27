@@ -1,6 +1,9 @@
 use super::*;
-use l2_workbench::job::cache::CacheError;
-use std::io::{self, Write};
+use l2_workbench::{
+    evidence::{Case, CaseSnapshotLimits, EvidenceError},
+    job::cache::CacheError,
+};
+use std::io::{self, Cursor, Write};
 
 #[test]
 fn held_write_lease_recomputes_without_cache_and_strict_mode_fails() -> Result<(), Box<dyn Error>> {
@@ -147,26 +150,24 @@ fn cache_quota_commit_failure_preserves_recovery_and_is_fatal_in_strict_mode()
 }
 
 #[test]
-fn case_writer_limit_uses_the_case_size_fallback() {
-    let mut limited_writer = super::super::LimitedWriter {
-        inner: Vec::new(),
-        remaining: 3,
-        failure: None,
-    };
-    assert!(limited_writer.write_all(b"payload").is_err());
-    assert_eq!(
-        limited_writer.failure,
-        Some(super::super::LimitedWriterFailure::CaseJsonTooLarge)
-    );
-    let size_kind = super::super::cache_commit_fallback_kind(
-        &super::super::LimitedWriterFailure::CaseJsonTooLarge,
-    );
+fn snapshot_limit_uses_the_case_size_fallback() -> Result<(), Box<dyn Error>> {
+    let (case, _) = case_and_scope(b"4142", 3)?;
+    let error = case
+        .write_snapshot(
+            &mut Vec::new(),
+            &mut Vec::new(),
+            CaseSnapshotLimits::new(0, 0),
+        )
+        .err()
+        .ok_or("zero storage allowance should reject the snapshot")?;
+    assert!(matches!(error, EvidenceError::CaseTooLarge { .. }));
+    let size_kind = super::super::cache_commit_fallback_kind(&error);
     assert_eq!(size_kind, CacheFallbackKind::CommitCaseTooLarge);
+    Ok(())
 }
 
 #[test]
-fn limited_writer_retries_interrupted_writes_without_a_fatal_marker() -> Result<(), Box<dyn Error>>
-{
+fn case_snapshot_retries_interrupted_graph_and_pack_writes() -> Result<(), Box<dyn Error>> {
     struct InterruptedOnceWriter {
         interrupted: bool,
         written: Vec<u8>,
@@ -187,38 +188,39 @@ fn limited_writer_retries_interrupted_writes_without_a_fatal_marker() -> Result<
         }
     }
 
-    let mut limited_writer = super::super::LimitedWriter {
-        inner: InterruptedOnceWriter {
-            interrupted: false,
-            written: Vec::new(),
-        },
-        remaining: 16,
-        failure: None,
-    };
-    limited_writer.write_all(b"payload")?;
-
-    assert_eq!(limited_writer.inner.written, b"payload");
-    assert_eq!(limited_writer.failure, None);
-
     let (case, _) = case_and_scope(b"4142", 3)?;
-    let expected_json = case.to_json()?;
-    let mut case_writer = super::super::LimitedWriter {
-        inner: InterruptedOnceWriter {
-            interrupted: false,
-            written: Vec::new(),
-        },
-        remaining: usize::MAX,
-        failure: None,
+    let limits = CaseSnapshotLimits::new(1024 * 1024, 1024 * 1024);
+    let mut graph_writer = InterruptedOnceWriter {
+        interrupted: false,
+        written: Vec::new(),
     };
-    case.write_json(&mut case_writer)?;
+    let mut pack_writer = InterruptedOnceWriter {
+        interrupted: false,
+        written: Vec::new(),
+    };
+    let usage = case.write_snapshot(&mut graph_writer, &mut pack_writer, limits)?;
 
-    assert_eq!(case_writer.inner.written, expected_json);
-    assert_eq!(case_writer.failure, None);
+    assert!(graph_writer.interrupted);
+    assert!(pack_writer.interrupted);
+    assert_eq!(
+        usage.graph_bytes,
+        u64::try_from(graph_writer.written.len())?
+    );
+    assert_eq!(
+        usage.blob_pack_bytes,
+        u64::try_from(pack_writer.written.len())?
+    );
+    let (parsed, _usage) = Case::from_snapshot(
+        Cursor::new(graph_writer.written),
+        Cursor::new(pack_writer.written),
+        limits,
+    )?;
+    assert_eq!(parsed, case);
     Ok(())
 }
 
 #[test]
-fn case_writer_io_failure_uses_the_storage_fallback() -> Result<(), Box<dyn Error>> {
+fn case_snapshot_io_failure_uses_the_storage_fallback() -> Result<(), Box<dyn Error>> {
     struct FailingWriter;
 
     impl Write for FailingWriter {
@@ -231,22 +233,17 @@ fn case_writer_io_failure_uses_the_storage_fallback() -> Result<(), Box<dyn Erro
         }
     }
 
-    let mut io_writer = super::super::LimitedWriter {
-        inner: FailingWriter,
-        remaining: 16,
-        failure: None,
-    };
-    assert!(io_writer.write_all(b"x").is_err());
-    assert!(matches!(
-        io_writer.failure,
-        Some(super::super::LimitedWriterFailure::StorageIo(_))
-    ));
-    let io_kind = super::super::cache_commit_fallback_kind(
-        io_writer
-            .failure
-            .as_ref()
-            .ok_or("writer I/O cause was not recorded")?,
-    );
+    let (case, _) = case_and_scope(b"4142", 3)?;
+    let error = case
+        .write_snapshot(
+            &mut FailingWriter,
+            &mut Vec::new(),
+            CaseSnapshotLimits::new(1024, 1024),
+        )
+        .err()
+        .ok_or("graph writer failure should reject the snapshot")?;
+    assert!(matches!(error, EvidenceError::WriteFailed));
+    let io_kind = super::super::cache_commit_fallback_kind(&error);
     assert_eq!(io_kind, CacheFallbackKind::CommitStorageIo);
     Ok(())
 }

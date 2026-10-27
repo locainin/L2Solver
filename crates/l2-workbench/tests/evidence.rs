@@ -18,5 +18,7 @@ mod receipt_verification;
 mod resource_usage;
 #[path = "evidence/roundtrip.rs"]
 mod roundtrip;
+#[path = "evidence/snapshot.rs"]
+mod snapshot;
 #[path = "evidence/transaction.rs"]
 mod transaction;

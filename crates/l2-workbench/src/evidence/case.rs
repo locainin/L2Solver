@@ -15,10 +15,13 @@ use std::{
 mod index_tests;
 #[path = "mapping.rs"]
 mod mapping;
+#[path = "case/snapshot/mod.rs"]
+mod snapshot;
 #[path = "transaction.rs"]
 mod transaction;
 
 pub use mapping::{CheckedByteMappingCursor, clip_byte_mappings};
+pub use snapshot::{CaseSnapshotLimits, CaseSnapshotUsage};
 
 /// Current serialized evidence schema version
 pub const SCHEMA_VERSION: u32 = 1;

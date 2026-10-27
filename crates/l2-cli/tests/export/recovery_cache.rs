@@ -1,7 +1,7 @@
 use super::{RecoveryCaseKind, RecoveryContext, recover, recovery_key};
 use crate::arguments::{ProgressMode, RecoveryOptions, RecoveryProfile};
 use l2_workbench::{
-    evidence::Case,
+    evidence::{Case, Edge, EvidenceStatus, MAX_EDGES, MAX_REASON_BYTES},
     job::{
         CacheFallbackKind, CacheStage, Counter, Job,
         cache::{Cache, CacheReadPolicy, StageStatus},
@@ -13,6 +13,9 @@ use std::{error::Error, fs};
 
 #[path = "recovery_cache/failures.rs"]
 mod failures;
+
+#[path = "recovery_cache/integrity.rs"]
+mod integrity;
 
 #[test]
 fn warm_cache_restores_the_case_and_local_coverage() -> Result<(), Box<dyn Error>> {
@@ -31,6 +34,25 @@ fn warm_cache_restores_the_case_and_local_coverage() -> Result<(), Box<dyn Error
         },
     )?;
     let expected_case = first_case.to_json()?;
+    let entry_key = recovery_key(RecoveryCaseKind::Flow, &scope, &options)?;
+    let entry = cache
+        .lookup(&entry_key, CacheReadPolicy::AllowPartial)?
+        .ok_or("the first recovery did not publish its cache entry")?;
+    let graph_path = entry.directory().join("case.graph.gz");
+    let blob_pack_path = entry.directory().join("case.blobs");
+    assert!(
+        graph_path.is_file(),
+        "the exact graph stream should be stored"
+    );
+    assert!(
+        blob_pack_path.is_file(),
+        "the exact blob pack should be stored"
+    );
+    assert!(
+        !entry.directory().join("case.json").exists(),
+        "new entries should use the normalized snapshot pair"
+    );
+    assert_snapshot_metadata(entry.metadata())?;
 
     let job = Job::new("cached flow recovery");
     job.increment(Counter::CandidatesExamined, 7)?;
@@ -67,6 +89,76 @@ fn warm_cache_restores_the_case_and_local_coverage() -> Result<(), Box<dyn Error
         snapshot.counters.get(&Counter::CandidatesExamined),
         Some(&7),
         "a cache hit must not count cached candidates as newly examined"
+    );
+    Ok(())
+}
+
+#[test]
+fn large_case_snapshot_commits_and_replays_above_the_legacy_json_limit()
+-> Result<(), Box<dyn Error>> {
+    const EDGE_COUNT: usize = MAX_EDGES - 10_000;
+    const CACHE_LIMIT_BYTES: u64 = 96 * 1024 * 1024;
+
+    let temporary = tempfile::tempdir()?;
+    let cache = open_cache_with_limit(temporary.path(), CACHE_LIMIT_BYTES)?;
+    let options = RecoveryOptions {
+        cache_max_bytes: CACHE_LIMIT_BYTES,
+        ..RecoveryOptions::default()
+    };
+    let (mut first_case, scope) = large_case_and_scope(EDGE_COUNT)?;
+    assert!(
+        count_case_json_bytes(&first_case)?
+            > u64::try_from(l2_workbench::evidence::MAX_CASE_JSON_BYTES)?,
+        "the test Case should exceed the legacy JSON cache ceiling"
+    );
+
+    let first_job = Job::new("large recovery snapshot commit");
+    let first_result = recover(
+        &mut first_case,
+        RecoveryCaseKind::Flow,
+        &scope,
+        &RecoveryContext {
+            cache: Some(&cache),
+            job: Some(&first_job),
+            options: &options,
+        },
+    )?;
+    assert_eq!(
+        first_job.snapshot()?.counters.get(&Counter::CacheMisses),
+        Some(&1)
+    );
+    let key = recovery_key(RecoveryCaseKind::Flow, &scope, &options)?;
+    let entry = cache
+        .lookup(&key, CacheReadPolicy::AllowPartial)?
+        .ok_or("the large Case recovery did not publish a cache entry")?;
+    assert!(
+        snapshot_graph_decoded_bytes(entry.metadata())?
+            > u64::try_from(l2_workbench::evidence::MAX_CASE_JSON_BYTES)?
+    );
+
+    let (mut second_case, second_scope) = case_and_scope(b"4142", 101)?;
+    let job = Job::new("large recovery snapshot replay");
+    let second_result = recover(
+        &mut second_case,
+        RecoveryCaseKind::Flow,
+        &second_scope,
+        &RecoveryContext {
+            cache: Some(&cache),
+            job: Some(&job),
+            options: &options,
+        },
+    )?;
+
+    assert_cases_equal(&second_case, &first_case);
+    assert_eq!(
+        serde_json::to_value(second_result.coverage)?,
+        serde_json::to_value(first_result.coverage)?
+    );
+    assert_eq!(second_result.omissions, first_result.omissions);
+    assert_eq!(job.snapshot()?.counters.get(&Counter::CacheHits), Some(&1));
+    assert_eq!(
+        job.snapshot()?.counters.get(&Counter::CacheMisses),
+        Some(&0)
     );
     Ok(())
 }
@@ -223,6 +315,169 @@ fn partial_recovery_is_reused_as_partial_for_the_same_policy() -> Result<(), Box
 }
 
 #[test]
+fn legacy_json_cache_entries_remain_readable_without_snapshot_metadata()
+-> Result<(), Box<dyn Error>> {
+    let temporary = tempfile::tempdir()?;
+    let cache = open_cache(temporary.path())?;
+    let options = RecoveryOptions::default();
+    let (mut expected_case, scope) = case_and_scope(b"4142", 13)?;
+    let expected_result = recover(
+        &mut expected_case,
+        RecoveryCaseKind::Flow,
+        &scope,
+        &RecoveryContext {
+            cache: None,
+            job: None,
+            options: &options,
+        },
+    )?;
+    let key = recovery_key(RecoveryCaseKind::Flow, &scope, &options)?;
+    let lease = cache.lease(&key)?;
+    fs::write(
+        lease.directory().join("case.json"),
+        expected_case.to_json()?,
+    )?;
+    let metadata = json!({
+        "coverage": &expected_result.coverage,
+        "omissions": &expected_result.omissions,
+    });
+    drop(lease.commit(StageStatus::Complete, metadata)?);
+
+    let (mut restored_case, restored_scope) = case_and_scope(b"4142", 13)?;
+    let job = Job::new("legacy recovery cache replay");
+    let restored_result = recover(
+        &mut restored_case,
+        RecoveryCaseKind::Flow,
+        &restored_scope,
+        &RecoveryContext {
+            cache: Some(&cache),
+            job: Some(&job),
+            options: &options,
+        },
+    )?;
+
+    assert_eq!(restored_case.sources(), expected_case.sources());
+    assert_eq!(restored_case.nodes(), expected_case.nodes());
+    assert_eq!(restored_result.omissions, expected_result.omissions);
+    assert_eq!(
+        serde_json::to_value(restored_result.coverage)?,
+        serde_json::to_value(expected_result.coverage)?
+    );
+    assert_eq!(job.snapshot()?.counters.get(&Counter::CacheHits), Some(&1));
+    Ok(())
+}
+
+#[test]
+fn legacy_json_replay_obeys_the_current_physical_storage_limit() -> Result<(), Box<dyn Error>> {
+    let temporary = tempfile::tempdir()?;
+    let cache = open_cache(temporary.path())?;
+    let mut options = RecoveryOptions::default();
+    let (mut expected_case, scope) = case_and_scope(b"4142", 14)?;
+    let expected_result = recover(
+        &mut expected_case,
+        RecoveryCaseKind::Flow,
+        &scope,
+        &RecoveryContext {
+            cache: None,
+            job: None,
+            options: &options,
+        },
+    )?;
+    let key = recovery_key(RecoveryCaseKind::Flow, &scope, &options)?;
+    let lease = cache.lease(&key)?;
+    fs::write(
+        lease.directory().join("case.json"),
+        expected_case.to_json()?,
+    )?;
+    let metadata = json!({
+        "coverage": &expected_result.coverage,
+        "omissions": &expected_result.omissions,
+    });
+    let status = if expected_result.coverage.is_complete() {
+        StageStatus::Complete
+    } else {
+        StageStatus::Partial
+    };
+    drop(lease.commit(status, metadata)?);
+
+    options.cache_max_bytes = 1;
+    let (mut fresh_case, fresh_scope) = case_and_scope(b"4142", 14)?;
+    let job = Job::new("legacy cache physical limit");
+    let fresh = recover(
+        &mut fresh_case,
+        RecoveryCaseKind::Flow,
+        &fresh_scope,
+        &RecoveryContext {
+            cache: Some(&cache),
+            job: Some(&job),
+            options: &options,
+        },
+    )?;
+
+    assert!(fresh.coverage.is_complete());
+    let snapshot = job.snapshot()?;
+    assert_eq!(snapshot.counters.get(&Counter::CacheHits), Some(&0));
+    assert_eq!(snapshot.counters.get(&Counter::CacheMisses), Some(&1));
+    assert!(snapshot.cache_fallbacks.records().iter().any(|fallback| {
+        fallback.stage() == CacheStage::CaseRecovery
+            && fallback.kind() == CacheFallbackKind::InvalidEntry
+    }));
+    Ok(())
+}
+
+#[test]
+fn null_snapshot_metadata_is_not_treated_as_a_legacy_entry() -> Result<(), Box<dyn Error>> {
+    let temporary = tempfile::tempdir()?;
+    let cache = open_cache(temporary.path())?;
+    let options = RecoveryOptions::default();
+    let (mut previous_case, scope) = case_and_scope(b"4142", 15)?;
+    let previous_result = recover(
+        &mut previous_case,
+        RecoveryCaseKind::Flow,
+        &scope,
+        &RecoveryContext {
+            cache: None,
+            job: None,
+            options: &options,
+        },
+    )?;
+    let key = recovery_key(RecoveryCaseKind::Flow, &scope, &options)?;
+    let lease = cache.lease(&key)?;
+    fs::write(
+        lease.directory().join("case.json"),
+        previous_case.to_json()?,
+    )?;
+    let metadata = json!({
+        "coverage": &previous_result.coverage,
+        "omissions": &previous_result.omissions,
+        "case_storage_format": null,
+        "case_snapshot_usage": null,
+    });
+    drop(lease.commit(StageStatus::Complete, metadata)?);
+
+    let (mut fresh_case, fresh_scope) = case_and_scope(b"4142", 15)?;
+    let job = Job::new("null snapshot format metadata");
+    let _fresh = recover(
+        &mut fresh_case,
+        RecoveryCaseKind::Flow,
+        &fresh_scope,
+        &RecoveryContext {
+            cache: Some(&cache),
+            job: Some(&job),
+            options: &options,
+        },
+    )?;
+    let snapshot = job.snapshot()?;
+    assert_eq!(snapshot.counters.get(&Counter::CacheHits), Some(&0));
+    assert_eq!(snapshot.counters.get(&Counter::CacheMisses), Some(&1));
+    assert!(snapshot.cache_fallbacks.records().iter().any(|fallback| {
+        fallback.stage() == CacheStage::CaseRecovery
+            && fallback.kind() == CacheFallbackKind::InvalidEntry
+    }));
+    Ok(())
+}
+
+#[test]
 fn cache_key_tracks_scope_profile_and_memory_policy_only() -> Result<(), Box<dyn Error>> {
     let (_, scope) = case_and_scope(b"4142", 17)?;
     let normal = RecoveryOptions::default();
@@ -326,7 +581,7 @@ fn assert_previous_recovery_recomputed(version: u32) -> Result<(), Box<dyn Error
     previous.coverage.omissions = u64::try_from(previous.omissions.len())?;
     old_case.add_node("previous_algorithm_marker", None, Vec::new(), json!({}))?;
     let previous_key = previous_recovery_key(&scope, &options, version)?;
-    super::store_result(cache.lease(&previous_key)?, &old_case, &previous)?;
+    super::store_result(cache.lease(&previous_key)?, &old_case, &previous, &options)?;
 
     let job = Job::new("recovery algorithm invalidation");
     let (mut current_case, _) = case_and_scope(b"4142", 37)?;
@@ -392,7 +647,7 @@ fn previous_recovery_key(
 }
 
 #[test]
-fn corrupt_cached_case_is_rejected_in_strict_mode_and_recomputed_otherwise()
+fn cached_case_with_inaccurate_snapshot_usage_is_rejected_and_recomputed()
 -> Result<(), Box<dyn Error>> {
     let temporary = tempfile::tempdir()?;
     let cache = open_cache(temporary.path())?;
@@ -410,7 +665,7 @@ fn corrupt_cached_case_is_rejected_in_strict_mode_and_recomputed_otherwise()
     )?;
 
     let key = recovery_key(RecoveryCaseKind::Flow, &scope, &options)?;
-    store_unparseable_case(&cache, &key, &first)?;
+    store_case_with_inaccurate_snapshot_usage(&cache, &key, &first_case, &first, &options)?;
 
     let mut strict = options.clone();
     strict.strict_cache = true;
@@ -469,20 +724,100 @@ fn corrupt_cached_case_is_rejected_in_strict_mode_and_recomputed_otherwise()
     Ok(())
 }
 
-fn store_unparseable_case(
+#[test]
+fn unknown_snapshot_format_is_rejected_instead_of_counted_as_a_hit() -> Result<(), Box<dyn Error>> {
+    let temporary = tempfile::tempdir()?;
+    let cache = open_cache(temporary.path())?;
+    let options = RecoveryOptions::default();
+    let (mut source_case, scope) = case_and_scope(b"4142", 21)?;
+    let result = recover(
+        &mut source_case,
+        RecoveryCaseKind::Flow,
+        &scope,
+        &RecoveryContext {
+            cache: None,
+            job: None,
+            options: &options,
+        },
+    )?;
+    let key = recovery_key(RecoveryCaseKind::Flow, &scope, &options)?;
+    let metadata = json!({
+        "coverage": result.coverage,
+        "omissions": result.omissions,
+        "case_storage_format": 77,
+        "case_snapshot_usage": {
+            "graph_bytes": 0,
+            "graph_decoded_bytes": 0,
+            "blob_pack_bytes": 0,
+        },
+    });
+    drop(cache.lease(&key)?.commit(StageStatus::Complete, metadata)?);
+
+    let (mut fresh_case, fresh_scope) = case_and_scope(b"4142", 21)?;
+    let job = Job::new("unsupported recovery snapshot format");
+    let fresh = recover(
+        &mut fresh_case,
+        RecoveryCaseKind::Flow,
+        &fresh_scope,
+        &RecoveryContext {
+            cache: Some(&cache),
+            job: Some(&job),
+            options: &options,
+        },
+    )?;
+
+    assert!(fresh.coverage.is_complete());
+    assert_eq!(job.snapshot()?.counters.get(&Counter::CacheHits), Some(&0));
+    assert_eq!(
+        job.snapshot()?.counters.get(&Counter::CacheMisses),
+        Some(&1)
+    );
+    assert!(
+        job.snapshot()?
+            .cache_fallbacks
+            .records()
+            .iter()
+            .any(|fallback| {
+                fallback.stage() == CacheStage::CaseRecovery
+                    && fallback.kind() == CacheFallbackKind::InvalidEntry
+            })
+    );
+    Ok(())
+}
+
+fn store_case_with_inaccurate_snapshot_usage(
     cache: &Cache,
     key: &l2_workbench::job::cache::StageKey,
+    case: &Case,
     result: &super::CachedRecovery,
+    options: &RecoveryOptions,
 ) -> Result<(), Box<dyn Error>> {
     let lease = cache.lease(key)?;
-    fs::write(
-        lease.directory().join("case.json"),
-        b"not a valid cached Case",
+    let mut graph = Vec::new();
+    let mut blob_pack = Vec::new();
+    let mut usage = case.write_snapshot(
+        &mut graph,
+        &mut blob_pack,
+        l2_workbench::evidence::CaseSnapshotLimits::new(
+            options.cache_max_bytes,
+            options.memory_limit,
+        ),
     )?;
-    // Keep the cache receipt valid so recovery reaches the Case parser
+    fs::write(lease.directory().join(super::CASE_GRAPH_FILE), graph)?;
+    fs::write(
+        lease.directory().join(super::CASE_BLOB_PACK_FILE),
+        blob_pack,
+    )?;
+    usage.graph_decoded_bytes = usage
+        .graph_decoded_bytes
+        .checked_add(1)
+        .ok_or("snapshot usage fixture overflow")?;
+    // Keep the exact files valid while corrupting only their diagnostic usage receipt
     let metadata = serde_json::to_value(super::RecoveryMetadataRef {
         coverage: &result.coverage,
         omissions: &result.omissions,
+        case_storage_format: super::CASE_SNAPSHOT_FORMAT,
+        case_snapshot_usage: &usage,
     })?;
     let status = if result.coverage.is_complete() {
         StageStatus::Complete
@@ -530,11 +865,89 @@ fn recovery_rejects_a_valid_digest_outside_the_case_sources() -> Result<(), Box<
 }
 
 fn open_cache(root: &std::path::Path) -> Result<Cache, Box<dyn Error>> {
+    open_cache_with_limit(root, 16 * 1024 * 1024)
+}
+
+fn open_cache_with_limit(
+    root: &std::path::Path,
+    maximum_bytes: u64,
+) -> Result<Cache, Box<dyn Error>> {
     Ok(Cache::open_at(
         root.join("cache"),
         root.join("state"),
-        16 * 1024 * 1024,
+        maximum_bytes,
     )?)
+}
+
+fn count_case_json_bytes(case: &Case) -> Result<u64, Box<dyn Error>> {
+    struct ByteCounter(u64);
+
+    impl std::io::Write for ByteCounter {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.0 = self
+                .0
+                .checked_add(u64::try_from(bytes.len()).map_err(std::io::Error::other)?)
+                .ok_or_else(|| std::io::Error::other("encoded Case byte count overflow"))?;
+            Ok(bytes.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    let mut counter = ByteCounter(0);
+    case.write_json(&mut counter)?;
+    Ok(counter.0)
+}
+
+fn snapshot_graph_decoded_bytes(metadata: &Value) -> Result<u64, Box<dyn Error>> {
+    metadata
+        .get("case_snapshot_usage")
+        .and_then(Value::as_object)
+        .and_then(|usage| usage.get("graph_decoded_bytes"))
+        .and_then(Value::as_u64)
+        .ok_or_else(|| "snapshot graph usage was not recorded".into())
+}
+
+fn assert_snapshot_metadata(metadata: &Value) -> Result<(), Box<dyn Error>> {
+    assert_eq!(
+        metadata.get("case_storage_format").and_then(Value::as_u64),
+        Some(u64::from(super::CASE_SNAPSHOT_FORMAT))
+    );
+    let usage = metadata
+        .get("case_snapshot_usage")
+        .and_then(Value::as_object)
+        .ok_or("snapshot usage details are missing")?;
+    for field in ["graph_bytes", "graph_decoded_bytes", "blob_pack_bytes"] {
+        assert!(usage.get(field).and_then(Value::as_u64).is_some());
+    }
+    Ok(())
+}
+
+fn assert_cases_equal(left: &Case, right: &Case) {
+    assert_eq!(left.sources(), right.sources());
+    assert_eq!(left.blobs(), right.blobs());
+    assert_eq!(left.nodes(), right.nodes());
+    assert_eq!(left.edges(), right.edges());
+    assert_eq!(left.limitations(), right.limitations());
+}
+
+fn large_case_and_scope(edge_count: usize) -> Result<(Case, Value), Box<dyn Error>> {
+    let (mut case, scope) = case_and_scope(b"4142", 101)?;
+    let first = case.add_node("large_fixture_first", None, Vec::new(), json!({}))?;
+    let second = case.add_node("large_fixture_second", None, Vec::new(), json!({}))?;
+    let reason = "r".repeat(MAX_REASON_BYTES);
+    for _ in 0..edge_count {
+        case.add_edge(Edge {
+            from: first,
+            to: second,
+            relation: String::from("fixture_relation"),
+            status: EvidenceStatus::Observed,
+            reason: reason.clone(),
+        })?;
+    }
+    Ok((case, scope))
 }
 
 fn case_and_scope(bytes: &[u8], flow_id: u64) -> Result<(Case, Value), Box<dyn Error>> {

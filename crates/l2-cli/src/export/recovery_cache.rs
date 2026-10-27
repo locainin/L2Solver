@@ -6,7 +6,7 @@ use crate::{
     input, workbench,
 };
 use l2_workbench::{
-    evidence::{Case, EvidenceError, MAX_CASE_JSON_BYTES},
+    evidence::{Case, CaseSnapshotLimits, CaseSnapshotUsage, EvidenceError, MAX_CASE_JSON_BYTES},
     job::{
         CacheFallbackKind, CacheStage, Counter, Job, PhaseState,
         cache::{
@@ -32,6 +32,9 @@ pub(super) const RECOVERY_STAGE_VERSION: u32 = 19;
 const RECOVERY_STAGE: &str = "default_case_recovery";
 const RECOVERY_ALGORITHM: &str = "l2-default-case-recovery";
 const CASE_FILE: &str = "case.json";
+const CASE_GRAPH_FILE: &str = "case.graph.gz";
+const CASE_BLOB_PACK_FILE: &str = "case.blobs";
+const CASE_SNAPSHOT_FORMAT: u32 = 1;
 
 #[cfg(test)]
 #[path = "../../tests/export/recovery_cache.rs"]
@@ -57,12 +60,38 @@ pub(super) struct CachedRecovery {
 struct RecoveryMetadata {
     coverage: RecoveryCoverage,
     omissions: Vec<String>,
+    #[serde(default, deserialize_with = "deserialize_metadata_field")]
+    case_storage_format: MetadataField<u32>,
+    #[serde(default, deserialize_with = "deserialize_metadata_field")]
+    case_snapshot_usage: MetadataField<CaseSnapshotUsage>,
+}
+
+#[derive(Default)]
+enum MetadataField<T> {
+    // Only absent fields identify the older JSON format; explicit null is invalid
+    #[default]
+    Missing,
+    Null,
+    Value(T),
+}
+
+fn deserialize_metadata_field<'de, D, T>(
+    deserializer: D,
+) -> std::result::Result<MetadataField<T>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: Deserialize<'de>,
+{
+    Option::<T>::deserialize(deserializer)
+        .map(|value| value.map_or_else(|| MetadataField::Null, MetadataField::Value))
 }
 
 #[derive(Serialize)]
 struct RecoveryMetadataRef<'a> {
     coverage: &'a RecoveryCoverage,
     omissions: &'a [String],
+    case_storage_format: u32,
+    case_snapshot_usage: &'a CaseSnapshotUsage,
 }
 
 /// Recover one flow or cohort Case, reusing only an exact matching stage result
@@ -81,7 +110,7 @@ pub(super) fn recover(
         if !context.options.refresh {
             // Profile and memory limits are in the key, keeping partial reuse policy exact
             match cache.lookup(&key, CacheReadPolicy::AllowPartial) {
-                Ok(Some(entry)) => match cached_result(&entry, &source_id, kind) {
+                Ok(Some(entry)) => match cached_result(&entry, &source_id, kind, context.options) {
                     Ok((cached_case, result)) => {
                         count_cache_hit(context.job)?;
                         *case = cached_case;
@@ -140,7 +169,7 @@ pub(super) fn recover(
     };
 
     if let Some(lease) = lease {
-        match store_result(lease, case, &result) {
+        match store_result(lease, case, &result, context.options) {
             Err(error) if context.options.strict_cache => return Err(error),
             Ok(()) => {}
             Err(error) => {
@@ -168,11 +197,11 @@ fn note_cache_fallback(
 }
 
 fn cache_commit_fallback_kind(error: &(dyn Error + 'static)) -> CacheFallbackKind {
-    if let Some(failure) = error.downcast_ref::<LimitedWriterFailure>() {
-        return match failure {
-            LimitedWriterFailure::CaseJsonTooLarge => CacheFallbackKind::CommitCaseTooLarge,
-            LimitedWriterFailure::StorageIo(_) => CacheFallbackKind::CommitStorageIo,
-        };
+    if matches!(
+        error.downcast_ref::<EvidenceError>(),
+        Some(EvidenceError::CaseTooLarge { .. })
+    ) {
+        return CacheFallbackKind::CommitCaseTooLarge;
     }
     if let Some(cache_error) = error.downcast_ref::<CacheError>() {
         return match cache_error {
@@ -195,7 +224,9 @@ fn cache_commit_fallback_kind(error: &(dyn Error + 'static)) -> CacheFallbackKin
 
 const fn cache_commit_fallback_detail(kind: CacheFallbackKind) -> &'static str {
     match kind {
-        CacheFallbackKind::CommitCaseTooLarge => "Case JSON exceeds the recovery-cache limit",
+        CacheFallbackKind::CommitCaseTooLarge => {
+            "recovery Case snapshot exceeds its storage or memory limit"
+        }
         CacheFallbackKind::CommitMetadataTooLarge => "recovery cache metadata exceeds its limit",
         CacheFallbackKind::CommitQuotaExceeded => "recovery cache quota exceeded",
         CacheFallbackKind::CommitStorageIo => "recovery cache storage I/O failed",
@@ -235,15 +266,40 @@ fn cached_result(
     entry: &CacheEntry,
     expected_source_id: &str,
     kind: RecoveryCaseKind,
+    options: &RecoveryOptions,
 ) -> Result<(Case, CachedRecovery)> {
     let metadata: RecoveryMetadata = serde_json::from_value(entry.metadata().clone())?;
+    let case_storage_format = metadata.case_storage_format;
+    let case_snapshot_usage = metadata.case_snapshot_usage;
     let result = CachedRecovery {
         coverage: metadata.coverage,
         omissions: metadata.omissions,
     };
     validate_cached_coverage(&result, entry.status(), kind)?;
-    let case = read_cached_case(entry)?;
+    let case = read_cached_case(
+        entry,
+        case_storage_format,
+        case_snapshot_usage,
+        snapshot_limits(options),
+    )?;
     require_case_source(&case, expected_source_id)?;
+    let incomplete_case_count = match kind {
+        RecoveryCaseKind::Flow => {
+            result
+                .coverage
+                .flow_cases_with_incomplete_case_evidence_collection
+        }
+        RecoveryCaseKind::Cohort => {
+            result
+                .coverage
+                .cohort_cases_with_incomplete_case_evidence_collection
+        }
+    };
+    if incomplete_case_count != u64::from(!case.collection_complete()) {
+        return Err(invalid_cache(
+            "cached recovery coverage disagrees with the Case collection flag",
+        ));
+    }
     Ok((case, result))
 }
 
@@ -275,33 +331,94 @@ fn validate_cached_coverage(
     }
 }
 
-fn read_cached_case(entry: &CacheEntry) -> Result<Case> {
+fn read_cached_case(
+    entry: &CacheEntry,
+    storage_format: MetadataField<u32>,
+    usage: MetadataField<CaseSnapshotUsage>,
+    limits: CaseSnapshotLimits,
+) -> Result<Case> {
+    match (storage_format, usage) {
+        (MetadataField::Missing, MetadataField::Missing) => read_legacy_case(entry, limits),
+        (MetadataField::Value(CASE_SNAPSHOT_FORMAT), MetadataField::Value(usage)) => {
+            read_snapshot_case(entry, usage, limits)
+        }
+        _ => Err(invalid_cache("recovery Case storage metadata is invalid")),
+    }
+}
+
+fn read_snapshot_case(
+    entry: &CacheEntry,
+    usage: CaseSnapshotUsage,
+    limits: CaseSnapshotLimits,
+) -> Result<Case> {
+    let declared_decoded_bytes = usage
+        .graph_decoded_bytes
+        .checked_add(usage.blob_pack_bytes)
+        .ok_or("snapshot decoded size overflow")?;
+    if declared_decoded_bytes > limits.maximum_decoded_bytes() {
+        return Err(invalid_cache(
+            "cached recovery snapshot exceeds its decoded size limit",
+        ));
+    }
+    let graph = input::regular_no_follow(&entry.directory().join(CASE_GRAPH_FILE))?;
+    let blob_pack = input::regular_no_follow(&entry.directory().join(CASE_BLOB_PACK_FILE))?;
+    let graph_bytes = graph.metadata()?.len();
+    let blob_pack_bytes = blob_pack.metadata()?.len();
+    let total_storage_bytes = graph_bytes
+        .checked_add(blob_pack_bytes)
+        .ok_or("snapshot package size overflow")?;
+    if total_storage_bytes > limits.maximum_storage_bytes() {
+        return Err(invalid_cache(
+            "cached recovery snapshot exceeds its storage limit",
+        ));
+    }
+    let (case, actual_usage) = Case::from_snapshot(graph, blob_pack, limits)?;
+    if actual_usage != usage {
+        return Err(invalid_cache(
+            "snapshot usage metadata does not match stored files",
+        ));
+    }
+    Ok(case)
+}
+
+fn read_legacy_case(entry: &CacheEntry, limits: CaseSnapshotLimits) -> Result<Case> {
     let path = entry.directory().join(CASE_FILE);
     let file = input::regular_no_follow(&path)?;
-    let maximum = u64::try_from(MAX_CASE_JSON_BYTES)?;
-    if file.metadata()?.len() > maximum {
+    let maximum = u64::try_from(MAX_CASE_JSON_BYTES)?
+        .min(limits.maximum_decoded_bytes())
+        .min(limits.maximum_storage_bytes());
+    let file_bytes = file.metadata()?.len();
+    if file_bytes > maximum {
         return Err(invalid_cache(
-            "cached recovery Case exceeds the evidence size limit",
+            "cached legacy recovery Case exceeds its size limit",
         ));
     }
     let probe = maximum
         .checked_add(1)
         .ok_or("Case JSON size limit overflow")?;
     let mut bytes = Vec::new();
+    bytes.try_reserve_exact(usize::try_from(file_bytes)?)?;
     file.take(probe).read_to_end(&mut bytes)?;
-    if bytes.len() > MAX_CASE_JSON_BYTES {
+    if u64::try_from(bytes.len())? > maximum {
         return Err(invalid_cache(
-            "cached recovery Case exceeds the evidence size limit",
+            "cached legacy recovery Case exceeds its size limit",
         ));
     }
     Ok(Case::from_json(&bytes)?)
 }
 
-fn store_result(lease: Lease, case: &Case, result: &CachedRecovery) -> Result<()> {
-    write_case(&lease, case)?;
+fn store_result(
+    lease: Lease,
+    case: &Case,
+    result: &CachedRecovery,
+    options: &RecoveryOptions,
+) -> Result<()> {
+    let usage = write_case(&lease, case, options)?;
     let metadata = serde_json::to_value(RecoveryMetadataRef {
         coverage: &result.coverage,
         omissions: &result.omissions,
+        case_storage_format: CASE_SNAPSHOT_FORMAT,
+        case_snapshot_usage: &usage,
     })?;
     let status = if result.coverage.is_complete() {
         StageStatus::Complete
@@ -312,83 +429,35 @@ fn store_result(lease: Lease, case: &Case, result: &CachedRecovery) -> Result<()
     Ok(())
 }
 
-fn write_case(lease: &Lease, case: &Case) -> Result<()> {
-    let path = lease.directory().join(CASE_FILE);
-    let file = OpenOptions::new().write(true).create_new(true).open(path)?;
-    // Stream through a size limit instead of allocating a second full Case representation
-    let mut writer = LimitedWriter {
-        inner: BufWriter::new(file),
-        remaining: MAX_CASE_JSON_BYTES,
-        failure: None,
-    };
-    let result = case.write_json(&mut writer);
-    if let Some(failure) = writer.failure {
-        return Err(Box::new(failure));
-    }
-    result?;
+fn write_case(lease: &Lease, case: &Case, options: &RecoveryOptions) -> Result<CaseSnapshotUsage> {
+    let graph_file = create_case_snapshot_file(lease, CASE_GRAPH_FILE)?;
+    let blob_pack_file = create_case_snapshot_file(lease, CASE_BLOB_PACK_FILE)?;
+    let mut graph = BufWriter::new(graph_file);
+    let mut blob_pack = BufWriter::new(blob_pack_file);
+    let usage = case.write_snapshot(&mut graph, &mut blob_pack, snapshot_limits(options))?;
+    sync_snapshot_file(graph)?;
+    sync_snapshot_file(blob_pack)?;
+    Ok(usage)
+}
+
+fn create_case_snapshot_file(lease: &Lease, filename: &str) -> Result<std::fs::File> {
+    Ok(OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(lease.directory().join(filename))?)
+}
+
+fn sync_snapshot_file(mut writer: BufWriter<std::fs::File>) -> Result<()> {
     writer.flush()?;
     writer
-        .inner
         .into_inner()
         .map_err(io::IntoInnerError::into_error)?
         .sync_all()?;
     Ok(())
 }
 
-struct LimitedWriter<W> {
-    inner: W,
-    remaining: usize,
-    failure: Option<LimitedWriterFailure>,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum LimitedWriterFailure {
-    CaseJsonTooLarge,
-    StorageIo(io::ErrorKind),
-}
-
-impl fmt::Display for LimitedWriterFailure {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::CaseJsonTooLarge => {
-                formatter.write_str("Case JSON exceeds the recovery-cache limit")
-            }
-            Self::StorageIo(kind) => write!(formatter, "Case JSON write failed ({kind})"),
-        }
-    }
-}
-
-impl Error for LimitedWriterFailure {}
-
-impl<W: Write> Write for LimitedWriter<W> {
-    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
-        if bytes.is_empty() {
-            return Ok(0);
-        }
-        if self.remaining == 0 {
-            self.failure = Some(LimitedWriterFailure::CaseJsonTooLarge);
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "case JSON exceeds the evidence size limit",
-            ));
-        }
-        let length = bytes.len().min(self.remaining);
-        let written = match self.inner.write(bytes.split_at(length).0) {
-            Ok(written) => written,
-            Err(error) => {
-                if error.kind() != io::ErrorKind::Interrupted {
-                    self.failure = Some(LimitedWriterFailure::StorageIo(error.kind()));
-                }
-                return Err(error);
-            }
-        };
-        self.remaining -= written;
-        Ok(written)
-    }
-
-    fn flush(&mut self) -> io::Result<()> {
-        self.inner.flush()
-    }
+const fn snapshot_limits(options: &RecoveryOptions) -> CaseSnapshotLimits {
+    CaseSnapshotLimits::new(options.cache_max_bytes, options.memory_limit)
 }
 
 fn count_cache_hit(job: Option<&Job>) -> Result<()> {
