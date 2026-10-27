@@ -30,7 +30,7 @@ use std::{
     path::{Path, PathBuf},
 };
 
-const REFINE_ALGORITHM_VERSION: u32 = 9;
+const REFINE_ALGORITHM_VERSION: u32 = 10;
 
 #[derive(Serialize)]
 pub(super) struct SourceRecord {

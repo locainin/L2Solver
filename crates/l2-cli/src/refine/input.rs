@@ -7,7 +7,7 @@ use super::{
 use crate::safe_filename::is_safe_flat_file_name;
 use l2_workbench::{
     job::{
-        Counter, Job, MemoryBudget, MemoryClass, MemoryError, MemoryLease,
+        Counter, Job, MemoryBudget, MemoryClass, MemoryLease,
         cache::{SourceFingerprint, SourceIdentity},
     },
     sha256,
@@ -115,6 +115,7 @@ impl InputSet {
         artifact: &super::file_artifact::FileArtifact,
         staging: &Path,
         job: &Job,
+        buffer: &mut [u8],
     ) -> Result<(), Box<dyn Error>> {
         if !is_safe_flat_file_name(&artifact.file_name) {
             return Err(invalid_input("artifact output name is unsafe"));
@@ -146,7 +147,6 @@ impl InputSet {
             .create_new(true)
             .open(staging.join(&artifact.file_name))?;
         let mut digest = Sha256::new();
-        let mut buffer = [0_u8; 16 * 1024];
         let mut remaining = artifact.range.length;
         while remaining > 0 {
             let count = remaining.min(buffer.len());
@@ -217,12 +217,6 @@ pub(super) enum SourceData {
     },
     File(RangeSource),
     Skipped(ReadOmission),
-    MemorySkipped {
-        length: usize,
-        requested: u64,
-        used: u64,
-        maximum: u64,
-    },
 }
 
 pub(super) struct RangeSource {
@@ -243,21 +237,20 @@ impl LoadedSource {
             SourceData::Memory { bytes, .. } => bytes.len(),
             SourceData::File(source) => source.length,
             SourceData::Skipped(omission) => omission.length,
-            SourceData::MemorySkipped { length, .. } => *length,
         }
     }
 
     pub(super) fn bytes(&self) -> Option<&[u8]> {
         match &self.data {
             SourceData::Memory { bytes, .. } => Some(bytes),
-            SourceData::File(_) | SourceData::Skipped(_) | SourceData::MemorySkipped { .. } => None,
+            SourceData::File(_) | SourceData::Skipped(_) => None,
         }
     }
 
     pub(super) fn digest(&self) -> Option<&str> {
         match &self.data {
             SourceData::Memory { sha256, .. } => Some(sha256),
-            SourceData::File(_) | SourceData::Skipped(_) | SourceData::MemorySkipped { .. } => None,
+            SourceData::File(_) | SourceData::Skipped(_) => None,
         }
     }
 
@@ -873,10 +866,7 @@ fn read_memory_source(
     job: &Job,
     memory: &MemoryBudget,
 ) -> Result<LoadedSource, Box<dyn Error>> {
-    let mut lease = match memory.try_reserve(MemoryClass::Base, u64::try_from(length)?) {
-        Ok(lease) => lease,
-        Err(error) => return skipped_for_memory(spec, length, error),
-    };
+    let mut lease = memory.try_reserve(MemoryClass::Base, u64::try_from(length)?)?;
     input.budget.reserve(
         u64::try_from(length)?
             .checked_add(1)
@@ -888,9 +878,7 @@ fn read_memory_source(
         Some(length),
         spec.expected_sha256.as_deref(),
     )?;
-    if let Err(error) = lease.try_resize(u64::try_from(bytes.capacity())?) {
-        return skipped_for_memory(spec, length, error);
-    }
+    lease.try_resize(u64::try_from(bytes.capacity())?)?;
     Ok(LoadedSource {
         label: spec.label.clone(),
         data: SourceData::Memory {
@@ -899,29 +887,6 @@ fn read_memory_source(
             _memory: Some(lease),
         },
     })
-}
-
-fn skipped_for_memory(
-    spec: &InputSpec,
-    length: usize,
-    error: MemoryError,
-) -> Result<LoadedSource, Box<dyn Error>> {
-    match error {
-        MemoryError::Limit {
-            limit,
-            used,
-            requested,
-        } => Ok(LoadedSource {
-            label: spec.label.clone(),
-            data: SourceData::MemorySkipped {
-                length,
-                requested,
-                used,
-                maximum: limit,
-            },
-        }),
-        other => Err(other.into()),
-    }
 }
 
 #[cfg(test)]

@@ -1,17 +1,44 @@
 use std::{error::Error, fs};
 
 use crate::arguments::{RecoveryOptions, RefineOptions};
-use l2_workbench::job::{Job, MemoryBudget, MemoryClass};
+use l2_workbench::job::{Job, MemoryBudget, MemoryClass, MemoryError};
 
 #[test]
-#[expect(
-    clippy::too_many_lines,
-    reason = "shared admission and the result manifest form one scenario"
-)]
-fn shared_memory_pressure_skips_one_input_and_preserves_a_later_small_input()
+fn publication_buffer_uses_the_fixed_policy_size_and_releases_its_lease()
+-> Result<(), Box<dyn Error>> {
+    let budget = MemoryBudget::new(32 * 1024);
+    let held = budget.try_reserve(MemoryClass::Executor, 16 * 1024)?;
+    let mut buffer = crate::refine::publication_memory::PublicationBuffer::try_new(&budget)?;
+    assert_eq!(buffer.bytes_mut().len(), 16 * 1024);
+    assert_eq!(budget.snapshot()?.used(MemoryClass::Publication), 16 * 1024);
+    drop(buffer);
+    assert_eq!(budget.snapshot()?.used_bytes, held.bytes());
+    drop(held);
+    assert_eq!(budget.snapshot()?.used_bytes, 0);
+    Ok(())
+}
+
+#[test]
+fn publication_buffer_reports_typed_pressure_instead_of_changing_size() -> Result<(), Box<dyn Error>>
+{
+    let budget = MemoryBudget::new(32 * 1024);
+    let _held = budget.try_reserve(MemoryClass::Executor, 16 * 1024 + 1)?;
+    let error = crate::refine::publication_memory::PublicationBuffer::try_new(&budget)
+        .err()
+        .ok_or("publication pressure was ignored")?;
+    assert!(matches!(
+        error.downcast_ref::<MemoryError>(),
+        Some(MemoryError::Limit { .. })
+    ));
+    Ok(())
+}
+
+#[test]
+fn temporary_cache_pressure_fails_without_publication_and_retry_keeps_the_same_artifacts()
 -> Result<(), Box<dyn Error>> {
     let directory = tempfile::tempdir()?;
     let input = directory.path().join("inputs");
+    let baseline = directory.path().join("baseline");
     let output = directory.path().join("result");
     fs::create_dir(&input)?;
     let png = super::structural_png()?;
@@ -27,9 +54,9 @@ fn shared_memory_pressure_skips_one_input_and_preserves_a_later_small_input()
             ]
         }))?,
     )?;
-    let options = RefineOptions {
+    let mut options = RefineOptions {
         input,
-        output: Some(output.clone()),
+        output: Some(baseline.clone()),
         dry_run: false,
         salvage: false,
         recovery: RecoveryOptions {
@@ -38,58 +65,35 @@ fn shared_memory_pressure_skips_one_input_and_preserves_a_later_small_input()
             ..RecoveryOptions::default()
         },
     };
+    let baseline_job = Job::new("baseline refinement");
+    let baseline_result = crate::refine::run_with_job(&options, &mut Vec::new(), &baseline_job)?;
+    options.output = Some(output.clone());
     let memory = MemoryBudget::new(options.recovery.memory_limit);
-    let held = memory.try_reserve(MemoryClass::Executor, 900 * 1024)?;
-    let job = Job::new("refinement shared memory pressure");
-    assert!(!crate::refine::run_with_memory_budget(
+    let held = memory.try_reserve(MemoryClass::Cache, 900 * 1024)?;
+    let job = Job::new("temporary cache pressure");
+    let error = crate::refine::run_with_memory_budget(&options, &mut Vec::new(), &job, &memory)
+        .err()
+        .ok_or("temporary pressure was ignored")?;
+    assert!(matches!(
+        error.downcast_ref::<MemoryError>(),
+        Some(MemoryError::Limit { .. })
+    ));
+    assert!(!output.exists(), "failed admission published a result");
+    assert_eq!(memory.snapshot()?.used_bytes, held.bytes());
+    drop(held);
+    let retry = crate::refine::run_with_memory_budget(
         &options,
         &mut Vec::new(),
-        &job,
-        &memory
-    )?);
-    let snapshot = memory.snapshot()?;
-    assert!(snapshot.rejected > 0);
-    assert!(snapshot.peak_bytes <= snapshot.limit_bytes);
-    assert_eq!(snapshot.used_bytes, held.bytes());
-    let manifest: serde_json::Value =
-        serde_json::from_slice(&fs::read(output.join("manifest.json"))?)?;
-    assert!(
-        manifest
-            .pointer("/sources/0/sha256")
-            .is_none_or(serde_json::Value::is_null)
-    );
-    assert!(
-        manifest
-            .pointer("/l2solver_result/source_identity_sha256")
-            .is_none_or(serde_json::Value::is_null)
-    );
-    assert!(
-        manifest
-            .pointer("/sources/0/omissions")
-            .and_then(serde_json::Value::as_array)
-            .ok_or("source omissions missing")?
-            .iter()
-            .any(|item| item.get("kind").and_then(serde_json::Value::as_str)
-                == Some("source_memory_limit"))
-    );
-    assert_eq!(
-        manifest
-            .pointer("/sources/1/sha256")
-            .and_then(serde_json::Value::as_str),
-        Some(l2_workbench::sha256(&png).as_str())
-    );
-    assert!(
-        manifest
-            .get("artifacts")
-            .and_then(serde_json::Value::as_array)
-            .ok_or("artifacts missing")?
-            .iter()
-            .any(
-                |artifact| artifact.get("sha256").and_then(serde_json::Value::as_str)
-                    == Some(l2_workbench::sha256(&png).as_str())
-            )
-    );
-    drop(held);
+        &Job::new("retry"),
+        &memory,
+    )?;
+    assert_eq!(retry, baseline_result);
     assert_eq!(memory.snapshot()?.used_bytes, 0);
+    let first: serde_json::Value =
+        serde_json::from_slice(&fs::read(baseline.join("manifest.json"))?)?;
+    let second: serde_json::Value =
+        serde_json::from_slice(&fs::read(output.join("manifest.json"))?)?;
+    assert_eq!(first.get("artifacts"), second.get("artifacts"));
+    assert_eq!(first.get("sources"), second.get("sources"));
     Ok(())
 }

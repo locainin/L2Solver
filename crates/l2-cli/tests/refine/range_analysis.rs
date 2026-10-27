@@ -155,11 +155,11 @@ fn large_manifest_member_with_wrong_digest_is_never_published() -> Result<(), Bo
     let input = directory.path().join("input");
     let destination = directory.path().join("result");
     fs::create_dir(&input)?;
-    fs::write(input.join("member.bin"), vec![7_u8; 4096])?;
+    fs::write(input.join("member.bin"), vec![7_u8; 16 * 1024])?;
     fs::write(
         input.join("manifest.json"),
         serde_json::to_vec(&serde_json::json!({
-            "schema_version": 1, "artifacts": [{"file": "member.bin", "byte_length": 4096, "sha256": "0".repeat(64)}]
+            "schema_version": 1, "artifacts": [{"file": "member.bin", "byte_length": 16 * 1024, "sha256": "0".repeat(64)}]
         }))?,
     )?;
     let options = RefineOptions {
@@ -169,7 +169,7 @@ fn large_manifest_member_with_wrong_digest_is_never_published() -> Result<(), Bo
         salvage: false,
         recovery: RecoveryOptions {
             no_cache: true,
-            memory_limit: 4096,
+            memory_limit: 32 * 1024,
             ..RecoveryOptions::default()
         },
     };
@@ -474,12 +474,7 @@ fn short_source_read_counts_only_bytes_actually_returned() -> Result<(), Box<dyn
 }
 
 #[test]
-#[expect(
-    clippy::too_many_lines,
-    reason = "the sources and their shared-budget omissions form one scenario"
-)]
-fn range_and_memory_sources_share_the_case_blob_budget_and_report_partial()
--> Result<(), Box<dyn Error>> {
+fn exhausted_shared_case_memory_fails_without_publishing_a_result() -> Result<(), Box<dyn Error>> {
     let directory = tempfile::tempdir()?;
     let inputs = directory.path().join("inputs");
     let destination = directory.path().join("result");
@@ -519,48 +514,14 @@ fn range_and_memory_sources_share_the_case_blob_budget_and_report_partial()
             ..RecoveryOptions::default()
         },
     };
-    assert!(!run(&options, &mut Vec::new())?);
-    let manifest: serde_json::Value =
-        serde_json::from_slice(&fs::read(destination.join("manifest.json"))?)?;
-    assert_eq!(
-        manifest
-            .get("sources")
-            .and_then(serde_json::Value::as_array)
-            .map(Vec::len),
-        Some(3)
-    );
-    let retained = manifest
-        .get("artifacts")
-        .and_then(serde_json::Value::as_array)
-        .ok_or("artifacts missing")?;
-    assert!(retained.len() < 3, "retained {} artifacts", retained.len());
-    let sources = manifest
-        .get("sources")
-        .and_then(serde_json::Value::as_array)
-        .ok_or("sources missing")?;
-    assert!(sources.iter().any(|source| {
-        source
-            .get("omissions")
-            .and_then(serde_json::Value::as_array)
-            .is_some_and(|omissions| {
-                omissions.iter().any(|item| {
-                    item.get("kind").and_then(serde_json::Value::as_str)
-                        == Some("case_memory_limit")
-                })
-            })
-    }));
-    assert_eq!(
-        manifest
-            .pointer("/sources/2/status")
-            .and_then(serde_json::Value::as_str),
-        Some("partial")
-    );
-    assert_eq!(
-        manifest
-            .get("complete")
-            .and_then(serde_json::Value::as_bool),
-        Some(false)
-    );
+    let error = run(&options, &mut Vec::new())
+        .err()
+        .ok_or("case memory pressure was ignored")?;
+    assert!(matches!(
+        error.downcast_ref::<l2_workbench::job::MemoryError>(),
+        Some(l2_workbench::job::MemoryError::Limit { .. })
+    ));
+    assert!(!destination.exists(), "memory pressure published a result");
     Ok(())
 }
 

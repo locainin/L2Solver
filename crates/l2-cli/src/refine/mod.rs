@@ -5,6 +5,7 @@ mod file_artifact;
 mod input;
 mod output;
 mod policy;
+mod publication_memory;
 mod range_members;
 mod range_zip;
 mod read_budget;
@@ -52,6 +53,7 @@ fn run_with_memory_budget(
     memory: &MemoryBudget,
 ) -> Result<bool, Box<dyn Error>> {
     job.check_cancelled()?;
+    let mut publication_buffer = publication_memory::PublicationBuffer::try_new(memory)?;
     let destination = options
         .output
         .clone()
@@ -93,7 +95,6 @@ fn run_with_memory_budget(
         job,
         memory,
     )?;
-    let publication_identity = identity_after_admission(reuse_identity, &sources);
     ensure_input_unchanged(&input_set, &sampled, &policy, job)?;
     // A checkpoint cannot use a sample as proof of a range source's identity
     let cache = if options.dry_run || sources.iter().any(|source| source.digest().is_none()) {
@@ -124,29 +125,17 @@ fn run_with_memory_budget(
             job,
             destination: &destination,
             result_directory,
-            identity: &publication_identity,
+            identity: &reuse_identity,
             policy: &policy,
             sources: &sources,
             input_set: &input_set,
             sampled: &sampled,
             cache: cache.cache(),
             memory,
+            publication_buffer: &mut publication_buffer,
         })
     })();
     cache.finish(result, job)
-}
-
-fn identity_after_admission(
-    mut identity: crate::result_directory::ResultIdentity,
-    sources: &[LoadedSource],
-) -> crate::result_directory::ResultIdentity {
-    if sources
-        .iter()
-        .any(|source| matches!(&source.data, input::SourceData::MemorySkipped { .. }))
-    {
-        identity.source = l2_workbench::job::cache::SourceIdentity::Unavailable;
-    }
-    identity
 }
 
 struct ReuseContext<'a, W: Write> {
@@ -223,8 +212,13 @@ struct AnalysisPublishContext<'a, W: Write> {
     sampled: &'a input::FingerprintedSources,
     cache: Option<&'a Cache>,
     memory: &'a MemoryBudget,
+    publication_buffer: &'a mut publication_memory::PublicationBuffer,
 }
 
+#[expect(
+    clippy::too_many_lines,
+    reason = "analysis, staged writes, and publication share one transaction"
+)]
 fn analyze_and_publish<W: Write>(
     context: AnalysisPublishContext<'_, W>,
 ) -> Result<bool, Box<dyn Error>> {
@@ -241,6 +235,7 @@ fn analyze_and_publish<W: Write>(
         sampled,
         cache,
         memory,
+        publication_buffer,
     } = context;
     job.check_cancelled()?;
     let analyzed = analysis::analyze_sources(
@@ -285,7 +280,13 @@ fn analyze_and_publish<W: Write>(
         job.check_cancelled()?;
         result_directory.publish(identity, job, |staging| {
             artifact_export::write_artifacts_into(staging, &selected)?;
-            write_file_artifacts(input_set, &analyzed.file_artifacts, staging, job)?;
+            write_file_artifacts(
+                input_set,
+                &analyzed.file_artifacts,
+                staging,
+                job,
+                publication_buffer.bytes_mut(),
+            )?;
             output::write_manifest(staging, &manifest)?;
             output::write_summary_file(staging, &summary)?;
             if !analyzed.file_artifacts.is_empty() {
@@ -313,9 +314,10 @@ fn write_file_artifacts(
     artifacts: &[file_artifact::FileArtifact],
     staging: &std::path::Path,
     job: &Job,
+    buffer: &mut [u8],
 ) -> Result<(), Box<dyn Error>> {
     for artifact in artifacts {
-        input.write_file_artifact(artifact, staging, job)?;
+        input.write_file_artifact(artifact, staging, job, buffer)?;
     }
     Ok(())
 }

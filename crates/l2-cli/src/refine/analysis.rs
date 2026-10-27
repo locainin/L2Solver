@@ -14,9 +14,9 @@ use l2_workbench::{
         AnalysisStatus, ArtifactAnalysisOptions, ArtifactOrigin, ArtifactValidationState,
         analyze_artifacts_with_source_sha256,
     },
-    evidence::{Case, EvidenceError, MAX_NODES, SourceRange},
+    evidence::{Case, MAX_NODES, SourceRange},
     job::{
-        CacheFallbackKind, CacheStage, Counter, Job, MemoryBudget, MemoryError, Phase,
+        CacheFallbackKind, CacheStage, Counter, Job, MemoryBudget, Phase,
         cache::{Cache, CacheEntry, CacheReadPolicy, Lease, SourceIdentity, StageKey, StageStatus},
     },
     recovery::proposals::TRANSFORM_PROPOSAL_FORMAT_VERSION,
@@ -31,7 +31,7 @@ use std::{
     io::{self, Write},
 };
 
-pub(super) const REFINE_ANALYZER_ALGORITHM_VERSION: u32 = 9;
+pub(super) const REFINE_ANALYZER_ALGORITHM_VERSION: u32 = 10;
 pub(super) const CACHE_ANALYSIS_SCHEMA_VERSION: u32 = 1;
 const MAX_CACHE_RECEIPT_BYTES: usize = 8 * 1024 * 1024;
 
@@ -65,34 +65,6 @@ pub(super) fn analyze_sources(
                     maximum: omission.maximum,
                 }],
                 reason: Some(String::from("source read limit prevented analysis")),
-            });
-            job.advance(Phase::TransformDiscovery, 1)?;
-            continue;
-        }
-        if let SourceData::MemorySkipped {
-            length,
-            requested,
-            used,
-            maximum,
-        } = &source.data
-        {
-            analysis.complete = false;
-            analysis.source_records.push(SourceRecord {
-                label: source.label.clone(),
-                sha256: None,
-                byte_length: *length,
-                status: AnalysisStatus::Partial,
-                omissions: vec![
-                    l2_workbench::artifact::AnalysisOmission::SourceMemoryLimit {
-                        length: u64::try_from(*length)?,
-                        requested: *requested,
-                        used: *used,
-                        maximum: *maximum,
-                    },
-                ],
-                reason: Some(String::from(
-                    "shared memory limit prevented source admission",
-                )),
             });
             job.advance(Phase::TransformDiscovery, 1)?;
             continue;
@@ -140,14 +112,13 @@ fn analyze_file_source(
         let parent_index = next_file_index;
         next_file_index += 1;
         if range.retain_source {
-            let result = analysis.append_file_archive(
+            analysis.append_file_archive(
                 source_index,
                 parent_index,
                 source,
                 &report.source_sha256,
                 &archive,
-            );
-            record_case_memory_omission(result, &mut report)?;
+            )?;
         }
         super::range_members::append_members(&mut report, archive, parent_index, options)?;
     }
@@ -158,46 +129,16 @@ fn analyze_file_source(
             .map(|artifact| artifact.index)
             .max()
             .map_or(next_file_index, |index| next_file_index.max(index + 1));
-        let result = analysis.append_file_png(
+        analysis.append_file_png(
             source_index,
             artifact_index,
             source,
             &report.source_sha256,
             png,
-        );
-        record_case_memory_omission(result, &mut report)?;
+        )?;
     }
     record_analysis_work(job, &report)?;
     Ok(report)
-}
-
-fn record_case_memory_omission(
-    result: Result<(), Box<dyn Error>>,
-    report: &mut l2_workbench::artifact::ArtifactAnalysis,
-) -> Result<(), Box<dyn Error>> {
-    match result {
-        Ok(()) => Ok(()),
-        Err(error) => {
-            if let Some(EvidenceError::Memory(MemoryError::Limit {
-                limit,
-                used,
-                requested,
-            })) = error.downcast_ref::<EvidenceError>()
-            {
-                report.status = AnalysisStatus::Partial;
-                report
-                    .omissions
-                    .push(l2_workbench::artifact::AnalysisOmission::CaseMemoryLimit {
-                        requested: *requested,
-                        used: *used,
-                        maximum: *limit,
-                    });
-                Ok(())
-            } else {
-                Err(error)
-            }
-        }
-    }
 }
 
 fn no_case_space(
@@ -357,13 +298,9 @@ impl AnalyzedSources {
         &mut self,
         source_index: usize,
         source: &LoadedSource,
-        mut report: l2_workbench::artifact::ArtifactAnalysis,
+        report: l2_workbench::artifact::ArtifactAnalysis,
     ) -> Result<(), Box<dyn Error>> {
-        let memory_omissions = self.append_artifacts(source_index, &report.artifacts)?;
-        if !memory_omissions.is_empty() {
-            report.status = AnalysisStatus::Partial;
-            report.omissions.extend(memory_omissions);
-        }
+        self.append_artifacts(source_index, &report.artifacts)?;
         let reason = analysis_reason(&report);
         self.complete &= report.status == AnalysisStatus::Complete;
         self.source_records.push(SourceRecord {
@@ -381,7 +318,7 @@ impl AnalyzedSources {
         &mut self,
         source_index: usize,
         artifacts: &[l2_workbench::artifact::AnalyzedArtifact],
-    ) -> Result<Vec<l2_workbench::artifact::AnalysisOmission>, Box<dyn Error>> {
+    ) -> Result<(), Box<dyn Error>> {
         let origin_count = artifacts
             .iter()
             .try_fold(0_usize, |count, artifact| {
@@ -396,35 +333,18 @@ impl AnalyzedSources {
         self.artifact_records
             .try_reserve(origin_count)
             .map_err(|_| io::Error::other("artifact provenance allocation failed"))?;
-        let mut omissions = Vec::new();
         for artifact in artifacts {
             if self.case.nodes().len() >= MAX_NODES {
                 return Err(invalid_input(
                     "refined output exceeds the evidence node limit",
                 ));
             }
-            let node = self.case.add_bytes_node(
+            let node_id = self.case.add_bytes_node(
                 "record_object",
                 &artifact.bytes,
                 Vec::new(),
                 json!({"source_index":source_index,"artifact_index":artifact.index}),
-            );
-            let node_id = match node {
-                Ok(id) => id,
-                Err(EvidenceError::Memory(MemoryError::Limit {
-                    limit,
-                    used,
-                    requested,
-                })) => {
-                    omissions.push(l2_workbench::artifact::AnalysisOmission::CaseMemoryLimit {
-                        requested,
-                        used,
-                        maximum: limit,
-                    });
-                    continue;
-                }
-                Err(error) => return Err(error.into()),
-            };
+            )?;
             for origin in &artifact.origins {
                 self.artifact_records.push(ArtifactRecord {
                     node_id,
@@ -438,7 +358,7 @@ impl AnalyzedSources {
                 });
             }
         }
-        Ok(omissions)
+        Ok(())
     }
 }
 
