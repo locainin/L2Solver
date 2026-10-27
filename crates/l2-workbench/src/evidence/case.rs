@@ -1350,12 +1350,7 @@ impl Case {
             let Some(edge) = self.edges.get(index) else {
                 return false;
             };
-            if edge.from == from
-                && edge.to == to
-                && edge.relation == relation
-                && edge.status == status
-                && reason.is_none_or(|reason| edge.reason == reason)
-            {
+            if edge.relation == relation && reason.is_none_or(|reason| edge.reason == reason) {
                 return true;
             }
             let Some(links) = self.edge_links.get(index) else {
