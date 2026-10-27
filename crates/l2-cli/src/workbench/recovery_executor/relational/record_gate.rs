@@ -419,7 +419,23 @@ fn deferred_header_result(
     assessment_scope: &'static str,
 ) -> GateResult {
     let work_bytes = primary.work_bytes;
-    primary.details = serde_json::json!({
+    let schema_plan_cache_hit = primary
+        .details
+        .get("schema_plan_cache_hit")
+        .and_then(Value::as_bool);
+    let header_schema_plan_cache_hit = primary
+        .details
+        .get("header_schema_plan_cache_hit")
+        .and_then(Value::as_bool);
+    let header_schema_models_retained = primary
+        .details
+        .get("header_schema_models_retained")
+        .and_then(Value::as_u64);
+    let header_schema_plan_retained_bytes = primary
+        .details
+        .get("header_schema_plan_retained_bytes")
+        .and_then(Value::as_u64);
+    let mut details = serde_json::json!({
         "assessment_scope":assessment_scope,
         "primary_header_assessment":primary.details,
         "full_inference_deferred":true,
@@ -431,6 +447,30 @@ fn deferred_header_result(
         "full_inference_fallback_work_bytes":0,
         "work_bytes":work_bytes,
     });
+    if let Some(details) = details.as_object_mut() {
+        if let Some(cache_hit) = schema_plan_cache_hit {
+            details.insert("schema_plan_cache_hit".to_owned(), Value::Bool(cache_hit));
+        }
+        if let Some(cache_hit) = header_schema_plan_cache_hit {
+            details.insert(
+                "header_schema_plan_cache_hit".to_owned(),
+                Value::Bool(cache_hit),
+            );
+        }
+        if let Some(models) = header_schema_models_retained {
+            details.insert(
+                "header_schema_models_retained".to_owned(),
+                Value::from(models),
+            );
+        }
+        if let Some(bytes) = header_schema_plan_retained_bytes {
+            details.insert(
+                "header_schema_plan_retained_bytes".to_owned(),
+                Value::from(bytes),
+            );
+        }
+    }
+    primary.details = details;
     primary.assessment_scope = SchemaOffsetScope::PreservedHeader;
     primary
 }

@@ -11,13 +11,13 @@ use l2_workbench::{
     evidence::{Case, EvidenceStatus},
     protocol::{
         ByteRange, Direction, HoldoutBasis, MessageContext, RecordSchemaProposalLimits,
-        RelationalAppliedOutput, RelationalByteRangeLocator, RelationalCoordinateBasis,
-        RelationalCounterReset, RelationalFit, RelationalFitStatus, RelationalOperationTemplate,
-        RelationalOutputMapping, RelationalParserScope, RelationalRecordSample,
-        RelationalSessionCheck, RelationalSessionId, RelationalSha256CounterXor,
-        RelationalTransformCandidate, RelationalTransformEvaluationContext,
-        RelationalTransformLimits, RelationalTransformReport, RelationalTransformRule,
-        RelationalTransformStatus, apply_relational_transform_rule,
+        RelationalAppliedOutput, RelationalByteRangeLocator, RelationalCandidateEvaluation,
+        RelationalCoordinateBasis, RelationalCounterReset, RelationalFit, RelationalFitStatus,
+        RelationalOperationTemplate, RelationalOutputMapping, RelationalParserScope,
+        RelationalRecordSample, RelationalSessionCheck, RelationalSessionId,
+        RelationalSha256CounterXor, RelationalTransformCandidate,
+        RelationalTransformEvaluationContext, RelationalTransformLimits, RelationalTransformReport,
+        RelationalTransformRule, RelationalTransformStatus, apply_relational_transform_rule,
     },
     recovery::RecoveryTask,
     sha256,
@@ -287,31 +287,41 @@ fn evaluator_cache_does_not_reuse_a_plan_for_changed_transformed_bytes() -> Test
     );
 
     let (first_candidate, first_outputs) = candidate_with_outputs(b"alpha", &sessions);
-    let first = gate.evaluate(
+    let first = evaluate_partitioned_candidate(
+        &mut gate,
         &context,
         &first_candidate,
-        first_outputs
-            .get(..2)
-            .ok_or("first discovery output partition is missing")?,
-        first_outputs
-            .get(2..)
-            .ok_or("first held-out output partition is missing")?,
+        &first_outputs,
+        "first",
     )?;
     assert_eq!(
         first.assessment.details.get("schema_plan_cache_hit"),
         Some(&Value::Bool(false))
     );
+    assert_eq!(first.assessment.status, GateStatus::Pending);
+
+    let (repeated_candidate, repeated_outputs) = candidate_with_outputs(b"alpha", &sessions);
+    let repeated = evaluate_partitioned_candidate(
+        &mut gate,
+        &context,
+        &repeated_candidate,
+        &repeated_outputs,
+        "repeated",
+    )?;
+    assert_eq!(repeated.assessment.status, GateStatus::Pending);
+    assert_eq!(
+        repeated.assessment.details.get("schema_plan_cache_hit"),
+        Some(&Value::Bool(true)),
+        "an identical frozen input should retain its exact cache-hit fact"
+    );
 
     let (second_candidate, second_outputs) = candidate_with_outputs(b"bravo", &sessions);
-    let second = gate.evaluate(
+    let second = evaluate_partitioned_candidate(
+        &mut gate,
         &context,
         &second_candidate,
-        second_outputs
-            .get(..2)
-            .ok_or("second discovery output partition is missing")?,
-        second_outputs
-            .get(2..)
-            .ok_or("second held-out output partition is missing")?,
+        &second_outputs,
+        "second",
     )?;
 
     assert_eq!(
@@ -319,7 +329,24 @@ fn evaluator_cache_does_not_reuse_a_plan_for_changed_transformed_bytes() -> Test
         Some(&Value::Bool(false)),
         "evaluator outputs share candidate index zero, so cache identity must bind transformed bytes"
     );
+    assert_eq!(second.assessment.status, GateStatus::Pending);
     Ok(())
+}
+
+fn evaluate_partitioned_candidate(
+    gate: &mut CandidateGate<'_>,
+    context: &RelationalTransformEvaluationContext<'_>,
+    candidate: &RelationalTransformCandidate,
+    outputs: &[RelationalAppliedOutput],
+    label: &str,
+) -> TestResult<RelationalCandidateEvaluation<super::GateAssessment>> {
+    let discovery = outputs
+        .get(..2)
+        .ok_or_else(|| format!("{label} discovery output partition is missing"))?;
+    let heldout = outputs
+        .get(2..)
+        .ok_or_else(|| format!("{label} held-out output partition is missing"))?;
+    Ok(gate.evaluate(context, candidate, discovery, heldout)?)
 }
 
 #[test]
