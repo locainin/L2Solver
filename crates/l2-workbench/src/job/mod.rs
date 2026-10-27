@@ -11,6 +11,7 @@ pub use cache_fallback::{
 };
 pub use model::{
     Counter, Job, JobError, JobSnapshot, Phase, PhaseOutcome, PhaseSnapshot, PhaseState,
+    WorkSnapshot,
 };
 
 pub use recovery_transition::{

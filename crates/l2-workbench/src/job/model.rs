@@ -8,6 +8,12 @@ use serde::{Deserialize, Serialize};
 
 use super::recovery_transition::{RecoveryTransition, RecoveryTransitionSummary};
 
+#[path = "work.rs"]
+mod work;
+
+pub use work::WorkSnapshot;
+use work::{WorkLedger, WorkOwner};
+
 use super::cache_fallback::{
     CacheFallbackKind, CacheFallbackSummary, CacheStage, bounded_escaped_sample,
 };
@@ -338,6 +344,7 @@ impl JobSnapshot {
 #[derive(Clone, Debug)]
 pub struct Job {
     inner: Arc<Inner>,
+    work: Option<Arc<WorkOwner>>,
 }
 
 #[derive(Debug)]
@@ -352,6 +359,7 @@ struct State {
     created_at: Instant,
     elapsed_base_ms: u64,
     phase_started_at: BTreeMap<Phase, Instant>,
+    work: WorkLedger,
 }
 
 /// Errors returned when a progress update cannot be applied
@@ -370,6 +378,14 @@ pub enum JobError {
     PhaseOverflow(Phase),
     /// Snapshot restoration was requested after live work started
     RestoreAfterStart,
+    /// A work scope must have a lowercase SHA-256 identity
+    InvalidWorkIdentity,
+    /// The same work identity is already owned by an active handle
+    WorkAlreadyActive,
+    /// The operation requires a scoped work handle
+    WorkScopeRequired,
+    /// A saved contribution has a different identity or an unsupported format
+    InvalidWorkSnapshot,
     /// Cooperative cancellation was requested
     Cancelled,
 }
@@ -394,6 +410,14 @@ impl fmt::Display for JobError {
                 formatter.write_str("job snapshot cannot be restored after live work started")
             }
             Self::Cancelled => formatter.write_str("job cancellation was requested"),
+            Self::InvalidWorkIdentity => {
+                formatter.write_str("work identity must be a SHA-256 digest")
+            }
+            Self::WorkAlreadyActive => formatter.write_str("work identity is already active"),
+            Self::WorkScopeRequired => formatter.write_str("a scoped work handle is required"),
+            Self::InvalidWorkSnapshot => {
+                formatter.write_str("work snapshot is incompatible with this scope")
+            }
         }
     }
 }
@@ -427,9 +451,11 @@ impl Job {
                     created_at,
                     elapsed_base_ms: 0,
                     phase_started_at: BTreeMap::new(),
+                    work: WorkLedger::default(),
                 }),
                 cancel_requested: AtomicBool::new(false),
             }),
+            work: None,
         }
     }
 
@@ -471,6 +497,12 @@ impl Job {
     /// [`JobError::PhaseOverflow`] when the update cannot be recorded
     pub fn advance(&self, phase: Phase, amount: u64) -> Result<(), JobError> {
         let mut state = self.lock_state()?;
+        if let Some(work) = &self.work {
+            return work.advance(&mut state, phase, amount);
+        }
+        state
+            .work
+            .check_phase(&state.snapshot, None, phase, amount)?;
         let phase_snapshot = find_phase_mut(&mut state.snapshot.phases, phase)
             .ok_or(JobError::PhaseNotInProgress(phase))?;
         if phase_snapshot.state != PhaseState::InProgress {
@@ -493,6 +525,10 @@ impl Job {
     /// is not active
     pub fn set_completed(&self, phase: Phase, completed: u64) -> Result<(), JobError> {
         let mut state = self.lock_state()?;
+        if let Some(work) = &self.work {
+            return work.set_completed(&mut state, phase, completed);
+        }
+        state.work.check_base_phase_replacement(phase, completed)?;
         let phase_snapshot = find_phase_mut(&mut state.snapshot.phases, phase)
             .ok_or(JobError::PhaseNotInProgress(phase))?;
         if phase_snapshot.state != PhaseState::InProgress {
@@ -535,6 +571,12 @@ impl Job {
     /// cannot be recorded
     pub fn increment(&self, counter: Counter, amount: u64) -> Result<(), JobError> {
         let mut state = self.lock_state()?;
+        if let Some(work) = &self.work {
+            return work.increment(&mut state, counter, amount);
+        }
+        state
+            .work
+            .check_counter(&state.snapshot, None, counter, amount)?;
         let current = state
             .snapshot
             .counters
@@ -557,6 +599,21 @@ impl Job {
     /// [`JobError::PhaseOverflow`] when the update cannot be recorded without partial changes
     pub fn record_work(&self, phase: Phase, counter: Counter, amount: u64) -> Result<(), JobError> {
         let mut state = self.lock_state()?;
+        if let Some(work) = &self.work {
+            return work.record_work(&mut state, phase, counter, amount);
+        }
+        state
+            .work
+            .check_counter(&state.snapshot, None, counter, amount)?;
+        if state
+            .snapshot
+            .phase(phase)
+            .is_some_and(|entry| entry.state == PhaseState::InProgress)
+        {
+            state
+                .work
+                .check_phase(&state.snapshot, None, phase, amount)?;
+        }
         let JobSnapshot {
             counters,
             current_phase,
@@ -617,6 +674,9 @@ impl Job {
     /// Returns [`JobError::LockPoisoned`] if shared state cannot be accessed
     pub fn record_recovery_transition(&self, event: RecoveryTransition) -> Result<(), JobError> {
         let mut state = self.lock_state()?;
+        if let Some(work) = &self.work {
+            return work.record_transition(&mut state, event);
+        }
         state.snapshot.recovery_transitions.record(event);
         drop(state);
         Ok(())
@@ -672,22 +732,22 @@ impl Job {
     /// the state lock
     pub fn snapshot(&self) -> Result<JobSnapshot, JobError> {
         let state = self.lock_state()?;
-        let mut snapshot = state.snapshot.clone();
-        snapshot.elapsed_ms = state
-            .elapsed_base_ms
-            .saturating_add(duration_millis(state.created_at.elapsed()));
-        snapshot.cancel_requested = self.is_cancelled();
-
-        // Runtime clocks stay outside the serialized model and are applied only to this copy
-        for phase in &mut snapshot.phases {
-            if let Some(started_at) = state.phase_started_at.get(&phase.phase) {
-                phase.elapsed_ms = phase
-                    .elapsed_ms
-                    .saturating_add(duration_millis(started_at.elapsed()));
-                phase.refresh_measurements();
-            }
-        }
+        let mut snapshot = timed_snapshot(&state, self.is_cancelled());
+        state.work.apply_to(&mut snapshot)?;
+        drop(state);
         Ok(snapshot)
+    }
+
+    /// Returns progress whose durable state belongs to the job rather than a Case
+    ///
+    /// Scoped measurements belong to their own committed generations. Leaving them out
+    /// prevents a background display checkpoint from duplicating restored Case work.
+    ///
+    /// # Errors
+    /// Returns [`JobError::LockPoisoned`] when shared state is unavailable
+    pub fn checkpoint_snapshot(&self) -> Result<JobSnapshot, JobError> {
+        let state = self.lock_state()?;
+        Ok(timed_snapshot(&state, self.is_cancelled()))
     }
 
     /// Restores a saved snapshot into this shared job handle
@@ -706,7 +766,8 @@ impl Job {
                 .snapshot
                 .phases
                 .iter()
-                .all(|phase| phase.state == PhaseState::Pending);
+                .all(|phase| phase.state == PhaseState::Pending)
+            && state.work.is_empty();
         if !no_live_phase_started {
             return Err(JobError::RestoreAfterStart);
         }
@@ -766,6 +827,25 @@ impl Job {
     fn lock_state(&self) -> Result<std::sync::MutexGuard<'_, State>, JobError> {
         self.inner.state.lock().map_err(|_| JobError::LockPoisoned)
     }
+}
+
+fn timed_snapshot(state: &State, cancel_requested: bool) -> JobSnapshot {
+    let mut snapshot = state.snapshot.clone();
+    snapshot.elapsed_ms = state
+        .elapsed_base_ms
+        .saturating_add(duration_millis(state.created_at.elapsed()));
+    snapshot.cancel_requested = cancel_requested;
+
+    // Runtime clocks stay outside the serialized model and are applied only to this copy
+    for phase in &mut snapshot.phases {
+        if let Some(started_at) = state.phase_started_at.get(&phase.phase) {
+            phase.elapsed_ms = phase
+                .elapsed_ms
+                .saturating_add(duration_millis(started_at.elapsed()));
+            phase.refresh_measurements();
+        }
+    }
+    snapshot
 }
 
 fn find_phase_mut(phases: &mut [PhaseSnapshot], phase: Phase) -> Option<&mut PhaseSnapshot> {

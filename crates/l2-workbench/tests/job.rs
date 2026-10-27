@@ -7,6 +7,9 @@ use l2_workbench::job::{
     Counter, Job, JobError, JobSnapshot, Phase, PhaseOutcome, PhaseSnapshot, PhaseState,
 };
 
+#[path = "job/work.rs"]
+mod work;
+
 type TestResult = Result<(), Box<dyn Error>>;
 
 fn phase(snapshot: &JobSnapshot, phase: Phase) -> Result<&PhaseSnapshot, io::Error> {

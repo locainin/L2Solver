@@ -88,8 +88,8 @@ impl CheckpointWriter {
     ) -> Result<Self, CheckpointError> {
         let key = StageKey::new(
             "recovery_job",
-            2,
-            "l2-recovery-job-v2",
+            3,
+            "l2-recovery-job-v3",
             &json!({"kind": identity.kind, "algorithm_version": identity.algorithm_version,
                 "settings": identity.settings}),
             &identity.source,
@@ -131,7 +131,7 @@ impl CheckpointWriter {
                     match receiver.recv_timeout(Duration::from_secs(1)) {
                         Ok(_) | Err(mpsc::RecvTimeoutError::Disconnected) => break,
                         Err(mpsc::RecvTimeoutError::Timeout) => {
-                            let snapshot = worker_job.snapshot()?;
+                            let snapshot = worker_job.checkpoint_snapshot()?;
                             worker_cache.write_checkpoint(
                                 &worker_key,
                                 &snapshot,
@@ -168,7 +168,7 @@ impl CheckpointWriter {
         self.stop_worker()?;
         self.cache.write_checkpoint(
             &self.key,
-            &self.job.snapshot()?,
+            &self.job.checkpoint_snapshot()?,
             if finished {
                 CheckpointStatus::Complete
             } else {
@@ -197,7 +197,7 @@ fn preview_snapshot(
     job: &Job,
     saved: Option<&JobSnapshot>,
 ) -> Result<JobSnapshot, CheckpointError> {
-    let current = job.snapshot()?;
+    let current = job.checkpoint_snapshot()?;
     let Some(saved) = saved else {
         return Ok(current);
     };
@@ -216,7 +216,7 @@ fn preview_snapshot(
     }
     preview.restore(current)?;
     preview.restore(saved.clone())?;
-    Ok(preview.snapshot()?)
+    Ok(preview.checkpoint_snapshot()?)
 }
 
 impl Drop for CheckpointWriter {

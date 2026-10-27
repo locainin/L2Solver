@@ -5,6 +5,43 @@ use l2_workbench::job::{Counter, Phase};
 use serde_json::json;
 
 #[test]
+fn job_checkpoint_does_not_replay_a_cases_uncommitted_progress() -> Result<(), Box<dyn Error>> {
+    let temporary = tempfile::tempdir()?;
+    let cache = Cache::open_at(
+        temporary.path().join("cache"),
+        temporary.path().join("state"),
+        1024 * 1024,
+    )?;
+    let identity = ResultIdentity {
+        kind: ResultKind::Extract,
+        algorithm_version: 2,
+        source: SourceIdentity::from_sha256("a".repeat(64))?,
+        settings: json!({"profile":"normal"}),
+    };
+    let job = Job::new("live extraction");
+    let writer = CheckpointWriter::start(&cache, &identity, &job, false)?;
+    let case_job = job.work_scope(&"b".repeat(64))?;
+    job.increment(Counter::Packets, 13)?;
+    case_job.increment(Counter::CandidatesExamined, 17)?;
+    let committed_work = case_job.work_snapshot()?;
+    case_job.increment(Counter::CandidatesExamined, 100)?;
+    writer.finish(false)?;
+
+    let resumed = Job::new("resumed extraction");
+    let writer = CheckpointWriter::start(&cache, &identity, &resumed, false)?;
+    let case_job = resumed.work_scope(&"b".repeat(64))?;
+    case_job.restore_work(committed_work)?;
+    let snapshot = resumed.snapshot()?;
+    assert_eq!(
+        snapshot.counters.get(&Counter::CandidatesExamined),
+        Some(&17)
+    );
+    assert_eq!(snapshot.counters.get(&Counter::Packets), Some(&13));
+    writer.finish(true)?;
+    Ok(())
+}
+
+#[test]
 fn interrupted_job_restores_cumulative_work_and_replays_cached_stages() -> Result<(), Box<dyn Error>>
 {
     let temporary = tempfile::tempdir()?;
