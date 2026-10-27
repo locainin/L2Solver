@@ -3,16 +3,17 @@
 use super::super::model::{RecordSchemaProposalLimits, default_sequence_base};
 use super::length_layouts::{LengthLayoutOrder, length_domain_stats, visit_length_layouts};
 use super::{
-    CandidateGeneration, FieldDomains, LengthFieldMembership, LengthFields, RecordRange,
-    SupportedLength, allocation_error, candidate_field_domains, empty_length_fields,
-    empty_pair_fields, finish_candidate_generation, sequence_group_candidates, try_charge_work,
-    varying_sequence_fields,
+    CandidateGeneration, FieldDomains, LengthFieldMembership, LengthFields, PairCheckProgress,
+    RecordRange, RepeatedViewGroup, SupportedLength, SupportedPairCollection, allocation_error,
+    candidate_field_domains, empty_length_fields, empty_pair_fields, finish_candidate_generation,
+    sequence_group_candidates, try_charge_work, varying_sequence_fields,
 };
 use crate::protocol::{
     ByteField, ByteOrder, IntegerField, RecordCount, RecordDiscoveryError, RecordError,
     RecordInput, RecordLengthMeaning, RecordLimits, RecordSchema, RecordWorkBudget,
 };
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet, hash_map::DefaultHasher};
+use std::hash::{Hash, Hasher};
 use std::ops::ControlFlow;
 
 pub(super) fn generate_candidates(
@@ -40,41 +41,92 @@ pub(super) fn generate_candidates(
         lengths.meanings.clear();
         lengths.supported.clear();
         lengths.record_ranges.clear();
+        lengths.view_groups.clear();
+        lengths.group_view_count = 0;
         let pairs = empty_pair_fields(0);
         return finish_candidate_generation(&raw_fields, pairs, lengths, limits, Vec::new(), work);
     }
 
-    let Some(views) = record_views(training_messages, &lengths.record_ranges, work)? else {
-        lengths.work_limit_reached = true;
-        lengths.omitted_record_views = lengths
-            .omitted_record_views
-            .checked_add(lengths.record_ranges.len())
-            .ok_or(RecordDiscoveryError::InvalidLimits)?;
-        return finish_candidate_generation(
-            &raw_fields,
-            empty_pair_fields(0),
-            lengths,
-            limits,
-            Vec::new(),
-            work,
-        );
-    };
-    let header_fields = candidate_field_domains(&views, header_limits, work)?;
     let mut fields = raw_fields;
-    add_field_check_counts(&mut fields, &header_fields)?;
-    fields.work_limit_reached |= header_fields.work_limit_reached;
+    let group_count = lengths.view_groups.len();
+    let mut supported_pairs = SupportedPairCollection::default();
+    let mut pair_checks = PairCheckProgress::default();
+    let mut completed_group_views = 0_usize;
+    for (group_index, group) in lengths.view_groups.iter().enumerate() {
+        let Some(views) = record_views(training_messages, &group.ranges, work)? else {
+            record_group_work_stopped(&mut lengths, &mut fields, completed_group_views)?;
+            break;
+        };
+        completed_group_views = completed_group_views
+            .checked_add(group.ranges.len())
+            .ok_or(RecordDiscoveryError::InvalidLimits)?;
 
-    let (sequence_fields, sequence_work_limit) =
-        varying_sequence_fields(&views, &header_fields.integer_shapes, work)?;
-    let mut pairs = sequence_group_candidates(
-        &views,
-        &header_fields.identifiers,
-        &sequence_fields,
-        limits.max_pair_checks,
-        work,
-    )?;
-    pairs.work_limit_reached |= sequence_work_limit;
+        let mut group_limits = header_limits;
+        group_limits.max_field_checks_per_domain = shared_group_limit(
+            header_limits.max_field_checks_per_domain,
+            group_count,
+            group_index,
+        );
+        let header_fields = candidate_field_domains(&views, group_limits, work)?;
+        add_field_check_counts(&mut fields, &header_fields)?;
+        fields.work_limit_reached |= header_fields.work_limit_reached;
+
+        let (sequence_fields, sequence_work_limit) =
+            varying_sequence_fields(&views, &header_fields.integer_shapes, work)?;
+        let group_pair_checks = sequence_group_candidates(
+            &views,
+            &header_fields.identifiers,
+            &sequence_fields,
+            shared_group_limit(limits.max_pair_checks, group_count, group_index),
+            Some(group_index),
+            &mut supported_pairs,
+            work,
+        )?;
+        pair_checks.examined_checks = pair_checks
+            .examined_checks
+            .checked_add(group_pair_checks.examined_checks)
+            .ok_or(RecordDiscoveryError::InvalidLimits)?;
+        pair_checks.omitted_checks = pair_checks
+            .omitted_checks
+            .checked_add(group_pair_checks.omitted_checks)
+            .ok_or(RecordDiscoveryError::InvalidLimits)?;
+        pair_checks.work_limit_reached |=
+            group_pair_checks.work_limit_reached || sequence_work_limit;
+    }
+    let pairs = supported_pairs.into_pair_fields(
+        pair_checks.examined_checks,
+        pair_checks.omitted_checks,
+        pair_checks.work_limit_reached,
+    );
     finish_candidate_generation(&fields, pairs, lengths, limits, Vec::new(), work)
+}
+
+const fn shared_group_limit(limit: usize, group_count: usize, group_index: usize) -> usize {
+    limit / group_count
+        + if group_index < limit % group_count {
+            1
+        } else {
+            0
+        }
+}
+
+fn record_group_work_stopped(
+    lengths: &mut LengthFields,
+    fields: &mut FieldDomains,
+    completed_group_views: usize,
+) -> Result<(), RecordDiscoveryError> {
+    lengths.work_limit_reached = true;
+    fields.work_limit_reached = true;
+    // The cached total includes this and later groups, so no further range scan is needed
+    let remaining_group_views = lengths
+        .group_view_count
+        .checked_sub(completed_group_views)
+        .ok_or(RecordDiscoveryError::InvalidLimits)?;
+    lengths.omitted_record_views = lengths
+        .omitted_record_views
+        .checked_add(remaining_group_views)
+        .ok_or(RecordDiscoveryError::InvalidLimits)?;
+    Ok(())
 }
 
 const fn split_field_check_budget(
@@ -187,6 +239,7 @@ struct LengthCandidateSearch<'a, 'input> {
     result: LengthFields,
     seen_layout_fields: LengthFieldMembership,
     seen_record_ranges: HashSet<(usize, usize, usize)>,
+    view_group_index: HashMap<u64, Vec<usize>>,
     incomplete_checks: usize,
 }
 
@@ -218,6 +271,7 @@ impl<'a, 'input> LengthCandidateSearch<'a, 'input> {
             result: empty_length_fields(),
             seen_layout_fields: LengthFieldMembership::default(),
             seen_record_ranges: HashSet::new(),
+            view_group_index: HashMap::new(),
             incomplete_checks: 0,
         }))
     }
@@ -255,7 +309,7 @@ impl<'a, 'input> LengthCandidateSearch<'a, 'input> {
                     self.result.work_limit_reached = true;
                     return Ok(ControlFlow::Break(()));
                 }
-                if !self.retain_layout(field, data_offset, meaning, ranges, omitted, work)? {
+                if !self.retain_layout(field, data_offset, meaning, &ranges, omitted, work)? {
                     self.result.work_limit_reached = true;
                     return Ok(ControlFlow::Break(()));
                 }
@@ -269,16 +323,37 @@ impl<'a, 'input> LengthCandidateSearch<'a, 'input> {
         field: IntegerField,
         data_offset: usize,
         meaning: RecordLengthMeaning,
-        ranges: Vec<RecordRange>,
+        ranges: &[RecordRange],
         omitted: usize,
         work: &mut Option<&mut RecordWorkBudget>,
     ) -> Result<bool, RecordDiscoveryError> {
+        let mut layout_group = None;
+        if layout_has_repeated_boundaries(ranges, self.messages.len()) {
+            self.result.has_repeated_boundaries = true;
+            for range in ranges {
+                if !self.retain_record_range(*range, work)? {
+                    return Ok(false);
+                }
+            }
+            match self.retain_view_group(ranges, work)? {
+                ViewGroupRetention::Retained(index) => layout_group = Some(index),
+                ViewGroupRetention::Omitted => {
+                    self.result.omitted_record_views = self
+                        .result
+                        .omitted_record_views
+                        .checked_add(ranges.len())
+                        .ok_or(RecordDiscoveryError::InvalidLimits)?;
+                }
+                ViewGroupRetention::WorkLimit => return Ok(false),
+            }
+        }
         self.result.retain_layout(
             &mut self.seen_layout_fields,
             SupportedLength {
                 field,
                 data_offset,
                 meaning,
+                layout_group,
             },
         )?;
         self.result.omitted_record_views = self
@@ -286,15 +361,79 @@ impl<'a, 'input> LengthCandidateSearch<'a, 'input> {
             .omitted_record_views
             .checked_add(omitted)
             .ok_or(RecordDiscoveryError::InvalidLimits)?;
-        if layout_has_repeated_boundaries(&ranges, self.messages.len()) {
-            self.result.has_repeated_boundaries = true;
-            for range in ranges {
-                if !self.retain_record_range(range, work)? {
-                    return Ok(false);
+        Ok(true)
+    }
+
+    fn retain_view_group(
+        &mut self,
+        ranges: &[RecordRange],
+        work: &mut Option<&mut RecordWorkBudget>,
+    ) -> Result<ViewGroupRetention, RecordDiscoveryError> {
+        let range_bytes = std::mem::size_of::<RecordRange>()
+            .checked_mul(ranges.len())
+            .ok_or(RecordDiscoveryError::InvalidLimits)?;
+        if !try_charge_work(work, range_bytes) {
+            return Ok(ViewGroupRetention::WorkLimit);
+        }
+        let mut hasher = DefaultHasher::new();
+        ranges.hash(&mut hasher);
+        let signature = hasher.finish();
+
+        if let Some(indices) = self.view_group_index.get(&signature) {
+            for index in indices {
+                if !try_charge_work(work, range_bytes) {
+                    return Ok(ViewGroupRetention::WorkLimit);
+                }
+                let group = self
+                    .result
+                    .view_groups
+                    .get(*index)
+                    .ok_or(RecordDiscoveryError::InvalidLimits)?;
+                if group.ranges == ranges {
+                    return Ok(ViewGroupRetention::Retained(*index));
                 }
             }
         }
-        Ok(true)
+
+        let next_view_count = self
+            .result
+            .group_view_count
+            .checked_add(ranges.len())
+            .ok_or(RecordDiscoveryError::InvalidLimits)?;
+        if next_view_count > self.maximum_record_views {
+            return Ok(ViewGroupRetention::Omitted);
+        }
+
+        let group_storage = std::mem::size_of::<RepeatedViewGroup>()
+            .checked_add(range_bytes)
+            .and_then(|bytes| bytes.checked_add(std::mem::size_of::<(u64, Vec<usize>)>()))
+            .ok_or(RecordDiscoveryError::InvalidLimits)?;
+        if !try_charge_work(work, group_storage) {
+            return Ok(ViewGroupRetention::WorkLimit);
+        }
+        self.result
+            .view_groups
+            .try_reserve(1)
+            .map_err(|_| allocation_error())?;
+        self.view_group_index
+            .try_reserve(1)
+            .map_err(|_| allocation_error())?;
+        let group_index = self.result.view_groups.len();
+        let group_indices = self.view_group_index.entry(signature).or_default();
+        group_indices
+            .try_reserve(1)
+            .map_err(|_| allocation_error())?;
+        let mut retained_ranges = Vec::new();
+        retained_ranges
+            .try_reserve_exact(ranges.len())
+            .map_err(|_| allocation_error())?;
+        retained_ranges.extend_from_slice(ranges);
+        self.result.view_groups.push(RepeatedViewGroup {
+            ranges: retained_ranges,
+        });
+        group_indices.push(group_index);
+        self.result.group_view_count = next_view_count;
+        Ok(ViewGroupRetention::Retained(group_index))
     }
 
     fn retain_record_range(
@@ -346,6 +485,12 @@ impl<'a, 'input> LengthCandidateSearch<'a, 'input> {
         self.result.work_limit_reached |= stopped;
         Ok(self.result)
     }
+}
+
+enum ViewGroupRetention {
+    Retained(usize),
+    Omitted,
+    WorkLimit,
 }
 
 fn layout_has_repeated_boundaries(ranges: &[RecordRange], message_count: usize) -> bool {

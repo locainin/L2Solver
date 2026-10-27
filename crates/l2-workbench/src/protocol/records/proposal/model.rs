@@ -160,17 +160,18 @@ pub struct RecordSchemaProposalReport {
     pub candidate_combinations: Option<usize>,
     /// Raw field layouts examined across identifier and integer field domains
     pub examined_field_checks: usize,
-    /// Raw field layouts skipped after a field-domain check budget was reached
+    /// Checks skipped in visited field domains; work-limit stops can leave later domains uncounted
     pub omitted_field_checks: usize,
     /// Identifier and sequence field pairs checked for ordering invariants
     pub examined_pair_checks: usize,
-    /// Identifier and sequence combinations skipped after the pair-check budget was reached
+    /// Checks skipped in visited pair domains; work-limit stops can leave later domains uncounted
     pub omitted_pair_checks: usize,
     /// Length field, meaning, and payload boundary combinations checked
     pub examined_length_checks: usize,
-    /// Length field, meaning, and payload boundary combinations skipped at the length-check limit
+    /// Length checks not reached under the length cap or shared work budget
     pub omitted_length_checks: usize,
-    /// Parsed record-boundary views excluded by the configured sample-memory budget
+    /// Layout/view associations excluded by the view cap or left unprocessed at a work-limit stop
+    /// A source span is counted once for each distinct layout that uses it
     pub omitted_record_views: usize,
     /// Bounded record spans selected by repeated-boundary analysis in training-message order
     pub repeated_boundary_cues: Vec<RecordBoundaryCue>,
@@ -178,7 +179,7 @@ pub struct RecordSchemaProposalReport {
     pub omitted_schema_combinations: Option<usize>,
     /// Whether all bounded candidate-generation checks and schema combinations were examined
     pub search_exhaustive_within_plan: bool,
-    /// Whether the shared logical work-byte budget stopped proposal generation
+    /// Whether the work-byte budget stopped generation before all eligible domains were checked
     pub work_limit_reached: bool,
     /// Limits of the structural evidence used to build the candidate domains
     pub limitations: [&'static str; 2],

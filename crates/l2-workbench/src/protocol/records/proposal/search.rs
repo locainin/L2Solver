@@ -621,6 +621,8 @@ struct SupportedPair {
     identifier: ByteField,
     sequence: IntegerField,
     evidence: SequenceEvidence,
+    // Repeated headers only pair with lengths learned from the same record views
+    layout_group: Option<usize>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -634,6 +636,8 @@ struct SupportedLength {
     field: IntegerField,
     data_offset: usize,
     meaning: super::super::RecordLengthMeaning,
+    // None is the established fixed-layout path; repeated layouts carry their view group
+    layout_group: Option<usize>,
 }
 
 #[derive(Clone, Copy)]
@@ -646,6 +650,13 @@ struct PairFields {
     identifiers: Vec<ByteField>,
     sequences: Vec<IntegerField>,
     supported: Vec<SupportedPair>,
+    examined_checks: usize,
+    omitted_checks: usize,
+    work_limit_reached: bool,
+}
+
+#[derive(Default)]
+struct PairCheckProgress {
     examined_checks: usize,
     omitted_checks: usize,
     work_limit_reached: bool,
@@ -666,6 +677,7 @@ impl SupportedPairCollection {
         identifier: ByteField,
         sequence: IntegerField,
         evidence: SequenceEvidence,
+        layout_group: Option<usize>,
     ) -> Result<(), RecordDiscoveryError> {
         push_unique_by(
             &mut self.identifiers,
@@ -690,6 +702,7 @@ impl SupportedPairCollection {
                 identifier,
                 sequence,
                 evidence,
+                layout_group,
             },
         )
     }
@@ -717,11 +730,17 @@ struct LengthFields {
     meanings: Vec<super::super::RecordLengthMeaning>,
     supported: Vec<SupportedLength>,
     record_ranges: Vec<RecordRange>,
+    view_groups: Vec<RepeatedViewGroup>,
+    group_view_count: usize,
     has_repeated_boundaries: bool,
     omitted_record_views: usize,
     examined_checks: usize,
     omitted_checks: usize,
     work_limit_reached: bool,
+}
+
+struct RepeatedViewGroup {
+    ranges: Vec<RecordRange>,
 }
 
 #[derive(Default)]
@@ -947,6 +966,7 @@ fn supported_pair_order(pair: &SupportedPair, prioritize_evidence: bool) -> Supp
         )
     };
     SupportedPairOrder {
+        layout_group: pair.layout_group,
         priority_ordinal_span_holes,
         priority_capture_order_violations,
         field_gap,
@@ -966,6 +986,7 @@ fn supported_pair_order(pair: &SupportedPair, prioritize_evidence: bool) -> Supp
 
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
 struct SupportedPairOrder {
+    layout_group: Option<usize>,
     priority_ordinal_span_holes: u128,
     priority_capture_order_violations: usize,
     field_gap: usize,
@@ -990,7 +1011,9 @@ fn first_compatible_pair(
 ) -> Result<Option<usize>, RecordDiscoveryError> {
     for (index, pair) in pairs.iter().enumerate().skip(start) {
         charge_proposal_work(work, std::mem::size_of::<SupportedPair>())?;
-        if pair_fits_before_data(pair, length.data_offset) {
+        if pair.layout_group == length.layout_group
+            && pair_fits_before_data(pair, length.data_offset)
+        {
             return Ok(Some(index));
         }
     }
@@ -1038,7 +1061,9 @@ fn compatible_pair_counts(
             if !try_charge_work(work, std::mem::size_of::<SupportedPair>()) {
                 return Ok(None);
             }
-            if pair_fits_before_data(pair, length.data_offset) {
+            if pair.layout_group == length.layout_group
+                && pair_fits_before_data(pair, length.data_offset)
+            {
                 summary.count = summary
                     .count
                     .checked_add(1)
@@ -1081,13 +1106,21 @@ fn generate_candidates(
         normalized_training_data_offsets(training_data_offsets, fields.maximum_offset)?;
     let (sequence_fields, sequence_work_limit) =
         varying_sequence_fields(training_messages, &fields.integer_shapes, work)?;
-    let mut pair_fields = sequence_group_candidates(
+    let mut supported_pairs = SupportedPairCollection::default();
+    let pair_progress = sequence_group_candidates(
         training_messages,
         &fields.identifiers,
         &sequence_fields,
         limits.max_pair_checks,
+        None,
+        &mut supported_pairs,
         work,
     )?;
+    let mut pair_fields = supported_pairs.into_pair_fields(
+        pair_progress.examined_checks,
+        pair_progress.omitted_checks,
+        pair_progress.work_limit_reached,
+    );
     pair_fields.work_limit_reached |= sequence_work_limit;
     // The fixed-layout path avoids length work when semantic fields cannot form a schema
     let length_fields = if pair_fields.supported.is_empty() {
@@ -1180,6 +1213,8 @@ const fn empty_length_fields() -> LengthFields {
         meanings: Vec::new(),
         supported: Vec::new(),
         record_ranges: Vec::new(),
+        view_groups: Vec::new(),
+        group_view_count: 0,
         has_repeated_boundaries: false,
         omitted_record_views: 0,
         examined_checks: 0,
@@ -1597,17 +1632,22 @@ fn sequence_group_candidates(
     identifiers: &[ByteField],
     sequences: &[IntegerField],
     maximum_checks: usize,
+    layout_group: Option<usize>,
+    supported: &mut SupportedPairCollection,
     work: &mut Option<&mut RecordWorkBudget>,
-) -> Result<PairFields, RecordDiscoveryError> {
+) -> Result<PairCheckProgress, RecordDiscoveryError> {
     let total_checks = identifiers
         .len()
         .checked_mul(sequences.len())
         .ok_or(RecordDiscoveryError::InvalidLimits)?;
     if identifiers.is_empty() || sequences.is_empty() {
-        return Ok(empty_pair_fields(total_checks));
+        return Ok(PairCheckProgress {
+            examined_checks: 0,
+            omitted_checks: total_checks,
+            work_limit_reached: false,
+        });
     }
 
-    let mut supported = SupportedPairCollection::default();
     let mut checks = 0_usize;
     let mut work_limit_reached = false;
     let maximum_diagonal = identifiers
@@ -1647,14 +1687,14 @@ fn sequence_group_candidates(
                     break 'diagonals;
                 }
             };
-            supported.retain(*identifier, *sequence, evidence)?;
+            supported.retain(*identifier, *sequence, evidence, layout_group)?;
         }
     }
-    Ok(supported.into_pair_fields(
-        checks,
-        total_checks.saturating_sub(checks),
+    Ok(PairCheckProgress {
+        examined_checks: checks,
+        omitted_checks: total_checks.saturating_sub(checks),
         work_limit_reached,
-    ))
+    })
 }
 
 const fn empty_pair_fields(total_checks: usize) -> PairFields {
@@ -1860,6 +1900,7 @@ fn length_candidates(
                     field,
                     data_offset,
                     meaning,
+                    layout_group: None,
                 },
             )?;
             Ok(ControlFlow::Continue(()))
