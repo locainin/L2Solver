@@ -7,9 +7,10 @@ use super::{
     policy::RefinePolicy,
 };
 use crate::arguments::{RecoveryOptions, RecoveryProfile};
+use crate::workbench::artifact_export::AnalyzerValidationReceipt;
 use l2_workbench::{
     artifact::{
-        AnalysisStatus, ArtifactAnalysisOptions, ArtifactOrigin,
+        AnalysisStatus, ArtifactAnalysisOptions, ArtifactOrigin, ArtifactValidationState,
         analyze_artifacts_with_source_sha256,
     },
     evidence::{Case, MAX_NODES},
@@ -22,13 +23,14 @@ use l2_workbench::{
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::{
+    collections::HashSet,
     error::Error,
     fmt,
     fs::File,
     io::{self, Write},
 };
 
-pub(super) const REFINE_ANALYZER_ALGORITHM_VERSION: u32 = 2;
+pub(super) const REFINE_ANALYZER_ALGORITHM_VERSION: u32 = 3;
 pub(super) const CACHE_ANALYSIS_SCHEMA_VERSION: u32 = 1;
 const MAX_CACHE_RECEIPT_BYTES: usize = 8 * 1024 * 1024;
 
@@ -47,7 +49,15 @@ pub(super) fn analyze_sources(
             format!("analyzing {}", source.label.escape_debug()),
         )?;
         let report = analyze_source_cached(source, policy.analyzer, recovery, cache, job)?;
-        analysis.append_source(source_index, source, report, job)?;
+        let expanded_members = report
+            .artifacts
+            .iter()
+            .flat_map(|artifact| &artifact.origins)
+            .filter(|origin| matches!(origin, ArtifactOrigin::ArchiveMember { .. }))
+            .count();
+        analysis.append_source(source_index, source, report)?;
+        job.advance(Phase::Expansion, u64::try_from(expanded_members)?)?;
+        job.advance(Phase::TransformDiscovery, 1)?;
     }
     Ok(analysis)
 }
@@ -73,14 +83,40 @@ impl AnalyzedSources {
         })
     }
 
+    pub(super) fn analyzer_validation_receipts(
+        &self,
+    ) -> Result<Vec<AnalyzerValidationReceipt>, Box<dyn Error>> {
+        let mut seen_nodes = HashSet::new();
+        seen_nodes.try_reserve(self.artifact_records.len())?;
+        let mut receipts = Vec::new();
+        receipts
+            .try_reserve_exact(self.artifact_records.len())
+            .map_err(|_| io::Error::other("artifact validation allocation failed"))?;
+
+        for artifact in &self.artifact_records {
+            if artifact.validation.state != ArtifactValidationState::Validated
+                || !seen_nodes.insert(artifact.node_id)
+            {
+                continue;
+            }
+            receipts.push(AnalyzerValidationReceipt::new(
+                artifact.node_id,
+                artifact.sha256.clone(),
+                artifact.byte_length,
+                artifact.validation,
+            ));
+        }
+        Ok(receipts)
+    }
+
     fn append_source(
         &mut self,
         source_index: usize,
         source: &LoadedSource,
         report: l2_workbench::artifact::ArtifactAnalysis,
-        job: &Job,
     ) -> Result<(), Box<dyn Error>> {
-        let artifact_counts = self.append_artifacts(source_index, &report.artifacts)?;
+        let reason = analysis_reason(&report);
+        self.append_artifacts(source_index, &report.artifacts)?;
         self.complete &= report.status == AnalysisStatus::Complete;
         self.source_records.push(SourceRecord {
             label: source.label.clone(),
@@ -88,17 +124,8 @@ impl AnalyzedSources {
             byte_length: report.source_length,
             status: report.status,
             omissions: report.omissions,
+            reason,
         });
-
-        job.increment(
-            Counter::CandidatesExamined,
-            u64::try_from(report.artifacts.len())?,
-        )?;
-        job.increment(Counter::Transforms, artifact_counts.transforms)?;
-        job.increment(Counter::ExpandedMembers, artifact_counts.archive_members)?;
-        job.increment(Counter::ValidatedArtifacts, artifact_counts.validated)?;
-        job.advance(Phase::Expansion, artifact_counts.archive_members)?;
-        job.advance(Phase::TransformDiscovery, 1)?;
         Ok(())
     }
 
@@ -106,7 +133,7 @@ impl AnalyzedSources {
         &mut self,
         source_index: usize,
         artifacts: &[l2_workbench::artifact::AnalyzedArtifact],
-    ) -> Result<ArtifactCounts, Box<dyn Error>> {
+    ) -> Result<(), Box<dyn Error>> {
         let origin_count = artifacts
             .iter()
             .try_fold(0_usize, |count, artifact| {
@@ -121,8 +148,6 @@ impl AnalyzedSources {
         self.artifact_records
             .try_reserve(origin_count)
             .map_err(|_| io::Error::other("artifact provenance allocation failed"))?;
-
-        let mut counts = ArtifactCounts::default();
         for artifact in artifacts {
             if self.case.nodes().len() >= MAX_NODES {
                 return Err(invalid_input(
@@ -136,35 +161,104 @@ impl AnalyzedSources {
                 json!({"source_index":source_index,"artifact_index":artifact.index}),
             )?;
             for origin in &artifact.origins {
-                match origin {
-                    ArtifactOrigin::Transformation { .. } => counts.transforms += 1,
-                    ArtifactOrigin::ArchiveMember { .. } => counts.archive_members += 1,
-                    ArtifactOrigin::EmbeddedObject { .. } | ArtifactOrigin::Source => {}
-                }
                 self.artifact_records.push(ArtifactRecord {
                     node_id,
                     source_index,
                     artifact_index: artifact.index,
                     origin: origin.clone(),
+                    sha256: artifact.sha256.clone(),
+                    byte_length: artifact.bytes.len(),
                     validation: artifact.validation,
                     signature_match_count: artifact.signature_match_count,
                 });
             }
-            if artifact.validation.state
-                == l2_workbench::artifact::ArtifactValidationState::Validated
-            {
-                counts.validated += 1;
-            }
         }
-        Ok(counts)
+        Ok(())
     }
 }
 
-#[derive(Default)]
-struct ArtifactCounts {
-    transforms: u64,
-    archive_members: u64,
-    validated: u64,
+fn analysis_reason(report: &l2_workbench::artifact::ArtifactAnalysis) -> Option<String> {
+    match report.status {
+        AnalysisStatus::Complete => None,
+        AnalysisStatus::Unsupported => Some(String::from(
+            "no supported object or canonical derivation was found",
+        )),
+        AnalysisStatus::Partial if !report.omissions.is_empty() => Some(format!(
+            "bounded analysis omitted work or outputs; see {} source omission(s)",
+            report.omissions.len()
+        )),
+        AnalysisStatus::Partial => Some(region_analysis_reason(report)),
+    }
+}
+
+fn region_analysis_reason(report: &l2_workbench::artifact::ArtifactAnalysis) -> String {
+    let mut incomplete_report_count = 0_usize;
+    let mut omitted_region_count = 0_usize;
+    let mut omitted_region_bytes = 0_usize;
+    let mut omitted_proposals = 0_usize;
+    let mut omitted_assessments = 0_usize;
+    for artifact_report in &report.region_transform_reports {
+        let coverage = artifact_report.report.coverage;
+        if !coverage.complete {
+            incomplete_report_count = incomplete_report_count.saturating_add(1);
+            omitted_region_count = omitted_region_count
+                .saturating_add(coverage.omissions.regions)
+                .saturating_add(coverage.omissions.cues)
+                .saturating_add(coverage.omissions.invalid_cues)
+                .saturating_add(coverage.omissions.incomplete_regions);
+            omitted_region_bytes = omitted_region_bytes
+                .saturating_add(coverage.omissions.scan_bytes)
+                .saturating_add(coverage.omissions.region_bytes);
+        }
+        for region in &artifact_report.report.regions {
+            omitted_proposals =
+                omitted_proposals.saturating_add(region.proposal_report.omissions.candidates);
+            omitted_assessments =
+                omitted_assessments.saturating_add(region.proposal_report.omissions.reports);
+        }
+    }
+    if incomplete_report_count > 0 {
+        format!(
+            "bounded region search was incomplete ({omitted_region_count} range or cue(s) and {omitted_region_bytes} byte(s) omitted)"
+        )
+    } else if omitted_proposals > 0 || omitted_assessments > 0 {
+        format!(
+            "bounded region syntax checks omitted {omitted_proposals} candidate(s) and {omitted_assessments} assessment(s)"
+        )
+    } else {
+        String::from("one or more bounded analysis stages were incomplete")
+    }
+}
+
+fn record_analysis_work(
+    job: &Job,
+    report: &l2_workbench::artifact::ArtifactAnalysis,
+) -> Result<(), Box<dyn Error>> {
+    let transforms = report
+        .artifacts
+        .iter()
+        .flat_map(|artifact| &artifact.origins)
+        .filter(|origin| matches!(origin, ArtifactOrigin::Transformation { .. }))
+        .count();
+    let expanded_members = report
+        .artifacts
+        .iter()
+        .flat_map(|artifact| &artifact.origins)
+        .filter(|origin| matches!(origin, ArtifactOrigin::ArchiveMember { .. }))
+        .count();
+    let validated = report
+        .artifacts
+        .iter()
+        .filter(|artifact| artifact.validation.state == ArtifactValidationState::Validated)
+        .count();
+    job.increment(
+        Counter::CandidatesExamined,
+        u64::try_from(report.artifacts.len())?,
+    )?;
+    job.increment(Counter::Transforms, u64::try_from(transforms)?)?;
+    job.increment(Counter::ExpandedMembers, u64::try_from(expanded_members)?)?;
+    job.increment(Counter::ValidatedArtifacts, u64::try_from(validated)?)?;
+    Ok(())
 }
 
 pub(super) fn analyze_source_cached(
@@ -175,11 +269,9 @@ pub(super) fn analyze_source_cached(
     job: &Job,
 ) -> Result<l2_workbench::artifact::ArtifactAnalysis, Box<dyn Error>> {
     let Some(cache) = cache else {
-        return Ok(analyze_artifacts_with_source_sha256(
-            &source.bytes,
-            &source.sha256,
-            options,
-        )?);
+        let report = analyze_artifacts_with_source_sha256(&source.bytes, &source.sha256, options)?;
+        record_analysis_work(job, &report)?;
+        return Ok(report);
     };
 
     let identity = SourceIdentity::from_sha256(source.sha256.clone())?;
@@ -237,6 +329,7 @@ pub(super) fn analyze_source_cached(
     };
 
     let report = analyze_artifacts_with_source_sha256(&source.bytes, &source.sha256, options)?;
+    record_analysis_work(job, &report)?;
     if let Some(lease) = lease
         && let Err(error) = store_cached_analysis(lease, &report)
     {

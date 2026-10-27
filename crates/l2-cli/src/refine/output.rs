@@ -29,7 +29,7 @@ use std::{
     path::{Path, PathBuf},
 };
 
-const REFINE_ALGORITHM_VERSION: u32 = 2;
+const REFINE_ALGORITHM_VERSION: u32 = 3;
 
 #[derive(Serialize)]
 pub(super) struct SourceRecord {
@@ -38,6 +38,8 @@ pub(super) struct SourceRecord {
     pub(super) byte_length: usize,
     pub(super) status: AnalysisStatus,
     pub(super) omissions: Vec<AnalysisOmission>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(super) reason: Option<String>,
 }
 
 pub(super) struct ArtifactRecord {
@@ -45,6 +47,8 @@ pub(super) struct ArtifactRecord {
     pub(super) source_index: usize,
     pub(super) artifact_index: usize,
     pub(super) origin: ArtifactOrigin,
+    pub(super) sha256: String,
+    pub(super) byte_length: usize,
     pub(super) validation: l2_workbench::artifact::ValidationSummary,
     pub(super) signature_match_count: usize,
 }
@@ -270,6 +274,10 @@ pub(super) fn format_summary(
             AnalysisStatus::Unsupported => "unsupported",
             AnalysisStatus::Partial => "partial",
         });
+        if let Some(reason) = &source.reason {
+            summary.push_str("; reason: ");
+            summary.push_str(&reason.escape_debug().to_string());
+        }
         summary.push('\n');
     }
     for artifact in selected {

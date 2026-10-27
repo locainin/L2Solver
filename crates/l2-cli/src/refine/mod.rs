@@ -165,7 +165,11 @@ fn analyze_and_publish<W: Write>(
     job.finish(Phase::TransformDiscovery, PhaseOutcome::Completed)?;
     job.finish(Phase::Expansion, PhaseOutcome::Completed)?;
 
-    let selected = artifact_export::select_artifacts(&analyzed.case)?;
+    let validation_receipts = analyzed.analyzer_validation_receipts()?;
+    let selected = artifact_export::select_artifacts_with_analyzer_receipts(
+        &analyzed.case,
+        &validation_receipts,
+    )?;
     job.start(Phase::Reports, Some(1))?;
     let manifest = output::make_manifest(
         &selected,

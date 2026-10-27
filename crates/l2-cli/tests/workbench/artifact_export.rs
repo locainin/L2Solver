@@ -98,6 +98,191 @@ fn selected_artifact_identity_matches_its_canonical_case_blob_digest()
 }
 
 #[test]
+fn ordinary_selection_keeps_compatible_signature_evidence_reference()
+-> Result<(), Box<dyn std::error::Error>> {
+    let mut bytes = Vec::new();
+    let mut encoder = png::Encoder::new(&mut bytes, 1, 1);
+    encoder.set_color(png::ColorType::Rgb);
+    encoder.set_depth(png::BitDepth::Eight);
+    encoder.write_header()?.write_image_data(&[1, 2, 3])?;
+
+    let mut case = Case::new();
+    let record = case.add_bytes_node("record_object", &bytes, Vec::new(), json!({}))?;
+    let record_blob = case
+        .nodes()
+        .iter()
+        .find(|node| node.id == record)
+        .and_then(|node| node.blob.clone())
+        .ok_or("record blob is missing")?;
+    let signature_report = l2_workbench::artifact::scan_file_signatures(&bytes);
+    let signature_match = signature_report
+        .matches
+        .iter()
+        .find(|matched| matched.extensions.contains(&"png"))
+        .ok_or("PNG signature match is missing")?;
+    let mut signature_details = serde_json::to_value(signature_match)?;
+    let details = signature_details
+        .as_object_mut()
+        .ok_or("signature details are not an object")?;
+    details.insert("input_node".to_owned(), json!(record));
+    details.insert(
+        "input_sha256".to_owned(),
+        json!(signature_report.source_sha256),
+    );
+    details.insert("input_blob".to_owned(), json!(record_blob));
+    details.insert(
+        "coordinate_base".to_owned(),
+        json!("zero_based_from_byte_0_of_input_blob"),
+    );
+    let signature = case.add_node(
+        "file_signature_match",
+        Some(&record_blob),
+        Vec::new(),
+        signature_details,
+    )?;
+    case.add_edge(l2_workbench::evidence::Edge {
+        from: record,
+        to: signature,
+        relation: String::from("contains_signature"),
+        status: EvidenceStatus::Observed,
+        reason: String::from("Signature bytes were observed in the input object"),
+    })?;
+
+    let selected = super::select_artifacts(&case)?;
+    let artifact = selected.first().ok_or("PNG record was not selected")?;
+    let provenance = artifact
+        .provenance()
+        .first()
+        .ok_or("artifact provenance is missing")?;
+
+    assert!(
+        Path::new(artifact.file_name())
+            .extension()
+            .and_then(std::ffi::OsStr::to_str)
+            .is_some_and(|extension| extension.eq_ignore_ascii_case("png"))
+    );
+    assert_eq!(provenance.extension_evidence_node, Some(signature));
+    assert_eq!(provenance.validated_as(), Some("png_structure"));
+    Ok(())
+}
+
+#[test]
+fn arbitrary_record_details_cannot_promote_garbage_to_validated_png()
+-> Result<(), Box<dyn std::error::Error>> {
+    use super::StructuralValidationStatus;
+
+    let bytes = [0xff, 0x00, b'n', b'o', b't'];
+    let mut case = Case::new();
+    case.add_bytes_node(
+        "record_object",
+        &bytes,
+        Vec::new(),
+        json!({
+            "analysis_validation": {
+                "state": "validated",
+                "format": "png",
+                "boundary": "png_iend",
+                "range": {"offset": 0, "length": bytes.len()}
+            },
+            "extension": "png"
+        }),
+    )?;
+    let selected = super::select_artifacts(&case)?;
+    let artifact = selected.first().ok_or("garbage record was not selected")?;
+
+    assert!(
+        Path::new(artifact.file_name())
+            .extension()
+            .and_then(std::ffi::OsStr::to_str)
+            .is_some_and(|extension| extension.eq_ignore_ascii_case("bin"))
+    );
+    assert_eq!(
+        artifact
+            .provenance()
+            .first()
+            .ok_or("artifact provenance is missing")?
+            .structural_validation
+            .status(),
+        StructuralValidationStatus::NotChecked
+    );
+    Ok(())
+}
+
+#[test]
+fn analyzer_receipt_for_another_blob_cannot_promote_garbage_to_validated_png()
+-> Result<(), Box<dyn std::error::Error>> {
+    use super::{AnalyzerValidationReceipt, StructuralValidationStatus};
+    use l2_workbench::artifact::{
+        AnalysisBoundary, AnalysisFormat, ArtifactValidationState, FileRange, ValidationSummary,
+    };
+
+    let bytes = [0xff, 0x00, b'n', b'o', b't'];
+    let mismatches = [
+        (
+            l2_workbench::sha256(b"different validated PNG bytes"),
+            FileRange {
+                offset: 0,
+                length: bytes.len(),
+            },
+            AnalysisBoundary::PngIend,
+        ),
+        (
+            l2_workbench::sha256(&bytes),
+            FileRange {
+                offset: 1,
+                length: bytes.len() - 1,
+            },
+            AnalysisBoundary::PngIend,
+        ),
+        (
+            l2_workbench::sha256(&bytes),
+            FileRange {
+                offset: 0,
+                length: bytes.len(),
+            },
+            AnalysisBoundary::ZipEndRecord,
+        ),
+    ];
+
+    for (sha256, range, boundary) in mismatches {
+        let mut case = Case::new();
+        let node_id = case.add_bytes_node("record_object", &bytes, Vec::new(), json!({}))?;
+        let receipt = AnalyzerValidationReceipt::new(
+            node_id,
+            sha256,
+            bytes.len(),
+            ValidationSummary {
+                state: ArtifactValidationState::Validated,
+                format: Some(AnalysisFormat::Png),
+                boundary: Some(boundary),
+                range: Some(range),
+                structure_count: 3,
+            },
+        );
+        let selected = super::select_artifacts_with_analyzer_receipts(&case, &[receipt])?;
+        let artifact = selected.first().ok_or("garbage record was not selected")?;
+
+        assert!(
+            Path::new(artifact.file_name())
+                .extension()
+                .and_then(std::ffi::OsStr::to_str)
+                .is_some_and(|extension| extension.eq_ignore_ascii_case("bin"))
+        );
+        assert_eq!(
+            artifact
+                .provenance()
+                .first()
+                .ok_or("artifact provenance is missing")?
+                .structural_validation
+                .status(),
+            StructuralValidationStatus::NotChecked,
+            "analyzer receipt mismatch {boundary:?} cannot validate this blob"
+        );
+    }
+    Ok(())
+}
+
+#[test]
 fn repeated_validation_is_cached_once_per_blob_and_format() -> Result<(), Box<dyn std::error::Error>>
 {
     let validator = ArtifactValidator::default();

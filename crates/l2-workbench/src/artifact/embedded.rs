@@ -203,7 +203,16 @@ pub fn discover_embedded_objects_with_work(
     limits: EmbeddedDiscoveryLimits,
     max_work_bytes: usize,
 ) -> Result<EmbeddedDiscoveryReport, EmbeddedDiscoveryError> {
-    let scan = scan_markers(bytes, limits)?;
+    discover_embedded_objects_with_work_and_skip_start(bytes, limits, max_work_bytes, None)
+}
+
+pub(super) fn discover_embedded_objects_with_work_and_skip_start(
+    bytes: &[u8],
+    limits: EmbeddedDiscoveryLimits,
+    max_work_bytes: usize,
+    skip_start_format: Option<EmbeddedFormat>,
+) -> Result<EmbeddedDiscoveryReport, EmbeddedDiscoveryError> {
+    let scan = scan_markers(bytes, limits, skip_start_format)?;
     validate_markers(bytes, limits, scan, max_work_bytes)
 }
 
@@ -286,6 +295,7 @@ fn validate_markers(
 fn scan_markers(
     bytes: &[u8],
     limits: EmbeddedDiscoveryLimits,
+    skip_start_format: Option<EmbeddedFormat>,
 ) -> Result<MarkerScan, EmbeddedDiscoveryError> {
     let scan_length = bytes.len().min(limits.max_scan_bytes);
     let mut markers = Vec::new();
@@ -313,7 +323,9 @@ fn scan_markers(
 
     // Each position is checked once for the supported format prefixes
     for offset in 0..scan_length {
-        if marker_matches(bytes, offset, &super::PNG_SIGNATURE, scan_length) {
+        if !(offset == 0 && skip_start_format == Some(EmbeddedFormat::Png))
+            && marker_matches(bytes, offset, &super::PNG_SIGNATURE, scan_length)
+        {
             retain_marker(
                 &mut markers,
                 &mut omissions,
@@ -325,7 +337,9 @@ fn scan_markers(
             );
         }
 
-        if marker_matches(bytes, offset, ZIP_LOCAL_FILE_SIGNATURE, scan_length) {
+        if !(offset == 0 && skip_start_format == Some(EmbeddedFormat::Zip))
+            && marker_matches(bytes, offset, ZIP_LOCAL_FILE_SIGNATURE, scan_length)
+        {
             retain_marker(
                 &mut markers,
                 &mut omissions,
@@ -340,7 +354,9 @@ fn scan_markers(
         if marker_matches(bytes, offset, ZIP_END_SIGNATURE, scan_length)
             && let Some(end) = zip_end_boundary(bytes, offset, scan_length)
         {
-            if empty_zip_fields(bytes, offset, scan_length) {
+            if !(offset == 0 && skip_start_format == Some(EmbeddedFormat::Zip))
+                && empty_zip_fields(bytes, offset, scan_length)
+            {
                 retain_marker(
                     &mut markers,
                     &mut omissions,

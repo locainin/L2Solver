@@ -168,6 +168,130 @@ fn result_directory_keeps_original_and_writes_manifest_and_summary() -> Result<(
 }
 
 #[test]
+fn refined_png_and_zip_reuse_analyzer_validation_for_names_and_export_provenance()
+-> Result<(), Box<dyn Error>> {
+    let directory = tempfile::tempdir()?;
+    let artifacts = [
+        ("image", structural_png()?, "png", "png_structure"),
+        ("archive", structural_zip()?, "zip", "zip_structure"),
+    ];
+
+    for (label, bytes, extension, format) in artifacts {
+        let input = directory.path().join(format!("{label}.bin"));
+        let output_dir = directory.path().join(format!("{label}.refined"));
+        fs::write(&input, &bytes)?;
+        let options = RefineOptions {
+            input,
+            output: Some(output_dir.clone()),
+            dry_run: false,
+            salvage: false,
+            recovery: RecoveryOptions {
+                no_cache: true,
+                ..RecoveryOptions::default()
+            },
+        };
+
+        assert!(run(&options, &mut Vec::new())?);
+        let manifest: serde_json::Value =
+            serde_json::from_slice(&fs::read(output_dir.join("manifest.json"))?)?;
+        assert_eq!(
+            manifest
+                .get("schema_version")
+                .and_then(serde_json::Value::as_u64),
+            Some(1)
+        );
+        let published = manifest
+            .get("artifacts")
+            .and_then(serde_json::Value::as_array)
+            .and_then(|records| {
+                records.iter().find(|record| {
+                    record.get("sha256").and_then(serde_json::Value::as_str)
+                        == Some(l2_workbench::sha256(&bytes).as_str())
+                })
+            })
+            .ok_or("validated input was not selected for publication")?;
+        let file = string_field(published, "file")?;
+        assert!(
+            file.ends_with(&format!(".{extension}")),
+            "unexpected file name {file}"
+        );
+        let node = published
+            .get("nodes")
+            .and_then(serde_json::Value::as_array)
+            .and_then(|nodes| nodes.first())
+            .ok_or("export node provenance is missing")?;
+        assert_eq!(
+            node.get("structural_validation_status")
+                .and_then(serde_json::Value::as_str),
+            Some("validated")
+        );
+        assert_eq!(
+            node.get("structural_validation_format")
+                .and_then(serde_json::Value::as_str),
+            Some(format)
+        );
+        assert_eq!(
+            node.get("validated_as").and_then(serde_json::Value::as_str),
+            Some(format)
+        );
+
+        let input_set = prepare_input_set(&output_dir)?;
+        let reloaded = read_sources(
+            &input_set,
+            1024,
+            1024,
+            &l2_workbench::job::Job::new("refine output reinput test"),
+        )?;
+        assert!(reloaded.iter().any(|source| source.bytes == bytes));
+    }
+    Ok(())
+}
+
+#[test]
+fn incomplete_region_search_has_a_reason_in_the_manifest_and_summary() -> Result<(), Box<dyn Error>>
+{
+    let directory = tempfile::tempdir()?;
+    let input = directory.path().join("partial.bin");
+    let output_dir = directory.path().join("partial.refined");
+    let bytes = b"x|".repeat(100);
+    fs::write(&input, &bytes)?;
+    let options = RefineOptions {
+        input,
+        output: Some(output_dir.clone()),
+        dry_run: false,
+        salvage: false,
+        recovery: RecoveryOptions {
+            no_cache: true,
+            ..RecoveryOptions::default()
+        },
+    };
+
+    assert!(!run(&options, &mut Vec::new())?);
+    let manifest: serde_json::Value =
+        serde_json::from_slice(&fs::read(output_dir.join("manifest.json"))?)?;
+    let source = manifest_entry(&manifest, "sources", 0)?;
+    assert_eq!(string_field(source, "status")?, "partial");
+    assert_eq!(
+        source
+            .get("omissions")
+            .and_then(serde_json::Value::as_array)
+            .map(Vec::len),
+        Some(0),
+        "the reason must cover incomplete region reports without top-level omissions"
+    );
+    let reason = string_field(source, "reason")?;
+    assert!(
+        reason.contains("region"),
+        "unexpected partial reason: {reason}"
+    );
+    assert!(
+        fs::read_to_string(output_dir.join("summary.txt"))?.contains(reason),
+        "the summary must include the source limitation reason"
+    );
+    Ok(())
+}
+
+#[test]
 fn unsupported_file_is_preserved_and_marked_incomplete() -> Result<(), Box<dyn Error>> {
     let directory = tempfile::tempdir()?;
     let input = directory.path().join("unknown.bin");
@@ -202,6 +326,10 @@ fn unsupported_file_is_preserved_and_marked_incomplete() -> Result<(), Box<dyn E
     );
     let source = manifest_entry(&manifest, "sources", 0)?;
     assert_eq!(string_field(source, "status")?, "unsupported");
+    assert!(
+        string_field(source, "reason")?.contains("no supported"),
+        "unsupported inputs need a concise explanation"
+    );
     Ok(())
 }
 
@@ -226,13 +354,15 @@ fn per_input_cache_reuses_the_complete_analysis_and_restores_artifact_bytes()
     let identity = l2_workbench::job::cache::SourceIdentity::from_sha256(source.sha256.clone())?;
     let previous_policy = json!({
         "schema_version": 1,
+        "transform_proposal_format_version":
+            l2_workbench::recovery::proposals::TRANSFORM_PROPOSAL_FORMAT_VERSION,
         "analyzer": options,
         "profile": "normal",
     });
     let previous_key = l2_workbench::job::cache::StageKey::new(
         "file_artifact_analysis",
         1,
-        "l2_artifact_analyzer_v1",
+        "l2_artifact_analyzer_v2",
         &previous_policy,
         &identity,
         &[],
@@ -273,6 +403,58 @@ fn per_input_cache_reuses_the_complete_analysis_and_restores_artifact_bytes()
 }
 
 #[test]
+fn per_input_cache_hit_does_not_repeat_analysis_progress_counters() -> Result<(), Box<dyn Error>> {
+    use l2_workbench::job::{Counter, Phase};
+
+    let directory = tempfile::tempdir()?;
+    let cache = l2_workbench::job::cache::Cache::open_at(
+        directory.path().join("cache"),
+        directory.path().join("state"),
+        16 * 1024 * 1024,
+    )?;
+    let archive = structural_zip()?;
+    let bytes =
+        base64::Engine::encode(&base64::engine::general_purpose::STANDARD, &archive).into_bytes();
+    let source = loaded_source("source.bin", &bytes);
+    let sources = [source];
+    let recovery = RecoveryOptions::default();
+    let policy = RefinePolicy::new(&recovery, false)?;
+
+    let first_job = l2_workbench::job::Job::new("refine cold analysis");
+    first_job.start(Phase::Expansion, None)?;
+    first_job.start(Phase::TransformDiscovery, Some(1))?;
+    let _first =
+        super::analysis::analyze_sources(&sources, &policy, &recovery, Some(&cache), &first_job)?;
+
+    let second_job = l2_workbench::job::Job::new("refine cached analysis");
+    second_job.start(Phase::Expansion, None)?;
+    second_job.start(Phase::TransformDiscovery, Some(1))?;
+    let _second =
+        super::analysis::analyze_sources(&sources, &policy, &recovery, Some(&cache), &second_job)?;
+    let first = first_job.snapshot()?;
+    let second = second_job.snapshot()?;
+
+    for counter in [
+        Counter::CandidatesExamined,
+        Counter::Transforms,
+        Counter::ExpandedMembers,
+        Counter::ValidatedArtifacts,
+    ] {
+        assert_eq!(
+            second.counters.get(&counter).copied().unwrap_or_default(),
+            0,
+            "cache hits do not repeat {counter:?} work"
+        );
+        assert!(
+            first.counters.get(&counter).copied().unwrap_or_default() > 0,
+            "cold analysis records {counter:?} work"
+        );
+    }
+    assert_eq!(second.counters.get(&Counter::CacheHits), Some(&1));
+    Ok(())
+}
+
+#[test]
 fn default_destination_appends_refined_to_the_input_path() {
     let input = Path::new("capture.pcapng");
     assert_eq!(
@@ -293,10 +475,10 @@ fn result_identity_uses_ordered_content_hashes_and_analysis_settings() -> Result
     let recovery = RecoveryOptions::default();
     let policy = RefinePolicy::new(&recovery, false)?;
     let identity = result_identity(&sources, &recovery, &policy)?;
-    assert_eq!(identity.algorithm_version, 2);
+    assert_eq!(identity.algorithm_version, 3);
     assert_eq!(
         identity.settings.get("analyzer_algorithm_version"),
-        Some(&json!(2))
+        Some(&json!(3))
     );
     assert_eq!(
         identity.settings.get("analysis_receipt_schema_version"),
@@ -381,7 +563,8 @@ fn matching_result_directory_is_reused_before_artifact_analysis() -> Result<(), 
 }
 
 #[test]
-fn pre_region_result_identity_is_not_reused_for_region_analysis() -> Result<(), Box<dyn Error>> {
+fn prior_analyzer_identity_is_not_reused_after_validation_receipts_change()
+-> Result<(), Box<dyn Error>> {
     let directory = tempfile::tempdir()?;
     let input = directory.path().join("source.bin");
     let output_dir = directory.path().join("result.refined");
@@ -410,19 +593,17 @@ fn pre_region_result_identity_is_not_reused_for_region_analysis() -> Result<(), 
         .get_mut("identity")
         .and_then(serde_json::Value::as_object_mut)
         .ok_or("result identity is missing")?;
-    identity.insert("algorithm_version".to_owned(), json!(1));
+    identity.insert("algorithm_version".to_owned(), json!(2));
     let settings = identity
         .get_mut("settings")
         .and_then(serde_json::Value::as_object_mut)
         .ok_or("result settings are missing")?;
-    settings.remove("analyzer_algorithm_version");
-    settings.remove("analysis_receipt_schema_version");
-    settings.remove("transform_proposal_format_version");
+    settings.insert("analyzer_algorithm_version".to_owned(), json!(2));
     fs::write(&manifest_path, serde_json::to_vec(&manifest)?)?;
 
     let error = run(&options, &mut Vec::new())
         .err()
-        .ok_or("pre-region result was reused for the updated analyzer")?;
+        .ok_or("analyzer version 2 result was reused for version 3")?;
     assert!(
         error
             .to_string()
@@ -594,6 +775,18 @@ fn structural_png() -> Result<Vec<u8>, Box<dyn Error>> {
     append_png_chunk(&mut bytes, *b"IHDR", &header)?;
     append_png_chunk(&mut bytes, *b"IEND", &[])?;
     Ok(bytes)
+}
+
+fn structural_zip() -> Result<Vec<u8>, Box<dyn Error>> {
+    use std::io::Cursor;
+
+    let mut archive = zip::ZipWriter::new(Cursor::new(Vec::new()));
+    archive.start_file(
+        "member.bin",
+        zip::write::SimpleFileOptions::default().compression_method(zip::CompressionMethod::Stored),
+    )?;
+    archive.write_all(b"member payload")?;
+    Ok(archive.finish()?.into_inner())
 }
 
 fn loaded_source(label: &str, bytes: &[u8]) -> LoadedSource {

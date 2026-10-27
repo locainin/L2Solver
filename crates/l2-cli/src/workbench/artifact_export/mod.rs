@@ -12,6 +12,7 @@ pub use provenance::ArtifactProvenance;
 #[cfg(test)]
 pub use provenance::ReconstructionStatus;
 pub use publish::{artifact_node_count, publish_artifact_directory, write_artifacts_into};
+pub use selection::{AnalyzerValidationReceipt, select_artifacts_with_analyzer_receipts};
 pub use selection::{SelectedArtifact, select_artifacts};
 pub use validation::validated_extension;
 #[cfg(test)]

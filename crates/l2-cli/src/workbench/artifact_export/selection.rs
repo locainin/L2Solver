@@ -10,6 +10,9 @@ use super::{
     },
 };
 use l2_workbench::artifact::ArtifactValidator;
+use l2_workbench::artifact::{
+    AnalysisBoundary, AnalysisFormat, ArtifactValidationState, FileRange, ValidationSummary,
+};
 use l2_workbench::evidence::{Case, EvidenceStatus, Node};
 use std::{
     collections::{HashMap, HashSet},
@@ -22,6 +25,44 @@ pub struct SelectedArtifact<'a> {
     content_sha256: &'a str,
     file_name: String,
     provenance: Vec<ArtifactProvenance>,
+}
+
+/// Existing analyzer validation bound to the exact case blob it inspected
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AnalyzerValidationReceipt {
+    node_id: u64,
+    sha256: String,
+    byte_length: usize,
+    summary: ValidationSummary,
+}
+
+impl AnalyzerValidationReceipt {
+    /// Bind a validation summary to the analyzed node, digest, and byte length
+    pub const fn new(
+        node_id: u64,
+        sha256: String,
+        byte_length: usize,
+        summary: ValidationSummary,
+    ) -> Self {
+        Self {
+            node_id,
+            sha256,
+            byte_length,
+            summary,
+        }
+    }
+}
+
+struct AnalyzerExportValidation {
+    extension: String,
+    validation: StructuralValidation,
+}
+
+#[derive(Clone, Copy)]
+struct ExportEdges<'a> {
+    parsed: &'a HashSet<(u64, u64)>,
+    contains_member: &'a HashSet<(u64, u64)>,
+    followed_by: &'a HashSet<(u64, u64)>,
 }
 
 impl SelectedArtifact<'_> {
@@ -54,8 +95,25 @@ pub fn select_artifacts(case: &Case) -> Result<Vec<SelectedArtifact<'_>>, Box<dy
     select_artifacts_with_cache(case, &mut work)
 }
 
+/// Reuse trusted analyzer validation when publishing the same case blobs
+pub fn select_artifacts_with_analyzer_receipts<'a>(
+    case: &'a Case,
+    receipts: &[AnalyzerValidationReceipt],
+) -> Result<Vec<SelectedArtifact<'a>>, Box<dyn Error>> {
+    let mut work = SelectionWorkCache::default();
+    select_artifacts_with_receipts_and_cache(case, receipts, &mut work)
+}
+
 pub(super) fn select_artifacts_with_cache<'a>(
     case: &'a Case,
+    work: &mut SelectionWorkCache<'a>,
+) -> Result<Vec<SelectedArtifact<'a>>, Box<dyn Error>> {
+    select_artifacts_with_receipts_and_cache(case, &[], work)
+}
+
+fn select_artifacts_with_receipts_and_cache<'a>(
+    case: &'a Case,
+    receipts: &[AnalyzerValidationReceipt],
     work: &mut SelectionWorkCache<'a>,
 ) -> Result<Vec<SelectedArtifact<'a>>, Box<dyn Error>> {
     // Indexes resolve node references without rescanning the case for each object
@@ -74,13 +132,17 @@ pub(super) fn select_artifacts_with_cache<'a>(
     let parsed_edges = observed_parse_edges(case);
     let contains_member_edges = observed_edges(case, "contains_member");
     let followed_by_edges = observed_edges(case, "followed_by");
+    let receipts_by_node = analyzer_receipts_by_node(receipts)?;
     let specs = export_specs(
         case,
         &nodes_by_id,
         &bytes_by_id,
-        &parsed_edges,
-        &contains_member_edges,
-        &followed_by_edges,
+        ExportEdges {
+            parsed: &parsed_edges,
+            contains_member: &contains_member_edges,
+            followed_by: &followed_by_edges,
+        },
+        &receipts_by_node,
         &mut validation,
     );
 
@@ -139,23 +201,39 @@ pub(super) fn select_artifacts_with_cache<'a>(
     Ok(artifacts)
 }
 
+fn analyzer_receipts_by_node(
+    receipts: &[AnalyzerValidationReceipt],
+) -> Result<HashMap<u64, &AnalyzerValidationReceipt>, Box<dyn Error>> {
+    let mut by_node = HashMap::new();
+    by_node.try_reserve(receipts.len())?;
+    for receipt in receipts {
+        by_node.insert(receipt.node_id, receipt);
+    }
+    Ok(by_node)
+}
+
 fn export_specs<'a>(
     case: &'a Case,
     nodes_by_id: &HashMap<u64, &'a Node>,
     bytes_by_id: &HashMap<&'a str, &'a [u8]>,
-    parsed_edges: &HashSet<(u64, u64)>,
-    contains_member_edges: &HashSet<(u64, u64)>,
-    followed_by_edges: &HashSet<(u64, u64)>,
+    edges: ExportEdges<'_>,
+    analysis_receipts: &HashMap<u64, &AnalyzerValidationReceipt>,
     validation: &mut SelectionValidation<'_, 'a>,
 ) -> HashMap<u64, ExportSpec> {
     let signature_extensions =
         record_signature_extensions(case, nodes_by_id, bytes_by_id, validation);
-    let mut specs = direct_export_specs(case, &signature_extensions, bytes_by_id, validation);
+    let mut specs = direct_export_specs(
+        case,
+        &signature_extensions,
+        bytes_by_id,
+        analysis_receipts,
+        validation,
+    );
     add_validated_inputs(
         case,
         nodes_by_id,
         bytes_by_id,
-        parsed_edges,
+        edges.parsed,
         validation,
         &mut specs,
     );
@@ -163,8 +241,8 @@ fn export_specs<'a>(
         case,
         nodes_by_id,
         bytes_by_id,
-        parsed_edges,
-        contains_member_edges,
+        edges.parsed,
+        edges.contains_member,
         validation,
         &mut specs,
     );
@@ -172,8 +250,8 @@ fn export_specs<'a>(
         case,
         nodes_by_id,
         bytes_by_id,
-        parsed_edges,
-        followed_by_edges,
+        edges.parsed,
+        edges.followed_by,
         validation,
         &mut specs,
     );
@@ -184,6 +262,7 @@ fn direct_export_specs<'a>(
     case: &'a Case,
     signature_extensions: &HashMap<u64, SignatureExtension>,
     bytes_by_id: &HashMap<&'a str, &'a [u8]>,
+    analysis_receipts: &HashMap<u64, &AnalyzerValidationReceipt>,
     validation: &mut SelectionValidation<'_, 'a>,
 ) -> HashMap<u64, ExportSpec> {
     let mut specs = HashMap::new();
@@ -192,8 +271,14 @@ fn direct_export_specs<'a>(
         let spec = match node.kind.as_str() {
             "record_object" => {
                 let signature = signature_extensions.get(&node.id);
-                let extension = signature
-                    .and_then(|matched| matched.extension.clone())
+                let analyzed = analysis_receipts
+                    .get(&node.id)
+                    .copied()
+                    .and_then(|receipt| analyzer_export_validation(node, receipt, bytes_by_id));
+                let extension = analyzed
+                    .as_ref()
+                    .map(|matched| matched.extension.clone())
+                    .or_else(|| signature.and_then(|matched| matched.extension.clone()))
                     .or_else(|| {
                         let blob_id = node.blob.as_deref()?;
                         let bytes = node_bytes(node, bytes_by_id)?;
@@ -201,6 +286,21 @@ fn direct_export_specs<'a>(
                             .is_plain_text(blob_id, bytes)
                             .then(|| String::from("txt"))
                     });
+                let structural_validation = analyzed
+                    .as_ref()
+                    .map(|matched| matched.validation.clone())
+                    .or_else(|| signature.map(|matched| matched.structural_validation.clone()))
+                    .unwrap_or_else(StructuralValidation::not_checked);
+                let extension_evidence_node = signature
+                    .filter(|matched| {
+                        analyzed.as_ref().is_none_or(|receipt| {
+                            matched
+                                .extension
+                                .as_ref()
+                                .is_some_and(|candidate| candidate == &receipt.extension)
+                        })
+                    })
+                    .map(|matched| matched.evidence_node);
                 Some(ExportSpec {
                     file_name: format!(
                         "artifact-{}-record.{}",
@@ -208,11 +308,8 @@ fn direct_export_specs<'a>(
                         extension.as_deref().unwrap_or("bin")
                     ),
                     archive_path: None,
-                    structural_validation: signature
-                        .map_or_else(StructuralValidation::not_checked, |matched| {
-                            matched.structural_validation.clone()
-                        }),
-                    extension_evidence_node: signature.map(|matched| matched.evidence_node),
+                    structural_validation,
+                    extension_evidence_node,
                 })
             }
             _ => None,
@@ -222,6 +319,45 @@ fn direct_export_specs<'a>(
         }
     }
     specs
+}
+
+fn analyzer_export_validation(
+    node: &Node,
+    receipt: &AnalyzerValidationReceipt,
+    bytes_by_id: &HashMap<&str, &[u8]>,
+) -> Option<AnalyzerExportValidation> {
+    let blob_id = node.blob.as_deref()?;
+    if blob_id.strip_prefix("sha256:")? != receipt.sha256 {
+        return None;
+    }
+    let bytes = node_bytes(node, bytes_by_id)?;
+    if bytes.len() != receipt.byte_length
+        || receipt.summary.state != ArtifactValidationState::Validated
+        || receipt.summary.range
+            != Some(FileRange {
+                offset: 0,
+                length: bytes.len(),
+            })
+    {
+        return None;
+    }
+
+    let (extension, format) = match (receipt.summary.format?, receipt.summary.boundary?) {
+        (AnalysisFormat::Der, AnalysisBoundary::DerEncodedLength) => ("der", "der_structure"),
+        (AnalysisFormat::Png, AnalysisBoundary::PngIend) => ("png", "png_structure"),
+        (AnalysisFormat::Zip, AnalysisBoundary::ZipEndRecord) => ("zip", "zip_structure"),
+        (AnalysisFormat::Der, AnalysisBoundary::PngIend | AnalysisBoundary::ZipEndRecord)
+        | (
+            AnalysisFormat::Png,
+            AnalysisBoundary::DerEncodedLength | AnalysisBoundary::ZipEndRecord,
+        )
+        | (AnalysisFormat::Zip, AnalysisBoundary::DerEncodedLength | AnalysisBoundary::PngIend)
+        | (AnalysisFormat::Elf | AnalysisFormat::PortableExecutable, _) => return None,
+    };
+    Some(AnalyzerExportValidation {
+        extension: extension.to_owned(),
+        validation: StructuralValidation::validated(format, None),
+    })
 }
 
 fn observed_parse_edges(case: &Case) -> HashSet<(u64, u64)> {

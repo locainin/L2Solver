@@ -161,6 +161,9 @@ pub struct ValidationSummary {
     pub format: Option<AnalysisFormat>,
     /// Boundary evidence supplied by the parser when validation completed
     pub boundary: Option<AnalysisBoundary>,
+    /// Exact range accepted by the parser when a complete boundary was proven
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub range: Option<FileRange>,
     /// Number of top-level chunks, nodes, sections, or archive entries parsed
     pub structure_count: usize,
 }
@@ -470,7 +473,7 @@ fn inspect_artifact(
 ) -> Result<ArtifactInspection, AnalyzerError> {
     let (signature_match_count, signatures_scanned) = scan_signatures(context, budget, report);
     let validation = validate_and_expand_zip(context, budget, report, found)?;
-    discover_embedded_objects(context, budget, report, found)?;
+    discover_embedded_objects(context, validation, budget, report, found)?;
     derive_candidates(context, budget, report, found)?;
     Ok(ArtifactInspection {
         signature_match_count,
@@ -592,6 +595,7 @@ fn append_zip_omissions(
 
 fn discover_embedded_objects(
     context: &ArtifactContext<'_>,
+    validation: ValidationSummary,
     budget: &mut AnalysisBudget,
     report: &mut ArtifactAnalysis,
     found: &mut Vec<PendingArtifact>,
@@ -610,10 +614,13 @@ fn discover_embedded_objects(
     let mut discovery_limits = embedded_limits(context.limits);
     // ZIP members were expanded by validation; discovery only finds exact ranges
     discovery_limits.max_zip_operation_expanded_bytes = 0;
-    let discovery = super::discover_embedded_objects_with_work(
+    let skip_start_format =
+        embedded_format_for_validated_full_range(validation, context.input_bytes.len());
+    let discovery = super::embedded::discover_embedded_objects_with_work_and_skip_start(
         context.input_bytes,
         discovery_limits,
         budget.work.remaining,
+        skip_start_format,
     )
     .map_err(|_| AnalyzerError::AllocationFailure)?;
     let charged_discovery_work = budget.work.charge(discovery.validation_input_bytes);
@@ -631,6 +638,10 @@ fn discover_embedded_objects(
     }
     for candidate in discovery.candidates {
         if candidate.validation.is_err() {
+            continue;
+        }
+        // A full-range candidate is the current object again, so it adds no provenance
+        if candidate.range.offset == 0 && candidate.range.length == context.input_bytes.len() {
             continue;
         }
         let Some(end) = candidate.range.offset.checked_add(candidate.range.length) else {
@@ -653,6 +664,32 @@ fn discover_embedded_objects(
         )?;
     }
     Ok(())
+}
+
+const fn embedded_format_for_validated_full_range(
+    validation: ValidationSummary,
+    input_length: usize,
+) -> Option<EmbeddedFormat> {
+    match (
+        validation.state,
+        validation.format,
+        validation.boundary,
+        validation.range,
+    ) {
+        (
+            ArtifactValidationState::Validated,
+            Some(AnalysisFormat::Png),
+            Some(AnalysisBoundary::PngIend),
+            Some(range),
+        ) if range.offset == 0 && range.length == input_length => Some(EmbeddedFormat::Png),
+        (
+            ArtifactValidationState::Validated,
+            Some(AnalysisFormat::Zip),
+            Some(AnalysisBoundary::ZipEndRecord),
+            Some(range),
+        ) if range.offset == 0 && range.length == input_length => Some(EmbeddedFormat::Zip),
+        _ => None,
+    }
 }
 
 fn derive_candidates(
@@ -1153,13 +1190,14 @@ fn summarize_validation(outcome: &ArtifactValidationOutcome<'_>) -> ValidationSu
     match outcome {
         ArtifactValidationOutcome::Validated {
             format,
+            range,
             boundary,
             structure,
-            ..
         } => ValidationSummary {
             state: ArtifactValidationState::Validated,
             format: Some(format_label(*format)),
             boundary: Some(boundary_label(*boundary)),
+            range: Some(*range),
             structure_count: structure_count(structure),
         },
         ArtifactValidationOutcome::BoundaryUnproven {
@@ -1168,12 +1206,14 @@ fn summarize_validation(outcome: &ArtifactValidationOutcome<'_>) -> ValidationSu
             state: ArtifactValidationState::BoundaryUnproven,
             format: Some(format_label(*format)),
             boundary: None,
+            range: None,
             structure_count: structure_count(structure),
         },
         ArtifactValidationOutcome::Rejected { format, .. } => ValidationSummary {
             state: ArtifactValidationState::Rejected,
             format: Some(format_label(*format)),
             boundary: None,
+            range: None,
             structure_count: 0,
         },
         ArtifactValidationOutcome::Unsupported { .. } => unsupported_validation(),
@@ -1181,6 +1221,7 @@ fn summarize_validation(outcome: &ArtifactValidationOutcome<'_>) -> ValidationSu
             state: ArtifactValidationState::Omitted,
             format: format.map(format_label),
             boundary: None,
+            range: None,
             structure_count: 0,
         },
     }
@@ -1200,6 +1241,7 @@ const fn unsupported_validation() -> ValidationSummary {
         state: ArtifactValidationState::Unsupported,
         format: None,
         boundary: None,
+        range: None,
         structure_count: 0,
     }
 }

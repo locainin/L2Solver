@@ -33,6 +33,13 @@ fn standalone_png_keeps_the_same_structural_boundary_as_capture_bytes() -> Resul
         ArtifactValidationState::Validated
     );
     assert_eq!(artifact.validation.format, Some(AnalysisFormat::Png));
+    assert_eq!(
+        artifact.validation.range,
+        Some(l2_workbench::artifact::FileRange {
+            offset: 0,
+            length: png.len(),
+        })
+    );
     assert_eq!(artifact.validation.structure_count, 2);
     assert_eq!(artifact.bytes, png);
     Ok(())
@@ -53,6 +60,13 @@ fn standalone_zip_uses_the_existing_zip_parser_and_retains_its_member() -> Resul
 
     assert_eq!(source.validation.format, Some(AnalysisFormat::Zip));
     assert_eq!(source.validation.structure_count, structural.entry_count);
+    assert_eq!(
+        source.validation.range,
+        Some(l2_workbench::artifact::FileRange {
+            offset: 0,
+            length: archive.len(),
+        })
+    );
     assert!(report.artifacts.iter().any(|artifact| {
         artifact.bytes == content
             && artifact.origins.iter().any(|origin| {
@@ -92,6 +106,87 @@ fn encoded_input_can_yield_a_valid_object_inside_unrelated_bytes() -> Result<(),
         origin,
         ArtifactOrigin::EmbeddedObject { range, .. } if range.length == png.len()
     )));
+    Ok(())
+}
+
+#[test]
+fn embedded_png_and_zip_keep_parent_origins_without_self_ranges() -> Result<(), Box<dyn Error>> {
+    let png = structural_png(&[])?;
+    let zip = zip_support::build_zip(&[zip_support::FixtureEntry::stored(
+        b"member.bin",
+        b"member payload",
+    )])?;
+
+    for bytes in [png, zip] {
+        let mut input = b"prefix".to_vec();
+        let offset = input.len();
+        input.extend_from_slice(&bytes);
+        input.extend_from_slice(b"suffix");
+        let report = analyze_artifacts(&input, ArtifactAnalysisOptions::default())?;
+        let artifact = report
+            .artifacts
+            .iter()
+            .find(|artifact| artifact.bytes == bytes)
+            .ok_or("embedded object was not retained")?;
+        let parent_origin = artifact.origins.iter().any(|origin| {
+            matches!(origin, ArtifactOrigin::EmbeddedObject { parent_index: 0, range, .. }
+                if range.offset == offset && range.length == bytes.len())
+        });
+        let self_origin = artifact.origins.iter().any(|origin| {
+            matches!(origin, ArtifactOrigin::EmbeddedObject { parent_index, range, .. }
+                if *parent_index == artifact.index
+                    && range.offset == 0
+                    && range.length == bytes.len())
+        });
+
+        assert!(
+            parent_origin,
+            "the genuine containing-source origin is retained"
+        );
+        assert!(
+            !self_origin,
+            "an object does not originate from its own full range"
+        );
+    }
+    Ok(())
+}
+
+#[test]
+fn duplicate_object_from_a_second_parent_keeps_both_real_origins() -> Result<(), Box<dyn Error>> {
+    let png = structural_png(&[])?;
+    let zip = zip_support::build_zip(&[zip_support::FixtureEntry::stored(b"image.png", &png)])?;
+    let mut input = b"prefix".to_vec();
+    let png_offset = input.len();
+    input.extend_from_slice(&png);
+    input.extend_from_slice(b"separator");
+    input.extend_from_slice(&zip);
+    input.extend_from_slice(b"suffix");
+    let report = analyze_artifacts(&input, ArtifactAnalysisOptions::default())?;
+    let image = report
+        .artifacts
+        .iter()
+        .find(|artifact| artifact.bytes == png)
+        .ok_or("embedded PNG was not retained")?;
+    let archive = report
+        .artifacts
+        .iter()
+        .find(|artifact| artifact.bytes == zip)
+        .ok_or("embedded ZIP was not retained")?;
+
+    assert!(image.origins.iter().any(|origin| {
+        matches!(origin, ArtifactOrigin::EmbeddedObject { parent_index: 0, range, .. }
+            if range.offset == png_offset && range.length == png.len())
+    }));
+    assert!(image.origins.iter().any(|origin| {
+        matches!(origin, ArtifactOrigin::ArchiveMember { parent_index, entry_index: 0, .. }
+            if *parent_index == archive.index)
+    }));
+    assert!(!image.origins.iter().any(|origin| {
+        matches!(origin, ArtifactOrigin::EmbeddedObject { parent_index, range, .. }
+            if *parent_index == image.index
+                && range.offset == 0
+                && range.length == png.len())
+    }));
     Ok(())
 }
 
