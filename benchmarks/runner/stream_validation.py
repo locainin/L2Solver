@@ -7,6 +7,7 @@ from pathlib import Path
 
 from .capture import iter_packet_windows
 from .catalogue import read_json_bytes, unique_object
+from .index_validation import LEGACY_SUMMARY_FIELDS, SUMMARY_FIELDS
 from .validation import WorkBudget, require, validate_case_window
 
 MAX_MANIFEST_BYTES = 16 * 1024 * 1024
@@ -27,10 +28,6 @@ MANIFEST_FIELDS = {
 }
 SOURCE_FIELDS = {"id", "label", "length", "frames"}
 CURRENT_SOURCE_FIELDS = SOURCE_FIELDS | {"collection_summary"}
-COLLECTION_SUMMARY_FIELDS = {
-    "sections", "reported_sections", "incomplete_sections", "capture_dropped",
-    "interface_dropped",
-}
 MAX_COLLECTION_COUNTER = 2 ** 64 - 1
 PAGE_FIELDS = {
     "path", "sha256", "first_record", "last_record", "context_first_record",
@@ -51,12 +48,12 @@ def bounded_strings(values, name):
 
 
 def check_collection_summary(summary):
-    require(isinstance(summary, dict) and set(summary) == COLLECTION_SUMMARY_FIELDS,
+    require(isinstance(summary, dict) and set(summary) in (LEGACY_SUMMARY_FIELDS, SUMMARY_FIELDS),
             "unsupported stream collection summary fields")
     counters = {
         name: bounded_integer(summary[name], MAX_COLLECTION_COUNTER,
                               f"collection summary {name}")
-        for name in sorted(COLLECTION_SUMMARY_FIELDS)
+        for name in sorted(summary)
     }
     require(counters["reported_sections"] <= counters["sections"]
             and counters["incomplete_sections"] <= counters["reported_sections"],
@@ -90,7 +87,11 @@ def check_manifest(manifest, metadata, capture_length):
     source_collection_complete = True
     if "collection_summary" in source:
         summary = check_collection_summary(source["collection_summary"])
-        source_collection_complete = summary["incomplete_sections"] == 0
+        # Packet-block loss or an unknown count also marks source analysis partial
+        source_collection_complete = not any(summary.get(name, 0) for name in (
+            "incomplete_sections", "packet_block_packets_dropped",
+            "packet_blocks_with_unavailable_drop_count",
+        ))
     expected_id = "sha256:" + metadata["capture_sha256"]
     require(source["id"] == expected_id, "stream source id mismatch")
     require(isinstance(source["label"], str) and 0 < len(source["label"]) <= 4096,

@@ -11,6 +11,18 @@ from benchmarks.runner.stream_validation import validate_stream_bundle
 from .stream_support import classic_capture, metadata_for, write_bundle
 
 
+def current_collection_summary():
+    return {
+        "sections": 0,
+        "reported_sections": 0,
+        "incomplete_sections": 0,
+        "capture_dropped": 0,
+        "interface_dropped": 0,
+        "packet_block_packets_dropped": 0,
+        "packet_blocks_with_unavailable_drop_count": 0,
+    }
+
+
 class StreamValidationTests(unittest.TestCase):
     def setUp(self):
         self.temporary = tempfile.TemporaryDirectory()
@@ -58,6 +70,58 @@ class StreamValidationTests(unittest.TestCase):
 
         self.assertTrue(result["raw_collection_complete"])
 
+    def test_accepts_current_collection_summary_with_packet_block_counters(self):
+        self.write_collection_summary(current_collection_summary())
+
+        result = validate_stream_bundle(self.bundle, self.capture, self.metadata, self.exit_code)
+
+        self.assertTrue(result["raw_collection_complete"])
+        self.assertTrue(result["analysis_complete"])
+
+    def test_collection_summary_rejects_missing_current_fields(self):
+        for field in current_collection_summary():
+            with self.subTest(field=field):
+                summary = current_collection_summary()
+                del summary[field]
+                self.write_collection_summary(summary)
+                with self.assertRaisesRegex(ValueError, "collection summary fields"):
+                    validate_stream_bundle(self.bundle, self.capture, self.metadata, self.exit_code)
+
+    def test_collection_summary_rejects_invalid_packet_block_counters(self):
+        for field in ("packet_block_packets_dropped", "packet_blocks_with_unavailable_drop_count"):
+            for value in (-1, True, 1.5, None, "1", 2 ** 64):
+                with self.subTest(field=field, value=value):
+                    summary = current_collection_summary()
+                    summary[field] = value
+                    self.write_collection_summary(summary)
+                    with self.assertRaisesRegex(ValueError, "collection summary"):
+                        validate_stream_bundle(self.bundle, self.capture, self.metadata, self.exit_code)
+
+    def test_packet_block_loss_or_unknown_count_makes_analysis_partial(self):
+        for field in ("packet_block_packets_dropped", "packet_blocks_with_unavailable_drop_count"):
+            with self.subTest(field=field):
+                summary = current_collection_summary()
+                summary[field] = 1
+                self.write_collection_summary(summary)
+                manifest_path = self.bundle / "manifest.json"
+                manifest = json.loads(manifest_path.read_text())
+                manifest["analysis_complete"] = False
+                manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+
+                result = validate_stream_bundle(self.bundle, self.capture, self.metadata, 3)
+
+                self.assertTrue(result["raw_collection_complete"])
+                self.assertFalse(result["analysis_complete"])
+
+    def test_packet_block_loss_or_unknown_count_rejects_complete_analysis_claim(self):
+        for field in ("packet_block_packets_dropped", "packet_blocks_with_unavailable_drop_count"):
+            with self.subTest(field=field):
+                summary = current_collection_summary()
+                summary[field] = 1
+                self.write_collection_summary(summary)
+                with self.assertRaisesRegex(ValueError, "analysis status"):
+                    validate_stream_bundle(self.bundle, self.capture, self.metadata, self.exit_code)
+
     def test_collection_summary_rejects_unknown_fields(self):
         self.write_collection_summary({
             "sections": 0,
@@ -67,6 +131,14 @@ class StreamValidationTests(unittest.TestCase):
             "interface_dropped": 0,
             "unknown": 0,
         })
+
+        with self.assertRaisesRegex(ValueError, "collection summary fields"):
+            validate_stream_bundle(self.bundle, self.capture, self.metadata, self.exit_code)
+
+    def test_current_collection_summary_rejects_unknown_fields(self):
+        summary = current_collection_summary()
+        summary["unknown"] = 0
+        self.write_collection_summary(summary)
 
         with self.assertRaisesRegex(ValueError, "collection summary fields"):
             validate_stream_bundle(self.bundle, self.capture, self.metadata, self.exit_code)
