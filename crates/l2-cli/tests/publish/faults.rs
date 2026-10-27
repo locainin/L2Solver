@@ -108,12 +108,10 @@ fn unwritable_parent_preserves_the_existing_directory() -> TestResult {
     let result = publish::replace_directory_with_precommit(&prepared, |_| Ok(()), || Ok(()));
     fs::set_permissions(root.path(), fs::Permissions::from_mode(0o700))?;
 
-    assert_eq!(
-        probe
-            .expect_err("unwritable parent accepted the permission probe")
-            .raw_os_error(),
-        Some(libc::EACCES)
-    );
+    let Err(probe) = probe else {
+        return Err("unwritable parent accepted the permission probe".into());
+    };
+    assert_eq!(probe.raw_os_error(), Some(libc::EACCES));
     assert_before_publication_errno(result, libc::EACCES)?;
     assert_eq!(fs::read(destination.join("payload"))?, b"previous output");
     assert_eq!(fs::read_dir(root.path())?.count(), 1);
@@ -154,8 +152,9 @@ fn real_read_only_filesystem_preserves_the_existing_directory() -> TestResult {
     };
     let destination = Path::new(&base).join("bundle");
     let prepared = publish::prepare_directory_replacement(&destination)?;
-    let probe = fs::write(Path::new(&base).join("readonly-probe"), b"probe")
-        .expect_err("read-only filesystem accepted the write probe");
+    let Err(probe) = fs::write(Path::new(&base).join("readonly-probe"), b"probe") else {
+        return Err("read-only filesystem accepted the write probe".into());
+    };
     let result = publish::replace_directory_with_precommit(&prepared, |_| Ok(()), || Ok(()));
 
     assert_eq!(probe.raw_os_error(), Some(libc::EROFS));
@@ -228,10 +227,13 @@ fn killing_the_publisher_before_commit_preserves_the_previous_directory() -> Tes
                 .starts_with(".l2solver-")
         })
         .collect();
-    assert_eq!(staged.len(), 1, "interrupted staging was not retained");
-    assert_eq!(
-        fs::read(staged[0].path().join("payload"))?,
-        b"staged output"
-    );
+    let [staged] = staged.as_slice() else {
+        return Err(format!(
+            "expected one retained staging directory, got {}",
+            staged.len()
+        )
+        .into());
+    };
+    assert_eq!(fs::read(staged.path().join("payload"))?, b"staged output");
     Ok(())
 }
