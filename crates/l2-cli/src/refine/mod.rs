@@ -28,7 +28,7 @@ use crate::{
     workbench::artifact_export,
 };
 use l2_workbench::job::{
-    CacheStage, Counter, Job, MemoryBudget, Phase, PhaseOutcome, cache::Cache,
+    CacheStage, Counter, Job, MemoryBudget, MemoryClass, Phase, PhaseOutcome, cache::Cache,
 };
 use policy::RefinePolicy;
 use std::{
@@ -55,6 +55,8 @@ fn run_with_memory_budget(
 ) -> Result<bool, Box<dyn Error>> {
     job.check_cancelled()?;
     let mut publication_buffer = publication_memory::PublicationBuffer::try_new(memory)?;
+    // Fingerprints and strict source digests use one fixed reusable-sized buffer at a time
+    let _identity_scratch = memory.try_reserve(MemoryClass::Base, 64 * 1024)?;
     let destination = options
         .output
         .clone()
@@ -62,7 +64,7 @@ fn run_with_memory_budget(
     let result_directory = ResultDirectory::inspect(&destination, ResultKind::Refine)?;
     let policy = RefinePolicy::new(&options.recovery, options.salvage)?;
     let input_set =
-        input::prepare_input_set_with_limit(&options.input, policy.source_read_limit, job)?;
+        input::prepare_input_set_with_limit(&options.input, policy.source_read_limit, job, memory)?;
 
     // A bounded sample locates a likely result without loading complete source files
     let sampled = input::fingerprint_sources(

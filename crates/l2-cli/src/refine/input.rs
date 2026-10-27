@@ -12,6 +12,7 @@ use l2_workbench::{
     },
     sha256,
 };
+use serde::de::{self, SeqAccess, Visitor};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::{
@@ -42,6 +43,7 @@ pub(super) struct InputSet {
     publication_recheck_held: Cell<bool>,
     manifest_read_bytes: u64,
     manifest_sha256: Option<String>,
+    _metadata_memory: MemoryLease,
     #[cfg(target_os = "linux")]
     directory: Option<DirectoryAnchor>,
     #[cfg(not(target_os = "linux"))]
@@ -613,6 +615,7 @@ struct SampledSource<'a> {
 #[derive(Deserialize)]
 struct InputManifest {
     schema_version: u32,
+    #[serde(deserialize_with = "deserialize_manifest_artifacts")]
     artifacts: Vec<InputManifestArtifact>,
 }
 
@@ -624,15 +627,47 @@ struct InputManifestArtifact {
     sha256: Option<String>,
 }
 
+fn deserialize_manifest_artifacts<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Vec<InputManifestArtifact>, D::Error> {
+    struct ArtifactsVisitor;
+    impl<'de> Visitor<'de> for ArtifactsVisitor {
+        type Value = Vec<InputManifestArtifact>;
+        fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            formatter.write_str("a bounded artifact list")
+        }
+        fn visit_seq<A: SeqAccess<'de>>(self, mut sequence: A) -> Result<Self::Value, A::Error> {
+            let mut artifacts = Vec::new();
+            while let Some(artifact) = sequence.next_element()? {
+                if artifacts.len() >= MAX_MANIFEST_ARTIFACTS {
+                    return Err(de::Error::custom(
+                        "artifact manifest entry count exceeds the limit",
+                    ));
+                }
+                artifacts.try_reserve(1).map_err(de::Error::custom)?;
+                artifacts.push(artifact);
+            }
+            Ok(artifacts)
+        }
+    }
+    deserializer.deserialize_seq(ArtifactsVisitor)
+}
+
 #[cfg(test)]
 pub(super) fn prepare_input_set(path: &Path) -> Result<InputSet, Box<dyn Error>> {
-    prepare_input_set_with_limit(path, u64::MAX, &Job::new("unlimited test input"))
+    prepare_input_set_with_limit(
+        path,
+        u64::MAX,
+        &Job::new("unlimited test input"),
+        &MemoryBudget::new(u64::MAX),
+    )
 }
 
 pub(super) fn prepare_input_set_with_limit(
     path: &Path,
     maximum: u64,
     job: &Job,
+    memory: &MemoryBudget,
 ) -> Result<InputSet, Box<dyn Error>> {
     let budget = SourceReadBudget::new(maximum);
     let metadata = fs::symlink_metadata(path)?;
@@ -640,7 +675,7 @@ pub(super) fn prepare_input_set_with_limit(
         return Err(invalid_input("input path must not be a symbolic link"));
     }
     if metadata.is_dir() {
-        let mut input = prepare_export_directory(path, budget, job)?;
+        let mut input = prepare_export_directory(path, budget, job, memory)?;
         plan_sources(&mut input)?;
         return Ok(input);
     }
@@ -650,6 +685,14 @@ pub(super) fn prepare_input_set_with_limit(
         ));
     }
 
+    let metadata_bytes = path
+        .as_os_str()
+        .as_encoded_bytes()
+        .len()
+        .checked_mul(2)
+        .and_then(|bytes| bytes.checked_add(1024))
+        .ok_or_else(|| invalid_input("input metadata size overflows"))?;
+    let metadata_memory = memory.try_reserve(MemoryClass::Base, u64::try_from(metadata_bytes)?)?;
     let label = path.file_name().map_or_else(
         || String::from("input.bin"),
         |name| name.to_string_lossy().into_owned(),
@@ -662,6 +705,7 @@ pub(super) fn prepare_input_set_with_limit(
             expected_sha256: None,
         }],
         manifest_sha256: None,
+        _metadata_memory: metadata_memory,
         plans: Vec::new(),
         budget,
         extra_read_bytes: Cell::new(0),
@@ -680,18 +724,20 @@ fn prepare_export_directory(
     path: &Path,
     budget: SourceReadBudget,
     job: &Job,
+    memory: &MemoryBudget,
 ) -> Result<InputSet, Box<dyn Error>> {
     #[cfg(target_os = "linux")]
     let directory = DirectoryAnchor::open(path)?;
     #[cfg(not(target_os = "linux"))]
     let directory = path.to_owned();
 
-    let (manifest_bytes, manifest_sha256) = read_directory_member(
+    let (manifest_bytes, manifest_sha256, metadata_memory) = read_directory_member(
         &directory,
         "manifest.json",
         MAX_MANIFEST_BYTES,
         &budget,
         job,
+        memory,
     )?;
     let manifest_read_bytes = u64::try_from(manifest_bytes.len())?
         .checked_add(1)
@@ -732,6 +778,7 @@ fn prepare_export_directory(
     Ok(InputSet {
         sources,
         manifest_sha256: Some(manifest_sha256),
+        _metadata_memory: metadata_memory,
         plans: Vec::new(),
         budget,
         extra_read_bytes: Cell::new(0),
@@ -1258,20 +1305,11 @@ fn read_directory_member(
     maximum: usize,
     budget: &SourceReadBudget,
     job: &Job,
-) -> Result<(Vec<u8>, String), Box<dyn Error>> {
+    memory: &MemoryBudget,
+) -> Result<(Vec<u8>, String, MemoryLease), Box<dyn Error>> {
     let file = open_directory_member(directory, name)?;
     let length = checked_length(&file.metadata()?, None, maximum)?;
-    budget.reserve(
-        u64::try_from(length)?
-            .checked_add(1)
-            .ok_or_else(|| invalid_input("manifest read length overflows"))?,
-    )?;
-    read_snapshot(
-        CancellableReader::new(file, job),
-        maximum,
-        Some(length),
-        None,
-    )
+    read_manifest_snapshot(file, length, maximum, budget, job, memory)
 }
 
 #[cfg(not(target_os = "linux"))]
@@ -1281,21 +1319,50 @@ fn read_directory_member(
     maximum: usize,
     budget: &SourceReadBudget,
     job: &Job,
-) -> Result<(Vec<u8>, String), Box<dyn Error>> {
+    memory: &MemoryBudget,
+) -> Result<(Vec<u8>, String, MemoryLease), Box<dyn Error>> {
     let path = directory.join(name);
     let file = crate::input::regular_no_follow(&path)?;
     let length = checked_length(&file.metadata()?, None, maximum)?;
+    read_manifest_snapshot(file, length, maximum, budget, job, memory)
+}
+
+fn read_manifest_snapshot(
+    file: impl Read + MetadataReader,
+    length: usize,
+    maximum: usize,
+    budget: &SourceReadBudget,
+    job: &Job,
+    memory: &MemoryBudget,
+) -> Result<(Vec<u8>, String, MemoryLease), Box<dyn Error>> {
+    // Bound both the raw manifest and its parsed source records before reading
+    let records = (length / 2 + 1).min(MAX_MANIFEST_ARTIFACTS);
+    let record_size = std::mem::size_of::<InputSpec>()
+        + std::mem::size_of::<InputManifestArtifact>()
+        + std::mem::size_of::<SourcePlan>()
+        + 128;
+    let allowance = length
+        .checked_mul(4)
+        .and_then(|bytes| {
+            records
+                .checked_mul(record_size)
+                .and_then(|extra| bytes.checked_add(extra))
+        })
+        .and_then(|bytes| bytes.checked_add(1024))
+        .ok_or_else(|| invalid_input("manifest memory allowance overflows"))?;
+    let lease = memory.try_reserve(MemoryClass::Base, u64::try_from(allowance)?)?;
     budget.reserve(
         u64::try_from(length)?
             .checked_add(1)
             .ok_or_else(|| invalid_input("manifest read length overflows"))?,
     )?;
-    read_snapshot(
+    let (bytes, digest) = read_snapshot(
         CancellableReader::new(file, job),
         maximum,
         Some(length),
         None,
-    )
+    )?;
+    Ok((bytes, digest, lease))
 }
 
 #[cfg(target_os = "linux")]

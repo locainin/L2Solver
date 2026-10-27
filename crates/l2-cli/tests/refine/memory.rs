@@ -143,3 +143,54 @@ fn range_scanner_scratch_shares_the_job_budget_and_fails_before_publication()
     assert_eq!(snapshot.used_bytes, 0);
     Ok(())
 }
+
+#[test]
+fn manifest_memory_is_admitted_before_reading_manifest_contents() -> Result<(), Box<dyn Error>> {
+    use l2_workbench::job::Counter;
+    let directory = tempfile::tempdir()?;
+    let input = directory.path().join("inputs");
+    fs::create_dir(&input)?;
+    fs::write(input.join("manifest.json"), vec![b' '; 32 * 1024])?;
+    let budget = MemoryBudget::new(1024);
+    let job = Job::new("manifest admission");
+    let error = crate::refine::input::prepare_input_set_with_limit(&input, u64::MAX, &job, &budget)
+        .err()
+        .ok_or("manifest was read without admission")?;
+    assert!(matches!(
+        error.downcast_ref::<MemoryError>(),
+        Some(MemoryError::Limit { .. })
+    ));
+    assert_eq!(
+        job.snapshot()?
+            .counters
+            .get(&Counter::SourceReadBytes)
+            .copied()
+            .unwrap_or(0),
+        0
+    );
+    assert_eq!(budget.snapshot()?.used_bytes, 0);
+    Ok(())
+}
+
+#[test]
+fn oversized_manifest_entry_list_is_rejected_with_its_lease_released() -> Result<(), Box<dyn Error>>
+{
+    let directory = tempfile::tempdir()?;
+    let entries = vec![serde_json::json!({"file": "item.bin", "byte_length": 0}); 4097];
+    fs::write(
+        directory.path().join("manifest.json"),
+        serde_json::to_vec(&serde_json::json!({"schema_version": 1, "artifacts": entries}))?,
+    )?;
+    let budget = MemoryBudget::new(16 * 1024 * 1024);
+    let error = crate::refine::input::prepare_input_set_with_limit(
+        directory.path(),
+        u64::MAX,
+        &Job::new("oversized manifest"),
+        &budget,
+    )
+    .err()
+    .ok_or("oversized manifest was accepted")?;
+    assert!(error.to_string().contains("entry count"), "{error}");
+    assert_eq!(budget.snapshot()?.used_bytes, 0);
+    Ok(())
+}
