@@ -44,11 +44,7 @@ pub fn record_result<T>(
     record(job, outcome, sample);
 }
 
-pub fn record(
-    job: &Job,
-    outcome: RecoveryTransitionOutcome,
-    sample: RecoveryPublicationSample,
-) {
+pub fn record(job: &Job, outcome: RecoveryTransitionOutcome, sample: RecoveryPublicationSample) {
     // A diagnostic failure cannot change whether the atomic commit happened
     let _ = job.record_recovery_transition(RecoveryTransition {
         stage: RecoveryTransitionStage::Publication,
