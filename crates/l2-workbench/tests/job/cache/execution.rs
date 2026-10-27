@@ -10,7 +10,7 @@ use std::{
     path::{Path, PathBuf},
 };
 
-const fn limits() -> ExecutionCheckpointLimits {
+pub(super) const fn limits() -> ExecutionCheckpointLimits {
     ExecutionCheckpointLimits {
         max_encoded_bytes: 4_096,
         max_executor_bytes: 1_024,

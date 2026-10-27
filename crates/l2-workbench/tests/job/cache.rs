@@ -28,6 +28,9 @@ mod memory;
 
 #[path = "cache/maintenance.rs"]
 mod maintenance;
+#[cfg(target_os = "linux")]
+#[path = "cache/terminal_fsync.rs"]
+mod terminal_fsync;
 
 fn cache_at(directory: &Path, max_bytes: u64) -> Result<Cache, CacheError> {
     Cache::open_at(directory.join("cache"), directory.join("state"), max_bytes)
