@@ -1,5 +1,3 @@
-use std::panic::catch_unwind;
-
 const ONE_BYTE_LENGTH_ORDER_ALIAS: [u8; 32] = [
     0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0a, 0x0b, 0x0c, 0x0d, 0x0e, 0x0f,
     0x10, 0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17, 0x18, 0x19, 0x1a, 0x1b, 0x1c, 0x1d, 0x1e, 0x1f,
@@ -15,16 +13,8 @@ const DECOY_DER_OUTPUT_LENGTH: [u8; 28] = [
 
 #[path = "../fuzz_targets/workbench/relational.rs"]
 mod relational;
-
-fn fail() -> ! {
-    std::panic::resume_unwind(Box::new("relational fuzz invariant failed"))
-}
-
-fn require(condition: bool) {
-    if !condition {
-        fail();
-    }
-}
+#[path = "../fuzz_targets/workbench/invariant_support.rs"]
+mod support;
 
 #[test]
 fn preserved_relational_oracle_cases_pass() {
@@ -33,9 +23,6 @@ fn preserved_relational_oracle_cases_pass() {
         INCOMPLETE_CANDIDATE_SEARCH.as_slice(),
         DECOY_DER_OUTPUT_LENGTH.as_slice(),
     ] {
-        assert!(
-            catch_unwind(|| relational::exercise(input)).is_ok(),
-            "a preserved relational harness seed triggered an invariant failure"
-        );
+        relational::exercise(input);
     }
 }

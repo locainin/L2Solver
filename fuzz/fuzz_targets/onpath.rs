@@ -586,7 +586,7 @@ fn packet_reference(input: &[u8]) -> Option<PacketReference> {
 }
 
 fn byte_at(input: &[u8], offset: usize) -> u8 {
-    input.get(offset).copied().map_or(0, |value| value)
+    input.get(offset).copied().unwrap_or_default()
 }
 
 struct Fixture {

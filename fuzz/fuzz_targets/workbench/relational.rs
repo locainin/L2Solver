@@ -1,4 +1,6 @@
-use super::{fail, require};
+use super::support::{fail, require};
+#[path = "relational_ranges.rs"]
+mod ranges;
 use l2_workbench::{
     artifact::ArtifactValidationFormat,
     derivation::{
@@ -14,7 +16,7 @@ use l2_workbench::{
         infer_relational_transform_candidates,
     },
 };
-use std::ops::Range;
+use ranges::candidate_ranges_are_valid;
 
 const MAX_SESSIONS: usize = 4;
 const MAX_SEED_LENGTH: usize = 3;
@@ -482,7 +484,7 @@ fn check_candidate(
                 .is_none_or(|digest| digest.len() == 64),
         );
     }
-    require(candidate_ranges_are_valid(samples, candidate));
+    require(candidate_ranges_are_valid(samples, &candidate.rule));
     require(
         candidate
             .rule
@@ -495,70 +497,6 @@ fn check_candidate(
                     .is_some()
             }),
     );
-}
-
-fn candidate_ranges_are_valid(
-    samples: &[RelationalRecordSample<'_>],
-    candidate: &RelationalTransformCandidate,
-) -> bool {
-    for sample in samples {
-        let seed_matches = locator_matches(sample, &candidate.rule.seed_locator);
-        let payload_matches = locator_matches(sample, &candidate.rule.payload_locator);
-        let seed_range = if seed_matches {
-            let Some(range) = value_range(sample, &candidate.rule.seed_locator) else {
-                return false;
-            };
-            Some(range)
-        } else {
-            None
-        };
-        let payload_range = if payload_matches {
-            let Some(range) = value_range(sample, &candidate.rule.payload_locator) else {
-                return false;
-            };
-            Some(range)
-        } else {
-            None
-        };
-        if let (Some(seed), Some(payload)) = (seed_range, payload_range)
-            && ranges_overlap(&seed, &payload)
-        {
-            return false;
-        }
-    }
-    true
-}
-
-fn locator_matches(
-    sample: &RelationalRecordSample<'_>,
-    locator: &l2_workbench::protocol::RelationalByteRangeLocator,
-) -> bool {
-    sample.context.direction == locator.direction
-        && sample
-            .bytes
-            .get(locator.marker_offset..)
-            .and_then(|tail| tail.get(..locator.marker.len()))
-            == Some(locator.marker.as_slice())
-}
-
-fn value_range(
-    sample: &RelationalRecordSample<'_>,
-    locator: &l2_workbench::protocol::RelationalByteRangeLocator,
-) -> Option<Range<usize>> {
-    let end = match locator.value_length {
-        Some(length) => locator.value_offset.checked_add(length)?,
-        None => sample.bytes.len(),
-    };
-    let range = locator.value_offset..end;
-    let bytes = sample.bytes.get(range.clone())?;
-    if bytes.is_empty() {
-        return None;
-    }
-    Some(range)
-}
-
-const fn ranges_overlap(left: &Range<usize>, right: &Range<usize>) -> bool {
-    left.start < right.end && right.start < left.end
 }
 
 fn check_known_hypothesis(scenario: &Scenario, report: &RelationalTransformReport) -> bool {

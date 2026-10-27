@@ -47,10 +47,10 @@ fuzz_target!(|data: &[u8]| {
         let frequency = 2_412_u16.saturating_add(
             u16::from(chunk.first().copied().map_or(0, |value| value % 15)).saturating_mul(5),
         );
-        let dwell = u64::from(chunk.get(1).copied().map_or(1, |value| value));
+        let dwell = u64::from(chunk.get(1).copied().unwrap_or(1));
         let _ = survey.record_channel_dwell(0, frequency, dwell);
 
-        let radiotap = seeded_radiotap(&beacon, chunk.first().copied().map_or(0, |value| value));
+        let radiotap = seeded_radiotap(&beacon, chunk.first().copied().unwrap_or(0));
         let radiotap_context = ObservationContext::new(
             sequence.saturating_add(2),
             sequence.saturating_add(2).saturating_mul(1_000),

@@ -2,7 +2,7 @@ use l2_workbench::{
     artifact::{
         self, EmbeddedDiscoveryLimits, EmbeddedFormat, EmbeddedValidationEvidence, PngLimits,
     },
-    evidence::{Case, Edge, EvidenceStatus},
+    evidence::Case,
     measurement::LengthMeaning,
     protocol::{
         self, BoundaryCandidate, BoundaryExtractionReport, ByteField, ByteOrder, ByteRunSample,
@@ -13,12 +13,13 @@ use l2_workbench::{
     recovery::{
         EnqueueOutcome, RecoveryCoordinator, RecoveryError, RecoveryResource,
         RecoveryResourcePolicy, RecoveryResult, RecoveryTask,
-        proposals::transform_proposal_operations,
     },
 };
-use serde_json::json;
-
+mod queue_priority;
 mod relational;
+#[path = "recovery_support.rs"]
+mod support;
+use support::{add_bytes_node, add_derived_edge, fail, recovery_policy, require};
 
 const MAX_RECOVERY_INPUT_BYTES: usize = 256;
 const MAX_RECORD_INPUT_BYTES: usize = 272;
@@ -26,25 +27,26 @@ const MAX_RECORDS: usize = 8;
 const MAX_CANDIDATES: usize = 8;
 const MAX_FRAMES: usize = 8;
 
-pub(super) fn exercise(input: &[u8]) {
+pub fn exercise(input: &[u8]) {
     let input = input
         .get(..input.len().min(MAX_RECOVERY_INPUT_BYTES))
         .unwrap_or_default();
 
     // Keep each parser independent so one rejected input cannot skip later paths
     exercise_coordinator(input);
+    queue_priority::exercise(input);
     exercise_framing(input);
     exercise_records(input);
     exercise_embedded(input);
     relational::exercise(input);
 }
 
-pub(super) fn exercise_reconstructed_framing(
+pub fn exercise_reconstructed_framing(
     reconstruction: &l2_workbench::reconstruction::ReconstructionReport,
 ) {
     let (run_count, total_bytes, maximum_run_bytes) = reconstruction_run_sizes(reconstruction);
     let limits = ProtocolLimits {
-        max_samples: run_count.max(1).min(MAX_FRAMES),
+        max_samples: run_count.clamp(1, MAX_FRAMES),
         max_message_bytes: maximum_run_bytes.max(1),
         max_total_bytes: total_bytes.max(1),
         max_run_bytes: maximum_run_bytes.max(1),
@@ -141,13 +143,10 @@ fn coordinator_observation(input: &[u8]) -> CoordinatorObservation {
     let policy = recovery_policy(bytes.len());
     let mut coordinator = RecoveryCoordinator::new(policy);
     let task = RecoveryTask::StructuralValidation;
-    let queued = match coordinator.enqueue(&case, first_node, task.clone()) {
-        Ok(EnqueueOutcome::Queued(id)) => EnqueueOutcome::Queued(id),
-        _ => fail(),
-    };
-    let candidate_id = match queued {
-        EnqueueOutcome::Queued(id) => id,
-        _ => fail(),
+    let Ok(queued @ EnqueueOutcome::Queued(candidate_id)) =
+        coordinator.enqueue(&case, first_node, task.clone())
+    else {
+        fail();
     };
     let merged = match coordinator.enqueue(&case, alias_node, task) {
         Ok(outcome @ EnqueueOutcome::Merged(id)) if id == candidate_id => outcome,
@@ -164,9 +163,8 @@ fn coordinator_observation(input: &[u8]) -> CoordinatorObservation {
     require(input.origin_node_ids().contains(&first_node));
     require(input.origin_node_ids().contains(&alias_node));
     let origins_after_merge = input.origin_node_ids().len();
-    let input_blob = match coordinator.input_blob(&case, candidate_id) {
-        Ok(blob) => blob,
-        Err(_) => fail(),
+    let Ok(input_blob) = coordinator.input_blob(&case, candidate_id) else {
+        fail();
     };
     require(input_blob.bytes.as_slice() == bytes);
 
@@ -182,6 +180,33 @@ fn coordinator_observation(input: &[u8]) -> CoordinatorObservation {
     }
     require(matches!(coordinator.pop_next(), Ok(None)));
 
+    let (rejected_other_case, charged) =
+        check_case_identity_and_work_budget(&mut coordinator, policy, bytes);
+
+    let (cycle, candidates_after_cycle) = exercise_cycle(bytes);
+    let (contextual_first, contextual_repeat, contextual_alias, contextual_candidate_count) =
+        exercise_context_identity(bytes);
+    CoordinatorObservation {
+        queued,
+        merged,
+        cycle,
+        candidates_after_merge: coordinator.candidate_count(),
+        candidates_after_cycle,
+        origins_after_merge,
+        charged_work: charged,
+        rejected_other_case,
+        contextual_first,
+        contextual_repeat,
+        contextual_alias,
+        contextual_candidate_count,
+    }
+}
+
+fn check_case_identity_and_work_budget(
+    coordinator: &mut RecoveryCoordinator,
+    policy: RecoveryResourcePolicy,
+    bytes: &[u8],
+) -> (bool, usize) {
     let mut other_case = Case::new();
     let other_node = add_bytes_node(&mut other_case, "recovery_input", bytes);
     let rejected_other_case = matches!(
@@ -190,10 +215,12 @@ fn coordinator_observation(input: &[u8]) -> CoordinatorObservation {
     );
     require(rejected_other_case);
 
-    let charged = match coordinator.charge_case_work(bytes.len()) {
-        l2_workbench::recovery::BudgetCheck::WithinBudget => coordinator.work_bytes_charged(),
-        l2_workbench::recovery::BudgetCheck::Exhausted { .. } => fail(),
+    let l2_workbench::recovery::BudgetCheck::WithinBudget =
+        coordinator.charge_case_work(bytes.len())
+    else {
+        fail();
     };
+    let charged = coordinator.work_bytes_charged();
     require(charged <= policy.max_work_bytes);
     let Some(over_budget) = policy
         .max_work_bytes
@@ -217,24 +244,7 @@ fn coordinator_observation(input: &[u8]) -> CoordinatorObservation {
         l2_workbench::recovery::BudgetCheck::WithinBudget => fail(),
     }
     require(coordinator.work_bytes_charged() == charged);
-
-    let (cycle, candidates_after_cycle) = exercise_cycle(bytes);
-    let (contextual_first, contextual_repeat, contextual_alias, contextual_candidate_count) =
-        exercise_context_identity(bytes);
-    CoordinatorObservation {
-        queued,
-        merged,
-        cycle,
-        candidates_after_merge: coordinator.candidate_count(),
-        candidates_after_cycle,
-        origins_after_merge,
-        charged_work: charged,
-        rejected_other_case,
-        contextual_first,
-        contextual_repeat,
-        contextual_alias,
-        contextual_candidate_count,
-    }
+    (rejected_other_case, charged)
 }
 
 fn exercise_context_identity(
@@ -245,13 +255,10 @@ fn exercise_context_identity(
     let alias_node = add_bytes_node(&mut case, "framing_origin", bytes);
     let mut coordinator = RecoveryCoordinator::new(recovery_policy(bytes.len()));
     let task = RecoveryTask::FramingDiscovery;
-    let first = match coordinator.enqueue(&case, first_node, task.clone()) {
-        Ok(outcome @ EnqueueOutcome::Queued(_)) => outcome,
-        _ => fail(),
-    };
-    let first_id = match first {
-        EnqueueOutcome::Queued(id) => id,
-        _ => fail(),
+    let Ok(first @ EnqueueOutcome::Queued(first_id)) =
+        coordinator.enqueue(&case, first_node, task.clone())
+    else {
+        fail();
     };
     let repeat = match coordinator.enqueue(&case, first_node, task.clone()) {
         Ok(outcome @ EnqueueOutcome::Merged(id)) if id == first_id => outcome,
@@ -270,9 +277,8 @@ fn exercise_context_identity(
         fail();
     };
     require(first_input.origin_node_ids() == [first_node]);
-    let alias_id = match alias {
-        EnqueueOutcome::Queued(id) => id,
-        _ => fail(),
+    let EnqueueOutcome::Queued(alias_id) = alias else {
+        fail();
     };
     let Some(alias_candidate) = coordinator.candidate(alias_id) else {
         fail();
@@ -294,9 +300,10 @@ fn exercise_cycle(bytes: &[u8]) -> (EnqueueOutcome, usize) {
 
     let mut coordinator = RecoveryCoordinator::new(recovery_policy(bytes.len()));
     let task = RecoveryTask::RecursiveExpansion;
-    let candidate_id = match coordinator.enqueue(&case, input_node, task.clone()) {
-        Ok(EnqueueOutcome::Queued(id)) => id,
-        _ => fail(),
+    let Ok(EnqueueOutcome::Queued(candidate_id)) =
+        coordinator.enqueue(&case, input_node, task.clone())
+    else {
+        fail();
     };
     match coordinator.pop_next() {
         Ok(Some(id)) if id == candidate_id => {}
@@ -324,44 +331,6 @@ fn exercise_cycle(bytes: &[u8]) -> (EnqueueOutcome, usize) {
     };
     require(coordinator.candidate_count() == 1);
     (cycle, coordinator.candidate_count())
-}
-
-fn recovery_policy(input_length: usize) -> RecoveryResourcePolicy {
-    let input_limit = input_length.max(1);
-    let max_candidate_task_identity_bytes = [
-        RecoveryTask::StructuralValidation,
-        RecoveryTask::FramingDiscovery,
-        RecoveryTask::RecursiveExpansion,
-    ]
-    .iter()
-    .map(|task| serde_json::to_vec(task).map_or(0, |identity| identity.len()))
-    .max()
-    .unwrap_or_default()
-    .saturating_mul(4);
-    let max_proposal_identity_bytes = transform_proposal_operations()
-        .map(RecoveryTask::transform)
-        .map(|task| serde_json::to_vec(&task).map_or(0, |identity| identity.len()))
-        .max()
-        .unwrap_or_default()
-        .saturating_mul(4);
-    RecoveryResourcePolicy {
-        max_candidates: 4,
-        max_frontier: 4,
-        max_inputs_per_candidate: 4,
-        max_origins_per_candidate: 4,
-        max_input_bytes_per_item: input_limit,
-        max_total_input_bytes_per_candidate: input_limit.saturating_mul(2),
-        max_depth: 3,
-        max_output_bytes: input_limit,
-        max_work_bytes: input_limit.saturating_mul(4).saturating_add(16),
-        max_candidate_task_identity_bytes,
-        max_transform_proposal_identity_bytes: max_proposal_identity_bytes,
-        max_transform_proposal_associations: 4,
-        max_parent_links: 8,
-        max_lineage_work: 64,
-        max_context_aliases: 16,
-        max_pending_origin_links: 8,
-    }
 }
 
 fn exercise_framing(input: &[u8]) {
@@ -526,8 +495,7 @@ fn check_explicit_boundaries(input: &[u8], framing: &FramingKind) {
     let mut cursor = 0;
     for boundary in protocol::frame_boundaries(input, framing) {
         let range = match boundary {
-            FrameBoundary::Frame(range) => range,
-            FrameBoundary::Tail { range, .. } => range,
+            FrameBoundary::Frame(range) | FrameBoundary::Tail { range, .. } => range,
         };
         require(range.start == cursor);
         require(range.start <= range.end);
@@ -660,12 +628,7 @@ fn check_reconstructed_candidate(
     run: &l2_workbench::protocol::ReconstructedFramingRun<'_>,
     candidate: &BoundaryCandidate,
 ) {
-    for range in candidate
-        .frames
-        .iter()
-        .copied()
-        .chain(candidate.trailing.into_iter())
-    {
+    for range in candidate.frames.iter().copied().chain(candidate.trailing) {
         let Ok(mapping) = run.map_range(range) else {
             fail();
         };
@@ -1180,7 +1143,7 @@ fn record_limits(input_length: usize) -> RecordLimits {
     }
 }
 
-fn proposal_limits(record_limits: RecordLimits) -> RecordSchemaProposalLimits {
+const fn proposal_limits(record_limits: RecordLimits) -> RecordSchemaProposalLimits {
     RecordSchemaProposalLimits {
         discovery: RecordDiscoveryLimits {
             max_candidates: 8,
@@ -1199,7 +1162,7 @@ fn proposal_limits(record_limits: RecordLimits) -> RecordSchemaProposalLimits {
 fn protocol_limits(input_length: usize, sample_count: usize) -> ProtocolLimits {
     let input_limit = input_length.max(1);
     ProtocolLimits {
-        max_samples: sample_count.max(1).min(MAX_FRAMES),
+        max_samples: sample_count.clamp(1, MAX_FRAMES),
         max_message_bytes: input_limit,
         max_total_bytes: input_limit,
         max_run_bytes: input_limit,
@@ -1210,36 +1173,6 @@ fn protocol_limits(input_length: usize, sample_count: usize) -> ProtocolLimits {
     }
 }
 
-fn add_bytes_node(case: &mut Case, kind: &str, bytes: &[u8]) -> u64 {
-    match case.add_bytes_node(kind, bytes, Vec::new(), json!({})) {
-        Ok(node) => node,
-        Err(_) => fail(),
-    }
-}
-
-fn add_derived_edge(case: &mut Case, output: u64, input: u64) {
-    let edge = Edge {
-        from: output,
-        to: input,
-        relation: "derived_from".to_owned(),
-        status: EvidenceStatus::Observed,
-        reason: "The output retains the exact input relation used by the fuzz scenario".to_owned(),
-    };
-    if case.add_edge(edge).is_err() {
-        fail();
-    }
-}
-
 fn byte_at(bytes: &[u8], offset: usize) -> u8 {
     bytes.get(offset).copied().unwrap_or_default()
-}
-
-fn require(condition: bool) {
-    if !condition {
-        fail();
-    }
-}
-
-fn fail() -> ! {
-    std::process::abort()
 }

@@ -5,8 +5,8 @@ use l2_workbench::protocol::observation::{
     ObservationPlan, ObservationProvenance, SampleRange, observe,
 };
 use l2_workbench::protocol::{
-    ByteRange, Direction, FramingKind, MessageContext, MessageFamilyLimits, MessageRole,
-    MessageSample, discover_message_families,
+    ByteRange, Direction, FramingKind, MessageContext, MessageFamilyLimits, MessageFamilyReport,
+    MessageRole, MessageSample, discover_message_families,
 };
 
 const SUPPORTED_SAMPLE_ID: u64 = 1;
@@ -25,7 +25,7 @@ const OBSERVATION_SAMPLE_IDS: [u64; 8] = [
 ];
 const FAMILY_SAMPLE_IDS: [u64; 8] = [101, 102, 103, 104, 105, 106, 107, 108];
 
-pub(super) fn exercise(input: &[u8]) {
+pub fn exercise(input: &[u8]) {
     let bounded = input.get(..input.len().min(32)).unwrap_or_default();
     exercise_observation(bounded);
 
@@ -39,76 +39,9 @@ fn exercise_observation(input: &[u8]) {
     let scope = format!("scope-{:02x}", byte_at(input, 2));
     let other_scope = format!("scope-{:02x}-other", byte_at(input, 3));
 
-    // Fixed message lengths make supported, contradicted, and short-field cases reproducible
-    let messages = vec![
-        message_with_first(8, 8, input, 0),
-        message_with_first(7, 8, input, 1),
-        Vec::new(),
-        message_with_first(byte_at(input, 4), 8, input, 2),
-        message_with_first(8, 8, input, 3),
-        message_with_first(8, 8, input, 4),
-        message_with_first(8, 8, input, 5),
-        message_with_first(8, 8, input, 6),
-    ];
-
-    // Session IDs differ while source, scope, and direction define comparison cohorts
-    let contexts = vec![
-        Some(message_context(
-            &source,
-            &scope,
-            10,
-            Direction::FirstToSecond,
-        )),
-        Some(message_context(
-            &source,
-            &scope,
-            11,
-            Direction::FirstToSecond,
-        )),
-        Some(message_context(
-            &source,
-            &scope,
-            12,
-            Direction::FirstToSecond,
-        )),
-        Some(message_context(
-            &other_source,
-            &scope,
-            13,
-            Direction::FirstToSecond,
-        )),
-        Some(message_context(
-            &source,
-            &other_scope,
-            14,
-            Direction::FirstToSecond,
-        )),
-        Some(message_context(
-            &source,
-            &scope,
-            15,
-            Direction::SecondToFirst,
-        )),
-        Some(message_context(
-            &source,
-            &scope,
-            16,
-            Direction::FirstToSecond,
-        )),
-        None,
-    ];
-
-    // Mappings include complete, absent, gapped, overlapping, and derived origins
-    let mappings = vec![
-        complete_mappings(&source, 1, 8),
-        Vec::new(),
-        Vec::new(),
-        Vec::new(),
-        gapped_mappings(&source, 5),
-        overlapping_mappings(&source, 6),
-        complete_mappings(&source, 7, 8),
-        Vec::new(),
-    ];
+    let messages = observation_messages(input);
+    let contexts = observation_contexts(&source, &other_source, &scope, &other_scope);
+    let mappings = observation_mappings(&source);
 
     let derived_start = usize::from(byte_at(input, 5));
     let mut observations = Vec::with_capacity(messages.len());
@@ -153,7 +86,75 @@ fn exercise_observation(input: &[u8]) {
     exercise_hostile_ranges(&observations);
 }
 
+fn observation_messages(input: &[u8]) -> [Vec<u8>; 8] {
+    // Fixed message lengths make supported, contradicted, and short-field cases reproducible
+    [
+        message_with_first(8, 8, input, 0),
+        message_with_first(7, 8, input, 1),
+        Vec::new(),
+        message_with_first(byte_at(input, 4), 8, input, 2),
+        message_with_first(8, 8, input, 3),
+        message_with_first(8, 8, input, 4),
+        message_with_first(8, 8, input, 5),
+        message_with_first(8, 8, input, 6),
+    ]
+}
+
+fn observation_contexts(
+    source: &str,
+    other_source: &str,
+    scope: &str,
+    other_scope: &str,
+) -> [Option<MessageContext>; 8] {
+    // Session IDs differ while source, scope, and direction define comparison cohorts
+    [
+        Some(message_context(source, scope, 10, Direction::FirstToSecond)),
+        Some(message_context(source, scope, 11, Direction::FirstToSecond)),
+        Some(message_context(source, scope, 12, Direction::FirstToSecond)),
+        Some(message_context(
+            other_source,
+            scope,
+            13,
+            Direction::FirstToSecond,
+        )),
+        Some(message_context(
+            source,
+            other_scope,
+            14,
+            Direction::FirstToSecond,
+        )),
+        Some(message_context(source, scope, 15, Direction::SecondToFirst)),
+        Some(message_context(source, scope, 16, Direction::FirstToSecond)),
+        None,
+    ]
+}
+
+fn observation_mappings(source: &str) -> [Vec<ByteMapping>; 8] {
+    // Mappings include complete, absent, gapped, overlapping, and derived origins
+    [
+        complete_mappings(source, 1, 8),
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+        gapped_mappings(source, 5),
+        overlapping_mappings(source, 6),
+        complete_mappings(source, 7, 8),
+        Vec::new(),
+    ]
+}
+
 fn exercise_observation_report(input: &[u8], observations: &[ObservationInput<'_>]) {
+    let plan = observation_plan();
+    let Ok(report) = observe(observations, &plan) else {
+        fail();
+    };
+    assert_omissions_clear_incompleteness(&report.coverage);
+    check_length_constraints(&report);
+    check_observation_origins(input, &report);
+    check_region_references(&report);
+}
+
+fn observation_plan() -> ObservationPlan {
     let mut region_ranges = Vec::with_capacity(16);
     for sample in OBSERVATION_SAMPLE_IDS {
         // One-byte windows also request a safe but unavailable range from the empty message
@@ -178,31 +179,27 @@ fn exercise_observation_report(input: &[u8], observations: &[ObservationInput<'_
         sample: 6,
         range: ByteRange { start: 0, end: 8 },
     });
-    let plan = ObservationPlan {
+    ObservationPlan {
         region_ranges,
         ..ObservationPlan::default()
-    };
+    }
+}
 
-    let report = match observe(observations, &plan) {
-        Ok(report) => report,
-        Err(_) => fail(),
-    };
-    assert_omissions_clear_incompleteness(&report.coverage);
-
+fn check_length_constraints(report: &l2_workbench::protocol::observation::ObservationReport) {
     // The first byte is a length hypothesis in two complete messages and one empty message
-    let supported = length_constraint(&report, SUPPORTED_SAMPLE_ID);
+    let supported = length_constraint(report, SUPPORTED_SAMPLE_ID);
     require(supported.outcome == ConstraintOutcome::Supported);
     require(supported.expected == Some(8));
     require(supported.observed == Some(8));
     require(supported.semantic_status == EvidenceStatus::Hypothesis);
 
-    let contradicted = length_constraint(&report, CONTRADICTED_SAMPLE_ID);
+    let contradicted = length_constraint(report, CONTRADICTED_SAMPLE_ID);
     require(contradicted.outcome == ConstraintOutcome::Contradicted);
     require(contradicted.expected == Some(8));
     require(contradicted.observed == Some(7));
     require(contradicted.semantic_status == EvidenceStatus::Hypothesis);
 
-    let untestable = length_constraint(&report, UNTESTABLE_SAMPLE_ID);
+    let untestable = length_constraint(report, UNTESTABLE_SAMPLE_ID);
     require(untestable.outcome == ConstraintOutcome::Untestable);
     require(untestable.observed.is_none());
     require(untestable.semantic_status == EvidenceStatus::Hypothesis);
@@ -227,7 +224,12 @@ fn exercise_observation_report(input: &[u8], observations: &[ObservationInput<'_
             ConstraintOutcome::Untestable => require(constraint.observed.is_none()),
         }
     }
+}
 
+fn check_observation_origins(
+    input: &[u8],
+    report: &l2_workbench::protocol::observation::ObservationReport,
+) {
     // Missing provenance keeps raw facts visible without claiming a complete origin
     let missing_origin = report
         .byte_observations
@@ -268,11 +270,13 @@ fn exercise_observation_report(input: &[u8], observations: &[ObservationInput<'_
     require(!literal.origins.is_empty());
 
     // Gaps and overlapping source mappings cannot claim a complete literal origin
-    let gapped = byte_observation(&report, 5, ByteRange { start: 0, end: 5 });
-    let overlapping = byte_observation(&report, 6, ByteRange { start: 0, end: 8 });
+    let gapped = byte_observation(report, 5, ByteRange { start: 0, end: 5 });
+    let overlapping = byte_observation(report, 6, ByteRange { start: 0, end: 8 });
     require(!gapped.origin_complete);
     require(!overlapping.origin_complete);
+}
 
+fn check_region_references(report: &l2_workbench::protocol::observation::ObservationReport) {
     // Region values point back to facts with the same exact range and full cohort
     for region in &report.regions {
         for value in &region.values {
@@ -323,9 +327,8 @@ fn exercise_observation_limits(observations: &[ObservationInput<'_>]) {
             .collect(),
         limits,
     };
-    let report = match observe(observations, &plan) {
-        Ok(report) => report,
-        Err(_) => fail(),
+    let Ok(report) = observe(observations, &plan) else {
+        fail();
     };
     require(!report.coverage.complete);
     require(report.coverage.omitted_samples > 0);
@@ -337,15 +340,14 @@ fn exercise_observation_limits(observations: &[ObservationInput<'_>]) {
         max_samples: 0,
         ..ObservationLimits::default()
     };
-    let zero_sample_report = match observe(
+    let Ok(zero_sample_report) = observe(
         observations,
         &ObservationPlan {
             limits: invalid_limits,
             ..ObservationPlan::default()
         },
-    ) {
-        Ok(report) => report,
-        Err(_) => fail(),
+    ) else {
+        fail();
     };
     require(zero_sample_report.coverage.samples_retained == 0);
     require(zero_sample_report.coverage.omitted_samples == observations.len());
@@ -377,9 +379,8 @@ fn exercise_hostile_ranges(observations: &[ObservationInput<'_>]) {
         }],
         ..ObservationPlan::default()
     };
-    let report = match observe(observations, &oversized) {
-        Ok(report) => report,
-        Err(_) => fail(),
+    let Ok(report) = observe(observations, &oversized) else {
+        fail();
     };
     require(!report.coverage.complete);
     require(report.coverage.omitted_region_occurrences > 0);
@@ -394,7 +395,7 @@ fn exercise_message_families(input: &[u8]) {
     let other_source = format!("family-other-{:02x}", byte_at(input, 4));
 
     // Two values recur in distinct training sessions; holdout includes one seen and one unseen value
-    let message_bytes = vec![
+    let message_bytes = [
         message_with_first(first_value, message_length(input, 0), input, 7),
         message_with_first(first_value, message_length(input, 1), input, 8),
         message_with_first(second_value, message_length(input, 2), input, 9),
@@ -437,10 +438,29 @@ fn exercise_message_families(input: &[u8]) {
         max_report_bytes: 65_536,
         ..MessageFamilyLimits::default()
     };
-    let report = match discover_message_families(&samples, &[101, 102, 103, 104], limits) {
-        Ok(report) => report,
-        Err(_) => fail(),
+    let Ok(report) = discover_message_families(&samples, &[101, 102, 103, 104], limits) else {
+        fail();
     };
+    check_message_family_report(
+        &report,
+        &samples,
+        &source,
+        &scope,
+        first_value,
+        second_value,
+        heldout_value,
+    );
+}
+
+fn check_message_family_report(
+    report: &MessageFamilyReport,
+    samples: &[MessageSample<'_>],
+    source: &str,
+    scope: &str,
+    first_value: u8,
+    second_value: u8,
+    heldout_value: u8,
+) {
     require(report.samples_seen == samples.len());
     require(report.training_samples == 4);
     require(report.heldout_samples == 4);
@@ -503,7 +523,7 @@ fn exercise_message_families(input: &[u8]) {
         max_samples: 0,
         ..MessageFamilyLimits::default()
     };
-    require(discover_message_families(&samples, &[101, 102, 103, 104], invalid_limits).is_err());
+    require(discover_message_families(samples, &[101, 102, 103, 104], invalid_limits).is_err());
 }
 
 fn length_constraint(
@@ -636,7 +656,7 @@ fn message_context(
     }
 }
 
-fn message_role(value: u8) -> MessageRole {
+const fn message_role(value: u8) -> MessageRole {
     match value % 3 {
         0 => MessageRole::Request,
         1 => MessageRole::Response,
