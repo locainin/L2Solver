@@ -270,6 +270,17 @@ pub enum AnalysisStatus {
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum AnalysisOmission {
+    /// The operation-wide source read limit prevented opening this source for analysis
+    SourceReadLimit {
+        /// Source bytes that were not read
+        length: u64,
+        /// Reserved bytes required to analyze and recheck the source
+        required: u64,
+        /// Bytes still available for source admission
+        remaining: u64,
+        /// Operation-wide source read limit
+        maximum: u64,
+    },
     /// The shared evidence Case has no remaining space for another source object
     CaseBlobLimit {
         /// Maximum aggregate bytes retained by the Case

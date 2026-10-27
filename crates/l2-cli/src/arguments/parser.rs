@@ -177,6 +177,9 @@ struct RefineArgs {
     /// Recover supported partial archive members
     #[arg(long)]
     salvage: bool,
+    /// Set the aggregate source and manifest read limit for this invocation
+    #[arg(long, value_name = "SIZE", default_value = "4GiB", value_parser = value::parse_byte_size)]
+    source_read_limit: u64,
     #[command(flatten)]
     recovery: RecoveryOptions,
 }
@@ -484,13 +487,17 @@ impl TopCommand {
                 require_tshark: arguments.require_tshark,
                 recovery: arguments.recovery,
             })),
-            Self::Refine(arguments) => Ok(Command::Refine(RefineOptions {
-                input: arguments.input,
-                output: arguments.output,
-                dry_run: arguments.dry_run,
-                salvage: arguments.salvage,
-                recovery: arguments.recovery,
-            })),
+            Self::Refine(arguments) => {
+                let mut recovery = arguments.recovery;
+                recovery.source_read_limit = arguments.source_read_limit;
+                Ok(Command::Refine(RefineOptions {
+                    input: arguments.input,
+                    output: arguments.output,
+                    dry_run: arguments.dry_run,
+                    salvage: arguments.salvage,
+                    recovery,
+                }))
+            }
             Self::Cache { command } => Ok(Command::Cache(command)),
             Self::Completions { shell } => Ok(Command::Completions(shell)),
             Self::Assess(arguments) | Self::Survey(arguments) => {

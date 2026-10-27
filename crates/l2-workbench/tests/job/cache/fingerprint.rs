@@ -3,6 +3,48 @@ use std::{error::Error, fs};
 use l2_workbench::{job::cache::SourceFingerprint, sha256};
 
 #[test]
+fn expected_length_blocks_fingerprinting_and_hashing_before_any_content_read()
+-> Result<(), Box<dyn Error>> {
+    use l2_workbench::job::cache::SourceIdentity;
+    use std::io::Seek;
+
+    let directory = tempfile::tempdir()?;
+    let source = directory.path().join("source.bin");
+    fs::write(&source, vec![3_u8; 256 * 1024])?;
+    let mut file = fs::File::open(source)?;
+    assert!(SourceFingerprint::fast_open_file_with_expected_length(&mut file, 1).is_err());
+    assert_eq!(file.stream_position()?, 0);
+    let mut checks = 0;
+    assert!(
+        SourceIdentity::sha256_open_file_with_expected_length_and_check(&mut file, 1, || {
+            checks += 1;
+            Ok(())
+        })
+        .is_err()
+    );
+    assert_eq!(checks, 0);
+    assert_eq!(file.stream_position()?, 0);
+    Ok(())
+}
+
+#[test]
+fn fingerprint_read_reservation_matches_whole_and_three_range_samples() {
+    for (length, expected) in [
+        (0, 0),
+        (65_537, 65_537),
+        (196_608, 196_608),
+        (196_609, 196_608),
+        (1_000_000, 196_608),
+    ] {
+        assert_eq!(
+            SourceFingerprint::sample_read_bytes(length),
+            expected,
+            "source length {length}"
+        );
+    }
+}
+
+#[test]
 fn opened_file_identity_reads_from_start_and_matches_the_source_bytes() -> Result<(), Box<dyn Error>>
 {
     use l2_workbench::job::cache::SourceIdentity;

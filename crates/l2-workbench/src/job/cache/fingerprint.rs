@@ -60,6 +60,8 @@ pub enum SourceIdentity {
     Fast(SourceFingerprint),
     /// Full-file SHA-256, suitable for content identity across moves and renames
     Sha256(String),
+    /// No complete content identity was computed for this source set
+    Unavailable,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -72,6 +74,16 @@ struct MetadataIdentity {
 }
 
 impl SourceFingerprint {
+    /// Return the exact maximum content bytes read by one fast source sample
+    #[must_use]
+    pub const fn sample_read_bytes(length: u64) -> u64 {
+        if length <= WHOLE_FILE_SAMPLE_LIMIT {
+            length
+        } else {
+            WHOLE_FILE_SAMPLE_LIMIT
+        }
+    }
+
     /// Calculates a bounded metadata and sample fingerprint for a regular file
     ///
     /// Small files are sampled in full. Larger files are sampled at the beginning, middle,
@@ -92,11 +104,26 @@ impl SourceFingerprint {
     /// # Errors
     /// Returns an error for non-regular, unreadable, or changing files
     pub fn fast_open_file(file: &mut File) -> Result<Self> {
+        Self::fast_open_file_inner(file, None)
+    }
+
+    /// Fingerprint an open file only if its length matches an admitted read reservation
+    ///
+    /// # Errors
+    /// Returns an error for a non-regular, unreadable, changing, or differently sized source
+    pub fn fast_open_file_with_expected_length(file: &mut File, length: u64) -> Result<Self> {
+        Self::fast_open_file_inner(file, Some(length))
+    }
+
+    fn fast_open_file_inner(file: &mut File, expected_length: Option<u64>) -> Result<Self> {
         let before = file.metadata()?;
         if !before.is_file() {
             return Err(CacheError::UnsafePath("source is not a regular file"));
         }
         let identity = metadata_identity(&before);
+        if expected_length.is_some_and(|length| length != identity.size_bytes) {
+            return Err(CacheError::SourceChanged);
+        }
         let sample_sha256 = sample_digest(&mut *file, identity.size_bytes)?;
         let after = file.metadata()?;
         if identity != metadata_identity(&after) {
@@ -174,6 +201,26 @@ impl SourceIdentity {
     /// Returns an error for non-regular, unreadable, changing, or cancelled files
     pub fn sha256_open_file_with_check(
         file: &mut File,
+        check: impl FnMut() -> std::io::Result<()>,
+    ) -> Result<Self> {
+        Self::sha256_open_file_inner(file, None, check)
+    }
+
+    /// Hash an open file only if its length matches an admitted read reservation
+    ///
+    /// # Errors
+    /// Returns an error for a non-regular, unreadable, changing, cancelled, or differently sized source
+    pub fn sha256_open_file_with_expected_length_and_check(
+        file: &mut File,
+        length: u64,
+        check: impl FnMut() -> std::io::Result<()>,
+    ) -> Result<Self> {
+        Self::sha256_open_file_inner(file, Some(length), check)
+    }
+
+    fn sha256_open_file_inner(
+        file: &mut File,
+        expected_length: Option<u64>,
         mut check: impl FnMut() -> std::io::Result<()>,
     ) -> Result<Self> {
         let before = file.metadata()?;
@@ -181,6 +228,9 @@ impl SourceIdentity {
             return Err(CacheError::UnsafePath("source is not a regular file"));
         }
         let identity = metadata_identity(&before);
+        if expected_length.is_some_and(|length| length != identity.size_bytes) {
+            return Err(CacheError::SourceChanged);
+        }
         file.seek(SeekFrom::Start(0))?;
         let digest = full_digest(&mut *file, identity.size_bytes, &mut check)?;
         let after = file.metadata()?;
@@ -194,6 +244,9 @@ impl SourceIdentity {
         let digest = match self {
             Self::Fast(fingerprint) => &fingerprint.sample_sha256,
             Self::Sha256(digest) => digest,
+            Self::Unavailable => {
+                return Err(CacheError::InvalidInput("source identity is unavailable"));
+            }
         };
         if !is_sha256_digest(digest) {
             return Err(CacheError::InvalidInput(

@@ -10,6 +10,7 @@ pub(super) const MAX_ANALYSIS_FILE_BYTES: usize = 64 * 1024 * 1024;
 #[derive(Clone, Copy)]
 pub(super) struct RefinePolicy {
     pub(super) memory_limit: usize,
+    pub(super) source_read_limit: u64,
     pub(super) total_input_limit: usize,
     pub(super) per_file_limit: usize,
     pub(super) case_blob_limit: usize,
@@ -23,6 +24,7 @@ impl RefinePolicy {
         let output_limit = (memory_limit / 3).max(1);
         Ok(Self {
             memory_limit,
+            source_read_limit: recovery.source_read_limit,
             total_input_limit: memory_limit / 4,
             per_file_limit: input_limit,
             case_blob_limit: (memory_limit / 3).max(1),

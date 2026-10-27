@@ -27,6 +27,12 @@ pub(super) fn reuse(
 
     prepared.check_location()?;
     ensure_policy_matches(directory, identity, receipt)?;
+    if receipt.source_identity_sha256.is_none() {
+        return Err(actionable_conflict(
+            "source identity is unavailable; use --refresh or a different output",
+        )
+        .into());
+    }
     verify_source(identity, receipt, current_input, strict)?;
 
     verified_result(prepared, manifest, receipt, strict).map(Some)
@@ -63,6 +69,14 @@ pub(super) fn reuse_refinement(
     {
         return Err(actionable_conflict(
             "refinement source labels differ from the existing result",
+        )
+        .into());
+    }
+    if receipt.source_identity_sha256.is_none()
+        || matches!(identity.source, SourceIdentity::Unavailable)
+    {
+        return Err(actionable_conflict(
+            "source identity is unavailable; use --refresh or a different output",
         )
         .into());
     }
@@ -150,7 +164,7 @@ fn verify_source(
             )
             .into());
         }
-        if receipt.source_identity_sha256 != digest {
+        if receipt.source_identity_sha256.as_deref() != Some(digest.as_str()) {
             return Err(actionable_conflict("source bytes differ from the existing result").into());
         }
         return Ok(());
@@ -167,7 +181,7 @@ fn verify_source(
     }
 
     if let Some(digest) = source_digest(&identity.source)
-        && receipt.source_identity_sha256 == digest
+        && receipt.source_identity_sha256.as_deref() == Some(digest)
     {
         return Ok(());
     }
@@ -184,7 +198,7 @@ fn verify_source_by_digest(
     let actual = SourceIdentity::sha256_file(input)?;
     let digest = source_digest(&actual)
         .ok_or_else(|| invalid_source("current input has no strong SHA-256 identity"))?;
-    if receipt.source_identity_sha256 == digest {
+    if receipt.source_identity_sha256.as_deref() == Some(digest) {
         Ok(())
     } else {
         Err(actionable_conflict("source bytes differ from the existing result").into())

@@ -17,6 +17,7 @@ use super::{
 
 mod early_reuse;
 mod range_analysis;
+mod read_budget;
 
 fn run(options: &RefineOptions, output: &mut impl Write) -> Result<bool, Box<dyn Error>> {
     let job = l2_workbench::job::Job::new("refine test");
@@ -98,8 +99,7 @@ fn manifest_member_symlink_is_rejected() -> Result<(), Box<dyn Error>> {
         }))?,
     )?;
 
-    let input_set = prepare_input_set(directory.path())?;
-    assert!(read_sources(&input_set, 1024, 1024, &l2_workbench::job::Job::new("test")).is_err());
+    assert!(prepare_input_set(directory.path()).is_err());
     Ok(())
 }
 

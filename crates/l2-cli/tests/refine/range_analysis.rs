@@ -8,7 +8,7 @@ use std::{
 };
 
 #[cfg(target_os = "linux")]
-fn process_read_bytes() -> Result<u64, Box<dyn Error>> {
+pub(super) fn process_read_bytes() -> Result<u64, Box<dyn Error>> {
     let io = fs::read_to_string("/proc/self/io")?;
     Ok(io
         .lines()

@@ -297,6 +297,9 @@ pub struct RecoveryOptions {
         value_parser = super::value::parse_byte_size
     )]
     pub memory_limit: u64,
+    /// Set the aggregate byte limit for refinement source and manifest reads
+    #[arg(skip = 4_u64 * 1024 * 1024 * 1024)]
+    pub source_read_limit: u64,
     /// Set the maximum retained cache size using bytes, KB/MB/GB/TB, or KiB/MiB/GiB/TiB
     #[arg(
         long,
@@ -319,6 +322,7 @@ impl Default for RecoveryOptions {
             quiet: false,
             verbosity: 0,
             memory_limit: 512 * 1024 * 1024,
+            source_read_limit: 4 * 1024 * 1024 * 1024,
             cache_max_bytes: 2 * 1024 * 1024 * 1024,
         }
     }

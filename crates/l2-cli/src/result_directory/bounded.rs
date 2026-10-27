@@ -414,6 +414,7 @@ where
     let digest = match &identity {
         SourceIdentity::Fast(fingerprint) => &fingerprint.sample_sha256,
         SourceIdentity::Sha256(digest) => digest,
+        SourceIdentity::Unavailable => return Ok(identity),
         _ => {
             return Err(de::Error::custom(
                 "metadata has an unsupported source identity",
@@ -469,15 +470,22 @@ where
     deserialize_sequence::<D, T, { super::manifest::MAX_RESULT_OUTPUT_STAMPS }>(deserializer)
 }
 
-pub(super) fn deserialize_source_digests<'de, D>(deserializer: D) -> Result<Vec<String>, D::Error>
+pub(super) fn deserialize_source_digests<'de, D>(
+    deserializer: D,
+) -> Result<Vec<Option<String>>, D::Error>
 where
     D: Deserializer<'de>,
 {
-    let LimitedSequence::<LimitedString<64>, { super::manifest::MAX_RESULT_SOURCES }>(digests) =
-        LimitedSequence::deserialize(deserializer)?;
+    let LimitedSequence::<Option<LimitedString<64>>, { super::manifest::MAX_RESULT_SOURCES }>(
+        digests,
+    ) = LimitedSequence::deserialize(deserializer)?;
     digests
         .into_iter()
-        .map(|digest| validate_sha256::<D::Error>(digest.0))
+        .map(|digest| {
+            digest
+                .map(|digest| validate_sha256::<D::Error>(digest.0))
+                .transpose()
+        })
         .collect()
 }
 
@@ -513,14 +521,6 @@ where
     D: Deserializer<'de>,
 {
     Option::<LimitedString<1024>>::deserialize(deserializer).map(|label| label.map(|label| label.0))
-}
-
-pub(super) fn deserialize_sha256<'de, D>(deserializer: D) -> Result<String, D::Error>
-where
-    D: Deserializer<'de>,
-{
-    let digest = LimitedString::<64>::deserialize(deserializer)?.0;
-    validate_sha256::<D::Error>(digest)
 }
 
 pub(super) fn deserialize_optional_sha256<'de, D>(

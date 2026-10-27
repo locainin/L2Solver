@@ -89,6 +89,10 @@ pub enum Counter {
     Files,
     /// Bytes read or written
     Bytes,
+    /// Source and manifest read bytes reserved during the current invocation
+    SourceReadBytes,
+    /// Source read bytes reserved by earlier invocations of the restored job
+    PriorSourceReadBytes,
     /// Packet records indexed during a fresh capture ingestion
     ///
     /// Reusing a cached index does not add packet work
@@ -128,9 +132,11 @@ pub enum Counter {
 }
 
 impl Counter {
-    const ALL: [Self; 15] = [
+    const ALL: [Self; 17] = [
         Self::Files,
         Self::Bytes,
+        Self::SourceReadBytes,
+        Self::PriorSourceReadBytes,
         Self::Packets,
         Self::Flows,
         Self::Cohorts,
@@ -152,6 +158,8 @@ impl Counter {
         match self {
             Self::Files => "files",
             Self::Bytes => "bytes",
+            Self::SourceReadBytes => "source read bytes",
+            Self::PriorSourceReadBytes => "prior source read bytes",
             Self::Packets => "packets",
             Self::Flows => "flows",
             Self::Cohorts => "cohorts",
@@ -756,7 +764,8 @@ impl Job {
     /// Interrupted stages return to pending while their completed counts and elapsed times
     /// remain available. A live preparation stage keeps its clock, work and message. Counters
     /// collected during the current invocation are added to saved totals, and the live
-    /// cancellation flag remains owned by this handle
+    /// cancellation flag remains owned by this handle. Source reads from earlier invocations
+    /// remain separate from reads performed during this invocation
     ///
     /// # Errors
     /// Returns an error if shared state is unavailable, a measurement overflows, or other live
@@ -850,6 +859,12 @@ fn restored_snapshot(
     cancel_requested: bool,
 ) -> Result<JobSnapshot, JobError> {
     let preparation = live_preparation(state)?;
+
+    // Saved source reads describe prior work, not I/O performed by this process
+    let previous_reads = snapshot.counters.remove(&Counter::SourceReadBytes).unwrap_or_default();
+    let prior_reads = snapshot.counters.entry(Counter::PriorSourceReadBytes).or_insert(0);
+    *prior_reads = prior_reads.checked_add(previous_reads)
+        .ok_or(JobError::CounterOverflow(Counter::PriorSourceReadBytes))?;
 
     // Cache lookups may have recorded work before restoration
     for (counter, value) in &state.snapshot.counters {

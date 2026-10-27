@@ -14,6 +14,22 @@ mod work;
 
 type TestResult = Result<(), Box<dyn Error>>;
 
+#[test]
+fn restored_source_read_observations_keep_the_current_invocation_separate() -> TestResult {
+    let first = Job::new("first read invocation");
+    first.increment(Counter::SourceReadBytes, 1234)?;
+    let resumed = Job::new("resumed read invocation");
+    resumed.increment(Counter::SourceReadBytes, 567)?;
+    resumed.restore(first.snapshot()?)?;
+    let snapshot = resumed.snapshot()?;
+    assert_eq!(snapshot.counters.get(&Counter::SourceReadBytes), Some(&567));
+    assert_eq!(
+        snapshot.counters.get(&Counter::PriorSourceReadBytes),
+        Some(&1234)
+    );
+    Ok(())
+}
+
 fn phase(snapshot: &JobSnapshot, phase: Phase) -> Result<&PhaseSnapshot, io::Error> {
     snapshot
         .phase(phase)

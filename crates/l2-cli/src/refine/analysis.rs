@@ -1,7 +1,7 @@
 //! Bounded artifact analysis, per-input caching, and evidence-case construction
 
 use super::{
-    input::{InputSet, LoadedSource},
+    input::{InputSet, LoadedSource, SourceData},
     invalid_input,
     output::{ArtifactRecord, SourceRecord},
     policy::RefinePolicy,
@@ -49,6 +49,24 @@ pub(super) fn analyze_sources(
             Phase::TransformDiscovery,
             format!("analyzing {}", source.label.escape_debug()),
         )?;
+        if let SourceData::Skipped(omission) = &source.data {
+            analysis.complete = false;
+            analysis.source_records.push(SourceRecord {
+                label: source.label.clone(),
+                sha256: None,
+                byte_length: omission.length,
+                status: AnalysisStatus::Partial,
+                omissions: vec![l2_workbench::artifact::AnalysisOmission::SourceReadLimit {
+                    length: u64::try_from(omission.length)?,
+                    required: omission.required,
+                    remaining: omission.remaining,
+                    maximum: omission.maximum,
+                }],
+                reason: Some(String::from("source read limit prevented analysis")),
+            });
+            job.advance(Phase::TransformDiscovery, 1)?;
+            continue;
+        }
         // Every source shares the Case space left by earlier sources
         let remaining = policy
             .case_blob_limit
@@ -155,7 +173,7 @@ impl AnalyzedSources {
         self.complete &= report.status == AnalysisStatus::Complete;
         self.source_records.push(SourceRecord {
             label: source.label.clone(),
-            sha256: report.source_sha256.clone(),
+            sha256: Some(report.source_sha256.clone()),
             byte_length: report.source_length,
             status: report.status,
             omissions: report.omissions,

@@ -34,7 +34,7 @@ const REFINE_ALGORITHM_VERSION: u32 = 4;
 #[derive(Serialize)]
 pub(super) struct SourceRecord {
     pub(super) label: String,
-    pub(super) sha256: String,
+    pub(super) sha256: Option<String>,
     pub(super) byte_length: usize,
     pub(super) status: AnalysisStatus,
     pub(super) omissions: Vec<AnalysisOmission>,
@@ -114,6 +114,7 @@ pub(super) fn result_identity_with_source(
             "recovery_mode": policy.analyzer.recovery,
             "profile": recovery_profile_name(recovery.profile),
             "memory_limit": u64::try_from(policy.memory_limit)?,
+            "source_read_limit": policy.source_read_limit,
             "analyzer_algorithm_version": REFINE_ANALYZER_ALGORITHM_VERSION,
             "analysis_receipt_schema_version": CACHE_ANALYSIS_SCHEMA_VERSION,
             "transform_proposal_format_version": TRANSFORM_PROPOSAL_FORMAT_VERSION,
@@ -232,7 +233,11 @@ pub(super) fn make_manifest<'a>(
         });
     }
     Ok(RefineManifest {
-        schema_version: 1,
+        schema_version: if sources.iter().all(|source| source.sha256.is_some()) {
+            1
+        } else {
+            2
+        },
         complete,
         sources,
         artifacts: published,
@@ -280,7 +285,7 @@ pub(super) fn format_summary(
         summary.push_str("Source: ");
         summary.push_str(&source.label.escape_debug().to_string());
         summary.push_str("; SHA-256: ");
-        summary.push_str(&source.sha256);
+        summary.push_str(source.sha256.as_deref().unwrap_or("not read"));
         summary.push_str("; bytes: ");
         summary.push_str(&source.byte_length.to_string());
         summary.push_str("; analysis: ");

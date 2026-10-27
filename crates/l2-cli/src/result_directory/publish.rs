@@ -104,7 +104,7 @@ fn write_result_stage<T>(
     let snapshot = job.snapshot()?;
 
     let parsed = manifest::parse_staged_manifest(staging, kind)?;
-    validate_identity(identity, kind, &parsed.source_identity_sha256)?;
+    validate_identity(identity, kind, parsed.source_identity_sha256.as_deref())?;
     let file_names = manifest::staged_output_files(staging, kind, &parsed)?;
     let output_files = file_names
         .iter()
@@ -151,7 +151,11 @@ fn write_result_stage<T>(
         ),
     });
     let receipt = manifest::ResultReceipt {
-        schema_version: 1,
+        schema_version: if parsed.source_identity_sha256.is_some() {
+            1
+        } else {
+            2
+        },
         identity: identity.clone(),
         complete: parsed.complete,
         source_sha256s: parsed.source_sha256s,
@@ -167,7 +171,7 @@ fn write_result_stage<T>(
 fn validate_identity(
     identity: &ResultIdentity,
     kind: ResultKind,
-    source_identity_sha256: &str,
+    source_identity_sha256: Option<&str>,
 ) -> Result<(), Box<dyn Error>> {
     if identity.kind != kind {
         return Err(manifest::actionable_conflict(
@@ -175,13 +179,12 @@ fn validate_identity(
         )
         .into());
     }
-    if let SourceIdentity::Sha256(digest) = &identity.source
-        && digest != source_identity_sha256
-    {
-        return Err(manifest::actionable_conflict(
+    match (&identity.source, source_identity_sha256) {
+        (SourceIdentity::Unavailable, None) | (SourceIdentity::Fast(_), Some(_)) => Ok(()),
+        (SourceIdentity::Sha256(digest), Some(expected)) if digest == expected => Ok(()),
+        _ => Err(manifest::actionable_conflict(
             "result identity source differs from the generating manifest",
         )
-        .into());
+        .into()),
     }
-    Ok(())
 }

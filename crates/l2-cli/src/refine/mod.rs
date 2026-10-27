@@ -4,6 +4,7 @@ mod analysis;
 mod input;
 mod output;
 mod policy;
+mod read_budget;
 
 #[cfg(test)]
 use analysis::analyze_source_cached;
@@ -41,8 +42,9 @@ pub fn run_with_job(
         .clone()
         .unwrap_or_else(|| output::default_output_path(&options.input));
     let result_directory = ResultDirectory::inspect(&destination, ResultKind::Refine)?;
-    let input_set = input::prepare_input_set(&options.input)?;
     let policy = RefinePolicy::new(&options.recovery, options.salvage)?;
+    let input_set =
+        input::prepare_input_set_with_limit(&options.input, policy.source_read_limit, job)?;
 
     // A bounded sample locates a likely result without loading complete source files
     let sampled = input::fingerprint_sources(
@@ -283,7 +285,10 @@ fn ensure_input_unchanged(
         job,
     )?;
     input::ensure_manifest_unchanged(input_set, job)?;
-    if actual.identity != expected.identity || actual.labels != expected.labels {
+    if actual.identity != expected.identity
+        || actual.labels != expected.labels
+        || actual.sample_set_sha256 != expected.sample_set_sha256
+    {
         return Err(invalid_input("input artifact changed during refinement"));
     }
     Ok(())

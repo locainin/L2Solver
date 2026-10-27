@@ -55,9 +55,9 @@ pub(super) struct OwnedManifest {
     /// Sidecar selected by the extract manifest, or absent for refinement results
     pub evidence_file: Option<String>,
     /// Strong source SHA-256 values recorded by the generating workflow
-    pub source_sha256s: Vec<String>,
+    pub source_sha256s: Vec<Option<String>>,
     /// Strong identity for the complete ordered source set
-    pub source_identity_sha256: String,
+    pub source_identity_sha256: Option<String>,
     /// Ordered refinement labels bind reused output provenance to the input names
     pub source_labels: Vec<Option<String>>,
 }
@@ -87,10 +87,10 @@ pub(super) struct ResultReceipt {
     pub complete: bool,
     /// Strong source identities copied from the generating manifest
     #[serde(deserialize_with = "bounded::deserialize_source_digests")]
-    pub source_sha256s: Vec<String>,
+    pub source_sha256s: Vec<Option<String>>,
     /// Strong identity for the complete ordered source set
-    #[serde(deserialize_with = "bounded::deserialize_sha256")]
-    pub source_identity_sha256: String,
+    #[serde(deserialize_with = "bounded::deserialize_optional_sha256")]
+    pub source_identity_sha256: Option<String>,
     /// Job state at the start of atomic publication
     #[serde(deserialize_with = "bounded::deserialize_job_snapshot")]
     pub job: JobSnapshot,
@@ -146,8 +146,8 @@ struct RawSource {
     )]
     label: Option<String>,
     byte_length: u64,
-    #[serde(deserialize_with = "bounded::deserialize_sha256")]
-    sha256: String,
+    #[serde(default, deserialize_with = "bounded::deserialize_optional_sha256")]
+    sha256: Option<String>,
 }
 
 pub(super) fn inspect(
@@ -205,7 +205,11 @@ fn inspect_prepared(
     raw: RawManifest,
 ) -> Result<super::ResultDirectory, Box<dyn Error>> {
     prepared.check_location()?;
-    let (complete, source_sha256s, source_identity_sha256) = manifest_identity_facts(&raw, kind)?;
+    let SourceFacts {
+        complete,
+        source_sha256s,
+        source_identity_sha256,
+    } = manifest_identity_facts(&raw, kind)?;
     let manifest = OwnedManifest {
         complete,
         evidence_file: evidence_file(&raw, kind)?,
@@ -250,7 +254,11 @@ pub(super) fn parse_staged_manifest(
     if raw.l2solver_result.is_some() {
         return Err(invalid_result("writer supplied a reserved l2solver_result field").into());
     }
-    let (complete, source_sha256s, source_identity_sha256) = manifest_identity_facts(&raw, kind)?;
+    let SourceFacts {
+        complete,
+        source_sha256s,
+        source_identity_sha256,
+    } = manifest_identity_facts(&raw, kind)?;
     let manifest = OwnedManifest {
         complete,
         evidence_file: evidence_file(&raw, kind)?,
@@ -264,7 +272,11 @@ pub(super) fn parse_staged_manifest(
 
 pub(super) fn validate_staged_receipt(path: &Path, kind: ResultKind) -> Result<(), Box<dyn Error>> {
     let raw = read_manifest_path::<RawManifest>(path)?;
-    let (complete, source_sha256s, source_identity_sha256) = manifest_identity_facts(&raw, kind)?;
+    let SourceFacts {
+        complete,
+        source_sha256s,
+        source_identity_sha256,
+    } = manifest_identity_facts(&raw, kind)?;
     let manifest = OwnedManifest {
         complete,
         evidence_file: evidence_file(&raw, kind)?,
@@ -433,11 +445,20 @@ impl ManifestFileIdentity {
     }
 }
 
+struct SourceFacts {
+    complete: bool,
+    source_sha256s: Vec<Option<String>>,
+    source_identity_sha256: Option<String>,
+}
+
 fn manifest_identity_facts(
     raw: &RawManifest,
     kind: ResultKind,
-) -> Result<(bool, Vec<String>, String), Box<dyn Error>> {
-    if raw.schema_version != 1 {
+) -> Result<SourceFacts, Box<dyn Error>> {
+    if !matches!(
+        (kind, raw.schema_version),
+        (ResultKind::Extract, 1) | (ResultKind::Refine, 1 | 2)
+    ) {
         return Err(invalid_result("result manifest schema is unsupported").into());
     }
     match kind {
@@ -460,7 +481,11 @@ fn manifest_identity_facts(
                 .strip_prefix("sha256:")
                 .filter(|digest| is_sha256(digest))
                 .ok_or_else(|| invalid_result("extract manifest has no strong source SHA-256"))?;
-            Ok((complete, vec![digest.to_owned()], digest.to_owned()))
+            Ok(SourceFacts {
+                complete,
+                source_sha256s: vec![Some(digest.to_owned())],
+                source_identity_sha256: Some(digest.to_owned()),
+            })
         }
         ResultKind::Refine => {
             let complete = raw
@@ -475,23 +500,38 @@ fn manifest_identity_facts(
             }
             let digests = sources
                 .iter()
-                .map(|source| {
-                    if is_sha256(&source.sha256) {
-                        Ok(source.sha256.clone())
-                    } else {
-                        Err(invalid_result(
-                            "refine manifest contains an invalid source SHA-256",
-                        ))
-                    }
-                })
-                .collect::<Result<Vec<_>, _>>()?;
+                .map(|source| source.sha256.clone())
+                .collect::<Vec<_>>();
             let identity_sources = sources
                 .iter()
-                .map(|source| (source.byte_length, source.sha256.as_str()))
-                .collect::<Vec<_>>();
-            let source_identity_sha256 =
-                crate::refine::refine_source_identity_sha256(identity_sources)?;
-            Ok((complete, digests, source_identity_sha256))
+                .map(|source| {
+                    source
+                        .sha256
+                        .as_deref()
+                        .map(|digest| (source.byte_length, digest))
+                })
+                .collect::<Option<Vec<_>>>();
+            let source_identity_sha256 = if let Some(identity_sources) = identity_sources {
+                if raw.schema_version != 1 {
+                    return Err(invalid_result(
+                        "refine manifest schema does not match its source identities",
+                    )
+                    .into());
+                }
+                Some(crate::refine::refine_source_identity_sha256(
+                    identity_sources,
+                )?)
+            } else {
+                if complete || raw.schema_version != 2 {
+                    return Err(invalid_result("complete refinement has an unread source").into());
+                }
+                None
+            };
+            Ok(SourceFacts {
+                complete,
+                source_sha256s: digests,
+                source_identity_sha256,
+            })
         }
     }
 }
@@ -556,7 +596,12 @@ fn validate_receipt(
     manifest: &OwnedManifest,
     kind: ResultKind,
 ) -> Result<(), Box<dyn Error>> {
-    if receipt.schema_version != 1 || receipt.identity.kind != kind {
+    let schema_version = if manifest.source_identity_sha256.is_some() {
+        1
+    } else {
+        2
+    };
+    if receipt.schema_version != schema_version || receipt.identity.kind != kind {
         return Err(
             actionable_conflict("result receipt is incompatible with this workflow").into(),
         );
@@ -567,7 +612,10 @@ fn validate_receipt(
     {
         return Err(invalid_result("result receipt does not match its generating manifest").into());
     }
-    validate_source_receipt(&receipt.identity.source, &receipt.source_identity_sha256)?;
+    validate_source_receipt(
+        &receipt.identity.source,
+        receipt.source_identity_sha256.as_deref(),
+    )?;
 
     let mut names = BTreeSet::new();
     for stamp in &receipt.output_files {
@@ -628,16 +676,15 @@ fn validate_receipt(
 
 fn validate_source_receipt(
     source: &SourceIdentity,
-    source_identity_sha256: &str,
+    source_identity_sha256: Option<&str>,
 ) -> Result<(), Box<dyn Error>> {
-    if let SourceIdentity::Sha256(digest) = source
-        && digest != source_identity_sha256
-    {
-        return Err(
-            invalid_result("result identity disagrees with its manifest source SHA-256").into(),
-        );
+    match (source, source_identity_sha256) {
+        (SourceIdentity::Unavailable, None) | (SourceIdentity::Fast(_), Some(_)) => Ok(()),
+        (SourceIdentity::Sha256(digest), Some(expected)) if digest == expected => Ok(()),
+        _ => {
+            Err(invalid_result("result identity disagrees with its manifest source SHA-256").into())
+        }
     }
-    Ok(())
 }
 
 fn validate_directory_entries(

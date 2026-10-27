@@ -66,12 +66,39 @@ fn extraction_uses_shared_recovery_defaults() -> Result<(), Box<dyn std::error::
     assert_eq!(options.recovery.progress, ProgressMode::Auto);
     assert_eq!(options.recovery.jobs, None);
     assert_eq!(options.recovery.memory_limit, 512 * 1024 * 1024);
+    assert_eq!(options.recovery.source_read_limit, 4 * 1024 * 1024 * 1024);
     assert_eq!(options.recovery.cache_max_bytes, 2 * 1024 * 1024 * 1024);
     assert!(!options.recovery.refresh);
     assert!(!options.recovery.no_cache);
     assert!(!options.recovery.strict_cache);
     assert!(!options.recovery.quiet);
     assert_eq!(options.recovery.verbosity, 0);
+    Ok(())
+}
+
+#[test]
+fn refinement_parses_aggregate_source_read_limit() -> Result<(), Box<dyn std::error::Error>> {
+    let Command::Refine(options) = parse_from([
+        "l2solver",
+        "refine",
+        "source.bin",
+        "--source-read-limit",
+        "900MiB",
+    ])?
+    else {
+        return Err("refine did not select file refinement".into());
+    };
+    assert_eq!(options.recovery.source_read_limit, 900 * 1024 * 1024);
+    assert!(
+        parse_from([
+            "l2solver",
+            "extract",
+            "capture.pcapng",
+            "--source-read-limit",
+            "1MiB"
+        ])
+        .is_err()
+    );
     Ok(())
 }
 

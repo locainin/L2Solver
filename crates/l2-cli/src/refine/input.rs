@@ -1,6 +1,9 @@
 //! Secure bounded source admission for standalone files and artifact manifests
 
-use super::invalid_input;
+use super::{
+    invalid_input,
+    read_budget::{SourceReadBudget, analysis_reservation},
+};
 use crate::safe_filename::is_safe_flat_file_name;
 use l2_workbench::{
     job::{
@@ -31,11 +34,28 @@ struct DirectoryAnchor {
 
 pub(super) struct InputSet {
     sources: Vec<InputSpec>,
+    plans: Vec<SourcePlan>,
+    budget: SourceReadBudget,
+    manifest_read_bytes: u64,
     manifest_sha256: Option<String>,
     #[cfg(target_os = "linux")]
     directory: Option<DirectoryAnchor>,
     #[cfg(not(target_os = "linux"))]
     directory: Option<PathBuf>,
+}
+
+struct SourcePlan {
+    length: usize,
+    metadata: MetadataFingerprint,
+    omission: Option<ReadOmission>,
+}
+
+#[derive(Clone, Copy)]
+pub(super) struct ReadOmission {
+    pub(super) length: usize,
+    pub(super) required: u64,
+    pub(super) remaining: u64,
+    pub(super) maximum: u64,
 }
 
 struct InputSpec {
@@ -58,6 +78,7 @@ pub(super) struct LoadedSource {
 pub(super) enum SourceData {
     Memory { bytes: Vec<u8>, sha256: String },
     File(RangeSource),
+    Skipped(ReadOmission),
 }
 
 pub(super) struct RangeSource {
@@ -70,20 +91,21 @@ impl LoadedSource {
         match &self.data {
             SourceData::Memory { bytes, .. } => bytes.len(),
             SourceData::File(source) => source.length,
+            SourceData::Skipped(omission) => omission.length,
         }
     }
 
     pub(super) fn bytes(&self) -> Option<&[u8]> {
         match &self.data {
             SourceData::Memory { bytes, .. } => Some(bytes),
-            SourceData::File(_) => None,
+            SourceData::File(_) | SourceData::Skipped(_) => None,
         }
     }
 
     pub(super) fn digest(&self) -> Option<&str> {
         match &self.data {
             SourceData::Memory { sha256, .. } => Some(sha256),
-            SourceData::File(_) => None,
+            SourceData::File(_) | SourceData::Skipped(_) => None,
         }
     }
 
@@ -108,6 +130,12 @@ impl LoadedSource {
             ));
         }
         file.seek(SeekFrom::Start(0))?;
+        input_set.budget.charge(
+            u64::try_from(source.length)?
+                .checked_add(1)
+                .ok_or_else(|| invalid_input("source read length overflows"))?,
+            job,
+        )?;
         let mut reader = CancellableReader::new(file, job);
         let report = l2_workbench::artifact::analyze_artifacts_from_reader(
             &mut reader,
@@ -180,6 +208,7 @@ pub(super) struct FingerprintedSources {
     pub(super) identity: SourceIdentity,
     pub(super) labels: Vec<String>,
     pub(super) total_bytes: u64,
+    pub(super) sample_set_sha256: String,
 }
 
 #[derive(Serialize)]
@@ -187,7 +216,8 @@ struct SampledSource<'a> {
     label: &'a str,
     expected_length: Option<usize>,
     expected_sha256: Option<&'a str>,
-    fingerprint: SourceFingerprint,
+    fingerprint: Option<SourceFingerprint>,
+    skipped_metadata: Option<MetadataFingerprint>,
 }
 
 #[derive(Deserialize)]
@@ -204,13 +234,25 @@ struct InputManifestArtifact {
     sha256: Option<String>,
 }
 
+#[cfg(test)]
 pub(super) fn prepare_input_set(path: &Path) -> Result<InputSet, Box<dyn Error>> {
+    prepare_input_set_with_limit(path, u64::MAX, &Job::new("unlimited test input"))
+}
+
+pub(super) fn prepare_input_set_with_limit(
+    path: &Path,
+    maximum: u64,
+    job: &Job,
+) -> Result<InputSet, Box<dyn Error>> {
+    let budget = SourceReadBudget::new(maximum);
     let metadata = fs::symlink_metadata(path)?;
     if metadata.file_type().is_symlink() {
         return Err(invalid_input("input path must not be a symbolic link"));
     }
     if metadata.is_dir() {
-        return prepare_export_directory(path);
+        let mut input = prepare_export_directory(path, budget, job)?;
+        plan_sources(&mut input)?;
+        return Ok(input);
     }
     if !metadata.is_file() {
         return Err(invalid_input(
@@ -222,7 +264,7 @@ pub(super) fn prepare_input_set(path: &Path) -> Result<InputSet, Box<dyn Error>>
         || String::from("input.bin"),
         |name| name.to_string_lossy().into_owned(),
     );
-    Ok(InputSet {
+    let mut input = InputSet {
         sources: vec![InputSpec {
             label,
             path: InputPath::Direct(path.to_owned()),
@@ -230,23 +272,40 @@ pub(super) fn prepare_input_set(path: &Path) -> Result<InputSet, Box<dyn Error>>
             expected_sha256: None,
         }],
         manifest_sha256: None,
+        plans: Vec::new(),
+        budget,
+        manifest_read_bytes: 0,
         #[cfg(target_os = "linux")]
         directory: None,
         #[cfg(not(target_os = "linux"))]
         directory: None,
-    })
+    };
+    plan_sources(&mut input)?;
+    Ok(input)
 }
 
-fn prepare_export_directory(path: &Path) -> Result<InputSet, Box<dyn Error>> {
+fn prepare_export_directory(
+    path: &Path,
+    budget: SourceReadBudget,
+    job: &Job,
+) -> Result<InputSet, Box<dyn Error>> {
     #[cfg(target_os = "linux")]
     let directory = DirectoryAnchor::open(path)?;
     #[cfg(not(target_os = "linux"))]
     let directory = path.to_owned();
 
-    let (manifest_bytes, manifest_sha256) =
-        read_directory_member(&directory, "manifest.json", MAX_MANIFEST_BYTES)?;
+    let (manifest_bytes, manifest_sha256) = read_directory_member(
+        &directory,
+        "manifest.json",
+        MAX_MANIFEST_BYTES,
+        &budget,
+        job,
+    )?;
+    let manifest_read_bytes = u64::try_from(manifest_bytes.len())?
+        .checked_add(1)
+        .ok_or_else(|| invalid_input("manifest read length overflows"))?;
     let manifest: InputManifest = serde_json::from_slice(&manifest_bytes)?;
-    if manifest.schema_version != 1 {
+    if !matches!(manifest.schema_version, 1 | 2) {
         return Err(invalid_input(
             "artifact manifest schema version is unsupported",
         ));
@@ -281,11 +340,55 @@ fn prepare_export_directory(path: &Path) -> Result<InputSet, Box<dyn Error>> {
     Ok(InputSet {
         sources,
         manifest_sha256: Some(manifest_sha256),
+        plans: Vec::new(),
+        budget,
+        manifest_read_bytes,
         #[cfg(target_os = "linux")]
         directory: Some(directory),
         #[cfg(not(target_os = "linux"))]
         directory: Some(directory),
     })
+}
+
+fn plan_sources(input_set: &mut InputSet) -> Result<(), Box<dyn Error>> {
+    // Leave room for both manifest rechecks before admitting source reads
+    let manifest_reserve = input_set
+        .manifest_read_bytes
+        .checked_mul(2)
+        .ok_or_else(|| invalid_input("manifest read reservation overflows"))?;
+    let mut available = input_set
+        .budget
+        .remaining()
+        .checked_sub(manifest_reserve)
+        .ok_or_else(|| invalid_input("source read limit cannot cover manifest rechecks"))?;
+    let mut plans = Vec::new();
+    plans.try_reserve_exact(input_set.sources.len())?;
+    for spec in &input_set.sources {
+        let file = open_identity_source(input_set, spec)?;
+        let metadata = file.metadata()?;
+        let length = checked_length(&metadata, spec.expected_length, usize::MAX)?;
+        let length_u64 = u64::try_from(length)?;
+        let required = analysis_reservation(length_u64);
+        let omission = match required {
+            Some(required) if required <= available => {
+                available -= required;
+                None
+            }
+            required => Some(ReadOmission {
+                length,
+                required: required.unwrap_or(u64::MAX),
+                remaining: available,
+                maximum: input_set.budget.maximum(),
+            }),
+        };
+        plans.push(SourcePlan {
+            length,
+            metadata: metadata_fingerprint(&metadata),
+            omission,
+        });
+    }
+    input_set.plans = plans;
+    Ok(())
 }
 
 pub(super) fn ensure_manifest_unchanged(
@@ -300,11 +403,18 @@ pub(super) fn ensure_manifest_unchanged(
         directory.check_location()?;
     }
     let file = read_directory_file(input_set, "manifest.json")?;
-    let opened = metadata_fingerprint(&file.file_metadata()?);
+    let metadata = file.file_metadata()?;
+    let opened = metadata_fingerprint(&metadata);
+    let manifest_length = usize::try_from(metadata.len())?;
+    let manifest_read_bytes = metadata
+        .len()
+        .checked_add(1)
+        .ok_or_else(|| invalid_input("manifest read length overflows"))?;
+    input_set.budget.charge(manifest_read_bytes, job)?;
     let (_, digest) = read_snapshot(
         CancellableReader::new(file, job),
         MAX_MANIFEST_BYTES,
-        None,
+        Some(manifest_length),
         None,
     )?;
     let named = read_directory_file(input_set, "manifest.json")?;
@@ -331,11 +441,21 @@ pub(super) fn read_sources(
         .try_reserve_exact(input_set.sources.len())
         .map_err(|_| io::Error::other("input source allocation failed"))?;
     let mut total_bytes = 0_usize;
-    for spec in &input_set.sources {
+    for (spec, plan) in input_set.sources.iter().zip(&input_set.plans) {
         job.check_cancelled()?;
+        if let Some(omission) = plan.omission {
+            sources.push(LoadedSource {
+                label: spec.label.clone(),
+                data: SourceData::Skipped(omission),
+            });
+            continue;
+        }
         let file = open_identity_source(input_set, spec)?;
         let metadata = file.metadata()?;
-        let length = checked_length(&metadata, spec.expected_length, usize::MAX)?;
+        if metadata_fingerprint(&metadata) != plan.metadata {
+            return Err(invalid_input("input artifact changed during admission"));
+        }
+        let length = plan.length;
         if length > per_file_limit {
             // Keep the identity, then hash content as the analyzer reads it
             let fingerprint = metadata_fingerprint(&metadata);
@@ -351,10 +471,16 @@ pub(super) fn read_sources(
             });
         } else {
             total_bytes = checked_total(total_bytes, length, total_limit)?;
+            input_set.budget.charge(
+                u64::try_from(length)?
+                    .checked_add(1)
+                    .ok_or_else(|| invalid_input("source read length overflows"))?,
+                job,
+            )?;
             let (bytes, digest) = read_snapshot(
                 CancellableReader::new(file, job),
                 per_file_limit,
-                spec.expected_length,
+                Some(length),
                 spec.expected_sha256.as_deref(),
             )?;
             sources.push(LoadedSource {
@@ -381,46 +507,70 @@ pub(super) fn fingerprint_sources(
     labels.try_reserve_exact(input_set.sources.len())?;
     let mut total = 0_u64;
     let mut memory_bytes = 0_usize;
-    for spec in &input_set.sources {
+    for (spec, plan) in input_set.sources.iter().zip(&input_set.plans) {
         job.check_cancelled()?;
         let mut file = open_identity_source(input_set, spec)?;
-        let length = checked_source_length(&file, spec, usize::MAX)?;
-        if length <= per_file_limit {
+        let metadata = metadata_fingerprint(&file.metadata()?);
+        if metadata != plan.metadata {
+            return Err(invalid_input("input artifact changed during refinement"));
+        }
+        let length = plan.length;
+        if plan.omission.is_none() && length <= per_file_limit {
             memory_bytes = checked_total(memory_bytes, length, total_limit)?;
         }
         total = total
             .checked_add(u64::try_from(length)?)
             .ok_or_else(|| invalid_input("input source byte total overflows"))?;
-        let fingerprint = SourceFingerprint::fast_open_file(&mut file)?;
-        if fingerprint.size_bytes != u64::try_from(length)? {
-            return Err(invalid_input(
-                "input artifact changed while it was fingerprinted",
-            ));
-        }
+        let fingerprint = if plan.omission.is_none() {
+            input_set.budget.charge(
+                SourceFingerprint::sample_read_bytes(u64::try_from(length)?),
+                job,
+            )?;
+            let fingerprint = SourceFingerprint::fast_open_file_with_expected_length(
+                &mut file,
+                u64::try_from(length)?,
+            )?;
+            if fingerprint.size_bytes != u64::try_from(length)? {
+                return Err(invalid_input(
+                    "input artifact changed while it was fingerprinted",
+                ));
+            }
+            Some(fingerprint)
+        } else {
+            None
+        };
         sampled.push(SampledSource {
             label: &spec.label,
             expected_length: spec.expected_length,
             expected_sha256: spec.expected_sha256.as_deref(),
             fingerprint,
+            skipped_metadata: plan.omission.map(|_| metadata),
         });
         labels.push(spec.label.clone());
     }
 
-    let mut fingerprint = sampled
-        .first()
-        .ok_or_else(|| invalid_input("input has no sources"))?
-        .fingerprint
-        .sample_hint();
-    fingerprint.size_bytes = total;
     // The set hint binds ordering, labels, declarations, metadata, and bounded samples
-    fingerprint.sample_sha256 = sha256(&serde_json::to_vec(&(
+    let sample_set_sha256 = sha256(&serde_json::to_vec(&(
         "l2solver-refine-sample-set-v1",
         &sampled,
     ))?);
+    let identity = if sampled.iter().all(|entry| entry.fingerprint.is_some()) {
+        let mut fingerprint = sampled
+            .first()
+            .and_then(|entry| entry.fingerprint.as_ref())
+            .ok_or_else(|| invalid_input("input has no sources"))?
+            .sample_hint();
+        fingerprint.size_bytes = total;
+        fingerprint.sample_sha256.clone_from(&sample_set_sha256);
+        SourceIdentity::Fast(fingerprint)
+    } else {
+        SourceIdentity::Unavailable
+    };
     Ok(FingerprintedSources {
-        identity: SourceIdentity::Fast(fingerprint),
+        identity,
         labels,
         total_bytes: total,
+        sample_set_sha256,
     })
 }
 
@@ -433,17 +583,33 @@ pub(super) fn strong_source_identity(
     let mut digests = Vec::new();
     digests.try_reserve_exact(input_set.sources.len())?;
     let mut total = 0_usize;
-    for spec in &input_set.sources {
+    for (spec, plan) in input_set.sources.iter().zip(&input_set.plans) {
         job.check_cancelled()?;
+        if plan.omission.is_some() {
+            return Err(invalid_input(
+                "source read limit prevents full identity verification",
+            ));
+        }
         let mut file = open_identity_source(input_set, spec)?;
-        let length = checked_source_length(&file, spec, usize::MAX)?;
+        if metadata_fingerprint(&file.metadata()?) != plan.metadata {
+            return Err(invalid_input("input artifact changed during refinement"));
+        }
+        let length = plan.length;
         if length <= per_file_limit {
             total = checked_total(total, length, total_limit)?;
         }
+        input_set.budget.charge(
+            u64::try_from(length)?
+                .checked_add(1)
+                .ok_or_else(|| invalid_input("source read length overflows"))?,
+            job,
+        )?;
         let SourceIdentity::Sha256(digest) =
-            SourceIdentity::sha256_open_file_with_check(&mut file, || {
-                job.check_cancelled().map_err(io::Error::other)
-            })?
+            SourceIdentity::sha256_open_file_with_expected_length_and_check(
+                &mut file,
+                u64::try_from(length)?,
+                || job.check_cancelled().map_err(io::Error::other),
+            )?
         else {
             return Err(invalid_input("source digest is unavailable"));
         };
@@ -572,7 +738,7 @@ impl MetadataReader for File {
     }
 }
 
-#[derive(PartialEq, Eq)]
+#[derive(PartialEq, Eq, Serialize)]
 struct MetadataFingerprint {
     length: u64,
     #[cfg(not(unix))]
@@ -653,8 +819,23 @@ fn read_directory_member(
     directory: &DirectoryAnchor,
     name: &str,
     maximum: usize,
+    budget: &SourceReadBudget,
+    job: &Job,
 ) -> Result<(Vec<u8>, String), Box<dyn Error>> {
-    read_snapshot(open_directory_member(directory, name)?, maximum, None, None)
+    let file = open_directory_member(directory, name)?;
+    let length = checked_length(&file.metadata()?, None, maximum)?;
+    budget.charge(
+        u64::try_from(length)?
+            .checked_add(1)
+            .ok_or_else(|| invalid_input("manifest read length overflows"))?,
+        job,
+    )?;
+    read_snapshot(
+        CancellableReader::new(file, job),
+        maximum,
+        Some(length),
+        None,
+    )
 }
 
 #[cfg(not(target_os = "linux"))]
@@ -662,9 +843,24 @@ fn read_directory_member(
     directory: &PathBuf,
     name: &str,
     maximum: usize,
+    budget: &SourceReadBudget,
+    job: &Job,
 ) -> Result<(Vec<u8>, String), Box<dyn Error>> {
     let path = directory.join(name);
-    read_snapshot(crate::input::regular_no_follow(&path)?, maximum, None, None)
+    let file = crate::input::regular_no_follow(&path)?;
+    let length = checked_length(&file.metadata()?, None, maximum)?;
+    budget.charge(
+        u64::try_from(length)?
+            .checked_add(1)
+            .ok_or_else(|| invalid_input("manifest read length overflows"))?,
+        job,
+    )?;
+    read_snapshot(
+        CancellableReader::new(file, job),
+        maximum,
+        Some(length),
+        None,
+    )
 }
 
 #[cfg(target_os = "linux")]
