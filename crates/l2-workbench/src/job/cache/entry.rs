@@ -3,7 +3,7 @@ use std::{
     path::{Path, PathBuf},
 };
 
-use crate::job::{JobSnapshot, MemoryLease};
+use crate::job::{JobSnapshot, MemoryBudget, MemoryLease};
 use serde_json::Value;
 
 use super::{
@@ -191,9 +191,8 @@ impl Lease {
                 actual_bytes: metadata_json.len(),
             });
         }
-        let manifest = Manifest::scan(self.directory.path())?;
-        let manifest_json = serde_json::to_string(&manifest)?;
-        let entry_bytes = manifest.total_bytes();
+        let prepared = prepare_manifest(self.directory.path(), self.cache.inner.memory_budget())?;
+        let entry_bytes = prepared.manifest.total_bytes();
         let bytes = i64::try_from(entry_bytes).map_err(|_| CacheError::SizeOverflow)?;
         let _quota_lock = self.cache.reserve_capacity(&self.key, entry_bytes)?;
         self.cache.inner.check_locations()?;
@@ -219,11 +218,10 @@ impl Lease {
             .reserve_stage(&self.key, &relative_path, bytes)?;
         // Make every output file and directory durable before publishing the new pointer
         self.directory.sync_tree()?;
-        if Manifest::scan(self.directory.path())? != manifest {
-            return Err(CacheError::CorruptEntry(
-                "stage changed while syncing".to_owned(),
-            ));
-        }
+        prepared
+            .manifest
+            .validate(self.directory.path())
+            .map_err(|_| CacheError::CorruptEntry("stage changed while syncing".to_owned()))?;
         self.cache.inner.entries.sync()?;
         staging_key.rename_child_to(&generation, &entry_root)?;
         self.cleanup_on_drop = false;
@@ -236,7 +234,7 @@ impl Lease {
             status,
             &relative_path,
             &metadata_json,
-            &manifest_json,
+            &prepared.json,
             bytes,
         )?;
 
@@ -249,8 +247,7 @@ impl Lease {
         lock.downgrade()?;
 
         drop(metadata_json);
-        drop(manifest_json);
-        drop(manifest);
+        drop(prepared);
         drop(transient_memory);
         Ok(CacheEntry::new(
             self.key.clone(),
@@ -261,6 +258,32 @@ impl Lease {
             metadata_memory,
         ))
     }
+}
+
+struct PreparedManifest {
+    manifest: Manifest,
+    json: String,
+    _manifest_memory: Option<MemoryLease>,
+    _json_memory: Option<MemoryLease>,
+}
+
+fn prepare_manifest(directory: &Path, budget: Option<&MemoryBudget>) -> Result<PreparedManifest> {
+    let (manifest, manifest_memory) = Manifest::scan(directory, budget)?;
+    let json_memory = if budget.is_some() {
+        memory::reserve(
+            budget,
+            memory::serialized_charge(memory::json_size(&manifest)?)?,
+        )?
+    } else {
+        None
+    };
+    let json = serde_json::to_string(&manifest)?;
+    Ok(PreparedManifest {
+        manifest,
+        json,
+        _manifest_memory: manifest_memory,
+        _json_memory: json_memory,
+    })
 }
 
 impl Drop for Lease {
@@ -299,11 +322,12 @@ pub(super) fn read_entry(
         .map_err(|_| CacheError::CorruptEntry("entry metadata is not valid JSON".to_owned()))?;
     let expected: Manifest = serde_json::from_str(&record.manifest_json)
         .map_err(|_| CacheError::CorruptEntry("entry manifest is not valid JSON".to_owned()))?;
-    let actual = Manifest::scan_for_validation(directory.path(), &expected)
+    expected
+        .validate(directory.path())
         .map_err(|_| CacheError::CorruptEntry("entry files are missing or unsafe".to_owned()))?;
     let recorded_bytes = u64::try_from(record.bytes)
         .map_err(|_| CacheError::CorruptEntry("entry size is invalid".to_owned()))?;
-    if actual != expected || actual.total_bytes() != recorded_bytes {
+    if expected.total_bytes() != recorded_bytes {
         return Err(CacheError::CorruptEntry(
             "entry files no longer match their committed manifest".to_owned(),
         ));

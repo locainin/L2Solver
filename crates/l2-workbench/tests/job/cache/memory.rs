@@ -242,9 +242,9 @@ fn denied_commit_does_not_publish_metadata_or_a_stage_result() -> Result<(), Box
     let temporary = tempfile::tempdir()?;
     let key = stage_key("memory-denied-commit")?;
     let cache = cache_at(temporary.path(), 64 * 1024)?;
+    let lease = cache.lease(&key)?;
     let budget = MemoryBudget::new(1);
     cache.attach_memory_budget(budget.clone())?;
-    let lease = cache.lease(&key)?;
     fs::write(lease.directory().join("result"), b"result")?;
     assert!(matches!(
         lease.commit(StageStatus::Complete, json!({"data": "new"})),
@@ -306,5 +306,26 @@ fn denied_checkpoint_read_does_not_read_the_large_snapshot_column() -> Result<()
         delta < u64::try_from(LARGE_METADATA_BYTES / 4)?,
         "denied checkpoint read {delta} bytes"
     );
+    Ok(())
+}
+
+#[test]
+fn commit_admits_manifest_growth_before_recording_a_large_stage_tree() -> Result<(), Box<dyn Error>>
+{
+    let temporary = tempfile::tempdir()?;
+    let key = stage_key("memory-manifest-growth")?;
+    let cache = cache_at(temporary.path(), 64 * 1024)?;
+    let budget = MemoryBudget::new(160 * 1024);
+    cache.attach_memory_budget(budget.clone())?;
+    let lease = cache.lease(&key)?;
+    for index in 0..256 {
+        fs::write(lease.directory().join(format!("item-{index:04}")), b"x")?;
+    }
+    assert!(matches!(
+        lease.commit(StageStatus::Complete, json!({})),
+        Err(CacheError::Memory(MemoryError::Limit { .. }))
+    ));
+    assert_eq!(cache.stats()?.entries, 0);
+    assert_eq!(budget.snapshot()?.used_bytes, 0);
     Ok(())
 }

@@ -26,6 +26,9 @@ mod execution;
 #[path = "cache/memory.rs"]
 mod memory;
 
+#[path = "cache/maintenance.rs"]
+mod maintenance;
+
 fn cache_at(directory: &Path, max_bytes: u64) -> Result<Cache, CacheError> {
     Cache::open_at(directory.join("cache"), directory.join("state"), max_bytes)
 }

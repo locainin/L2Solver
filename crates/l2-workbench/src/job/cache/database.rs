@@ -210,12 +210,18 @@ fn validate_stage_schema(connection: &Connection) -> Result<()> {
 
 fn has_columns(connection: &Connection, table: &str, required: &[&str]) -> Result<bool> {
     let mut statement = connection.prepare(&format!("PRAGMA table_info({table})"))?;
-    let columns = statement
-        .query_map([], |row| row.get::<_, String>(1))?
-        .collect::<rusqlite::Result<Vec<_>>>()?;
-    Ok(required
-        .iter()
-        .all(|required_column| columns.iter().any(|column| column == required_column)))
+    let mut rows = statement.query([])?;
+    let mut matched = 0;
+    while let Some(row) = rows.next()? {
+        let name = row
+            .get_ref(1)?
+            .as_str()
+            .map_err(|_| CacheError::CorruptDatabase)?;
+        if required.contains(&name) {
+            matched += 1;
+        }
+    }
+    Ok(matched == required.len())
 }
 
 fn pragma_i64(connection: &Connection, name: &str) -> Result<i64> {

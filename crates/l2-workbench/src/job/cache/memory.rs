@@ -35,6 +35,13 @@ pub(super) fn lookup_transient_charge(
         .ok_or(CacheError::SizeOverflow)
 }
 
+pub(super) fn serialized_charge(encoded_bytes: u64) -> Result<u64> {
+    encoded_bytes
+        .checked_mul(2)
+        .and_then(|bytes| bytes.checked_add(256))
+        .ok_or(CacheError::SizeOverflow)
+}
+
 pub(super) fn checkpoint_charge(encoded_bytes: u64) -> Result<u64> {
     encoded_bytes
         .checked_mul(JSON_BYTES_FACTOR)
