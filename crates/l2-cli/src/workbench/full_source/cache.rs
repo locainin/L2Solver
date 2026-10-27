@@ -35,7 +35,7 @@ const CACHE_CONTENTION_WAIT: Duration = Duration::from_secs(5);
 const CACHE_CONTENTION_POLL: Duration = Duration::from_millis(20);
 const CACHE_BUSY_FALLBACK_MESSAGE: &str = "Cache is busy; building a temporary index";
 
-pub const NATIVE_CASE_VERSION: u32 = 1;
+pub const NATIVE_CASE_VERSION: u32 = 2;
 
 type Result<T> = std::result::Result<T, Box<dyn Error>>;
 

@@ -8,6 +8,7 @@ mod bounded_json;
 mod cache_cli;
 mod capture_compare;
 mod capture_tcp;
+mod case_snapshot;
 mod completion;
 mod dev;
 mod export;

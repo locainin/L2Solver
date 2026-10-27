@@ -24,6 +24,9 @@ use std::{
 const LLDP_CAPTURE: &[u8] = include_bytes!("../../../../tests/pcaps/lldp.pcap");
 const STP_CAPTURE: &[u8] = include_bytes!("../../../../tests/pcaps/linux-stp.pcap");
 
+#[path = "full_source/cache/cases.rs"]
+mod native_case_cache_tests;
+
 #[test]
 fn published_capture_index_can_be_reused_without_reingestion() -> Result<(), Box<dyn Error>> {
     let directory = tempfile::tempdir()?;
