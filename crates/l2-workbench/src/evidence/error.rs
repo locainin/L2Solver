@@ -3,6 +3,8 @@ use core::fmt;
 /// A bounded evidence case, source, reference, or encoding failure
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum EvidenceError {
+    /// A shared live-memory charge could not be admitted
+    Memory(crate::job::MemoryError),
     /// The case does not use the current evidence schema
     UnsupportedSchema { found: u32, expected: u32 },
     /// A serialized case exceeded its input or output limit
@@ -48,6 +50,7 @@ pub enum EvidenceError {
 impl fmt::Display for EvidenceError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::Memory(error) => write!(formatter, "evidence memory admission failed: {error}"),
             Self::UnsupportedSchema { found, expected } => write!(
                 formatter,
                 "unsupported evidence schema version {found}; expected {expected}"
@@ -107,4 +110,11 @@ impl fmt::Display for EvidenceError {
     }
 }
 
-impl std::error::Error for EvidenceError {}
+impl std::error::Error for EvidenceError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Memory(error) => Some(error),
+            _ => None,
+        }
+    }
+}

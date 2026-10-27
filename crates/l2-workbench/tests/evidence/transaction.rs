@@ -74,7 +74,7 @@ fn transaction_error_restores_case() -> Result<(), EvidenceError> {
         }],
         json!({"existing": true}),
     )?;
-    let before = case.clone();
+    let before = case.try_clone()?;
 
     let result = case.transaction(|case| {
         case.add_bytes_node("new", b"new blob", Vec::new(), json!({"count": 2}))?;

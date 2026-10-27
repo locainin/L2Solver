@@ -36,7 +36,7 @@ fn transaction_without_source_changes_does_not_snapshot_source_records() -> Resu
                 .is_some_and(|checkpoint| checkpoint.source_snapshots.is_empty())
         );
         case.add_limitation("A bounded transaction without source changes")?;
-        assert_eq!(*case, case.clone());
+        assert_eq!(*case, case.try_clone()?);
         let encoded = case.to_json()?;
         assert_eq!(Case::from_json(&encoded)?, *case);
         Ok(())

@@ -447,7 +447,7 @@ fn coordinator_rejects_cloned_case() -> Result<(), Box<dyn Error>> {
         origin,
         transform(Operation::Reverse {}),
     )?;
-    let clone = case.clone();
+    let clone = case.try_clone()?;
 
     assert_eq!(
         coordinator.input_blob(&clone, id),

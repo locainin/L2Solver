@@ -264,7 +264,7 @@ fn failed_contextual_decoding_view_commit_does_not_cache_rolled_back_node()
     let plan = RecoveryPlan::default();
     let execution_policy = policy();
     let mut executor = super::test_support::build_executor(&mut case, &plan, &execution_policy)?;
-    let before = executor.case.clone();
+    let before = executor.case.try_clone()?;
     let key = (blob_id(b"output"), receipt_node, input_node);
 
     assert!(
@@ -3616,7 +3616,7 @@ fn finish_rolls_back_partial_context_links_at_edge_quota() -> Result<(), Box<dyn
     assert_eq!(coordinator.pop_next()?, Some(candidate_id));
     let plan = RecoveryPlan::default();
     let mut executor = running_executor(&mut case, &plan, &execution_policy, coordinator)?;
-    let before = executor.case.clone();
+    let before = executor.case.try_clone()?;
 
     let result = executor.finish(
         candidate_id,
@@ -3673,7 +3673,7 @@ fn late_context_link_batch_rolls_back_at_edge_quota() -> Result<(), Box<dyn Erro
     ));
     let plan = RecoveryPlan::default();
     let mut executor = running_executor(&mut case, &plan, &execution_policy, coordinator)?;
-    let before = executor.case.clone();
+    let before = executor.case.try_clone()?;
 
     let result = executor.record_enqueue(third_merge, &task, &[third_origin]);
 
@@ -3723,7 +3723,7 @@ fn validation_receipt_and_links_roll_back_at_edge_quota() -> Result<(), Box<dyn 
     assert_eq!(coordinator.pop_next()?, Some(candidate_id));
     let plan = RecoveryPlan::default();
     let mut executor = running_executor(&mut case, &plan, &execution_policy, coordinator)?;
-    let before = executor.case.clone();
+    let before = executor.case.try_clone()?;
 
     let result = executor.run_validation(
         candidate_id,
@@ -3826,7 +3826,7 @@ fn embedded_receipt_children_and_finish_roll_back_at_edge_quota() -> Result<(), 
     assert_eq!(coordinator.pop_next()?, Some(candidate_id));
     let plan = RecoveryPlan::default();
     let mut executor = running_executor(&mut case, &plan, &execution_policy, coordinator)?;
-    let before = executor.case.clone();
+    let before = executor.case.try_clone()?;
 
     let result = executor.run_embedded(candidate_id, &[first_origin, second_origin]);
 
@@ -3888,7 +3888,7 @@ fn framing_edge_quota_is_recorded_as_a_typed_omission() -> Result<(), Box<dyn Er
     assert_eq!(coordinator.pop_next()?, Some(candidate_id));
     let plan = RecoveryPlan::default();
     let mut executor = running_executor(&mut case, &plan, &execution_policy, coordinator)?;
-    let before = executor.case.clone();
+    let before = executor.case.try_clone()?;
 
     let result = executor.run_framing(
         candidate_id,
@@ -3955,7 +3955,7 @@ fn framing_node_quota_is_recorded_as_a_typed_omission() -> Result<(), Box<dyn Er
     assert_eq!(coordinator.pop_next()?, Some(candidate_id));
     let plan = RecoveryPlan::default();
     let mut executor = running_executor(&mut case, &plan, &execution_policy, coordinator)?;
-    let before = executor.case.clone();
+    let before = executor.case.try_clone()?;
 
     let result = executor.run_framing(
         candidate_id,
@@ -4028,7 +4028,7 @@ fn transform_receipt_and_output_roll_back_when_final_link_hits_edge_quota()
     executor
         .transform_proposal_receipts
         .insert(candidate_id, proposal_receipts);
-    let before = executor.case.clone();
+    let before = executor.case.try_clone()?;
 
     let result = executor.run_transform(candidate_id, input_node, &recipe);
 
@@ -4126,7 +4126,7 @@ fn speculative_transform_edge_quota_is_typed_and_later_candidate_completes()
     executor
         .transform_proposal_receipts
         .insert(candidate_id, proposal_receipts);
-    let before = executor.case.clone();
+    let before = executor.case.try_clone()?;
 
     let result = executor.run_transform(candidate_id, input_node, &recipe);
 
@@ -4193,7 +4193,7 @@ fn speculative_transform_node_quota_is_a_typed_omission_with_atomic_rollback()
     executor
         .transform_proposal_receipts
         .insert(candidate_id, proposal_receipts);
-    let before = executor.case.clone();
+    let before = executor.case.try_clone()?;
 
     let result = executor.run_transform(candidate_id, input_node, &recipe);
 
@@ -4232,7 +4232,7 @@ fn expansion_probe_child_mutations_roll_back_at_node_quota() -> Result<(), Box<d
     assert_eq!(coordinator.pop_next()?, Some(candidate_id));
     let plan = RecoveryPlan::default();
     let mut executor = running_executor(&mut case, &plan, &execution_policy, coordinator)?;
-    let before = executor.case.clone();
+    let before = executor.case.try_clone()?;
 
     let result = executor.run_expansion(candidate_id, &[input_node], input_node);
 

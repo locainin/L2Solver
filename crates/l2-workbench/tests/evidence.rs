@@ -8,6 +8,8 @@ mod graph;
 mod import_scan;
 #[path = "evidence/mapping.rs"]
 mod mapping;
+#[path = "evidence/memory.rs"]
+mod memory;
 #[path = "evidence/preflight.rs"]
 mod preflight;
 #[path = "evidence/ranges.rs"]

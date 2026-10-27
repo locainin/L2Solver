@@ -142,7 +142,7 @@ fn repeated_resource_usage_reads_are_exact_and_do_not_mutate_the_case() -> Resul
         details_bytes: 7,
         source_ranges: 1,
     };
-    let before = case.clone();
+    let before = case.try_clone()?;
 
     for _ in 0..32 {
         assert_eq!(case.resource_usage(), expected);

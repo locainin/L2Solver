@@ -2997,7 +2997,7 @@ fn assert_compact_report_details_omitted(
 fn report_node_quota_exhaustion_rolls_back_and_keeps_discovery_results_typed() -> TestResult<()> {
     let mut fixture = build_primary_fixture()?;
     fill_case_nodes_to_quota(&mut fixture.case)?;
-    let before = fixture.case.clone();
+    let before = fixture.case.try_clone()?;
     let policy = normal_policy(&fixture.case)?;
     let outcome = run_record_discovery_only(&mut fixture.case, &recovery_plan(), &policy)?;
 
@@ -3014,7 +3014,7 @@ fn report_node_quota_exhaustion_rolls_back_and_keeps_discovery_results_typed() -
 fn report_edge_quota_exhaustion_rolls_back_node_and_provenance_edges() -> TestResult<()> {
     let mut fixture = build_primary_fixture()?;
     fill_case_edges_to_quota(&mut fixture.case)?;
-    let before = fixture.case.clone();
+    let before = fixture.case.try_clone()?;
     let policy = normal_policy(&fixture.case)?;
     let outcome = run_record_discovery_only(&mut fixture.case, &recovery_plan(), &policy)?;
 

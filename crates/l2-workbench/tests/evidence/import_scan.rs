@@ -223,7 +223,7 @@ fn literal_exact_finding_budget_exhausted() -> Result<(), Box<dyn Error>> {
 fn failed_import_leaves_case_unchanged() -> Result<(), Box<dyn Error>> {
     let mut case = Case::new();
     case.add_node("existing", None, Vec::new(), serde_json::json!({}))?;
-    let before = case.clone();
+    let before = case.try_clone()?;
 
     assert!(
         case.scan_import("invalid\nlabel", "binary", b"contents")

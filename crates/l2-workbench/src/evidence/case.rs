@@ -2,7 +2,7 @@ use super::{
     EvidenceError, EvidenceStatus, bounded,
     model::{Blob, Edge, Node, Source, SourceRange},
 };
-use crate::{serialization::CountWriter, sha256};
+use crate::{job::MemoryBudget, serialization::CountWriter, sha256};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::{
@@ -15,6 +15,8 @@ use std::{
 mod index_tests;
 #[path = "mapping.rs"]
 mod mapping;
+#[path = "case/memory.rs"]
+mod memory;
 #[path = "case/snapshot/mod.rs"]
 mod snapshot;
 #[path = "transaction.rs"]
@@ -122,6 +124,8 @@ pub struct Case {
     identity: Arc<()>,
     #[serde(skip)]
     transaction_checkpoints: Vec<transaction::CaseCheckpoint>,
+    #[serde(skip)]
+    memory: Option<memory::CaseMemory>,
 }
 
 impl PartialEq for Case {
@@ -159,9 +163,19 @@ impl CaseIdentity {
     }
 }
 
-impl Clone for Case {
-    fn clone(&self) -> Self {
-        Self {
+impl Case {
+    /// Make an independent Case copy, reserving a separate charge when memory admission is active
+    ///
+    /// # Errors
+    /// Returns an admission error when the copy cannot fit in the shared budget
+    pub fn try_clone(&self) -> Result<Self, EvidenceError> {
+        // A cloned graph can diverge and must have its own live charge
+        let memory = self
+            .memory
+            .as_ref()
+            .map(memory::CaseMemory::try_duplicate)
+            .transpose()?;
+        let mut copy = Self {
             schema_version: self.schema_version,
             collection_complete: self.collection_complete,
             resource_limits: self.resource_limits,
@@ -176,10 +190,36 @@ impl Clone for Case {
             edge_index: self.edge_index.clone(),
             source_index: self.source_index.clone(),
             range_count: self.range_count,
-            // A cloned graph can diverge after this point
             identity: Arc::new(()),
             transaction_checkpoints: Vec::new(),
+            memory,
+        };
+        let graph_bytes = copy
+            .memory
+            .as_ref()
+            .map(|_| memory::graph_bytes(&copy))
+            .transpose()?;
+        if let Some(memory) = &mut copy.memory {
+            let bytes = copy
+                .blobs
+                .iter()
+                .try_fold(0_u64, |total, blob| {
+                    u64::try_from(blob.bytes.capacity())
+                        .ok()
+                        .and_then(|value| total.checked_add(value))
+                })
+                .ok_or(EvidenceError::ArithmeticOverflow {
+                    field: "Case memory bytes",
+                })?;
+            memory
+                .blobs
+                .try_resize(bytes)
+                .map_err(EvidenceError::Memory)?;
+            if let Some(graph_bytes) = graph_bytes {
+                memory.set_graph(graph_bytes)?;
+            }
         }
+        Ok(copy)
     }
 }
 
@@ -230,7 +270,18 @@ impl Case {
             range_count: 0,
             identity: Arc::new(()),
             transaction_checkpoints: Vec::new(),
+            memory: None,
         }
+    }
+
+    /// Create an empty Case that charges retained blobs and logical graph storage
+    ///
+    /// # Errors
+    /// Returns an error if the shared budget cannot create a Case lease
+    pub fn with_memory_budget(budget: &MemoryBudget) -> Result<Self, EvidenceError> {
+        let mut case = Self::new();
+        case.memory = Some(memory::CaseMemory::new(budget)?);
+        Ok(case)
     }
 
     /// Create an empty case with an explicit aggregate blob-retention budget
@@ -325,7 +376,15 @@ impl Case {
     pub fn add_blob(&mut self, bytes: &[u8]) -> Result<String, EvidenceError> {
         let (id, should_add, next_size) = self.preflight_blob(bytes)?;
         if should_add {
-            let retained = copy_blob_bytes(bytes)?;
+            self.prepare_blob_graph()?;
+            let prior_graph = self.reserve_blob_graph(&id)?;
+            let retained = match self.copy_admitted_blob(bytes) {
+                Ok(retained) => retained,
+                Err(error) => {
+                    self.restore_graph_memory(prior_graph);
+                    return Err(error);
+                }
+            };
             self.commit_blob(id.clone(), retained, next_size);
         }
         Ok(id)
@@ -392,53 +451,16 @@ impl Case {
         validate_label(label)?;
         validate_text(kind, 64, "source kind")?;
         let id = source_id(sha256_hex)?;
-        let blob_value = blob.map(str::to_owned);
-        if let Some(blob_id) = &blob_value {
+        if let Some(blob_id) = blob {
             let retained = self
                 .blob(blob_id)
                 .ok_or(EvidenceError::MissingReference { kind: "blob" })?;
-            if blob_id != &id || u64::try_from(retained.bytes.len()).ok() != Some(length) {
+            if blob_id != id || u64::try_from(retained.bytes.len()).ok() != Some(length) {
                 return Err(EvidenceError::SourceMetadataConflict);
             }
         }
         if let Some(index) = self.source_index.get(&id).copied() {
-            let existing = self
-                .sources
-                .get(index)
-                .ok_or(EvidenceError::SourceMetadataConflict)?;
-            if existing.kind != kind || existing.length != length {
-                return Err(EvidenceError::SourceMetadataConflict);
-            }
-            if let Some(existing_blob) = &existing.blob
-                && blob_value
-                    .as_ref()
-                    .is_some_and(|candidate| candidate != existing_blob)
-            {
-                return Err(EvidenceError::SourceMetadataConflict);
-            }
-            let needs_alias =
-                existing.label != label && !existing.aliases.iter().any(|alias| alias == label);
-            if needs_alias && existing.aliases.len() == MAX_SOURCE_ALIASES {
-                return Err(EvidenceError::QuotaExceeded {
-                    field: "source aliases",
-                    maximum: MAX_SOURCE_ALIASES,
-                });
-            }
-            let attaches_blob = existing.blob.is_none() && blob_value.is_some();
-            if needs_alias || attaches_blob {
-                self.snapshot_source_mutation(index);
-            }
-            let existing = self
-                .sources
-                .get_mut(index)
-                .ok_or(EvidenceError::SourceMetadataConflict)?;
-            if existing.blob.is_none() {
-                existing.blob.clone_from(&blob_value);
-            }
-            if needs_alias {
-                existing.aliases.push(label.to_owned());
-                existing.aliases.sort_unstable();
-            }
+            self.merge_source(index, label, kind, length, blob)?;
             return Ok(id);
         }
         if self.sources.len() >= MAX_SOURCES {
@@ -447,6 +469,20 @@ impl Case {
                 maximum: MAX_SOURCES,
             });
         }
+        memory::grow_vec(&mut self.memory, &mut self.sources)?;
+        memory::grow_map(&mut self.memory, &mut self.source_index)?;
+        if let Some(memory) = &mut self.memory {
+            let bytes = id
+                .len()
+                .checked_mul(2)
+                .and_then(|bytes| bytes.checked_add(label.len()))
+                .and_then(|bytes| bytes.checked_add(kind.len()))
+                .and_then(|bytes| bytes.checked_add(blob.map_or(0, str::len)))
+                .ok_or(EvidenceError::ArithmeticOverflow {
+                    field: "Case memory bytes",
+                })?;
+            memory.reserve_graph(bytes)?;
+        }
         let index = self.sources.len();
         self.sources.push(Source {
             id: id.clone(),
@@ -454,10 +490,76 @@ impl Case {
             aliases: Vec::new(),
             kind: kind.to_owned(),
             length,
-            blob: blob_value,
+            blob: blob.map(str::to_owned),
         });
         self.source_index.insert(id.clone(), index);
         Ok(id)
+    }
+
+    fn merge_source(
+        &mut self,
+        index: usize,
+        label: &str,
+        kind: &str,
+        length: u64,
+        blob_value: Option<&str>,
+    ) -> Result<(), EvidenceError> {
+        let existing = self
+            .sources
+            .get(index)
+            .ok_or(EvidenceError::SourceMetadataConflict)?;
+        if existing.kind != kind || existing.length != length {
+            return Err(EvidenceError::SourceMetadataConflict);
+        }
+        if let Some(existing_blob) = &existing.blob
+            && blob_value.is_some_and(|candidate| candidate != existing_blob)
+        {
+            return Err(EvidenceError::SourceMetadataConflict);
+        }
+        let needs_alias =
+            existing.label != label && !existing.aliases.iter().any(|alias| alias == label);
+        if needs_alias && existing.aliases.len() == MAX_SOURCE_ALIASES {
+            return Err(EvidenceError::QuotaExceeded {
+                field: "source aliases",
+                maximum: MAX_SOURCE_ALIASES,
+            });
+        }
+        let attaches_blob = existing.blob.is_none() && blob_value.is_some();
+        if needs_alias || attaches_blob {
+            self.snapshot_source_mutation(index)?;
+        }
+        if needs_alias {
+            let existing = self
+                .sources
+                .get_mut(index)
+                .ok_or(EvidenceError::SourceMetadataConflict)?;
+            memory::grow_vec(&mut self.memory, &mut existing.aliases)?;
+        }
+        if let Some(memory) = &mut self.memory {
+            let alias_bytes = if needs_alias { label.len() } else { 0 };
+            let blob_bytes = if attaches_blob {
+                blob_value.map_or(0, str::len)
+            } else {
+                0
+            };
+            memory.reserve_graph(alias_bytes.checked_add(blob_bytes).ok_or(
+                EvidenceError::ArithmeticOverflow {
+                    field: "Case memory bytes",
+                },
+            )?)?;
+        }
+        let existing = self
+            .sources
+            .get_mut(index)
+            .ok_or(EvidenceError::SourceMetadataConflict)?;
+        if existing.blob.is_none() {
+            existing.blob = blob_value.map(str::to_owned);
+        }
+        if needs_alias {
+            existing.aliases.push(label.to_owned());
+            existing.aliases.sort_unstable();
+        }
+        Ok(())
     }
 
     /// Bind one source to the basename used by the current request
@@ -478,6 +580,58 @@ impl Case {
             .get(source_id)
             .copied()
             .ok_or(EvidenceError::MissingReference { kind: "source" })?;
+        let source = self
+            .sources
+            .get(index)
+            .ok_or(EvidenceError::SourceMetadataConflict)?;
+        if source.label != label || !source.aliases.is_empty() {
+            self.snapshot_source_mutation(index)?;
+        }
+        if self.memory.is_some() {
+            let source = self
+                .sources
+                .get(index)
+                .ok_or(EvidenceError::SourceMetadataConflict)?;
+            let changed = source.label != label;
+            let old_label = if changed { source.label.capacity() } else { 0 };
+            let released = source
+                .aliases
+                .iter()
+                .try_fold(old_label, |total, alias| {
+                    total.checked_add(alias.capacity())
+                })
+                .ok_or(EvidenceError::ArithmeticOverflow {
+                    field: "Case memory bytes",
+                })?;
+            let prior = self.memory.as_ref().map(memory::CaseMemory::graph_bytes);
+            if changed {
+                if let Some(memory) = &mut self.memory {
+                    memory.reserve_graph(label.len())?;
+                }
+                let replacement = label.to_owned();
+                let extra = replacement.capacity() - label.len();
+                if let Some(memory) = &mut self.memory
+                    && let Err(error) = memory.reserve_graph(extra)
+                {
+                    self.restore_graph_memory(prior);
+                    return Err(error);
+                }
+                let source = self
+                    .sources
+                    .get_mut(index)
+                    .ok_or(EvidenceError::SourceMetadataConflict)?;
+                source.label = replacement;
+            }
+            let source = self
+                .sources
+                .get_mut(index)
+                .ok_or(EvidenceError::SourceMetadataConflict)?;
+            source.aliases.clear();
+            if let Some(memory) = &mut self.memory {
+                memory.release_graph(released)?;
+            }
+            return Ok(());
+        }
         let source = self
             .sources
             .get_mut(index)
@@ -501,6 +655,7 @@ impl Case {
         details: Value,
     ) -> Result<u64, EvidenceError> {
         let plan = self.plan_node(kind, blob, None, &ranges, &details)?;
+        self.admit_node_memory(kind, blob, &ranges, ranges.capacity(), &details)?;
         Ok(self.commit_node(kind, blob, ranges, details, plan))
     }
 
@@ -548,12 +703,34 @@ impl Case {
                 maximum: MAX_TOTAL_DETAILS_BYTES,
             });
         }
+        let graph_change = if self.memory.is_some() {
+            Some((
+                memory::value_bytes(&previous.details)?,
+                memory::value_bytes(&details)?,
+            ))
+        } else {
+            None
+        };
+        if let (Some(memory), Some((before, after))) = (&mut self.memory, graph_change)
+            && after > before
+        {
+            memory.reserve_graph(after - before)?;
+        }
         let node = self
             .nodes
             .get_mut(index)
             .ok_or(EvidenceError::InvalidNodeId)?;
         node.details = details;
         self.details_bytes = total_length;
+        if let (Some(memory), Some((before, after))) = (&mut self.memory, graph_change)
+            && before > after
+        {
+            let released =
+                u64::try_from(before - after).map_err(|_| EvidenceError::ArithmeticOverflow {
+                    field: "Case memory bytes",
+                })?;
+            memory.restore_graph(memory.graph_bytes() - released);
+        }
         Ok(())
     }
 
@@ -603,7 +780,22 @@ impl Case {
         let (blob_id, should_add, next_blob_bytes) = self.preflight_blob(bytes)?;
         let plan = self.plan_node(kind, Some(&blob_id), Some(&blob_id), &ranges, &details)?;
         if should_add {
-            let retained = copy_blob_bytes(bytes)?;
+            self.prepare_blob_graph()?;
+        }
+        let prior_graph =
+            self.admit_node_memory(kind, Some(&blob_id), &ranges, ranges.capacity(), &details)?;
+        if should_add {
+            if let Err(error) = self.reserve_blob_graph(&blob_id) {
+                self.restore_graph_memory(prior_graph);
+                return Err(error);
+            }
+            let retained = match self.copy_admitted_blob(bytes) {
+                Ok(retained) => retained,
+                Err(error) => {
+                    self.restore_graph_memory(prior_graph);
+                    return Err(error);
+                }
+            };
             self.commit_blob(blob_id.clone(), retained, next_blob_bytes);
         }
         Ok(self.commit_node(kind, Some(&blob_id), ranges, details, plan))
@@ -711,6 +903,17 @@ impl Case {
         validate_text(&edge.relation, MAX_RELATION_BYTES, "edge relation")?;
         validate_text(&edge.reason, MAX_REASON_BYTES, "edge reason")?;
         let key = edge_index_key(&edge);
+        if self.memory.is_some() {
+            let new_index_entry = !self.edge_index.contains_key(&key);
+            let payload = memory::edge_payload(&edge, new_index_entry)?;
+            memory::grow_vec(&mut self.memory, &mut self.edges)?;
+            if new_index_entry {
+                memory::grow_map(&mut self.memory, &mut self.edge_index)?;
+            }
+            if let Some(memory) = &mut self.memory {
+                memory.reserve_graph(payload)?;
+            }
+        }
         self.edges.push(edge);
         // Counts preserve earlier copies when a later duplicate is rolled back
         *self.edge_index.entry(key).or_default() += 1;
@@ -731,6 +934,10 @@ impl Case {
                 field: "limitations",
                 maximum: MAX_LIMITATIONS,
             });
+        }
+        memory::grow_vec(&mut self.memory, &mut self.limitations)?;
+        if let Some(memory) = &mut self.memory {
+            memory.reserve_graph(limitation.len())?;
         }
         self.limitations.push(limitation.to_owned());
         Ok(())
@@ -971,6 +1178,7 @@ impl Case {
             range_count: 0,
             identity: Arc::new(()),
             transaction_checkpoints: Vec::new(),
+            memory: None,
         };
         case.rebuild_indexes()?;
         case.validate()?;

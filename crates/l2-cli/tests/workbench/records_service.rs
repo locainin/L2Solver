@@ -108,7 +108,7 @@ fn service_failure_is_atomic() -> Result<(), Box<dyn Error>> {
         Vec::new(),
         serde_json::json!({}),
     )?;
-    let original = case.clone();
+    let original = case.try_clone()?;
     let mut schema_value: serde_json::Value = serde_json::from_slice(schema_bytes())?;
     schema_value
         .as_object_mut()

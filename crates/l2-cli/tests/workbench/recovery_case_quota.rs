@@ -107,7 +107,7 @@ fn embedded_blob_byte_quota_rolls_back_receipt_and_continues_independent_work()
         queued(coordinator.enqueue(&case, plain_node, RecoveryTask::EmbeddedDiscovery)?)?;
     assert_eq!(coordinator.pop_next()?, Some(candidate_id));
     let mut executor = running_executor(&mut case, &plan, &execution_policy, coordinator)?;
-    let before = executor.case.clone();
+    let before = executor.case.try_clone()?;
 
     executor.run_embedded(candidate_id, &[input_node])?;
 
@@ -220,7 +220,7 @@ fn case_evidence_quota_helper_reports_current_usage_and_ignores_nonquota_errors(
         field: "source ranges",
         maximum: MAX_TOTAL_SOURCE_RANGES,
     };
-    let before = case.clone();
+    let before = case.try_clone()?;
     assert_eq!(
         case_evidence_quota(&case, &blob_quota_error),
         Some((RecoveryResource::EvidenceBlobBytes, 32, 20))
@@ -313,7 +313,7 @@ fn speculative_transform_blob_quota_rolls_back() -> Result<(), Box<dyn Error>> {
     executor
         .transform_proposal_receipts
         .insert(candidate_id, proposal_receipts);
-    let before = executor.case.clone();
+    let before = executor.case.try_clone()?;
 
     executor.run_transform(candidate_id, input_node, &recipe)?;
 
@@ -375,7 +375,7 @@ fn exact_transform_blob_quota_remains_fatal() -> Result<(), Box<dyn Error>> {
     exact_executor
         .transform_proposal_receipts
         .insert(exact_candidate, exact_receipts);
-    let before_exact = exact_executor.case.clone();
+    let before_exact = exact_executor.case.try_clone()?;
 
     let result = exact_executor.run_transform(exact_candidate, exact_input, &recipe);
 

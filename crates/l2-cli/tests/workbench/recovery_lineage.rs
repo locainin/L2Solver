@@ -33,7 +33,7 @@ fn contextual_transform_view_edge_quota_rolls_back_with_typed_omission() -> Test
         }],
     );
 
-    let before = executor.case.clone();
+    let before = executor.case.try_clone()?;
     let result = executor.flush_transform_cohorts();
 
     assert!(

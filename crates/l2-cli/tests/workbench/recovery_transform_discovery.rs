@@ -793,7 +793,7 @@ fn edge_quota_does_not_leave_an_unlinked_discovery_report() -> Result<(), Box<dy
     }
     let mut bounded = policy();
     bounded.resources.max_candidates = 1;
-    let before = case.clone();
+    let before = case.try_clone()?;
 
     let outcome = execute(&mut case, &automatic_recovery_plan(), &bounded)?;
 
@@ -857,7 +857,7 @@ fn node_quota_does_not_leave_an_unpublished_discovery_report() -> Result<(), Box
     while case.nodes().len() < l2_workbench::evidence::MAX_NODES {
         case.add_node("quota_filler", None, Vec::new(), serde_json::json!({}))?;
     }
-    let before = case.clone();
+    let before = case.try_clone()?;
     let mut bounded = policy();
     bounded.resources.max_candidates = 1;
 

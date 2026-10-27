@@ -55,7 +55,7 @@ fn returns_created_frames() -> Result<(), Box<dyn Error>> {
 #[test]
 fn failure_is_atomic() -> Result<(), Box<dyn Error>> {
     let (mut case, _) = tcp_run(b"message")?;
-    let before = case.clone();
+    let before = case.try_clone()?;
 
     assert!(apply(&mut case, u64::MAX, &FramingKind::Delimiter { byte: b'\n' },).is_err());
     assert_eq!(case, before);
@@ -230,7 +230,7 @@ fn caller_and_discovered_basis_keeps_report_as_selection_provenance_only()
 #[test]
 fn invalid_discovery_report_identity_fails_atomically() -> Result<(), Box<dyn Error>> {
     let (mut case, input) = tcp_run(b"aabb")?;
-    let before = case.clone();
+    let before = case.try_clone()?;
 
     assert!(
         apply_with_basis(
@@ -252,7 +252,7 @@ fn discovered_materialization_is_atomic_when_selection_edge_exceeds_quota()
     let rule = FramingKind::FixedSize { bytes: 2 };
     let report = add_discovery_report(&mut case, &rule)?;
     fill_edges_to(&mut case, input, MAX_EDGES - 5)?;
-    let before = case.clone();
+    let before = case.try_clone()?;
 
     assert!(
         apply_with_basis(

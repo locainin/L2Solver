@@ -235,7 +235,7 @@ fn a_different_case_with_identical_contents_and_counts_invalidates_the_plan()
 -> Result<(), Box<dyn Error>> {
     let (case, _, _) = framing_case()?;
     let plan = collect_plan(&case, ProtocolLimits::default())?;
-    let cloned = case.clone();
+    let cloned = case.try_clone()?;
     let serialized = case.to_json()?;
     let deserialized = Case::from_json(&serialized)?;
 

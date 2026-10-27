@@ -96,7 +96,7 @@ fn incremental_metadata_is_bounded_across_cohorts_without_changing_normal_inputs
         start_known: true,
     };
     let scan = collect_plan(&case, ProtocolLimits::default())?;
-    let mut normal_case = case.clone();
+    let mut normal_case = case.try_clone()?;
     let normal = collect_tiny_cohorts(&mut normal_case, &scan, &first, &second, false)?;
     let deep = collect_tiny_cohorts(&mut case, &scan, &first, &second, true)?;
     assert_eq!(deep.normal_samples, normal.normal_samples);

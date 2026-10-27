@@ -1109,7 +1109,7 @@ fn report_node_quota_exhaustion_keeps_completed_search_and_rolls_back() -> Resul
     let source = capture(&mut case, "framing-report-node-quota")?;
     let run = add_tcp_run(&mut case, &source, "scope-a", 1, 0, 0, b"one|two|")?;
     fill_case_nodes_to_quota(&mut case)?;
-    let before = case.clone();
+    let before = case.try_clone()?;
     let mut policy = framing_policy(&case)?;
     disable_root_expansion(&mut policy);
 
@@ -1158,7 +1158,7 @@ fn report_edge_quota_exhaustion_keeps_completed_search_and_rolls_back() -> Resul
     let source = capture(&mut case, "framing-report-edge-quota")?;
     let run = add_tcp_run(&mut case, &source, "scope-a", 1, 0, 0, b"one|two|")?;
     fill_case_edges_to_quota(&mut case)?;
-    let before = case.clone();
+    let before = case.try_clone()?;
     let mut policy = framing_policy(&case)?;
     disable_root_expansion(&mut policy);
 

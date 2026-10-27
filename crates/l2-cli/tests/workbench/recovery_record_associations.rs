@@ -243,7 +243,7 @@ fn edge_quota_rolls_back_assembly_and_all_report_association_links() -> TestResu
         .checked_sub(free_edges)
         .ok_or("record assembly edge allowance exceeds Case quota")?;
     fill_edges_to(&mut case, edge_target)?;
-    let before = case.clone();
+    let before = case.try_clone()?;
     let job = Job::new("rolled back record assembly progress");
     let outcome = run_record_with_reports(&mut case, input_node_id, &reports, None, Some(&job))?;
     assert_edge_quota_failure(&case, &before, &outcome, input_node_id)?;

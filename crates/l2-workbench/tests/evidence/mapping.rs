@@ -391,7 +391,7 @@ fn receipt_failure_is_atomic() -> Result<(), Box<dyn Error>> {
         Vec::new(),
         json!({}),
     )?;
-    let before = case.clone();
+    let before = case.try_clone()?;
     assert!(
         case.add_mapped_bytes_node("recovered", b"AB", &mapping, json!({}))
             .is_err()
@@ -408,7 +408,7 @@ fn node_failure_is_atomic() -> Result<(), Box<dyn Error>> {
     for _ in 0..MAX_NODES - 1 {
         case.add_node("retained", None, Vec::new(), json!({}))?;
     }
-    let before = case.clone();
+    let before = case.try_clone()?;
     assert!(
         case.add_mapped_bytes_node("recovered", b"AB", &mapping, json!({}))
             .is_err()

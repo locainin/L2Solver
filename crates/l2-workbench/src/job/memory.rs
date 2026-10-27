@@ -292,6 +292,24 @@ pub struct MemoryLease {
 }
 
 impl MemoryLease {
+    pub(crate) fn try_duplicate(&self) -> Result<Self, MemoryError> {
+        self.budget.try_reserve(self.class, self.bytes)
+    }
+
+    pub(crate) fn try_sibling(&self, bytes: u64) -> Result<Self, MemoryError> {
+        self.budget.try_reserve(self.class, bytes)
+    }
+
+    pub(crate) fn absorb(&mut self, mut other: Self) {
+        assert!(
+            Arc::ptr_eq(&self.budget.shared, &other.budget.shared) && self.class == other.class,
+            "memory charges must share one budget and class"
+        );
+        // Both charges are already included in the same bounded aggregate
+        self.bytes += other.bytes;
+        other.bytes = 0;
+    }
+
     /// Return the bytes currently represented by this lease
     #[must_use]
     pub const fn bytes(&self) -> u64 {
