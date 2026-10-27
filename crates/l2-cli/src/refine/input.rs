@@ -53,11 +53,10 @@ enum InputPath {
 pub(super) struct LoadedSource {
     pub(super) label: String,
     pub(super) data: SourceData,
-    pub(super) sha256: String,
 }
 
 pub(super) enum SourceData {
-    Memory(Vec<u8>),
+    Memory { bytes: Vec<u8>, sha256: String },
     File(RangeSource),
 }
 
@@ -69,14 +68,21 @@ pub(super) struct RangeSource {
 impl LoadedSource {
     pub(super) const fn length(&self) -> usize {
         match &self.data {
-            SourceData::Memory(bytes) => bytes.len(),
+            SourceData::Memory { bytes, .. } => bytes.len(),
             SourceData::File(source) => source.length,
         }
     }
 
     pub(super) fn bytes(&self) -> Option<&[u8]> {
         match &self.data {
-            SourceData::Memory(bytes) => Some(bytes),
+            SourceData::Memory { bytes, .. } => Some(bytes),
+            SourceData::File(_) => None,
+        }
+    }
+
+    pub(super) fn digest(&self) -> Option<&str> {
+        match &self.data {
+            SourceData::Memory { sha256, .. } => Some(sha256),
             SourceData::File(_) => None,
         }
     }
@@ -109,12 +115,28 @@ impl LoadedSource {
             options,
         )?;
         let file = reader.into_inner();
-        if metadata_fingerprint(&file.metadata()?) != source.metadata
-            || report.source_sha256 != self.sha256
-        {
+        if metadata_fingerprint(&file.metadata()?) != source.metadata {
             return Err(invalid_input(
                 "input artifact changed during range analysis",
             ));
+        }
+        if spec
+            .expected_sha256
+            .as_ref()
+            .is_some_and(|expected| expected != &report.source_sha256)
+        {
+            return Err(invalid_input("artifact hash does not match its manifest"));
+        }
+        // Confirm the name still resolves to the same opened object
+        let named = open_identity_source(input_set, spec)?;
+        if metadata_fingerprint(&named.metadata()?) != source.metadata {
+            return Err(invalid_input(
+                "input artifact changed during range analysis",
+            ));
+        }
+        #[cfg(target_os = "linux")]
+        if let Some(directory) = &input_set.directory {
+            directory.check_location()?;
         }
         Ok(report)
     }
@@ -311,32 +333,17 @@ pub(super) fn read_sources(
     let mut total_bytes = 0_usize;
     for spec in &input_set.sources {
         job.check_cancelled()?;
-        let mut file = open_identity_source(input_set, spec)?;
+        let file = open_identity_source(input_set, spec)?;
         let metadata = file.metadata()?;
         let length = checked_length(&metadata, spec.expected_length, usize::MAX)?;
         if length > per_file_limit {
-            // Record the digest and file identity, then close the source until analysis
-            let SourceIdentity::Sha256(digest) =
-                SourceIdentity::sha256_open_file_with_check(&mut file, || {
-                    job.check_cancelled().map_err(io::Error::other)
-                })?
-            else {
-                return Err(invalid_input("source digest is unavailable"));
-            };
-            if spec
-                .expected_sha256
-                .as_ref()
-                .is_some_and(|expected| expected != &digest)
-            {
-                return Err(invalid_input("artifact hash does not match its manifest"));
-            }
+            // Keep the identity, then hash content as the analyzer reads it
             let fingerprint = metadata_fingerprint(&metadata);
             if fingerprint != metadata_fingerprint(&file.metadata()?) {
-                return Err(invalid_input("input artifact changed while it was hashed"));
+                return Err(invalid_input("input artifact changed during admission"));
             }
             sources.push(LoadedSource {
                 label: spec.label.clone(),
-                sha256: digest,
                 data: SourceData::File(RangeSource {
                     length,
                     metadata: fingerprint,
@@ -352,8 +359,10 @@ pub(super) fn read_sources(
             )?;
             sources.push(LoadedSource {
                 label: spec.label.clone(),
-                sha256: digest,
-                data: SourceData::Memory(bytes),
+                data: SourceData::Memory {
+                    bytes,
+                    sha256: digest,
+                },
             });
         }
     }

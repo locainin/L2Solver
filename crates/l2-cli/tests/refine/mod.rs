@@ -352,13 +352,17 @@ fn per_input_cache_ignores_version_3_and_reuses_version_4() -> Result<(), Box<dy
     let bytes = structural_png()?;
     let source = LoadedSource {
         label: String::from("source.bin"),
-        sha256: l2_workbench::sha256(&bytes),
-        data: SourceData::Memory(bytes.clone()),
+        data: SourceData::Memory {
+            bytes: bytes.clone(),
+            sha256: l2_workbench::sha256(&bytes),
+        },
     };
     let recovery = RecoveryOptions::default();
     let options = analyzer_options(&recovery, false, 4096, 8192);
     let job = l2_workbench::job::Job::new("cache test");
-    let identity = l2_workbench::job::cache::SourceIdentity::from_sha256(source.sha256.clone())?;
+    let identity = l2_workbench::job::cache::SourceIdentity::from_sha256(
+        source.digest().ok_or("missing digest")?.to_owned(),
+    )?;
     let previous_policy = json!({
         "schema_version": 1,
         "transform_proposal_format_version":
@@ -834,8 +838,10 @@ fn structural_zip() -> Result<Vec<u8>, Box<dyn Error>> {
 fn loaded_source(label: &str, bytes: &[u8]) -> LoadedSource {
     LoadedSource {
         label: label.to_owned(),
-        data: SourceData::Memory(bytes.to_vec()),
-        sha256: l2_workbench::sha256(bytes),
+        data: SourceData::Memory {
+            bytes: bytes.to_vec(),
+            sha256: l2_workbench::sha256(bytes),
+        },
     }
 }
 

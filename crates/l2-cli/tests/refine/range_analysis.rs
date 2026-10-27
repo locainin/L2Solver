@@ -7,6 +7,180 @@ use std::{
     path::Path,
 };
 
+#[cfg(target_os = "linux")]
+fn process_read_bytes() -> Result<u64, Box<dyn Error>> {
+    let io = fs::read_to_string("/proc/self/io")?;
+    Ok(io
+        .lines()
+        .find_map(|line| line.strip_prefix("rchar: "))
+        .ok_or("rchar missing")?
+        .parse()?)
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn range_source_admission_and_analysis_read_content_once() -> Result<(), Box<dyn Error>> {
+    use crate::refine::input::{prepare_input_set, read_sources};
+    use l2_workbench::{artifact::ArtifactAnalysisOptions, job::Job};
+    use std::process::Command;
+
+    const CHILD_MARKER: &str = "L2_TEST_SINGLE_RANGE_PASS_CHILD";
+    if std::env::var_os(CHILD_MARKER).is_none() {
+        let output = Command::new(std::env::current_exe()?)
+            .args(["refine::tests::range_analysis::range_source_admission_and_analysis_read_content_once", "--exact"])
+            .env(CHILD_MARKER, "1")
+            .output()?;
+        assert!(
+            output.status.success(),
+            "child failed: {}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        return Ok(());
+    }
+    let directory = tempfile::tempdir()?;
+    let input = directory.path().join("large.bin");
+    let file = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&input)?;
+    const LENGTH: u64 = 70 * 1024 * 1024;
+    file.set_len(LENGTH)?;
+    let set = prepare_input_set(&input)?;
+    let job = Job::new("single range pass");
+    let before = process_read_bytes()?;
+    let sources = read_sources(&set, 1024, 1024, &job)?;
+    let mut options = ArtifactAnalysisOptions::default();
+    options.limits.max_input_bytes = 1024;
+    options.limits.max_total_work_bytes = 1024;
+    let report = sources
+        .first()
+        .ok_or("source missing")?
+        .analyze_ranges(&set, 0, options, &job)?;
+    let bytes_read = process_read_bytes()? - before;
+    assert!(
+        bytes_read < LENGTH + 1024 * 1024,
+        "read {bytes_read} bytes for a {LENGTH}-byte source"
+    );
+    let identity = l2_workbench::job::cache::SourceIdentity::sha256_file(&input)?;
+    assert_eq!(
+        serde_json::to_value(identity)?
+            .get("value")
+            .and_then(serde_json::Value::as_str),
+        Some(report.source_sha256.as_str())
+    );
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn changing_a_large_source_during_analysis_prevents_publication() -> Result<(), Box<dyn Error>> {
+    use std::{
+        process::Command,
+        thread,
+        time::{Duration, Instant},
+    };
+
+    const CHILD_MARKER: &str = "L2_TEST_CHANGING_RANGE_CHILD";
+    if std::env::var_os(CHILD_MARKER).is_none() {
+        let output = Command::new(std::env::current_exe()?)
+            .args(["refine::tests::range_analysis::changing_a_large_source_during_analysis_prevents_publication", "--exact"])
+            .env(CHILD_MARKER, "1")
+            .output()?;
+        assert!(
+            output.status.success(),
+            "child failed: {}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        return Ok(());
+    }
+    let directory = tempfile::tempdir()?;
+    let input = directory.path().join("large.bin");
+    let destination = directory.path().join("result");
+    let file = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&input)?;
+    file.set_len(70 * 1024 * 1024)?;
+    let before = process_read_bytes()?;
+    let changed_path = input.clone();
+    let writer = thread::spawn(move || -> Result<(), String> {
+        let deadline = Instant::now() + Duration::from_secs(15);
+        loop {
+            let read = process_read_bytes().map_err(|error| error.to_string())?;
+            if read.saturating_sub(before) > 1024 * 1024 {
+                let mut file = OpenOptions::new()
+                    .write(true)
+                    .open(changed_path)
+                    .map_err(|error| error.to_string())?;
+                file.seek(SeekFrom::Start(69 * 1024 * 1024))
+                    .map_err(|error| error.to_string())?;
+                file.write_all(b"changed")
+                    .map_err(|error| error.to_string())?;
+                file.sync_all().map_err(|error| error.to_string())?;
+                return Ok(());
+            }
+            if Instant::now() >= deadline {
+                return Err(String::from("analysis did not start reading"));
+            }
+            thread::sleep(Duration::from_millis(1));
+        }
+    });
+    let options = RefineOptions {
+        input,
+        output: Some(destination.clone()),
+        dry_run: false,
+        salvage: false,
+        recovery: RecoveryOptions {
+            no_cache: true,
+            profile: RecoveryProfile::Fast,
+            memory_limit: 48 * 1024 * 1024,
+            ..RecoveryOptions::default()
+        },
+    };
+    let result = run(&options, &mut Vec::new());
+    writer
+        .join()
+        .map_err(|_| "writer thread panicked")?
+        .map_err(std::io::Error::other)?;
+    assert!(result.is_err(), "changed source was accepted");
+    assert!(!destination.exists(), "changed source was published");
+    Ok(())
+}
+
+#[test]
+fn large_manifest_member_with_wrong_digest_is_never_published() -> Result<(), Box<dyn Error>> {
+    let directory = tempfile::tempdir()?;
+    let input = directory.path().join("input");
+    let destination = directory.path().join("result");
+    fs::create_dir(&input)?;
+    fs::write(input.join("member.bin"), vec![7_u8; 4096])?;
+    fs::write(
+        input.join("manifest.json"),
+        serde_json::to_vec(&serde_json::json!({
+            "schema_version": 1, "artifacts": [{"file": "member.bin", "byte_length": 4096, "sha256": "0".repeat(64)}]
+        }))?,
+    )?;
+    let options = RefineOptions {
+        input,
+        output: Some(destination.clone()),
+        dry_run: false,
+        salvage: false,
+        recovery: RecoveryOptions {
+            no_cache: true,
+            memory_limit: 4096,
+            ..RecoveryOptions::default()
+        },
+    };
+    let error = run(&options, &mut Vec::new())
+        .err()
+        .ok_or("wrong digest was accepted")?;
+    assert!(error.to_string().contains("hash does not match"), "{error}");
+    assert!(!destination.exists(), "failed analysis published a result");
+    Ok(())
+}
+
 #[test]
 fn large_sparse_input_carves_validated_cross_window_ranges_without_a_source_blob()
 -> Result<(), Box<dyn Error>> {

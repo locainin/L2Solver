@@ -76,11 +76,11 @@ pub fn run_with_job(
         job,
     )?;
     ensure_input_unchanged(&input_set, &sampled, &policy, job)?;
-    let identity = output::result_identity(&sources, &options.recovery, &policy)?;
-
-    let cache = if options.dry_run {
+    // A checkpoint cannot use a sample as proof of a range source's identity
+    let cache = if options.dry_run || sources.iter().any(|source| source.digest().is_none()) {
         crate::recovery_job::RecoveryCache::disabled()
     } else {
+        let identity = output::result_identity(&sources, &options.recovery, &policy)?;
         crate::recovery_job::RecoveryCache::open(
             &identity,
             &options.recovery,

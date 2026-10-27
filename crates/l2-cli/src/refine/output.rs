@@ -87,7 +87,14 @@ pub(super) fn result_identity(
 ) -> Result<ResultIdentity, Box<dyn Error>> {
     let input_identities = sources
         .iter()
-        .map(|source| Ok((u64::try_from(source.length())?, source.sha256.as_str())))
+        .map(|source| {
+            Ok((
+                u64::try_from(source.length())?,
+                source.digest().ok_or_else(|| {
+                    invalid_input("source digest is not available before analysis")
+                })?,
+            ))
+        })
         .collect::<Result<Vec<_>, Box<dyn Error>>>()?;
     let source = SourceIdentity::from_sha256(refine_source_identity_sha256(input_identities)?)?;
     result_identity_with_source(source, recovery, policy)

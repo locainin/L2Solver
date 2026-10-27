@@ -58,7 +58,7 @@ pub(super) fn analyze_sources(
         options.limits.max_total_output_bytes =
             options.limits.max_total_output_bytes.min(remaining);
         let report = if source.bytes().is_some() && remaining == 0 {
-            no_case_space(source, policy.case_blob_limit)
+            no_case_space(source, policy.case_blob_limit)?
         } else if source.bytes().is_some() {
             analyze_source_cached(source, options, recovery, cache, job)?
         } else {
@@ -82,16 +82,19 @@ pub(super) fn analyze_sources(
 fn no_case_space(
     source: &LoadedSource,
     maximum: usize,
-) -> l2_workbench::artifact::ArtifactAnalysis {
-    l2_workbench::artifact::ArtifactAnalysis {
-        source_sha256: source.sha256.clone(),
+) -> Result<l2_workbench::artifact::ArtifactAnalysis, Box<dyn Error>> {
+    Ok(l2_workbench::artifact::ArtifactAnalysis {
+        source_sha256: source
+            .digest()
+            .ok_or_else(|| invalid_input("memory source digest is missing"))?
+            .to_owned(),
         source_length: source.length(),
         artifacts: Vec::new(),
         status: AnalysisStatus::Partial,
         omissions: vec![l2_workbench::artifact::AnalysisOmission::CaseBlobLimit { maximum }],
         region_transform_reports: Vec::new(),
         work_bytes: 0,
-    }
+    })
 }
 
 pub(super) struct AnalyzedSources {
@@ -329,13 +332,16 @@ pub(super) fn analyze_source_cached(
     let bytes = source.bytes().ok_or_else(|| {
         invalid_input("file-backed source cannot use the in-memory analysis cache")
     })?;
+    let digest = source
+        .digest()
+        .ok_or_else(|| invalid_input("memory source digest is missing"))?;
     let Some(cache) = cache else {
-        let report = analyze_artifacts_with_source_sha256(bytes, &source.sha256, options)?;
+        let report = analyze_artifacts_with_source_sha256(bytes, digest, options)?;
         record_analysis_work(job, &report)?;
         return Ok(report);
     };
 
-    let identity = SourceIdentity::from_sha256(source.sha256.clone())?;
+    let identity = SourceIdentity::from_sha256(digest.to_owned())?;
     let policy = json!({
         "schema_version": CACHE_ANALYSIS_SCHEMA_VERSION,
         "transform_proposal_format_version": TRANSFORM_PROPOSAL_FORMAT_VERSION,
@@ -389,7 +395,7 @@ pub(super) fn analyze_source_cached(
         }
     };
 
-    let report = analyze_artifacts_with_source_sha256(bytes, &source.sha256, options)?;
+    let report = analyze_artifacts_with_source_sha256(bytes, digest, options)?;
     record_analysis_work(job, &report)?;
     if let Some(lease) = lease
         && let Err(error) = store_cached_analysis(lease, &report)
@@ -533,7 +539,7 @@ fn read_cache_receipt(
             .and_then(serde_json::Value::as_u64)
             != Some(u64::try_from(receipt.analysis.artifacts.len())?)
         || receipt.artifact_lengths.len() != receipt.analysis.artifacts.len()
-        || receipt.analysis.source_sha256 != source.sha256
+        || Some(receipt.analysis.source_sha256.as_str()) != source.digest()
         || receipt.analysis.source_length != source.length()
         || receipt.analysis.artifacts.len() > options.limits.max_artifacts
     {
