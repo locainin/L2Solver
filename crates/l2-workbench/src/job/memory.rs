@@ -4,11 +4,10 @@ use super::Job;
 use std::error::Error;
 use std::fmt;
 use std::sync::{Arc, Condvar, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 // A timed wait lets a job cancellation stop admission without coupling job and budget locks
 const CANCELLATION_POLL: Duration = Duration::from_millis(50);
-const CLASS_COUNT: usize = 5;
 
 /// Class of live allocations represented by a memory lease
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -25,18 +24,6 @@ pub enum MemoryClass {
     Publication,
 }
 
-impl MemoryClass {
-    const fn index(self) -> usize {
-        match self {
-            Self::Base => 0,
-            Self::Case => 1,
-            Self::Executor => 2,
-            Self::Cache => 3,
-            Self::Publication => 4,
-        }
-    }
-}
-
 /// Failure to reserve or inspect a shared live-memory budget
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum MemoryError {
@@ -51,6 +38,15 @@ pub enum MemoryError {
     },
     /// The job was cancelled before admission
     Cancelled,
+    /// Capacity was still unavailable when the caller's deadline arrived
+    TimedOut {
+        /// Selected aggregate byte limit
+        limit: u64,
+        /// Bytes charged to all live leases at the deadline
+        used: u64,
+        /// Bytes requested for the new lease
+        requested: u64,
+    },
     /// Another thread panicked while updating the budget
     StatePoisoned,
 }
@@ -67,6 +63,14 @@ impl fmt::Display for MemoryError {
                 "memory limit {limit} bytes cannot admit {requested} bytes with {used} bytes already charged"
             ),
             Self::Cancelled => formatter.write_str("memory admission was cancelled"),
+            Self::TimedOut {
+                limit,
+                used,
+                requested,
+            } => write!(
+                formatter,
+                "memory admission timed out requesting {requested} bytes with {used} of {limit} bytes charged"
+            ),
             Self::StatePoisoned => formatter.write_str("memory admission state was poisoned"),
         }
     }
@@ -89,14 +93,47 @@ pub struct MemorySnapshot {
     pub rejected: u64,
     /// Number of fresh reservations currently waiting for capacity
     pub waiting: usize,
-    by_class: [u64; CLASS_COUNT],
+    /// Number of fresh reservations that reached their deadline
+    pub timed_out: u64,
+    by_class: ClassCharges,
 }
 
 impl MemorySnapshot {
     /// Return the current live charge for one allocation class
     #[must_use]
     pub const fn used(&self, class: MemoryClass) -> u64 {
-        self.by_class[class.index()]
+        *self.by_class.get(class)
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+struct ClassCharges {
+    base: u64,
+    case: u64,
+    executor: u64,
+    cache: u64,
+    publication: u64,
+}
+
+impl ClassCharges {
+    const fn get(&self, class: MemoryClass) -> &u64 {
+        match class {
+            MemoryClass::Base => &self.base,
+            MemoryClass::Case => &self.case,
+            MemoryClass::Executor => &self.executor,
+            MemoryClass::Cache => &self.cache,
+            MemoryClass::Publication => &self.publication,
+        }
+    }
+
+    const fn get_mut(&mut self, class: MemoryClass) -> &mut u64 {
+        match class {
+            MemoryClass::Base => &mut self.base,
+            MemoryClass::Case => &mut self.case,
+            MemoryClass::Executor => &mut self.executor,
+            MemoryClass::Cache => &mut self.cache,
+            MemoryClass::Publication => &mut self.publication,
+        }
     }
 }
 
@@ -106,7 +143,8 @@ struct State {
     peak: u64,
     rejected: u64,
     waiting: usize,
-    by_class: [u64; CLASS_COUNT],
+    timed_out: u64,
+    by_class: ClassCharges,
 }
 
 #[derive(Debug)]
@@ -137,7 +175,8 @@ impl MemoryBudget {
                     peak: 0,
                     rejected: 0,
                     waiting: 0,
-                    by_class: [0; CLASS_COUNT],
+                    timed_out: 0,
+                    by_class: ClassCharges::default(),
                 }),
                 released: Condvar::new(),
             }),
@@ -162,18 +201,19 @@ impl MemoryBudget {
         })
     }
 
-    /// Wait for a fresh reservation while checking the optional job for cancellation
+    /// Wait for a fresh reservation until a deadline while checking cancellation
     ///
     /// Call only while holding no other leases: waiting while retaining a charge can deadlock
     /// Requests larger than the entire budget fail immediately
     ///
     /// # Errors
-    /// Returns a limit, cancellation, or poisoned-state error
+    /// Returns a limit, cancellation, timeout, or poisoned-state error
     pub fn wait_reserve(
         &self,
         class: MemoryClass,
         bytes: u64,
         job: Option<&Job>,
+        deadline: Instant,
     ) -> Result<MemoryLease, MemoryError> {
         let mut state = self
             .shared
@@ -200,12 +240,21 @@ impl MemoryBudget {
                     bytes,
                 });
             }
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                state.timed_out = state.timed_out.saturating_add(1);
+                return Err(MemoryError::TimedOut {
+                    limit: self.shared.limit,
+                    used: state.used,
+                    requested: bytes,
+                });
+            }
             // The predicate is checked again after wakeups, including spurious ones
             state.waiting += 1;
             state = self
                 .shared
                 .released
-                .wait_timeout(state, CANCELLATION_POLL)
+                .wait_timeout(state, remaining.min(CANCELLATION_POLL))
                 .map_err(|_| MemoryError::StatePoisoned)?
                 .0;
             state.waiting -= 1;
@@ -228,6 +277,7 @@ impl MemoryBudget {
             peak_bytes: state.peak,
             rejected: state.rejected,
             waiting: state.waiting,
+            timed_out: state.timed_out,
             by_class: state.by_class,
         })
     }
@@ -303,13 +353,13 @@ fn charge(
     }
     // Each class is a subset of the aggregate, so neither addition can overflow
     state.used += bytes;
-    state.by_class[class.index()] += bytes;
+    *state.by_class.get_mut(class) += bytes;
     state.peak = state.peak.max(state.used);
     Ok(())
 }
 
-fn release(state: &mut State, class: MemoryClass, bytes: u64) {
+const fn release(state: &mut State, class: MemoryClass, bytes: u64) {
     // A lease releases only bytes it previously charged to this same class
     state.used -= bytes;
-    state.by_class[class.index()] -= bytes;
+    *state.by_class.get_mut(class) -= bytes;
 }
