@@ -118,6 +118,7 @@ pub fn recover_case_with_job(
 
 fn discovery_input_coverage_complete(omissions: &[RecoveryOmission]) -> bool {
     omissions.iter().all(|omission| match omission {
+        RecoveryOmission::RelationalIncrementalMetadata { .. } => false,
         RecoveryOmission::RelationalTransformAnalysis {
             input_coverage_complete,
             ..
@@ -148,7 +149,8 @@ fn search_exhaustive_within_plan(omissions: &[RecoveryOmission]) -> bool {
         RecoveryOmission::TransformDiscoveryAnalysis {
             omitted_candidates, ..
         } => *omitted_candidates == 0,
-        RecoveryOmission::TransformProposalAssociations { .. }
+        RecoveryOmission::RelationalIncrementalMetadata { .. }
+        | RecoveryOmission::TransformProposalAssociations { .. }
         | RecoveryOmission::RelationalTransformAnalysis {
             search_exhaustive_within_plan: false,
             ..
@@ -204,7 +206,8 @@ fn report_details_complete(omissions: &[RecoveryOmission]) -> bool {
             report_details_complete,
             ..
         } => *report_details_complete,
-        RecoveryOmission::FramingDiscoveryReportDetails { .. }
+        RecoveryOmission::RelationalIncrementalMetadata { .. }
+        | RecoveryOmission::FramingDiscoveryReportDetails { .. }
         | RecoveryOmission::RecordDiscoveryReportDetails { .. }
         | RecoveryOmission::ResourceExhausted {
             task:
@@ -300,6 +303,7 @@ fn execute_executor(executor: &mut Executor<'_>) -> Result<(), RecoveryExecution
         // Deferred cohort work can mutate the Case even when the frontier is empty
         executor.check_cancelled()?;
         if evidence_stop.is_some() {
+            executor.report_incremental_metadata_omission()?;
             executor.omit_unsearched_incremental_cohorts()?;
             break;
         }
@@ -325,6 +329,8 @@ fn execute_executor(executor: &mut Executor<'_>) -> Result<(), RecoveryExecution
         if executor.enqueue_deferred_record_discovery()? {
             continue;
         }
+        // Report a disabled extra view only after normal recovery has drained
+        executor.report_incremental_metadata_omission()?;
         // Deep work cannot consume resources needed by normal recovery or its derived artifacts
         if executor.flush_relational_cohorts(RelationalLane::Incremental)? {
             continue;

@@ -49,6 +49,27 @@ struct CandidateSearchResult {
 }
 
 #[test]
+fn bounded_history_report_scopes_completeness_before_new_rule_registration() {
+    let mut history = l2_workbench::protocol::RelationalReplayHistory::new(0);
+    let mut report = serde_json::Map::new();
+    super::search::add_history_search_fields(&mut report, 0, 0, 0, Some(history.is_complete()));
+
+    // A newly published rule may exceed the remaining history after this report is formed
+    assert!(!history.register_published_rule(&expected_session_relative_rule()));
+    assert!(!history.is_complete());
+    assert_eq!(
+        report.get("history_complete_before_publication"),
+        Some(&Value::Bool(true))
+    );
+    assert!(report.get("history_complete").is_none());
+    assert!(report.get("history_recording_omissions").is_none());
+    assert_eq!(
+        report.get("history_search_recording_omissions"),
+        Some(&serde_json::json!(0))
+    );
+}
+
+#[test]
 fn deep_profile_reserves_the_same_normal_admission_before_its_wider_domain() -> TestResult {
     let fixture = build_session_relative_fixture()?;
     let normal = policy_for_profile(&fixture.case, RecoveryProfile::Normal, 64 * 1024 * 1024)?;

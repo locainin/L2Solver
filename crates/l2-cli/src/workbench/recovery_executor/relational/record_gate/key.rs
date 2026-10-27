@@ -248,12 +248,8 @@ fn frame_header_key(frame: &DecodedFrameOutput) -> Result<FrameHeaderKey, Recove
 }
 
 fn try_clone_string(value: &str) -> Result<String, RecoveryExecutionError> {
-    let mut clone = String::new();
-    clone
-        .try_reserve_exact(value.len())
-        .map_err(|source| operational("record gate header key text allocation failed", source))?;
-    clone.push_str(value);
-    Ok(clone)
+    super::super::try_clone_string(value)
+        .map_err(|source| operational("record gate header key text allocation failed", source))
 }
 
 fn try_copy_slice<T: Copy>(values: &[T]) -> Result<Vec<T>, RecoveryExecutionError> {

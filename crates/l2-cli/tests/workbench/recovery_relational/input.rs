@@ -11,6 +11,29 @@ use serde_json::json;
 use std::error::Error;
 
 #[test]
+fn incremental_admission_recognizes_context_wrapped_allocation_failures()
+-> Result<(), Box<dyn Error>> {
+    let allocation = Vec::<u8>::new()
+        .try_reserve(usize::MAX)
+        .err()
+        .ok_or("an impossible reservation unexpectedly succeeded")?;
+    let error = operational("incremental sample allocation failed", allocation);
+
+    assert!(super::incremental_allocation_failed(&error));
+    Ok(())
+}
+
+#[test]
+fn incremental_admission_preserves_other_operational_failures() {
+    let error = operational(
+        "incremental metadata read failed",
+        std::io::Error::other("metadata is unavailable"),
+    );
+
+    assert!(!super::incremental_allocation_failed(&error));
+}
+
+#[test]
 fn known_start_without_observed_end_remains_eligible_for_exact_artifact_checks()
 -> Result<(), Box<dyn Error>> {
     let (case, run, key) = input(true)?;
@@ -56,6 +79,178 @@ fn multiple_runs_in_one_session_are_not_joined_across_a_gap() -> Result<(), Box<
     assert!(selected.incoming.is_empty());
     assert_eq!(selected.omitted_runs, 2);
     Ok(())
+}
+
+#[test]
+fn incremental_metadata_is_bounded_across_cohorts_without_changing_normal_inputs()
+-> Result<(), Box<dyn Error>> {
+    let (mut case, first, _) = input(true)?;
+    let episode = case.add_node("tcp_episode", None, Vec::new(), json!({}))?;
+    let node = case.add_bytes_node("tcp_byte_run", b"x", Vec::new(), json!({}))?;
+    let second = RawRelationalRunInput {
+        node_id: node,
+        episode_node_id: episode,
+        direction_node_id: episode,
+        session_order: 2,
+        stream_offset: 0,
+        start_known: true,
+    };
+    let scan = collect_plan(&case, ProtocolLimits::default())?;
+    let mut normal_case = case.clone();
+    let normal = collect_tiny_cohorts(&mut normal_case, &scan, &first, &second, false)?;
+    let deep = collect_tiny_cohorts(&mut case, &scan, &first, &second, true)?;
+    assert_eq!(deep.normal_samples, normal.normal_samples);
+    assert_eq!(deep.normal_samples.len(), 8);
+    assert!(deep.incremental_metadata_disabled);
+    assert!(deep.incremental_metadata_used <= 128 * 1024);
+    assert_eq!(deep.incremental_cohorts, 0);
+    assert_eq!(deep.metadata_omissions, 1);
+    Ok(())
+}
+
+#[test]
+fn incremental_metadata_charges_retained_samples_when_a_cohort_grows() -> Result<(), Box<dyn Error>>
+{
+    let (mut case, first, _) = input(true)?;
+    let episode = case.add_node("tcp_episode", None, Vec::new(), json!({}))?;
+    let node = case.add_bytes_node("tcp_byte_run", b"x", Vec::new(), json!({}))?;
+    let second = RawRelationalRunInput {
+        node_id: node,
+        episode_node_id: episode,
+        direction_node_id: episode,
+        session_order: 2,
+        stream_offset: 0,
+        start_known: true,
+    };
+    let scan = collect_plan(&case, ProtocolLimits::default())?;
+    let plan = super::super::super::RecoveryPlan::default();
+    let mut policy = super::super::super::normal_policy(&case)?;
+    let mut extra = policy.relational_transform_plan.clone();
+    extra.limits.max_total_bytes = 112 * 1024;
+    policy.relational_incremental_plan = Some(extra);
+    let mut executor =
+        super::super::super::test_support::build_executor(&mut case, &plan, &policy)?;
+    let peer = PeerCohort {
+        endpoints_json: "{}".into(),
+        direction: Direction::FirstToSecond,
+    };
+    let scope = "s".repeat(2048);
+    executor.collect_raw_cohort("source", &scope, &peer, &[&first], &scan)?;
+    assert_eq!(executor.relational_samples.incremental_cohorts.len(), 1);
+    executor.collect_raw_cohort("source", &scope, &peer, &[&second], &scan)?;
+    assert_eq!(
+        executor.relational_samples.incremental_metadata_stop,
+        Some("incremental_metadata_limit")
+    );
+    assert!(executor.relational_samples.incremental_cohorts.is_empty());
+    assert_eq!(
+        executor
+            .relational_samples
+            .cohorts
+            .first()
+            .ok_or("normal cohort is missing")?
+            .active_samples()
+            .count(),
+        2
+    );
+    Ok(())
+}
+
+struct TinyCohortOutcome {
+    normal_samples: Vec<(String, Vec<u64>)>,
+    incremental_metadata_used: usize,
+    incremental_metadata_disabled: bool,
+    incremental_cohorts: usize,
+    metadata_omissions: usize,
+}
+
+fn collect_tiny_cohorts(
+    case: &mut Case,
+    scan: &FramingDiscoveryPlan,
+    first: &RawRelationalRunInput,
+    second: &RawRelationalRunInput,
+    deep: bool,
+) -> Result<TinyCohortOutcome, Box<dyn Error>> {
+    let plan = super::super::super::RecoveryPlan::default();
+    let mut policy = super::super::super::normal_policy(case)?;
+    if deep {
+        let mut extra = policy.relational_transform_plan.clone();
+        extra.limits.max_total_bytes = 128 * 1024;
+        policy.relational_incremental_plan = Some(extra);
+    }
+    let mut executor = super::super::super::test_support::build_executor(case, &plan, &policy)?;
+    let peer = PeerCohort {
+        endpoints_json: "{}".into(),
+        direction: Direction::FirstToSecond,
+    };
+    for index in 0..8 {
+        let scope = format!("{}-{index}", "s".repeat(1024));
+        executor.collect_raw_cohort("source", &scope, &peer, &[first, second], scan)?;
+    }
+    executor.report_incremental_metadata_omission()?;
+    if executor
+        .relational_samples
+        .incremental_metadata_stop
+        .is_some()
+    {
+        assert!(
+            executor
+                .omissions
+                .iter()
+                .any(|omission| { omission.to_string().contains("for this Case") })
+        );
+        assert!(!super::super::super::discovery_input_coverage_complete(
+            &executor.omissions
+        ));
+        assert!(!super::super::super::search_exhaustive_within_plan(
+            &executor.omissions
+        ));
+        assert!(!super::super::super::report_details_complete(
+            &executor.omissions
+        ));
+    }
+    let normal_samples = executor
+        .relational_samples
+        .cohorts
+        .iter()
+        .map(|cohort| {
+            let scope = cohort
+                .key
+                .as_ref()
+                .map(|key| key.scope_json.clone())
+                .unwrap_or_default();
+            (
+                scope,
+                cohort
+                    .active_samples()
+                    .map(|sample| sample.node_id)
+                    .collect(),
+            )
+        })
+        .collect();
+    let metadata_omissions = executor
+        .omissions
+        .iter()
+        .filter(|omission| {
+            matches!(
+                omission,
+                super::super::RecoveryOmission::RelationalIncrementalMetadata {
+                    reason: "incremental_metadata_limit",
+                    ..
+                }
+            )
+        })
+        .count();
+    Ok(TinyCohortOutcome {
+        normal_samples,
+        incremental_metadata_used: executor.relational_samples.incremental_metadata_used,
+        incremental_metadata_disabled: executor
+            .relational_samples
+            .incremental_metadata_stop
+            .is_some(),
+        incremental_cohorts: executor.relational_samples.incremental_cohorts.len(),
+        metadata_omissions,
+    })
 }
 
 #[test]

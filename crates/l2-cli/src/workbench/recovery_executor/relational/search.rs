@@ -74,7 +74,12 @@ pub(super) fn prepare_contexts(
         if let Some(job) = job {
             job.check_cancelled()?;
         }
-        let history = if executor.policy.relational_incremental_plan.is_some() {
+        let history = if executor.policy.relational_incremental_plan.is_some()
+            && executor
+                .relational_samples
+                .incremental_metadata_stop
+                .is_none()
+        {
             let limits = executor.policy.relational_transform_plan.limits;
             histories.for_context(&context, limits.max_cohorts, limits.max_total_bytes)
         } else {
@@ -495,21 +500,12 @@ fn finish_evaluation(
         let fields = report_value
             .as_object_mut()
             .ok_or_else(|| invalid_policy("relational report is not an object"))?;
-        fields.insert(
-            "history_reused_rejections".to_owned(),
-            serde_json::json!(history_reused_rejections),
-        );
-        fields.insert(
-            "history_reused_published".to_owned(),
-            serde_json::json!(history_reused_published),
-        );
-        fields.insert(
-            "history_recording_omissions".to_owned(),
-            serde_json::json!(history_recording_omissions),
-        );
-        fields.insert(
-            "history_complete".to_owned(),
-            serde_json::json!(history_complete),
+        add_history_search_fields(
+            fields,
+            history_reused_rejections,
+            history_reused_published,
+            history_recording_omissions,
+            history_complete,
         );
     }
     Ok(CohortSearchResult {
@@ -525,6 +521,31 @@ fn finish_evaluation(
         accepted_schemas: applications.accepted_schemas,
         published_rules,
     })
+}
+
+pub(super) fn add_history_search_fields(
+    fields: &mut serde_json::Map<String, Value>,
+    reused_rejections: usize,
+    reused_published: usize,
+    recording_omissions: usize,
+    complete_before_publication: Option<bool>,
+) {
+    fields.insert(
+        "history_reused_rejections".to_owned(),
+        serde_json::json!(reused_rejections),
+    );
+    fields.insert(
+        "history_reused_published".to_owned(),
+        serde_json::json!(reused_published),
+    );
+    fields.insert(
+        "history_search_recording_omissions".to_owned(),
+        serde_json::json!(recording_omissions),
+    );
+    fields.insert(
+        "history_complete_before_publication".to_owned(),
+        serde_json::json!(complete_before_publication),
+    );
 }
 
 fn fully_published_rules(

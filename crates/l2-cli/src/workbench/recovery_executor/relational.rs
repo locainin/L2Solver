@@ -142,7 +142,7 @@ fn history_input_matches(
 struct SampleCohort {
     key: Option<RelationalCohortKey>,
     samples: Vec<StoredSample>,
-    incomplete_sessions: BTreeSet<u64>,
+    incomplete_sessions: HashSet<u64>,
     omitted_sample_ids: HashSet<u64>,
     scheduled_sample_count: usize,
     completed_sample_count: usize,
@@ -168,10 +168,17 @@ impl SampleCohort {
             .filter(|sample| !self.incomplete_sessions.contains(&sample.context.session))
     }
 
-    fn active_session_ids(&self) -> BTreeSet<u64> {
-        self.active_samples()
-            .map(|sample| sample.context.session)
-            .collect()
+    fn active_session_ids(&self) -> Result<HashSet<u64>, RecoveryExecutionError> {
+        let mut sessions = HashSet::new();
+        for sample in self.active_samples() {
+            if !sessions.contains(&sample.context.session) {
+                sessions.try_reserve(1).map_err(|source| {
+                    operational("relational session index allocation failed", source)
+                })?;
+                sessions.insert(sample.context.session);
+            }
+        }
+        Ok(sessions)
     }
 }
 
@@ -180,6 +187,9 @@ pub(super) struct RelationalSampleCollections {
     cohorts: Vec<SampleCohort>,
     incremental_cohorts: Vec<SampleCohort>,
     histories: history::RelationalReplayHistories,
+    incremental_metadata_used: usize,
+    incremental_metadata_stop: Option<&'static str>,
+    incremental_metadata_reported: bool,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -306,6 +316,31 @@ struct CommittedRelationalOutputs {
 }
 
 impl Executor<'_> {
+    pub(super) fn report_incremental_metadata_omission(
+        &mut self,
+    ) -> Result<(), RecoveryExecutionError> {
+        let Some(reason) = self.relational_samples.incremental_metadata_stop else {
+            return Ok(());
+        };
+        if self.relational_samples.incremental_metadata_reported {
+            return Ok(());
+        }
+        let limit = self
+            .policy
+            .relational_incremental_plan
+            .as_ref()
+            .ok_or(RecoveryError::InvariantFailure)?
+            .limits
+            .max_total_bytes;
+        self.omissions.try_reserve(1).map_err(|source| {
+            operational("relational metadata omission allocation failed", source)
+        })?;
+        self.omissions
+            .push(RecoveryOmission::RelationalIncrementalMetadata { limit, reason });
+        self.relational_samples.incremental_metadata_reported = true;
+        Ok(())
+    }
+
     pub(super) fn omit_unsearched_incremental_cohorts(
         &mut self,
     ) -> Result<(), RecoveryExecutionError> {
@@ -326,7 +361,7 @@ impl Executor<'_> {
                 .ok_or(RecoveryError::InvariantFailure)?
                 .source_id
                 .clone();
-            let sessions_available = cohort.active_session_ids().len();
+            let sessions_available = cohort.active_session_ids()?.len();
             self.omissions
                 .push(RecoveryOmission::RelationalTransformAnalysis {
                     source_id,
@@ -367,7 +402,9 @@ impl Executor<'_> {
             .map_err(|source| operational("relational omission allocation failed", source))?;
         self.omissions
             .push(RecoveryOmission::RelationalTransformAnalysis {
-                source_id: source_id.to_owned(),
+                source_id: try_clone_string(source_id).map_err(|source| {
+                    operational("relational omission source allocation failed", source)
+                })?,
                 sessions_available: 0,
                 omitted_sessions,
                 omitted_samples,
@@ -673,10 +710,22 @@ fn admit_sample_views(
     normal_limits: l2_workbench::protocol::RelationalTransformLimits,
 ) -> Result<(), RecoveryExecutionError> {
     if let Some(normal) = normal {
-        append_framed_samples(case, normal, incoming, normal_limits)?;
+        append_framed_samples(
+            case,
+            normal,
+            incoming,
+            normal_limits,
+            RelationalLane::Normal,
+        )?;
     }
     if let Some((incremental, limits)) = incremental {
-        append_framed_samples(case, incremental, incoming, limits)?;
+        append_framed_samples(
+            case,
+            incremental,
+            incoming,
+            limits,
+            RelationalLane::Incremental,
+        )?;
     }
     Ok(())
 }
@@ -686,6 +735,7 @@ fn append_framed_samples(
     cohort: &mut SampleCohort,
     incoming: &[StoredSample],
     limits: l2_workbench::protocol::RelationalTransformLimits,
+    lane: RelationalLane,
 ) -> Result<(), RecoveryExecutionError> {
     let mut existing_ids = HashSet::new();
     existing_ids
@@ -693,7 +743,12 @@ fn append_framed_samples(
             cohort
                 .samples
                 .len()
-                .saturating_add(cohort.omitted_sample_ids.len()),
+                .saturating_add(cohort.omitted_sample_ids.len())
+                .saturating_add(if matches!(lane, RelationalLane::Incremental) {
+                    incoming.len()
+                } else {
+                    0
+                }),
         )
         .map_err(|source| operational("relational sample index allocation failed", source))?;
     existing_ids.extend(cohort.samples.iter().map(|sample| sample.node_id));
@@ -717,7 +772,14 @@ fn append_framed_samples(
         let session_samples = incoming
             .get(cursor..end)
             .ok_or(RecoveryError::InvariantFailure)?;
-        append_framed_session(case, cohort, session_samples, &mut existing_ids, limits)?;
+        append_framed_session(
+            case,
+            cohort,
+            session_samples,
+            &mut existing_ids,
+            limits,
+            lane,
+        )?;
         cursor = end;
     }
     Ok(())
@@ -729,6 +791,7 @@ fn append_framed_session(
     incoming: &[StoredSample],
     existing_ids: &mut HashSet<u64>,
     limits: l2_workbench::protocol::RelationalTransformLimits,
+    lane: RelationalLane,
 ) -> Result<(), RecoveryExecutionError> {
     let session_id = incoming
         .first()
@@ -741,7 +804,15 @@ fn append_framed_session(
         .map_err(|source| operational("relational session sample allocation failed", source))?;
     for sample in incoming {
         if existing_ids.insert(sample.node_id) {
-            new_samples.push(sample.clone());
+            let copied = match lane {
+                RelationalLane::Normal => sample.clone(),
+                RelationalLane::Incremental => {
+                    try_clone_stored_sample(sample).map_err(|source| {
+                        operational("incremental sample allocation failed", source)
+                    })?
+                }
+            };
+            new_samples.push(copied);
         }
     }
     if new_samples.is_empty() {
@@ -760,6 +831,31 @@ fn append_framed_session(
         .map_err(|source| operational("relational cohort sample allocation failed", source))?;
     cohort.samples.extend(new_samples);
     Ok(())
+}
+
+fn try_clone_string(value: &str) -> Result<String, std::collections::TryReserveError> {
+    let mut copy = String::new();
+    copy.try_reserve_exact(value.len())?;
+    copy.push_str(value);
+    Ok(copy)
+}
+
+fn try_clone_stored_sample(
+    sample: &StoredSample,
+) -> Result<StoredSample, std::collections::TryReserveError> {
+    Ok(StoredSample {
+        node_id: sample.node_id,
+        context: MessageContext {
+            source: try_clone_string(&sample.context.source)?,
+            scope: try_clone_string(&sample.context.scope)?,
+            session: sample.context.session,
+            direction: sample.context.direction,
+        },
+        session_order: sample.session_order,
+        direction_node_id: sample.direction_node_id,
+        episode_node_id: sample.episode_node_id,
+        stream_offset: sample.stream_offset,
+    })
 }
 
 fn session_exceeds_limits(
@@ -782,7 +878,7 @@ fn session_exceeds_limits(
     let next_session_bytes = existing_session_bytes
         .checked_add(new_session_bytes)
         .ok_or_else(|| invalid_policy("relational session byte count overflowed"))?;
-    let active_session_ids = cohort.active_session_ids();
+    let active_session_ids = cohort.active_session_ids()?;
     let new_session_count = active_session_ids
         .len()
         .checked_add(usize::from(!active_session_ids.contains(&session_id)))
@@ -819,13 +915,24 @@ fn record_omitted_session(
     new_samples: &[StoredSample],
     existing_session_samples: usize,
 ) -> Result<(), RecoveryExecutionError> {
+    cohort
+        .incomplete_sessions
+        .try_reserve(1)
+        .map_err(|source| operational("relational session omission allocation failed", source))?;
     let first_omission = cohort.incomplete_sessions.insert(session_id);
-    let prior_session_ids = cohort
-        .samples
-        .iter()
-        .filter(|sample| sample.context.session == session_id)
-        .map(|sample| sample.node_id)
-        .collect::<Vec<_>>();
+    let mut prior_session_ids = Vec::new();
+    prior_session_ids
+        .try_reserve_exact(existing_session_samples)
+        .map_err(|source| {
+            operational("relational omitted sample index allocation failed", source)
+        })?;
+    prior_session_ids.extend(
+        cohort
+            .samples
+            .iter()
+            .filter(|sample| sample.context.session == session_id)
+            .map(|sample| sample.node_id),
+    );
     cohort
         .omitted_sample_ids
         .try_reserve(prior_session_ids.len().saturating_add(new_samples.len()))

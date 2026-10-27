@@ -149,6 +149,8 @@ pub enum RecoveryOmission {
         omitted_pair_checks: usize,
         omitted_length_checks: usize,
     },
+    /// Additional relational views for this Case were discarded before wider discovery
+    RelationalIncrementalMetadata { limit: usize, reason: &'static str },
     /// Relational transform work or report details were bounded or lacked eligible sessions
     RelationalTransformAnalysis {
         source_id: String,
@@ -223,6 +225,10 @@ pub enum RecoveryOmission {
 impl fmt::Display for RecoveryOmission {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::RelationalIncrementalMetadata { limit, reason } => write!(
+                formatter,
+                "incremental relational metadata for this Case was omitted ({reason}; budget {limit} bytes)"
+            ),
             Self::FramingDiscoveryInputs { .. }
             | Self::FramingDiscoveryAnalysis { .. }
             | Self::FramingDiscoveryReportDetails { .. }

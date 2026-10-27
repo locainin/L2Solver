@@ -54,6 +54,46 @@ fn all_normal_cohorts_finish_before_incremental_search() -> TestResult {
 }
 
 #[test]
+fn stopped_incremental_metadata_does_not_recreate_history_during_normal_search() -> TestResult {
+    let mut case = Case::new();
+    let (key, samples) = simple_cohort(&mut case, 1)?;
+    let plan = RecoveryPlan::default();
+    let mut policy = normal_policy(&case)?;
+    policy.relational_transform_plan.limits.max_candidates = 4;
+    policy
+        .relational_transform_plan
+        .limits
+        .max_locator_candidates = 16;
+    policy.relational_transform_plan.limits.max_work_bytes = 8_192;
+    policy.relational_incremental_plan = Some(policy.relational_transform_plan.clone());
+    let mut executor = test_support::build_executor(&mut case, &plan, &policy)?;
+    add_cohort_views(&mut executor, key, &samples, &samples);
+    // Metadata exhaustion drops the extra views before normal recovery begins
+    executor.relational_samples.incremental_cohorts.clear();
+    executor.relational_samples.incremental_metadata_stop = Some("incremental_metadata_limit");
+    assert!(executor.flush_relational_cohorts(super::RelationalLane::Normal)?);
+    let context = executor
+        .relational_discoveries
+        .values()
+        .find_map(|contexts| contexts.first())
+        .ok_or("normal discovery was not scheduled")?
+        .clone();
+
+    execute_executor(&mut executor)?;
+
+    assert_eq!(reports(executor.case)?.len(), 1);
+    assert!(
+        executor
+            .relational_samples
+            .histories
+            .published_history(&context, 256 * 1024)
+            .is_none(),
+        "a stopped extra lane must not retain unused replay histories"
+    );
+    Ok(())
+}
+
+#[test]
 fn wider_cohort_keeps_normal_artifacts_and_reports_its_heldout_contradiction() -> TestResult {
     let AdversarialFixture {
         mut case,
@@ -125,9 +165,10 @@ fn incremental_search_reuses_rules_only_after_their_outputs_are_published() -> T
         "the incremental lane should reuse at least one committed exact rule"
     );
     assert_eq!(
-        incremental.get("history_complete"),
+        incremental.get("history_complete_before_publication"),
         Some(&Value::Bool(true))
     );
+    assert!(incremental.get("history_complete").is_none());
     Ok(())
 }
 
