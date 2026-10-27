@@ -6,10 +6,13 @@ use crate::{
     input, workbench,
 };
 use l2_workbench::{
-    evidence::{Case, MAX_CASE_JSON_BYTES},
+    evidence::{Case, EvidenceError, MAX_CASE_JSON_BYTES},
     job::{
         CacheFallbackKind, CacheStage, Counter, Job, PhaseState,
-        cache::{Cache, CacheEntry, CacheReadPolicy, Lease, SourceIdentity, StageKey, StageStatus},
+        cache::{
+            Cache, CacheEntry, CacheError, CacheReadPolicy, Lease, SourceIdentity, StageKey,
+            StageStatus,
+        },
     },
     recovery::proposals::TRANSFORM_PROPOSAL_FORMAT_VERSION,
 };
@@ -140,11 +143,14 @@ pub(super) fn recover(
         match store_result(lease, case, &result) {
             Err(error) if context.options.strict_cache => return Err(error),
             Ok(()) => {}
-            Err(_) => note_cache_fallback(
-                context.job,
-                CacheFallbackKind::CommitFailed,
-                format_args!("recovery cache write failed"),
-            )?,
+            Err(error) => {
+                let kind = cache_commit_fallback_kind(error.as_ref());
+                note_cache_fallback(
+                    context.job,
+                    kind,
+                    format_args!("{}", cache_commit_fallback_detail(kind)),
+                )?;
+            }
         }
     }
     Ok(result)
@@ -159,6 +165,42 @@ fn note_cache_fallback(
         job.record_cache_fallback(CacheStage::CaseRecovery, kind, detail)?;
     }
     Ok(())
+}
+
+fn cache_commit_fallback_kind(error: &(dyn Error + 'static)) -> CacheFallbackKind {
+    if let Some(failure) = error.downcast_ref::<LimitedWriterFailure>() {
+        return match failure {
+            LimitedWriterFailure::CaseJsonTooLarge => CacheFallbackKind::CommitCaseTooLarge,
+            LimitedWriterFailure::StorageIo(_) => CacheFallbackKind::CommitStorageIo,
+        };
+    }
+    if let Some(cache_error) = error.downcast_ref::<CacheError>() {
+        return match cache_error {
+            CacheError::MetadataTooLarge { .. } => CacheFallbackKind::CommitMetadataTooLarge,
+            CacheError::QuotaExceeded { .. } => CacheFallbackKind::CommitQuotaExceeded,
+            CacheError::Io(_) => CacheFallbackKind::CommitStorageIo,
+            _ => CacheFallbackKind::CommitFailed,
+        };
+    }
+    if error.downcast_ref::<io::Error>().is_some()
+        || matches!(
+            error.downcast_ref::<EvidenceError>(),
+            Some(EvidenceError::WriteFailed)
+        )
+    {
+        return CacheFallbackKind::CommitStorageIo;
+    }
+    CacheFallbackKind::CommitFailed
+}
+
+const fn cache_commit_fallback_detail(kind: CacheFallbackKind) -> &'static str {
+    match kind {
+        CacheFallbackKind::CommitCaseTooLarge => "Case JSON exceeds the recovery-cache limit",
+        CacheFallbackKind::CommitMetadataTooLarge => "recovery cache metadata exceeds its limit",
+        CacheFallbackKind::CommitQuotaExceeded => "recovery cache quota exceeded",
+        CacheFallbackKind::CommitStorageIo => "recovery cache storage I/O failed",
+        _ => "recovery cache write failed",
+    }
 }
 
 fn recovery_key(
@@ -277,8 +319,13 @@ fn write_case(lease: &Lease, case: &Case) -> Result<()> {
     let mut writer = LimitedWriter {
         inner: BufWriter::new(file),
         remaining: MAX_CASE_JSON_BYTES,
+        failure: None,
     };
-    case.write_json(&mut writer)?;
+    let result = case.write_json(&mut writer);
+    if let Some(failure) = writer.failure {
+        return Err(Box::new(failure));
+    }
+    result?;
     writer.flush()?;
     writer
         .inner
@@ -291,7 +338,27 @@ fn write_case(lease: &Lease, case: &Case) -> Result<()> {
 struct LimitedWriter<W> {
     inner: W,
     remaining: usize,
+    failure: Option<LimitedWriterFailure>,
 }
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum LimitedWriterFailure {
+    CaseJsonTooLarge,
+    StorageIo(io::ErrorKind),
+}
+
+impl fmt::Display for LimitedWriterFailure {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::CaseJsonTooLarge => {
+                formatter.write_str("Case JSON exceeds the recovery-cache limit")
+            }
+            Self::StorageIo(kind) => write!(formatter, "Case JSON write failed ({kind})"),
+        }
+    }
+}
+
+impl Error for LimitedWriterFailure {}
 
 impl<W: Write> Write for LimitedWriter<W> {
     fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
@@ -299,13 +366,22 @@ impl<W: Write> Write for LimitedWriter<W> {
             return Ok(0);
         }
         if self.remaining == 0 {
+            self.failure = Some(LimitedWriterFailure::CaseJsonTooLarge);
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 "case JSON exceeds the evidence size limit",
             ));
         }
         let length = bytes.len().min(self.remaining);
-        let written = self.inner.write(bytes.split_at(length).0)?;
+        let written = match self.inner.write(bytes.split_at(length).0) {
+            Ok(written) => written,
+            Err(error) => {
+                if error.kind() != io::ErrorKind::Interrupted {
+                    self.failure = Some(LimitedWriterFailure::StorageIo(error.kind()));
+                }
+                return Err(error);
+            }
+        };
         self.remaining -= written;
         Ok(written)
     }

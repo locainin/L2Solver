@@ -1,7 +1,14 @@
 use crate::job::{JobSnapshot, cache::key::StageKey};
 
 /// Version of the serialized [`JobSnapshot`] checkpoint representation
-pub const JOB_SNAPSHOT_VERSION: u32 = 1;
+///
+/// Version 2 adds typed cache-commit fallback categories while keeping the version 1 shape readable
+pub const JOB_SNAPSHOT_VERSION: u32 = 2;
+pub(super) const COMPATIBLE_JOB_SNAPSHOT_VERSION: u32 = 1;
+
+pub(super) const fn supports_job_snapshot_version(version: u32) -> bool {
+    version == JOB_SNAPSHOT_VERSION || version == COMPATIBLE_JOB_SNAPSHOT_VERSION
+}
 
 /// Whether a cached stage contains its complete result or only resumable work
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

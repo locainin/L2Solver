@@ -42,6 +42,52 @@ fn cache_fallbacks_group_by_stage_and_kind_and_choose_a_stable_sample() -> TestR
 }
 
 #[test]
+fn cache_commit_failure_causes_keep_separate_counts_and_safe_samples() -> TestResult {
+    let job = Job::new("typed cache commit failures");
+    let categories = [
+        (
+            CacheFallbackKind::CommitCaseTooLarge,
+            "Case JSON exceeds the recovery-cache limit",
+        ),
+        (
+            CacheFallbackKind::CommitMetadataTooLarge,
+            "cache metadata exceeds its limit",
+        ),
+        (
+            CacheFallbackKind::CommitQuotaExceeded,
+            "cache quota exceeded",
+        ),
+        (
+            CacheFallbackKind::CommitStorageIo,
+            "cache storage I/O failed",
+        ),
+        (CacheFallbackKind::CommitFailed, "cache commit failed"),
+    ];
+
+    for (kind, detail) in categories {
+        job.record_cache_fallback(CacheStage::CaseRecovery, kind, format_args!("{detail}"))?;
+    }
+
+    let snapshot = job.snapshot()?;
+    assert_eq!(snapshot.cache_fallbacks.records().len(), categories.len());
+    for (kind, detail) in categories {
+        let record = snapshot
+            .cache_fallbacks
+            .records()
+            .iter()
+            .find(|record| record.stage() == CacheStage::CaseRecovery && record.kind() == kind)
+            .ok_or_else(|| io::Error::other("typed cache commit category is missing"))?;
+        assert_eq!(record.count(), 1);
+        assert_eq!(record.sample_detail(), Some(detail));
+    }
+
+    let serialized = serde_json::to_string(&snapshot)?;
+    let restored: JobSnapshot = serde_json::from_str(&serialized)?;
+    assert_eq!(restored, snapshot);
+    Ok(())
+}
+
+#[test]
 fn cache_fallback_samples_are_escaped_and_bounded_while_formatting() -> TestResult {
     let job = Job::new("bounded cache fallback detail");
     let detail = "long cache diagnostic ".repeat(32);
@@ -261,6 +307,10 @@ fn cache_fallback_categories() -> Vec<serde_json::Value> {
         CacheFallbackKind::LookupFailed,
         CacheFallbackKind::LeaseUnavailable,
         CacheFallbackKind::CommitFailed,
+        CacheFallbackKind::CommitCaseTooLarge,
+        CacheFallbackKind::CommitMetadataTooLarge,
+        CacheFallbackKind::CommitQuotaExceeded,
+        CacheFallbackKind::CommitStorageIo,
         CacheFallbackKind::CacheUnavailable,
         CacheFallbackKind::ContentionFallback,
     ];

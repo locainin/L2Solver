@@ -58,6 +58,14 @@ pub enum CacheFallbackKind {
     LeaseUnavailable,
     /// A cache entry could not be committed
     CommitFailed,
+    /// A serialized Case exceeded the persistent recovery-cache size limit
+    CommitCaseTooLarge,
+    /// Cache metadata exceeded its serialized size limit
+    CommitMetadataTooLarge,
+    /// A cache entry could not fit under the configured quota
+    CommitQuotaExceeded,
+    /// The cache filesystem rejected a write
+    CommitStorageIo,
     /// The persistent cache could not be opened
     CacheUnavailable,
     /// Another process held a cache lock beyond the wait bound
@@ -65,11 +73,15 @@ pub enum CacheFallbackKind {
 }
 
 impl CacheFallbackKind {
-    const ALL: [Self; 6] = [
+    const ALL: [Self; 10] = [
         Self::InvalidEntry,
         Self::LookupFailed,
         Self::LeaseUnavailable,
         Self::CommitFailed,
+        Self::CommitCaseTooLarge,
+        Self::CommitMetadataTooLarge,
+        Self::CommitQuotaExceeded,
+        Self::CommitStorageIo,
         Self::CacheUnavailable,
         Self::ContentionFallback,
     ];
@@ -82,6 +94,10 @@ impl CacheFallbackKind {
             Self::LookupFailed => "lookup failed",
             Self::LeaseUnavailable => "write lease unavailable",
             Self::CommitFailed => "write failed",
+            Self::CommitCaseTooLarge => "Case JSON size limit",
+            Self::CommitMetadataTooLarge => "cache metadata size limit",
+            Self::CommitQuotaExceeded => "cache quota exceeded",
+            Self::CommitStorageIo => "cache storage I/O failed",
             Self::CacheUnavailable => "cache unavailable",
             Self::ContentionFallback => "lock contention fallback",
         }

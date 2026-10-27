@@ -8,7 +8,7 @@ use std::{
 };
 
 use l2_workbench::job::{
-    Job,
+    CacheFallbackKind, CacheStage, Job,
     cache::{
         Cache, CacheError, CacheReadPolicy, CheckpointStatus, SourceFingerprint, SourceIdentity,
         StageKey, StageStatus,
@@ -572,6 +572,72 @@ fn checkpoint_snapshot_versions_are_validated_before_restore() -> Result<(), Box
         cache.read_checkpoint(&key),
         Err(CacheError::CorruptCheckpoint)
     ));
+    Ok(())
+}
+
+#[test]
+fn checkpoint_version_two_round_trips_new_fallbacks_and_reads_compatible_version_one()
+-> Result<(), Box<dyn Error>> {
+    let temporary = tempfile::tempdir()?;
+    let cache = cache_at(temporary.path(), 1024)?;
+
+    let current_key = stage_key("version-two-fallbacks")?;
+    let current_job = Job::new("version two fallback checkpoint");
+    current_job.record_cache_fallback(
+        CacheStage::CaseRecovery,
+        CacheFallbackKind::CommitCaseTooLarge,
+        format_args!("Case JSON exceeds the recovery-cache limit"),
+    )?;
+    let current_snapshot = current_job.snapshot()?;
+    cache.write_checkpoint(&current_key, &current_snapshot, CheckpointStatus::Active)?;
+    let current = cache
+        .read_checkpoint(&current_key)?
+        .ok_or_else(|| missing("version-two checkpoint should be available"))?;
+    assert_eq!(current.snapshot_version, 2);
+    assert_eq!(current.snapshot, current_snapshot);
+
+    let legacy_key = stage_key("compatible-version-one")?;
+    let legacy_job = Job::new("compatible version one checkpoint");
+    legacy_job.record_cache_fallback(
+        CacheStage::CaseRecovery,
+        CacheFallbackKind::InvalidEntry,
+        format_args!("cached Case could not be restored"),
+    )?;
+    let legacy_snapshot = legacy_job.snapshot()?;
+    cache.write_checkpoint(&legacy_key, &legacy_snapshot, CheckpointStatus::Active)?;
+    let database =
+        rusqlite::Connection::open(temporary.path().join("state").join("cache.sqlite3"))?;
+    database.execute(
+        "UPDATE checkpoints SET snapshot_version = 1 WHERE key = ?1",
+        [legacy_key.as_str()],
+    )?;
+    drop(database);
+
+    let legacy = cache
+        .read_checkpoint(&legacy_key)?
+        .ok_or_else(|| missing("compatible version-one checkpoint should be available"))?;
+    assert_eq!(legacy.snapshot_version, 1);
+    assert_eq!(legacy.snapshot, legacy_snapshot);
+    Ok(())
+}
+
+#[test]
+fn oversized_cache_metadata_has_a_typed_size_error() -> Result<(), Box<dyn Error>> {
+    let temporary = tempfile::tempdir()?;
+    let cache = cache_at(temporary.path(), 1024)?;
+    let key = stage_key("oversized-metadata")?;
+    let lease = cache.lease(&key)?;
+    let metadata_limit = 4 * 1024 * 1024;
+    let oversized_metadata = Value::String("x".repeat(metadata_limit - 1));
+
+    assert!(matches!(
+        lease.commit(StageStatus::Complete, oversized_metadata),
+        Err(CacheError::MetadataTooLarge {
+            limit_bytes: 4_194_304,
+            actual_bytes: 4_194_305,
+        })
+    ));
+    assert_eq!(cache.stats()?.entries, 0);
     Ok(())
 }
 

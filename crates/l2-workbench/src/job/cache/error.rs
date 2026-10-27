@@ -26,6 +26,13 @@ pub enum CacheError {
     LockBusy,
     /// Cache initialization or quota maintenance stayed busy past its retry window
     CacheBusy,
+    /// A cache entry's serialized metadata exceeded its size limit
+    MetadataTooLarge {
+        /// Maximum serialized metadata size
+        limit_bytes: usize,
+        /// Actual serialized metadata size
+        actual_bytes: usize,
+    },
     /// An input used to build a cache identity is invalid
     InvalidInput(&'static str),
     /// A source changed while its fingerprint or digest was being calculated
@@ -61,6 +68,13 @@ impl fmt::Display for CacheError {
             Self::CacheBusy => {
                 formatter.write_str("cache maintenance stayed busy; retry the operation")
             }
+            Self::MetadataTooLarge {
+                limit_bytes,
+                actual_bytes,
+            } => write!(
+                formatter,
+                "cache metadata has {actual_bytes} bytes; maximum is {limit_bytes} bytes"
+            ),
             Self::InvalidInput(message) => write!(formatter, "invalid cache input: {message}"),
             Self::SourceChanged => formatter.write_str("source changed while it was fingerprinted"),
             Self::SizeOverflow => formatter.write_str("cache size exceeded its supported range"),

@@ -419,7 +419,7 @@ impl Cache {
         row.map(|(status, snapshot_version, snapshot_json)| {
             let snapshot_version =
                 u32::try_from(snapshot_version).map_err(|_| CacheError::CorruptCheckpoint)?;
-            if snapshot_version != super::model::JOB_SNAPSHOT_VERSION {
+            if !super::model::supports_job_snapshot_version(snapshot_version) {
                 return Err(CacheError::CorruptCheckpoint);
             }
             let status =

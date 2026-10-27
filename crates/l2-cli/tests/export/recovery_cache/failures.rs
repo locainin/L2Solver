@@ -1,4 +1,6 @@
 use super::*;
+use l2_workbench::job::cache::CacheError;
+use std::io::{self, Write};
 
 #[test]
 fn held_write_lease_recomputes_without_cache_and_strict_mode_fails() -> Result<(), Box<dyn Error>> {
@@ -117,7 +119,7 @@ fn cache_quota_commit_failure_preserves_recovery_and_is_fatal_in_strict_mode()
         serde_json::to_value(uncached.coverage)?
     );
     assert_eq!(recovered.omissions, uncached.omissions);
-    assert_cache_fallback(&job.snapshot()?, CacheFallbackKind::CommitFailed, 1)?;
+    assert_cache_fallback(&job.snapshot()?, CacheFallbackKind::CommitQuotaExceeded, 1)?;
     assert_eq!(cache.stats()?.entries, 0);
 
     let strict = RecoveryOptions {
@@ -141,6 +143,171 @@ fn cache_quota_commit_failure_preserves_recovery_and_is_fatal_in_strict_mode()
     assert!(error.to_string().contains("cache stage needs at least"));
     assert!(strict_job.snapshot()?.cache_fallbacks.records().is_empty());
     assert_eq!(cache.stats()?.entries, 0);
+    Ok(())
+}
+
+#[test]
+fn case_writer_limit_uses_the_case_size_fallback() {
+    let mut limited_writer = super::super::LimitedWriter {
+        inner: Vec::new(),
+        remaining: 3,
+        failure: None,
+    };
+    assert!(limited_writer.write_all(b"payload").is_err());
+    assert_eq!(
+        limited_writer.failure,
+        Some(super::super::LimitedWriterFailure::CaseJsonTooLarge)
+    );
+    let size_kind = super::super::cache_commit_fallback_kind(
+        &super::super::LimitedWriterFailure::CaseJsonTooLarge,
+    );
+    assert_eq!(size_kind, CacheFallbackKind::CommitCaseTooLarge);
+}
+
+#[test]
+fn limited_writer_retries_interrupted_writes_without_a_fatal_marker() -> Result<(), Box<dyn Error>>
+{
+    struct InterruptedOnceWriter {
+        interrupted: bool,
+        written: Vec<u8>,
+    }
+
+    impl Write for InterruptedOnceWriter {
+        fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+            if !self.interrupted {
+                self.interrupted = true;
+                return Err(io::Error::from(io::ErrorKind::Interrupted));
+            }
+            self.written.extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    let mut limited_writer = super::super::LimitedWriter {
+        inner: InterruptedOnceWriter {
+            interrupted: false,
+            written: Vec::new(),
+        },
+        remaining: 16,
+        failure: None,
+    };
+    limited_writer.write_all(b"payload")?;
+
+    assert_eq!(limited_writer.inner.written, b"payload");
+    assert_eq!(limited_writer.failure, None);
+
+    let (case, _) = case_and_scope(b"4142", 3)?;
+    let expected_json = case.to_json()?;
+    let mut case_writer = super::super::LimitedWriter {
+        inner: InterruptedOnceWriter {
+            interrupted: false,
+            written: Vec::new(),
+        },
+        remaining: usize::MAX,
+        failure: None,
+    };
+    case.write_json(&mut case_writer)?;
+
+    assert_eq!(case_writer.inner.written, expected_json);
+    assert_eq!(case_writer.failure, None);
+    Ok(())
+}
+
+#[test]
+fn case_writer_io_failure_uses_the_storage_fallback() -> Result<(), Box<dyn Error>> {
+    struct FailingWriter;
+
+    impl Write for FailingWriter {
+        fn write(&mut self, _bytes: &[u8]) -> io::Result<usize> {
+            Err(io::Error::other("private/capture-controlled/path"))
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    let mut io_writer = super::super::LimitedWriter {
+        inner: FailingWriter,
+        remaining: 16,
+        failure: None,
+    };
+    assert!(io_writer.write_all(b"x").is_err());
+    assert!(matches!(
+        io_writer.failure,
+        Some(super::super::LimitedWriterFailure::StorageIo(_))
+    ));
+    let io_kind = super::super::cache_commit_fallback_kind(
+        io_writer
+            .failure
+            .as_ref()
+            .ok_or("writer I/O cause was not recorded")?,
+    );
+    assert_eq!(io_kind, CacheFallbackKind::CommitStorageIo);
+    Ok(())
+}
+
+#[test]
+fn cache_commit_errors_map_to_safe_typed_fallbacks() {
+    let quota = CacheError::QuotaExceeded {
+        limit_bytes: 10,
+        required_bytes: 11,
+    };
+    assert_eq!(
+        super::super::cache_commit_fallback_kind(&quota),
+        CacheFallbackKind::CommitQuotaExceeded
+    );
+    let metadata = CacheError::MetadataTooLarge {
+        limit_bytes: 10,
+        actual_bytes: 11,
+    };
+    assert_eq!(
+        super::super::cache_commit_fallback_kind(&metadata),
+        CacheFallbackKind::CommitMetadataTooLarge
+    );
+    let storage = CacheError::Io(io::Error::other("private/capture-controlled/path"));
+    assert_eq!(
+        super::super::cache_commit_fallback_kind(&storage),
+        CacheFallbackKind::CommitStorageIo
+    );
+    let unknown = CacheError::InvalidInput("unknown commit failure");
+    assert_eq!(
+        super::super::cache_commit_fallback_kind(&unknown),
+        CacheFallbackKind::CommitFailed
+    );
+}
+
+#[test]
+fn cache_commit_sample_details_do_not_include_error_text() -> Result<(), Box<dyn Error>> {
+    let job = Job::new("safe cache diagnostics");
+    let error = CacheError::Io(io::Error::other("private/capture-controlled/path"));
+    let kind = super::super::cache_commit_fallback_kind(&error);
+    job.record_cache_fallback(
+        CacheStage::CaseRecovery,
+        kind,
+        format_args!("{}", super::super::cache_commit_fallback_detail(kind)),
+    )?;
+    let snapshot = job.snapshot()?;
+    let fallback = snapshot
+        .cache_fallbacks
+        .records()
+        .first()
+        .ok_or_else(|| io::Error::other("typed storage fallback should be recorded"))?;
+    assert_eq!(fallback.kind(), kind);
+    assert_eq!(
+        fallback.sample_detail(),
+        Some("recovery cache storage I/O failed")
+    );
+    assert!(
+        !fallback
+            .sample_detail()
+            .unwrap_or_default()
+            .contains("private/capture-controlled/path")
+    );
     Ok(())
 }
 

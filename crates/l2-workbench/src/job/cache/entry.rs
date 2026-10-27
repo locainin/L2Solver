@@ -172,9 +172,10 @@ impl Lease {
         self.directory.check_location()?;
         let metadata_json = serde_json::to_string(&metadata)?;
         if metadata_json.len() > MAX_METADATA_BYTES {
-            return Err(CacheError::InvalidInput(
-                "entry metadata exceeds the size limit",
-            ));
+            return Err(CacheError::MetadataTooLarge {
+                limit_bytes: MAX_METADATA_BYTES,
+                actual_bytes: metadata_json.len(),
+            });
         }
         let manifest = Manifest::scan(self.directory.path())?;
         let manifest_json = serde_json::to_string(&manifest)?;
