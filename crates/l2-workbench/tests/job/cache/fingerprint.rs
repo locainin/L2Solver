@@ -25,6 +25,55 @@ fn opened_file_identity_reads_from_start_and_matches_the_source_bytes() -> Resul
     Ok(())
 }
 
+#[test]
+fn opened_file_digest_stops_when_the_cancellation_check_fails() -> Result<(), Box<dyn Error>> {
+    use l2_workbench::job::cache::SourceIdentity;
+    use std::io;
+
+    let temporary = tempfile::tempdir()?;
+    let source = temporary.path().join("source.bin");
+    fs::write(&source, vec![0_u8; 256 * 1024])?;
+    let mut file = fs::File::open(source)?;
+    let mut checks = 0;
+    let error = SourceIdentity::sha256_open_file_with_check(&mut file, || {
+        checks += 1;
+        if checks == 3 {
+            Err(io::Error::other("cancelled during hashing"))
+        } else {
+            Ok(())
+        }
+    })
+    .err()
+    .ok_or("cancelled hashing completed")?;
+    assert!(error.to_string().contains("cancelled during hashing"));
+    assert_eq!(checks, 3);
+    Ok(())
+}
+
+#[test]
+fn opened_file_digest_rejects_growth_after_the_opening_length() -> Result<(), Box<dyn Error>> {
+    use l2_workbench::job::cache::SourceIdentity;
+    use std::io::Write;
+
+    let temporary = tempfile::tempdir()?;
+    let source = temporary.path().join("source.bin");
+    fs::write(&source, vec![0_u8; 128 * 1024])?;
+    let mut file = fs::File::open(&source)?;
+    let mut writer = fs::OpenOptions::new().append(true).open(&source)?;
+    let growth = vec![1_u8; 64 * 1024];
+    let mut checks = 0;
+    let result = SourceIdentity::sha256_open_file_with_check(&mut file, || {
+        checks += 1;
+        if checks >= 2 {
+            writer.write_all(&growth)?;
+        }
+        Ok(())
+    });
+    assert!(result.is_err(), "growing source was accepted");
+    assert!(checks <= 4, "hashing did not stop at the opening length");
+    Ok(())
+}
+
 #[cfg(unix)]
 #[test]
 fn opened_file_identity_rejects_non_regular_and_unreadable_handles() -> Result<(), Box<dyn Error>> {

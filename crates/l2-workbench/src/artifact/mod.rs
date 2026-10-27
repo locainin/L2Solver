@@ -13,6 +13,7 @@ mod pe;
 mod png;
 mod png_pixels;
 mod r2;
+mod range_analyzer;
 mod signatures;
 mod validator;
 pub mod zip;
@@ -60,6 +61,7 @@ pub use png_pixels::{
     PngPixelLimits, decode_png_pixels,
 };
 pub use r2::import_r2_json;
+pub use range_analyzer::analyze_artifacts_from_reader;
 pub use signatures::{
     FILE_SIGNATURE_RELATION_REASON, FileSignatureCatalogue, FileSignatureEvidence,
     FileSignatureMatch, FileSignatureMatchKind, FileSignatureReport, scan_file_signatures,

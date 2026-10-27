@@ -418,9 +418,10 @@ fn format_content_omission(
             omissions,
         } => write!(
             formatter,
-            "embedded discovery on input node {input_node_id} was partial ({} candidates omitted, {} validations omitted, unscanned range: {})",
+            "embedded discovery on input node {input_node_id} was partial ({} candidates omitted, {} validations omitted, {} ZIP entry-count limits, unscanned range: {})",
             omissions.output_candidate_count,
             omissions.unvalidated_candidate_count,
+            omissions.zip_entry_count_limited,
             omissions.unscanned_range.is_some()
         ),
         RecoveryOmission::ArtifactExpansion {

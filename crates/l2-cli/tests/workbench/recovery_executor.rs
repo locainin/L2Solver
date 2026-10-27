@@ -824,6 +824,72 @@ fn embedded_scan_omission_stays_partial() -> Result<(), Box<dyn Error>> {
 }
 
 #[test]
+fn oversized_zip_directory_is_an_omission_not_a_validated_embedded_object()
+-> Result<(), Box<dyn Error>> {
+    let mut bytes = b"PK\x03\x04PK\x05\x06".to_vec();
+    bytes.extend_from_slice(&[0_u8; 4]);
+    bytes.extend_from_slice(&4097_u16.to_le_bytes());
+    bytes.extend_from_slice(&4097_u16.to_le_bytes());
+    bytes.extend_from_slice(&[0_u8; 10]);
+    let mut case = Case::new();
+    let input = source(&mut case, "http_body", &bytes)?;
+    let outcome = execute(&mut case, &RecoveryPlan::default(), &policy())?;
+    assert!(outcome.omissions.iter().any(|omission| matches!(omission,
+        RecoveryOmission::EmbeddedDiscovery { input_node_id, omissions }
+            if *input_node_id == input && omissions.zip_entry_count_limited > 0)));
+    assert!(
+        case.nodes()
+            .iter()
+            .all(|node| node.kind != "embedded_artifact")
+    );
+    let receipt = case
+        .nodes()
+        .iter()
+        .find(|node| node.kind == "embedded_discovery_receipt")
+        .ok_or("missing embedded discovery receipt")?;
+    assert_eq!(
+        receipt
+            .details
+            .get("omitted_candidate_count")
+            .and_then(serde_json::Value::as_u64),
+        Some(1)
+    );
+    assert_eq!(
+        receipt
+            .details
+            .get("rejected_candidate_count")
+            .and_then(serde_json::Value::as_u64),
+        Some(0)
+    );
+    assert_eq!(
+        receipt
+            .details
+            .pointer("/omissions/zip_entry_count_limited")
+            .and_then(serde_json::Value::as_u64),
+        Some(1)
+    );
+    let blob = receipt
+        .blob
+        .as_ref()
+        .and_then(|id| case.blobs().iter().find(|blob| &blob.id == id))
+        .ok_or("missing embedded discovery report")?;
+    let report: serde_json::Value = serde_json::from_slice(&blob.bytes)?;
+    assert_eq!(
+        report
+            .pointer("/candidates/0/validation/reason")
+            .and_then(serde_json::Value::as_str),
+        Some("zip_entry_count_limit")
+    );
+    assert_eq!(
+        report
+            .pointer("/candidates/0/validation/status")
+            .and_then(serde_json::Value::as_str),
+        Some("omitted")
+    );
+    Ok(())
+}
+
+#[test]
 fn false_embedded_signatures_do_not_create_artifacts() -> Result<(), Box<dyn Error>> {
     let false_signatures = [
         b"\x89PNG\r\n\x1a\nnot a PNG chunk".as_slice(),

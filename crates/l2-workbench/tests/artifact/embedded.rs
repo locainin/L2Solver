@@ -9,6 +9,22 @@ use l2_workbench::artifact::{
 use super::{image_support::structural_png, zip_support};
 
 #[test]
+fn oversized_zip_directory_is_omitted_before_any_validation_claim() -> Result<(), Box<dyn Error>> {
+    let source = zip_support::entry_count_limited_zip();
+    let report = artifact::discover_embedded_objects(&source, discovery_limits(source.len()))?;
+    assert_eq!(report.omissions.zip_entry_count_limited, 1);
+    assert_eq!(report.omissions.unvalidated_candidate_count, 1);
+    assert!(report.candidates.iter().any(|candidate| matches!(
+        candidate.validation,
+        Err(EmbeddedValidationFailure::ZipEntryCountLimit {
+            count: 4097,
+            maximum: 4096
+        })
+    )));
+    Ok(())
+}
+
+#[test]
 fn embedded_zip_ranges() -> Result<(), Box<dyn Error>> {
     let archive =
         zip_support::build_zip(&[zip_support::FixtureEntry::stored(b"sample.bin", b"data")])?;

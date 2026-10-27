@@ -107,6 +107,8 @@ pub fn run_with_job(
             identity: &reuse_identity,
             policy: &policy,
             sources: &sources,
+            input_set: &input_set,
+            sampled: &sampled,
             cache: cache.cache(),
         })
     })();
@@ -183,6 +185,8 @@ struct AnalysisPublishContext<'a, W: Write> {
     identity: &'a crate::result_directory::ResultIdentity,
     policy: &'a RefinePolicy,
     sources: &'a [LoadedSource],
+    input_set: &'a input::InputSet,
+    sampled: &'a input::FingerprintedSources,
     cache: Option<&'a Cache>,
 }
 
@@ -198,10 +202,14 @@ fn analyze_and_publish<W: Write>(
         identity,
         policy,
         sources,
+        input_set,
+        sampled,
         cache,
     } = context;
     job.check_cancelled()?;
-    let analyzed = analysis::analyze_sources(sources, policy, &options.recovery, cache, job)?;
+    let analyzed =
+        analysis::analyze_sources(sources, input_set, policy, &options.recovery, cache, job)?;
+    ensure_input_unchanged(input_set, sampled, policy, job)?;
     job.finish(Phase::TransformDiscovery, PhaseOutcome::Completed)?;
     job.finish(Phase::Expansion, PhaseOutcome::Completed)?;
 
@@ -273,6 +281,7 @@ fn ensure_input_unchanged(
         policy.per_file_limit,
         job,
     )?;
+    input::ensure_manifest_unchanged(input_set, job)?;
     if actual.identity != expected.identity || actual.labels != expected.labels {
         return Err(invalid_input("input artifact changed during refinement"));
     }

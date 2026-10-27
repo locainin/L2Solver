@@ -8,6 +8,7 @@ use std::{
 use l2_cli::arguments::{RecoveryOptions, RecoveryProfile, RefineOptions};
 use serde_json::json;
 
+use super::input::SourceData;
 use super::policy::RefinePolicy;
 use super::{
     LoadedSource, analyze_source_cached, analyzer_options, default_output_path, prepare_input_set,
@@ -15,6 +16,7 @@ use super::{
 };
 
 mod early_reuse;
+mod range_analysis;
 
 fn run(options: &RefineOptions, output: &mut impl Write) -> Result<bool, Box<dyn Error>> {
     let job = l2_workbench::job::Job::new("refine test");
@@ -42,7 +44,7 @@ fn manifest_input_uses_only_listed_artifacts_and_ignores_sidecars() -> Result<()
 
     assert_eq!(sources.len(), 1);
     assert_eq!(source.label, "object.bin");
-    assert_eq!(source.bytes, artifact);
+    assert_eq!(source.bytes(), Some(artifact.as_slice()));
     Ok(())
 }
 
@@ -244,7 +246,11 @@ fn refined_png_and_zip_reuse_analyzer_validation_for_names_and_export_provenance
             1024,
             &l2_workbench::job::Job::new("refine output reinput test"),
         )?;
-        assert!(reloaded.iter().any(|source| source.bytes == bytes));
+        assert!(
+            reloaded
+                .iter()
+                .any(|source| source.bytes() == Some(bytes.as_slice()))
+        );
     }
     Ok(())
 }
@@ -336,8 +342,7 @@ fn unsupported_file_is_preserved_and_marked_incomplete() -> Result<(), Box<dyn E
 }
 
 #[test]
-fn per_input_cache_reuses_the_complete_analysis_and_restores_artifact_bytes()
--> Result<(), Box<dyn Error>> {
+fn per_input_cache_ignores_version_3_and_reuses_version_4() -> Result<(), Box<dyn Error>> {
     let directory = tempfile::tempdir()?;
     let cache = l2_workbench::job::cache::Cache::open_at(
         directory.path().join("cache"),
@@ -348,7 +353,7 @@ fn per_input_cache_reuses_the_complete_analysis_and_restores_artifact_bytes()
     let source = LoadedSource {
         label: String::from("source.bin"),
         sha256: l2_workbench::sha256(&bytes),
-        bytes: bytes.clone(),
+        data: SourceData::Memory(bytes.clone()),
     };
     let recovery = RecoveryOptions::default();
     let options = analyzer_options(&recovery, false, 4096, 8192);
@@ -364,7 +369,7 @@ fn per_input_cache_reuses_the_complete_analysis_and_restores_artifact_bytes()
     let previous_key = l2_workbench::job::cache::StageKey::new(
         "file_artifact_analysis",
         1,
-        "l2_artifact_analyzer_v2",
+        "l2_artifact_analyzer_v3",
         &previous_policy,
         &identity,
         &[],
@@ -419,20 +424,35 @@ fn per_input_cache_hit_does_not_repeat_analysis_progress_counters() -> Result<()
         base64::Engine::encode(&base64::engine::general_purpose::STANDARD, &archive).into_bytes();
     let source = loaded_source("source.bin", &bytes);
     let sources = [source];
+    let input_path = directory.path().join("source.bin");
+    fs::write(&input_path, &bytes)?;
+    let input_set = prepare_input_set(&input_path)?;
     let recovery = RecoveryOptions::default();
     let policy = RefinePolicy::new(&recovery, false)?;
 
     let first_job = l2_workbench::job::Job::new("refine cold analysis");
     first_job.start(Phase::Expansion, None)?;
     first_job.start(Phase::TransformDiscovery, Some(1))?;
-    let _first =
-        super::analysis::analyze_sources(&sources, &policy, &recovery, Some(&cache), &first_job)?;
+    let _first = super::analysis::analyze_sources(
+        &sources,
+        &input_set,
+        &policy,
+        &recovery,
+        Some(&cache),
+        &first_job,
+    )?;
 
     let second_job = l2_workbench::job::Job::new("refine cached analysis");
     second_job.start(Phase::Expansion, None)?;
     second_job.start(Phase::TransformDiscovery, Some(1))?;
-    let _second =
-        super::analysis::analyze_sources(&sources, &policy, &recovery, Some(&cache), &second_job)?;
+    let _second = super::analysis::analyze_sources(
+        &sources,
+        &input_set,
+        &policy,
+        &recovery,
+        Some(&cache),
+        &second_job,
+    )?;
     let first = first_job.snapshot()?;
     let second = second_job.snapshot()?;
 
@@ -477,10 +497,10 @@ fn result_identity_uses_ordered_content_hashes_and_analysis_settings() -> Result
     let recovery = RecoveryOptions::default();
     let policy = RefinePolicy::new(&recovery, false)?;
     let identity = result_identity(&sources, &recovery, &policy)?;
-    assert_eq!(identity.algorithm_version, 3);
+    assert_eq!(identity.algorithm_version, 4);
     assert_eq!(
         identity.settings.get("analyzer_algorithm_version"),
-        Some(&json!(3))
+        Some(&json!(4))
     );
     assert_eq!(
         identity.settings.get("analysis_receipt_schema_version"),
@@ -565,8 +585,22 @@ fn matching_result_directory_is_reused_before_artifact_analysis() -> Result<(), 
 }
 
 #[test]
-fn prior_analyzer_identity_is_not_reused_after_validation_receipts_change()
--> Result<(), Box<dyn Error>> {
+fn version_3_analyzer_result_is_not_reused() -> Result<(), Box<dyn Error>> {
+    rejects_prior_result_version(StaleResultVersion::Analyzer)
+}
+
+#[test]
+fn version_3_publication_result_is_not_reused() -> Result<(), Box<dyn Error>> {
+    rejects_prior_result_version(StaleResultVersion::Publication)
+}
+
+#[derive(Clone, Copy)]
+enum StaleResultVersion {
+    Analyzer,
+    Publication,
+}
+
+fn rejects_prior_result_version(version: StaleResultVersion) -> Result<(), Box<dyn Error>> {
     let directory = tempfile::tempdir()?;
     let input = directory.path().join("source.bin");
     let output_dir = directory.path().join("result.refined");
@@ -595,17 +629,23 @@ fn prior_analyzer_identity_is_not_reused_after_validation_receipts_change()
         .get_mut("identity")
         .and_then(serde_json::Value::as_object_mut)
         .ok_or("result identity is missing")?;
-    identity.insert("algorithm_version".to_owned(), json!(2));
-    let settings = identity
-        .get_mut("settings")
-        .and_then(serde_json::Value::as_object_mut)
-        .ok_or("result settings are missing")?;
-    settings.insert("analyzer_algorithm_version".to_owned(), json!(2));
+    match version {
+        StaleResultVersion::Publication => {
+            identity.insert("algorithm_version".to_owned(), json!(3));
+        }
+        StaleResultVersion::Analyzer => {
+            let settings = identity
+                .get_mut("settings")
+                .and_then(serde_json::Value::as_object_mut)
+                .ok_or("result settings are missing")?;
+            settings.insert("analyzer_algorithm_version".to_owned(), json!(3));
+        }
+    }
     fs::write(&manifest_path, serde_json::to_vec(&manifest)?)?;
 
     let error = run(&options, &mut Vec::new())
         .err()
-        .ok_or("analyzer version 2 result was reused for version 3")?;
+        .ok_or("version 3 result was reused under version 4")?;
     assert!(
         error
             .to_string()
@@ -794,7 +834,7 @@ fn structural_zip() -> Result<Vec<u8>, Box<dyn Error>> {
 fn loaded_source(label: &str, bytes: &[u8]) -> LoadedSource {
     LoadedSource {
         label: label.to_owned(),
-        bytes: bytes.to_vec(),
+        data: SourceData::Memory(bytes.to_vec()),
         sha256: l2_workbench::sha256(bytes),
     }
 }

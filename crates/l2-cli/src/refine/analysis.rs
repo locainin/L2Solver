@@ -1,7 +1,7 @@
 //! Bounded artifact analysis, per-input caching, and evidence-case construction
 
 use super::{
-    input::LoadedSource,
+    input::{InputSet, LoadedSource},
     invalid_input,
     output::{ArtifactRecord, SourceRecord},
     policy::RefinePolicy,
@@ -30,12 +30,13 @@ use std::{
     io::{self, Write},
 };
 
-pub(super) const REFINE_ANALYZER_ALGORITHM_VERSION: u32 = 3;
+pub(super) const REFINE_ANALYZER_ALGORITHM_VERSION: u32 = 4;
 pub(super) const CACHE_ANALYSIS_SCHEMA_VERSION: u32 = 1;
 const MAX_CACHE_RECEIPT_BYTES: usize = 8 * 1024 * 1024;
 
 pub(super) fn analyze_sources(
     sources: &[LoadedSource],
+    input_set: &InputSet,
     policy: &RefinePolicy,
     recovery: &RecoveryOptions,
     cache: Option<&Cache>,
@@ -48,7 +49,23 @@ pub(super) fn analyze_sources(
             Phase::TransformDiscovery,
             format!("analyzing {}", source.label.escape_debug()),
         )?;
-        let report = analyze_source_cached(source, policy.analyzer, recovery, cache, job)?;
+        // Every source shares the Case space left by earlier sources
+        let remaining = policy
+            .case_blob_limit
+            .checked_sub(analysis.case.resource_usage().blob_bytes)
+            .ok_or_else(|| invalid_input("case blob usage exceeds its limit"))?;
+        let mut options = policy.analyzer;
+        options.limits.max_total_output_bytes =
+            options.limits.max_total_output_bytes.min(remaining);
+        let report = if source.bytes().is_some() && remaining == 0 {
+            no_case_space(source, policy.case_blob_limit)
+        } else if source.bytes().is_some() {
+            analyze_source_cached(source, options, recovery, cache, job)?
+        } else {
+            let report = source.analyze_ranges(input_set, source_index, options, job)?;
+            record_analysis_work(job, &report)?;
+            report
+        };
         let expanded_members = report
             .artifacts
             .iter()
@@ -60,6 +77,21 @@ pub(super) fn analyze_sources(
         job.advance(Phase::TransformDiscovery, 1)?;
     }
     Ok(analysis)
+}
+
+fn no_case_space(
+    source: &LoadedSource,
+    maximum: usize,
+) -> l2_workbench::artifact::ArtifactAnalysis {
+    l2_workbench::artifact::ArtifactAnalysis {
+        source_sha256: source.sha256.clone(),
+        source_length: source.length(),
+        artifacts: Vec::new(),
+        status: AnalysisStatus::Partial,
+        omissions: vec![l2_workbench::artifact::AnalysisOmission::CaseBlobLimit { maximum }],
+        region_transform_reports: Vec::new(),
+        work_bytes: 0,
+    }
 }
 
 pub(super) struct AnalyzedSources {
@@ -178,6 +210,32 @@ impl AnalyzedSources {
 }
 
 fn analysis_reason(report: &l2_workbench::artifact::ArtifactAnalysis) -> Option<String> {
+    if let Some((max_object_bytes, omitted_candidates, signature_scans_omitted, uncovered_range)) =
+        report.omissions.iter().find_map(|omission| {
+            if let l2_workbench::artifact::AnalysisOmission::SourceRangeCoverage {
+                max_object_bytes,
+                omitted_candidates,
+                signature_scans_omitted,
+                uncovered_range,
+                ..
+            } = omission
+            {
+                Some((
+                    *max_object_bytes,
+                    *omitted_candidates,
+                    *signature_scans_omitted,
+                    *uncovered_range,
+                ))
+            } else {
+                None
+            }
+        })
+    {
+        let uncovered_bytes = uncovered_range.map_or(0, |range| range.length);
+        return Some(format!(
+            "range analysis searches for embedded PNG and ZIP objects; objects up to {max_object_bytes} bytes fit across windows, subject to budgets; {uncovered_bytes} source bytes lacked complete range coverage, {omitted_candidates} candidates and {signature_scans_omitted} signature scans were omitted; whole-source validation, archive expansion, and transforms were not performed"
+        ));
+    }
     match report.status {
         AnalysisStatus::Complete => None,
         AnalysisStatus::Unsupported => Some(String::from(
@@ -268,8 +326,11 @@ pub(super) fn analyze_source_cached(
     cache: Option<&Cache>,
     job: &Job,
 ) -> Result<l2_workbench::artifact::ArtifactAnalysis, Box<dyn Error>> {
+    let bytes = source.bytes().ok_or_else(|| {
+        invalid_input("file-backed source cannot use the in-memory analysis cache")
+    })?;
     let Some(cache) = cache else {
-        let report = analyze_artifacts_with_source_sha256(&source.bytes, &source.sha256, options)?;
+        let report = analyze_artifacts_with_source_sha256(bytes, &source.sha256, options)?;
         record_analysis_work(job, &report)?;
         return Ok(report);
     };
@@ -328,7 +389,7 @@ pub(super) fn analyze_source_cached(
         }
     };
 
-    let report = analyze_artifacts_with_source_sha256(&source.bytes, &source.sha256, options)?;
+    let report = analyze_artifacts_with_source_sha256(bytes, &source.sha256, options)?;
     record_analysis_work(job, &report)?;
     if let Some(lease) = lease
         && let Err(error) = store_cached_analysis(lease, &report)
@@ -473,7 +534,7 @@ fn read_cache_receipt(
             != Some(u64::try_from(receipt.analysis.artifacts.len())?)
         || receipt.artifact_lengths.len() != receipt.analysis.artifacts.len()
         || receipt.analysis.source_sha256 != source.sha256
-        || receipt.analysis.source_length != source.bytes.len()
+        || receipt.analysis.source_length != source.length()
         || receipt.analysis.artifacts.len() > options.limits.max_artifacts
     {
         return Err(invalid_cache_entry(
@@ -549,7 +610,7 @@ fn validate_cached_source_artifact(
             .origins
             .iter()
             .any(|origin| matches!(origin, ArtifactOrigin::Source))
-        && source_artifact.bytes != source.bytes
+        && source.bytes() != Some(source_artifact.bytes.as_slice())
     {
         return Err(invalid_cache_entry(
             "cached source artifact bytes do not match the input",
@@ -565,6 +626,11 @@ fn validate_cached_lineage(
         for origin in &artifact.origins {
             let (parent_index, range) = match origin {
                 ArtifactOrigin::Source => continue,
+                ArtifactOrigin::SourceRange { .. } => {
+                    return Err(invalid_cache_entry(
+                        "cached source-range reports are unsupported",
+                    ));
+                }
                 ArtifactOrigin::EmbeddedObject {
                     parent_index,
                     range,

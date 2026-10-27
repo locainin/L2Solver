@@ -162,13 +162,27 @@ impl SourceIdentity {
     /// # Errors
     /// Returns an error for non-regular, unreadable, or changing files
     pub fn sha256_open_file(file: &mut File) -> Result<Self> {
+        Self::sha256_open_file_with_check(file, || Ok(()))
+    }
+
+    /// Calculate an opened file's digest while checking for cancellation between reads
+    ///
+    /// The caller must enforce path protections and ensure exclusive use of the file cursor.
+    /// The check runs before each bounded read and may stop the operation with an I/O error.
+    ///
+    /// # Errors
+    /// Returns an error for non-regular, unreadable, changing, or cancelled files
+    pub fn sha256_open_file_with_check(
+        file: &mut File,
+        mut check: impl FnMut() -> std::io::Result<()>,
+    ) -> Result<Self> {
         let before = file.metadata()?;
         if !before.is_file() {
             return Err(CacheError::UnsafePath("source is not a regular file"));
         }
         let identity = metadata_identity(&before);
         file.seek(SeekFrom::Start(0))?;
-        let digest = full_digest(&mut *file)?;
+        let digest = full_digest(&mut *file, identity.size_bytes, &mut check)?;
         let after = file.metadata()?;
         if identity != metadata_identity(&after) {
             return Err(CacheError::SourceChanged);
@@ -261,15 +275,31 @@ fn sample_ranges(size_bytes: u64) -> Vec<(u64, u64)> {
     ]
 }
 
-fn full_digest(file: &mut File) -> Result<String> {
+fn full_digest(
+    file: &mut File,
+    length: u64,
+    check: &mut impl FnMut() -> std::io::Result<()>,
+) -> Result<String> {
     let mut hasher = Sha256::new();
     let mut buffer = vec![0_u8; READ_BUFFER_BYTES].into_boxed_slice();
-    loop {
-        let count = file.read(&mut buffer)?;
+    let buffer_capacity = u64::try_from(READ_BUFFER_BYTES).map_err(|_| CacheError::SizeOverflow)?;
+    let mut remaining = length;
+    while remaining > 0 {
+        check()?;
+        let maximum = usize::try_from(remaining.min(buffer_capacity))
+            .map_err(|_| CacheError::SizeOverflow)?;
+        let part = buffer.get_mut(..maximum).ok_or(CacheError::SizeOverflow)?;
+        let count = file.read(part)?;
         if count == 0 {
-            break;
+            return Err(CacheError::SourceChanged);
         }
         hasher.update(buffer.get(..count).ok_or(CacheError::SizeOverflow)?);
+        remaining -= u64::try_from(count).map_err(|_| CacheError::SizeOverflow)?;
+    }
+    check()?;
+    let mut extra = [0_u8; 1];
+    if file.read(&mut extra)? != 0 {
+        return Err(CacheError::SourceChanged);
     }
     Ok(format!("{:x}", hasher.finalize()))
 }

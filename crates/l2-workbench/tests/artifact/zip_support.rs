@@ -3,6 +3,15 @@ use flate2::{Compression, write::DeflateEncoder};
 use std::error::Error;
 use std::io::Write;
 
+pub(super) fn entry_count_limited_zip() -> Vec<u8> {
+    let mut bytes = b"PK\x03\x04PK\x05\x06".to_vec();
+    bytes.extend_from_slice(&[0_u8; 4]);
+    bytes.extend_from_slice(&4097_u16.to_le_bytes());
+    bytes.extend_from_slice(&4097_u16.to_le_bytes());
+    bytes.extend_from_slice(&[0_u8; 10]);
+    bytes
+}
+
 pub(super) struct FixtureEntry<'a> {
     name: &'a [u8],
     uncompressed_size: usize,

@@ -174,6 +174,13 @@ pub struct ValidationSummary {
 pub enum ArtifactOrigin {
     /// The exact input object supplied to the analyzer
     Source,
+    /// A parser-validated range of the source stream, without a retained source blob
+    SourceRange {
+        /// Exact range in the source identified by the containing analysis receipt
+        range: FileRange,
+        /// Format selected by the existing embedded-object validator
+        format: EmbeddedFormat,
+    },
     /// A complete PNG or ZIP carved from the parent object's byte range
     EmbeddedObject {
         /// Parent artifact index whose bytes contain the carved range
@@ -263,6 +270,24 @@ pub enum AnalysisStatus {
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum AnalysisOmission {
+    /// The shared evidence Case has no remaining space for another source object
+    CaseBlobLimit {
+        /// Maximum aggregate bytes retained by the Case
+        maximum: usize,
+    },
+    /// Range analysis excludes whole-source validation, transforms, and larger objects
+    SourceRangeCoverage {
+        /// Largest object guaranteed to fit within overlapping source windows
+        max_object_bytes: usize,
+        /// Candidate observations omitted by configured budgets
+        omitted_candidates: usize,
+        /// ZIP candidates stopped before directory parsing by the entry-count limit
+        zip_entry_count_limited: usize,
+        /// Retained objects whose signature catalogue scan did not fit its budget
+        signature_scans_omitted: usize,
+        /// Source positions without a complete bounded-object discovery window
+        uncovered_range: Option<FileRange>,
+    },
     /// Source bytes exceeded the selected in-memory analysis ceiling
     InputLimit { length: usize, maximum: usize },
     /// The source could not fit in the retained output byte budget
@@ -322,6 +347,8 @@ pub enum AnalysisOmission {
         artifact_index: usize,
         output_candidates: usize,
         unvalidated_candidates: usize,
+        #[serde(default)]
+        zip_entry_count_limited: usize,
         unscanned_range: Option<FileRange>,
     },
     /// The requested salvage mode has no supported partial-repair operation for this input
@@ -633,6 +660,7 @@ fn discover_embedded_objects(
             artifact_index: context.index,
             output_candidates: discovery.omissions.output_candidate_count,
             unvalidated_candidates: discovery.omissions.unvalidated_candidate_count,
+            zip_entry_count_limited: discovery.omissions.zip_entry_count_limited,
             unscanned_range: discovery.omissions.unscanned_range,
         });
     }
@@ -1130,7 +1158,7 @@ fn analysis_status(report: &ArtifactAnalysis) -> AnalysisStatus {
     }
 }
 
-fn validate_limits(limits: AnalyzerLimits) -> Result<(), AnalyzerError> {
+pub(super) fn validate_limits(limits: AnalyzerLimits) -> Result<(), AnalyzerError> {
     for (field, valid) in [
         ("input bytes", limits.max_input_bytes > 0),
         ("artifact count", limits.max_artifacts > 0),
@@ -1459,7 +1487,7 @@ const fn candidate_output_size(
 
 const fn origin_parent(origin: &ArtifactOrigin) -> Option<usize> {
     match origin {
-        ArtifactOrigin::Source => None,
+        ArtifactOrigin::Source | ArtifactOrigin::SourceRange { .. } => None,
         ArtifactOrigin::EmbeddedObject { parent_index, .. }
         | ArtifactOrigin::ArchiveMember { parent_index, .. }
         | ArtifactOrigin::Transformation { parent_index, .. } => Some(*parent_index),

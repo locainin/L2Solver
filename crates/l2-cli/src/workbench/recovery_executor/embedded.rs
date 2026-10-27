@@ -8,7 +8,8 @@ use super::{
 use l2_workbench::{
     artifact::{
         EmbeddedCandidate, EmbeddedDiscoveryOmissions, EmbeddedDiscoveryReport, EmbeddedFormat,
-        EmbeddedValidationEvidence, FileRange, discover_embedded_objects_with_work,
+        EmbeddedValidationEvidence, EmbeddedValidationFailure, FileRange,
+        discover_embedded_objects_with_work,
     },
     evidence::EvidenceStatus,
     recovery::{RecoveryError, RecoveryResult},
@@ -382,6 +383,7 @@ fn embedded_receipt(
     let omissions = json!({
         "output_candidate_count":report.omissions.output_candidate_count,
         "unvalidated_candidate_count":report.omissions.unvalidated_candidate_count,
+        "zip_entry_count_limited":report.omissions.zip_entry_count_limited,
         "unscanned_range":report.omissions.unscanned_range
     });
     let receipt_content = json!({
@@ -403,6 +405,7 @@ fn embedded_receipt(
         .candidates
         .len()
         .checked_sub(validated_count)
+        .and_then(|count| count.checked_sub(report.omissions.unvalidated_candidate_count))
         .ok_or(RecoveryError::InvariantFailure)?;
     let details = json!({
         "representation":"json_blob",
@@ -410,6 +413,7 @@ fn embedded_receipt(
         "candidate_count":report.candidates.len(),
         "validated_candidate_count":validated_count,
         "rejected_candidate_count":rejected_count,
+        "omitted_candidate_count":report.omissions.unvalidated_candidate_count,
         "validation_attempt_count":report.validation_attempt_count,
         "validation_input_bytes":report.validation_input_bytes,
         "zip_work_bytes":report.zip_work_bytes,
@@ -445,6 +449,18 @@ fn embedded_candidate_summary(candidate: &EmbeddedCandidate) -> Value {
             "expanded_work_byte_count":expanded_work_byte_count,
             "omitted_entry_count":omitted_entry_count
         }),
+        Err(EmbeddedValidationFailure::ZipEntryCountLimit { count, maximum }) => json!({
+            "status":"omitted", "reason":"zip_entry_count_limit", "count":count, "maximum":maximum
+        }),
+        Err(EmbeddedValidationFailure::ValidationAttemptsExhausted) => {
+            json!({"status":"omitted","reason":"validation_attempts_exhausted"})
+        }
+        Err(EmbeddedValidationFailure::ValidationWorkExhausted) => {
+            json!({"status":"omitted","reason":"validation_work_exhausted"})
+        }
+        Err(EmbeddedValidationFailure::ScanBudgetExhausted) => {
+            json!({"status":"omitted","reason":"scan_budget_exhausted"})
+        }
         Err(reason) => json!({"status":"rejected","reason":format!("{reason:?}")}),
     };
     json!({

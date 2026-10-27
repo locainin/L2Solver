@@ -259,14 +259,14 @@ fn replaced_manifest_member_symlink_is_rejected_before_reuse() -> TestResult {
 }
 
 #[test]
-fn fingerprint_admission_rejects_oversized_and_missing_inputs() -> TestResult {
+fn fingerprint_admission_bounds_memory_and_accepts_range_backed_inputs() -> TestResult {
     let directory = tempfile::tempdir()?;
     let input_path = directory.path().join("input.bin");
     fs::write(&input_path, b"12345")?;
     let set = input::prepare_input_set(&input_path)?;
     let job = Job::new("input limits");
     assert!(input::fingerprint_sources(&set, 4, 10, &job).is_err());
-    assert!(input::fingerprint_sources(&set, 10, 4, &job).is_err());
+    assert!(input::fingerprint_sources(&set, 10, 4, &job).is_ok());
     fs::remove_file(&input_path)?;
     assert!(input::fingerprint_sources(&set, 10, 10, &job).is_err());
     Ok(())

@@ -8,6 +8,7 @@ mod limits;
 mod png;
 mod png_pixels;
 mod r2;
+mod range_analysis;
 mod rgb_reachability;
 mod signatures;
 mod support;

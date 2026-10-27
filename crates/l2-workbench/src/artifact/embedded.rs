@@ -2,7 +2,10 @@ use core::fmt;
 
 use serde::{Deserialize, Serialize};
 
-use super::zip::{ZipArtifactError, ZipArtifactLimits, inspect_zip_at_depth_with_operation_budget};
+use super::zip::{
+    ZipArtifactError, ZipArtifactLimits, ZipArtifactOmissionReason,
+    inspect_zip_at_depth_with_operation_budget,
+};
 use super::{FileRange, PngError, PngLimits, PngReport, parse_png};
 
 const ZIP_LOCAL_FILE_SIGNATURE: &[u8; 4] = b"PK\x03\x04";
@@ -78,6 +81,13 @@ pub enum EmbeddedValidationFailure {
     ValidationWorkExhausted,
     /// The configured scan budget ended before a usable ZIP boundary was found
     ScanBudgetExhausted,
+    /// ZIP entry count exceeded the limit before the directory could be parsed
+    ZipEntryCountLimit {
+        /// Entry count declared by the archive
+        count: usize,
+        /// Maximum entry count permitted for structural parsing
+        maximum: usize,
+    },
 }
 
 /// Marker candidate with the range considered and its structural result
@@ -100,6 +110,8 @@ pub struct EmbeddedDiscoveryOmissions {
     pub output_candidate_count: usize,
     /// Retained marker candidates without a complete validation attempt
     pub unvalidated_candidate_count: usize,
+    /// ZIP candidates stopped before directory parsing by the entry-count limit
+    pub zip_entry_count_limited: usize,
     /// Input bytes beyond the scan limit
     pub unscanned_range: Option<FileRange>,
 }
@@ -272,9 +284,16 @@ fn validate_markers(
             candidate.validation,
             Err(EmbeddedValidationFailure::ValidationAttemptsExhausted
                 | EmbeddedValidationFailure::ValidationWorkExhausted
-                | EmbeddedValidationFailure::ScanBudgetExhausted)
+                | EmbeddedValidationFailure::ScanBudgetExhausted
+                | EmbeddedValidationFailure::ZipEntryCountLimit { .. })
         ) {
             omissions.unvalidated_candidate_count += 1;
+        }
+        if matches!(
+            candidate.validation,
+            Err(EmbeddedValidationFailure::ZipEntryCountLimit { .. })
+        ) {
+            omissions.zip_entry_count_limited += 1;
         }
         candidates.push(candidate);
     }
@@ -647,6 +666,16 @@ fn inspect_zip_boundary(
     *context.work_remaining -= consumed;
 
     match result {
+        Ok(report)
+            if report.omissions.iter().any(|omission| {
+                matches!(omission.reason, ZipArtifactOmissionReason::EntryCountLimit)
+            }) =>
+        {
+            ZipBoundaryResult::Omitted(EmbeddedValidationFailure::ZipEntryCountLimit {
+                count: report.entry_count,
+                maximum: context.limits.max_entries,
+            })
+        }
         Ok(report) => ZipBoundaryResult::Validated(EmbeddedValidationEvidence::Zip {
             archive_sha256: report.archive_sha256,
             entry_count: report.entry_count,

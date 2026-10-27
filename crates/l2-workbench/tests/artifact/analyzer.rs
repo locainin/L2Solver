@@ -10,6 +10,22 @@ use l2_workbench::artifact::{
 use super::{image_support::structural_png, zip_support};
 
 #[test]
+fn oversized_zip_directory_produces_a_typed_discovery_omission() -> Result<(), Box<dyn Error>> {
+    let source = zip_support::entry_count_limited_zip();
+    let report = analyze_artifacts(&source, ArtifactAnalysisOptions::default())?;
+    assert!(
+        report
+            .artifacts
+            .iter()
+            .all(|artifact| artifact.validation.state != ArtifactValidationState::Validated)
+    );
+    assert!(report.omissions.iter().any(|omission| matches!(omission,
+        l2_workbench::artifact::AnalysisOmission::EmbeddedDiscovery { zip_entry_count_limited, .. }
+            if *zip_entry_count_limited > 0)));
+    Ok(())
+}
+
+#[test]
 fn standalone_png_keeps_the_same_structural_boundary_as_capture_bytes() -> Result<(), Box<dyn Error>>
 {
     let png = structural_png(&[])?;
