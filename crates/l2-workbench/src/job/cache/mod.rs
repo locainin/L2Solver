@@ -3,6 +3,7 @@
 mod database;
 mod entry;
 mod error;
+mod execution;
 mod filesystem;
 mod fingerprint;
 mod key;
@@ -12,6 +13,7 @@ mod model;
 
 pub use entry::{CacheEntry, Lease};
 pub use error::{CacheError, Result};
+pub use execution::{ActiveExecution, ExecutionCheckpointLimits, ExecutionWriter};
 pub use fingerprint::{FileTimestamp, SourceFingerprint, SourceIdentity};
 pub use key::StageKey;
 pub use manager::Cache;

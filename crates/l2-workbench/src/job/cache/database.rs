@@ -1,6 +1,6 @@
 use std::{fs, path::Path, time::Duration};
 
-use rusqlite::{Connection, OpenFlags};
+use rusqlite::{Connection, OpenFlags, TransactionBehavior};
 
 use super::{
     error::{CacheError, Result},
@@ -8,7 +8,7 @@ use super::{
 };
 
 pub(super) const DATABASE_NAME: &str = "cache.sqlite3";
-const SCHEMA_VERSION: u32 = 1;
+const SCHEMA_VERSION: u32 = 2;
 const APPLICATION_ID: i64 = 0x4c32_5343;
 const INITIALIZATION_LOCK: &str = "cache-init.lock";
 
@@ -20,7 +20,7 @@ pub(super) enum Durability {
 
 pub(super) fn initialize(state: &HeldDirectory, locks: &HeldDirectory) -> Result<()> {
     let _lock = locks.lock_with_retry(INITIALIZATION_LOCK, true)?;
-    let connection = open_connection(state, Durability::Checkpoint)?;
+    let mut connection = open_connection(state, Durability::Checkpoint)?;
     // Check ownership and schema before changing another database's journal mode
     let application_id = pragma_i64(&connection, "application_id")?;
     let version = pragma_i64(&connection, "user_version")?;
@@ -30,14 +30,21 @@ pub(super) fn initialize(state: &HeldDirectory, locks: &HeldDirectory) -> Result
             return Err(CacheError::IncompatibleDatabase);
         }
         enable_wal(&connection)?;
-        create_schema(&connection)?;
+        create_schema(&mut connection)?;
         return Ok(());
     }
     if application_id != APPLICATION_ID {
         return Err(CacheError::IncompatibleDatabase);
     }
     let version = u32::try_from(version).map_err(|_| CacheError::IncompatibleDatabase)?;
-    if version != SCHEMA_VERSION {
+    if version == 1 {
+        validate_stage_schema(&connection)?;
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        create_execution_schema(&transaction)?;
+        validate_schema(&transaction)?;
+        transaction.pragma_update(None, "user_version", SCHEMA_VERSION)?;
+        transaction.commit()?;
+    } else if version != SCHEMA_VERSION {
         return Err(CacheError::IncompatibleSchema(version));
     }
     validate_schema(&connection)?;
@@ -78,10 +85,10 @@ fn enable_wal(connection: &Connection) -> Result<()> {
     Ok(())
 }
 
-fn create_schema(connection: &Connection) -> Result<()> {
-    connection.execute_batch(
-        "BEGIN IMMEDIATE;
-         CREATE TABLE entries (
+fn create_schema(connection: &mut Connection) -> Result<()> {
+    let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    transaction.execute_batch(
+        "CREATE TABLE entries (
              key TEXT PRIMARY KEY NOT NULL CHECK(length(key) = 64),
              stage TEXT NOT NULL,
              status INTEGER NOT NULL CHECK(status IN (1, 2)),
@@ -100,14 +107,50 @@ fn create_schema(connection: &Connection) -> Result<()> {
              snapshot_json TEXT NOT NULL,
              updated_ns INTEGER NOT NULL
          );
-         PRAGMA application_id = 1278366531;
-         PRAGMA user_version = 1;
-         COMMIT;",
+         PRAGMA application_id = 1278366531;",
     )?;
-    validate_schema(connection)
+    create_execution_schema(&transaction)?;
+    validate_schema(&transaction)?;
+    transaction.pragma_update(None, "user_version", SCHEMA_VERSION)?;
+    transaction.commit()?;
+    Ok(())
 }
 
 fn validate_schema(connection: &Connection) -> Result<()> {
+    validate_stage_schema(connection)?;
+    if !has_columns(
+        connection,
+        "executions",
+        &["key", "relative_path", "envelope_json", "bytes"],
+    )? || !has_columns(
+        connection,
+        "execution_reservations",
+        &["token", "key", "bytes"],
+    )? {
+        return Err(CacheError::IncompatibleSchema(SCHEMA_VERSION));
+    }
+    Ok(())
+}
+
+fn create_execution_schema(connection: &Connection) -> Result<()> {
+    connection.execute_batch(
+        "CREATE TABLE IF NOT EXISTS executions (
+             key TEXT PRIMARY KEY NOT NULL CHECK(length(key) = 64),
+             relative_path TEXT NOT NULL,
+             envelope_json TEXT NOT NULL,
+             bytes INTEGER NOT NULL CHECK(bytes >= 0)
+         );
+         CREATE TABLE IF NOT EXISTS execution_reservations (
+             token TEXT PRIMARY KEY NOT NULL,
+             key TEXT NOT NULL CHECK(length(key) = 64),
+             bytes INTEGER NOT NULL CHECK(bytes >= 0)
+         );
+         CREATE INDEX IF NOT EXISTS execution_reservations_key ON execution_reservations(key);",
+    )?;
+    Ok(())
+}
+
+fn validate_stage_schema(connection: &Connection) -> Result<()> {
     let required_entries = [
         "key",
         "stage",

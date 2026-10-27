@@ -28,8 +28,8 @@ pub struct CacheEntry {
 
 /// An exclusive work area for one stable stage key
 pub struct Lease {
-    cache: Cache,
-    key: StageKey,
+    pub(super) cache: Cache,
+    pub(super) key: StageKey,
     lock: Option<LockGuard>,
     staging_path: PathBuf,
     cleanup_on_drop: bool,

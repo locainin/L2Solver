@@ -23,6 +23,133 @@ pub(super) struct LockGuard {
 }
 
 impl HeldDirectory {
+    pub(super) fn sync(&self) -> Result<()> {
+        self.check_location()?;
+        self.file.sync_all()?;
+        self.check_location()
+    }
+
+    pub(super) fn create_private_child(&self, prefix: &str) -> Result<(String, Self)> {
+        self.check_location()?;
+        let temporary = tempfile::Builder::new()
+            .prefix(prefix)
+            .make_in(self.path(), |path| {
+                let name = path
+                    .file_name()
+                    .ok_or_else(|| io::Error::other("missing temporary name"))?;
+                #[cfg(unix)]
+                rustix::fs::mkdirat(&self.file, name, rustix::fs::Mode::RWXU)
+                    .map_err(io::Error::from)?;
+                #[cfg(not(unix))]
+                fs::create_dir(path)?;
+                let name = name
+                    .to_str()
+                    .ok_or_else(|| io::Error::other("temporary name is not UTF-8"))?;
+                self.open_child(name).map_err(io::Error::other)
+            })?;
+        let (directory, path) = temporary.into_parts();
+        let path = path.keep().map_err(|error| error.error)?;
+        let name = path
+            .file_name()
+            .and_then(|value| value.to_str())
+            .ok_or(CacheError::InvalidInput(
+                "temporary directory name is invalid",
+            ))?
+            .to_owned();
+        self.check_location()?;
+        Ok((name, directory))
+    }
+
+    pub(super) fn create_new_file(&self, name: &str) -> Result<File> {
+        self.check_location()?;
+        validate_component(name)?;
+        #[cfg(unix)]
+        let file = File::from(
+            rustix::fs::openat(
+                &self.file,
+                name,
+                rustix::fs::OFlags::RDWR
+                    | rustix::fs::OFlags::CREATE
+                    | rustix::fs::OFlags::EXCL
+                    | rustix::fs::OFlags::NOFOLLOW
+                    | rustix::fs::OFlags::CLOEXEC,
+                rustix::fs::Mode::RUSR | rustix::fs::Mode::WUSR,
+            )
+            .map_err(io::Error::from)?,
+        );
+        #[cfg(not(unix))]
+        let file = File::options()
+            .read(true)
+            .write(true)
+            .create_new(true)
+            .open(self.path.join(name))?;
+        self.check_location()?;
+        Ok(file)
+    }
+
+    pub(super) fn open_file(&self, name: &str) -> Result<File> {
+        self.check_location()?;
+        validate_component(name)?;
+        #[cfg(unix)]
+        let file = File::from(
+            rustix::fs::openat(
+                &self.file,
+                name,
+                rustix::fs::OFlags::RDONLY
+                    | rustix::fs::OFlags::NOFOLLOW
+                    | rustix::fs::OFlags::CLOEXEC
+                    | rustix::fs::OFlags::NONBLOCK,
+                rustix::fs::Mode::empty(),
+            )
+            .map_err(io::Error::from)?,
+        );
+        #[cfg(not(unix))]
+        let file = File::open(self.path.join(name))?;
+        let held = file.metadata()?;
+        let named = fs::symlink_metadata(self.path.join(name))?;
+        if !held.is_file()
+            || !named.is_file()
+            || named.file_type().is_symlink()
+            || !same_file(&held, &named)
+        {
+            return Err(CacheError::UnsafePath(
+                "checkpoint component is not a stable regular file",
+            ));
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            if held.nlink() != 1 {
+                return Err(CacheError::UnsafePath(
+                    "checkpoint component has an external link",
+                ));
+            }
+        }
+        self.check_location()?;
+        Ok(file)
+    }
+
+    pub(super) fn rename_child_to(&self, name: &str, target: &Self) -> Result<()> {
+        self.check_location()?;
+        target.check_location()?;
+        validate_component(name)?;
+        #[cfg(target_os = "linux")]
+        rustix::fs::renameat_with(
+            &self.file,
+            name,
+            &target.file,
+            name,
+            rustix::fs::RenameFlags::NOREPLACE,
+        )
+        .map_err(io::Error::from)?;
+        #[cfg(not(target_os = "linux"))]
+        return Err(CacheError::InvalidInput(
+            "execution checkpoints require Linux no-replace rename",
+        ));
+        self.check_location()?;
+        target.check_location()
+    }
+
     pub(super) fn open_root(path: &Path) -> Result<Self> {
         match fs::symlink_metadata(path) {
             Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_dir() => {

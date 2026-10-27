@@ -36,9 +36,9 @@ pub(super) struct CacheInner {
     pub(super) cache_root: HeldDirectory,
     pub(super) state_root: HeldDirectory,
     pub(super) entries: HeldDirectory,
-    staging: HeldDirectory,
+    pub(super) staging: HeldDirectory,
     locks: HeldDirectory,
-    max_bytes: u64,
+    pub(super) max_bytes: u64,
 }
 
 struct EvictionSnapshot {
@@ -96,22 +96,11 @@ impl CacheInner {
         let connection = database::open_connection(&self.state_root, Durability::Recomputable)?;
         connection
             .query_row(
-                "SELECT EXISTS(SELECT 1 FROM checkpoints WHERE key = ?1 AND status = ?2)",
+                "SELECT EXISTS(SELECT 1 FROM checkpoints WHERE key = ?1 AND status = ?2)
+                    OR EXISTS(SELECT 1 FROM executions WHERE key = ?1)",
                 params![key, CheckpointStatus::Active.to_database()],
                 |row| row.get(0),
             )
-            .map_err(Into::into)
-    }
-
-    fn current_relative_path(&self, key: &str) -> Result<Option<String>> {
-        let connection = database::open_connection(&self.state_root, Durability::Recomputable)?;
-        connection
-            .query_row(
-                "SELECT relative_path FROM entries WHERE key = ?1",
-                [key],
-                |row| row.get(0),
-            )
-            .optional()
             .map_err(Into::into)
     }
 
@@ -124,7 +113,7 @@ impl CacheInner {
         manifest_json: &str,
         bytes: i64,
     ) -> Result<Option<String>> {
-        let mut connection = database::open_connection(&self.state_root, Durability::Recomputable)?;
+        let mut connection = database::open_connection(&self.state_root, Durability::Checkpoint)?;
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
         // Publish the directory pointer and receipt together after the stage tree has been renamed
         let old_relative = transaction
@@ -161,6 +150,14 @@ impl CacheInner {
                 now,
             ],
         )?;
+        if status == StageStatus::Complete {
+            // Keep the terminal result and cursor retirement in the same transaction
+            transaction.execute("DELETE FROM executions WHERE key = ?1", [key.as_str()])?;
+            transaction.execute(
+                "UPDATE checkpoints SET status = ?1 WHERE key = ?2",
+                params![CheckpointStatus::Complete.to_database(), key.as_str()],
+            )?;
+        }
         transaction.commit()?;
         Ok(old_relative)
     }
@@ -346,6 +343,10 @@ impl Cache {
         key.validate()?;
         self.inner.check_locations()?;
         let lock = self.inner.lock(key, true)?;
+        {
+            let _quota_lock = self.inner.quota_lock()?;
+            self.clear_stale_execution(key.as_str())?;
+        }
         let staging_key = self.inner.staging.open_child_or_create(key.as_str())?;
         let active_checkpoint = self.inner.active_checkpoint(key.as_str())?;
         // A checkpointed work directory remains available to the next lease
@@ -450,7 +451,9 @@ impl Cache {
         let (entries, bytes, checkpoints): (i64, i64, i64) = connection.query_row(
             "SELECT
                  (SELECT count(*) FROM entries),
-                 (SELECT COALESCE(sum(bytes), 0) FROM entries),
+                 (SELECT COALESCE(sum(bytes), 0) FROM (
+                    SELECT bytes FROM entries UNION ALL SELECT bytes FROM executions
+                    UNION ALL SELECT bytes FROM execution_reservations)),
                  (SELECT count(*) FROM checkpoints)",
             [],
             |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
@@ -520,18 +523,85 @@ impl Cache {
             });
         }
 
-        let plan = self.capacity_plan(key, incoming_bytes)?;
+        let plan = self.capacity_plan(key, incoming_bytes, true)?;
         self.remove_capacity_candidates(&plan)?;
         drop(plan);
         Ok(quota_lock)
     }
 
-    fn capacity_plan(&self, key: &StageKey, incoming_bytes: u64) -> Result<CapacityPlan> {
+    pub(super) fn reserve_execution_capacity(
+        &self,
+        key: &StageKey,
+        token: &str,
+        incoming_bytes: u64,
+    ) -> Result<()> {
+        self.reserve_execution(key, token, incoming_bytes, true)
+    }
+
+    pub(super) fn reserve_execution_spare(
+        &self,
+        key: &StageKey,
+        token: &str,
+        incoming_bytes: u64,
+    ) -> Result<()> {
+        self.reserve_execution(key, token, incoming_bytes, false)
+    }
+
+    fn reserve_execution(
+        &self,
+        key: &StageKey,
+        token: &str,
+        incoming_bytes: u64,
+        evict: bool,
+    ) -> Result<()> {
+        let _quota_lock = self.inner.quota_lock()?;
+        self.inner.check_locations()?;
+        // Speculative reservation credit never causes an unrelated result to be evicted
+        if evict {
+            let plan = self.capacity_plan(key, incoming_bytes, false)?;
+            self.remove_capacity_candidates(&plan)?;
+        } else {
+            let required_bytes = self
+                .eviction_snapshot()?
+                .total_bytes
+                .checked_add(incoming_bytes)
+                .ok_or(CacheError::SizeOverflow)?;
+            if required_bytes > self.inner.max_bytes {
+                return Err(CacheError::QuotaExceeded {
+                    limit_bytes: self.inner.max_bytes,
+                    required_bytes,
+                });
+            }
+        }
+        let connection = database::open_connection(&self.inner.state_root, Durability::Checkpoint)?;
+        let changed = connection.execute(
+            "INSERT INTO execution_reservations (token, key, bytes) VALUES (?1, ?2, ?3)
+             ON CONFLICT(token) DO UPDATE SET bytes = execution_reservations.bytes + excluded.bytes
+             WHERE execution_reservations.key = excluded.key
+                 AND execution_reservations.bytes <= 9223372036854775807 - excluded.bytes",
+            params![
+                token,
+                key.as_str(),
+                i64::try_from(incoming_bytes).map_err(|_| CacheError::SizeOverflow)?
+            ],
+        )?;
+        if changed != 1 {
+            return Err(CacheError::SizeOverflow);
+        }
+        Ok(())
+    }
+
+    fn capacity_plan(
+        &self,
+        key: &StageKey,
+        incoming_bytes: u64,
+        replace_entry: bool,
+    ) -> Result<CapacityPlan> {
         let snapshot = self.eviction_snapshot()?;
         let replaced_bytes = snapshot
             .rows
             .iter()
-            .find(|(candidate, _)| candidate == key.as_str())
+            .find(|(candidate, _)| replace_entry && candidate == key.as_str())
             .map_or(0, |(_, bytes)| *bytes);
         let base_bytes = snapshot
             .total_bytes
@@ -608,7 +678,8 @@ impl Cache {
                 break;
             }
             let active: bool = transaction.query_row(
-                "SELECT EXISTS(SELECT 1 FROM checkpoints WHERE key = ?1 AND status = ?2)",
+                "SELECT EXISTS(SELECT 1 FROM checkpoints WHERE key = ?1 AND status = ?2)
+                    OR EXISTS(SELECT 1 FROM executions WHERE key = ?1)",
                 params![candidate.key, CheckpointStatus::Active.to_database()],
                 |row| row.get(0),
             )?;
@@ -662,6 +733,7 @@ impl Cache {
     fn evict(&self, limit: Option<u64>) -> Result<PruneReport> {
         let _quota_lock = self.inner.quota_lock()?;
         self.inner.check_locations()?;
+        self.cleanup_stale_reservations()?;
         let snapshot = self.eviction_snapshot()?;
         self.cleanup_stale_staging(&snapshot.active_checkpoints)?;
         self.cleanup_orphan_generations()?;
@@ -707,7 +779,8 @@ impl Cache {
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
         // Recheck the durable pin in the same transaction that removes the entry row
         let active: bool = transaction.query_row(
-            "SELECT EXISTS(SELECT 1 FROM checkpoints WHERE key = ?1 AND status = ?2)",
+            "SELECT EXISTS(SELECT 1 FROM checkpoints WHERE key = ?1 AND status = ?2)
+                    OR EXISTS(SELECT 1 FROM executions WHERE key = ?1)",
             params![key, CheckpointStatus::Active.to_database()],
             |row| row.get(0),
         )?;
@@ -756,6 +829,107 @@ impl Cache {
         Ok(())
     }
 
+    fn cleanup_stale_reservations(&self) -> Result<()> {
+        let connection = database::open_connection(&self.inner.state_root, Durability::Checkpoint)?;
+        let mut statement =
+            connection.prepare("SELECT DISTINCT key FROM execution_reservations")?;
+        let keys = statement
+            .query_map([], |row| row.get::<_, String>(0))?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        for key in keys {
+            if !is_sha256_digest(&key) {
+                return Err(CacheError::CorruptDatabase);
+            }
+            let lock = match self
+                .inner
+                .locks
+                .lock(&format!("{key}{KEY_LOCK_SUFFIX}"), true)
+            {
+                Ok(lock) => lock,
+                Err(CacheError::LockBusy) => continue,
+                Err(error) => return Err(error),
+            };
+            self.clear_stale_execution(&key)?;
+            drop(lock);
+        }
+        Ok(())
+    }
+
+    pub(super) fn clear_execution_debris(&self, key: &str) -> Result<()> {
+        let _quota_lock = self.inner.quota_lock()?;
+        self.clear_stale_execution(key)
+    }
+
+    fn clear_stale_execution(&self, key: &str) -> Result<()> {
+        match self.inner.staging.open_child(key) {
+            Ok(directory) => {
+                let mut changed = false;
+                for item in fs::read_dir(directory.path())? {
+                    let item = item?;
+                    let name = item.file_name();
+                    let name = name
+                        .to_str()
+                        .ok_or(CacheError::UnsafePath("staging name is invalid"))?;
+                    if !name.starts_with("active-") {
+                        continue;
+                    }
+                    let metadata = fs::symlink_metadata(item.path())?;
+                    if metadata.file_type().is_symlink() || !metadata.is_dir() {
+                        return Err(CacheError::UnsafePath(
+                            "checkpoint staging directory is unsafe",
+                        ));
+                    }
+                    fs::remove_dir_all(item.path())?;
+                    changed = true;
+                }
+                if changed {
+                    directory.sync()?;
+                }
+            }
+            Err(CacheError::Io(error)) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error),
+        }
+        let connection = database::open_connection(&self.inner.state_root, Durability::Checkpoint)?;
+        let mut statement = connection.prepare(
+            "SELECT relative_path FROM entries WHERE key = ?1 UNION ALL
+             SELECT relative_path FROM executions WHERE key = ?1",
+        )?;
+        let current = statement
+            .query_map([key], |row| row.get::<_, String>(0))?
+            .collect::<rusqlite::Result<HashSet<_>>>()?;
+        for relative in &current {
+            safe_entry_path(self.inner.entries.path(), key, relative)?;
+        }
+        match self.inner.entries.open_child(key) {
+            Ok(directory) => {
+                let mut changed = false;
+                for item in fs::read_dir(directory.path())? {
+                    let item = item?;
+                    let name = item.file_name();
+                    let name = name
+                        .to_str()
+                        .ok_or(CacheError::UnsafePath("generation name is invalid"))?;
+                    if !name.starts_with("active-") || current.contains(&format!("{key}/{name}")) {
+                        continue;
+                    }
+                    let metadata = fs::symlink_metadata(item.path())?;
+                    if metadata.file_type().is_symlink() || !metadata.is_dir() {
+                        return Err(CacheError::UnsafePath("checkpoint generation is unsafe"));
+                    }
+                    fs::remove_dir_all(item.path())?;
+                    changed = true;
+                }
+                if changed {
+                    directory.sync()?;
+                }
+            }
+            Err(CacheError::Io(error)) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error),
+        }
+        connection.execute("DELETE FROM execution_reservations WHERE key = ?1", [key])?;
+        Ok(())
+    }
+
     fn cleanup_stale_staging(&self, active_checkpoints: &HashSet<String>) -> Result<()> {
         for entry in fs::read_dir(self.inner.staging.path())? {
             let entry = entry?;
@@ -769,7 +943,7 @@ impl Cache {
                 .file_name()
                 .into_string()
                 .map_err(|_| CacheError::UnsafePath("staging key is not valid UTF-8"))?;
-            if !is_sha256_digest(&key) || active_checkpoints.contains(&key) {
+            if !is_sha256_digest(&key) {
                 continue;
             }
             let lock = match self
@@ -781,9 +955,10 @@ impl Cache {
                 Err(CacheError::LockBusy) => continue,
                 Err(error) => return Err(error),
             };
+            self.clear_stale_execution(&key)?;
             let staging_key = self.inner.staging.open_child(&key)?;
             // Check again after the exclusive lock closes the checkpoint-write race
-            if self.inner.active_checkpoint(&key)? {
+            if active_checkpoints.contains(&key) || self.inner.active_checkpoint(&key)? {
                 drop(lock);
                 continue;
             }
@@ -817,13 +992,18 @@ impl Cache {
                 Err(CacheError::LockBusy) => continue,
                 Err(error) => return Err(error),
             };
-            let current = self.inner.current_relative_path(&key)?;
-            if let Some(relative) = &current {
+            let connection =
+                database::open_connection(&self.inner.state_root, Durability::Recomputable)?;
+            let mut statement = connection.prepare(
+                "SELECT relative_path FROM entries WHERE key = ?1 UNION ALL
+                 SELECT relative_path FROM executions WHERE key = ?1",
+            )?;
+            let current = statement
+                .query_map([&key], |row| row.get::<_, String>(0))?
+                .collect::<rusqlite::Result<HashSet<_>>>()?;
+            for relative in &current {
                 safe_entry_path(self.inner.entries.path(), &key, relative)?;
             }
-            let current_generation = current
-                .as_deref()
-                .and_then(|relative| relative.strip_prefix(&format!("{key}/")));
             let key_directory = self.inner.entries.open_child(&key)?;
             for generation in fs::read_dir(key_directory.path())? {
                 let generation = generation?;
@@ -833,7 +1013,7 @@ impl Cache {
                     .file_name()
                     .into_string()
                     .map_err(|_| CacheError::UnsafePath("entry generation is not valid UTF-8"))?;
-                if current_generation == Some(name.as_str()) {
+                if current.contains(&format!("{key}/{name}")) {
                     continue;
                 }
                 if metadata.file_type().is_symlink() || !metadata.is_dir() {
@@ -867,7 +1047,18 @@ impl Cache {
                 .ok_or(CacheError::SizeOverflow)?;
             keys.push((key, bytes));
         }
-        let mut statement = connection.prepare("SELECT key FROM checkpoints WHERE status = ?1")?;
+        let mut statement = connection.prepare(
+            "SELECT bytes FROM executions UNION ALL SELECT bytes FROM execution_reservations",
+        )?;
+        let protected_bytes = statement.query_map([], |row| row.get::<_, i64>(0))?;
+        for bytes in protected_bytes {
+            total_bytes = total_bytes
+                .checked_add(nonnegative(bytes?)?)
+                .ok_or(CacheError::SizeOverflow)?;
+        }
+        let mut statement = connection.prepare(
+            "SELECT key FROM checkpoints WHERE status = ?1 UNION SELECT key FROM executions",
+        )?;
         let active_checkpoints = statement
             .query_map([CheckpointStatus::Active.to_database()], |row| row.get(0))?
             .collect::<rusqlite::Result<HashSet<_>>>()?;
@@ -952,7 +1143,11 @@ fn create_staging_directory(directory: &HeldDirectory) -> Result<(PathBuf, Strin
     Ok((path, name))
 }
 
-fn remove_generation(entries: &HeldDirectory, key: &str, relative_path: &str) -> Result<()> {
+pub(super) fn remove_generation(
+    entries: &HeldDirectory,
+    key: &str,
+    relative_path: &str,
+) -> Result<()> {
     let path = safe_entry_path(entries.path(), key, relative_path)?;
     let entry_root = match entries.open_child(key) {
         Ok(root) => root,
@@ -975,7 +1170,7 @@ fn nonnegative(value: i64) -> Result<u64> {
     u64::try_from(value).map_err(|_| CacheError::CorruptDatabase)
 }
 
-fn now_ns() -> i64 {
+pub(super) fn now_ns() -> i64 {
     let elapsed = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
