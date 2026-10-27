@@ -20,14 +20,19 @@ fn case_applies_blob_policy_and_shared_memory_pressure_together() -> TestResult 
     let budget = MemoryBudget::new(100_000);
     assert!(matches!(
         Case::with_blob_limit_and_memory_budget(0, &budget),
-        Err(EvidenceError::InvalidResourceLimit { field: "blob bytes" })
+        Err(EvidenceError::InvalidResourceLimit {
+            field: "blob bytes"
+        })
     ));
     let mut case = Case::with_blob_limit_and_memory_budget(4, &budget)?;
     assert_eq!(case.blob_byte_limit(), Some(4));
     case.add_blob(b"four")?;
     assert!(matches!(
         case.add_blob(b"other"),
-        Err(EvidenceError::QuotaExceeded { field: "blob bytes", .. })
+        Err(EvidenceError::QuotaExceeded {
+            field: "blob bytes",
+            ..
+        })
     ));
     assert!(budget.snapshot()?.used(MemoryClass::Case) >= 4);
     drop(case);
