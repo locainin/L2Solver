@@ -21,6 +21,33 @@ pub(super) struct RecordDiscoveryInputOmissions {
 }
 
 impl RecordDiscoveryInputOmissions {
+    pub(super) fn eligibility_only(&self) -> Self {
+        // Sampling does not change whether a frame has valid source evidence
+        let reason_counts = self
+            .reason_counts
+            .iter()
+            .filter(|(reason, _)| !is_learning_omission(reason))
+            .map(|(reason, count)| (*reason, *count))
+            .collect::<BTreeMap<_, _>>();
+        let total = reason_counts.values().sum();
+        let examples = self
+            .examples
+            .iter()
+            .filter(|example| {
+                example
+                    .get("reason")
+                    .and_then(Value::as_str)
+                    .is_some_and(|reason| !is_learning_omission(reason))
+            })
+            .cloned()
+            .collect();
+        Self {
+            total,
+            reason_counts,
+            examples,
+        }
+    }
+
     fn record(
         &mut self,
         node_id: u64,
@@ -167,6 +194,16 @@ impl OmissionKind {
             }
         }
     }
+}
+
+fn is_learning_omission(reason: &str) -> bool {
+    [
+        OmissionKind::LearningPrefixMessageCountLimit,
+        OmissionKind::LearningPrefixAggregateByteLimit,
+        OmissionKind::LearningPrefixMessageCountAndAggregateByteLimits,
+    ]
+    .into_iter()
+    .any(|kind| kind.name() == reason)
 }
 
 type Omission = (Option<String>, OmissionKind);

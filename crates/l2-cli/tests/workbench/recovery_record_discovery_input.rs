@@ -170,3 +170,37 @@ fn record_collection_skips_registered_derived_frames_and_keeps_native_omissions(
     assert!(!native_examples.contains(&registered_derived));
     Ok(())
 }
+
+#[test]
+fn eligibility_omissions_exclude_learning_limits_but_keep_real_input_failures()
+-> Result<(), Box<dyn Error>> {
+    use super::RecordDiscoveryInputOmissions;
+    let mut omissions = RecordDiscoveryInputOmissions::default();
+    omissions.record_many(
+        "missing_materialization_receipt",
+        2,
+        Some("source-a"),
+        &[1, 2],
+    )?;
+    omissions.record_many(
+        "learning_prefix_message_count_limit",
+        7,
+        Some("source-a"),
+        &[3],
+    )?;
+    let eligibility = omissions.eligibility_only();
+    assert_eq!(eligibility.total, 2);
+    assert_eq!(
+        eligibility
+            .reason_counts
+            .get("missing_materialization_receipt"),
+        Some(&2)
+    );
+    assert!(
+        !eligibility
+            .reason_counts
+            .contains_key("learning_prefix_message_count_limit")
+    );
+    assert!(eligibility.examples.iter().all(|example| example.get("reason") == Some(&json!("missing_materialization_receipt"))));
+    Ok(())
+}

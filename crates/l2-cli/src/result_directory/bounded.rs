@@ -15,11 +15,11 @@ const MAX_SOURCE_IDENTITY_ITEMS: usize = 16;
 const MAX_SOURCE_IDENTITY_DEPTH: usize = 8;
 const MAX_SOURCE_IDENTITY_STRING_BYTES: usize = 256;
 const MAX_SOURCE_IDENTITY_TOTAL_STRING_BYTES: usize = 2 * 1024;
-const MAX_JOB_SNAPSHOT_NODES: usize = 512;
-const MAX_JOB_SNAPSHOT_ITEMS: usize = 64;
+const MAX_JOB_SNAPSHOT_NODES: usize = 4_096;
+const MAX_JOB_SNAPSHOT_ITEMS: usize = 80;
 const MAX_JOB_SNAPSHOT_DEPTH: usize = 8;
 const MAX_JOB_SNAPSHOT_STRING_BYTES: usize = 4 * 1024;
-const MAX_JOB_SNAPSHOT_TOTAL_STRING_BYTES: usize = 32 * 1024;
+const MAX_JOB_SNAPSHOT_TOTAL_STRING_BYTES: usize = 128 * 1024;
 const MAX_FILE_NAME_BYTES: usize = 255;
 const MAX_SOURCE_ID_BYTES: usize = 7 + 64;
 
@@ -573,3 +573,7 @@ fn copy_bounded_string<E: de::Error>(value: &str) -> Result<String, E> {
     copy.push_str(value);
     Ok(copy)
 }
+
+#[cfg(test)]
+#[path = "../../tests/result_directory/recovery_transition_snapshot.rs"]
+mod recovery_transition_snapshot_tests;

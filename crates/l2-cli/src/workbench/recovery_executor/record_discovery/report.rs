@@ -21,10 +21,10 @@ use l2_workbench::{
     recovery::{EnqueueOutcome, RecoveryCandidate, RecoveryError, RecoveryResult},
 };
 use serde_json::{Value, json};
-use std::collections::HashMap;
+use std::{collections::HashMap, sync::Arc};
 
 const REPORT_KIND: &str = "recovery_record_discovery_report";
-const REPORT_VERSION: u16 = 2;
+const REPORT_VERSION: u16 = 3;
 const STATUS_NO_CANDIDATES: &str = "no_candidates";
 const STATUS_HYPOTHESES_FOUND: &str = "hypotheses_found";
 
@@ -32,9 +32,31 @@ const STATUS_HYPOTHESES_FOUND: &str = "hypotheses_found";
 pub(in crate::workbench::recovery_executor) struct RecordDiscoveryContext {
     key: RecordCohortKey,
     inputs: Vec<RecordFrameInput>,
-    application_inputs: Vec<RecordFrameInput>,
+    application_inputs: Arc<[RecordFrameInput]>,
+    sampling: LearningSample,
     omitted_frames: usize,
     eligibility_omissions: RecordDiscoveryInputOmissions,
+}
+
+#[derive(Clone, Copy)]
+pub(in crate::workbench::recovery_executor) struct PendingRecordSuffix {
+    pub(in crate::workbench::recovery_executor) candidate_id: RecoveryCandidateId,
+    pub(in crate::workbench::recovery_executor) context_index: usize,
+}
+
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum LearningSample {
+    SessionPrefix,
+    SessionSuffix,
+}
+
+impl LearningSample {
+    const fn label(self) -> &'static str {
+        match self {
+            Self::SessionPrefix => "session_prefix",
+            Self::SessionSuffix => "session_suffix",
+        }
+    }
 }
 
 #[derive(Default)]
@@ -337,7 +359,7 @@ impl Executor<'_> {
             let source_eligibility_omissions = plan
                 .omissions
                 .get(&Some(key.source_id.clone()))
-                .map_or(0, |omission| omission.total);
+                .map_or(0, |omission| omission.eligibility_only().total);
             self.collect_relational_frame_samples(
                 key,
                 frames,
@@ -432,7 +454,7 @@ impl Executor<'_> {
                 let eligibility_omissions = plan
                     .omissions
                     .get(&Some(key.source_id.clone()))
-                    .cloned()
+                    .map(RecordDiscoveryInputOmissions::eligibility_only)
                     .unwrap_or_default();
                 let contexts = self.record_discoveries.entry(candidate_id).or_default();
                 if !contexts
@@ -445,7 +467,8 @@ impl Executor<'_> {
                     contexts.push(RecordDiscoveryContext {
                         key: key.clone(),
                         inputs: inputs.clone(),
-                        application_inputs: application_inputs.clone(),
+                        application_inputs: Arc::from(application_inputs.clone()),
+                        sampling: LearningSample::SessionPrefix,
                         omitted_frames,
                         eligibility_omissions,
                     });
@@ -534,7 +557,119 @@ impl Executor<'_> {
         else {
             return Ok(());
         };
-        self.enqueue_retained_report_schemas(&reports, &report_nodes)
+        self.enqueue_retained_report_schemas(&reports, &report_nodes)?;
+        self.defer_suffix_fallbacks(candidate_id, &reports)
+    }
+
+    fn defer_suffix_fallbacks(
+        &mut self,
+        candidate_id: RecoveryCandidateId,
+        reports: &[RecordReportOutput],
+    ) -> Result<(), RecoveryExecutionError> {
+        for report in reports {
+            let context = &report.context;
+            if report.analysis.result != STATUS_NO_CANDIDATES
+                || context.sampling != LearningSample::SessionPrefix
+                || context.omitted_frames == 0
+                || !matches!(context.key.origin, RecordCohortOrigin::TcpMaterialized)
+            {
+                continue;
+            }
+            let context_index = self
+                .record_discoveries
+                .get(&candidate_id)
+                .and_then(|contexts| {
+                    contexts.iter().position(|stored| {
+                        stored.sampling == context.sampling
+                            && stored.matches(
+                                &context.key,
+                                &context.inputs,
+                                &context.application_inputs,
+                                context.omitted_frames,
+                            )
+                    })
+                })
+                .ok_or(RecoveryError::InvariantFailure)?;
+            if self.pending_record_suffixes.len() >= self.policy.resources.max_candidates {
+                self.omissions.push(RecoveryOmission::ResourceExhausted {
+                    task: RecoveryTask::RecordDiscovery,
+                    input_node_ids: context.inputs.iter().map(|input| input.node_id).collect(),
+                    resource: l2_workbench::recovery::RecoveryResource::CandidateCount,
+                    limit: self.policy.resources.max_candidates,
+                    used: self.pending_record_suffixes.len(),
+                    requested: 1,
+                });
+                continue;
+            }
+            self.pending_record_suffixes
+                .try_reserve(1)
+                .map_err(|source| operational("record suffix queue allocation failed", source))?;
+            self.pending_record_suffixes.push_back(PendingRecordSuffix {
+                candidate_id,
+                context_index,
+            });
+        }
+        Ok(())
+    }
+
+    pub(in crate::workbench::recovery_executor) fn enqueue_next_record_suffix(
+        &mut self,
+    ) -> Result<bool, RecoveryExecutionError> {
+        let Some(pending) = self.pending_record_suffixes.pop_front() else {
+            return Ok(false);
+        };
+        let context = self
+            .record_discoveries
+            .get(&pending.candidate_id)
+            .and_then(|contexts| contexts.get(pending.context_index))
+            .cloned()
+            .ok_or(RecoveryError::InvariantFailure)?;
+        // Account for the full-cohort scan before choosing any later observations
+        if !self.charge_record_case_work(context.application_inputs.len())? {
+            return Ok(true);
+        }
+        let Some(inputs) = suffix_inputs(&context, self.policy.record_schema_proposal_limits)?
+        else {
+            return Ok(true);
+        };
+        let mut node_ids = Vec::new();
+        node_ids
+            .try_reserve_exact(inputs.len())
+            .map_err(|source| operational("record suffix node allocation failed", source))?;
+        node_ids.extend(inputs.iter().map(|input| input.node_id));
+        let task = RecoveryTask::RecordDiscovery;
+        let outcome = self
+            .coordinator
+            .enqueue_nodes(self.case, &node_ids, task.clone())?;
+        let candidate_id = match outcome {
+            EnqueueOutcome::Queued(id)
+            | EnqueueOutcome::Merged(id)
+            | EnqueueOutcome::MergedNeedsContext(id)
+            | EnqueueOutcome::CycleSkipped { candidate_id: id } => Some(id),
+            EnqueueOutcome::ResourceExhausted { .. } => None,
+        };
+        self.record_enqueue(outcome, &task, &node_ids)?;
+        if let Some(candidate_id) = candidate_id {
+            let mut later = context;
+            later.inputs = inputs;
+            later.sampling = LearningSample::SessionSuffix;
+            let contexts = self.record_discoveries.entry(candidate_id).or_default();
+            if !contexts.iter().any(|existing| {
+                existing.sampling == later.sampling
+                    && existing.matches(
+                        &later.key,
+                        &later.inputs,
+                        &later.application_inputs,
+                        later.omitted_frames,
+                    )
+            }) {
+                contexts.try_reserve(1).map_err(|source| {
+                    operational("record discovery context allocation failed", source)
+                })?;
+                contexts.push(later);
+            }
+        }
+        Ok(true)
     }
 
     fn plan_record_discovery_work(
@@ -1041,24 +1176,10 @@ fn build_compact_report(
             "direction":context.key.direction,
             "framing_rule":framing_rule,
         },
-        "partition":{
-            "basis":analysis.partition.basis,
-            "training_session_nodes":analysis.partition.training_session_nodes,
-            "held_out_session_nodes":analysis.partition.held_out_session_nodes,
-            "training_message_count":analysis.partition.training_count,
-            "held_out_message_count":context.inputs.len().saturating_sub(analysis.partition.training_count),
-        },
+        "partition":report_partition(context, analysis),
         "input_frame_refs":input_frame_refs,
-        "input_omissions":{
-            "learning_budget_omitted_frame_count":context.omitted_frames,
-            "eligibility_omitted_frame_count":context.eligibility_omissions.total,
-            "eligibility_reason_counts":context.eligibility_omissions.reason_counts,
-            "eligibility_examples":context.eligibility_omissions.examples,
-        },
-        "application":{
-            "validated_frame_count":context.application_inputs.len(),
-            "session_count":application_session_count(&context.application_inputs),
-        },
+        "input_omissions":report_input_omissions(context),
+        "application":report_application(context, analysis),
         "report_detail_omissions":{
             "input_frame_descriptors":omitted_input_frame_descriptors,
             "schema_proposal_details":omitted_schema_proposals,
@@ -1126,6 +1247,63 @@ fn candidate_origins(
         return Err(RecoveryError::InvariantFailure.into());
     }
     Ok(origins)
+}
+
+fn suffix_inputs(
+    context: &RecordDiscoveryContext,
+    limits: l2_workbench::protocol::RecordSchemaProposalLimits,
+) -> Result<Option<Vec<RecordFrameInput>>, RecoveryExecutionError> {
+    let mut selected_sessions = context
+        .inputs
+        .chunk_by(|left, right| left.session_node_id == right.session_node_id)
+        .peekable();
+    let mut selected = Vec::new();
+    selected
+        .try_reserve_exact(context.inputs.len())
+        .map_err(|source| operational("record suffix sample allocation failed", source))?;
+    let mut bytes = 0_usize;
+    for session in context
+        .application_inputs
+        .chunk_by(|left, right| left.session_node_id == right.session_node_id)
+    {
+        let Some(prefix) = selected_sessions.peek() else {
+            break;
+        };
+        if prefix.first().map(|input| input.session_node_id)
+            != session.first().map(|input| input.session_node_id)
+        {
+            continue;
+        }
+        let count = prefix.len();
+        let start = session
+            .len()
+            .checked_sub(count)
+            .ok_or(RecoveryError::InvariantFailure)?;
+        for input in session
+            .get(start..)
+            .ok_or(RecoveryError::InvariantFailure)?
+        {
+            bytes = bytes
+                .checked_add(input.byte_length)
+                .ok_or(RecoveryError::InvariantFailure)?;
+            if bytes > limits.discovery.record_limits.max_input_bytes {
+                return Ok(None);
+            }
+            selected.push(input.clone());
+        }
+        selected_sessions.next();
+    }
+    if selected_sessions.peek().is_some() || selected.len() != context.inputs.len() {
+        return Err(RecoveryError::InvariantFailure.into());
+    }
+    if selected
+        .iter()
+        .zip(&context.inputs)
+        .all(|(left, right)| left.node_id == right.node_id)
+    {
+        return Ok(None);
+    }
+    Ok(Some(selected))
 }
 
 fn partition_inputs(
@@ -1241,29 +1419,44 @@ fn build_report(
             "direction":context.key.direction,
             "framing_rule":framing_rule,
         },
-        "partition":{
-            "basis":analysis.partition.basis,
-            "training_session_nodes":analysis.partition.training_session_nodes,
-            "held_out_session_nodes":analysis.partition.held_out_session_nodes,
-            "training_message_count":analysis.partition.training_count,
-            "held_out_message_count":context.inputs.len() - analysis.partition.training_count,
-        },
+        "partition":report_partition(context, analysis),
         "input_frame_refs":input_frame_refs,
-        "input_omissions":{
-            "learning_budget_omitted_frame_count":context.omitted_frames,
-            "eligibility_omitted_frame_count":context.eligibility_omissions.total,
-            "eligibility_reason_counts":context.eligibility_omissions.reason_counts,
-            "eligibility_examples":context.eligibility_omissions.examples,
-        },
-        "application":{
-            "validated_frame_count":context.application_inputs.len(),
-            "session_count":application_session_count(&context.application_inputs),
-        },
+        "input_omissions":report_input_omissions(context),
+        "application":report_application(context, analysis),
         "schema_proposal":schema_proposal,
         "schema_discovery":schema_discovery,
         "repeated_boundary_analysis":repeated_boundary_analysis,
         "work_bound_bytes":requested_work,
     }))
+}
+
+fn report_partition(context: &RecordDiscoveryContext, analysis: &RecordAnalysis) -> Value {
+    json!({
+        "basis":analysis.partition.basis,
+        "sampling":context.sampling.label(),
+        "training_session_nodes":analysis.partition.training_session_nodes,
+        "held_out_session_nodes":analysis.partition.held_out_session_nodes,
+        "training_message_count":analysis.partition.training_count,
+        "held_out_message_count":context.inputs.len() - analysis.partition.training_count,
+    })
+}
+
+fn report_input_omissions(context: &RecordDiscoveryContext) -> Value {
+    json!({
+        "learning_budget_omitted_frame_count":context.omitted_frames,
+        "eligibility_omitted_frame_count":context.eligibility_omissions.total,
+        "eligibility_reason_counts":context.eligibility_omissions.reason_counts,
+        "eligibility_examples":context.eligibility_omissions.examples,
+    })
+}
+
+fn report_application(context: &RecordDiscoveryContext, analysis: &RecordAnalysis) -> Value {
+    json!({
+        "eligible_frame_count":context.application_inputs.len(),
+        "learning_sampled_frame_count":context.inputs.len(),
+        "not_applied_by_this_report_no_schema_frame_count":if analysis.result == STATUS_NO_CANDIDATES { context.application_inputs.len() } else { 0 },
+        "session_count":application_session_count(&context.application_inputs),
+    })
 }
 
 fn report_input_frame_refs(inputs: &[RecordFrameInput], training_count: usize) -> Vec<Value> {
@@ -1397,3 +1590,7 @@ impl std::error::Error for RecordDiscoveryReportError {
         Some(self.source.as_ref())
     }
 }
+
+#[cfg(test)]
+#[path = "../../../../tests/workbench/recovery_record_discovery_sampling.rs"]
+mod sampling_tests;

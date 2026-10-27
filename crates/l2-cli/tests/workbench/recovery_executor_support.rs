@@ -84,6 +84,7 @@ pub(super) fn build_executor<'a>(
         record_schema_associations_charged: 0,
         record_phase_work_charged: 0,
         pending_record_assemblies: std::collections::VecDeque::new(),
+        pending_record_suffixes: std::collections::VecDeque::new(),
         pending_record_assembly_count: 0,
         relational_samples: super::RelationalSampleCollections::default(),
         relational_discoveries: std::collections::HashMap::new(),

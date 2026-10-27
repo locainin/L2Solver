@@ -199,6 +199,7 @@ fn test_executor<'a>(
         record_schema_associations_charged: 0,
         record_phase_work_charged: 0,
         pending_record_assemblies: VecDeque::default(),
+        pending_record_suffixes: VecDeque::default(),
         pending_record_assembly_count: 0,
         relational_samples: super::super::relational::RelationalSampleCollections::default(),
         relational_discoveries: HashMap::default(),

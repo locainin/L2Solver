@@ -31,7 +31,7 @@ mod hex;
 mod integer;
 mod serialization;
 
-pub use hashing::sha256;
+pub use hashing::{parse_sha256_digest, sha256};
 
 #[cfg(test)]
 #[path = "../tests/hashing/format.rs"]

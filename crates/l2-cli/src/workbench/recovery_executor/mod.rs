@@ -8,6 +8,7 @@ mod cancel_boundary_tests;
 mod case_index_tests;
 mod case_scan;
 mod derived_discovery;
+mod diagnostics;
 mod discovery;
 mod embedded;
 mod evidence;
@@ -275,6 +276,7 @@ fn execute_internal(
         record_schema_associations_charged: 0,
         record_phase_work_charged: 0,
         pending_record_assemblies: VecDeque::new(),
+        pending_record_suffixes: VecDeque::new(),
         pending_record_assembly_count: 0,
         relational_samples: RelationalSampleCollections::default(),
         relational_discoveries: HashMap::new(),
@@ -335,6 +337,9 @@ fn execute_executor(executor: &mut Executor<'_>) -> Result<(), RecoveryExecution
         if executor.flush_relational_cohorts(RelationalLane::Incremental)? {
             continue;
         }
+        if executor.enqueue_next_record_suffix()? {
+            continue;
+        }
         break;
     }
 
@@ -389,17 +394,17 @@ fn drain_candidate_frontier(
                 !*evidence_stop_reported,
             )?;
             *evidence_stop_reported = true;
+            record_candidate_progress(executor, candidate_id, executor.omissions.len())?;
             continue;
         }
         let omission_start = executor.omissions.len();
         if let Err(error) = executor.execute_candidate(candidate_id) {
             *evidence_stop = Some(executor.stop_after_case_evidence_error(candidate_id, error)?);
             *evidence_stop_reported = true;
+            record_candidate_progress(executor, candidate_id, executor.omissions.len())?;
             continue;
         }
-        if let Some(progress) = &executor.job {
-            progress.finish_candidate(candidate_id, &executor.coordinator)?;
-        }
+        record_candidate_progress(executor, candidate_id, omission_start)?;
         if let Some(stop) = evidence::recent_case_evidence_stop(
             executor
                 .omissions
@@ -409,6 +414,26 @@ fn drain_candidate_frontier(
             *evidence_stop = Some(stop);
             *evidence_stop_reported = true;
         }
+    }
+    Ok(())
+}
+
+fn record_candidate_progress(
+    executor: &Executor<'_>,
+    candidate_id: RecoveryCandidateId,
+    omission_start: usize,
+) -> Result<(), RecoveryExecutionError> {
+    if let Some(progress) = &executor.job {
+        let omissions = executor
+            .omissions
+            .get(omission_start..)
+            .ok_or(RecoveryError::InvariantFailure)?;
+        progress.finish_candidate(
+            candidate_id,
+            &executor.coordinator,
+            executor.case,
+            omissions,
+        )?;
     }
     Ok(())
 }
@@ -567,6 +592,7 @@ struct Executor<'a> {
     record_schema_associations_charged: usize,
     record_phase_work_charged: usize,
     pending_record_assemblies: VecDeque<VecDeque<scheduler::PendingRecordAssembly>>,
+    pending_record_suffixes: VecDeque<record_discovery::PendingRecordSuffix>,
     pending_record_assembly_count: usize,
     relational_samples: RelationalSampleCollections,
     relational_discoveries: HashMap<RecoveryCandidateId, Vec<RelationalDiscoveryContext>>,
@@ -602,7 +628,10 @@ impl JobProgress {
         &self,
         candidate_id: RecoveryCandidateId,
         coordinator: &RecoveryCoordinator,
+        case: &Case,
+        omissions: &[RecoveryOmission],
     ) -> Result<(), RecoveryExecutionError> {
+        diagnostics::record_candidate(&self.job, case, coordinator, candidate_id, omissions)?;
         let rejected = coordinator
             .candidate(candidate_id)
             .is_some_and(|candidate| {
@@ -635,6 +664,17 @@ impl JobProgress {
         let member_count =
             u64::try_from(member_count).map_err(|_| RecoveryError::InvariantFailure)?;
         self.job.increment(Counter::ExpandedMembers, member_count)?;
+        Ok(())
+    }
+
+    fn record_input_applications_committed(
+        &self,
+        input_count: usize,
+    ) -> Result<(), RecoveryExecutionError> {
+        let input_count =
+            u64::try_from(input_count).map_err(|_| RecoveryError::InvariantFailure)?;
+        self.job
+            .increment(Counter::RecordInputApplications, input_count)?;
         Ok(())
     }
 

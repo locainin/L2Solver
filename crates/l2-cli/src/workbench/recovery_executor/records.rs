@@ -290,6 +290,7 @@ impl Executor<'_> {
         };
         if let Some(progress) = &self.job {
             progress.parsed_records_committed(parsed_record_count)?;
+            progress.record_input_applications_committed(input_node_ids.len())?;
         }
         if let Some(links) = self.record_schema_report_links.get_mut(&candidate_id) {
             links.mark_linked(committed.receipt_node_id);

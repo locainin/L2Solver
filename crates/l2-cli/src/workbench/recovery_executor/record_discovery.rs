@@ -12,7 +12,7 @@ pub(in crate::workbench::recovery_executor) use input::{
     collect_input_plan, collect_input_plan_excluding,
 };
 pub(in crate::workbench::recovery_executor) use report::{
-    RecordDiscoveryContext, RecordSchemaReportLinks,
+    PendingRecordSuffix, RecordDiscoveryContext, RecordSchemaReportLinks,
 };
 
 pub(super) const fn scan_work(plan: &RecordDiscoveryPlan) -> usize {

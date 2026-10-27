@@ -1070,6 +1070,7 @@ fn run_record_discovery_only(
         record_schema_associations_charged: 0,
         record_phase_work_charged: 0,
         pending_record_assemblies: std::collections::VecDeque::new(),
+        pending_record_suffixes: std::collections::VecDeque::new(),
         pending_record_assembly_count: 0,
         relational_samples: super::RelationalSampleCollections::default(),
         relational_discoveries: std::collections::HashMap::new(),
@@ -1187,7 +1188,7 @@ fn assert_cohort_record_report(
         report.pointer("/cohort/framing_rule"),
         Some(&json!({"kind":"fixed_size","bytes":14}))
     );
-    assert_eq!(report.get("version"), Some(&json!(2)));
+    assert_eq!(report.get("version"), Some(&json!(3)));
     let report_frames = report
         .pointer("/input_frame_refs")
         .and_then(Value::as_array)
@@ -2955,7 +2956,7 @@ fn assert_compact_report_details_omitted(
 ) -> TestResult<()> {
     let (expected_schema_count, falsification_count) = expected_counts;
     assert_eq!(report.get("report_details_complete"), Some(&json!(false)));
-    assert_eq!(report.get("version"), Some(&json!(2)));
+    assert_eq!(report.get("version"), Some(&json!(3)));
     assert!(report.get("schema_proposal").is_none());
     assert!(report.get("schema_discovery").is_none());
     assert!(report.get("input_frames").is_none());
@@ -3290,7 +3291,7 @@ fn assert_primary_report(
     fixture: &PrimaryFixture,
     report_node_id: u64,
 ) -> TestResult<()> {
-    assert_eq!(report.get("version"), Some(&json!(2)));
+    assert_eq!(report.get("version"), Some(&json!(3)));
     assert_eq!(report.get("result"), Some(&json!("hypotheses_found")));
     assert_eq!(
         report.get("search_exhaustive_within_plan"),
@@ -3710,6 +3711,15 @@ fn no_candidates_and_budget_partial_have_distinct_report_statuses() -> TestResul
         decode_report(&no_candidate_case, *node_id)?.get("search_exhaustive_within_plan"),
         Some(&json!(true))
     );
+    let empty_report = decode_report(&no_candidate_case, *node_id)?;
+    assert_eq!(
+        empty_report.pointer("/application/eligible_frame_count"),
+        Some(&json!(2))
+    );
+    assert_eq!(
+        empty_report.pointer("/application/not_applied_by_this_report_no_schema_frame_count"),
+        Some(&json!(2))
+    );
 
     let mut partial_case = Case::new();
     let framing = FramingKind::FixedSize { bytes: 14 };
@@ -3943,3 +3953,6 @@ fn default_recovery_retains_the_unrelated_length_prefixed_record_schema() -> Tes
     assert!(summary.validated_artifact_count >= artifacts.len());
     Ok(())
 }
+
+#[path = "recovery_record_discovery_diagnostics.rs"]
+mod diagnostics;

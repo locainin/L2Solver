@@ -6,6 +6,8 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
 
+use super::recovery_transition::{RecoveryTransition, RecoveryTransitionSummary};
+
 use super::cache_fallback::{
     CacheFallbackKind, CacheFallbackSummary, CacheStage, bounded_escaped_sample,
 };
@@ -109,6 +111,10 @@ pub enum Counter {
     ///
     /// Failed or rolled-back assemblies do not add record work
     Records,
+    /// Record input applications recorded by committed strict-parser receipts
+    ///
+    /// The same frame can count more than once when different schemas are tried
+    RecordInputApplications,
     /// Transformations discovered
     Transforms,
     /// Reports written
@@ -116,7 +122,7 @@ pub enum Counter {
 }
 
 impl Counter {
-    const ALL: [Self; 14] = [
+    const ALL: [Self; 15] = [
         Self::Files,
         Self::Bytes,
         Self::Packets,
@@ -129,6 +135,7 @@ impl Counter {
         Self::CacheHits,
         Self::CacheMisses,
         Self::Records,
+        Self::RecordInputApplications,
         Self::Transforms,
         Self::Reports,
     ];
@@ -149,6 +156,7 @@ impl Counter {
             Self::CacheHits => "cache hits",
             Self::CacheMisses => "cache misses",
             Self::Records => "records",
+            Self::RecordInputApplications => "record input applications",
             Self::Transforms => "transforms",
             Self::Reports => "reports",
         }
@@ -295,6 +303,9 @@ pub struct JobSnapshot {
     /// Bounded reasons cache-backed work continued without reusing an entry
     #[serde(default)]
     pub cache_fallbacks: CacheFallbackSummary,
+    /// Bounded stage and outcome counts for observed recovery transitions
+    #[serde(default)]
+    pub recovery_transitions: RecoveryTransitionSummary,
     /// Whether a cooperative cancellation request has been sent
     pub cancel_requested: bool,
 }
@@ -405,6 +416,7 @@ impl Job {
                 .map(|counter| (counter, 0))
                 .collect(),
             cache_fallbacks: CacheFallbackSummary::default(),
+            recovery_transitions: RecoveryTransitionSummary::default(),
             cancel_requested: false,
         };
 
@@ -599,6 +611,17 @@ impl Job {
         Ok(())
     }
 
+    /// Records one bounded recovery transition without retaining candidate bytes
+    ///
+    /// # Errors
+    /// Returns [`JobError::LockPoisoned`] if shared state cannot be accessed
+    pub fn record_recovery_transition(&self, event: RecoveryTransition) -> Result<(), JobError> {
+        let mut state = self.lock_state()?;
+        state.snapshot.recovery_transitions.record(event);
+        drop(state);
+        Ok(())
+    }
+
     /// Records the final outcome for a stage
     ///
     /// A skipped stage may finish while pending; other outcomes require a running stage
@@ -699,6 +722,8 @@ impl Job {
         // Cache fallback counts are cumulative, just like the counters above
         let current_cache_fallbacks = std::mem::take(&mut state.snapshot.cache_fallbacks);
         snapshot.cache_fallbacks.merge(current_cache_fallbacks);
+        let transitions = std::mem::take(&mut state.snapshot.recovery_transitions);
+        snapshot.recovery_transitions.merge(transitions);
 
         // A prior process cancellation does not cancel this run, but a signal during lookup does
         snapshot.cancel_requested = self.is_cancelled();

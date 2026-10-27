@@ -248,7 +248,7 @@ fn assert_bounded_learning_application(
         .ok_or("record report has an invalid learning frame reference")?;
     assert_eq!(report_frame_ids, learned_frames);
     assert_eq!(
-        report.pointer("/application/validated_frame_count"),
+        report.pointer("/application/eligible_frame_count"),
         Some(&json!(
             full_session_frames.iter().map(Vec::len).sum::<usize>()
         ))
@@ -257,6 +257,16 @@ fn assert_bounded_learning_application(
         report.pointer("/application/session_count"),
         Some(&json!(2))
     );
+    assert_eq!(
+        report.pointer("/application/learning_sampled_frame_count"),
+        Some(&json!(4))
+    );
+    assert_eq!(
+        report.pointer("/input_omissions/eligibility_omitted_frame_count"),
+        Some(&json!(0)),
+        "learning limits do not make otherwise eligible frames fail provenance checks"
+    );
+
     assert_eq!(
         report.pointer("/input_omissions/learning_budget_omitted_frame_count"),
         Some(&json!(

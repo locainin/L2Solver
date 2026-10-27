@@ -353,3 +353,6 @@ mod cache;
 
 #[path = "job/cache_fallback.rs"]
 mod cache_fallback;
+
+#[path = "job/recovery_transition.rs"]
+mod recovery_transition;
