@@ -14,8 +14,8 @@ use std::{
     io::{self, BufWriter, Write},
 };
 
-const GRAPH_FILE: &str = "case.graph.gz";
-const BLOB_PACK_FILE: &str = "case.blobs";
+pub const GRAPH_FILE: &str = "case.graph.gz";
+pub const BLOB_PACK_FILE: &str = "case.blobs";
 pub const STORAGE_FORMAT: u32 = 1;
 
 // Reserve a bounded scratch allowance before either stream is opened

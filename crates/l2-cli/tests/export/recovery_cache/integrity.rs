@@ -21,6 +21,7 @@ fn cached_coverage_cannot_claim_complete_collection_for_an_incomplete_case()
             kind,
             &scope,
             &RecoveryContext {
+                memory: None,
                 cache: None,
                 job: None,
                 options: &options,
@@ -31,14 +32,20 @@ fn cached_coverage_cannot_claim_complete_collection_for_an_incomplete_case()
         // The bytes and source remain valid, but the saved coverage no longer describes the Case
         case.mark_incomplete("fixture collection stopped after the coverage was recorded")?;
         let key = recovery_key(kind, &scope, &options)?;
-        super::super::store_result(cache.lease(&key)?, &case, &result, &options)?;
+        super::super::store_result(cache.lease(&key)?, &case, &result, &options, None)?;
         let entry = cache
             .lookup(&key, CacheReadPolicy::AllowPartial)?
             .ok_or("the inconsistent cache fixture was not committed")?;
 
         assert!(
-            super::super::cached_result(&entry, &super::super::source_id(&scope)?, kind, &options,)
-                .is_err(),
+            super::super::cached_result(
+                &entry,
+                &super::super::source_id(&scope)?,
+                kind,
+                &options,
+                None
+            )
+            .is_err(),
             "cached {} coverage must agree with the retained collection flag",
             super::super::kind_name(kind)
         );

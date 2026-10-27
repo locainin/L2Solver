@@ -73,6 +73,7 @@ fn collection_phases_cover_indexed_analysis_and_optional_tshark() -> Result<(), 
     };
     let job = Job::new("collection phase test");
     let context = RecoveryContext {
+        memory: None,
         cache: None,
         job: Some(&job),
         options: &options.recovery,
@@ -139,6 +140,7 @@ fn recover_indexed_cases(
         ..RecoveryOptions::default()
     };
     let context = RecoveryContext {
+        memory: None,
         cache: None,
         job: None,
         options: &options,
@@ -218,6 +220,7 @@ fn collect_with_jobs(
         },
     };
     let context = RecoveryContext {
+        memory: None,
         cache: None,
         job: None,
         options: &options.recovery,

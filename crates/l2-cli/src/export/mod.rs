@@ -73,7 +73,7 @@ use crate::{
     result_directory::{ResultDirectory, ResultKind},
 };
 use l2_workbench::job::{
-    CacheStage, Counter, Job, Phase, PhaseOutcome, RecoveryPublicationSample,
+    CacheStage, Counter, Job, MemoryBudget, Phase, PhaseOutcome, RecoveryPublicationSample,
     RecoveryPublicationSourceBasis,
 };
 use recovery_cache::RecoveryContext;
@@ -139,7 +139,9 @@ pub fn run_with_job(
         job.set_current(Phase::Preparation, "input and output policies accepted")?;
         job.check_cancelled()?;
         job.finish(Phase::Preparation, PhaseOutcome::Completed)?;
+        let memory = MemoryBudget::new(options.recovery.memory_limit);
         let context = RecoveryContext {
+            memory: Some(&memory),
             cache: cache.cache(),
             job: Some(job),
             options: &options.recovery,
@@ -299,7 +301,9 @@ fn run_standard_input(
     job: &Job,
     destination: &Path,
 ) -> Result<bool, Box<dyn Error>> {
+    let memory = MemoryBudget::new(options.recovery.memory_limit);
     let context = RecoveryContext {
+        memory: Some(&memory),
         cache: None,
         job: Some(job),
         options: &options.recovery,

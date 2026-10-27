@@ -8,7 +8,7 @@ use crate::{
 use l2_workbench::{
     evidence::{Case, CaseSnapshotLimits, CaseSnapshotUsage, EvidenceError, MAX_CASE_JSON_BYTES},
     job::{
-        CacheFallbackKind, CacheStage, Counter, Job, PhaseState,
+        CacheFallbackKind, CacheStage, Counter, Job, MemoryBudget, PhaseState,
         cache::{
             Cache, CacheEntry, CacheError, CacheReadPolicy, Lease, SourceIdentity, StageKey,
             StageStatus,
@@ -21,20 +21,17 @@ use serde_json::{Value, json};
 use std::{
     error::Error,
     fmt,
-    fs::OpenOptions,
-    io::{self, BufWriter, Read, Write},
+    io::{self, Read},
 };
 
 // Advance when recovery eligibility, generation, cohorting, or parser constraints change
 // Application semantics also belong to this stage's identity
 // Capture indexing and native reconstruction keep their separate upstream versions
-pub(super) const RECOVERY_STAGE_VERSION: u32 = 23;
+pub(super) const RECOVERY_STAGE_VERSION: u32 = 24;
 const RECOVERY_STAGE: &str = "default_case_recovery";
 const RECOVERY_ALGORITHM: &str = "l2-default-case-recovery";
 const CASE_FILE: &str = "case.json";
-const CASE_GRAPH_FILE: &str = "case.graph.gz";
-const CASE_BLOB_PACK_FILE: &str = "case.blobs";
-const CASE_SNAPSHOT_FORMAT: u32 = 1;
+const CASE_SNAPSHOT_FORMAT: u32 = crate::case_snapshot::STORAGE_FORMAT;
 
 #[cfg(test)]
 #[path = "../../tests/export/recovery_cache.rs"]
@@ -46,6 +43,7 @@ type Result<T> = std::result::Result<T, Box<dyn Error>>;
 pub(super) struct RecoveryContext<'a> {
     pub(super) cache: Option<&'a Cache>,
     pub(super) job: Option<&'a Job>,
+    pub(super) memory: Option<&'a MemoryBudget>,
     pub(super) options: &'a RecoveryOptions,
 }
 
@@ -107,30 +105,11 @@ pub(super) fn recover(
     let cache = context.cache.filter(|_| !context.options.no_cache);
 
     if let Some(cache) = cache {
-        if !context.options.refresh {
-            // Profile and memory limits are in the key, keeping partial reuse policy exact
-            match cache.lookup(&key, CacheReadPolicy::AllowPartial) {
-                Ok(Some(entry)) => match cached_result(&entry, &source_id, kind, context.options) {
-                    Ok((cached_case, result)) => {
-                        count_cache_hit(context.job)?;
-                        *case = cached_case;
-                        return Ok(result);
-                    }
-                    Err(error) if context.options.strict_cache => return Err(error),
-                    Err(_) => note_cache_fallback(
-                        context.job,
-                        CacheFallbackKind::InvalidEntry,
-                        format_args!("cached Case could not be restored"),
-                    )?,
-                },
-                Err(error) if context.options.strict_cache => return Err(error.into()),
-                Err(_) => note_cache_fallback(
-                    context.job,
-                    CacheFallbackKind::LookupFailed,
-                    format_args!("recovery cache lookup failed"),
-                )?,
-                Ok(None) => {}
-            }
+        if let Some((cached_case, result)) = lookup_result(cache, &key, &source_id, kind, context)?
+        {
+            count_cache_hit(context.job)?;
+            *case = cached_case;
+            return Ok(result);
         }
         count_cache_miss(context.job, kind)?;
     }
@@ -169,8 +148,10 @@ pub(super) fn recover(
     };
 
     if let Some(lease) = lease {
-        match store_result(lease, case, &result, context.options) {
-            Err(error) if context.options.strict_cache => return Err(error),
+        match store_result(lease, case, &result, context.options, context.memory) {
+            Err(error) if context.options.strict_cache || memory_pressure(error.as_ref()) => {
+                return Err(error);
+            }
             Ok(()) => {}
             Err(error) => {
                 let kind = cache_commit_fallback_kind(error.as_ref());
@@ -185,6 +166,44 @@ pub(super) fn recover(
     Ok(result)
 }
 
+fn lookup_result(
+    cache: &Cache,
+    key: &StageKey,
+    source_id: &str,
+    kind: RecoveryCaseKind,
+    context: &RecoveryContext<'_>,
+) -> Result<Option<(Case, CachedRecovery)>> {
+    if context.options.refresh {
+        return Ok(None);
+    }
+    // Profile and memory limits bind partial results to their exact search policy
+    match cache.lookup(key, CacheReadPolicy::AllowPartial) {
+        Ok(Some(entry)) => {
+            match cached_result(&entry, source_id, kind, context.options, context.memory) {
+                Ok(result) => return Ok(Some(result)),
+                Err(error) if context.options.strict_cache || memory_pressure(error.as_ref()) => {
+                    return Err(error);
+                }
+                Err(_) => note_cache_fallback(
+                    context.job,
+                    CacheFallbackKind::InvalidEntry,
+                    format_args!("cached Case could not be restored"),
+                )?,
+            }
+        }
+        Err(error) if context.options.strict_cache || memory_pressure(&error) => {
+            return Err(error.into());
+        }
+        Err(_) => note_cache_fallback(
+            context.job,
+            CacheFallbackKind::LookupFailed,
+            format_args!("recovery cache lookup failed"),
+        )?,
+        Ok(None) => {}
+    }
+    Ok(None)
+}
+
 fn note_cache_fallback(
     job: Option<&Job>,
     kind: CacheFallbackKind,
@@ -194,6 +213,18 @@ fn note_cache_fallback(
         job.record_cache_fallback(CacheStage::CaseRecovery, kind, detail)?;
     }
     Ok(())
+}
+
+fn memory_pressure(mut error: &(dyn Error + 'static)) -> bool {
+    loop {
+        if error.is::<l2_workbench::job::MemoryError>() {
+            return true;
+        }
+        let Some(source) = error.source() else {
+            return false;
+        };
+        error = source;
+    }
 }
 
 fn cache_commit_fallback_kind(error: &(dyn Error + 'static)) -> CacheFallbackKind {
@@ -267,6 +298,7 @@ fn cached_result(
     expected_source_id: &str,
     kind: RecoveryCaseKind,
     options: &RecoveryOptions,
+    memory: Option<&MemoryBudget>,
 ) -> Result<(Case, CachedRecovery)> {
     let metadata: RecoveryMetadata = serde_json::from_value(entry.metadata().clone())?;
     let case_storage_format = metadata.case_storage_format;
@@ -281,6 +313,7 @@ fn cached_result(
         case_storage_format,
         case_snapshot_usage,
         snapshot_limits(options),
+        memory,
     )?;
     require_case_source(&case, expected_source_id)?;
     let incomplete_case_count = match kind {
@@ -336,49 +369,17 @@ fn read_cached_case(
     storage_format: MetadataField<u32>,
     usage: MetadataField<CaseSnapshotUsage>,
     limits: CaseSnapshotLimits,
+    memory: Option<&MemoryBudget>,
 ) -> Result<Case> {
     match (storage_format, usage) {
-        (MetadataField::Missing, MetadataField::Missing) => read_legacy_case(entry, limits),
+        (MetadataField::Missing, MetadataField::Missing) if memory.is_none() => {
+            read_legacy_case(entry, limits)
+        }
         (MetadataField::Value(CASE_SNAPSHOT_FORMAT), MetadataField::Value(usage)) => {
-            read_snapshot_case(entry, usage, limits)
+            crate::case_snapshot::read(entry, usage, limits, memory)
         }
         _ => Err(invalid_cache("recovery Case storage metadata is invalid")),
     }
-}
-
-fn read_snapshot_case(
-    entry: &CacheEntry,
-    usage: CaseSnapshotUsage,
-    limits: CaseSnapshotLimits,
-) -> Result<Case> {
-    let declared_decoded_bytes = usage
-        .graph_decoded_bytes
-        .checked_add(usage.blob_pack_bytes)
-        .ok_or("snapshot decoded size overflow")?;
-    if declared_decoded_bytes > limits.maximum_decoded_bytes() {
-        return Err(invalid_cache(
-            "cached recovery snapshot exceeds its decoded size limit",
-        ));
-    }
-    let graph = input::regular_no_follow(&entry.directory().join(CASE_GRAPH_FILE))?;
-    let blob_pack = input::regular_no_follow(&entry.directory().join(CASE_BLOB_PACK_FILE))?;
-    let graph_bytes = graph.metadata()?.len();
-    let blob_pack_bytes = blob_pack.metadata()?.len();
-    let total_storage_bytes = graph_bytes
-        .checked_add(blob_pack_bytes)
-        .ok_or("snapshot package size overflow")?;
-    if total_storage_bytes > limits.maximum_storage_bytes() {
-        return Err(invalid_cache(
-            "cached recovery snapshot exceeds its storage limit",
-        ));
-    }
-    let (case, actual_usage) = Case::from_snapshot(graph, blob_pack, limits)?;
-    if actual_usage != usage {
-        return Err(invalid_cache(
-            "snapshot usage metadata does not match stored files",
-        ));
-    }
-    Ok(case)
 }
 
 fn read_legacy_case(entry: &CacheEntry, limits: CaseSnapshotLimits) -> Result<Case> {
@@ -412,8 +413,9 @@ fn store_result(
     case: &Case,
     result: &CachedRecovery,
     options: &RecoveryOptions,
+    memory: Option<&MemoryBudget>,
 ) -> Result<()> {
-    let usage = write_case(&lease, case, options)?;
+    let usage = crate::case_snapshot::write(&lease, case, snapshot_limits(options), memory)?;
     let metadata = serde_json::to_value(RecoveryMetadataRef {
         coverage: &result.coverage,
         omissions: &result.omissions,
@@ -426,33 +428,6 @@ fn store_result(
         StageStatus::Partial
     };
     drop(lease.commit(status, metadata)?);
-    Ok(())
-}
-
-fn write_case(lease: &Lease, case: &Case, options: &RecoveryOptions) -> Result<CaseSnapshotUsage> {
-    let graph_file = create_case_snapshot_file(lease, CASE_GRAPH_FILE)?;
-    let blob_pack_file = create_case_snapshot_file(lease, CASE_BLOB_PACK_FILE)?;
-    let mut graph = BufWriter::new(graph_file);
-    let mut blob_pack = BufWriter::new(blob_pack_file);
-    let usage = case.write_snapshot(&mut graph, &mut blob_pack, snapshot_limits(options))?;
-    sync_snapshot_file(graph)?;
-    sync_snapshot_file(blob_pack)?;
-    Ok(usage)
-}
-
-fn create_case_snapshot_file(lease: &Lease, filename: &str) -> Result<std::fs::File> {
-    Ok(OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(lease.directory().join(filename))?)
-}
-
-fn sync_snapshot_file(mut writer: BufWriter<std::fs::File>) -> Result<()> {
-    writer.flush()?;
-    writer
-        .into_inner()
-        .map_err(io::IntoInnerError::into_error)?
-        .sync_all()?;
     Ok(())
 }
 

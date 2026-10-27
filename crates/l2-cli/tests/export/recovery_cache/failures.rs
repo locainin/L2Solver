@@ -23,6 +23,7 @@ fn held_write_lease_recomputes_without_cache_and_strict_mode_fails() -> Result<(
         RecoveryCaseKind::Flow,
         &uncached_scope,
         &RecoveryContext {
+            memory: None,
             cache: None,
             job: None,
             options: &options,
@@ -36,6 +37,7 @@ fn held_write_lease_recomputes_without_cache_and_strict_mode_fails() -> Result<(
         RecoveryCaseKind::Flow,
         &recovered_scope,
         &RecoveryContext {
+            memory: None,
             cache: Some(&cache),
             job: Some(&job),
             options: &options,
@@ -60,6 +62,7 @@ fn held_write_lease_recomputes_without_cache_and_strict_mode_fails() -> Result<(
         RecoveryCaseKind::Flow,
         &strict_scope,
         &RecoveryContext {
+            memory: None,
             cache: Some(&cache),
             job: Some(&strict_job),
             options: &strict,
@@ -98,6 +101,7 @@ fn cache_quota_commit_failure_preserves_recovery_and_is_fatal_in_strict_mode()
         RecoveryCaseKind::Flow,
         &uncached_scope,
         &RecoveryContext {
+            memory: None,
             cache: None,
             job: None,
             options: &options,
@@ -111,6 +115,7 @@ fn cache_quota_commit_failure_preserves_recovery_and_is_fatal_in_strict_mode()
         RecoveryCaseKind::Flow,
         &recovered_scope,
         &RecoveryContext {
+            memory: None,
             cache: Some(&cache),
             job: Some(&job),
             options: &options,
@@ -136,6 +141,7 @@ fn cache_quota_commit_failure_preserves_recovery_and_is_fatal_in_strict_mode()
         RecoveryCaseKind::Flow,
         &strict_scope,
         &RecoveryContext {
+            memory: None,
             cache: Some(&cache),
             job: Some(&strict_job),
             options: &strict,

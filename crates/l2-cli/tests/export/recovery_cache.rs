@@ -17,6 +17,9 @@ mod failures;
 #[path = "recovery_cache/integrity.rs"]
 mod integrity;
 
+#[path = "recovery_cache/memory.rs"]
+mod memory;
+
 #[test]
 fn warm_cache_restores_the_case_and_local_coverage() -> Result<(), Box<dyn Error>> {
     let temporary = tempfile::tempdir()?;
@@ -28,6 +31,7 @@ fn warm_cache_restores_the_case_and_local_coverage() -> Result<(), Box<dyn Error
         RecoveryCaseKind::Flow,
         &scope,
         &RecoveryContext {
+            memory: None,
             cache: Some(&cache),
             job: None,
             options: &options,
@@ -62,6 +66,7 @@ fn warm_cache_restores_the_case_and_local_coverage() -> Result<(), Box<dyn Error
         RecoveryCaseKind::Flow,
         &second_scope,
         &RecoveryContext {
+            memory: None,
             cache: Some(&cache),
             job: Some(&job),
             options: &options,
@@ -118,6 +123,7 @@ fn large_case_snapshot_commits_and_replays_above_the_legacy_json_limit()
         RecoveryCaseKind::Flow,
         &scope,
         &RecoveryContext {
+            memory: None,
             cache: Some(&cache),
             job: Some(&first_job),
             options: &options,
@@ -143,6 +149,7 @@ fn large_case_snapshot_commits_and_replays_above_the_legacy_json_limit()
         RecoveryCaseKind::Flow,
         &second_scope,
         &RecoveryContext {
+            memory: None,
             cache: Some(&cache),
             job: Some(&job),
             options: &options,
@@ -174,6 +181,7 @@ fn refresh_recomputes_and_atomically_replaces_the_cached_recovery() -> Result<()
         RecoveryCaseKind::Flow,
         &scope,
         &RecoveryContext {
+            memory: None,
             cache: Some(&cache),
             job: None,
             options: &options,
@@ -189,6 +197,7 @@ fn refresh_recomputes_and_atomically_replaces_the_cached_recovery() -> Result<()
         RecoveryCaseKind::Flow,
         &refreshed_scope,
         &RecoveryContext {
+            memory: None,
             cache: Some(&cache),
             job: Some(&job),
             options: &refresh,
@@ -224,6 +233,7 @@ fn valid_cache_miss_and_no_cache_do_not_record_fallback_diagnostics() -> Result<
         RecoveryCaseKind::Flow,
         &scope,
         &RecoveryContext {
+            memory: None,
             cache: Some(&cache),
             job: Some(&job),
             options: &options,
@@ -243,6 +253,7 @@ fn valid_cache_miss_and_no_cache_do_not_record_fallback_diagnostics() -> Result<
         RecoveryCaseKind::Flow,
         &uncached_scope,
         &RecoveryContext {
+            memory: None,
             cache: Some(&cache),
             job: Some(&no_cache_job),
             options: &no_cache,
@@ -275,6 +286,7 @@ fn partial_recovery_is_reused_as_partial_for_the_same_policy() -> Result<(), Box
         RecoveryCaseKind::Flow,
         &scope,
         &RecoveryContext {
+            memory: None,
             cache: Some(&cache),
             job: None,
             options: &options,
@@ -297,6 +309,7 @@ fn partial_recovery_is_reused_as_partial_for_the_same_policy() -> Result<(), Box
         RecoveryCaseKind::Flow,
         &second_scope,
         &RecoveryContext {
+            memory: None,
             cache: Some(&cache),
             job: Some(&job),
             options: &options,
@@ -326,6 +339,7 @@ fn legacy_json_cache_entries_remain_readable_without_snapshot_metadata()
         RecoveryCaseKind::Flow,
         &scope,
         &RecoveryContext {
+            memory: None,
             cache: None,
             job: None,
             options: &options,
@@ -350,6 +364,7 @@ fn legacy_json_cache_entries_remain_readable_without_snapshot_metadata()
         RecoveryCaseKind::Flow,
         &restored_scope,
         &RecoveryContext {
+            memory: None,
             cache: Some(&cache),
             job: Some(&job),
             options: &options,
@@ -378,6 +393,7 @@ fn legacy_json_replay_obeys_the_current_physical_storage_limit() -> Result<(), B
         RecoveryCaseKind::Flow,
         &scope,
         &RecoveryContext {
+            memory: None,
             cache: None,
             job: None,
             options: &options,
@@ -408,6 +424,7 @@ fn legacy_json_replay_obeys_the_current_physical_storage_limit() -> Result<(), B
         RecoveryCaseKind::Flow,
         &fresh_scope,
         &RecoveryContext {
+            memory: None,
             cache: Some(&cache),
             job: Some(&job),
             options: &options,
@@ -436,6 +453,7 @@ fn null_snapshot_metadata_is_not_treated_as_a_legacy_entry() -> Result<(), Box<d
         RecoveryCaseKind::Flow,
         &scope,
         &RecoveryContext {
+            memory: None,
             cache: None,
             job: None,
             options: &options,
@@ -462,6 +480,7 @@ fn null_snapshot_metadata_is_not_treated_as_a_legacy_entry() -> Result<(), Box<d
         RecoveryCaseKind::Flow,
         &fresh_scope,
         &RecoveryContext {
+            memory: None,
             cache: Some(&cache),
             job: Some(&job),
             options: &options,
@@ -553,7 +572,7 @@ fn cache_key_does_not_reuse_the_previous_transform_proposal_policy() -> Result<(
 fn changed_recovery_algorithm_rejects_a_stale_partial_result() -> Result<(), Box<dyn Error>> {
     // Earlier stages lack current search, schema handoff, or deferred assembly semantics
     for version in [
-        4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22,
+        4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23,
     ] {
         assert_previous_recovery_recomputed(version)?;
     }
@@ -570,6 +589,7 @@ fn assert_previous_recovery_recomputed(version: u32) -> Result<(), Box<dyn Error
         RecoveryCaseKind::Flow,
         &scope,
         &RecoveryContext {
+            memory: None,
             cache: None,
             job: None,
             options: &options,
@@ -583,7 +603,13 @@ fn assert_previous_recovery_recomputed(version: u32) -> Result<(), Box<dyn Error
     previous.coverage.omissions = u64::try_from(previous.omissions.len())?;
     old_case.add_node("previous_algorithm_marker", None, Vec::new(), json!({}))?;
     let previous_key = previous_recovery_key(&scope, &options, version)?;
-    super::store_result(cache.lease(&previous_key)?, &old_case, &previous, &options)?;
+    super::store_result(
+        cache.lease(&previous_key)?,
+        &old_case,
+        &previous,
+        &options,
+        None,
+    )?;
 
     let job = Job::new("recovery algorithm invalidation");
     let (mut current_case, _) = case_and_scope(b"4142", 37)?;
@@ -592,6 +618,7 @@ fn assert_previous_recovery_recomputed(version: u32) -> Result<(), Box<dyn Error
         RecoveryCaseKind::Flow,
         &scope,
         &RecoveryContext {
+            memory: None,
             cache: Some(&cache),
             job: Some(&job),
             options: &options,
@@ -618,7 +645,12 @@ fn assert_previous_recovery_recomputed(version: u32) -> Result<(), Box<dyn Error
             .lookup(&previous_key, CacheReadPolicy::AllowPartial)?
             .is_some()
     );
-    assert_eq!(cache.stats()?.entries, 2);
+    assert_eq!(
+        cache.stats()?.entries,
+        2,
+        "recovery version {version}; cache fallback: {:?}",
+        job.snapshot()?.cache_fallbacks
+    );
     Ok(())
 }
 
@@ -660,6 +692,7 @@ fn cached_case_with_inaccurate_snapshot_usage_is_rejected_and_recomputed()
         RecoveryCaseKind::Flow,
         &scope,
         &RecoveryContext {
+            memory: None,
             cache: Some(&cache),
             job: None,
             options: &options,
@@ -679,6 +712,7 @@ fn cached_case_with_inaccurate_snapshot_usage_is_rejected_and_recomputed()
             RecoveryCaseKind::Flow,
             &strict_scope,
             &RecoveryContext {
+                memory: None,
                 cache: Some(&cache),
                 job: Some(&strict_job),
                 options: &strict,
@@ -695,6 +729,7 @@ fn cached_case_with_inaccurate_snapshot_usage_is_rejected_and_recomputed()
         RecoveryCaseKind::Flow,
         &fresh_scope,
         &RecoveryContext {
+            memory: None,
             cache: Some(&cache),
             job: Some(&job),
             options: &options,
@@ -737,6 +772,7 @@ fn unknown_snapshot_format_is_rejected_instead_of_counted_as_a_hit() -> Result<(
         RecoveryCaseKind::Flow,
         &scope,
         &RecoveryContext {
+            memory: None,
             cache: None,
             job: None,
             options: &options,
@@ -762,6 +798,7 @@ fn unknown_snapshot_format_is_rejected_instead_of_counted_as_a_hit() -> Result<(
         RecoveryCaseKind::Flow,
         &fresh_scope,
         &RecoveryContext {
+            memory: None,
             cache: Some(&cache),
             job: Some(&job),
             options: &options,
@@ -805,9 +842,12 @@ fn store_case_with_inaccurate_snapshot_usage(
             options.memory_limit,
         ),
     )?;
-    fs::write(lease.directory().join(super::CASE_GRAPH_FILE), graph)?;
     fs::write(
-        lease.directory().join(super::CASE_BLOB_PACK_FILE),
+        lease.directory().join(crate::case_snapshot::GRAPH_FILE),
+        graph,
+    )?;
+    fs::write(
+        lease.directory().join(crate::case_snapshot::BLOB_PACK_FILE),
         blob_pack,
     )?;
     usage.graph_decoded_bytes = usage
@@ -856,6 +896,7 @@ fn recovery_rejects_a_valid_digest_outside_the_case_sources() -> Result<(), Box<
             RecoveryCaseKind::Flow,
             &scope,
             &RecoveryContext {
+                memory: None,
                 cache: None,
                 job: None,
                 options: &options,

@@ -63,7 +63,7 @@ pub(super) fn collect_export(
     let capture_cache = context
         .cache
         .filter(|_| !context.options.no_cache && options.capture != Path::new("-"));
-    let indexed = workbench::full_source::acquire_indexed_source(
+    let mut indexed = workbench::full_source::acquire_indexed_source(
         &options.capture,
         staging,
         &workbench::full_source::AcquisitionOptions {
@@ -73,6 +73,9 @@ pub(super) fn collect_export(
             strict_cache: context.options.strict_cache,
         },
     )?;
+    if let Some(memory) = context.memory {
+        indexed.store.set_memory_budget(memory.clone())?;
+    }
     let worker_count = recovery_worker_count(
         context.options.jobs,
         std::thread::available_parallelism().map_or(1, std::num::NonZeroUsize::get),
