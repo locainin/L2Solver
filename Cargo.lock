@@ -868,6 +868,7 @@ dependencies = [
  "nix",
  "png",
  "rayon",
+ "rusqlite",
  "rustix",
  "serde",
  "serde_json",

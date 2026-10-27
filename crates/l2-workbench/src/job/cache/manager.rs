@@ -424,8 +424,11 @@ impl Cache {
             }
             let status =
                 CheckpointStatus::from_database(status).ok_or(CacheError::CorruptCheckpoint)?;
-            let snapshot =
+            let snapshot: JobSnapshot =
                 serde_json::from_str(&snapshot_json).map_err(|_| CacheError::CorruptCheckpoint)?;
+            if !snapshot.is_valid_checkpoint() {
+                return Err(CacheError::CorruptCheckpoint);
+            }
             Ok(Checkpoint {
                 key: key.clone(),
                 status,

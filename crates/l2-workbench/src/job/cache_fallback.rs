@@ -25,13 +25,16 @@ pub enum CacheStage {
     CaseRecovery,
     /// File artifact analysis during refinement
     ArtifactAnalysis,
+    /// Durable recovery job checkpoints
+    Checkpoint,
 }
 
 impl CacheStage {
-    const ALL: [Self; 3] = [
+    const ALL: [Self; 4] = [
         Self::CaptureIndex,
         Self::CaseRecovery,
         Self::ArtifactAnalysis,
+        Self::Checkpoint,
     ];
 
     /// Returns the short name used by text renderers
@@ -41,6 +44,7 @@ impl CacheStage {
             Self::CaptureIndex => "capture index",
             Self::CaseRecovery => "Case recovery",
             Self::ArtifactAnalysis => "artifact analysis",
+            Self::Checkpoint => "checkpoint",
         }
     }
 }

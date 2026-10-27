@@ -1,7 +1,8 @@
 //! Run extraction and refinement with one observable cancellation state
 
+mod cache;
 mod checkpoint;
-pub use checkpoint::CheckpointWriter;
+pub use cache::RecoveryCache;
 
 use crate::{
     arguments::{ProgressMode, RecoveryOptions},

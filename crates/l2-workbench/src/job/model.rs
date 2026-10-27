@@ -300,6 +300,22 @@ pub struct JobSnapshot {
 }
 
 impl JobSnapshot {
+    pub(super) fn is_valid_checkpoint(&self) -> bool {
+        // Restoration needs exactly one entry for every known phase
+        self.phases.len() == Phase::ALL.len()
+            && Phase::ALL.iter().all(|phase| {
+                self.phases
+                    .iter()
+                    .filter(|entry| entry.phase == *phase)
+                    .count()
+                    == 1
+            })
+            && self
+                .phases
+                .iter()
+                .all(|phase| phase.progress_percent.is_none_or(|percent| percent <= 100))
+    }
+
     /// Finds the recorded measurements for one stage
     #[must_use]
     pub fn phase(&self, phase: Phase) -> Option<&PhaseSnapshot> {

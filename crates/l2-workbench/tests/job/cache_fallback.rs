@@ -301,6 +301,7 @@ fn cache_fallback_categories() -> Vec<serde_json::Value> {
         CacheStage::CaptureIndex,
         CacheStage::CaseRecovery,
         CacheStage::ArtifactAnalysis,
+        CacheStage::Checkpoint,
     ];
     let kinds = [
         CacheFallbackKind::InvalidEntry,

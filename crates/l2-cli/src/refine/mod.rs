@@ -21,9 +21,7 @@ use crate::{
     result_directory::{ResultDirectory, ResultKind},
     workbench::artifact_export,
 };
-use l2_workbench::job::{
-    CacheFallbackKind, CacheStage, Counter, Job, Phase, PhaseOutcome, cache::Cache,
-};
+use l2_workbench::job::{CacheStage, Counter, Job, Phase, PhaseOutcome, cache::Cache};
 use policy::RefinePolicy;
 use std::{
     error::Error,
@@ -80,44 +78,39 @@ pub fn run_with_job(
     ensure_input_unchanged(&input_set, &sampled, &policy, job)?;
     let identity = output::result_identity(&sources, &options.recovery, &policy)?;
 
-    let cache = open_cache(options, job)?;
-    // A restored checkpoint must precede every phase transition in this run
-    let checkpoint = cache
-        .as_ref()
-        .map(|cache| {
-            crate::recovery_job::CheckpointWriter::start(
-                cache,
-                &identity,
-                job,
-                options.recovery.refresh,
-            )
+    let cache = if options.dry_run {
+        crate::recovery_job::RecoveryCache::disabled()
+    } else {
+        crate::recovery_job::RecoveryCache::open(
+            &identity,
+            &options.recovery,
+            CacheStage::ArtifactAnalysis,
+            job,
+        )?
+    };
+    let result = (|| {
+        skip_file_irrelevant_phases(job)?;
+        record_source_counters(job, &sampled)?;
+        start_input_phases(job, sampled.labels.len())?;
+        job.start(Phase::Expansion, None)?;
+        job.start(
+            Phase::TransformDiscovery,
+            Some(u64::try_from(sources.len())?),
+        )?;
+
+        analyze_and_publish(AnalysisPublishContext {
+            options,
+            output,
+            job,
+            destination: &destination,
+            result_directory,
+            identity: &reuse_identity,
+            policy: &policy,
+            sources: &sources,
+            cache: cache.cache(),
         })
-        .transpose()?;
-
-    skip_file_irrelevant_phases(job)?;
-    record_source_counters(job, &sampled)?;
-    start_input_phases(job, sampled.labels.len())?;
-    job.start(Phase::Expansion, None)?;
-    job.start(
-        Phase::TransformDiscovery,
-        Some(u64::try_from(sources.len())?),
-    )?;
-
-    let result = analyze_and_publish(AnalysisPublishContext {
-        options,
-        output,
-        job,
-        destination: &destination,
-        result_directory,
-        identity: &reuse_identity,
-        policy: &policy,
-        sources: &sources,
-        cache: cache.as_ref(),
-    });
-    if let Some(checkpoint) = checkpoint {
-        checkpoint.finish(result.is_ok() && !job.is_cancelled())?;
-    }
-    result
+    })();
+    cache.finish(result, job)
 }
 
 struct ReuseContext<'a, W: Write> {
@@ -179,24 +172,6 @@ fn try_reuse<W: Write>(context: ReuseContext<'_, W>) -> Result<Option<bool>, Box
         )?;
     }
     Ok(Some(reused.complete))
-}
-
-fn open_cache(options: &RefineOptions, job: &Job) -> Result<Option<Cache>, Box<dyn Error>> {
-    if options.dry_run || options.recovery.no_cache {
-        return Ok(None);
-    }
-    match Cache::from_environment(options.recovery.cache_max_bytes) {
-        Ok(cache) => Ok(Some(cache)),
-        Err(error) if options.recovery.strict_cache => Err(error.into()),
-        Err(_) => {
-            job.record_cache_fallback(
-                CacheStage::ArtifactAnalysis,
-                CacheFallbackKind::CacheUnavailable,
-                format_args!("persistent cache could not be opened"),
-            )?;
-            Ok(None)
-        }
-    }
 }
 
 struct AnalysisPublishContext<'a, W: Write> {

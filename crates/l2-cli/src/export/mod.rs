@@ -72,7 +72,7 @@ use crate::{
     publish,
     result_directory::{ResultDirectory, ResultKind},
 };
-use l2_workbench::job::{Counter, Job, Phase, PhaseOutcome, cache::Cache};
+use l2_workbench::job::{CacheStage, Counter, Job, Phase, PhaseOutcome};
 use recovery_cache::RecoveryContext;
 use std::{
     collections::HashSet,
@@ -124,37 +124,29 @@ pub fn run_with_job(
         }
         return Ok(reused.complete);
     }
-    let cache = (!options.recovery.no_cache)
-        .then(|| Cache::from_environment(options.recovery.cache_max_bytes))
-        .transpose()?;
-    let checkpoint = cache
-        .as_ref()
-        .map(|cache| {
-            crate::recovery_job::CheckpointWriter::start(
-                cache,
-                &identity,
-                job,
-                options.recovery.refresh,
-            )
+    let cache = crate::recovery_job::RecoveryCache::open(
+        &identity,
+        &options.recovery,
+        CacheStage::CaptureIndex,
+        job,
+    )?;
+    let result = (|| {
+        job.start(Phase::Preparation, None)?;
+        job.set_current(Phase::Preparation, "input and output policies accepted")?;
+        job.check_cancelled()?;
+        job.finish(Phase::Preparation, PhaseOutcome::Completed)?;
+        let context = RecoveryContext {
+            cache: cache.cache(),
+            job: Some(job),
+            options: &options.recovery,
+        };
+        directory.publish(&identity, job, |staging| {
+            let result = build_export(staging, options, artifact_limits, &context)?;
+            session::check_source_unchanged(options, &identity)?;
+            Ok(result)
         })
-        .transpose()?;
-    job.start(Phase::Preparation, None)?;
-    job.set_current(Phase::Preparation, "input and output policies accepted")?;
-    job.check_cancelled()?;
-    job.finish(Phase::Preparation, PhaseOutcome::Completed)?;
-    let context = RecoveryContext {
-        cache: cache.as_ref(),
-        job: Some(job),
-        options: &options.recovery,
-    };
-    let result = directory.publish(&identity, job, |staging| {
-        let result = build_export(staging, options, artifact_limits, &context)?;
-        session::check_source_unchanged(options, &identity)?;
-        Ok(result)
-    });
-    if let Some(checkpoint) = checkpoint {
-        checkpoint.finish(result.is_ok() && !job.is_cancelled())?;
-    }
+    })();
+    let result = cache.finish(result, job);
     let (count, complete) = result?;
     print_completion(output, options, &destination, count, complete)?;
     Ok(complete)

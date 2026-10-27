@@ -693,3 +693,47 @@ fn symlinked_key_lock_is_rejected_without_opening_its_target() -> Result<(), Box
     assert_eq!(fs::read(outside)?, b"outside-data");
     Ok(())
 }
+
+#[test]
+fn checkpoint_read_rejects_invalid_job_phase_structure() -> Result<(), Box<dyn Error>> {
+    for corruption in ["missing", "duplicate", "invalid progress"] {
+        let temporary = tempfile::tempdir()?;
+        let cache = cache_at(temporary.path(), 1024)?;
+        let key = stage_key("malformed-phase-checkpoint")?;
+        let snapshot = Job::new("checkpoint with invalid phases").snapshot()?;
+        cache.write_checkpoint(&key, &snapshot, CheckpointStatus::Active)?;
+        let mut value = serde_json::to_value(snapshot)?;
+        let phases = value
+            .get_mut("phases")
+            .and_then(serde_json::Value::as_array_mut)
+            .ok_or("checkpoint phase list is missing")?;
+        match corruption {
+            "missing" => phases.clear(),
+            "duplicate" => {
+                let first = phases.first().cloned().ok_or("first phase is missing")?;
+                *phases.get_mut(1).ok_or("second phase is missing")? = first;
+            }
+            _ => {
+                let first = phases.first_mut().ok_or("first phase is missing")?;
+                *first
+                    .get_mut("progress_percent")
+                    .ok_or("progress is missing")? = serde_json::json!(101);
+            }
+        }
+        let connection =
+            rusqlite::Connection::open(temporary.path().join("state").join("cache.sqlite3"))?;
+        connection.execute(
+            "UPDATE checkpoints SET snapshot_json = ?1 WHERE key = ?2",
+            rusqlite::params![value.to_string(), key.as_str()],
+        )?;
+        drop(connection);
+        assert!(
+            matches!(
+                cache.read_checkpoint(&key),
+                Err(CacheError::CorruptCheckpoint)
+            ),
+            "malformed phases must be rejected ({corruption})"
+        );
+    }
+    Ok(())
+}

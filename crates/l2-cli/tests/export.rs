@@ -10,6 +10,8 @@ use std::{
 const BODY: &[u8] = b"object bytes";
 const FTP_BODY: &[u8] = b"example FTP transfer bytes\r\n";
 
+#[path = "export/cache_failure.rs"]
+mod cache_failure;
 #[path = "export/relational.rs"]
 mod relational;
 #[path = "export/repeated.rs"]
