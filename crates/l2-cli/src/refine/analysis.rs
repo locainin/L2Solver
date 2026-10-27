@@ -31,7 +31,7 @@ use std::{
     io::{self, Write},
 };
 
-pub(super) const REFINE_ANALYZER_ALGORITHM_VERSION: u32 = 5;
+pub(super) const REFINE_ANALYZER_ALGORITHM_VERSION: u32 = 6;
 pub(super) const CACHE_ANALYSIS_SCHEMA_VERSION: u32 = 1;
 const MAX_CACHE_RECEIPT_BYTES: usize = 8 * 1024 * 1024;
 
@@ -81,23 +81,7 @@ pub(super) fn analyze_sources(
         } else if source.bytes().is_some() {
             analyze_source_cached(source, options, recovery, cache, job)?
         } else {
-            let range = source.analyze_ranges(input_set, source_index, options, job)?;
-            let mut report = range.report;
-            if let Some(archive) = range.archive {
-                let parent_index = report.artifacts.len();
-                if range.retain_source {
-                    analysis.append_file_archive(
-                        source_index,
-                        parent_index,
-                        source,
-                        &report.source_sha256,
-                        archive.entry_count,
-                    )?;
-                }
-                super::range_members::append_members(&mut report, archive, parent_index, options)?;
-            }
-            record_analysis_work(job, &report)?;
-            report
+            analyze_file_source(&mut analysis, input_set, source_index, source, options, job)?
         };
         let expanded_members = report
             .artifacts
@@ -110,6 +94,50 @@ pub(super) fn analyze_sources(
         job.advance(Phase::TransformDiscovery, 1)?;
     }
     Ok(analysis)
+}
+
+fn analyze_file_source(
+    analysis: &mut AnalyzedSources,
+    input: &InputSet,
+    source_index: usize,
+    source: &LoadedSource,
+    options: ArtifactAnalysisOptions,
+    job: &Job,
+) -> Result<l2_workbench::artifact::ArtifactAnalysis, Box<dyn Error>> {
+    let range = source.analyze_ranges(input, source_index, options, job)?;
+    let mut report = range.report;
+    let mut next_file_index = report.artifacts.len();
+    if let Some(archive) = range.archive {
+        let parent_index = next_file_index;
+        next_file_index += 1;
+        if range.retain_source {
+            analysis.append_file_archive(
+                source_index,
+                parent_index,
+                source,
+                &report.source_sha256,
+                archive.entry_count,
+            )?;
+        }
+        super::range_members::append_members(&mut report, archive, parent_index, options)?;
+    }
+    if let Some(png) = range.png {
+        let artifact_index = report
+            .artifacts
+            .iter()
+            .map(|artifact| artifact.index)
+            .max()
+            .map_or(next_file_index, |index| next_file_index.max(index + 1));
+        analysis.append_file_png(
+            source_index,
+            artifact_index,
+            source,
+            &report.source_sha256,
+            png,
+        )?;
+    }
+    record_analysis_work(job, &report)?;
+    Ok(report)
 }
 
 fn no_case_space(
@@ -162,6 +190,56 @@ impl AnalyzedSources {
         sha256: &str,
         entry_count: usize,
     ) -> Result<(), Box<dyn Error>> {
+        let range = l2_workbench::artifact::FileRange {
+            offset: 0,
+            length: source.length(),
+        };
+        let node_id = self.append_file_node(source_index, artifact_index, source, sha256, range)?;
+        self.file_artifacts.try_reserve(1)?;
+        self.file_artifacts.push(FileArtifact::zip(
+            node_id,
+            source_index,
+            artifact_index,
+            source.length(),
+            sha256.to_owned(),
+            entry_count,
+        ));
+        Ok(())
+    }
+
+    fn append_file_png(
+        &mut self,
+        source_index: usize,
+        artifact_index: usize,
+        source: &LoadedSource,
+        source_sha256: &str,
+        boundary: l2_workbench::artifact::StreamPngBoundary,
+    ) -> Result<(), Box<dyn Error>> {
+        let node_id = self.append_file_node(
+            source_index,
+            artifact_index,
+            source,
+            source_sha256,
+            boundary.range,
+        )?;
+        self.file_artifacts.try_reserve(1)?;
+        self.file_artifacts.push(FileArtifact::png(
+            node_id,
+            source_index,
+            artifact_index,
+            boundary,
+        ));
+        Ok(())
+    }
+
+    fn append_file_node(
+        &mut self,
+        source_index: usize,
+        artifact_index: usize,
+        source: &LoadedSource,
+        sha256: &str,
+        range: l2_workbench::artifact::FileRange,
+    ) -> Result<u64, Box<dyn Error>> {
         let length = u64::try_from(source.length())?;
         let source_id = self.case.add_source(
             &format!("refine-source-{source_index}"),
@@ -176,21 +254,12 @@ impl AnalyzedSources {
             vec![SourceRange {
                 source: source_id,
                 packet: None,
-                offset: 0,
-                length,
+                offset: u64::try_from(range.offset)?,
+                length: u64::try_from(range.length)?,
             }],
             json!({"source_index":source_index,"artifact_index":artifact_index}),
         )?;
-        self.file_artifacts.try_reserve(1)?;
-        self.file_artifacts.push(FileArtifact::zip(
-            node_id,
-            source_index,
-            artifact_index,
-            source.length(),
-            sha256.to_owned(),
-            entry_count,
-        ));
-        Ok(())
+        Ok(node_id)
     }
 
     pub(super) fn analyzer_validation_receipts(

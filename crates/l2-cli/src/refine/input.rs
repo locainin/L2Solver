@@ -224,6 +224,7 @@ pub(super) struct RangeAnalysis {
     pub(super) report: l2_workbench::artifact::ArtifactAnalysis,
     pub(super) archive: Option<l2_workbench::artifact::zip::ZipArtifactReport>,
     pub(super) retain_source: bool,
+    pub(super) png: Option<l2_workbench::artifact::StreamPngBoundary>,
 }
 
 impl LoadedSource {
@@ -287,11 +288,8 @@ impl LoadedSource {
         if zip_candidate {
             scan_options.limits.max_total_work_bytes -= options.limits.max_total_work_bytes / 2;
         }
-        let mut report = l2_workbench::artifact::analyze_artifacts_from_reader(
-            &mut reader,
-            source.length,
-            scan_options,
-        )?;
+        let (mut report, mut png) =
+            analyze_source_stream(&mut reader, source.length, scan_options)?;
         let mut file = reader.into_inner();
         if metadata_fingerprint(&file.metadata()?) != source.metadata {
             return Err(invalid_input(
@@ -317,6 +315,7 @@ impl LoadedSource {
         } else {
             (None, false)
         };
+        png = retain_png_range(png, &mut report, input_set)?;
         if metadata_fingerprint(&file.metadata()?) != source.metadata {
             return Err(invalid_input(
                 "input artifact changed during range analysis",
@@ -327,7 +326,71 @@ impl LoadedSource {
             report,
             archive,
             retain_source,
+            png,
         })
+    }
+}
+
+fn retain_png_range(
+    png: Option<l2_workbench::artifact::StreamPngBoundary>,
+    report: &mut l2_workbench::artifact::ArtifactAnalysis,
+    input: &InputSet,
+) -> Result<Option<l2_workbench::artifact::StreamPngBoundary>, Box<dyn Error>> {
+    let Some(boundary) = png else { return Ok(None) };
+    if report.artifacts.iter().any(|artifact| {
+        artifact.sha256 == boundary.sha256 && artifact.bytes.len() == boundary.range.length
+    }) {
+        return Ok(None);
+    }
+    let length = u64::try_from(boundary.range.length)?;
+    if input.reserve_source_output(length)? {
+        return Ok(Some(boundary));
+    }
+    report.omissions.push(
+        l2_workbench::artifact::AnalysisOmission::SourceRangeOutputReadLimit {
+            length,
+            remaining: input.extra_read_bytes(),
+            maximum: input.budget.maximum(),
+        },
+    );
+    Ok(None)
+}
+
+fn analyze_source_stream(
+    reader: &mut impl Read,
+    length: usize,
+    options: l2_workbench::artifact::ArtifactAnalysisOptions,
+) -> Result<
+    (
+        l2_workbench::artifact::ArtifactAnalysis,
+        Option<l2_workbench::artifact::StreamPngBoundary>,
+    ),
+    Box<dyn Error>,
+> {
+    let mut signature = [0_u8; l2_workbench::artifact::PNG_SIGNATURE.len()];
+    let count = length.min(signature.len());
+    let prefix = signature
+        .get_mut(..count)
+        .ok_or_else(|| invalid_input("source prefix length is invalid"))?;
+    reader.read_exact(prefix)?;
+    // Feed the already-read prefix to the analyzer without reopening the source
+    let is_png = count == signature.len() && signature == l2_workbench::artifact::PNG_SIGNATURE;
+    let prefix = signature
+        .get(..count)
+        .ok_or_else(|| invalid_input("source prefix length is invalid"))?;
+    let mut complete = io::Cursor::new(prefix).chain(reader);
+    if is_png {
+        let result = l2_workbench::artifact::analyze_png_artifacts_from_reader(
+            &mut complete,
+            length,
+            options,
+        )?;
+        Ok((result.analysis, result.png))
+    } else {
+        Ok((
+            l2_workbench::artifact::analyze_artifacts_from_reader(&mut complete, length, options)?,
+            None,
+        ))
     }
 }
 

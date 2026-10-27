@@ -7,7 +7,81 @@ use super::{image_support::structural_png, zip_support};
 use l2_workbench::artifact::{
     AnalysisOmission, AnalysisStatus, ArtifactAnalysisOptions, ArtifactOrigin,
     ArtifactValidationState, EmbeddedFormat, FileRange, analyze_artifacts_from_reader,
+    analyze_png_artifacts_from_reader,
 };
+
+#[test]
+fn streamed_png_and_source_are_hashed_in_one_pass_with_exact_iend_range()
+-> Result<(), Box<dyn Error>> {
+    struct Counted<'a> {
+        source: Cursor<&'a [u8]>,
+        bytes: usize,
+    }
+    impl Read for Counted<'_> {
+        fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+            let count = self.source.read(buffer)?;
+            self.bytes += count;
+            Ok(count)
+        }
+    }
+    let png = structural_png(&[])?;
+    let source = [png.as_slice(), b"unchanged trailing bytes"].concat();
+    let mut reader = Counted {
+        source: Cursor::new(&source),
+        bytes: 0,
+    };
+    let mut settings = options();
+    settings.limits.max_input_bytes = 256;
+    let result = analyze_png_artifacts_from_reader(&mut reader, source.len(), settings)?;
+    let boundary = result.png.ok_or("valid PNG was not identified")?;
+    assert_eq!(
+        boundary.range,
+        FileRange {
+            offset: 0,
+            length: png.len()
+        }
+    );
+    assert_eq!(boundary.sha256, l2_workbench::sha256(&png));
+    assert_eq!(boundary.chunk_count, 2);
+    assert_eq!(result.analysis.source_sha256, l2_workbench::sha256(&source));
+    assert_eq!(
+        reader.bytes,
+        source.len(),
+        "source content was read more than once"
+    );
+    Ok(())
+}
+
+#[test]
+fn streamed_png_crc_failure_never_claims_a_validated_boundary() -> Result<(), Box<dyn Error>> {
+    let mut source = structural_png(&[])?;
+    *source.last_mut().ok_or("PNG is empty")? ^= 1;
+    let result =
+        analyze_png_artifacts_from_reader(&mut Cursor::new(&source), source.len(), options())?;
+    assert!(result.png.is_none());
+    assert_eq!(result.analysis.source_sha256, l2_workbench::sha256(&source));
+    Ok(())
+}
+
+#[test]
+fn streamed_png_validation_work_limit_is_explicit_and_source_is_still_hashed()
+-> Result<(), Box<dyn Error>> {
+    let source = structural_png(&[])?;
+    let mut settings = options();
+    settings.limits.max_total_work_bytes = 8;
+    let result =
+        analyze_png_artifacts_from_reader(&mut Cursor::new(&source), source.len(), settings)?;
+    assert!(result.png.is_none());
+    assert!(result.analysis.omissions.iter().any(|omission| matches!(
+        omission,
+        AnalysisOmission::SourceRangeValidationLimit {
+            format: l2_workbench::artifact::AnalysisFormat::Png,
+            ..
+        }
+    )));
+    assert_eq!(result.analysis.source_sha256, l2_workbench::sha256(&source));
+    Ok(())
+}
 
 fn options() -> ArtifactAnalysisOptions {
     let mut options = ArtifactAnalysisOptions::default();

@@ -31,6 +31,203 @@ fn write_archive_blocks(
     Ok(())
 }
 
+fn write_large_png(path: &Path, blocks: usize, valid_crc: bool) -> Result<u64, Box<dyn Error>> {
+    let basic = super::structural_png()?;
+    let mut file = fs::File::create(path)?;
+    file.write_all(basic.get(..33).ok_or("PNG header missing")?)?;
+    let payload_length = blocks.checked_mul(16 * 1024).ok_or("PNG size overflow")?;
+    file.write_all(&u32::try_from(payload_length)?.to_be_bytes())?;
+    file.write_all(b"rUST")?;
+    let mut crc = crc32fast::Hasher::new();
+    crc.update(b"rUST");
+    for _ in 0..blocks {
+        let bytes = [7_u8; 16 * 1024];
+        crc.update(&bytes);
+        file.write_all(&bytes)?;
+    }
+    let checksum = if valid_crc {
+        crc.finalize()
+    } else {
+        crc.finalize() ^ 1
+    };
+    file.write_all(&checksum.to_be_bytes())?;
+    file.write_all(basic.get(33..).ok_or("PNG IEND missing")?)?;
+    let png_length = fs::metadata(path)?.len();
+    file.write_all(b"trailing bytes are not part of the PNG")?;
+    file.sync_all()?;
+    Ok(png_length)
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+#[expect(
+    clippy::too_many_lines,
+    reason = "the exact output and isolated read accounting form one scenario"
+)]
+fn large_png_is_published_to_iend_after_one_source_pass() -> Result<(), Box<dyn Error>> {
+    const CHILD_MARKER: &str = "L2_TEST_LARGE_PNG_READS_CHILD";
+    if std::env::var_os(CHILD_MARKER).is_none() {
+        let output = std::process::Command::new(std::env::current_exe()?)
+            .args(["refine::tests::large_formats::large_png_is_published_to_iend_after_one_source_pass", "--exact"])
+            .env(CHILD_MARKER, "1")
+            .output()?;
+        assert!(
+            output.status.success(),
+            "child failed: {}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        return Ok(());
+    }
+    let directory = tempfile::tempdir()?;
+    let input = directory.path().join("large.png");
+    let output = directory.path().join("result");
+    let png_length = write_large_png(&input, 70 * 64, true)?;
+    let source_length = fs::metadata(&input)?.len();
+    assert!(png_length > 64 * 1024 * 1024);
+    let options = RefineOptions {
+        input: input.clone(),
+        output: Some(output.clone()),
+        dry_run: false,
+        salvage: false,
+        recovery: RecoveryOptions {
+            no_cache: true,
+            memory_limit: 128 * 1024 * 1024,
+            source_read_limit: 160 * 1024 * 1024,
+            ..RecoveryOptions::default()
+        },
+    };
+    let job = Job::new("large PNG read accounting");
+    let before = super::range_analysis::process_read_bytes()?;
+    assert!(!super::run_with_job(&options, &mut Vec::new(), &job)?);
+    let observed = super::range_analysis::process_read_bytes()? - before;
+    let reads = job
+        .snapshot()?
+        .counters
+        .get(&Counter::SourceReadBytes)
+        .copied()
+        .ok_or("source read counter missing")?;
+    assert!(reads >= source_length + png_length);
+    assert!(
+        reads <= source_length + png_length + 2 * 1024 * 1024,
+        "unexpected source reread: {reads}"
+    );
+    assert!(reads <= options.recovery.source_read_limit);
+    assert!(
+        observed >= reads.saturating_sub(16) && observed <= reads + 128 * 1024,
+        "accounted {reads}, observed {observed}"
+    );
+    let manifest: serde_json::Value =
+        serde_json::from_slice(&fs::read(output.join("manifest.json"))?)?;
+    let artifacts = manifest
+        .get("artifacts")
+        .and_then(serde_json::Value::as_array)
+        .ok_or("artifacts missing")?;
+    let png = artifacts
+        .iter()
+        .find(|item| {
+            item.get("byte_length").and_then(serde_json::Value::as_u64) == Some(png_length)
+        })
+        .ok_or("large PNG missing")?;
+    let name = png
+        .get("file")
+        .and_then(serde_json::Value::as_str)
+        .ok_or("PNG filename missing")?;
+    assert_eq!(
+        Path::new(name)
+            .extension()
+            .and_then(std::ffi::OsStr::to_str),
+        Some("png")
+    );
+    let artifact_hash = serde_json::to_value(SourceIdentity::sha256_file(output.join(name))?)?;
+    assert_eq!(png.get("sha256"), artifact_hash.get("value"));
+    assert_eq!(
+        png.pointer("/origins/0/validation/boundary")
+            .and_then(serde_json::Value::as_str),
+        Some("png_iend")
+    );
+    assert_eq!(
+        png.pointer("/nodes/0/validated_as")
+            .and_then(serde_json::Value::as_str),
+        Some("png_structure")
+    );
+    assert_eq!(
+        manifest.pointer("/sources/0/sha256"),
+        serde_json::to_value(SourceIdentity::sha256_file(input)?)?.get("value")
+    );
+    Ok(())
+}
+
+#[test]
+fn large_png_with_bad_crc_is_not_published_as_validated() -> Result<(), Box<dyn Error>> {
+    let directory = tempfile::tempdir()?;
+    let input = directory.path().join("corrupt.png");
+    let output = directory.path().join("result");
+    let png_length = write_large_png(&input, 320, false)?;
+    let options = RefineOptions {
+        input,
+        output: Some(output.clone()),
+        dry_run: false,
+        salvage: false,
+        recovery: RecoveryOptions {
+            no_cache: true,
+            memory_limit: 16 * 1024 * 1024,
+            ..RecoveryOptions::default()
+        },
+    };
+    assert!(!super::run(&options, &mut Vec::new())?);
+    let manifest: serde_json::Value =
+        serde_json::from_slice(&fs::read(output.join("manifest.json"))?)?;
+    let artifacts = manifest
+        .get("artifacts")
+        .and_then(serde_json::Value::as_array)
+        .ok_or("artifacts missing")?;
+    assert!(!artifacts.iter().any(
+        |item| item.get("byte_length").and_then(serde_json::Value::as_u64) == Some(png_length)
+    ));
+    Ok(())
+}
+
+#[test]
+fn large_png_copy_over_read_limit_records_an_explicit_omission() -> Result<(), Box<dyn Error>> {
+    let directory = tempfile::tempdir()?;
+    let input = directory.path().join("large.png");
+    let output = directory.path().join("result");
+    let png_length = write_large_png(&input, 320, true)?;
+    let options = RefineOptions {
+        input,
+        output: Some(output.clone()),
+        dry_run: false,
+        salvage: false,
+        recovery: RecoveryOptions {
+            no_cache: true,
+            memory_limit: 16 * 1024 * 1024,
+            source_read_limit: 7 * 1024 * 1024,
+            ..RecoveryOptions::default()
+        },
+    };
+    assert!(!super::run(&options, &mut Vec::new())?);
+    let manifest: serde_json::Value =
+        serde_json::from_slice(&fs::read(output.join("manifest.json"))?)?;
+    let artifacts = manifest
+        .get("artifacts")
+        .and_then(serde_json::Value::as_array)
+        .ok_or("artifacts missing")?;
+    assert!(!artifacts.iter().any(
+        |item| item.get("byte_length").and_then(serde_json::Value::as_u64) == Some(png_length)
+    ));
+    assert!(
+        manifest
+            .pointer("/sources/0/omissions")
+            .and_then(serde_json::Value::as_array)
+            .ok_or("source omissions missing")?
+            .iter()
+            .any(|item| item.get("kind").and_then(serde_json::Value::as_str)
+                == Some("source_range_output_read_limit"))
+    );
+    Ok(())
+}
+
 #[test]
 fn archive_above_sixty_four_mib_keeps_its_exact_boundary_and_small_member()
 -> Result<(), Box<dyn Error>> {

@@ -64,7 +64,10 @@ pub use png_pixels::{
 };
 pub use png_stream::{PngRangeChunk, PngRangeReport, PngReadError, parse_png_from_reader};
 pub use r2::import_r2_json;
-pub use range_analyzer::analyze_artifacts_from_reader;
+pub use range_analyzer::{
+    StreamPngAnalysis, StreamPngBoundary, analyze_artifacts_from_reader,
+    analyze_png_artifacts_from_reader,
+};
 pub use signatures::{
     FILE_SIGNATURE_RELATION_REASON, FileSignatureCatalogue, FileSignatureEvidence,
     FileSignatureMatch, FileSignatureMatchKind, FileSignatureReport, scan_file_signatures,

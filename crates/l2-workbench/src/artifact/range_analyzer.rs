@@ -14,12 +14,31 @@ use std::io::{self, Read};
 const MAX_WINDOW_STEP_BYTES: usize = 4 * 1024 * 1024;
 const HASH_TAIL_BYTES: usize = 64 * 1024;
 
+/// A validated PNG boundary and digest collected during the source pass
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct StreamPngBoundary {
+    /// Exact PNG range ending immediately after IEND
+    pub range: FileRange,
+    /// SHA-256 of that range, excluding any following bytes
+    pub sha256: String,
+    /// Number of CRC-checked chunks
+    pub chunk_count: usize,
+}
+
+/// Source analysis and an optional independently validated PNG boundary
+pub struct StreamPngAnalysis {
+    /// Bounded rolling source analysis and the digest of the complete source
+    pub analysis: ArtifactAnalysis,
+    /// PNG structure when the source starts with a valid, affordable PNG
+    pub png: Option<StreamPngBoundary>,
+}
+
 /// Analyze bounded PNG and ZIP ranges while hashing the complete source stream
 ///
 /// Only objects no larger than half the in-memory input limit, capped at 4 MiB, are
-/// guaranteed to fit across a window boundary. Whole-source validation, recursive archive
-/// expansion, and transformations are not performed, so the result is always partial.
-/// The reader must begin at the first source byte and remain stable throughout the call.
+/// guaranteed to fit across a window boundary. Whole-source transformations and recursive
+/// archive expansion are not performed, so the result is always partial. The reader must
+/// begin at the first source byte and remain stable throughout the call.
 ///
 /// # Errors
 /// Returns an I/O error when the source length changes, reading fails, policy limits are
@@ -29,76 +48,242 @@ pub fn analyze_artifacts_from_reader(
     source_length: usize,
     options: ArtifactAnalysisOptions,
 ) -> io::Result<ArtifactAnalysis> {
-    // A full Case may leave no output space while the source still needs hashing
-    let mut validation_limits = options.limits;
-    validation_limits.max_total_output_bytes = validation_limits.max_total_output_bytes.max(1);
-    super::analyzer::validate_limits(validation_limits)
-        .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error))?;
-    if options.limits.max_input_bytes < 2 {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "range analysis needs at least two input bytes",
-        ));
-    }
-    let step = (options.limits.max_input_bytes / 2).clamp(1, MAX_WINDOW_STEP_BYTES);
-    let window_capacity = step
-        .checked_mul(2)
-        .ok_or_else(|| io::Error::other("range window length overflow"))?;
-    let mut window = Vec::new();
-    window
-        .try_reserve_exact(window_capacity.min(source_length))
-        .map_err(io::Error::other)?;
-    let mut state = RangeState::new(options, source_length);
-    let mut source_hasher = Sha256::new();
-    let mut read_bytes = 0_usize;
-    let mut offset = 0_usize;
+    let mut reader = ScannedReader::new(reader, source_length, options)?;
+    reader.drain_source()?;
+    reader.finish()
+}
 
-    // Hash each block once while keeping its bytes for the next overlapping window
-    while read_bytes < source_length || !window.is_empty() {
-        let additional = (source_length - read_bytes).min(window_capacity - window.len());
-        if additional > 0 {
-            let previous_length = window.len();
-            window.resize(previous_length + additional, 0);
-            let new_bytes = window
-                .get_mut(previous_length..)
-                .ok_or_else(|| io::Error::other("range window length is inconsistent"))?;
-            reader.read_exact(new_bytes)?;
-            source_hasher.update(new_bytes);
-            read_bytes += additional;
-        }
-        if !state.can_inspect(window.len()) {
-            // Once coverage stops, hash the remaining source in fixed-size blocks
-            let mut tail = Vec::new();
-            let tail_capacity = (source_length - read_bytes).min(HASH_TAIL_BYTES);
-            tail.try_reserve_exact(tail_capacity)
-                .map_err(io::Error::other)?;
-            tail.resize(tail_capacity, 0);
-            while read_bytes < source_length {
-                let count = (source_length - read_bytes).min(tail.len());
-                let part = tail
-                    .get_mut(..count)
-                    .ok_or_else(|| io::Error::other("hash buffer length is inconsistent"))?;
-                reader.read_exact(part)?;
-                source_hasher.update(part);
-                read_bytes += count;
+/// Validate a source-start PNG while the same bytes feed the rolling analyzer
+///
+/// The canonical PNG scanner checks chunk boundaries and CRCs. Its work is reserved from
+/// the shared byte-work allowance before reading, and a PNG is returned only after IEND.
+/// A file with additional bytes keeps a separate digest for the complete source.
+///
+/// # Errors
+/// Returns an I/O or policy error if the source changes, reading fails, or storage fails
+pub fn analyze_png_artifacts_from_reader(
+    reader: &mut impl Read,
+    source_length: usize,
+    options: ArtifactAnalysisOptions,
+) -> io::Result<StreamPngAnalysis> {
+    if source_length >= options.limits.max_total_work_bytes {
+        let mut analysis = analyze_artifacts_from_reader(reader, source_length, options)?;
+        analysis
+            .omissions
+            .push(AnalysisOmission::SourceRangeValidationLimit {
+                format: AnalysisFormat::Png,
+                reason: String::from("PNG validation exceeds the remaining byte-work limit"),
+            });
+        return Ok(StreamPngAnalysis {
+            analysis,
+            png: None,
+        });
+    }
+    let mut scan_options = options;
+    // Reserve the worst-case PNG scan before the rolling scanner spends work
+    scan_options.limits.max_total_work_bytes -= source_length;
+    let mut reader = ScannedReader::new(reader, source_length, scan_options)?;
+    // Keep chunk metadata within the caller's bounded input allowance
+    let metadata_bytes = std::mem::size_of::<super::PngRangeChunk>().max(1);
+    let limits = PngLimits {
+        max_input_bytes: source_length,
+        max_chunks: PngLimits::default()
+            .max_chunks
+            .min((options.limits.max_input_bytes / metadata_bytes).max(1)),
+    };
+    let result = super::parse_png_from_reader(&mut reader, source_length, limits);
+    let consumed = reader.scanned.read_bytes;
+    let (png, omission) = match result {
+        Ok(report) => {
+            let length = report.bytes_after_iend_range.offset;
+            if length != consumed {
+                return Err(io::Error::other(
+                    "PNG boundary differs from the consumed stream",
+                ));
             }
-            break;
+            // Snapshot at IEND before the reader continues into trailing bytes
+            (
+                Some(StreamPngBoundary {
+                    range: FileRange { offset: 0, length },
+                    sha256: format!("{:x}", reader.scanned.hasher.clone().finalize()),
+                    chunk_count: report.chunks.len(),
+                }),
+                None,
+            )
         }
-        state.inspect_window(&window, offset, step)?;
+        Err(super::PngReadError::Io(error)) => return Err(error),
+        Err(super::PngReadError::Format(
+            error @ (super::PngError::TooManyChunks { .. } | super::PngError::AllocationFailure),
+        )) => (None, Some(error.to_string())),
+        Err(super::PngReadError::Format(_)) => (None, None),
+    };
+    reader.drain_source()?;
+    let mut analysis = reader.finish()?;
+    analysis.work_bytes = analysis
+        .work_bytes
+        .checked_add(consumed)
+        .ok_or_else(|| io::Error::other("PNG validation work overflows"))?;
+    if let Some(reason) = omission {
+        analysis
+            .omissions
+            .push(AnalysisOmission::SourceRangeValidationLimit {
+                format: AnalysisFormat::Png,
+                reason,
+            });
+    }
+    Ok(StreamPngAnalysis { analysis, png })
+}
+
+struct ScannedReader<'a, R> {
+    inner: &'a mut R,
+    scanned: RangeCollector,
+}
+
+impl<'a, R: Read> ScannedReader<'a, R> {
+    fn new(
+        reader: &'a mut R,
+        source_length: usize,
+        options: ArtifactAnalysisOptions,
+    ) -> io::Result<Self> {
+        Ok(Self {
+            inner: reader,
+            scanned: RangeCollector::new(source_length, options)?,
+        })
+    }
+
+    fn drain_source(&mut self) -> io::Result<()> {
+        let capacity = (self.scanned.source_length - self.scanned.read_bytes).min(HASH_TAIL_BYTES);
+        let mut buffer = Vec::new();
+        buffer
+            .try_reserve_exact(capacity)
+            .map_err(io::Error::other)?;
+        buffer.resize(capacity, 0);
+        while self.scanned.read_bytes < self.scanned.source_length {
+            let length = (self.scanned.source_length - self.scanned.read_bytes).min(buffer.len());
+            let part = buffer
+                .get_mut(..length)
+                .ok_or_else(|| io::Error::other("source buffer length is invalid"))?;
+            self.read_exact(part)?;
+        }
+        let mut extra = [0_u8; 1];
+        if self.read(&mut extra)? != 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "source length changed while it was read",
+            ));
+        }
+        Ok(())
+    }
+
+    fn finish(self) -> io::Result<ArtifactAnalysis> {
+        self.scanned.finish()
+    }
+}
+
+impl<R: Read> Read for ScannedReader<'_, R> {
+    fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+        if self.scanned.read_bytes == self.scanned.source_length {
+            return self.inner.read(buffer);
+        }
+        let mut limit = (self.scanned.source_length - self.scanned.read_bytes).min(buffer.len());
+        if !self.scanned.stopped {
+            limit = limit.min(self.scanned.window_capacity - self.scanned.window.len());
+        }
+        let part = buffer
+            .get_mut(..limit)
+            .ok_or_else(|| io::Error::other("source buffer length is invalid"))?;
+        let count = self.inner.read(part)?;
+        self.scanned.accept(
+            part.get(..count)
+                .ok_or_else(|| io::Error::other("source read length is invalid"))?,
+        )?;
+        Ok(count)
+    }
+}
+
+struct RangeCollector {
+    state: RangeState,
+    source_length: usize,
+    read_bytes: usize,
+    offset: usize,
+    step: usize,
+    window_capacity: usize,
+    window: Vec<u8>,
+    hasher: Sha256,
+    stopped: bool,
+}
+
+impl RangeCollector {
+    fn new(source_length: usize, options: ArtifactAnalysisOptions) -> io::Result<Self> {
+        // A full Case may leave no output space while the source still needs hashing
+        let mut validation_limits = options.limits;
+        validation_limits.max_total_output_bytes = validation_limits.max_total_output_bytes.max(1);
+        super::analyzer::validate_limits(validation_limits)
+            .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error))?;
+        if options.limits.max_input_bytes < 2 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "range analysis needs at least two input bytes",
+            ));
+        }
+        let step = (options.limits.max_input_bytes / 2).clamp(1, MAX_WINDOW_STEP_BYTES);
+        let window_capacity = step
+            .checked_mul(2)
+            .ok_or_else(|| io::Error::other("range window length overflow"))?;
+        let mut window = Vec::new();
+        window
+            .try_reserve_exact(window_capacity.min(source_length))
+            .map_err(io::Error::other)?;
+        Ok(Self {
+            state: RangeState::new(options, source_length),
+            source_length,
+            read_bytes: 0,
+            offset: 0,
+            step,
+            window_capacity,
+            window,
+            hasher: Sha256::new(),
+            stopped: false,
+        })
+    }
+
+    fn accept(&mut self, bytes: &[u8]) -> io::Result<()> {
+        self.hasher.update(bytes);
+        self.read_bytes += bytes.len();
+        if self.stopped || bytes.is_empty() {
+            return Ok(());
+        }
+        self.window.extend_from_slice(bytes);
+        if self.window.len() == self.window_capacity {
+            self.inspect_window()?;
+        }
+        Ok(())
+    }
+
+    fn inspect_window(&mut self) -> io::Result<()> {
+        if !self.state.can_inspect(self.window.len()) {
+            self.stopped = true;
+            self.window.clear();
+            return Ok(());
+        }
+        self.state
+            .inspect_window(&self.window, self.offset, self.step)?;
         // The overlap gives boundary-spanning objects another complete window
-        let consumed = step.min(window.len());
-        window.copy_within(consumed.., 0);
-        window.truncate(window.len() - consumed);
-        offset += consumed;
+        let consumed = self.step.min(self.window.len());
+        self.window.copy_within(consumed.., 0);
+        self.window.truncate(self.window.len() - consumed);
+        self.offset += consumed;
+        Ok(())
     }
-    let mut extra = [0_u8; 1];
-    if reader.read(&mut extra)? != 0 {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "source length changed while it was read",
-        ));
+
+    fn finish(mut self) -> io::Result<ArtifactAnalysis> {
+        while !self.stopped && !self.window.is_empty() {
+            self.inspect_window()?;
+        }
+        Ok(self
+            .state
+            .finish(format!("{:x}", self.hasher.finalize()), self.step))
     }
-    Ok(state.finish(format!("{:x}", source_hasher.finalize()), step))
 }
 
 struct RangeState {
