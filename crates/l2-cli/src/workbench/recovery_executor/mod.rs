@@ -12,6 +12,10 @@ mod diagnostics;
 mod discovery;
 mod embedded;
 mod evidence;
+mod execution_state;
+#[cfg(test)]
+#[path = "../../../tests/workbench/recovery_executor_state.rs"]
+mod execution_state_tests;
 mod expansion;
 mod format;
 mod framing;
@@ -56,7 +60,7 @@ use model::{RecoveryExecutionOutcome, RecoveryExecutionPolicy, RecoveryPlan};
 #[cfg(test)]
 use policy::normal_policy;
 use policy::{policy_for_profile, resolve_policy, source_priority};
-use relational::{RelationalDiscoveryContext, RelationalLane, RelationalSampleCollections};
+use relational::{RelationalDiscoveryContext, RelationalSampleCollections};
 use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
 
 pub(super) use super::{decode::service::DecodeBatchLimits, expand::ExpansionLimits};
@@ -296,130 +300,18 @@ fn execute_internal(
 }
 
 fn execute_executor(executor: &mut Executor<'_>) -> Result<(), RecoveryExecutionError> {
-    executor.check_cancelled()?;
-    executor.enqueue_framing_discovery_if_enabled()?;
-    let seed_nodes = executor.initialize_case_index()?;
-    for (node_id, kind) in seed_nodes {
-        executor.enqueue_root(node_id, &kind)?;
-    }
-    let mut record_discovery_barrier_reached = false;
-    let mut evidence_stop = None;
-    let mut evidence_stop_reported = false;
-    loop {
-        drain_candidate_frontier(executor, &mut evidence_stop, &mut evidence_stop_reported)?;
-        // Deferred cohort work can mutate the Case even when the frontier is empty
-        executor.check_cancelled()?;
-        if evidence_stop.is_some() {
-            executor.report_incremental_metadata_omission()?;
-            executor.omit_unsearched_incremental_cohorts()?;
-            break;
-        }
-        if executor.flush_transform_cohorts()? {
-            continue;
-        }
-        if executor.flush_derived_discovery()? {
-            continue;
-        }
-        if !record_discovery_barrier_reached && executor.plan.discover_records {
-            record_discovery_barrier_reached = true;
-            executor.enqueue_record_discovery_if_enabled()?;
-            if executor.coordinator.peek_next_id().is_some() {
-                continue;
-            }
-        }
-        if executor.flush_relational_cohorts(RelationalLane::Normal)? {
-            continue;
-        }
-        if executor.flush_pending_record_assemblies()? {
-            continue;
-        }
-        if executor.enqueue_deferred_record_discovery()? {
-            continue;
-        }
-        // Report a disabled extra view only after normal recovery has drained
-        executor.report_incremental_metadata_omission()?;
-        // Deep work cannot consume resources needed by normal recovery or its derived artifacts
-        if executor.flush_relational_cohorts(RelationalLane::Incremental)? {
-            continue;
-        }
-        if executor.enqueue_next_record_suffix()? {
-            continue;
-        }
-        break;
-    }
-
+    let mut cursor = execution_state::SchedulerCursor::default();
+    while execution_state::step(executor, &mut cursor)? {}
     Ok(())
 }
 
+#[cfg(test)]
 fn drain_candidate_frontier(
     executor: &mut Executor<'_>,
     evidence_stop: &mut Option<evidence::CaseEvidenceStop>,
     evidence_stop_reported: &mut bool,
 ) -> Result<(), RecoveryExecutionError> {
-    loop {
-        // Check before admitting deferred work or removing the next candidate
-        executor.check_cancelled()?;
-        if evidence_stop.is_none()
-            && !executor.pending_record_assemblies.is_empty()
-            && !executor.next_candidate_precedes_deferred_assembly()
-        {
-            executor.flush_pending_record_assemblies()?;
-        }
-        let Some(candidate_id) = executor.coordinator.peek_next_id() else {
-            break;
-        };
-        if evidence_stop.is_none() {
-            let task = executor
-                .coordinator
-                .candidate(candidate_id)
-                .ok_or(RecoveryError::UnknownCandidate { id: candidate_id })?
-                .task();
-            *evidence_stop = evidence::saturated_case_evidence(executor.case, task);
-        }
-        // Keep the candidate queued when cancellation arrives during progress setup
-        if evidence_stop.is_none() {
-            let candidate_task = executor
-                .coordinator
-                .candidate(candidate_id)
-                .ok_or(RecoveryError::UnknownCandidate { id: candidate_id })?
-                .task();
-            if let Some(progress) = &executor.job {
-                progress.begin_candidate(candidate_task)?;
-            }
-        } else {
-            executor.check_cancelled()?;
-        }
-        if executor.coordinator.pop_next()? != Some(candidate_id) {
-            return Err(RecoveryError::InvariantFailure.into());
-        }
-        if let Some(stop) = *evidence_stop {
-            executor.stop_candidate_for_case_evidence(
-                candidate_id,
-                stop,
-                !*evidence_stop_reported,
-            )?;
-            *evidence_stop_reported = true;
-            record_candidate_progress(executor, candidate_id, executor.omissions.len())?;
-            continue;
-        }
-        let omission_start = executor.omissions.len();
-        if let Err(error) = executor.execute_candidate(candidate_id) {
-            *evidence_stop = Some(executor.stop_after_case_evidence_error(candidate_id, error)?);
-            *evidence_stop_reported = true;
-            record_candidate_progress(executor, candidate_id, executor.omissions.len())?;
-            continue;
-        }
-        record_candidate_progress(executor, candidate_id, omission_start)?;
-        if let Some(stop) = evidence::recent_case_evidence_stop(
-            executor
-                .omissions
-                .get(omission_start..)
-                .ok_or(RecoveryError::InvariantFailure)?,
-        ) {
-            *evidence_stop = Some(stop);
-            *evidence_stop_reported = true;
-        }
-    }
+    while execution_state::frontier_step(executor, evidence_stop, evidence_stop_reported)? {}
     Ok(())
 }
 

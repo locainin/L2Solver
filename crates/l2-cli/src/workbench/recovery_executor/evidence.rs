@@ -14,7 +14,8 @@ use l2_workbench::{
 };
 use serde_json::{Value, json};
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, serde::Deserialize, serde::Serialize)]
+#[serde(deny_unknown_fields)]
 pub(super) struct CaseEvidenceStop {
     resource: RecoveryResource,
     limit: usize,
