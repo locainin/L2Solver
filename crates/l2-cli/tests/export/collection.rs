@@ -312,6 +312,11 @@ fn recover_indexed_cases(
         },
     )?;
     process_case_batch(&mut batch, &pool, &context, &mut emit)?;
+    let buffered = budget.snapshot()?.buffered_cases;
+    assert_eq!(buffered.completed_waits, u64::try_from(cases.len())?);
+    assert_eq!(buffered.current_cases, 0);
+    assert_eq!(buffered.current_charged_bytes, 0);
+    assert!(buffered.peak_charged_bytes > 0);
     let (artifact_manifest, artifacts) =
         artifact_snapshot(&mut artifacts, artifact_directory.path())?;
     Ok(RecoveredCaseSnapshot {

@@ -182,7 +182,7 @@ pub(super) fn process_case_batch(
     batch: &mut Vec<PendingCase>,
     pool: &rayon::ThreadPool,
     context: &RecoveryContext<'_>,
-    emit: impl FnMut(RecoveredCase) -> Result<(), Box<dyn Error>>,
+    mut emit: impl FnMut(RecoveredCase) -> Result<(), Box<dyn Error>>,
 ) -> Result<(), Box<dyn Error>> {
     if batch.is_empty() {
         return Ok(());
@@ -207,13 +207,26 @@ pub(super) fn process_case_batch(
             } = pending;
             let recovery = recover(case_mut(&mut item), kind, &scope, context)
                 .map_err(|error| classify_worker_error(error.as_ref()))?;
-            Ok::<_, WorkerFailure>(RecoveredCase {
-                item,
-                scope,
-                recovery,
-            })
+            let buffered = context
+                .memory
+                .zip(case_mut(&mut item).charged_memory_bytes())
+                .map(|(memory, bytes)| memory.observe_buffered_case(bytes))
+                .transpose()
+                .map_err(|error| classify_worker_error(&error))?;
+            Ok::<_, WorkerFailure>((
+                RecoveredCase {
+                    item,
+                    scope,
+                    recovery,
+                },
+                buffered,
+            ))
         },
-        emit,
+        |(case, buffered)| {
+            // End the wait before publication; the Case still owns its allocation charges
+            drop(buffered);
+            emit(case)
+        },
     )
 }
 

@@ -1,5 +1,9 @@
 //! Shared admission for explicitly charged live memory
 
+mod buffering;
+
+pub use buffering::{BufferedCase, BufferedCaseSnapshot};
+
 use super::Job;
 use serde::Serialize;
 use std::error::Error;
@@ -50,6 +54,8 @@ pub enum MemoryError {
     },
     /// Another thread panicked while updating the budget
     StatePoisoned,
+    /// Buffered-result telemetry cannot represent another observation
+    ObservationOverflow,
 }
 
 impl fmt::Display for MemoryError {
@@ -73,6 +79,7 @@ impl fmt::Display for MemoryError {
                 "memory admission timed out requesting {requested} bytes with {used} of {limit} bytes charged"
             ),
             Self::StatePoisoned => formatter.write_str("memory admission state was poisoned"),
+            Self::ObservationOverflow => formatter.write_str("buffered Case observation overflow"),
         }
     }
 }
@@ -96,6 +103,8 @@ pub struct MemorySnapshot {
     pub waiting: usize,
     /// Number of fresh reservations that reached their deadline
     pub timed_out: u64,
+    /// Completed Cases waiting for ordered collection, already included in live charges
+    pub buffered_cases: BufferedCaseSnapshot,
     by_class: ClassCharges,
 }
 
@@ -146,6 +155,7 @@ struct State {
     waiting: usize,
     timed_out: u64,
     by_class: ClassCharges,
+    buffered_cases: BufferedCaseSnapshot,
 }
 
 #[derive(Debug)]
@@ -178,6 +188,7 @@ impl MemoryBudget {
                     waiting: 0,
                     timed_out: 0,
                     by_class: ClassCharges::default(),
+                    buffered_cases: BufferedCaseSnapshot::default(),
                 }),
                 released: Condvar::new(),
             }),
@@ -280,6 +291,7 @@ impl MemoryBudget {
             waiting: state.waiting,
             timed_out: state.timed_out,
             by_class: state.by_class,
+            buffered_cases: state.buffered_cases,
         })
     }
 }

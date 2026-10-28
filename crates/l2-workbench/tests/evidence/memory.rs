@@ -16,6 +16,26 @@ use std::thread;
 type TestResult = Result<(), Box<dyn Error>>;
 
 #[test]
+fn case_reports_its_own_retained_charge_without_including_other_cases() -> TestResult {
+    let budget = MemoryBudget::new(1_000_000);
+    let mut first = Case::with_memory_budget(&budget)?;
+    first.add_bytes_node("first", b"body", Vec::new(), json!({"label":"first"}))?;
+    let first_bytes = first.charged_memory_bytes().ok_or("missing Case charge")?;
+    let mut second = Case::with_memory_budget(&budget)?;
+    second.add_bytes_node("second", b"different", Vec::new(), json!({}))?;
+    assert_eq!(first.charged_memory_bytes(), Some(first_bytes));
+    assert_eq!(
+        budget.snapshot()?.used_bytes,
+        first_bytes
+            + second
+                .charged_memory_bytes()
+                .ok_or("missing second charge")?
+    );
+    assert_eq!(Case::new().charged_memory_bytes(), None);
+    Ok(())
+}
+
+#[test]
 fn case_applies_blob_policy_and_shared_memory_pressure_together() -> TestResult {
     let budget = MemoryBudget::new(100_000);
     assert!(matches!(

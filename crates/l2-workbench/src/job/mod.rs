@@ -10,7 +10,10 @@ mod recovery_transition;
 pub use cache_fallback::{
     CacheFallbackKind, CacheFallbackRecord, CacheFallbackSummary, CacheStage,
 };
-pub use memory::{MemoryBudget, MemoryClass, MemoryError, MemoryLease, MemorySnapshot};
+pub use memory::{
+    BufferedCase, BufferedCaseSnapshot, MemoryBudget, MemoryClass, MemoryError, MemoryLease,
+    MemorySnapshot,
+};
 pub use model::{
     Counter, Job, JobError, JobSnapshot, Phase, PhaseOutcome, PhaseSnapshot, PhaseState,
     WorkSnapshot,

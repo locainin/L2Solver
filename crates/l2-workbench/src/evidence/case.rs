@@ -345,6 +345,16 @@ impl Case {
         self.resource_limits.blob_bytes
     }
 
+    /// Return this Case's current retained allocation charge, when admission is enabled
+    ///
+    /// This excludes scratch allocations, other Cases, allocator overhead, and process RSS
+    #[must_use]
+    pub fn charged_memory_bytes(&self) -> Option<u64> {
+        self.memory
+            .as_ref()
+            .map(|memory| memory.graph_bytes() + memory.blobs.bytes())
+    }
+
     /// Return a read-only snapshot of retained blob, node-detail, and source-range usage
     ///
     /// This reads the counters maintained by successful Case mutations in constant time.

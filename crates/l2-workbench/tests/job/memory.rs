@@ -8,6 +8,62 @@ use std::time::Instant;
 type TestResult = Result<(), Box<dyn Error + Send + Sync>>;
 
 #[test]
+fn buffered_case_observations_measure_retention_without_charging_memory_twice() -> TestResult {
+    let budget = MemoryBudget::new(100);
+    let retained = budget.try_reserve(MemoryClass::Case, 80)?;
+    let first = budget.observe_buffered_case(30)?;
+    let second = budget.observe_buffered_case(50)?;
+    let snapshot = budget.snapshot()?;
+    assert_eq!(snapshot.used_bytes, 80);
+    assert_eq!(snapshot.buffered_cases.current_cases, 2);
+    assert_eq!(snapshot.buffered_cases.current_charged_bytes, 80);
+    assert_eq!(snapshot.buffered_cases.peak_cases, 2);
+    assert_eq!(snapshot.buffered_cases.peak_charged_bytes, 80);
+
+    drop(first);
+    let snapshot = budget.snapshot()?;
+    assert_eq!(snapshot.buffered_cases.current_cases, 1);
+    assert_eq!(snapshot.buffered_cases.current_charged_bytes, 50);
+    drop(second);
+    let snapshot = budget.snapshot()?;
+    assert_eq!(snapshot.buffered_cases.current_cases, 0);
+    assert_eq!(snapshot.buffered_cases.current_charged_bytes, 0);
+    assert_eq!(snapshot.buffered_cases.completed_waits, 2);
+    assert_eq!(snapshot.used_bytes, 80);
+    drop(retained);
+    assert_eq!(budget.snapshot()?.used_bytes, 0);
+    Ok(())
+}
+
+#[test]
+fn buffered_case_wait_is_measured_when_the_collector_releases_its_observation() -> TestResult {
+    let budget = MemoryBudget::new(100);
+    let queued = budget.observe_buffered_case(20)?;
+    // A short real wait checks the monotonic clock rather than an invented duration
+    thread::sleep(Duration::from_millis(5));
+    drop(queued);
+    let snapshot = budget.snapshot()?;
+    assert!(snapshot.buffered_cases.longest_wait_ms >= 5);
+    assert!(snapshot.buffered_cases.total_wait_ms >= snapshot.buffered_cases.longest_wait_ms);
+    Ok(())
+}
+
+#[test]
+fn overflowing_buffer_observation_preserves_the_previous_metrics() -> TestResult {
+    let budget = MemoryBudget::new(u64::MAX);
+    let first = budget.observe_buffered_case(u64::MAX)?;
+    let before = budget.snapshot()?;
+    assert_eq!(
+        budget.observe_buffered_case(1).err(),
+        Some(MemoryError::ObservationOverflow)
+    );
+    assert_eq!(budget.snapshot()?, before);
+    drop(first);
+    assert_eq!(budget.snapshot()?.buffered_cases.current_charged_bytes, 0);
+    Ok(())
+}
+
+#[test]
 fn leases_share_an_exact_limit_and_release_on_drop() -> TestResult {
     let budget = MemoryBudget::new(100);
     let mut case = budget.try_reserve(MemoryClass::Case, 40)?;
