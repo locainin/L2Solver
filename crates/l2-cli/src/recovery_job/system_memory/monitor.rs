@@ -1,6 +1,7 @@
 //! Observe kernel memory independently of progress rendering and cache writes
 
 use super::Reader;
+use crate::recovery_job::MEMORY_OBSERVATION_INTERVAL;
 use l2_workbench::job::MemoryBudget;
 use std::{
     error::Error,
@@ -8,10 +9,7 @@ use std::{
     path::Path,
     sync::mpsc::{self, Sender},
     thread::{self, JoinHandle},
-    time::Duration,
 };
-
-const INTERVAL: Duration = Duration::from_millis(250);
 
 pub(in crate::recovery_job) struct Monitor {
     stop: Sender<()>,
@@ -28,7 +26,7 @@ impl Monitor {
             .name("l2-memory-pressure".to_owned())
             .spawn(move || {
                 loop {
-                    match receiver.recv_timeout(INTERVAL) {
+                    match receiver.recv_timeout(MEMORY_OBSERVATION_INTERVAL) {
                         Ok(()) | Err(mpsc::RecvTimeoutError::Disconnected) => break,
                         Err(mpsc::RecvTimeoutError::Timeout) => observe(&memory)?,
                     }

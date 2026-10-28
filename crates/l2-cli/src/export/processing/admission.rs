@@ -6,15 +6,18 @@ mod tests;
 
 use super::{PendingCase, case_mut};
 use crate::export::recovery_cache::RecoveryContext;
+use crate::recovery_job::MEMORY_OBSERVATION_INTERVAL;
 use l2_workbench::{
     evidence::Case,
-    job::{MemoryBudget, MemoryError, MemorySnapshot, MemoryWorkingSet, Phase},
+    job::{Job, MemoryBudget, MemoryError, MemorySnapshot, MemoryWorkingSet, Phase},
     protocol::ProtocolLimits,
 };
-use std::error::Error;
+use std::{error::Error, thread, time::Duration};
 
 // Four missed monitor intervals make an old observation unsuitable for a new admission
-const MAX_SAMPLE_AGE_MS: u64 = 1_000;
+const MAX_SAMPLE_AGE: Duration = MEMORY_OBSERVATION_INTERVAL.saturating_mul(4);
+// Two further samples distinguish a transient cleanup peak from sustained pressure
+const QUIESCENT_PRESSURE_RECHECKS: u8 = 2;
 // This margin covers uncharged runtime allocations; it is not an RSS guarantee
 const SAFETY_MARGIN_DIVISOR: u64 = 8;
 
@@ -42,13 +45,8 @@ pub(super) fn admit(
         return Ok(Some(Admission { working_set: None }));
     };
     let growth = startup_growth(case_mut(&mut pending.item))?;
-    let mut snapshot = memory.snapshot()?;
-    if snapshot.system.is_some() || snapshot.system_observation_failures != 0 {
-        // Reuse the job's OS monitor; component-only budgets do not enable process accounting
-        crate::recovery_job::refresh_memory_observation(memory)?;
-        snapshot = memory.snapshot()?;
-    }
-    let admission = check_pressure(&snapshot, growth).and_then(|()| memory.try_working_set(growth));
+    let admission = check_admission_pressure(active, growth, context.job, || observe(memory))
+        .and_then(|()| memory.try_working_set(growth).map_err(Into::into));
     match admission {
         Ok(work) => {
             case_mut(&mut pending.item).use_working_set(&work)?;
@@ -56,7 +54,13 @@ pub(super) fn admit(
                 working_set: Some(work),
             }))
         }
-        Err(MemoryError::Limit { .. } | MemoryError::Pressure { .. }) if active > 0 => {
+        Err(error)
+            if active > 0
+                && matches!(
+                    crate::memory_error::find(error.as_ref()),
+                    Some(MemoryError::Limit { .. } | MemoryError::Pressure { .. })
+                ) =>
+        {
             if let Some(job) = context.job {
                 job.set_current(
                     Phase::FramingRecordDiscovery,
@@ -65,7 +69,54 @@ pub(super) fn admit(
             }
             Ok(None)
         }
-        Err(error) => Err(error.into()),
+        Err(error) => Err(error),
+    }
+}
+
+fn observe(memory: &MemoryBudget) -> Result<MemorySnapshot, MemoryError> {
+    let mut snapshot = memory.snapshot()?;
+    if snapshot.system.is_some() || snapshot.system_observation_failures != 0 {
+        // Reuse the job's OS monitor; component-only budgets do not enable process accounting
+        crate::recovery_job::refresh_memory_observation(memory)?;
+        snapshot = memory.snapshot()?;
+    }
+    Ok(snapshot)
+}
+
+fn check_admission_pressure(
+    active: usize,
+    growth: u64,
+    job: Option<&Job>,
+    mut observe: impl FnMut() -> Result<MemorySnapshot, MemoryError>,
+) -> Result<(), Box<dyn Error>> {
+    let mut rechecks = if active == 0 {
+        QUIESCENT_PRESSURE_RECHECKS
+    } else {
+        0
+    };
+    loop {
+        if let Some(job) = job {
+            job.check_cancelled()?;
+        }
+        let snapshot = observe()?;
+        if let Some(job) = job {
+            // Cancellation can arrive while the kernel observation is being read
+            job.check_cancelled()?;
+        }
+        match check_pressure(&snapshot, growth) {
+            Err(MemoryError::Pressure { .. }) if rechecks > 0 => {
+                rechecks -= 1;
+                if let Some(job) = job {
+                    job.set_current(
+                        Phase::FramingRecordDiscovery,
+                        "Waiting for released recovery storage to settle",
+                    )?;
+                }
+                // Active workers return immediately so the collector can release their results
+                thread::sleep(MEMORY_OBSERVATION_INTERVAL);
+            }
+            result => return result.map_err(Into::into),
+        }
     }
 }
 
@@ -89,7 +140,7 @@ fn check_pressure(snapshot: &MemorySnapshot, growth: u64) -> Result<(), MemoryEr
     let Some(system) = snapshot.system.filter(|_| {
         snapshot
             .system_sample_age_ms
-            .is_some_and(|age| age <= MAX_SAMPLE_AGE_MS)
+            .is_some_and(|age| Duration::from_millis(age) <= MAX_SAMPLE_AGE)
     }) else {
         // Logical admission remains available; missing OS data stays visible in telemetry
         return Ok(());

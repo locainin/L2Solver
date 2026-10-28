@@ -15,7 +15,11 @@ use l2_workbench::job::{Job, JobSnapshot, MemoryBudget, MemoryError};
 use std::{
     error::Error,
     io::{self, Write},
+    time::Duration,
 };
+
+/// Cadence for kernel observations and admission rechecks after workers have stopped
+pub const MEMORY_OBSERVATION_INTERVAL: Duration = Duration::from_millis(250);
 
 /// Refresh the shared observation before admitting another memory-intensive operation
 pub fn refresh_memory_observation(memory: &MemoryBudget) -> Result<(), MemoryError> {
