@@ -1,6 +1,6 @@
 use super::RecoveryExecutionError;
 use l2_workbench::evidence::{
-    Case, CaseIdentity, MAX_BLOBS, MAX_EDGES, MAX_NODE_KIND_BYTES, MAX_NODES, MAX_REASON_BYTES,
+    Case, CaseIdentity, MAX_EDGES, MAX_NODE_KIND_BYTES, MAX_NODES, MAX_REASON_BYTES,
     MAX_RELATION_BYTES,
 };
 use std::sync::Arc;
@@ -169,11 +169,6 @@ pub(super) fn case_index_work_limit() -> Result<usize, RecoveryExecutionError> {
             .ok_or_else(|| invalid_bound("Case index nodes"))?,
         "Case index nodes",
     )?;
-    let blob_work = checked_product(
-        MAX_BLOBS,
-        CONTENT_ID_BYTES + std::mem::size_of::<usize>(),
-        "Case index blobs",
-    )?;
     let edge_work = checked_product(
         MAX_EDGES,
         MAX_RELATION_BYTES
@@ -183,10 +178,7 @@ pub(super) fn case_index_work_limit() -> Result<usize, RecoveryExecutionError> {
             + INDEX_VALIDATED_RANGE_KEY_VALUE_BYTES,
         "Case index edges",
     )?;
-    checked_sum(
-        &[node_work, blob_work, edge_work, seed_sort],
-        "Case index ledger",
-    )
+    checked_sum(&[node_work, edge_work, seed_sort], "Case index ledger")
 }
 
 pub(super) fn case_index_scan_bound(case: &Case) -> Result<usize, RecoveryExecutionError> {
@@ -199,11 +191,6 @@ pub(super) fn case_index_scan_bound(case: &Case) -> Result<usize, RecoveryExecut
             + std::mem::size_of::<u64>()
             + std::mem::size_of::<usize>(),
         "Case index nodes",
-    )?;
-    let blob_work = checked_product(
-        case.blobs().len(),
-        CONTENT_ID_BYTES + std::mem::size_of::<usize>(),
-        "Case index blobs",
     )?;
     let edge_work = checked_product(
         case.edges().len(),
@@ -221,14 +208,13 @@ pub(super) fn case_index_scan_bound(case: &Case) -> Result<usize, RecoveryExecut
     )?;
     let seed_sort = seed_ordering_work_bound(case.nodes().len())?;
     checked_sum(
-        &[node_work, blob_work, edge_work, seed_visit, seed_sort],
+        &[node_work, edge_work, seed_visit, seed_sort],
         "initial Case index scan",
     )
 }
 
 pub(super) fn case_index_suffix_scan_bound(
     previous_nodes: usize,
-    previous_blobs: usize,
     previous_edges: usize,
     case: &Case,
 ) -> Result<usize, RecoveryExecutionError> {
@@ -237,11 +223,6 @@ pub(super) fn case_index_suffix_scan_bound(
         .len()
         .checked_sub(previous_nodes)
         .ok_or_else(|| invalid_bound("Case index node high-water mark"))?;
-    let blobs = case
-        .blobs()
-        .len()
-        .checked_sub(previous_blobs)
-        .ok_or_else(|| invalid_bound("Case index blob high-water mark"))?;
     let edges = case
         .edges()
         .len()
@@ -257,11 +238,6 @@ pub(super) fn case_index_suffix_scan_bound(
             + std::mem::size_of::<usize>(),
         "Case index suffix nodes",
     )?;
-    let blob_work = checked_product(
-        blobs,
-        CONTENT_ID_BYTES + std::mem::size_of::<usize>(),
-        "Case index suffix blobs",
-    )?;
     let edge_work = checked_product(
         edges,
         MAX_RELATION_BYTES
@@ -271,7 +247,7 @@ pub(super) fn case_index_suffix_scan_bound(
             + INDEX_VALIDATED_RANGE_KEY_VALUE_BYTES,
         "Case index suffix edges",
     )?;
-    checked_sum(&[node_work, blob_work, edge_work], "Case index suffix scan")
+    checked_sum(&[node_work, edge_work], "Case index suffix scan")
 }
 
 fn seed_ordering_work_bound(seeds: usize) -> Result<usize, RecoveryExecutionError> {

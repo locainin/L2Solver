@@ -750,14 +750,11 @@ type ContextualDecodingViewKey = (String, u64, u64);
 
 #[derive(Default)]
 struct CaseIndex {
-    node_positions: HashMap<u64, usize>,
-    blob_positions: HashMap<String, usize>,
     decoding_outputs: HashMap<u64, u64>,
     contextual_decoding_views: HashMap<ContextualDecodingViewKey, u64>,
     validated_ranges_by_receipt: HashMap<u64, BTreeSet<u64>>,
     has_relational_frames: bool,
     node_count: usize,
-    blob_count: usize,
     edge_count: usize,
     scan_ledger: CaseIndexScanLedger,
 }
@@ -791,8 +788,7 @@ impl CaseIndex {
     }
 
     fn refresh(&mut self, case: &Case) -> Result<(), RecoveryExecutionError> {
-        let scan_bound =
-            case_index_suffix_scan_bound(self.node_count, self.blob_count, self.edge_count, case)?;
+        let scan_bound = case_index_suffix_scan_bound(self.node_count, self.edge_count, case)?;
         if scan_bound > self.scan_ledger.remaining()? {
             return Err(RecoveryError::InvariantFailure.into());
         }
@@ -812,10 +808,7 @@ impl CaseIndex {
         case: &Case,
         collect_seeds: bool,
     ) -> Result<(usize, Vec<(u64, String)>), RecoveryExecutionError> {
-        if self.node_count > case.nodes().len()
-            || self.blob_count > case.blobs().len()
-            || self.edge_count > case.edges().len()
-        {
+        if self.node_count > case.nodes().len() || self.edge_count > case.edges().len() {
             return Err(RecoveryError::InvariantFailure.into());
         }
 
@@ -830,14 +823,10 @@ impl CaseIndex {
         }
         let mut work = self.index_new_nodes(case, collect_seeds, &mut seeds)?;
         work = work
-            .checked_add(self.index_new_blobs(case)?)
-            .ok_or(RecoveryError::InvariantFailure)?;
-        work = work
             .checked_add(self.index_new_edges(case)?)
             .ok_or(RecoveryError::InvariantFailure)?;
 
         self.node_count = case.nodes().len();
-        self.blob_count = case.blobs().len();
         self.edge_count = case.edges().len();
         let roots = if collect_seeds {
             let (roots, sort_work) = sort_root_seeds(&seeds)?;
@@ -858,8 +847,7 @@ impl CaseIndex {
         seeds: &mut Vec<RootSeed>,
     ) -> Result<usize, RecoveryExecutionError> {
         let mut work = 0_usize;
-        for (position, node) in case.nodes().iter().enumerate().skip(self.node_count) {
-            self.node_positions.insert(node.id, position);
+        for node in case.nodes().iter().skip(self.node_count) {
             // Cache this marker while visiting new nodes, before validation needs lineage
             self.has_relational_frames |= node.kind == relational::DECODED_FRAME_KIND;
             work = work
@@ -914,18 +902,6 @@ impl CaseIndex {
         Ok(work)
     }
 
-    fn index_new_blobs(&mut self, case: &Case) -> Result<usize, RecoveryExecutionError> {
-        let mut work = 0_usize;
-        for (position, blob) in case.blobs().iter().enumerate().skip(self.blob_count) {
-            self.blob_positions.insert(blob.id.clone(), position);
-            work = work
-                .checked_add(blob.id.len())
-                .and_then(|total| total.checked_add(std::mem::size_of::<usize>()))
-                .ok_or(RecoveryError::InvariantFailure)?;
-        }
-        Ok(work)
-    }
-
     fn index_new_edges(&mut self, case: &Case) -> Result<usize, RecoveryExecutionError> {
         let mut work = 0_usize;
         for edge in case.edges().iter().skip(self.edge_count) {
@@ -935,10 +911,7 @@ impl CaseIndex {
                 .and_then(|total| total.checked_add(17))
                 .ok_or(RecoveryError::InvariantFailure)?;
             if edge.relation == "produced"
-                && let Some(target) = self
-                    .node_positions
-                    .get(&edge.to)
-                    .and_then(|position| case.nodes().get(*position))
+                && let Some(target) = case.node(edge.to)
             {
                 work = work
                     .checked_add(target.kind.len())

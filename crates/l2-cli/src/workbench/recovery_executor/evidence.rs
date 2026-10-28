@@ -648,31 +648,18 @@ impl Executor<'_> {
 
     pub(super) fn node_kind(&mut self, node_id: u64) -> Result<&str, RecoveryExecutionError> {
         self.refresh_case_index()?;
-        let position = self
-            .case_index
-            .node_positions
-            .get(&node_id)
-            .copied()
-            .ok_or(RecoveryError::UnknownEvidenceNode { node_id })?;
+        // Case already provides constant-time lookup for its sequential node identifiers
         self.case
-            .nodes()
-            .get(position)
+            .node(node_id)
             .map(|node| node.kind.as_str())
-            .ok_or_else(|| RecoveryError::InvariantFailure.into())
+            .ok_or_else(|| RecoveryError::UnknownEvidenceNode { node_id }.into())
     }
 
     pub(super) fn node_blob_id(&mut self, node_id: u64) -> Result<&str, RecoveryExecutionError> {
         self.refresh_case_index()?;
-        let position = self
-            .case_index
-            .node_positions
-            .get(&node_id)
-            .copied()
-            .ok_or(RecoveryError::UnknownEvidenceNode { node_id })?;
         self.case
-            .nodes()
-            .get(position)
-            .ok_or(RecoveryError::InvariantFailure)?
+            .node(node_id)
+            .ok_or(RecoveryError::UnknownEvidenceNode { node_id })?
             .blob
             .as_deref()
             .ok_or_else(|| RecoveryError::InputBlobMissing { node_id }.into())
@@ -680,16 +667,16 @@ impl Executor<'_> {
 
     pub(super) fn node_bytes(&mut self, node_id: u64) -> Result<&[u8], RecoveryExecutionError> {
         self.refresh_case_index()?;
-        let blob_id = self.node_blob_id(node_id)?.to_owned();
-        let position = self
-            .case_index
-            .blob_positions
-            .get(&blob_id)
-            .copied()
-            .ok_or(RecoveryError::InvariantFailure)?;
+        let blob_id = self
+            .case
+            .node(node_id)
+            .ok_or(RecoveryError::UnknownEvidenceNode { node_id })?
+            .blob
+            .as_deref()
+            .ok_or(RecoveryError::InputBlobMissing { node_id })?;
+        // Reuse the canonical content index without cloning a digest for every read
         self.case
-            .blobs()
-            .get(position)
+            .blob(blob_id)
             .map(|blob| blob.bytes.as_slice())
             .ok_or_else(|| RecoveryError::InvariantFailure.into())
     }

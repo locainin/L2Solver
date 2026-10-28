@@ -171,7 +171,7 @@ fn retained_case_index_charges_initial_and_appended_entries_once() -> TestResult
 
     let appended_kind = "unrelated_evidence";
     case.add_node(appended_kind, None, Vec::new(), json!({}))?;
-    let suffix_bound = case_index_suffix_scan_bound(1, 1, 0, &case)?;
+    let suffix_bound = case_index_suffix_scan_bound(1, 0, &case)?;
     index.refresh(&case)?;
     let appended_charge = index
         .scan_ledger
@@ -230,12 +230,8 @@ fn retained_case_index_charges_contextual_view_key_bytes_within_both_bounds() ->
             "source_input_node":input_node
         }),
     )?;
-    let suffix_bound = case_index_suffix_scan_bound(
-        case.nodes().len() - 1,
-        case.blobs().len(),
-        case.edges().len(),
-        &case,
-    )?;
+    let suffix_bound =
+        case_index_suffix_scan_bound(case.nodes().len() - 1, case.edges().len(), &case)?;
     let previous_charge = index.scan_ledger.charged();
     index.refresh(&case)?;
     let appended_charge = index
@@ -269,7 +265,6 @@ fn retained_case_index_charges_validated_range_reverse_entries_within_all_bounds
     let second_input = case.add_bytes_node("source", b"second input", Vec::new(), json!({}))?;
     let validation = case.add_node("artifact_validation", None, Vec::new(), json!({}))?;
     let previous_nodes = case.nodes().len();
-    let previous_blobs = case.blobs().len();
     let previous_edges = case.edges().len();
     let empty_edge_bound = case_index_scan_bound(&case)?;
     let mut index = super::super::CaseIndex::new(&case)?;
@@ -292,8 +287,7 @@ fn retained_case_index_charges_validated_range_reverse_entries_within_all_bounds
         + INDEX_VALIDATED_RANGE_KEY_VALUE_BYTES;
     let expected_suffix_bound = 2 * per_edge_bound;
     let initial_bound = case_index_scan_bound(&case)?;
-    let suffix_bound =
-        case_index_suffix_scan_bound(previous_nodes, previous_blobs, previous_edges, &case)?;
+    let suffix_bound = case_index_suffix_scan_bound(previous_nodes, previous_edges, &case)?;
     assert_eq!(initial_bound - empty_edge_bound, expected_suffix_bound);
     assert_eq!(suffix_bound, expected_suffix_bound);
 
@@ -331,7 +325,6 @@ fn retained_case_index_charges_validated_range_reverse_entries_within_all_bounds
     let seed_visit = node_visit + MAX_NODE_KIND_BYTES + 2;
     let seed_sort = MAX_NODES * INDEX_RADIX_PASSES * 2 + INDEX_RADIX_PASSES * 256;
     let global_expected = MAX_NODES * (node_visit + seed_visit)
-        + MAX_BLOBS * (CONTENT_ID_BYTES + std::mem::size_of::<usize>())
         + MAX_EDGES
             * (MAX_RELATION_BYTES
                 + MAX_REASON_BYTES
