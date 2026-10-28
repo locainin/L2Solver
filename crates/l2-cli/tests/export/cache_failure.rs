@@ -1,6 +1,47 @@
 use super::*;
 
 #[test]
+fn strict_cache_startup_failure_finishes_the_visible_preparation_phase()
+-> Result<(), Box<dyn Error>> {
+    let temporary = tempfile::tempdir()?;
+    let root = temporary.path();
+    let capture = root.join("capture.pcap");
+    let destination = root.join("result");
+    fs::write(&capture, capture_with_http_body(BODY)?)?;
+    fs::write(root.join("cache"), b"not a directory")?;
+
+    let result = super::repeated::extraction_command(root, &capture, &destination)
+        .args(["--strict-cache", "--progress", "json"])
+        .output()?;
+    assert_eq!(result.status.code(), Some(1));
+    assert!(!destination.exists());
+    let stderr = String::from_utf8(result.stderr)?;
+    let preparation = stderr
+        .lines()
+        .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+        .filter_map(|snapshot| snapshot.get("phases").cloned())
+        .filter_map(|phases| phases.as_array().cloned())
+        .flatten()
+        .filter(|phase| {
+            phase.get("phase").and_then(serde_json::Value::as_str) == Some("preparation")
+        })
+        .last()
+        .ok_or("preparation progress is missing")?;
+    assert_eq!(
+        preparation.get("state").and_then(serde_json::Value::as_str),
+        Some("failed"),
+        "{stderr}"
+    );
+    assert_eq!(
+        preparation
+            .get("message")
+            .and_then(serde_json::Value::as_str),
+        Some("opening recovery cache")
+    );
+    Ok(())
+}
+
+#[test]
 fn unavailable_cache_preserves_recovered_artifact_bytes_and_completion()
 -> Result<(), Box<dyn Error>> {
     let temporary = tempfile::tempdir()?;

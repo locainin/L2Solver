@@ -128,18 +128,34 @@ pub fn run_with_job(
         }
         return Ok(reused.complete);
     }
-    let cache = crate::recovery_job::RecoveryCache::open(
+    let memory = MemoryBudget::new(options.recovery.memory_limit);
+    job.start(Phase::Preparation, None)?;
+    job.set_current(Phase::Preparation, "opening recovery cache")?;
+    let opened = crate::recovery_job::RecoveryCache::open(
         &identity,
         &options.recovery,
         CacheStage::CaptureIndex,
         job,
-    )?;
+        Some(&memory),
+    );
+    let cache = match opened {
+        Ok(cache) => cache,
+        Err(error) => {
+            job.finish(
+                Phase::Preparation,
+                if job.is_cancelled() {
+                    PhaseOutcome::Cancelled
+                } else {
+                    PhaseOutcome::Failed
+                },
+            )?;
+            return Err(error);
+        }
+    };
     let result = (|| {
-        job.start(Phase::Preparation, None)?;
         job.set_current(Phase::Preparation, "input and output policies accepted")?;
         job.check_cancelled()?;
         job.finish(Phase::Preparation, PhaseOutcome::Completed)?;
-        let memory = MemoryBudget::new(options.recovery.memory_limit);
         let context = RecoveryContext {
             memory: Some(&memory),
             cache: cache.cache(),

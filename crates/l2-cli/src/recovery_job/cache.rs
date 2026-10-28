@@ -2,7 +2,10 @@
 
 use super::checkpoint::{CheckpointError, CheckpointWriter};
 use crate::{arguments::RecoveryOptions, result_directory::ResultIdentity};
-use l2_workbench::job::{CacheFallbackKind, CacheStage, Job, cache::Cache};
+use l2_workbench::job::{
+    CacheFallbackKind, CacheStage, Job, MemoryBudget,
+    cache::{Cache, CacheError},
+};
 use std::{error::Error, fmt};
 
 pub struct RecoveryCache {
@@ -25,14 +28,24 @@ impl RecoveryCache {
         options: &RecoveryOptions,
         stage: CacheStage,
         job: &Job,
+        memory: Option<&MemoryBudget>,
     ) -> Result<Self, Box<dyn Error>> {
         job.check_cancelled()?;
         if options.no_cache {
             return Ok(Self::disabled());
         }
-        match Cache::from_environment(options.cache_max_bytes) {
+        // Startup maintenance and checkpoints share the same allowance as recovery
+        let opened = memory.map_or_else(
+            || Cache::from_environment(options.cache_max_bytes),
+            |budget| {
+                Cache::from_environment_with_memory_budget(options.cache_max_bytes, budget.clone())
+            },
+        );
+        match opened {
             Ok(cache) => Self::from_cache(cache, identity, options, job),
-            Err(error) if options.strict_cache => Err(error.into()),
+            Err(error) if options.strict_cache || matches!(error, CacheError::Memory(_)) => {
+                Err(error.into())
+            }
             Err(_) => {
                 job.check_cancelled()?;
                 job.record_cache_fallback(
@@ -51,7 +64,7 @@ impl RecoveryCache {
         options: &RecoveryOptions,
         job: &Job,
     ) -> Result<Self, Box<dyn Error>> {
-        // Restored progress must be applied before live phases start
+        // Preparation may stay visible while saved progress is restored
         match CheckpointWriter::start(&cache, identity, job, options.refresh) {
             Ok(checkpoint) => Ok(Self {
                 active: Some(ActiveCache {

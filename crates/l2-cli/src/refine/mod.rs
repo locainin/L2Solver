@@ -86,6 +86,7 @@ pub fn run_with_job(
             &options.recovery,
             CacheStage::ArtifactAnalysis,
             job,
+            None,
         )?
     };
     let result = (|| {
