@@ -3062,7 +3062,7 @@ fn record_input_omissions_survive_case_scan_work_exhaustion() -> TestResult<()> 
 
     let outcome = execute(&mut case, &plan, &policy)?;
 
-    assert_record_input_omissions(&outcome, &source, 3, 0, 0, 0)?;
+    assert_record_input_and_learning_omissions(&outcome, &source, 3, [0, 0, 0])?;
     assert!(outcome.omissions.iter().any(|omission| matches!(
         omission,
         super::RecoveryOmission::ResourceExhausted {
@@ -3080,7 +3080,7 @@ fn record_input_omissions_survive_case_scan_work_exhaustion() -> TestResult<()> 
 
     policy.resources.max_work_bytes = available_work;
     let admitted_outcome = execute(&mut case, &plan, &policy)?;
-    assert_record_input_omissions(&admitted_outcome, &source, 6, 1, 1, 1)
+    assert_record_input_and_learning_omissions(&admitted_outcome, &source, 6, [1, 1, 1])
 }
 
 fn record_input_omission_fixture() -> TestResult<(Case, String, super::RecoveryExecutionPolicy)> {
@@ -3160,15 +3160,13 @@ fn record_input_omission_fixture() -> TestResult<(Case, String, super::RecoveryE
     Ok((case, source, policy))
 }
 
-fn assert_record_input_omissions(
+fn assert_record_input_and_learning_omissions(
     outcome: &super::RecoveryExecutionOutcome,
     source: &str,
     expected_total: usize,
-    expected_message_limit: usize,
-    expected_byte_limit: usize,
-    expected_combined_limit: usize,
+    learning_counts: [usize; 3],
 ) -> TestResult<()> {
-    let (omitted_frames, reasons, formatted) = outcome
+    let (omitted_frames, reasons) = outcome
         .omissions
         .iter()
         .find_map(|omission| match omission {
@@ -3177,38 +3175,70 @@ fn assert_record_input_omissions(
                 omitted_frames,
                 reason_counts,
                 ..
-            } if omitted_source == source => {
-                Some((*omitted_frames, reason_counts, omission.to_string()))
-            }
+            } if omitted_source == source => Some((*omitted_frames, reason_counts)),
             _ => None,
         })
         .ok_or_else(|| std::io::Error::other("record discovery input omissions were lost"))?;
-    assert_eq!(omitted_frames, expected_total);
+    assert_eq!(omitted_frames, 3);
     assert_eq!(reasons.values().sum::<usize>(), omitted_frames);
+    assert_eq!(
+        reasons.len(),
+        2,
+        "training limits must not be reported as invalid input"
+    );
     assert_eq!(reasons.get("missing_materialization_receipt"), Some(&1));
     assert_eq!(reasons.get("duplicate_receipt_frame_index"), Some(&2));
-    assert_eq!(
-        reasons.get("learning_prefix_message_count_limit"),
-        (expected_message_limit > 0).then_some(&expected_message_limit)
-    );
-    assert_eq!(
-        reasons.get("learning_prefix_aggregate_byte_limit"),
-        (expected_byte_limit > 0).then_some(&expected_byte_limit)
-    );
-    assert_eq!(
-        reasons.get("learning_prefix_message_and_byte_limits"),
-        (expected_combined_limit > 0).then_some(&expected_combined_limit)
-    );
-    if expected_message_limit > 0 {
-        assert!(formatted.contains("learning_prefix_message_count_limit"));
-    }
-    if expected_byte_limit > 0 {
-        assert!(formatted.contains("learning_prefix_aggregate_byte_limit"));
-    }
-    if expected_combined_limit > 0 {
-        assert!(formatted.contains("learning_prefix_message_and_byte_limits"));
-    }
+    let learning = assert_record_learning_omissions(outcome, source, learning_counts)?;
+    assert_eq!(omitted_frames + learning, expected_total);
     Ok(())
+}
+
+fn assert_record_learning_omissions(
+    outcome: &super::RecoveryExecutionOutcome,
+    source: &str,
+    expected: [usize; 3],
+) -> TestResult<usize> {
+    let observation = outcome
+        .omissions
+        .iter()
+        .find_map(|omission| match omission {
+            super::RecoveryOmission::RecordDiscoveryLearningSample {
+                source_id: Some(omitted_source),
+                unsampled_frames,
+                reason_counts,
+                ..
+            } if omitted_source == source => {
+                Some((*unsampled_frames, reason_counts, omission.to_string()))
+            }
+            _ => None,
+        });
+    let total = expected.iter().sum::<usize>();
+    if total == 0 {
+        assert!(observation.is_none());
+        return Ok(0);
+    }
+    let (count, reasons, formatted) = observation.ok_or("record learning limits were lost")?;
+    assert_eq!(count, total);
+    assert_eq!(reasons.values().sum::<usize>(), total);
+    assert_eq!(
+        reasons.len(),
+        expected.iter().filter(|count| **count > 0).count()
+    );
+    assert!(formatted.contains("remain available for full schema application"));
+    for (reason, count) in [
+        "learning_prefix_message_count_limit",
+        "learning_prefix_aggregate_byte_limit",
+        "learning_prefix_message_and_byte_limits",
+    ]
+    .into_iter()
+    .zip(expected)
+    {
+        assert_eq!(reasons.get(reason), (count > 0).then_some(&count));
+        if count > 0 {
+            assert!(formatted.contains(reason));
+        }
+    }
+    Ok(count)
 }
 
 fn build_primary_fixture() -> TestResult<PrimaryFixture> {

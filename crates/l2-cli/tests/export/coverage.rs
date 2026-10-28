@@ -19,6 +19,39 @@ const INPUT_AND_SEARCH_INCOMPLETE: [bool; 3] = [false, false, true];
 const ALL_DISCOVERY_STATUS_COMPLETE: [bool; 3] = [true, true, true];
 
 #[test]
+fn bounded_record_learning_is_counted_without_claiming_input_loss() -> Result<(), Box<dyn Error>> {
+    let mut summary =
+        recovery_run_summary(SEARCH_NON_EXHAUSTIVE, 1, 1, 0, &flow_resource_totals())?;
+    summary
+        .omissions
+        .push(RecoveryOmission::RecordDiscoveryLearningSample {
+            source_id: Some("source".to_owned()),
+            unsampled_frames: 9,
+            reason_counts: BTreeMap::from([("learning_prefix_message_count_limit", 9)]),
+            examples: Vec::new(),
+        });
+    let mut coverage = RecoveryCoverage::default();
+    coverage.record(&summary, RecoveryCaseKind::Flow)?;
+    assert_eq!(coverage.omitted_record_input_frames, 0);
+    assert_eq!(coverage.record_learning_frames_not_sampled, 9);
+    assert_eq!(
+        coverage.flow_cases_with_incomplete_discovery_input_coverage,
+        0
+    );
+    assert_eq!(coverage.flow_cases_with_non_exhaustive_search, 1);
+    assert!(!coverage.is_complete());
+    let mut merged = RecoveryCoverage::default();
+    merged.merge(&coverage)?;
+    merged.merge(&coverage)?;
+    assert_eq!(merged.record_learning_frames_not_sampled, 18);
+    assert_eq!(merged.omitted_record_input_frames, 0);
+    let serialized = serde_json::to_value(merged)?;
+    assert_json_u64(&serialized, "record_learning_frames_not_sampled", 18);
+    assert_json_u64(&serialized, "omitted_record_input_frames", 0);
+    Ok(())
+}
+
+#[test]
 fn writes_exact_tcp_fragment_and_unmeasured_range_omission_totals() -> Result<(), Box<dyn Error>> {
     let temporary = tempfile::tempdir()?;
     let path = temporary.path().join("summary.txt");

@@ -330,8 +330,10 @@ fn write_recovery_input_status(output: &mut File, recovery: &RecoveryCoverage) -
     )?;
     writeln!(
         output,
-        "Default recovery discovery input coverage: {flow_status}; {cohort_status}; {} framing input runs and {} record input frames omitted",
-        recovery.omitted_framing_input_runs, recovery.omitted_record_input_frames,
+        "Default recovery discovery input coverage: {flow_status}; {cohort_status}; {} framing input runs and {} record input frames omitted; {} eligible record frame hypotheses excluded from bounded learning samples and retained for schema application",
+        recovery.omitted_framing_input_runs,
+        recovery.omitted_record_input_frames,
+        recovery.record_learning_frames_not_sampled,
     )
 }
 

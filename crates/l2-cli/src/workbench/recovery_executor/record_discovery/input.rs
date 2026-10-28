@@ -24,11 +24,19 @@ pub(super) struct RecordDiscoveryInputOmissions {
 
 impl RecordDiscoveryInputOmissions {
     pub(super) fn eligibility_only(&self) -> Self {
+        self.select(false)
+    }
+
+    pub(super) fn learning_only(&self) -> Self {
+        self.select(true)
+    }
+
+    fn select(&self, learning: bool) -> Self {
         // Sampling does not change whether a frame has valid source evidence
         let reason_counts = self
             .reason_counts
             .iter()
-            .filter(|(reason, _)| !is_learning_omission(reason))
+            .filter(|(reason, _)| is_learning_omission(reason) == learning)
             .map(|(reason, count)| (*reason, *count))
             .collect::<BTreeMap<_, _>>();
         let total = reason_counts.values().sum();
@@ -39,7 +47,7 @@ impl RecordDiscoveryInputOmissions {
                 example
                     .get("reason")
                     .and_then(Value::as_str)
-                    .is_some_and(|reason| !is_learning_omission(reason))
+                    .is_some_and(|reason| is_learning_omission(reason) == learning)
             })
             .cloned()
             .collect();

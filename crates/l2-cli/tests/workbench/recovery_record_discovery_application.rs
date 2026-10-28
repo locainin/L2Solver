@@ -48,6 +48,17 @@ fn bounded_learning_applies_the_frozen_schema_to_full_sessions() -> TestResult<(
     );
     assert!(outcome.validated_artifact_count >= archives.len());
     assert!(
+        super::super::discovery_input_coverage_complete(&outcome.omissions),
+        "a bounded learning sample must not claim that retained application inputs were lost"
+    );
+    assert!(
+        !outcome.omissions.iter().any(|omission| matches!(
+            omission,
+            RecoveryOmission::RecordDiscoveryInputs { omitted_frames, .. } if *omitted_frames > 0
+        )),
+        "training exclusions must be distinct from ineligible record inputs"
+    );
+    assert!(
         !outcome.complete,
         "bounded learning omissions remain visible"
     );
@@ -390,8 +401,8 @@ fn assert_learning_omission_is_reported(
     let omitted_frames = total_frames - 4;
     assert!(outcome.omissions.iter().any(|omission| matches!(
         omission,
-        RecoveryOmission::RecordDiscoveryInputs {
-            omitted_frames: omitted,
+        RecoveryOmission::RecordDiscoveryLearningSample {
+            unsampled_frames: omitted,
             ..
         } if *omitted == omitted_frames
     )));

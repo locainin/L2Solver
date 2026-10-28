@@ -137,6 +137,13 @@ pub enum RecoveryOmission {
         reason_counts: BTreeMap<&'static str, usize>,
         examples: Vec<Value>,
     },
+    /// Validated frames were retained for application but excluded from bounded learning
+    RecordDiscoveryLearningSample {
+        source_id: Option<String>,
+        unsampled_frames: usize,
+        reason_counts: BTreeMap<&'static str, usize>,
+        examples: Vec<Value>,
+    },
     /// Record schema proposal or strict validation work was incomplete under selected limits
     RecordDiscoveryAnalysis {
         source_id: String,
@@ -225,6 +232,17 @@ pub enum RecoveryOmission {
 impl fmt::Display for RecoveryOmission {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::RecordDiscoveryLearningSample {
+                source_id,
+                unsampled_frames,
+                reason_counts,
+                examples,
+            } => write!(
+                formatter,
+                "record learning for source {} excluded {unsampled_frames} eligible frame hypotheses from its bounded training sample; all remain available for full schema application; reason counts {reason_counts:?} ({} examples retained)",
+                source_id.as_deref().unwrap_or("unresolved"),
+                examples.len(),
+            ),
             Self::RelationalIncrementalMetadata { limit, reason } => write!(
                 formatter,
                 "incremental relational metadata for this Case was omitted ({reason}; budget {limit} bytes)"

@@ -25,18 +25,28 @@ pub(super) fn plan_has_inputs(plan: &RecordDiscoveryPlan) -> bool {
 }
 
 pub(super) fn input_omissions(plan: &RecordDiscoveryPlan) -> Vec<super::RecoveryOmission> {
-    plan.omissions
-        .iter()
-        .filter(|(_, omission)| omission.total > 0)
-        .map(
-            |(source_id, omission)| super::RecoveryOmission::RecordDiscoveryInputs {
+    let mut result = Vec::new();
+    for (source_id, omission) in &plan.omissions {
+        let eligibility = omission.eligibility_only();
+        if eligibility.total > 0 {
+            result.push(super::RecoveryOmission::RecordDiscoveryInputs {
                 source_id: source_id.clone(),
-                omitted_frames: omission.total,
-                reason_counts: omission.reason_counts.clone(),
-                examples: omission.examples.clone(),
-            },
-        )
-        .collect()
+                omitted_frames: eligibility.total,
+                reason_counts: eligibility.reason_counts,
+                examples: eligibility.examples,
+            });
+        }
+        let learning = omission.learning_only();
+        if learning.total > 0 {
+            result.push(super::RecoveryOmission::RecordDiscoveryLearningSample {
+                source_id: source_id.clone(),
+                unsampled_frames: learning.total,
+                reason_counts: learning.reason_counts,
+                examples: learning.examples,
+            });
+        }
+    }
+    result
 }
 pub(in crate::workbench::recovery_executor) use work::{
     case_max_cohort_input_bytes, case_work_bound, potential_framing_cohort_work_bound,

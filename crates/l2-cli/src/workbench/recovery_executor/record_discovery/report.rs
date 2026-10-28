@@ -360,16 +360,8 @@ impl Executor<'_> {
                     reason,
                 )?;
             }
-            if omission.total > 0 {
-                self.omissions
-                    .push(RecoveryOmission::RecordDiscoveryInputs {
-                        source_id: source_id.clone(),
-                        omitted_frames: omission.total,
-                        reason_counts: omission.reason_counts.clone(),
-                        examples: omission.examples.clone(),
-                    });
-            }
         }
+        self.omissions.extend(super::input_omissions(&plan));
         for (key, frames) in &plan.application_cohorts {
             if matches!(&key.origin, RecordCohortOrigin::Relational { .. }) {
                 continue;

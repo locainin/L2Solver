@@ -56,6 +56,8 @@ pub(super) struct RecoveryCoverage {
     pub(super) cohort_cases_with_incomplete_report_details: u64,
     pub(super) omitted_framing_input_runs: u64,
     pub(super) omitted_record_input_frames: u64,
+    #[serde(default)]
+    pub(super) record_learning_frames_not_sampled: u64,
     pub(super) candidates: u64,
     pub(super) complete_negative_transform_searches: u64,
     pub(super) validated_artifacts: u64,
@@ -82,6 +84,7 @@ impl RecoveryCoverage {
             cohort_cases_with_incomplete_report_details,
             omitted_framing_input_runs,
             omitted_record_input_frames,
+            record_learning_frames_not_sampled,
             candidates,
             complete_negative_transform_searches,
             validated_artifacts,
@@ -169,6 +172,15 @@ impl RecoveryCoverage {
                     self.omitted_record_input_frames = coverage_add(
                         self.omitted_record_input_frames,
                         u64::try_from(*omitted_frames)?,
+                    )?;
+                }
+                workbench::RecoveryOmission::RecordDiscoveryLearningSample {
+                    unsampled_frames,
+                    ..
+                } => {
+                    self.record_learning_frames_not_sampled = coverage_add(
+                        self.record_learning_frames_not_sampled,
+                        u64::try_from(*unsampled_frames)?,
                     )?;
                 }
                 _ => {}

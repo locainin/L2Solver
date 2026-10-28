@@ -152,7 +152,8 @@ fn search_exhaustive_within_plan(omissions: &[RecoveryOmission]) -> bool {
         RecoveryOmission::TransformDiscoveryAnalysis {
             omitted_candidates, ..
         } => *omitted_candidates == 0,
-        RecoveryOmission::RelationalIncrementalMetadata { .. }
+        RecoveryOmission::RecordDiscoveryLearningSample { .. }
+        | RecoveryOmission::RelationalIncrementalMetadata { .. }
         | RecoveryOmission::TransformProposalAssociations { .. }
         | RecoveryOmission::RelationalTransformAnalysis {
             search_exhaustive_within_plan: false,
