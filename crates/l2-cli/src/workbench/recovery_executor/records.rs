@@ -320,7 +320,7 @@ impl Executor<'_> {
         report_nodes: &[u64],
         prepared: record_service::service::PreparedRecordService,
     ) -> Result<RecordCommitArtifacts, RecoveryExecutionError> {
-        self.case_transaction_and_finish(candidate_id, |case, identities| {
+        self.case_transaction_and_finish(candidate_id, |case| {
             let recovery_outcome = record_service::service::commit_recovery(case, prepared)
                 .map_err(map_record_commit_error)?;
             let outcome = &recovery_outcome.outcome;
@@ -328,7 +328,6 @@ impl Executor<'_> {
             let receipt_node_id = outcome.receipt_node_id;
             add_transaction_links(
                 case,
-                identities,
                 receipt_node_id,
                 origins,
                 "record_assembly",
@@ -338,7 +337,6 @@ impl Executor<'_> {
             for report_node_id in report_nodes {
                 add_transaction_edge(
                     case,
-                    identities,
                     Edge {
                         from: *report_node_id,
                         to: receipt_node_id,
@@ -367,7 +365,6 @@ impl Executor<'_> {
             for child in &children {
                 super::evidence::add_transaction_edge(
                     case,
-                    identities,
                     l2_workbench::evidence::Edge {
                         from: *child,
                         to: receipt_node_id,
@@ -454,7 +451,7 @@ impl Executor<'_> {
                         source: Box::new(source),
                     }
                 })?;
-                self.case_transaction_and_finish(candidate_id, |case, identities| {
+                self.case_transaction_and_finish(candidate_id, |case| {
                     let issue = case.add_bytes_node(
                         "record_schema_rejected",
                         &receipt_bytes,
@@ -463,7 +460,6 @@ impl Executor<'_> {
                     )?;
                     add_transaction_links(
                         case,
-                        identities,
                         issue,
                         origins,
                         "record_parse_rejected",

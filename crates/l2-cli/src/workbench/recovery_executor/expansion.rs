@@ -1,7 +1,5 @@
 use super::super::expand;
-use super::evidence::{
-    TransactionEdges, add_transaction_edge, add_transaction_links, case_evidence_quota,
-};
+use super::evidence::{add_transaction_edge, add_transaction_links, case_evidence_quota};
 use super::format::is_recovery_byte_child_kind;
 use super::{
     DERIVED_REASON, Executor, RecoveryCandidateId, RecoveryExecutionError, RecoveryOmission,
@@ -42,9 +40,9 @@ impl Executor<'_> {
             .ok_or(RecoveryError::UnknownCandidate { id: candidate_id })?
             .depth();
         let limits = self.policy.expansion_limits;
-        let commit = self.case_transaction_and_finish_with_coordinator(
-            candidate_id,
-            |case, identities, coordinator| {
+        let memory = self.memory.clone();
+        let commit =
+            self.case_transaction_and_finish_with_coordinator(candidate_id, |case, coordinator| {
                 let request = ExpansionRequest {
                     candidate_id,
                     input_node,
@@ -52,9 +50,8 @@ impl Executor<'_> {
                     origins,
                     limits,
                 };
-                probe_expansion(case, identities, coordinator, &request)
-            },
-        );
+                probe_expansion(case, coordinator, &request, memory.as_ref())
+            });
         let commit = match commit {
             Ok(commit) => commit,
             Err(error) => {
@@ -125,12 +122,12 @@ impl Executor<'_> {
 
 fn probe_expansion(
     case: &mut Case,
-    identities: &mut TransactionEdges<'_>,
     coordinator: &mut l2_workbench::recovery::RecoveryCoordinator,
     request: &ExpansionRequest<'_>,
+    memory: Option<&l2_workbench::job::MemoryBudget>,
 ) -> Result<(ExpansionCommit, RecoveryResult), RecoveryExecutionError> {
     let expansion = {
-        let mut service = expand::ExpansionService::new(case, request.limits);
+        let mut service = expand::ExpansionService::new(case, request.limits, memory);
         service.probe_candidate_at_with_work(
             request.input_node,
             request.depth,
@@ -142,7 +139,6 @@ fn probe_expansion(
         Err(expand::ExpansionError::Rejected(rejection)) => {
             return reject_probe(
                 case,
-                identities,
                 request.input_node,
                 request.origins,
                 rejection.format,
@@ -162,7 +158,6 @@ fn probe_expansion(
     }
     let (children, committed_member_count, result) = record_expansion(
         case,
-        identities,
         request.input_node,
         request.depth,
         request.origins,
@@ -183,7 +178,6 @@ fn probe_expansion(
 
 fn reject_probe(
     case: &mut Case,
-    identities: &mut TransactionEdges<'_>,
     input_node: u64,
     origins: &[u64],
     format: &str,
@@ -203,7 +197,6 @@ fn reject_probe(
     )?;
     add_transaction_links(
         case,
-        identities,
         receipt,
         origins,
         "expansion_rejected",
@@ -224,7 +217,6 @@ fn reject_probe(
 
 fn record_expansion(
     case: &mut Case,
-    identities: &mut TransactionEdges<'_>,
     input_node: u64,
     depth: usize,
     origins: &[u64],
@@ -261,7 +253,6 @@ fn record_expansion(
     {
         add_transaction_links(
             case,
-            identities,
             receipt,
             origins,
             "expansion_rejected",
@@ -277,7 +268,6 @@ fn record_expansion(
     } else {
         add_transaction_links(
             case,
-            identities,
             receipt,
             origins,
             "expanded_by",
@@ -287,7 +277,6 @@ fn record_expansion(
         for member in &output_nodes {
             add_transaction_edge(
                 case,
-                identities,
                 Edge {
                     from: *member,
                     to: receipt,

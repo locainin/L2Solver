@@ -16,9 +16,15 @@ fn cancelled_job_stops_recovery_before_policy_scans_or_case_mutation() -> Result
     let job = Job::new("cancelled recovery");
     job.request_cancel();
 
-    let error = recover_case_with_job(&mut case, RecoveryProfile::Fast, 1024 * 1024, Some(&job))
-        .err()
-        .ok_or("cancelled recovery unexpectedly completed")?;
+    let error = recover_case_with_job(
+        &mut case,
+        RecoveryProfile::Fast,
+        1024 * 1024,
+        Some(&job),
+        None,
+    )
+    .err()
+    .ok_or("cancelled recovery unexpectedly completed")?;
 
     assert!(error.to_string().contains("cancellation was requested"));
     assert!(case.nodes().is_empty());
@@ -40,10 +46,45 @@ fn job_aware_recovery_accepts_profile_and_memory_limits() -> Result<(), Box<dyn 
         RecoveryProfile::Fast,
         8 * 1024 * 1024,
         Some(&job),
+        None,
     )?;
 
     assert!(summary.case_evidence_collection_complete);
     assert!(case.nodes().is_empty());
+    Ok(())
+}
+
+#[test]
+fn recovery_forwards_the_shared_budget_to_recursive_expansion() -> Result<(), Box<dyn Error>> {
+    let (_, archive) = archive_with_duplicate_png_members()?;
+    let mut case = Case::new();
+    let root = case.add_bytes_node("http_body", &archive, Vec::new(), serde_json::json!({}))?;
+    let budget = l2_workbench::job::MemoryBudget::new(0);
+    let error = recover_case_with_job(
+        &mut case,
+        RecoveryProfile::Fast,
+        8 * 1024 * 1024,
+        None,
+        Some(&budget),
+    )
+    .err()
+    .ok_or("recursive expansion ignored the shared budget")?;
+    assert!(matches!(
+        crate::memory_error::find(&error),
+        Some(l2_workbench::job::MemoryError::Limit { .. })
+    ));
+    assert_eq!(budget.snapshot()?.used_bytes, 0);
+    assert!(
+        case.nodes()
+            .iter()
+            .all(|node| node.kind != "archive_member")
+    );
+    let blob = case
+        .node(root)
+        .and_then(|node| node.blob.as_deref())
+        .and_then(|id| case.blob(id))
+        .ok_or("original bytes were lost")?;
+    assert_eq!(blob.bytes, archive);
     Ok(())
 }
 
@@ -67,6 +108,7 @@ fn recovery_job_counts_committed_validated_artifacts_and_archive_members()
         RecoveryProfile::Fast,
         8 * 1024 * 1024,
         Some(&job),
+        None,
     )?;
     let snapshot = job.snapshot()?;
     let validated_artifacts = snapshot

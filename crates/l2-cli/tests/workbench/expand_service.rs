@@ -10,7 +10,7 @@ fn service_expands_valid_png() -> Result<(), Box<dyn Error>> {
     let bytes = png(&[])?;
     let mut case = Case::new();
     let root = add_candidate(&mut case, &bytes)?;
-    let mut service = ExpansionService::new(&mut case, limits());
+    let mut service = ExpansionService::new(&mut case, limits(), None);
 
     let outcome = service.expand_selected(root)?;
 
@@ -31,7 +31,7 @@ fn strict_rejects_root() -> Result<(), Box<dyn Error>> {
     let bytes = invalid_png();
     let mut case = Case::new();
     let root = add_candidate(&mut case, &bytes)?;
-    let mut service = ExpansionService::new(&mut case, limits());
+    let mut service = ExpansionService::new(&mut case, limits(), None);
 
     let result = service.expand_selected(root);
 
@@ -48,7 +48,7 @@ fn probe_records_rejection() -> Result<(), Box<dyn Error>> {
     let bytes = invalid_png();
     let mut case = Case::new();
     let root = add_candidate(&mut case, &bytes)?;
-    let mut service = ExpansionService::new(&mut case, limits());
+    let mut service = ExpansionService::new(&mut case, limits(), None);
 
     let strict_result = service.expand_selected(root);
     assert!(matches!(
@@ -90,7 +90,7 @@ fn probe_continues_after_corruption() -> Result<(), Box<dyn Error>> {
     let mut case = Case::new();
     let corrupt_root = add_candidate(&mut case, &corrupt)?;
     let valid_root = add_candidate(&mut case, &valid)?;
-    let mut service = ExpansionService::new(&mut case, limits());
+    let mut service = ExpansionService::new(&mut case, limits(), None);
 
     let rejected = service.probe_candidate(corrupt_root)?;
     let expanded = service.probe_candidate(valid_root)?;
@@ -120,7 +120,7 @@ fn nested_rejections_stay_complete() -> Result<(), Box<dyn Error>> {
     let bytes = png(&[(*b"thMb", embedded.as_slice())])?;
     let mut case = Case::new();
     let root = add_candidate(&mut case, &bytes)?;
-    let mut service = ExpansionService::new(&mut case, limits());
+    let mut service = ExpansionService::new(&mut case, limits(), None);
 
     let outcome = service.expand_selected(root)?;
 
@@ -143,7 +143,7 @@ fn prior_omissions_stay_incomplete() -> Result<(), Box<dyn Error>> {
     let mut case = Case::new();
     let root = add_candidate(&mut case, &bytes)?;
     case.mark_incomplete("earlier resource omission")?;
-    let mut service = ExpansionService::new(&mut case, limits());
+    let mut service = ExpansionService::new(&mut case, limits(), None);
 
     let outcome = service.probe_candidate(root)?;
 
@@ -159,7 +159,7 @@ fn resource_omission_marks_incomplete() -> Result<(), Box<dyn Error>> {
     let root = add_candidate(&mut case, &bytes)?;
     let mut configured = limits();
     configured.objects = 1;
-    let mut service = ExpansionService::new(&mut case, configured);
+    let mut service = ExpansionService::new(&mut case, configured, None);
 
     let outcome = service.expand_selected(root)?;
 
@@ -183,7 +183,7 @@ fn invalid_limits_remain_failures() -> Result<(), Box<dyn Error>> {
     let root = add_candidate(&mut case, &bytes)?;
     let mut configured = limits();
     configured.objects = 0;
-    let mut service = ExpansionService::new(&mut case, configured);
+    let mut service = ExpansionService::new(&mut case, configured, None);
 
     let result = service.probe_candidate(root);
 
@@ -214,7 +214,7 @@ fn created_nodes_keep_provenance() -> Result<(), Box<dyn Error>> {
         .and_then(|node| node.blob.as_deref())
         .ok_or("input blob is missing")?
         .to_owned();
-    let mut service = ExpansionService::new(&mut case, limits());
+    let mut service = ExpansionService::new(&mut case, limits(), None);
 
     let outcome = service.expand_selected(root)?;
 

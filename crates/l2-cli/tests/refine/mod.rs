@@ -506,10 +506,10 @@ fn result_identity_uses_ordered_content_hashes_and_analysis_settings() -> Result
     let recovery = RecoveryOptions::default();
     let policy = RefinePolicy::new(&recovery, false)?;
     let identity = result_identity(&sources, &recovery, &policy)?;
-    assert_eq!(identity.algorithm_version, 12);
+    assert_eq!(identity.algorithm_version, 13);
     assert_eq!(
         identity.settings.get("analyzer_algorithm_version"),
-        Some(&json!(12))
+        Some(&json!(13))
     );
     assert_eq!(
         identity.settings.get("analysis_receipt_schema_version"),

@@ -270,7 +270,7 @@ fn assert_materialized_context(case: &Case, episode_id: u64, run_id: u64) -> Tes
 
 fn assert_record_report_context(case: &Case, run_id: u64) -> TestResult<()> {
     let (report, frame_node_id) = record_report_frame_for_run(case, run_id)?;
-    assert_eq!(report.get("version"), Some(&json!(2)));
+    assert_eq!(report.get("version"), Some(&json!(3)));
     let frame = case
         .nodes()
         .iter()

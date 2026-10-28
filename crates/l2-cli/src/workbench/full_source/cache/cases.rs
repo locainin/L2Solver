@@ -8,7 +8,10 @@ use super::{
 use l2_workbench::{
     evidence::{CaseSnapshotLimits, CaseSnapshotUsage, MAX_CASE_JSON_BYTES},
     investigation::BuildResult,
-    job::cache::{CacheReadPolicy, StageKey, StageStatus},
+    job::{
+        CacheFallbackKind, CacheStage, MemoryBudget,
+        cache::{Cache, CacheEntry, CacheReadPolicy, StageKey, StageStatus},
+    },
     reconstruction::Limits,
     store::Store,
 };
@@ -59,28 +62,21 @@ pub fn investigate_flow(
         &source,
         &[],
     )?;
-    if let Some(entry) = cache.lookup(&key, CacheReadPolicy::CompleteOnly)? {
-        if let Some(job) = context.job {
-            job.check_cancelled()?;
+    match cache.lookup(&key, CacheReadPolicy::CompleteOnly) {
+        Ok(Some(entry)) => {
+            match load_cached_case(&entry, source_id, store.memory_budget(), cache.max_bytes()) {
+                Ok(result) => {
+                    if let Some(job) = context.job {
+                        job.check_cancelled()?;
+                    }
+                    count_cache_hit(context.job)?;
+                    return Ok(result);
+                }
+                Err(error) => cache_failure(context, CacheFallbackKind::InvalidEntry, error)?,
+            }
         }
-        let metadata = NativeCaseMetadata::deserialize(entry.metadata())?;
-        if metadata.case_storage_format != crate::case_snapshot::STORAGE_FORMAT {
-            return Err(invalid("cached native Case snapshot format is unsupported"));
-        }
-        let case = crate::case_snapshot::read(
-            &entry,
-            metadata.case_snapshot_usage,
-            snapshot_limits(cache.max_bytes())?,
-            store.memory_budget(),
-        )?;
-        if !matches!(case.sources(), [source] if source.id == source_id) {
-            return Err(invalid("cached native Case belongs to a different source"));
-        }
-        count_cache_hit(context.job)?;
-        return Ok(BuildResult {
-            case,
-            complete: metadata.complete,
-        });
+        Ok(None) => {}
+        Err(error) => cache_failure(context, CacheFallbackKind::LookupFailed, error.into())?,
     }
 
     count_cache_miss(context.job)?;
@@ -88,12 +84,49 @@ pub fn investigate_flow(
     if let Some(job) = context.job {
         job.check_cancelled()?;
     }
-    let lease = cache.lease(&key)?;
+    if let Err(error) = store_cached_case(cache, &key, &result, store.memory_budget()) {
+        cache_failure(context, CacheFallbackKind::CommitFailed, error)?;
+    }
+    Ok(result)
+}
+
+fn load_cached_case(
+    entry: &CacheEntry,
+    source_id: &str,
+    memory: Option<&MemoryBudget>,
+    maximum_storage_bytes: u64,
+) -> Result<BuildResult> {
+    let metadata = NativeCaseMetadata::deserialize(entry.metadata())?;
+    if metadata.case_storage_format != crate::case_snapshot::STORAGE_FORMAT {
+        return Err(invalid("cached native Case snapshot format is unsupported"));
+    }
+    let case = crate::case_snapshot::read(
+        entry,
+        metadata.case_snapshot_usage,
+        snapshot_limits(maximum_storage_bytes)?,
+        memory,
+    )?;
+    if !matches!(case.sources(), [source] if source.id == source_id) {
+        return Err(invalid("cached native Case belongs to a different source"));
+    }
+    Ok(BuildResult {
+        case,
+        complete: metadata.complete,
+    })
+}
+
+fn store_cached_case(
+    cache: &Cache,
+    key: &StageKey,
+    result: &BuildResult,
+    memory: Option<&MemoryBudget>,
+) -> Result<()> {
+    let lease = cache.lease(key)?;
     let usage = crate::case_snapshot::write(
         &lease,
         &result.case,
         snapshot_limits(cache.max_bytes())?,
-        store.memory_budget(),
+        memory,
     )?;
     let metadata = NativeCaseMetadata {
         complete: result.complete,
@@ -101,7 +134,32 @@ pub fn investigate_flow(
         case_snapshot_usage: usage,
     };
     drop(lease.commit(StageStatus::Complete, serde_json::to_value(metadata)?)?);
-    Ok(result)
+    Ok(())
+}
+
+fn cache_failure(
+    context: IndexedAnalysisContext<'_>,
+    kind: CacheFallbackKind,
+    error: Box<dyn std::error::Error>,
+) -> Result<()> {
+    if let Some(job) = context.job {
+        job.check_cancelled()?;
+    }
+    // Shared pressure must stop admission instead of starting uncharged replacement work
+    if context.strict_cache || crate::memory_error::find(error.as_ref()).is_some() {
+        return Err(error);
+    }
+    if let Some(job) = context.job {
+        job.record_cache_fallback(
+            CacheStage::CaseRecovery,
+            kind,
+            format_args!(
+                "native Case cache {}; continuing from the capture index",
+                kind.label()
+            ),
+        )?;
+    }
+    Ok(())
 }
 
 fn snapshot_limits(maximum_storage_bytes: u64) -> Result<CaseSnapshotLimits> {

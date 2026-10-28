@@ -31,7 +31,11 @@ fn analyze_flow(
             include_cohorts: false,
             ..IndexedAnalysisOptions::default()
         },
-        IndexedAnalysisContext { cache, job },
+        IndexedAnalysisContext {
+            cache,
+            job,
+            strict_cache: true,
+        },
         |item| {
             if let FullSourceItem::Flow(flow) = item {
                 retained = Some(flow.result.case);
@@ -239,6 +243,103 @@ fn mismatched_native_snapshot_usage_fails_without_retaining_shared_memory() -> T
     indexed.store.set_memory_budget(budget.clone())?;
     assert!(analyze_flow(&indexed.store, &indexed.receipt, Some(&cache), None).is_err());
     assert_eq!(budget.snapshot()?.used_bytes, 0);
+    Ok(())
+}
+
+#[test]
+fn optional_invalid_native_snapshot_rebuilds_exact_evidence_and_reports_the_fallback() -> TestResult
+{
+    let directory = tempfile::tempdir()?;
+    let (capture, cache) = prepare_capture(directory.path())?;
+    let indexed =
+        acquire_indexed_source(&capture, directory.path(), &AcquisitionOptions::default())?;
+    let flow_id = indexed
+        .store
+        .packet(&indexed.receipt.source_id, 1)?
+        .flow
+        .ok_or("missing flow")?;
+    let expected = indexed
+        .store
+        .investigate_flows(&[flow_id], Limits::default())?;
+    let key = native_key(&indexed.receipt, flow_id, 2, "l2-native-case-v2")?;
+    seed_snapshot(&cache, &key, &expected.case, expected.complete, true)?;
+    let job = Job::new("optional invalid native cache");
+    let rebuilt = crate::workbench::full_source::cache::investigate_flow(
+        &indexed.store,
+        &indexed.receipt.source_id,
+        flow_id,
+        Limits::default(),
+        IndexedAnalysisContext {
+            cache: Some(&cache),
+            job: Some(&job),
+            strict_cache: false,
+        },
+    )?;
+    assert_eq!(rebuilt.case, expected.case);
+    assert_eq!(rebuilt.complete, expected.complete);
+    let snapshot = job.snapshot()?;
+    assert_eq!(snapshot.counters.get(&Counter::CacheHits), Some(&0));
+    assert_eq!(snapshot.counters.get(&Counter::CacheMisses), Some(&1));
+    assert!(
+        snapshot
+            .cache_fallbacks
+            .records()
+            .iter()
+            .any(|record| record.kind() == l2_workbench::job::CacheFallbackKind::InvalidEntry)
+    );
+    Ok(())
+}
+
+#[test]
+fn optional_native_commit_failure_preserves_the_already_computed_case() -> TestResult {
+    for strict_cache in [false, true] {
+        let directory = tempfile::tempdir()?;
+        let capture = directory.path().join("flow.pcap");
+        fs::write(&capture, single_flow_capture())?;
+        let indexed =
+            acquire_indexed_source(&capture, directory.path(), &AcquisitionOptions::default())?;
+        let cache = Cache::open_at(
+            directory.path().join("cache"),
+            directory.path().join("state"),
+            0,
+        )?;
+        let flow_id = indexed
+            .store
+            .packet(&indexed.receipt.source_id, 1)?
+            .flow
+            .ok_or("missing flow")?;
+        let expected = indexed
+            .store
+            .investigate_flows(&[flow_id], Limits::default())?;
+        let job = Job::new("native cache commit quota");
+        let result = crate::workbench::full_source::cache::investigate_flow(
+            &indexed.store,
+            &indexed.receipt.source_id,
+            flow_id,
+            Limits::default(),
+            IndexedAnalysisContext {
+                cache: Some(&cache),
+                job: Some(&job),
+                strict_cache,
+            },
+        );
+        if strict_cache {
+            assert!(result.is_err());
+            assert!(job.snapshot()?.cache_fallbacks.records().is_empty());
+        } else {
+            let actual = result?;
+            assert_eq!(actual.case, expected.case);
+            assert_eq!(actual.complete, expected.complete);
+            assert!(
+                job.snapshot()?
+                    .cache_fallbacks
+                    .records()
+                    .iter()
+                    .any(|record| record.kind()
+                        == l2_workbench::job::CacheFallbackKind::CommitFailed)
+            );
+        }
+    }
     Ok(())
 }
 

@@ -136,7 +136,10 @@ fn write_result_stage<T>(
                     })
             })
     });
-    let source_set_sha256 = l2_workbench::parse_sha256_digest(&parsed.source_identity_sha256);
+    let source_set_sha256 = parsed
+        .source_identity_sha256
+        .as_deref()
+        .and_then(l2_workbench::parse_sha256_digest);
     capture.sample.set(RecoveryPublicationSample {
         source_set_sha256,
         source_basis: if source_set_sha256.is_some() {

@@ -109,7 +109,7 @@ fn run_with_memory_budget(
             &options.recovery,
             CacheStage::ArtifactAnalysis,
             job,
-            None,
+            Some(memory),
         )?
     };
     let result = (|| {

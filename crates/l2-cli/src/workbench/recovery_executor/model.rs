@@ -33,7 +33,7 @@ pub(super) struct RecoveryPlan {
     pub(super) discover_transforms: bool,
     /// Infer framing hypotheses from each retained capture source's TCP runs
     pub(super) discover_framing: bool,
-    /// Propose record schemas only from frames materialized before this recovery pass
+    /// Propose record schemas for eligible materialized and derived frame cohorts
     pub(super) discover_records: bool,
 }
 

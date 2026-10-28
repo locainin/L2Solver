@@ -270,6 +270,7 @@ fn test_executor<'a>(
     case_index: CaseIndex,
 ) -> Executor<'a> {
     Executor {
+        memory: None,
         case,
         plan,
         policy,

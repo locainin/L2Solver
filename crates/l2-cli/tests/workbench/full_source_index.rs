@@ -574,6 +574,7 @@ fn indexed_flow_analysis_cache_requires_matching_reconstruction_limits()
         IndexedAnalysisContext {
             cache: Some(&cache),
             job: None,
+            strict_cache: false,
         },
         |_| Ok(()),
     )?;
@@ -589,6 +590,7 @@ fn indexed_flow_analysis_cache_requires_matching_reconstruction_limits()
         IndexedAnalysisContext {
             cache: Some(&cache),
             job: Some(&job),
+            strict_cache: false,
         },
         |_| Ok(()),
     )?;
@@ -617,6 +619,7 @@ fn indexed_flow_analysis_cache_requires_matching_reconstruction_limits()
         IndexedAnalysisContext {
             cache: Some(&cache),
             job: Some(&changed_job),
+            strict_cache: false,
         },
         |_| Ok(()),
     )?;

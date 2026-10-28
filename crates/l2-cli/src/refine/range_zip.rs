@@ -6,10 +6,10 @@ use l2_workbench::{
         AnalysisFormat, AnalysisOmission, ArtifactAnalysis, ArtifactAnalysisOptions,
         zip::{
             ZipArtifactLimits, ZipArtifactReport, ZipReadError, ZipReaderBudget, ZipReaderLimits,
-            inspect_zip_from_reader_with_source_sha256,
+            inspect_zip_from_reader_with_source_sha256_and_memory,
         },
     },
-    job::{Job, MemoryBudget, MemoryClass},
+    job::{Job, MemoryBudget, MemoryClass, MemoryLease},
 };
 use std::{
     error::Error,
@@ -77,6 +77,10 @@ pub(super) fn probe_tail(
     Ok(candidate)
 }
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the source checks share one job and report lease"
+)]
 pub(super) fn inspect(
     file: &mut File,
     length: usize,
@@ -85,6 +89,7 @@ pub(super) fn inspect(
     options: ArtifactAnalysisOptions,
     input: &InputSet,
     job: &Job,
+    memory: &mut MemoryLease,
 ) -> Result<Option<ZipArtifactReport>, Box<dyn Error>> {
     let remaining_work = options
         .limits
@@ -129,13 +134,15 @@ pub(super) fn inspect(
             .min(options.limits.max_input_bytes),
     };
     let mut reader = CancellableReader::new(file, job);
-    let result = inspect_zip_from_reader_with_source_sha256(
+    let before = memory.bytes();
+    let result = inspect_zip_from_reader_with_source_sha256_and_memory(
         &mut reader,
         length,
         source_sha256,
         limits,
         0,
         &mut budget,
+        memory,
     );
     let read_work = read_limit - budget.read_bytes_remaining;
     let expanded_work = expanded_limit - budget.expanded_bytes_remaining;
@@ -148,12 +155,14 @@ pub(super) fn inspect(
         .checked_add(read_work)
         .and_then(|work| work.checked_add(expanded_work))
         .ok_or("ZIP work counter overflow")?;
-    report_inspection_result(result, report)
+    report_inspection_result(result, report, memory, before)
 }
 
 fn report_inspection_result(
     result: Result<ZipArtifactReport, ZipReadError>,
     report: &mut ArtifactAnalysis,
+    memory: &mut MemoryLease,
+    before: u64,
 ) -> Result<Option<ZipArtifactReport>, Box<dyn Error>> {
     match result {
         Ok(archive)
@@ -165,6 +174,8 @@ fn report_inspection_result(
                 )
             }) =>
         {
+            drop(archive);
+            memory.try_resize(before)?;
             report
                 .omissions
                 .push(AnalysisOmission::SourceRangeValidationLimit {
@@ -177,6 +188,7 @@ fn report_inspection_result(
         }
         Ok(archive) => Ok(Some(archive)),
         Err(ZipReadError::Io(error)) => Err(error.into()),
+        Err(ZipReadError::Memory(error)) => Err(error.into()),
         Err(ZipReadError::Format(
             l2_workbench::artifact::zip::ZipArtifactError::InvalidArchive
             | l2_workbench::artifact::zip::ZipArtifactError::AmbiguousEndRecords,

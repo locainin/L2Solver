@@ -7,9 +7,11 @@ use super::{
 use l2_workbench::{
     artifact::zip::{
         ZipArtifactEntry, ZipArtifactError, ZipArtifactLimits, ZipArtifactOmission,
-        ZipArtifactOmissionReason, ZipArtifactReport, inspect_zip_at_depth_with_operation_budget,
+        ZipArtifactOmissionReason, ZipArtifactReport, ZipMemoryError,
+        inspect_zip_at_depth_with_memory, inspect_zip_at_depth_with_operation_budget,
     },
     evidence::EvidenceStatus,
+    job::{MemoryClass, MemoryLease},
 };
 use serde_json::json;
 use std::error::Error;
@@ -26,7 +28,12 @@ pub(super) fn expand(
         max_total_expanded_bytes: expansion.limits.zip_work_bytes,
         max_depth: expansion.limits.depth,
     };
-    let mut report = inspect_archive(expansion, item, bytes, limits)?;
+    // Member buffers stay charged until the Case has copied or discarded them
+    let mut member_memory = expansion
+        .memory
+        .map(|budget| budget.try_reserve(MemoryClass::Executor, 0))
+        .transpose()?;
+    let mut report = inspect_archive(expansion, item, bytes, limits, member_memory.as_mut())?;
     // These limits are checked before the parser opens and validates the central directory
     let directory_checks_skipped =
         item.depth > limits.max_depth || report.entry_count > limits.max_entries;
@@ -93,21 +100,40 @@ fn inspect_archive(
     item: WorkItem,
     bytes: &[u8],
     limits: ZipArtifactLimits,
+    memory: Option<&mut MemoryLease>,
 ) -> Result<ZipArtifactReport, ExpansionError> {
     // Structural failures reject a candidate; operational failures keep their error category
     let operation_limit = expansion.limit_zip_work();
     let mut operation_remaining = operation_limit;
-    let result = inspect_zip_at_depth_with_operation_budget(
-        bytes,
-        limits,
-        item.depth,
-        &mut operation_remaining,
-    );
+    let result = if let Some(memory) = memory {
+        inspect_zip_at_depth_with_memory(
+            bytes,
+            limits,
+            item.depth,
+            &mut operation_remaining,
+            memory,
+        )
+    } else {
+        inspect_zip_at_depth_with_operation_budget(
+            bytes,
+            limits,
+            item.depth,
+            &mut operation_remaining,
+        )
+        .map_err(ZipMemoryError::Archive)
+    };
     let work_used = operation_limit
         .checked_sub(operation_remaining)
         .ok_or("ZIP operation work allowance increased unexpectedly")?;
     expansion.retain_zip_work(work_used)?;
     result.map_err(|error| match error {
+        ZipMemoryError::Memory(error) => ExpansionError::Memory(error),
+        ZipMemoryError::Archive(error) => classify_archive_error(item, error),
+    })
+}
+
+fn classify_archive_error(item: WorkItem, error: ZipArtifactError) -> ExpansionError {
+    match error {
         error @ (ZipArtifactError::InvalidArchive | ZipArtifactError::AmbiguousEndRecords) => {
             ExpansionError::Rejected(CandidateRejection {
                 node: item.node,
@@ -119,7 +145,7 @@ fn inspect_archive(
         | ZipArtifactError::EntryCountOutOfRange { .. }
         | ZipArtifactError::AllocationFailure) => ExpansionError::resource(error),
         error => ExpansionError::invariant(error),
-    })
+    }
 }
 
 fn expand_entries(

@@ -184,7 +184,7 @@ impl Executor<'_> {
             origins,
         } = prepared;
         let item_state = summary.state;
-        let commit_result = self.case_transaction_and_finish(candidate_id, |case, identities| {
+        let commit_result = self.case_transaction_and_finish(candidate_id, |case| {
             let outcome =
                 decode::service::commit_prepared_recipe(case, prepared).map_err(|source| {
                     RecoveryExecutionError::Operational {
@@ -196,9 +196,7 @@ impl Executor<'_> {
                 .created_nodes
                 .first()
                 .ok_or(RecoveryError::InvariantFailure)?;
-            transform_result(
-                case, identities, item, item_state, input_node, recipe, &origins,
-            )
+            transform_result(case, item, item_state, input_node, recipe, &origins)
         });
         let commit = match commit_result {
             Ok(commit) => commit,
@@ -336,7 +334,6 @@ pub(super) fn transform_case_quota(
 
 fn transform_result(
     case: &mut l2_workbench::evidence::Case,
-    identities: &mut super::evidence::TransactionEdges<'_>,
     item: &decode::service::DecodeCreatedNodes,
     state: decode::service::DecodeItemState,
     input_node: u64,
@@ -345,20 +342,19 @@ fn transform_result(
 ) -> Result<(TransformCommit, RecoveryResult), RecoveryExecutionError> {
     match state {
         decode::service::DecodeItemState::Completed => {
-            completed_transform(case, identities, item, recipe, origins)
+            completed_transform(case, item, recipe, origins)
         }
         decode::service::DecodeItemState::Rejected => {
-            rejected_transform(case, identities, item.receipt_node, origins)
+            rejected_transform(case, item.receipt_node, origins)
         }
         decode::service::DecodeItemState::Failed => {
-            failed_transform(case, identities, item.receipt_node, input_node, origins)
+            failed_transform(case, item.receipt_node, input_node, origins)
         }
     }
 }
 
 fn completed_transform(
     case: &mut l2_workbench::evidence::Case,
-    identities: &mut super::evidence::TransactionEdges<'_>,
     item: &decode::service::DecodeCreatedNodes,
     recipe: &Recipe,
     origins: &[u64],
@@ -370,7 +366,6 @@ fn completed_transform(
     };
     add_transaction_links(
         case,
-        identities,
         item.receipt_node,
         origins,
         "decoding_result",
@@ -379,7 +374,6 @@ fn completed_transform(
     )?;
     add_transaction_edge(
         case,
-        identities,
         l2_workbench::evidence::Edge {
             from: item.output_node,
             to: item.receipt_node,
@@ -401,13 +395,11 @@ fn completed_transform(
 
 fn rejected_transform(
     case: &mut l2_workbench::evidence::Case,
-    identities: &mut super::evidence::TransactionEdges<'_>,
     receipt_node: u64,
     origins: &[u64],
 ) -> Result<(TransformCommit, RecoveryResult), RecoveryExecutionError> {
     add_transaction_links(
         case,
-        identities,
         receipt_node,
         origins,
         "decoding_rejected",
@@ -427,7 +419,6 @@ fn rejected_transform(
 
 fn failed_transform(
     case: &mut l2_workbench::evidence::Case,
-    identities: &mut super::evidence::TransactionEdges<'_>,
     receipt_node: u64,
     input_node: u64,
     origins: &[u64],
@@ -450,7 +441,6 @@ fn failed_transform(
     )?;
     add_transaction_links(
         case,
-        identities,
         issue,
         origins,
         "rejected_by_transform",

@@ -5,6 +5,9 @@ mod der;
 mod png;
 
 #[cfg(test)]
+#[path = "../../../tests/workbench/expand_memory.rs"]
+mod memory_tests;
+#[cfg(test)]
 #[path = "../../../tests/workbench/expand_service.rs"]
 mod service_tests;
 
@@ -13,6 +16,7 @@ use crate::arguments::ExpandArgs;
 use l2_workbench::{
     artifact::{PNG_SIGNATURE, zip::has_zip_end_record},
     evidence::{Case, Edge, EvidenceError, EvidenceStatus, MAX_NODES},
+    job::{MemoryBudget, MemoryClass, MemoryError, MemoryLease},
 };
 use serde_json::{Value, json};
 use std::{
@@ -36,13 +40,19 @@ struct WorkItem {
 
 struct NodeInput {
     blob: String,
-    bytes: Option<Vec<u8>>,
+    bytes: Option<ChargedInput>,
     length: usize,
+}
+
+struct ChargedInput {
+    bytes: Vec<u8>,
+    _memory: Option<MemoryLease>,
 }
 
 // One service owns shared budgets while candidate-local parser state resets
 pub(super) struct ExpansionService<'a> {
     case: &'a mut Case,
+    memory: Option<&'a MemoryBudget>,
     limits: ExpansionLimits,
     queue: VecDeque<WorkItem>,
     parsed_blobs: HashMap<String, u64>,
@@ -93,6 +103,7 @@ pub(super) struct ExpansionOutcome {
 pub(super) enum ExpansionError {
     Rejected(CandidateRejection),
     Failure(ExpansionFailure),
+    Memory(MemoryError),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -138,6 +149,7 @@ impl fmt::Display for ExpansionError {
                 };
                 write!(formatter, "{category} failure: {}", failure.source)
             }
+            Self::Memory(error) => write!(formatter, "expansion memory admission failed: {error}"),
         }
     }
 }
@@ -147,12 +159,19 @@ impl Error for ExpansionError {
         match self {
             Self::Rejected(_) => None,
             Self::Failure(failure) => Some(failure.source.as_ref()),
+            Self::Memory(error) => Some(error),
         }
     }
 }
 
 impl From<Box<dyn Error>> for ExpansionError {
     fn from(error: Box<dyn Error>) -> Self {
+        if let Some(memory) = error.downcast_ref::<MemoryError>() {
+            return Self::Memory(*memory);
+        }
+        if let Some(EvidenceError::Memory(memory)) = error.downcast_ref::<EvidenceError>() {
+            return Self::Memory(*memory);
+        }
         let kind = error.downcast_ref::<EvidenceError>().map_or_else(
             || {
                 if error.downcast_ref::<std::io::Error>().is_some() {
@@ -174,8 +193,17 @@ impl From<Box<dyn Error>> for ExpansionError {
 
 impl From<EvidenceError> for ExpansionError {
     fn from(error: EvidenceError) -> Self {
+        if let EvidenceError::Memory(memory) = error {
+            return Self::Memory(memory);
+        }
         let kind = evidence_failure_kind(&error);
         Self::failure(kind, Box::new(error))
+    }
+}
+
+impl From<MemoryError> for ExpansionError {
+    fn from(error: MemoryError) -> Self {
+        Self::Memory(error)
     }
 }
 
@@ -214,7 +242,7 @@ pub(super) fn run(args: &ExpandArgs, output: &mut impl Write) -> Result<bool, Bo
         .into());
     }
     let complete = {
-        let mut expansion = ExpansionService::new(&mut case, ExpansionLimits::from(args));
+        let mut expansion = ExpansionService::new(&mut case, ExpansionLimits::from(args), None);
         let outcome = expansion.expand_selected(args.node)?;
         outcome.complete && expansion.case().collection_complete()
     };
@@ -237,11 +265,16 @@ impl From<&ExpandArgs> for ExpansionLimits {
 }
 
 impl<'a> ExpansionService<'a> {
-    pub(super) fn new(case: &'a mut Case, limits: ExpansionLimits) -> Self {
+    pub(super) fn new(
+        case: &'a mut Case,
+        limits: ExpansionLimits,
+        memory: Option<&'a MemoryBudget>,
+    ) -> Self {
         let case_blob_bytes = case.blobs().iter().map(|blob| blob.bytes.len()).sum();
         let available_nodes = MAX_NODES.saturating_sub(case.nodes().len());
         Self {
             case,
+            memory,
             limits,
             queue: VecDeque::new(),
             parsed_blobs: HashMap::new(),
@@ -366,22 +399,22 @@ impl<'a> ExpansionService<'a> {
         let Some((blob, bytes)) = self.input_for_item(item)? else {
             return Ok(());
         };
-        if !item.root && !self.spend_work(bytes.len())? {
+        if !item.root && !self.spend_work(bytes.bytes.len())? {
             self.omit(
                 item.node,
                 "work_byte_limit",
-                &json!({"requested":bytes.len()}),
+                &json!({"requested":bytes.bytes.len()}),
             )?;
             return Ok(());
         }
         self.parsed_blobs.insert(blob, item.node);
-        self.parse_item(item, mode, &bytes)
+        self.parse_item(item, mode, &bytes.bytes)
     }
 
     fn input_for_item(
         &mut self,
         item: WorkItem,
-    ) -> Result<Option<(String, Vec<u8>)>, ExpansionError> {
+    ) -> Result<Option<(String, ChargedInput)>, ExpansionError> {
         if item.depth > self.limits.depth {
             self.omit(
                 item.node,
@@ -466,7 +499,7 @@ impl<'a> ExpansionService<'a> {
                 self.rejections.push(rejection);
                 Ok(())
             }
-            Err(error @ ExpansionError::Failure(_)) => Err(error),
+            Err(error @ (ExpansionError::Failure(_) | ExpansionError::Memory(_))) => Err(error),
         }
     }
 
@@ -692,7 +725,7 @@ impl<'a> ExpansionService<'a> {
         Ok(())
     }
 
-    fn node_blob_and_bytes(&self, id: u64) -> Result<NodeInput, Box<dyn Error>> {
+    fn node_blob_and_bytes(&self, id: u64) -> Result<NodeInput, ExpansionError> {
         let (node, bytes) = selected::bytes(self.case, id)?;
         let blob = node
             .blob
@@ -705,14 +738,27 @@ impl<'a> ExpansionService<'a> {
                 length: bytes.len(),
             });
         }
+        let requested = u64::try_from(bytes.len()).map_err(ExpansionError::invariant)?;
+        let mut memory = self
+            .memory
+            .map(|budget| budget.try_reserve(MemoryClass::Executor, requested))
+            .transpose()?;
         let mut retained = Vec::new();
         retained
             .try_reserve_exact(bytes.len())
-            .map_err(|error| -> Box<dyn Error> { Box::new(error) })?;
+            .map_err(ExpansionError::resource)?;
+        if let Some(memory) = &mut memory {
+            memory.try_resize(
+                u64::try_from(retained.capacity()).map_err(ExpansionError::invariant)?,
+            )?;
+        }
         retained.extend_from_slice(bytes);
         Ok(NodeInput {
             blob,
-            bytes: Some(retained),
+            bytes: Some(ChargedInput {
+                bytes: retained,
+                _memory: memory,
+            }),
             length: bytes.len(),
         })
     }

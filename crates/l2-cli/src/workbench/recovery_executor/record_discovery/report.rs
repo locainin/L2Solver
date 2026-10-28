@@ -900,7 +900,7 @@ impl Executor<'_> {
             .map_err(|source| {
                 operational("record discovery report-context allocation failed", source)
             })?;
-        let node_ids = self.case_transaction_and_finish(candidate_id, |case, identities| {
+        let node_ids = self.case_transaction_and_finish(candidate_id, |case| {
             let mut node_ids = Vec::new();
             node_ids
                 .try_reserve_exact(reports.len())
@@ -921,7 +921,6 @@ impl Executor<'_> {
                     case.add_bytes_node(REPORT_KIND, &report.bytes, Vec::new(), details)?;
                 add_transaction_links(
                     case,
-                    identities,
                     node_id,
                     origins,
                     "record_discovery_input",

@@ -1051,6 +1051,7 @@ fn run_record_discovery_only(
 ) -> TestResult<super::RecoveryExecutionOutcome> {
     let case_index = super::CaseIndex::new(case)?;
     let mut executor = super::Executor {
+        memory: None,
         case,
         plan,
         policy: policy.clone(),
@@ -1465,8 +1466,13 @@ fn single_session_relational_cohort_is_informational_and_does_not_block_recovery
     let context = add_session_context(&mut case, "single-session-http", 1, 0, wire.len())?;
     add_tcp_run_in_context(&mut case, &source, context.direction_node, 1, wire)?;
 
-    let summary =
-        recover_case_with_job(&mut case, RecoveryProfile::Normal, 64 * 1024 * 1024, None)?;
+    let summary = recover_case_with_job(
+        &mut case,
+        RecoveryProfile::Normal,
+        64 * 1024 * 1024,
+        None,
+        None,
+    )?;
     let relational_reports = case
         .nodes()
         .iter()
@@ -1509,19 +1515,21 @@ fn default_recovery_learns_and_applies_session_relative_record_transform() -> Te
     let mut case = fixture.case;
     let plaintext = fixture.plaintext;
     let episode_nodes = fixture.episode_nodes;
-    let summary =
-        match recover_case_with_job(&mut case, RecoveryProfile::Normal, 64 * 1024 * 1024, None) {
-            Ok(summary) => summary,
-            Err(error) => {
-                let details = format!("recovery failed before report assertions: {error}");
-                let snapshot = save_case_snapshot(
-                    &case,
-                    "l2-session-relative-recovery-error-",
-                    Some(&details),
-                )?;
-                return Err(format!("{details}; snapshot={snapshot:?}").into());
-            }
-        };
+    let summary = match recover_case_with_job(
+        &mut case,
+        RecoveryProfile::Normal,
+        64 * 1024 * 1024,
+        None,
+        None,
+    ) {
+        Ok(summary) => summary,
+        Err(error) => {
+            let details = format!("recovery failed before report assertions: {error}");
+            let snapshot =
+                save_case_snapshot(&case, "l2-session-relative-recovery-error-", Some(&details))?;
+            return Err(format!("{details}; snapshot={snapshot:?}").into());
+        }
+    };
 
     if !summary.discovery.input_coverage_complete {
         let omissions = summary.omissions.iter().take(8).collect::<Vec<_>>();
@@ -1545,6 +1553,7 @@ fn deep_recovery_preserves_normal_exact_artifact_and_source_provenance() -> Test
         RecoveryProfile::Normal,
         64 * 1024 * 1024,
         None,
+        None,
     )?;
     assert_session_relative_recovery(
         &normal_case,
@@ -1562,6 +1571,7 @@ fn deep_recovery_preserves_normal_exact_artifact_and_source_provenance() -> Test
         &mut deep_case,
         RecoveryProfile::Deep,
         64 * 1024 * 1024,
+        None,
         None,
     )?;
     assert_session_relative_recovery(
@@ -2552,8 +2562,13 @@ fn default_recovery_decodes_raw_directional_runs_before_record_discovery() -> Te
         plaintext,
         run_nodes,
     } = build_raw_directional_fixture()?;
-    let summary =
-        recover_case_with_job(&mut case, RecoveryProfile::Normal, 64 * 1024 * 1024, None)?;
+    let summary = recover_case_with_job(
+        &mut case,
+        RecoveryProfile::Normal,
+        64 * 1024 * 1024,
+        None,
+        None,
+    )?;
     let relational_reports = load_relational_reports(&case);
     assert!(summary.discovery.input_coverage_complete);
     assert!(
@@ -2751,8 +2766,13 @@ fn clear_record_headers_do_not_admit_randomly_decoded_payloads() -> TestResult<(
     let mut case = Case::new();
     let source = capture(&mut case, "clear-header-random-payload")?;
     add_clear_header_random_sessions(&mut case, &source)?;
-    let _summary =
-        recover_case_with_job(&mut case, RecoveryProfile::Normal, 64 * 1024 * 1024, None)?;
+    let _summary = recover_case_with_job(
+        &mut case,
+        RecoveryProfile::Normal,
+        64 * 1024 * 1024,
+        None,
+        None,
+    )?;
     let reports = load_relational_reports(&case);
     assert_clear_header_report_is_pending(&reports);
     assert_clear_header_produced_no_outputs(&case, &reports)

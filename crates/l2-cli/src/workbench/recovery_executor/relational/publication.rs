@@ -1,4 +1,4 @@
-use super::super::evidence::{TransactionEdges, add_transaction_edge, add_transaction_links};
+use super::super::evidence::{add_transaction_edge, add_transaction_links};
 use super::record_gate::AcceptedRecordSchema;
 use super::{
     CommittedRelationalOutputs, DECODED_FRAME_KIND, DECODED_FRAME_REASON, OUTPUT_KIND,
@@ -17,7 +17,6 @@ use std::collections::BTreeMap;
 // Write report, output, and frame evidence in the caller transaction
 pub(super) fn publish_prepared_cohorts(
     case: &mut Case,
-    identities: &mut TransactionEdges<'_>,
     prepared: &[PreparedRelationalCohort],
 ) -> Result<(CommittedRelationalOutputs, RecoveryResult), RecoveryExecutionError> {
     let mut report_nodes = Vec::new();
@@ -42,10 +41,10 @@ pub(super) fn publish_prepared_cohorts(
 
     // Preserve cohort order so report edges match the admitted work order
     for cohort in prepared {
-        let report_node = publish_report(case, identities, cohort)?;
+        let report_node = publish_report(case, cohort)?;
         report_nodes.push(report_node);
-        publish_outputs(case, identities, report_node, cohort, &mut output_node_ids)?;
-        let record_inputs = publish_record_inputs(case, identities, report_node, cohort)?;
+        publish_outputs(case, report_node, cohort, &mut output_node_ids)?;
+        let record_inputs = publish_record_inputs(case, report_node, cohort)?;
         decoded_record_inputs.extend(record_inputs.decoded_record_inputs);
         accepted_record_schemas.extend(record_inputs.accepted_record_schemas);
     }
@@ -75,7 +74,6 @@ pub(super) fn publish_prepared_cohorts(
 
 fn publish_report(
     case: &mut Case,
-    identities: &mut TransactionEdges<'_>,
     cohort: &PreparedRelationalCohort,
 ) -> Result<u64, RecoveryExecutionError> {
     let details = json!({
@@ -96,7 +94,6 @@ fn publish_report(
     cohort_origins.dedup();
     add_transaction_links(
         case,
-        identities,
         report_node,
         &cohort_origins,
         "relational_transform_input",
@@ -108,7 +105,6 @@ fn publish_report(
 
 fn publish_outputs(
     case: &mut Case,
-    identities: &mut TransactionEdges<'_>,
     report_node: u64,
     cohort: &PreparedRelationalCohort,
     output_node_ids: &mut Vec<u64>,
@@ -145,7 +141,6 @@ fn publish_outputs(
         parents.dedup();
         add_transaction_links(
             case,
-            identities,
             output_node,
             &parents,
             "derived_from",
@@ -154,7 +149,6 @@ fn publish_outputs(
         )?;
         add_transaction_edge(
             case,
-            identities,
             Edge {
                 from: report_node,
                 to: output_node,
@@ -183,7 +177,6 @@ struct PublishedFrameInputs {
 
 fn publish_record_inputs(
     case: &mut Case,
-    identities: &mut TransactionEdges<'_>,
     report_node: u64,
     cohort: &PreparedRelationalCohort,
 ) -> Result<PublishedRecordInputs, RecoveryExecutionError> {
@@ -198,7 +191,6 @@ fn publish_record_inputs(
     }
     let published_frames = publish_decoded_record_frames(
         case,
-        identities,
         report_node,
         &cohort.context.key.source_id,
         &cohort.decoded_frames,
@@ -214,7 +206,6 @@ fn publish_record_inputs(
 
 fn publish_decoded_record_frames(
     case: &mut Case,
-    identities: &mut TransactionEdges<'_>,
     report_node: u64,
     source_id: &str,
     frames: &[super::DecodedFrameOutput],
@@ -223,8 +214,7 @@ fn publish_decoded_record_frames(
     let mut by_candidate = BTreeMap::<usize, Vec<RecordFrameInput>>::new();
     let mut accepted_members_seen = BTreeMap::<usize, usize>::new();
     for frame in frames {
-        let (decoded_node, blob_id) =
-            publish_decoded_frame(case, identities, report_node, source_id, frame)?;
+        let (decoded_node, blob_id) = publish_decoded_frame(case, report_node, source_id, frame)?;
         let frame_inputs = by_candidate.entry(frame.candidate_index).or_default();
         frame_inputs
             .try_reserve(1)
@@ -366,7 +356,6 @@ fn relational_record_cohort_key(
 
 fn publish_decoded_frame(
     case: &mut Case,
-    identities: &mut TransactionEdges<'_>,
     report_node: u64,
     source_id: &str,
     frame: &super::DecodedFrameOutput,
@@ -397,7 +386,6 @@ fn publish_decoded_frame(
     parents.dedup();
     add_transaction_links(
         case,
-        identities,
         decoded_node,
         &parents,
         "decoded_from",
@@ -406,7 +394,6 @@ fn publish_decoded_frame(
     )?;
     add_transaction_edge(
         case,
-        identities,
         Edge {
             from: report_node,
             to: decoded_node,

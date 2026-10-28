@@ -188,6 +188,52 @@ fn shared_origin_context() -> Result<(), Box<dyn Error>> {
 }
 
 #[test]
+fn recovery_transaction_deduplicates_edges_and_restores_lookup_on_rollback()
+-> Result<(), Box<dyn Error>> {
+    let mut case = Case::new();
+    let from = case.add_node("first", None, Vec::new(), json!({}))?;
+    let to = case.add_node("second", None, Vec::new(), json!({}))?;
+    let edge = Edge {
+        from,
+        to,
+        relation: "supports".to_owned(),
+        status: EvidenceStatus::Observed,
+        reason: "first reason".to_owned(),
+    };
+    let mut alternate = edge.clone();
+    alternate.reason = "second reason".to_owned();
+    case.add_edge(edge.clone())?;
+    let plan = RecoveryPlan::default();
+    let execution_policy = policy();
+    let mut executor = super::test_support::build_executor(&mut case, &plan, &execution_policy)?;
+
+    let rolled_back = executor.case_transaction(|case| {
+        super::evidence::add_transaction_edge(case, edge.clone())?;
+        super::evidence::add_transaction_edge(case, alternate.clone())?;
+        super::evidence::add_transaction_edge(case, alternate.clone())?;
+        assert_eq!(case.edges().len(), 2);
+        Err::<(), _>(RecoveryExecutionError::Evidence(EvidenceError::InvalidJson))
+    });
+    assert!(rolled_back.is_err());
+    assert_eq!(executor.case.edges().len(), 1);
+    assert!(!executor.case.contains_exact_edge(
+        from,
+        to,
+        &alternate.relation,
+        alternate.status,
+        &alternate.reason,
+    ));
+
+    executor.case_transaction(|case| {
+        super::evidence::add_transaction_edge(case, edge.clone())?;
+        super::evidence::add_transaction_edge(case, alternate.clone())?;
+        super::evidence::add_transaction_edge(case, alternate.clone())
+    })?;
+    assert_eq!(executor.case.edges().len(), 2);
+    Ok(())
+}
+
+#[test]
 fn repeated_contextual_decoding_view_reuses_the_same_provenance_node() -> Result<(), Box<dyn Error>>
 {
     let mut case = Case::new();
@@ -4824,6 +4870,7 @@ fn running_executor<'a>(
 ) -> Result<Executor<'a>, RecoveryExecutionError> {
     let case_index = CaseIndex::new(case)?;
     Ok(Executor {
+        memory: None,
         case,
         plan,
         policy: policy.clone(),

@@ -556,8 +556,8 @@ impl Executor<'_> {
         self.omissions
             .try_reserve(prepared.len())
             .map_err(|source| operational("relational omission allocation failed", source))?;
-        let committed = self.case_transaction_and_finish(candidate_id, |case, identities| {
-            publication::publish_prepared_cohorts(case, identities, &prepared)
+        let committed = self.case_transaction_and_finish(candidate_id, |case| {
+            publication::publish_prepared_cohorts(case, &prepared)
         })?;
         self.record_committed_cohorts(&prepared);
         self.record_relational_omissions(&prepared);

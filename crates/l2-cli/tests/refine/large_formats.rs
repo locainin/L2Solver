@@ -8,7 +8,7 @@ use std::{
 use crate::arguments::{RecoveryOptions, RefineOptions};
 use l2_workbench::job::{Counter, Job, cache::SourceIdentity};
 
-fn write_large_archive(path: &Path, fill: u8, png: &[u8]) -> Result<(), Box<dyn Error>> {
+pub(super) fn write_large_archive(path: &Path, fill: u8, png: &[u8]) -> Result<(), Box<dyn Error>> {
     write_archive_blocks(path, fill, png, 320)
 }
 

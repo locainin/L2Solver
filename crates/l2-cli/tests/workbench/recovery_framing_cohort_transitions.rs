@@ -19,7 +19,14 @@ fn framing_cohort_events_bind_admission_and_missing_context_to_the_source()
     let policy = framing_policy(&case)?;
     let job = Job::new("framing cohort transitions");
     let progress = JobProgress::new(job.clone());
-    execute_internal(&mut case, &framing_plan(), &policy, true, Some(&progress))?;
+    execute_internal(
+        &mut case,
+        &framing_plan(),
+        &policy,
+        true,
+        Some(&progress),
+        None,
+    )?;
     let snapshot = job.snapshot()?;
     let source_digest = source
         .strip_prefix("sha256:")

@@ -62,6 +62,7 @@ pub(super) fn build_executor<'a>(
 ) -> Result<Executor<'a>, super::RecoveryExecutionError> {
     let case_index = CaseIndex::new(case)?;
     Ok(Executor {
+        memory: None,
         case,
         plan,
         policy: policy.clone(),

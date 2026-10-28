@@ -1,6 +1,4 @@
-use super::evidence::{
-    TransactionEdges, add_transaction_edge, add_transaction_links, case_evidence_quota,
-};
+use super::evidence::{add_transaction_edge, add_transaction_links, case_evidence_quota};
 use super::{
     DERIVED_REASON, Executor, RecoveryCandidateId, RecoveryExecutionError, RecoveryOmission,
     RecoveryStage, RecoveryTask,
@@ -220,17 +218,15 @@ impl Executor<'_> {
     ) -> Result<(RecoveryResult, Vec<u64>), RecoveryExecutionError> {
         let (receipt_bytes, receipt_details) =
             embedded_receipt(report, input_node, validated_count)?;
-        self.case_transaction_and_finish(candidate_id, |case, identities| {
+        self.case_transaction_and_finish(candidate_id, |case| {
             let receipt = case.add_bytes_node(
                 "embedded_discovery_receipt",
                 &receipt_bytes,
                 Vec::new(),
                 receipt_details,
             )?;
-            let result =
-                embedded_result(case, identities, receipt, origins, report, validated_count)?;
-            let children =
-                retain_embedded_children(case, identities, input_node, receipt, outputs)?;
+            let result = embedded_result(case, receipt, origins, report, validated_count)?;
+            let children = retain_embedded_children(case, input_node, receipt, outputs)?;
             Ok(((result.clone(), children), result))
         })
     }
@@ -238,7 +234,6 @@ impl Executor<'_> {
 
 fn embedded_result(
     case: &mut l2_workbench::evidence::Case,
-    identities: &mut TransactionEdges<'_>,
     receipt: u64,
     origins: &[u64],
     report: &EmbeddedDiscoveryReport,
@@ -247,7 +242,6 @@ fn embedded_result(
     if validated_count > 0 {
         add_transaction_links(
             case,
-            identities,
             receipt,
             origins,
             "embedded_scan",
@@ -262,7 +256,6 @@ fn embedded_result(
     {
         add_transaction_links(
             case,
-            identities,
             receipt,
             origins,
             "embedded_scan_incomplete",
@@ -273,7 +266,6 @@ fn embedded_result(
     } else {
         add_transaction_links(
             case,
-            identities,
             receipt,
             origins,
             "embedded_scan_rejected",
@@ -286,7 +278,6 @@ fn embedded_result(
 
 fn retain_embedded_children(
     case: &mut l2_workbench::evidence::Case,
-    identities: &mut TransactionEdges<'_>,
     input_node: u64,
     receipt: u64,
     outputs: Vec<EmbeddedOutput>,
@@ -312,7 +303,6 @@ fn retain_embedded_children(
         )?;
         add_transaction_edge(
             case,
-            identities,
             l2_workbench::evidence::Edge {
                 from: child,
                 to: receipt,
@@ -323,7 +313,6 @@ fn retain_embedded_children(
         )?;
         add_transaction_edge(
             case,
-            identities,
             l2_workbench::evidence::Edge {
                 from: input_node,
                 to: child,

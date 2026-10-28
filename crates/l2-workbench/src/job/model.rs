@@ -861,9 +861,16 @@ fn restored_snapshot(
     let preparation = live_preparation(state)?;
 
     // Saved source reads describe prior work, not I/O performed by this process
-    let previous_reads = snapshot.counters.remove(&Counter::SourceReadBytes).unwrap_or_default();
-    let prior_reads = snapshot.counters.entry(Counter::PriorSourceReadBytes).or_insert(0);
-    *prior_reads = prior_reads.checked_add(previous_reads)
+    let previous_reads = snapshot
+        .counters
+        .remove(&Counter::SourceReadBytes)
+        .unwrap_or_default();
+    let prior_reads = snapshot
+        .counters
+        .entry(Counter::PriorSourceReadBytes)
+        .or_insert(0);
+    *prior_reads = prior_reads
+        .checked_add(previous_reads)
         .ok_or(JobError::CounterOverflow(Counter::PriorSourceReadBytes))?;
 
     // Cache lookups may have recorded work before restoration

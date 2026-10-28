@@ -296,7 +296,7 @@ impl LoadedSource {
         let checkpoint = zip_candidate
             .as_ref()
             .and_then(|candidate| (candidate.length < source.length).then_some(candidate.length));
-        let (scanned, report_memory) =
+        let (scanned, mut report_memory) =
             analyze_source_stream(&mut reader, source.length, options, checkpoint, memory)?;
         let mut report = scanned.analysis;
         let mut png = scanned.png;
@@ -324,6 +324,7 @@ impl LoadedSource {
             options,
             input_set,
             job,
+            &mut report_memory,
         )?;
         png = retain_png_range(png, &mut report, input_set)?;
         if metadata_fingerprint(&file.metadata()?) != source.metadata {
@@ -471,6 +472,7 @@ fn inspect_source_archive(
     options: l2_workbench::artifact::ArtifactAnalysisOptions,
     input: &InputSet,
     job: &Job,
+    memory: &mut MemoryLease,
 ) -> Result<(Option<l2_workbench::artifact::zip::ZipArtifactReport>, bool), Box<dyn Error>> {
     let mut candidates = if let Some(observation) = ends.stream {
         if observation.unscanned_bytes > 0 || observation.omitted_candidates > 0 {
@@ -528,6 +530,7 @@ fn inspect_source_archive(
             options,
             input,
             job,
+            memory,
         )?
         else {
             continue;

@@ -54,6 +54,20 @@ pub(super) fn collect_export(
     limits: ArtifactLimits,
     context: &RecoveryContext<'_>,
 ) -> Result<CollectedExport, Box<dyn Error>> {
+    collect_export_inner(staging, options, limits, context).map_err(|source| {
+        Box::new(CaptureAnalysisError {
+            capture: options.capture.clone(),
+            source,
+        }) as Box<dyn Error>
+    })
+}
+
+fn collect_export_inner(
+    staging: &Path,
+    options: &ExportOptions,
+    limits: ArtifactLimits,
+    context: &RecoveryContext<'_>,
+) -> Result<CollectedExport, Box<dyn Error>> {
     let mut collection = CaseCollection {
         artifacts: ArtifactCollection::new(staging, limits)?,
         evidence: EvidenceSidecar::new(staging, limits.evidence_bytes, context.memory)?,
@@ -190,6 +204,7 @@ fn collect_flow_cases(
         workbench::full_source::IndexedAnalysisContext {
             cache: native_cache,
             job: context.job,
+            strict_cache: context.options.strict_cache,
         },
         |item| {
             let pending = PendingCase::new(item)?;
@@ -209,10 +224,7 @@ fn collect_flow_cases(
         process_case_batch(&mut batch, pool, context, &mut collect_case)?;
         Ok(coverage)
     });
-    let coverage = analysis.map_err(|source| CaptureAnalysisError {
-        capture: options.capture.clone(),
-        source,
-    })?;
+    let coverage = analysis?;
     add_source_limitations(&mut collection.limitations, &coverage.source)?;
     Ok(coverage)
 }

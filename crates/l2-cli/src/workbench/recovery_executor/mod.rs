@@ -40,7 +40,7 @@ use case_scan::{
 use discovery::TransformDiscoveryState;
 use l2_workbench::{
     evidence::{Case, EvidenceStatus},
-    job::{Counter, Job, JobError, Phase},
+    job::{Counter, Job, JobError, MemoryBudget, Phase},
     recovery::{
         RecoveryCandidateId, RecoveryCoordinator, RecoveryError, RecoveryStage, RecoveryTask,
     },
@@ -79,6 +79,7 @@ pub fn recover_case(case: &mut Case) -> Result<RecoveryRunSummary, RecoveryExecu
         RecoveryProfile::Normal,
         policy::DEFAULT_MEMORY_LIMIT_BYTES as u64,
         None,
+        None,
     )
 }
 
@@ -88,6 +89,7 @@ pub fn recover_case_with_job(
     profile: RecoveryProfile,
     memory_limit_bytes: u64,
     job: Option<&Job>,
+    memory: Option<&MemoryBudget>,
 ) -> Result<RecoveryRunSummary, RecoveryExecutionError> {
     if let Some(job) = job {
         job.check_cancelled()?;
@@ -100,7 +102,7 @@ pub fn recover_case_with_job(
         ..RecoveryPlan::default()
     };
     let progress = job.cloned().map(JobProgress::new);
-    let outcome = execute_internal(case, &plan, &policy, false, progress.as_ref())?;
+    let outcome = execute_internal(case, &plan, &policy, false, progress.as_ref(), memory)?;
     Ok(RecoveryRunSummary {
         case_evidence_collection_complete: case.collection_complete(),
         discovery: RecoveryDiscoveryStatus {
@@ -240,7 +242,7 @@ fn execute(
     plan: &RecoveryPlan,
     policy: &RecoveryExecutionPolicy,
 ) -> Result<RecoveryExecutionOutcome, RecoveryExecutionError> {
-    execute_internal(case, plan, policy, true, None)
+    execute_internal(case, plan, policy, true, None, None)
 }
 
 fn execute_internal(
@@ -249,11 +251,13 @@ fn execute_internal(
     policy: &RecoveryExecutionPolicy,
     snapshot_candidates: bool,
     job: Option<&JobProgress>,
+    memory: Option<&MemoryBudget>,
 ) -> Result<RecoveryExecutionOutcome, RecoveryExecutionError> {
     let policy = resolve_policy(policy.clone())?;
     let resources = policy.resources;
     let case_index_ledger = CaseIndexScanLedger::new()?;
     let mut executor = Executor {
+        memory: memory.cloned(),
         case,
         plan,
         policy,
@@ -569,6 +573,7 @@ fn snapshot_candidates(
 }
 
 struct Executor<'a> {
+    memory: Option<MemoryBudget>,
     case: &'a mut Case,
     plan: &'a RecoveryPlan,
     policy: RecoveryExecutionPolicy,
@@ -740,14 +745,12 @@ impl Executor<'_> {
     }
 }
 
-type EdgeIdentity = (u64, u64, String, u8, String);
 type ContextualDecodingViewKey = (String, u64, u64);
 
 #[derive(Default)]
 struct CaseIndex {
     node_positions: HashMap<u64, usize>,
     blob_positions: HashMap<String, usize>,
-    edge_identities: HashSet<EdgeIdentity>,
     decoding_outputs: HashMap<u64, u64>,
     contextual_decoding_views: HashMap<ContextualDecodingViewKey, u64>,
     validated_ranges_by_receipt: HashMap<u64, BTreeSet<u64>>,
@@ -925,13 +928,6 @@ impl CaseIndex {
     fn index_new_edges(&mut self, case: &Case) -> Result<usize, RecoveryExecutionError> {
         let mut work = 0_usize;
         for edge in case.edges().iter().skip(self.edge_count) {
-            self.edge_identities.insert(edge_identity(
-                edge.from,
-                edge.to,
-                &edge.relation,
-                edge.status,
-                &edge.reason,
-            ));
             work = work
                 .checked_add(edge.relation.len())
                 .and_then(|total| total.checked_add(edge.reason.len()))
@@ -1120,23 +1116,6 @@ fn root_seed_sort_byte(seed: &RootSeed, pass: usize) -> Result<u8, RecoveryExecu
         return Ok(seed.priority.0);
     }
     Err(RecoveryError::InvariantFailure.into())
-}
-
-fn edge_identity(
-    from: u64,
-    to: u64,
-    relation: &str,
-    status: EvidenceStatus,
-    reason: &str,
-) -> EdgeIdentity {
-    let status = match status {
-        EvidenceStatus::Observed => 0,
-        EvidenceStatus::Hypothesis => 1,
-        EvidenceStatus::ConstraintSatisfied => 2,
-        EvidenceStatus::ConstraintFailed => 3,
-        EvidenceStatus::Unresolved => 4,
-    };
-    (from, to, relation.to_owned(), status, reason.to_owned())
 }
 
 #[cfg(test)]

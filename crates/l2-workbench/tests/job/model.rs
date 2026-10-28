@@ -2,6 +2,49 @@ use super::{Counter, Job, JobError, Phase, PhaseOutcome, PhaseState, TestResult,
 use std::{thread, time::Duration};
 
 #[test]
+fn checkpoint_preview_keeps_prior_source_reads_separate_from_live_preparation_reads() -> TestResult
+{
+    let saved = Job::new("saved reads");
+    saved.increment(Counter::SourceReadBytes, 17)?;
+    saved.increment(Counter::PriorSourceReadBytes, 5)?;
+    let live = Job::new("current reads");
+    live.start(Phase::Preparation, None)?;
+    live.set_current(Phase::Preparation, "opening cache")?;
+    live.increment(Counter::SourceReadBytes, 3)?;
+
+    let checkpoint = saved.snapshot()?;
+    let preview = live.preview_checkpoint(Some(&checkpoint))?;
+    assert_eq!(preview.counters.get(&Counter::SourceReadBytes), Some(&3));
+    assert_eq!(
+        preview.counters.get(&Counter::PriorSourceReadBytes),
+        Some(&22)
+    );
+    assert_eq!(
+        phase(&preview, Phase::Preparation)?.state,
+        PhaseState::InProgress
+    );
+    assert_eq!(
+        live.snapshot()?
+            .counters
+            .get(&Counter::PriorSourceReadBytes),
+        Some(&0)
+    );
+
+    live.restore(checkpoint)?;
+    let restored = live.snapshot()?;
+    assert_eq!(restored.counters.get(&Counter::SourceReadBytes), Some(&3));
+    assert_eq!(
+        restored.counters.get(&Counter::PriorSourceReadBytes),
+        Some(&22)
+    );
+    assert_eq!(
+        phase(&restored, Phase::Preparation)?.message.as_deref(),
+        Some("opening cache")
+    );
+    Ok(())
+}
+
+#[test]
 fn restore_preserves_live_preparation_and_continues_its_clock() -> TestResult {
     let saved = Job::new("saved job");
     saved.start(Phase::Preparation, Some(20))?;

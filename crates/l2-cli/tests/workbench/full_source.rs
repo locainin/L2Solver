@@ -60,6 +60,7 @@ fn assert_late_png_structure(
             zip_work_bytes: body.len(),
             retained_bytes: body.len(),
         },
+        None,
     );
     let outcome = expansion.expand_selected(body_node)?;
     assert!(outcome.complete);

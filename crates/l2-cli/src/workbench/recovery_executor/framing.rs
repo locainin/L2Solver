@@ -90,12 +90,11 @@ impl Executor<'_> {
         origins: &[u64],
         prepared: PreparedFraming,
     ) -> Result<(Vec<u64>, Option<u64>, u64), RecoveryExecutionError> {
-        self.case_transaction_and_finish(candidate_id, |case, identities| {
+        self.case_transaction_and_finish(candidate_id, |case| {
             let outcome = framing_materialize::commit_recovery(case, prepared)
                 .map_err(framing_materialization_error)?;
             add_transaction_links(
                 case,
-                identities,
                 outcome.receipt_node,
                 origins,
                 "framing_execution",
@@ -107,7 +106,6 @@ impl Executor<'_> {
             for frame_node in outputs {
                 add_transaction_edge(
                     case,
-                    identities,
                     l2_workbench::evidence::Edge {
                         from: frame_node,
                         to: outcome.receipt_node,

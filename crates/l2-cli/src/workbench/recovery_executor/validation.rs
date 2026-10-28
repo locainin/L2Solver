@@ -1,4 +1,4 @@
-use super::evidence::{TransactionEdges, add_transaction_edge, add_transaction_links};
+use super::evidence::{add_transaction_edge, add_transaction_links};
 use super::format::{validation_boundary, validation_format};
 use super::{
     Executor, RecoveryCandidateId, RecoveryExecutionError, RecoveryOmission, RecoveryTask,
@@ -426,14 +426,13 @@ impl Executor<'_> {
             exact_bytes,
             relational_record_artifact,
         } = commit;
-        self.case_transaction_and_finish(candidate_id, |case, identities| {
+        self.case_transaction_and_finish(candidate_id, |case| {
             // The full input gets a validated-range edge below, so omit its reciprocal link
             let validated_input = exact_bytes.is_none().then_some(input_node);
             let receipt_node =
-                add_validation_receipt(case, identities, origins, validated_input, receipt)?;
+                add_validation_receipt(case, origins, validated_input, receipt)?;
             let expansion_node = add_validated_range(
                 case,
-                identities,
                 input_node,
                 receipt_node,
                 artifact,
@@ -473,7 +472,6 @@ impl Executor<'_> {
                 )?;
                 add_transaction_links(
                     case,
-                    identities,
                     output_node,
                     &[input_node],
                     "validated_record_assembly",
@@ -482,7 +480,6 @@ impl Executor<'_> {
                 )?;
                 add_transaction_edge(
                     case,
-                    identities,
                     Edge {
                         from: relational_artifact.report_node_id,
                         to: output_node,
@@ -579,7 +576,7 @@ impl Executor<'_> {
                 stage: RecoveryStage::StructuralValidation,
                 source: Box::new(source),
             })?;
-        self.case_transaction_and_finish(candidate_id, |case, identities| {
+        self.case_transaction_and_finish(candidate_id, |case| {
             let receipt = case.add_bytes_node(
                 "artifact_validation_receipt",
                 &receipt_bytes,
@@ -588,7 +585,6 @@ impl Executor<'_> {
             )?;
             add_transaction_links(
                 case,
-                identities,
                 receipt,
                 origins,
                 "validation_hypothesis",
@@ -620,7 +616,7 @@ impl Executor<'_> {
                 stage: RecoveryStage::StructuralValidation,
                 source: Box::new(source),
             })?;
-        self.case_transaction_and_finish(candidate_id, |case, identities| {
+        self.case_transaction_and_finish(candidate_id, |case| {
             let receipt = case.add_bytes_node(
                 "artifact_validation_receipt",
                 &receipt_bytes,
@@ -629,7 +625,6 @@ impl Executor<'_> {
             )?;
             add_transaction_links(
                 case,
-                identities,
                 receipt,
                 origins,
                 "validation_rejected",
@@ -661,7 +656,6 @@ impl ValidationReceipt {
 
 fn add_validation_receipt(
     case: &mut Case,
-    identities: &mut TransactionEdges<'_>,
     origins: &[u64],
     validated_input: Option<u64>,
     receipt: ValidationReceipt,
@@ -679,7 +673,6 @@ fn add_validation_receipt(
     {
         add_transaction_edge(
             case,
-            identities,
             Edge {
                 from: receipt_node,
                 to: origin,
@@ -695,26 +688,19 @@ fn add_validation_receipt(
 
 fn add_validated_range(
     case: &mut Case,
-    identities: &mut TransactionEdges<'_>,
     input_node: u64,
     receipt_node: u64,
     artifact: ValidatedArtifact,
     exact_bytes: Option<Vec<u8>>,
 ) -> Result<u64, RecoveryExecutionError> {
     let expansion_node = match exact_bytes {
-        Some(bytes) => add_exact_validated_artifact(
-            case,
-            identities,
-            input_node,
-            receipt_node,
-            artifact,
-            &bytes,
-        )?,
+        Some(bytes) => {
+            add_exact_validated_artifact(case, input_node, receipt_node, artifact, &bytes)?
+        }
         None => input_node,
     };
     add_transaction_edge(
         case,
-        identities,
         Edge {
             from: expansion_node,
             to: receipt_node,
@@ -728,7 +714,6 @@ fn add_validated_range(
 
 fn add_exact_validated_artifact(
     case: &mut Case,
-    identities: &mut TransactionEdges<'_>,
     input_node: u64,
     receipt_node: u64,
     artifact: ValidatedArtifact,
@@ -749,7 +734,6 @@ fn add_exact_validated_artifact(
     )?;
     add_transaction_edge(
         case,
-        identities,
         Edge {
             from: exact_node,
             to: receipt_node,

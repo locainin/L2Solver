@@ -697,11 +697,10 @@ impl Executor<'_> {
         if report_nodes.is_empty() {
             return Ok(());
         }
-        let linked = self.case_transaction(|case, identities| {
+        let linked = self.case_transaction(|case| {
             for report_node_id in &report_nodes {
                 add_transaction_edge(
                     case,
-                    identities,
                     Edge {
                         from: *report_node_id,
                         to: receipt_node_id,
@@ -894,10 +893,9 @@ impl Executor<'_> {
         };
         let pending = candidate.pending_origin_node_ids().to_vec();
         let relation = relation.to_owned();
-        self.case_transaction(|case, identities| {
+        self.case_transaction(|case| {
             add_transaction_links(
                 case,
-                identities,
                 result_node,
                 &pending,
                 &relation,

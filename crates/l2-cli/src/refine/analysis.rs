@@ -31,7 +31,7 @@ use std::{
     io::{self, Write},
 };
 
-pub(super) const REFINE_ANALYZER_ALGORITHM_VERSION: u32 = 12;
+pub(super) const REFINE_ANALYZER_ALGORITHM_VERSION: u32 = 13;
 pub(super) const CACHE_ANALYSIS_SCHEMA_VERSION: u32 = 1;
 const MAX_CACHE_RECEIPT_BYTES: usize = 8 * 1024 * 1024;
 
@@ -505,21 +505,7 @@ pub(super) fn analyze_source_cached(
         return Ok(report);
     };
 
-    let identity = SourceIdentity::from_sha256(digest.to_owned())?;
-    let policy = json!({
-        "schema_version": CACHE_ANALYSIS_SCHEMA_VERSION,
-        "transform_proposal_format_version": TRANSFORM_PROPOSAL_FORMAT_VERSION,
-        "analyzer": options,
-        "profile": recovery_profile_name(recovery.profile),
-    });
-    let key = StageKey::new(
-        "file_artifact_analysis",
-        CACHE_ANALYSIS_SCHEMA_VERSION,
-        format!("l2_artifact_analyzer_v{REFINE_ANALYZER_ALGORITHM_VERSION}"),
-        &policy,
-        &identity,
-        &[],
-    )?;
+    let key = analysis_cache_key(digest, options, recovery.profile)?;
 
     if !recovery.refresh {
         match cache.lookup(&key, CacheReadPolicy::AllowPartial) {
@@ -528,7 +514,12 @@ pub(super) fn analyze_source_cached(
                     job.increment(Counter::CacheHits, 1)?;
                     return Ok(report);
                 }
-                Err(error) if recovery.strict_cache => return Err(error),
+                Err(error)
+                    if recovery.strict_cache
+                        || crate::memory_error::find(error.as_ref()).is_some() =>
+                {
+                    return Err(error);
+                }
                 Err(_) => note_cache_fallback(
                     job,
                     CacheFallbackKind::InvalidEntry,
@@ -536,7 +527,9 @@ pub(super) fn analyze_source_cached(
                 )?,
             },
             Ok(None) => {}
-            Err(error) if recovery.strict_cache => return Err(error.into()),
+            Err(error) if recovery.strict_cache || crate::memory_error::find(&error).is_some() => {
+                return Err(error.into());
+            }
             Err(_) => note_cache_fallback(
                 job,
                 CacheFallbackKind::LookupFailed,
@@ -548,7 +541,9 @@ pub(super) fn analyze_source_cached(
 
     let lease = match cache.lease(&key) {
         Ok(lease) => Some(lease),
-        Err(error) if recovery.strict_cache => return Err(error.into()),
+        Err(error) if recovery.strict_cache || crate::memory_error::find(&error).is_some() => {
+            return Err(error.into());
+        }
         Err(_) => {
             note_cache_fallback(
                 job,
@@ -564,7 +559,7 @@ pub(super) fn analyze_source_cached(
     if let Some(lease) = lease
         && let Err(error) = store_cached_analysis(lease, &report)
     {
-        if recovery.strict_cache {
+        if recovery.strict_cache || crate::memory_error::find(error.as_ref()).is_some() {
             return Err(error);
         }
         note_cache_fallback(
@@ -574,6 +569,28 @@ pub(super) fn analyze_source_cached(
         )?;
     }
     Ok(report)
+}
+
+fn analysis_cache_key(
+    digest: &str,
+    options: ArtifactAnalysisOptions,
+    profile: RecoveryProfile,
+) -> Result<StageKey, Box<dyn Error>> {
+    let identity = SourceIdentity::from_sha256(digest.to_owned())?;
+    let policy = json!({
+        "schema_version": CACHE_ANALYSIS_SCHEMA_VERSION,
+        "transform_proposal_format_version": TRANSFORM_PROPOSAL_FORMAT_VERSION,
+        "analyzer": options,
+        "profile": recovery_profile_name(profile),
+    });
+    Ok(StageKey::new(
+        "file_artifact_analysis",
+        CACHE_ANALYSIS_SCHEMA_VERSION,
+        format!("l2_artifact_analyzer_v{REFINE_ANALYZER_ALGORITHM_VERSION}"),
+        &policy,
+        &identity,
+        &[],
+    )?)
 }
 
 pub(super) const fn recovery_profile_name(profile: RecoveryProfile) -> &'static str {

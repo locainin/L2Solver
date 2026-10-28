@@ -77,6 +77,8 @@ pub struct IndexedAnalysisContext<'a> {
     pub cache: Option<&'a Cache>,
     /// Cumulative progress and cache counters
     pub job: Option<&'a Job>,
+    /// Require native Case cache operations to succeed rather than recomputing safely
+    pub strict_cache: bool,
 }
 
 struct CachedIndexWork<'a> {

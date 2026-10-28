@@ -22,10 +22,9 @@ fn strict_cache_startup_failure_finishes_the_visible_preparation_phase()
         .filter_map(|snapshot| snapshot.get("phases").cloned())
         .filter_map(|phases| phases.as_array().cloned())
         .flatten()
-        .filter(|phase| {
+        .rfind(|phase| {
             phase.get("phase").and_then(serde_json::Value::as_str) == Some("preparation")
         })
-        .last()
         .ok_or("preparation progress is missing")?;
     assert_eq!(
         preparation.get("state").and_then(serde_json::Value::as_str),

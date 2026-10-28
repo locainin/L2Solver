@@ -4,6 +4,47 @@ use crate::arguments::{RecoveryOptions, RefineOptions};
 use l2_workbench::job::{Job, MemoryBudget, MemoryClass, MemoryError};
 
 #[test]
+fn cached_refinement_preserves_memory_pressure_in_optional_and_strict_modes()
+-> Result<(), Box<dyn Error>> {
+    use l2_workbench::job::cache::Cache;
+
+    let temporary = tempfile::tempdir()?;
+    let root = temporary.path().join("cache");
+    let state = temporary.path().join("state");
+    let cache = Cache::open_at(&root, &state, 1024 * 1024)?;
+    let source = super::loaded_source("source.bin", &super::structural_png()?);
+    let options = l2_workbench::artifact::ArtifactAnalysisOptions::default();
+    super::analyze_source_cached(
+        &source,
+        options,
+        &RecoveryOptions::default(),
+        Some(&cache),
+        &Job::new("populate"),
+    )?;
+    drop(cache);
+    let cache = Cache::open_at(root, state, 1024 * 1024)?;
+    let budget = MemoryBudget::new(1);
+    cache.attach_memory_budget(budget.clone())?;
+    for strict_cache in [false, true] {
+        let recovery = RecoveryOptions {
+            strict_cache,
+            ..RecoveryOptions::default()
+        };
+        let job = Job::new("cache pressure");
+        let error = super::analyze_source_cached(&source, options, &recovery, Some(&cache), &job)
+            .err()
+            .ok_or("memory pressure was swallowed as an optional cache failure")?;
+        assert!(matches!(
+            crate::memory_error::find(error.as_ref()),
+            Some(MemoryError::Limit { .. })
+        ));
+        assert!(job.snapshot()?.cache_fallbacks.records().is_empty());
+        assert_eq!(budget.snapshot()?.used_bytes, 0);
+    }
+    Ok(())
+}
+
+#[test]
 fn publication_buffer_uses_the_fixed_policy_size_and_releases_its_lease()
 -> Result<(), Box<dyn Error>> {
     let budget = MemoryBudget::new(32 * 1024);
@@ -186,6 +227,91 @@ fn range_scan_does_not_reserve_unused_maximum_output() -> Result<(), Box<dyn Err
         serde_json::from_slice(&fs::read(retry.join("manifest.json"))?)?;
     assert_eq!(first.get("sources"), second.get("sources"));
     assert_eq!(first.get("artifacts"), second.get("artifacts"));
+    Ok(())
+}
+
+#[test]
+fn range_zip_expansion_is_admitted_before_member_reads_and_retries_without_omissions()
+-> Result<(), Box<dyn Error>> {
+    use l2_workbench::artifact::{ArtifactAnalysisOptions, analyze_artifacts};
+    use l2_workbench::job::Counter;
+
+    let directory = tempfile::tempdir()?;
+    let input_path = directory.path().join("large.zip");
+    let png = super::structural_png()?;
+    super::large_formats::write_large_archive(&input_path, 7, &png)?;
+    let source_length = usize::try_from(fs::metadata(&input_path)?.len())?;
+    let digest = l2_workbench::sha256(&fs::read(&input_path)?);
+    let options = ArtifactAnalysisOptions::default();
+    let mut report = analyze_artifacts(b"", options)?;
+    report.source_sha256.clone_from(&digest);
+    report.source_length = source_length;
+
+    // Keep parser work eligible so that a work omission cannot hide missing memory admission
+    let memory = MemoryBudget::new(16 * 1024 * 1024);
+    let job = Job::new("ZIP member pressure");
+    let input =
+        crate::refine::input::prepare_input_set_with_limit(&input_path, u64::MAX, &job, &memory)?;
+    let mut file = fs::File::open(&input_path)?;
+    let mut retained = memory.try_reserve(MemoryClass::Executor, 0)?;
+    let held = memory.try_reserve(MemoryClass::Cache, 11 * 1024 * 1024)?;
+    let before = memory.snapshot()?.used_bytes;
+    let error = crate::refine::range_zip::inspect(
+        &mut file,
+        source_length,
+        &digest,
+        &mut report,
+        options,
+        &input,
+        &job,
+        &mut retained,
+    )
+    .err()
+    .ok_or("ZIP expansion ignored shared pressure")?;
+    assert!(matches!(
+        error.downcast_ref::<MemoryError>(),
+        Some(MemoryError::Limit { .. })
+    ));
+    assert_eq!(report.zip_expanded_work_bytes, 0);
+    assert!(report.omissions.is_empty());
+    let reads = job
+        .snapshot()?
+        .counters
+        .get(&Counter::SourceReadBytes)
+        .copied()
+        .unwrap_or(0);
+    assert!(
+        reads < 2 * 1024 * 1024,
+        "member was read before admission: {reads}"
+    );
+    assert_eq!(memory.snapshot()?.used_bytes, before);
+
+    drop(held);
+    let archive = crate::refine::range_zip::inspect(
+        &mut file,
+        source_length,
+        &digest,
+        &mut report,
+        options,
+        &input,
+        &job,
+        &mut retained,
+    )?
+    .ok_or("retry did not inspect the ZIP")?;
+    assert_eq!(archive.extracted_entry_count, 2);
+    assert_eq!(archive.omitted_entry_count, 0);
+    let [large, small] = archive.entries.as_slice() else {
+        return Err("expected both ZIP members".into());
+    };
+    let large = large.content.as_deref().ok_or("large member is missing")?;
+    assert_eq!(large.len(), 320 * 16 * 1024);
+    assert!(large.iter().all(|byte| *byte == 7));
+    assert_eq!(small.content.as_deref(), Some(png.as_slice()));
+    assert!(retained.bytes() >= u64::try_from(large.len())?);
+    drop(archive);
+    drop(retained);
+    drop(input);
+    assert_eq!(memory.snapshot()?.used_bytes, 0);
     Ok(())
 }
 

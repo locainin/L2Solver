@@ -176,6 +176,7 @@ fn test_executor<'a>(
 ) -> TestResult<Executor<'a>> {
     let case_index = CaseIndex::new(case)?;
     Ok(Executor {
+        memory: None,
         case,
         plan,
         policy,

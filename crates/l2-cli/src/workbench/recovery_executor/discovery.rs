@@ -1,8 +1,8 @@
-use super::evidence::{TransactionEdges, add_transaction_edge, case_evidence_quota};
+use super::evidence::{add_transaction_edge, case_evidence_quota};
 use super::scheduler::enqueue_candidate_id;
 use super::{
     Executor, PROPOSED_BY_REASON, RecoveryCandidateId, RecoveryExecutionError, RecoveryOmission,
-    RecoveryStage, RecoveryTask, TransformSlot, edge_identity,
+    RecoveryStage, RecoveryTask, TransformSlot,
 };
 use l2_workbench::{
     derivation::Recipe,
@@ -35,14 +35,12 @@ mod proposal_link_quota_tests;
 
 pub(super) fn add_transform_proposal_edges(
     case: &mut Case,
-    edge_identities: &mut TransactionEdges<'_>,
     transform_receipt: u64,
     proposal_receipts: &[u64],
 ) -> Result<(), RecoveryExecutionError> {
     for proposal_receipt in proposal_receipts {
         add_transaction_edge(
             case,
-            edge_identities,
             Edge {
                 from: transform_receipt,
                 to: *proposal_receipt,
@@ -512,8 +510,8 @@ impl Executor<'_> {
         }
 
         let requested = receipts.len();
-        match self.case_transaction(|case, identities| {
-            add_transform_proposal_edges(case, identities, transform_receipt, &receipts)
+        match self.case_transaction(|case| {
+            add_transform_proposal_edges(case, transform_receipt, &receipts)
         }) {
             Ok(()) => {
                 self.transform_proposal_receipts
@@ -594,14 +592,13 @@ impl Executor<'_> {
         );
         self.refresh_case_index()?;
         receipts.retain(|proposal_receipt| {
-            let identity = edge_identity(
+            !self.case.contains_exact_edge(
                 transform_receipt,
                 *proposal_receipt,
                 "proposed_by",
                 EvidenceStatus::Unresolved,
                 PROPOSED_BY_REASON,
-            );
-            !self.case_index.edge_identities.contains(&identity)
+            )
         });
         Ok(Some(receipts))
     }
@@ -811,14 +808,13 @@ impl Executor<'_> {
                 .get(&candidate_id)
                 .and_then(|receipts| receipts.blocked_omission_index(transform_receipt));
             if let Some(omission_index) = blocked_omission_index {
-                let identity = edge_identity(
+                if !self.case.contains_exact_edge(
                     transform_receipt,
                     proposal_receipt,
                     "proposed_by",
                     EvidenceStatus::Unresolved,
                     PROPOSED_BY_REASON,
-                );
-                if !self.case_index.edge_identities.contains(&identity) {
+                ) {
                     self.extend_proposal_link_omission(omission_index)?;
                 }
                 return Ok(());

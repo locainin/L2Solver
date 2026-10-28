@@ -27,7 +27,7 @@ use std::{
 // Advance when recovery eligibility, generation, cohorting, or parser constraints change
 // Application semantics also belong to this stage's identity
 // Capture indexing and native reconstruction keep their separate upstream versions
-pub(super) const RECOVERY_STAGE_VERSION: u32 = 24;
+pub(super) const RECOVERY_STAGE_VERSION: u32 = 25;
 const RECOVERY_STAGE: &str = "default_case_recovery";
 const RECOVERY_ALGORITHM: &str = "l2-default-case-recovery";
 const CASE_FILE: &str = "case.json";
@@ -117,7 +117,11 @@ pub(super) fn recover(
     let lease = match cache {
         Some(cache) => match cache.lease(&key) {
             Ok(lease) => Some(lease),
-            Err(error) if context.options.strict_cache => return Err(error.into()),
+            Err(error)
+                if context.options.strict_cache || crate::memory_error::find(&error).is_some() =>
+            {
+                return Err(error.into());
+            }
             Err(_) => {
                 note_cache_fallback(
                     context.job,
@@ -134,6 +138,7 @@ pub(super) fn recover(
         context.options.profile,
         context.options.memory_limit,
         context.job,
+        context.memory,
     )?;
     let mut coverage = RecoveryCoverage::default();
     coverage.record(&summary, kind)?;

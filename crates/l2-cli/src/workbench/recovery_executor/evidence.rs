@@ -1,6 +1,6 @@
 use super::{
     DERIVED_REASON, Executor, RESULT_REASON, RecoveryCandidateId, RecoveryExecutionError,
-    RecoveryOmission, RecoveryTask, edge_identity,
+    RecoveryOmission, RecoveryTask,
 };
 use l2_workbench::{
     evidence::{
@@ -13,7 +13,6 @@ use l2_workbench::{
     },
 };
 use serde_json::{Value, json};
-use std::collections::HashSet;
 
 #[derive(Clone, Copy)]
 pub(super) struct CaseEvidenceStop {
@@ -228,37 +227,18 @@ impl Executor<'_> {
     }
 }
 
-pub(super) struct TransactionEdges<'a> {
-    existing: &'a HashSet<super::EdgeIdentity>,
-    staged: HashSet<super::EdgeIdentity>,
-}
-
-impl<'a> TransactionEdges<'a> {
-    fn new(existing: &'a HashSet<super::EdgeIdentity>) -> Self {
-        Self {
-            existing,
-            staged: HashSet::new(),
-        }
-    }
-
-    fn contains_or_insert(&mut self, identity: super::EdgeIdentity) -> bool {
-        self.existing.contains(&identity) || !self.staged.insert(identity)
-    }
-}
-
 pub(super) fn add_transaction_edge(
     case: &mut Case,
-    identities: &mut TransactionEdges<'_>,
     edge: Edge,
 ) -> Result<(), RecoveryExecutionError> {
-    let identity = edge_identity(
+    // The Case index includes edges added earlier in this transaction
+    if case.contains_exact_edge(
         edge.from,
         edge.to,
         &edge.relation,
         edge.status,
         &edge.reason,
-    );
-    if identities.contains_or_insert(identity) {
+    ) {
         return Ok(());
     }
     case.add_edge(edge)?;
@@ -267,7 +247,6 @@ pub(super) fn add_transaction_edge(
 
 pub(super) fn add_transaction_links(
     case: &mut Case,
-    identities: &mut TransactionEdges<'_>,
     from: u64,
     origins: &[u64],
     relation: &str,
@@ -277,7 +256,6 @@ pub(super) fn add_transaction_links(
     for origin in origins {
         add_transaction_edge(
             case,
-            identities,
             Edge {
                 from,
                 to: *origin,
@@ -330,9 +308,7 @@ impl Executor<'_> {
             return Ok(view_node);
         }
 
-        let existing_edges = &self.case_index.edge_identities;
         let case = &mut *self.case;
-        let mut identities = TransactionEdges::new(existing_edges);
         let view_node = case.transaction(|case| {
             let view = case.add_node(
                 "decoding_output",
@@ -345,7 +321,7 @@ impl Executor<'_> {
                 }),
             )?;
             for edge in contextual_decoding_view_edges(view, receipt_node, input_node) {
-                add_transaction_edge(case, &mut identities, edge)?;
+                add_transaction_edge(case, edge)?;
             }
             Ok::<u64, RecoveryExecutionError>(view)
         })?;
@@ -361,24 +337,22 @@ impl Executor<'_> {
     ) -> Result<(), RecoveryExecutionError> {
         let edges = contextual_decoding_view_edges(view_node, receipt_node, input_node);
         let all_edges_exist = edges.iter().all(|edge| {
-            self.case_index.edge_identities.contains(&edge_identity(
+            self.case.contains_exact_edge(
                 edge.from,
                 edge.to,
                 &edge.relation,
                 edge.status,
                 &edge.reason,
-            ))
+            )
         });
         if all_edges_exist {
             return Ok(());
         }
 
-        let existing_edges = &self.case_index.edge_identities;
         let case = &mut *self.case;
-        let mut identities = TransactionEdges::new(existing_edges);
         case.transaction(|case| {
             for edge in edges {
-                add_transaction_edge(case, &mut identities, edge)?;
+                add_transaction_edge(case, edge)?;
             }
             Ok::<(), RecoveryExecutionError>(())
         })?;
@@ -543,22 +517,18 @@ impl Executor<'_> {
         candidate_id: RecoveryCandidateId,
         result: RecoveryResult,
     ) -> Result<(), RecoveryExecutionError> {
-        self.case_transaction_and_finish(candidate_id, |_case, _identities| Ok(((), result)))?;
+        self.case_transaction_and_finish(candidate_id, |_case| Ok(((), result)))?;
         Ok(())
     }
 
     pub(super) fn case_transaction_and_finish<T>(
         &mut self,
         candidate_id: RecoveryCandidateId,
-        write: impl FnOnce(
-            &mut Case,
-            &mut TransactionEdges<'_>,
-        ) -> Result<(T, RecoveryResult), RecoveryExecutionError>,
+        write: impl FnOnce(&mut Case) -> Result<(T, RecoveryResult), RecoveryExecutionError>,
     ) -> Result<T, RecoveryExecutionError> {
-        self.case_transaction_and_finish_with_coordinator(
-            candidate_id,
-            |case, identities, _coordinator| write(case, identities),
-        )
+        self.case_transaction_and_finish_with_coordinator(candidate_id, |case, _coordinator| {
+            write(case)
+        })
     }
 
     pub(super) fn case_transaction_and_finish_with_coordinator<T>(
@@ -566,21 +536,18 @@ impl Executor<'_> {
         candidate_id: RecoveryCandidateId,
         write: impl FnOnce(
             &mut Case,
-            &mut TransactionEdges<'_>,
             &mut l2_workbench::recovery::RecoveryCoordinator,
         ) -> Result<(T, RecoveryResult), RecoveryExecutionError>,
     ) -> Result<T, RecoveryExecutionError> {
         self.refresh_case_index()?;
-        let mut edge_identities = TransactionEdges::new(&self.case_index.edge_identities);
         let origins = self.candidate_origins(candidate_id)?;
         let case = &mut *self.case;
         let coordinator = &mut self.coordinator;
         let result = case.transaction(|case| {
-            let (value, recovery_result) = write(case, &mut edge_identities, coordinator)?;
+            let (value, recovery_result) = write(case, coordinator)?;
             if let Some(contract) = recovery_result.evidence_link_contract() {
                 add_transaction_links(
                     case,
-                    &mut edge_identities,
                     contract.node_id,
                     &origins,
                     contract.relation,
@@ -592,20 +559,17 @@ impl Executor<'_> {
             coordinator.finish(case, candidate_id, recovery_result)?;
             Ok::<T, RecoveryExecutionError>(value)
         });
-        drop(edge_identities);
         self.refresh_case_index()?;
         result
     }
 
     pub(super) fn case_transaction<T>(
         &mut self,
-        write: impl FnOnce(&mut Case, &mut TransactionEdges<'_>) -> Result<T, RecoveryExecutionError>,
+        write: impl FnOnce(&mut Case) -> Result<T, RecoveryExecutionError>,
     ) -> Result<T, RecoveryExecutionError> {
         self.refresh_case_index()?;
-        let mut edge_identities = TransactionEdges::new(&self.case_index.edge_identities);
         let case = &mut *self.case;
-        let result = case.transaction(|case| write(case, &mut edge_identities));
-        drop(edge_identities);
+        let result = case.transaction(write);
         self.refresh_case_index()?;
         result
     }
@@ -634,8 +598,10 @@ impl Executor<'_> {
         reason: &str,
     ) -> Result<(), RecoveryExecutionError> {
         self.refresh_case_index()?;
-        let identity = edge_identity(from, to, relation, status, reason);
-        if self.case_index.edge_identities.contains(&identity) {
+        if self
+            .case
+            .contains_exact_edge(from, to, relation, status, reason)
+        {
             return Ok(());
         }
         self.case.add_edge(Edge {
@@ -656,7 +622,7 @@ impl Executor<'_> {
         details: Value,
         result_for_node: impl FnOnce(u64) -> RecoveryResult,
     ) -> Result<u64, RecoveryExecutionError> {
-        self.case_transaction_and_finish(candidate_id, |case, _identities| {
+        self.case_transaction_and_finish(candidate_id, |case| {
             let node_id = case.add_bytes_node(kind, bytes, Vec::new(), details)?;
             let result = result_for_node(node_id);
             Ok((node_id, result))
