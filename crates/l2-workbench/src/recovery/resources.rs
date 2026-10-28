@@ -1,7 +1,10 @@
+use serde::{Deserialize, Serialize};
+
 /// Caller-resolved budgets shared by every recovery stage
 ///
 /// Values are used as supplied and are never scaled by the coordinator
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct RecoveryResourcePolicy {
     /// Maximum distinct candidate tasks accepted in this coordinator
     pub max_candidates: usize,

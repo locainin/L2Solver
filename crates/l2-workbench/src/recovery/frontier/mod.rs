@@ -1,6 +1,7 @@
 //! Coordinate bounded recovery tasks and their retained evidence contexts
 
 mod candidate;
+mod checkpoint;
 mod error;
 mod identity;
 mod lineage;

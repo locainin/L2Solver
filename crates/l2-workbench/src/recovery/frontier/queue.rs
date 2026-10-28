@@ -463,7 +463,11 @@ impl RecoveryCoordinator {
     }
 }
 
-fn result_allowed_at(stage: RecoveryStage, task: &RecoveryTask, result: &RecoveryResult) -> bool {
+pub(super) fn result_allowed_at(
+    stage: RecoveryStage,
+    task: &RecoveryTask,
+    result: &RecoveryResult,
+) -> bool {
     match result {
         RecoveryResult::ObservedValidation { .. } => stage == RecoveryStage::StructuralValidation,
         RecoveryResult::Derived { .. } => {

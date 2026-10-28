@@ -57,6 +57,14 @@ pub enum RecoveryError {
     InvalidTaskIdentity(crate::derivation::DerivationError),
     /// One coordinator cannot be reused across distinct evidence cases
     DifferentCase,
+    /// A candidate is running and cannot be captured at a transaction boundary
+    CheckpointRunningCandidate,
+    /// Secret-bearing operations cannot be stored in a restorable checkpoint
+    CheckpointSecret,
+    /// The checkpoint is malformed or does not match the supplied Case and policy
+    InvalidCheckpoint,
+    /// The checkpoint destination did not accept the complete document
+    CheckpointWrite,
 }
 
 impl fmt::Display for RecoveryError {
@@ -72,25 +80,13 @@ impl fmt::Display for RecoveryError {
                 )
             }
             Self::EmptyInputBatch => formatter.write_str("recovery input batch cannot be empty"),
-            Self::UnknownCandidate { id } => {
-                write!(
-                    formatter,
-                    "recovery candidate {} does not exist",
-                    id.index()
-                )
-            }
+            Self::UnknownCandidate { id } => format_candidate(formatter, *id, "does not exist"),
             Self::MultipleInputs { id, input_count } => write!(
                 formatter,
                 "recovery candidate {} has {input_count} inputs",
                 id.index()
             ),
-            Self::CandidateNotRunning { id } => {
-                write!(
-                    formatter,
-                    "recovery candidate {} is not running",
-                    id.index()
-                )
-            }
+            Self::CandidateNotRunning { id } => format_candidate(formatter, *id, "is not running"),
             Self::InvalidResultStage => {
                 formatter.write_str("recovery result does not match the current task stage")
             }
@@ -140,8 +136,24 @@ impl fmt::Display for RecoveryError {
             Self::DifferentCase => {
                 formatter.write_str("recovery coordinator is bound to a different evidence case")
             }
+            Self::CheckpointRunningCandidate => {
+                formatter.write_str("recovery checkpoint contains a running candidate")
+            }
+            Self::CheckpointSecret => {
+                formatter.write_str("recovery checkpoint contains a secret-bearing recipe")
+            }
+            Self::InvalidCheckpoint => formatter.write_str("invalid recovery checkpoint"),
+            Self::CheckpointWrite => formatter.write_str("recovery checkpoint write failed"),
         }
     }
+}
+
+fn format_candidate(
+    formatter: &mut fmt::Formatter<'_>,
+    id: RecoveryCandidateId,
+    detail: &str,
+) -> fmt::Result {
+    write!(formatter, "recovery candidate {} {detail}", id.index())
 }
 
 fn format_unlinked_child(

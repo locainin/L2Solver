@@ -1,11 +1,12 @@
 use crate::derivation::{Operation, Recipe};
 use crate::evidence::EvidenceStatus;
 use crate::protocol::{FramingKind, RecordSchema};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 
 /// Stable handle for one unique candidate task
-#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, PartialEq, Serialize)]
+#[serde(transparent)]
 pub struct RecoveryCandidateId(pub(super) usize);
 
 impl RecoveryCandidateId {
@@ -17,8 +18,13 @@ impl RecoveryCandidateId {
 }
 
 /// Typed unit of recovery work attached to a retained evidence blob
-#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
-#[serde(tag = "task", content = "operation", rename_all = "snake_case")]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(
+    tag = "task",
+    content = "operation",
+    rename_all = "snake_case",
+    deny_unknown_fields
+)]
 pub enum RecoveryTask {
     /// Apply one complete canonical recipe with its ordered operations and checks
     Transform(Recipe),
@@ -72,7 +78,7 @@ impl RecoveryTask {
 }
 
 /// Task category currently reached by one candidate
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub enum RecoveryStage {
     /// Canonical byte transformation task
     Transform,
@@ -117,7 +123,7 @@ impl RecoveryInput {
 }
 
 /// Resource dimension enforced by the recovery coordinator
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub enum RecoveryResource {
     /// Total distinct candidate tasks
     CandidateCount,
@@ -168,7 +174,7 @@ pub enum RecoveryResource {
 }
 
 /// Terminal interpretation or execution outcome for a candidate
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub enum RecoveryResult {
     /// A candidate matched a retained direct validation observation
     ObservedValidation { node_id: u64 },
@@ -239,7 +245,7 @@ impl RecoveryResult {
 }
 
 /// Current queue, execution, or terminal state for one candidate
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub enum RecoveryCandidateState {
     /// Waiting in the deterministic FIFO frontier
     Queued,
