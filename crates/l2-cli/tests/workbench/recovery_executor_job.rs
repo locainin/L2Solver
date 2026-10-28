@@ -22,6 +22,7 @@ fn cancelled_job_stops_recovery_before_policy_scans_or_case_mutation() -> Result
         1024 * 1024,
         Some(&job),
         None,
+        None,
     )
     .err()
     .ok_or("cancelled recovery unexpectedly completed")?;
@@ -47,6 +48,7 @@ fn job_aware_recovery_accepts_profile_and_memory_limits() -> Result<(), Box<dyn 
         8 * 1024 * 1024,
         Some(&job),
         None,
+        None,
     )?;
 
     assert!(summary.case_evidence_collection_complete);
@@ -66,6 +68,7 @@ fn recovery_forwards_the_shared_budget_to_recursive_expansion() -> Result<(), Bo
         8 * 1024 * 1024,
         None,
         Some(&budget),
+        None,
     )
     .err()
     .ok_or("recursive expansion ignored the shared budget")?;
@@ -108,6 +111,7 @@ fn recovery_job_counts_committed_validated_artifacts_and_archive_members()
         RecoveryProfile::Fast,
         8 * 1024 * 1024,
         Some(&job),
+        None,
         None,
     )?;
     let snapshot = job.snapshot()?;

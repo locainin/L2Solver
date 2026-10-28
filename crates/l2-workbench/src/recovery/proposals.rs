@@ -39,7 +39,7 @@ pub fn transform_proposal_scan_work_bound(input_length: usize) -> Option<usize> 
 }
 
 /// Caller-resolved limits for returned proposals and eligibility assessments
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, serde::Deserialize)]
 pub struct TransformProposalBudget {
     /// Maximum number of unique eligible execution recipes to return
     pub max_candidates: usize,

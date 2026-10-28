@@ -76,7 +76,7 @@ const DEFAULT_MAX_LENGTH_CHECKS: usize =
     };
 
 /// Budgets for deriving record field domains from already framed messages
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct RecordSchemaProposalLimits {
     /// Candidate evaluation limits shared with canonical record discovery
     pub discovery: RecordDiscoveryLimits,

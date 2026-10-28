@@ -22,7 +22,7 @@ pub const MAX_DER_VALUE_PREVIEW_BYTES: usize = 256;
 const MAX_OID_VALUE_BYTES: usize = 256;
 
 /// Object, recursion, inventory, and preview limits for one DER boundary
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct DerLimits {
     /// Largest complete DER object accepted from the source boundary
     pub max_object_bytes: usize,

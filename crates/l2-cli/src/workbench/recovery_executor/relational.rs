@@ -50,7 +50,7 @@ const INPUT_REASON: &str =
     "This assembled record candidate was included in a bounded cross-session relational analysis";
 const RAW_RUN_FRAMING_RULE: &str = "{\"kind\":\"raw_directional_run\"}";
 
-#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd, serde::Serialize, serde::Deserialize)]
 struct RelationalCohortKey {
     source_id: String,
     scope_json: String,
@@ -60,7 +60,7 @@ struct RelationalCohortKey {
     schema_json: String,
 }
 
-#[derive(Clone)]
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
 struct StoredSample {
     node_id: u64,
     context: MessageContext,
@@ -70,7 +70,7 @@ struct StoredSample {
     stream_offset: usize,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
 struct HistorySampleIdentity {
     node_id: u64,
     session: u64,
@@ -138,11 +138,13 @@ fn history_input_matches(
             .all(|(sample, identity)| history_sample_identity(key, sample) == Some(*identity))
 }
 
-#[derive(Default)]
+#[derive(Default, serde::Serialize, serde::Deserialize)]
 struct SampleCohort {
     key: Option<RelationalCohortKey>,
     samples: Vec<StoredSample>,
+    #[serde(with = "crate::workbench::recovery_executor::checkpoint::collections::hash_set")]
     incomplete_sessions: HashSet<u64>,
+    #[serde(with = "crate::workbench::recovery_executor::checkpoint::collections::hash_set")]
     omitted_sample_ids: HashSet<u64>,
     scheduled_sample_count: usize,
     completed_sample_count: usize,
@@ -182,17 +184,17 @@ impl SampleCohort {
     }
 }
 
-#[derive(Default)]
+#[derive(Default, serde::Serialize, serde::Deserialize)]
 pub(super) struct RelationalSampleCollections {
     cohorts: Vec<SampleCohort>,
     incremental_cohorts: Vec<SampleCohort>,
     histories: history::RelationalReplayHistories,
     incremental_metadata_used: usize,
-    incremental_metadata_stop: Option<&'static str>,
+    incremental_metadata_stop: Option<std::borrow::Cow<'static, str>>,
     incremental_metadata_reported: bool,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
 pub(super) enum RelationalLane {
     Normal,
     Incremental,
@@ -223,7 +225,7 @@ pub(in crate::workbench::recovery_executor) struct RawRelationalRunInput {
     pub(in crate::workbench::recovery_executor) start_known: bool,
 }
 
-#[derive(Clone)]
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
 pub(super) struct RelationalDiscoveryContext {
     lane: RelationalLane,
     key: RelationalCohortKey,
@@ -319,7 +321,7 @@ impl Executor<'_> {
     pub(super) fn report_incremental_metadata_omission(
         &mut self,
     ) -> Result<(), RecoveryExecutionError> {
-        let Some(reason) = self.relational_samples.incremental_metadata_stop else {
+        let Some(reason) = self.relational_samples.incremental_metadata_stop.clone() else {
             return Ok(());
         };
         if self.relational_samples.incremental_metadata_reported {
@@ -381,7 +383,7 @@ impl Executor<'_> {
                     input_coverage_complete: cohort.input_coverage_complete,
                     search_exhaustive_within_plan: false,
                     report_details_complete: false,
-                    reason: Some("incremental_evidence_limit"),
+                    reason: Some("incremental_evidence_limit".into()),
                 });
             cohort.evidence_limit_reported = true;
         }
@@ -415,7 +417,7 @@ impl Executor<'_> {
                 input_coverage_complete,
                 search_exhaustive_within_plan: false,
                 report_details_complete: true,
-                reason: Some(reason),
+                reason: Some(reason.into()),
             });
         Ok(())
     }
@@ -669,7 +671,7 @@ impl Executor<'_> {
                     input_coverage_complete: cohort.context.input_coverage_complete,
                     search_exhaustive_within_plan: cohort.search_exhaustive_within_plan,
                     report_details_complete: cohort.report_details_complete,
-                    reason: cohort.reason,
+                    reason: cohort.reason.map(Into::into),
                 });
         }
     }

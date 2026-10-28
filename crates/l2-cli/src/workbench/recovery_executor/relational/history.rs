@@ -10,11 +10,12 @@ use l2_workbench::protocol::RelationalReplayHistory;
 #[path = "../../../../tests/workbench/recovery_relational/history.rs"]
 mod tests;
 
-#[derive(Default)]
+#[derive(Default, serde::Serialize, serde::Deserialize)]
 pub(super) struct RelationalReplayHistories {
     slots: Vec<HistorySlot>,
 }
 
+#[derive(serde::Serialize, serde::Deserialize)]
 struct HistorySlot {
     key: RelationalCohortKey,
     signature: Vec<HistorySampleIdentity>,

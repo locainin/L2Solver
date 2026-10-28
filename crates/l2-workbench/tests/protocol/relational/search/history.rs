@@ -38,6 +38,80 @@ fn search(
     Ok((report, evaluated))
 }
 
+fn checkpoint_history() -> TestResult<(RelationalReplayHistory, RelationalTransformRule)> {
+    let records = same_message_sessions()?;
+    let samples = borrow_samples(&records)?;
+    let mut plan = same_message_plan();
+    plan.limits.max_candidates = 2_048;
+    let mut history = RelationalReplayHistory::new(1024 * 1024);
+    let (first, _) = search(&samples, &plan, Some(&mut history))?;
+    let published = first
+        .report
+        .candidates
+        .iter()
+        .find(|candidate| {
+            candidate.status == RelationalTransformStatus::HeldoutConstraintsSatisfied
+        })
+        .ok_or("checkpoint fixture has no fully supported rule")?
+        .rule
+        .clone();
+    assert!(history.register_published_rule(&published));
+    Ok((history, published))
+}
+
+#[test]
+fn saved_history_rebuilds_lookup_and_preserves_conclusive_replay_results() -> TestResult<()> {
+    let (history, published) = checkpoint_history()?;
+    let storage = history.storage_bytes();
+    let complete = history.is_complete();
+    let encoded = serde_json::to_vec(&history)?;
+    drop(history);
+    let mut restored: RelationalReplayHistory = serde_json::from_slice(&encoded)?;
+    assert_eq!(restored.storage_bytes(), storage);
+    assert_eq!(restored.is_complete(), complete);
+
+    let records = same_message_sessions()?;
+    let samples = borrow_samples(&records)?;
+    let mut plan = same_message_plan();
+    plan.limits.max_candidates = 2_048;
+    let (report, evaluated) = search(&samples, &plan, Some(&mut restored))?;
+    assert!(report.history_reused_rejections > 0);
+    assert!(report.history_reused_published > 0);
+    assert!(!evaluated.contains(&published));
+    Ok(())
+}
+
+#[test]
+fn saved_history_rejects_changed_versions_capacities_and_repeated_rules() -> TestResult<()> {
+    let (history, _) = checkpoint_history()?;
+    let original = serde_json::to_value(&history)?;
+    for (field, value) in [
+        ("version", serde_json::json!(999)),
+        ("max_bytes", serde_json::json!(0)),
+        ("entry_capacity", serde_json::json!(usize::MAX)),
+    ] {
+        let mut changed = original.clone();
+        *changed.get_mut(field).ok_or("missing history field")? = value;
+        assert!(serde_json::from_value::<RelationalReplayHistory>(changed).is_err());
+    }
+    let mut repeated = original;
+    let entries = repeated
+        .get_mut("entries")
+        .ok_or("missing history entries")?
+        .as_array_mut()
+        .ok_or("missing history entries")?;
+    entries.push(entries.first().ok_or("history has no saved rule")?.clone());
+    let count = entries.len();
+    *repeated
+        .get_mut("entry_capacity")
+        .ok_or("missing history capacity")? = serde_json::json!(count);
+    *repeated
+        .get_mut("max_bytes")
+        .ok_or("missing history byte limit")? = serde_json::json!(2 * 1024 * 1024);
+    assert!(serde_json::from_value::<RelationalReplayHistory>(repeated).is_err());
+    Ok(())
+}
+
 #[test]
 fn widened_search_reuses_completed_rejections_without_counting_them_as_attempts() -> TestResult<()>
 {

@@ -21,7 +21,7 @@ use serde_json::Value;
 use std::{collections::BTreeMap, error::Error, fmt, sync::Arc};
 
 /// Exact caller-selected recovery operations, independent of evidence node identifiers
-#[derive(Clone, Debug, Default, Eq, PartialEq)]
+#[derive(Clone, Debug, Default, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
 pub(super) struct RecoveryPlan {
     /// Ordered canonical transformations; recipe step order is preserved
     pub(super) recipes: Vec<Recipe>,
@@ -38,7 +38,7 @@ pub(super) struct RecoveryPlan {
 }
 
 /// Bounded syntax assessment work and retained proposal evidence
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, serde::Serialize, serde::Deserialize)]
 pub(super) struct TransformExplorationBudget {
     /// Limits for retained canonical candidates and per-operation reports
     pub(super) proposal_budget: TransformProposalBudget,
@@ -47,7 +47,7 @@ pub(super) struct TransformExplorationBudget {
 }
 
 /// Typed resource values passed to every recovery stage
-#[derive(Clone)]
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
 pub(super) struct RecoveryExecutionPolicy {
     /// Shared candidate, depth, origin, output, and work ceilings
     pub(super) resources: RecoveryResourcePolicy,
@@ -79,8 +79,27 @@ pub(super) struct RecoveryExecutionPolicy {
     pub(super) record_phase_work_limit: usize,
 }
 
+impl RecoveryExecutionPolicy {
+    pub(super) fn bind_restored_case(
+        &mut self,
+        case: &l2_workbench::evidence::Case,
+    ) -> Result<(), RecoveryExecutionError> {
+        if let Some(plan) = &mut self.framing_discovery_plan {
+            Arc::get_mut(plan)
+                .ok_or(RecoveryError::InvalidCheckpoint)?
+                .bind_restored_case(case)?;
+        }
+        if let Some(snapshot) = &mut self.record_discovery_snapshot {
+            Arc::get_mut(snapshot)
+                .ok_or(RecoveryError::InvalidCheckpoint)?
+                .bind_restored_case(case)?;
+        }
+        Ok(())
+    }
+}
+
 /// Explicit work or format omissions recorded during one recovery run
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
 pub enum RecoveryOmission {
     /// A typed coordinator budget prevented work or result retention
     ResourceExhausted {
@@ -110,7 +129,7 @@ pub enum RecoveryOmission {
     FramingDiscoveryInputs {
         source_id: Option<String>,
         omitted_runs: usize,
-        reason_counts: BTreeMap<&'static str, usize>,
+        reason_counts: BTreeMap<std::borrow::Cow<'static, str>, usize>,
     },
     /// Framing discovery omitted search work or retained report details
     FramingDiscoveryAnalysis {
@@ -134,14 +153,14 @@ pub enum RecoveryOmission {
     RecordDiscoveryInputs {
         source_id: Option<String>,
         omitted_frames: usize,
-        reason_counts: BTreeMap<&'static str, usize>,
+        reason_counts: BTreeMap<std::borrow::Cow<'static, str>, usize>,
         examples: Vec<Value>,
     },
     /// Validated frames were retained for application but excluded from bounded learning
     RecordDiscoveryLearningSample {
         source_id: Option<String>,
         unsampled_frames: usize,
-        reason_counts: BTreeMap<&'static str, usize>,
+        reason_counts: BTreeMap<std::borrow::Cow<'static, str>, usize>,
         examples: Vec<Value>,
     },
     /// Record schema proposal or strict validation work was incomplete under selected limits
@@ -157,7 +176,10 @@ pub enum RecoveryOmission {
         omitted_length_checks: usize,
     },
     /// Additional relational views for this Case were discarded before wider discovery
-    RelationalIncrementalMetadata { limit: usize, reason: &'static str },
+    RelationalIncrementalMetadata {
+        limit: usize,
+        reason: std::borrow::Cow<'static, str>,
+    },
     /// Relational transform work or report details were bounded or lacked eligible sessions
     RelationalTransformAnalysis {
         source_id: String,
@@ -171,7 +193,7 @@ pub enum RecoveryOmission {
         input_coverage_complete: bool,
         search_exhaustive_within_plan: bool,
         report_details_complete: bool,
-        reason: Option<&'static str>,
+        reason: Option<std::borrow::Cow<'static, str>>,
     },
     /// Full record discovery frame descriptors and schema details were omitted from the compact summary
     RecordDiscoveryReportDetails {
@@ -530,7 +552,9 @@ fn format_relational_analysis(
         } else {
             "compact"
         },
-        reason.map_or_else(String::new, |reason| format!(" ({reason})")),
+        reason
+            .as_ref()
+            .map_or_else(String::new, |reason| format!(" ({reason})")),
     )
 }
 
@@ -538,7 +562,7 @@ fn format_framing_inputs(
     formatter: &mut fmt::Formatter<'_>,
     source_id: Option<&str>,
     omitted_runs: usize,
-    reason_counts: &BTreeMap<&'static str, usize>,
+    reason_counts: &BTreeMap<std::borrow::Cow<'static, str>, usize>,
 ) -> fmt::Result {
     write!(
         formatter,

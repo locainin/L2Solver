@@ -115,7 +115,7 @@ pub(super) fn recover(
         count_cache_miss(context.job, kind)?;
     }
 
-    let lease = match cache {
+    let mut lease = match cache {
         Some(cache) => match cache.lease(&key) {
             Ok(lease) => Some(lease),
             Err(error)
@@ -134,13 +134,22 @@ pub(super) fn recover(
         },
         None => None,
     };
+    let recovery_job = context
+        .job
+        .map(|job| job.work_scope(key.as_str()))
+        .transpose()?;
+    let mut resume = lease
+        .as_mut()
+        .map(|lease| workbench::RecoveryResume::new(lease, context.options, context.memory));
     let summary = workbench::recover_case_with_job(
         case,
         context.options.profile,
         context.options.memory_limit,
-        context.job,
+        recovery_job.as_ref(),
         context.memory,
+        resume.as_mut(),
     )?;
+    drop(resume);
     let mut coverage = RecoveryCoverage::default();
     coverage.record(&summary, kind)?;
     let omissions = summary

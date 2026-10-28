@@ -127,7 +127,8 @@ impl Executor<'_> {
             for (reason, count) in &omission.counts {
                 let input_node_id = omission
                     .example
-                    .and_then(|(id, example_reason)| (example_reason == *reason).then_some(id));
+                    .as_ref()
+                    .and_then(|(id, example_reason)| (example_reason == reason).then_some(*id));
                 record_cohort_omission(
                     self,
                     RecoveryTransitionStage::Framing,
@@ -535,7 +536,7 @@ const fn framing_report_quota_request(
     }
 }
 
-#[derive(Clone)]
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
 pub(in crate::workbench::recovery_executor) struct FramingDiscoveryContext {
     source_id: String,
     scope: String,
@@ -547,7 +548,7 @@ pub(in crate::workbench::recovery_executor) struct FramingDiscoveryContext {
     ancestry_id: Option<String>,
 }
 
-#[derive(Clone)]
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
 struct NativeHttpCoverageReceipt {
     input_run_node_id: u64,
     application_checks_node_id: u64,

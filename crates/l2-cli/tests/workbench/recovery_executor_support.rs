@@ -61,37 +61,7 @@ pub(super) fn build_executor<'a>(
     policy: &RecoveryExecutionPolicy,
 ) -> Result<Executor<'a>, super::RecoveryExecutionError> {
     let case_index = CaseIndex::new(case)?;
-    Ok(Executor {
-        memory: None,
-        case,
-        plan,
-        policy: policy.clone(),
-        coordinator: l2_workbench::recovery::RecoveryCoordinator::new(policy.resources),
-        case_index,
-        candidate_ids: Vec::new(),
-        candidate_index: std::collections::HashSet::new(),
-        snapshot_candidates: true,
-        job: None,
-        validated_artifacts: std::collections::HashSet::new(),
-        transform_cohorts: Vec::new(),
-        derived_discovery: super::derived_discovery::DerivedDiscovery::default(),
-        transform_discoveries: std::collections::HashMap::new(),
-        framing_selection_bases: std::collections::HashMap::new(),
-        framing_discoveries: std::collections::HashMap::new(),
-        record_discoveries: std::collections::HashMap::new(),
-        record_discovery_context_by_report: std::collections::HashMap::new(),
-        deferred_record_discovery_plan: None,
-        record_schema_report_links: std::collections::HashMap::new(),
-        record_schema_associations_charged: 0,
-        record_phase_work_charged: 0,
-        pending_record_assemblies: std::collections::VecDeque::new(),
-        pending_record_suffixes: std::collections::VecDeque::new(),
-        pending_record_assembly_count: 0,
-        relational_samples: super::RelationalSampleCollections::default(),
-        relational_discoveries: std::collections::HashMap::new(),
-        transform_proposal_receipts: std::collections::HashMap::new(),
-        omissions: Vec::new(),
-        complete_negative_transform_searches: 0,
-        cycle_skips: 0,
-    })
+    let mut executor = super::new_executor(case, plan, policy.clone(), true, None, None)?;
+    executor.case_index = case_index;
+    Ok(executor)
 }

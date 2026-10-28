@@ -150,7 +150,7 @@ impl RecordSchemaDiscoverySpace {
 }
 
 /// Explicit resource bounds for one schema discovery run
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct RecordDiscoveryLimits {
     /// Maximum schema candidates evaluated within the supplied finite search plan
     pub max_candidates: usize,

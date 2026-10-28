@@ -42,11 +42,11 @@ impl InputOmissionKind {
     }
 }
 
-#[derive(Clone, Default)]
+#[derive(Clone, Default, serde::Serialize, serde::Deserialize)]
 pub(super) struct FramingInputOmissions {
-    pub(super) counts: BTreeMap<&'static str, usize>,
+    pub(super) counts: BTreeMap<std::borrow::Cow<'static, str>, usize>,
     pub(super) total: usize,
-    pub(super) example: Option<(u64, &'static str)>,
+    pub(super) example: Option<(u64, std::borrow::Cow<'static, str>)>,
 }
 
 impl FramingInputOmissions {
@@ -56,16 +56,16 @@ impl FramingInputOmissions {
         node_id: u64,
     ) -> Result<(), RecoveryExecutionError> {
         if self.example.is_none() {
-            self.example = Some((node_id, kind.name()));
+            self.example = Some((node_id, kind.name().into()));
         }
-        let count = self.counts.entry(kind.name()).or_default();
+        let count = self.counts.entry(kind.name().into()).or_default();
         *count = count.checked_add(1).ok_or_else(graph_work_overflow)?;
         self.total = self.total.checked_add(1).ok_or_else(graph_work_overflow)?;
         Ok(())
     }
 }
 
-#[derive(Clone)]
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
 pub(in crate::workbench::recovery_executor) struct FramingInput {
     pub(in crate::workbench::recovery_executor) node_id: u64,
     pub(in crate::workbench::recovery_executor) blob_id: String,
@@ -84,12 +84,16 @@ pub(in crate::workbench::recovery_executor) struct FramingInput {
     pub(in crate::workbench::recovery_executor) end_observed: bool,
 }
 
-#[derive(Default)]
+#[derive(Default, serde::Serialize, serde::Deserialize)]
 pub(in crate::workbench::recovery_executor) struct FramingDiscoveryPlan {
+    #[serde(with = "crate::workbench::recovery_executor::checkpoint::collections::btree_map")]
     pub(super) cohorts: BTreeMap<FramingCohortKey, Vec<FramingInput>>,
+    #[serde(with = "crate::workbench::recovery_executor::checkpoint::collections::btree_map")]
     pub(super) omissions: BTreeMap<Option<String>, FramingInputOmissions>,
     pub(super) graph_work: usize,
+    #[serde(with = "crate::workbench::recovery_executor::checkpoint::collections::hash_map")]
     native_http_coverage_by_run: HashMap<u64, NativeHttpCoverage>,
+    #[serde(skip)]
     case_identity: Option<CaseIdentity>,
     node_high_water_mark: usize,
     edge_high_water_mark: usize,
@@ -97,6 +101,20 @@ pub(in crate::workbench::recovery_executor) struct FramingDiscoveryPlan {
 }
 
 impl FramingDiscoveryPlan {
+    pub(in crate::workbench::recovery_executor) fn bind_restored_case(
+        &mut self,
+        case: &Case,
+    ) -> Result<(), RecoveryExecutionError> {
+        if self.node_high_water_mark > case.nodes().len()
+            || self.edge_high_water_mark > case.edges().len()
+            || self.blob_high_water_mark > case.blobs().len()
+        {
+            return Err(super::super::RecoveryError::InvalidCheckpoint.into());
+        }
+        self.case_identity = Some(case.identity());
+        Ok(())
+    }
+
     pub(in crate::workbench::recovery_executor) fn cohort_inputs(
         &self,
     ) -> impl Iterator<Item = (&FramingCohortKey, &FramingInput)> {
@@ -160,7 +178,7 @@ impl FramingDiscoveryPlan {
     }
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub(in crate::workbench::recovery_executor) struct NativeHttpCoverage {
     pub(in crate::workbench::recovery_executor) application_checks_node_id: u64,
     pub(in crate::workbench::recovery_executor) message_candidate_node_ids: Vec<u64>,
@@ -214,7 +232,7 @@ fn appended_edge_changes_framing_inputs(
     )
 }
 
-#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd, serde::Serialize, serde::Deserialize)]
 pub(in crate::workbench::recovery_executor) struct FramingCohortKey {
     pub(in crate::workbench::recovery_executor) source_id: String,
     pub(in crate::workbench::recovery_executor) scope: String,

@@ -53,7 +53,7 @@ pub(super) fn add_transform_proposal_edges(
     Ok(())
 }
 
-#[derive(Default)]
+#[derive(Default, serde::Serialize, serde::Deserialize)]
 pub(super) struct TransformDiscoveryState {
     contexts: OrderedUnique<TransformDiscoveryContext>,
     report_node: Option<u64>,
@@ -64,6 +64,35 @@ pub(super) struct TransformDiscoveryState {
 pub(super) struct OrderedUnique<T> {
     ordered: Vec<T>,
     membership: HashSet<T>,
+}
+
+impl<T: serde::Serialize> serde::Serialize for OrderedUnique<T> {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        self.ordered.serialize(serializer)
+    }
+}
+
+impl<'de, T: serde::Deserialize<'de> + Eq + Hash + Clone> serde::Deserialize<'de>
+    for OrderedUnique<T>
+{
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let ordered = Vec::<T>::deserialize(deserializer)?;
+        let mut membership = HashSet::new();
+        membership
+            .try_reserve(ordered.len())
+            .map_err(serde::de::Error::custom)?;
+        for value in &ordered {
+            if !membership.insert(value.clone()) {
+                return Err(serde::de::Error::custom(
+                    "repeated ordered checkpoint value",
+                ));
+            }
+        }
+        Ok(Self {
+            ordered,
+            membership,
+        })
+    }
 }
 
 impl<T> Default for OrderedUnique<T> {
@@ -103,7 +132,7 @@ impl<T: Eq + Hash + Clone> OrderedUnique<T> {
 }
 
 /// Track the committed receipt prefix for one terminal transform receipt
-#[derive(Default)]
+#[derive(Default, serde::Serialize, serde::Deserialize)]
 pub(super) struct OrderedProposalReceipts {
     receipts: OrderedUnique<u64>,
     linked_transform_receipt: Option<u64>,
@@ -111,7 +140,7 @@ pub(super) struct OrderedProposalReceipts {
     blocked_link: Option<BlockedProposalLink>,
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, serde::Serialize, serde::Deserialize)]
 struct BlockedProposalLink {
     transform_receipt: u64,
     omission_index: usize,
@@ -153,7 +182,7 @@ impl OrderedProposalReceipts {
     }
 }
 
-#[derive(Clone, Copy, Eq, Hash, PartialEq)]
+#[derive(Clone, Copy, Eq, Hash, PartialEq, serde::Serialize, serde::Deserialize)]
 struct TransformDiscoveryContext {
     byte_parent: Option<RecoveryCandidateId>,
     input_node: u64,

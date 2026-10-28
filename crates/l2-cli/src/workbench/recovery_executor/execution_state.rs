@@ -27,6 +27,55 @@ pub(super) enum SchedulerPhase {
     Finished,
 }
 
+impl SchedulerCursor {
+    pub(super) fn validate(&self, executor: &Executor<'_>) -> Result<(), RecoveryError> {
+        if self.evidence_stop_reported && self.evidence_stop.is_none() {
+            return Err(RecoveryError::InvalidCheckpoint);
+        }
+        match &self.phase {
+            SchedulerPhase::Start => {
+                if executor.coordinator.candidate_count() != 0
+                    || executor.case_index.node_count != 0
+                    || executor.case_index.edge_count != 0
+                {
+                    return Err(RecoveryError::InvalidCheckpoint);
+                }
+            }
+            SchedulerPhase::Seeding { roots, next } => {
+                if *next > roots.len() || roots.len() > executor.case.nodes().len() {
+                    return Err(RecoveryError::InvalidCheckpoint);
+                }
+                let mut unique = std::collections::HashSet::new();
+                unique
+                    .try_reserve(roots.len())
+                    .map_err(|_| RecoveryError::AllocationFailed)?;
+                for (id, kind) in roots {
+                    if executor
+                        .case
+                        .node(*id)
+                        .is_none_or(|node| node.kind != *kind)
+                        || !unique.insert(*id)
+                    {
+                        return Err(RecoveryError::InvalidCheckpoint);
+                    }
+                }
+            }
+            SchedulerPhase::Finished => {
+                if executor.coordinator.peek_next_id().is_some()
+                    || (self.evidence_stop.is_none()
+                        && (!executor.pending_record_assemblies.is_empty()
+                            || !executor.pending_record_suffixes.is_empty()
+                            || executor.deferred_record_discovery_plan.is_some()))
+                {
+                    return Err(RecoveryError::InvalidCheckpoint);
+                }
+            }
+            SchedulerPhase::Running => {}
+        }
+        Ok(())
+    }
+}
+
 pub(super) fn step(
     executor: &mut Executor<'_>,
     cursor: &mut SchedulerCursor,

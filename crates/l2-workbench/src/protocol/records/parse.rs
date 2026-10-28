@@ -201,7 +201,7 @@ pub(super) fn validate_schema(
     validate_integer_field(schema.length, schema.data_offset, "length")?;
     if schema.data_offset == 0 {
         return Err(RecordError::InvalidSchema {
-            field: "data_offset",
+            field: "data_offset".into(),
         });
     }
     if schema
@@ -209,7 +209,7 @@ pub(super) fn validate_schema(
         .is_some_and(|terminal| terminal < schema.sequence_base)
     {
         return Err(RecordError::InvalidSchema {
-            field: "terminal_sequence",
+            field: "terminal_sequence".into(),
         });
     }
     if let RecordCount::Field { field } = schema.count {
@@ -226,9 +226,11 @@ fn validate_byte_field(
     let end = field
         .offset
         .checked_add(field.width)
-        .ok_or(RecordError::InvalidSchema { field: name })?;
+        .ok_or(RecordError::InvalidSchema {
+            field: std::borrow::Cow::Borrowed(name),
+        })?;
     if field.width == 0 || end > boundary {
-        return Err(RecordError::InvalidSchema { field: name });
+        return Err(RecordError::InvalidSchema { field: name.into() });
     }
     Ok(())
 }
@@ -239,7 +241,7 @@ fn validate_integer_field(
     name: &'static str,
 ) -> Result<(), RecordError> {
     if !matches!(field.width, 1 | 2 | 4 | 8) {
-        return Err(RecordError::InvalidSchema { field: name });
+        return Err(RecordError::InvalidSchema { field: name.into() });
     }
     validate_byte_field(
         ByteField {
@@ -264,7 +266,9 @@ fn declared_count(
             let end = field
                 .offset
                 .checked_add(field.width)
-                .ok_or(RecordError::InvalidSchema { field: "count" })?;
+                .ok_or(RecordError::InvalidSchema {
+                    field: std::borrow::Cow::Borrowed("count"),
+                })?;
             let value = bytes
                 .get(field.offset..end)
                 .ok_or(RecordError::TruncatedPreamble {
@@ -273,7 +277,9 @@ fn declared_count(
                 })?;
             decode_unsigned(value, field.byte_order == ByteOrder::LittleEndian)
                 .map(Some)
-                .ok_or(RecordError::InvalidSchema { field: "count" })
+                .ok_or(RecordError::InvalidSchema {
+                    field: std::borrow::Cow::Borrowed("count"),
+                })
         }
     }
 }
@@ -381,8 +387,11 @@ fn decode_record_integer(
         needed: end,
         available: bytes.len(),
     })?;
-    decode_unsigned(value, field.byte_order == ByteOrder::LittleEndian)
-        .ok_or(RecordError::InvalidSchema { field: "integer" })
+    decode_unsigned(value, field.byte_order == ByteOrder::LittleEndian).ok_or(
+        RecordError::InvalidSchema {
+            field: std::borrow::Cow::Borrowed("integer"),
+        },
+    )
 }
 
 fn record_end(

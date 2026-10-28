@@ -156,8 +156,8 @@ struct DecodeReceipt<'a> {
     execution_error: Option<&'a str>,
 }
 
-#[derive(Clone, Copy, Serialize)]
 /// Explicit aggregate limits applied to one decode batch
+#[derive(Clone, Copy, Serialize, serde::Deserialize)]
 pub struct DecodeBatchLimits {
     #[serde(rename = "max_items")]
     /// Maximum selected input count

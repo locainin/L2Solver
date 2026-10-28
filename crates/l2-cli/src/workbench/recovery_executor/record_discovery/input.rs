@@ -15,10 +15,10 @@ use cap::cap_cohorts;
 
 const MAX_OMISSION_EXAMPLES: usize = 32;
 
-#[derive(Clone, Default)]
+#[derive(Clone, Default, serde::Serialize, serde::Deserialize)]
 pub(super) struct RecordDiscoveryInputOmissions {
     pub(super) total: usize,
-    pub(super) reason_counts: BTreeMap<&'static str, usize>,
+    pub(super) reason_counts: BTreeMap<std::borrow::Cow<'static, str>, usize>,
     pub(super) examples: Vec<Value>,
 }
 
@@ -37,7 +37,7 @@ impl RecordDiscoveryInputOmissions {
             .reason_counts
             .iter()
             .filter(|(reason, _)| is_learning_omission(reason) == learning)
-            .map(|(reason, count)| (*reason, *count))
+            .map(|(reason, count)| (reason.clone(), *count))
             .collect::<BTreeMap<_, _>>();
         let total = reason_counts.values().sum();
         let examples = self
@@ -78,7 +78,7 @@ impl RecordDiscoveryInputOmissions {
             .total
             .checked_add(count)
             .ok_or_else(|| invalid_work("record discovery omission count overflowed"))?;
-        let reason_count = self.reason_counts.entry(reason).or_default();
+        let reason_count = self.reason_counts.entry(reason.into()).or_default();
         *reason_count = reason_count
             .checked_add(count)
             .ok_or_else(|| invalid_work("record discovery omission reason count overflowed"))?;
@@ -98,7 +98,7 @@ impl RecordDiscoveryInputOmissions {
     }
 }
 
-#[derive(Clone)]
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
 pub(in crate::workbench::recovery_executor) struct RecordFrameInput {
     pub(in crate::workbench::recovery_executor) node_id: u64,
     pub(in crate::workbench::recovery_executor) blob_id: String,
@@ -113,7 +113,7 @@ pub(in crate::workbench::recovery_executor) struct RecordFrameInput {
     pub(in crate::workbench::recovery_executor) byte_length: usize,
 }
 
-#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd, serde::Serialize, serde::Deserialize)]
 pub(in crate::workbench::recovery_executor) enum RecordCohortOrigin {
     TcpMaterialized,
     Relational {
@@ -125,7 +125,7 @@ pub(in crate::workbench::recovery_executor) enum RecordCohortOrigin {
     },
 }
 
-#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd, serde::Serialize, serde::Deserialize)]
 pub(in crate::workbench::recovery_executor) struct RecordCohortKey {
     pub(in crate::workbench::recovery_executor) source_id: String,
     pub(in crate::workbench::recovery_executor) scope_json: String,
@@ -135,12 +135,16 @@ pub(in crate::workbench::recovery_executor) struct RecordCohortKey {
     pub(in crate::workbench::recovery_executor) framing_rule_json: String,
 }
 
-#[derive(Clone, Default)]
+#[derive(Clone, Default, serde::Serialize, serde::Deserialize)]
 pub(in crate::workbench::recovery_executor) struct RecordDiscoveryPlan {
     /// Full validated frame cohorts used to apply learned schemas after bounded learning
+    #[serde(with = "crate::workbench::recovery_executor::checkpoint::collections::btree_map")]
     pub(super) application_cohorts: BTreeMap<RecordCohortKey, Vec<RecordFrameInput>>,
+    #[serde(with = "crate::workbench::recovery_executor::checkpoint::collections::btree_map")]
     pub(super) cohorts: BTreeMap<RecordCohortKey, Vec<RecordFrameInput>>,
+    #[serde(with = "crate::workbench::recovery_executor::checkpoint::collections::btree_map")]
     pub(super) cohort_omitted_frames: BTreeMap<RecordCohortKey, usize>,
+    #[serde(with = "crate::workbench::recovery_executor::checkpoint::collections::btree_map")]
     pub(super) omissions: BTreeMap<Option<String>, RecordDiscoveryInputOmissions>,
     pub(super) graph_work: usize,
 }

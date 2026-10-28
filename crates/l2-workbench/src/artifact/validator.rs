@@ -14,13 +14,15 @@ use super::{
 };
 
 /// Format selected for structural artifact validation
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum ArtifactValidationFormat {
     /// Canonical DER value
     Der,
     /// Executable and linkable format
     Elf,
     /// Portable Network Executable image
+    #[serde(rename = "pe")]
     PortableExecutable,
     /// Portable Network Graphics image
     Png,
@@ -66,7 +68,7 @@ pub enum ArtifactValidationFailure {
 }
 
 /// Why validation work or report data was omitted by a resource limit
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
 pub enum ArtifactResourceOmissionReason {
     /// The selected byte slice exceeded an input ceiling
     InputTooLarge { length: usize, maximum: usize },
@@ -89,7 +91,10 @@ pub enum ArtifactResourceOmissionReason {
     /// The executable parser reached its image-size ceiling
     ExecutableSizeLimit { length: usize, maximum: usize },
     /// The executable parser reached a table-count ceiling
-    ExecutableTableLimit { field: &'static str, maximum: usize },
+    ExecutableTableLimit {
+        field: std::borrow::Cow<'static, str>,
+        maximum: usize,
+    },
     /// A parser rejected the configured limits before examining the bytes
     InvalidParserPolicy { format: ArtifactValidationFormat },
 }
@@ -144,7 +149,7 @@ pub enum ArtifactValidationOutcome<'a> {
 }
 
 /// Caller-controlled budgets for artifact validation
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct ArtifactValidationPolicy {
     /// Largest source slice dispatched to any parser
     pub max_input_bytes: usize,
@@ -580,7 +585,10 @@ const fn classify_executable_error<'a>(
         ArtifactError::LimitExceeded { field, maximum } => ArtifactValidationOutcome::Omitted {
             format: Some(format),
             input_range,
-            reason: ArtifactResourceOmissionReason::ExecutableTableLimit { field, maximum },
+            reason: ArtifactResourceOmissionReason::ExecutableTableLimit {
+                field: std::borrow::Cow::Borrowed(field),
+                maximum,
+            },
         },
         ArtifactError::UnsupportedFormat => ArtifactValidationOutcome::Unsupported { input_range },
         error @ (ArtifactError::InvalidRange { .. }

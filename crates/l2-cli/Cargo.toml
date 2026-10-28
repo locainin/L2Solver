@@ -29,7 +29,7 @@ l2-canary = { version = "=0.1.0", path = "../l2-canary" }
 l2-helper-protocol = { version = "=0.1.0", path = "../l2-helper-protocol" }
 l2-live = { version = "=0.1.0", path = "../l2-live", optional = true }
 tokio = { version = "1.47", features = ["net", "rt"], optional = true }
-serde = { version = "1", features = ["derive"] }
+serde = { version = "1", features = ["derive", "rc"] }
 serde_json = "1"
 sha2 = "0.10.9"
 tempfile = "3"

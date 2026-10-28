@@ -1,6 +1,7 @@
 //! Bounded record-schema hypotheses over already materialized frame evidence
 
 mod analysis;
+pub(in crate::workbench::recovery_executor) use report::checkpoint;
 mod input;
 mod report;
 mod work;

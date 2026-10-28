@@ -12,6 +12,8 @@ mod import_scan;
 mod mapping;
 #[path = "evidence/memory.rs"]
 mod memory;
+#[path = "evidence/prefix.rs"]
+mod prefix;
 #[path = "evidence/preflight.rs"]
 mod preflight;
 #[path = "evidence/published.rs"]

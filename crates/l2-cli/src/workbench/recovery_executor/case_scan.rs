@@ -13,7 +13,7 @@ pub(super) struct CaseScanWorkBounds {
     pub(super) record: usize,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
 pub(super) struct CaseScanShape {
     nodes: usize,
     edges: usize,
@@ -104,13 +104,17 @@ impl CaseScanShape {
     }
 }
 
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
 pub(super) struct CaseIndexScanLedger {
     maximum: usize,
     charged: usize,
 }
 
 impl CaseIndexScanLedger {
+    pub(super) fn is_valid_checkpoint(self) -> Result<bool, RecoveryExecutionError> {
+        Ok(self.maximum == case_index_work_limit()? && self.charged <= self.maximum)
+    }
+
     pub(super) fn new() -> Result<Self, RecoveryExecutionError> {
         Ok(Self {
             maximum: case_index_work_limit()?,
@@ -297,21 +301,33 @@ pub(super) fn preflight_scan<T>(
     Ok(ScanAdmission::Scanned { value, work })
 }
 
+#[derive(serde::Serialize, serde::Deserialize)]
 pub(super) struct RecordDiscoverySnapshot {
     pub(super) plan: Arc<super::record_discovery::RecordDiscoveryPlan>,
-    case_identity: CaseIdentity,
+    #[serde(skip)]
+    case_identity: Option<CaseIdentity>,
     node_high_water_mark: usize,
     edge_high_water_mark: usize,
 }
 
 impl RecordDiscoverySnapshot {
+    pub(super) fn bind_restored_case(&mut self, case: &Case) -> Result<(), RecoveryExecutionError> {
+        if self.node_high_water_mark > case.nodes().len()
+            || self.edge_high_water_mark > case.edges().len()
+        {
+            return Err(super::RecoveryError::InvalidCheckpoint.into());
+        }
+        self.case_identity = Some(case.identity());
+        Ok(())
+    }
+
     pub(super) fn new(
         case: &Case,
         plan: Arc<super::record_discovery::RecordDiscoveryPlan>,
     ) -> Self {
         Self {
             plan,
-            case_identity: case.identity(),
+            case_identity: Some(case.identity()),
             node_high_water_mark: case.nodes().len(),
             edge_high_water_mark: case.edges().len(),
         }
@@ -325,7 +341,10 @@ impl RecordDiscoverySnapshot {
         &self,
         case: &Case,
     ) -> Result<usize, RecoveryExecutionError> {
-        if !self.case_identity.identifies(case)
+        if !self
+            .case_identity
+            .as_ref()
+            .is_some_and(|identity| identity.identifies(case))
             || case.nodes().len() < self.node_high_water_mark
             || case.edges().len() < self.edge_high_water_mark
         {
@@ -354,7 +373,10 @@ impl RecordDiscoverySnapshot {
         &self,
         case: &Case,
     ) -> Result<(bool, usize), RecoveryExecutionError> {
-        if !self.case_identity.identifies(case)
+        if !self
+            .case_identity
+            .as_ref()
+            .is_some_and(|identity| identity.identifies(case))
             || case.nodes().len() < self.node_high_water_mark
             || case.edges().len() < self.edge_high_water_mark
         {

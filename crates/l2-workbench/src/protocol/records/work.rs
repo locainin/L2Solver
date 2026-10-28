@@ -45,7 +45,7 @@ impl RecordWorkBudget {
         Ok(())
     }
 
-    pub(super) const fn try_charge(&mut self, amount: usize) -> bool {
+    pub(super) fn try_charge(&mut self, amount: usize) -> bool {
         self.charge(amount).is_ok()
     }
 

@@ -67,7 +67,7 @@ pub(super) struct ExpansionService<'a> {
     rejections: Vec<CandidateRejection>,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub(super) struct ExpansionLimits {
     pub(super) depth: usize,
     pub(super) objects: usize,

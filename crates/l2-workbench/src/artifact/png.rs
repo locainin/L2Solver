@@ -9,7 +9,7 @@ const MAX_PNG_BYTES: usize = 16 * 1024 * 1024;
 const MAX_PNG_CHUNKS: usize = 65_536;
 
 /// Input and metadata limits for one PNG structural scan
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct PngLimits {
     /// Largest input slice accepted by the parser
     pub max_input_bytes: usize,

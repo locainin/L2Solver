@@ -14,7 +14,7 @@ pub const MAX_ZIP_TOTAL_EXPANDED_BYTES: usize = 64 * 1024 * 1024;
 pub const MAX_ZIP_DEPTH: usize = 4;
 
 /// Caller-selected resource budgets for parsing one ZIP archive
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, serde::Deserialize)]
 pub struct ZipArtifactLimits {
     /// Maximum bytes in the supplied compressed archive
     pub max_archive_bytes: usize,

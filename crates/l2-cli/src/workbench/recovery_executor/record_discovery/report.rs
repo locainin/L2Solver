@@ -1,3 +1,5 @@
+pub(in crate::workbench::recovery_executor) mod checkpoint;
+
 use super::super::case_scan::{ScanAdmission, case_scan_work_bounds, preflight_scan};
 use super::super::diagnostics::{record_cohort_enqueue, record_cohort_omission};
 use super::super::discovery::OrderedUnique;
@@ -40,13 +42,13 @@ pub(in crate::workbench::recovery_executor) struct RecordDiscoveryContext {
     eligibility_omissions: RecordDiscoveryInputOmissions,
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, serde::Serialize, serde::Deserialize)]
 pub(in crate::workbench::recovery_executor) struct PendingRecordSuffix {
     pub(in crate::workbench::recovery_executor) candidate_id: RecoveryCandidateId,
     pub(in crate::workbench::recovery_executor) context_index: usize,
 }
 
-#[derive(Clone, Copy, Eq, PartialEq)]
+#[derive(Clone, Copy, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
 enum LearningSample {
     SessionPrefix,
     SessionSuffix,
@@ -61,7 +63,7 @@ impl LearningSample {
     }
 }
 
-#[derive(Default)]
+#[derive(Default, serde::Serialize, serde::Deserialize)]
 pub(in crate::workbench::recovery_executor) struct RecordSchemaReportLinks {
     reports: OrderedUnique<u64>,
     linked_receipt: Option<u64>,
@@ -348,7 +350,9 @@ impl Executor<'_> {
                 let input_node_id = omission
                     .examples
                     .iter()
-                    .find(|example| example.get("reason").and_then(Value::as_str) == Some(*reason))
+                    .find(|example| {
+                        example.get("reason").and_then(Value::as_str) == Some(reason.as_ref())
+                    })
                     .and_then(|example| example.get("frame_node_id"))
                     .and_then(Value::as_u64);
                 record_cohort_omission(

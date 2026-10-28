@@ -40,7 +40,8 @@ mod visit;
 #[cfg(test)]
 pub use recovery_executor::recover_case;
 pub use recovery_executor::{
-    RecoveryOmission, RecoveryResourceSummary, RecoveryRunSummary, recover_case_with_job,
+    RecoveryOmission, RecoveryResourceSummary, RecoveryResume, RecoveryRunSummary,
+    recover_case_with_job,
 };
 pub use tshark::tshark_cache_identity;
 pub use tshark::{ExportObjectSet, ObjectExportBudget, ObjectExportStatus, ObjectExportUsage};

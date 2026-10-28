@@ -555,9 +555,7 @@ fn parser_invalid_truncation_unconsumed_bytes() {
     invalid.identifier.width = 11;
     assert!(matches!(
         parse_records(&[], &invalid),
-        Err(RecordError::InvalidSchema {
-            field: "identifier"
-        })
+        Err(RecordError::InvalidSchema { field }) if field == "identifier"
     ));
 
     let mut truncated = vec![1];
@@ -583,14 +581,14 @@ fn parser_rejects_invalid_integer_widths() {
     invalid_sequence.sequence.width = 3;
     assert!(matches!(
         parse_records(&[], &invalid_sequence),
-        Err(RecordError::InvalidSchema { field: "sequence" })
+        Err(RecordError::InvalidSchema { field }) if field == "sequence"
     ));
 
     let mut invalid_length = counted_payload_schema();
     invalid_length.length.width = 3;
     assert!(matches!(
         parse_records(&[], &invalid_length),
-        Err(RecordError::InvalidSchema { field: "length" })
+        Err(RecordError::InvalidSchema { field }) if field == "length"
     ));
 
     let mut invalid_count = counted_payload_schema();
@@ -603,7 +601,7 @@ fn parser_rejects_invalid_integer_widths() {
     };
     assert!(matches!(
         parse_records(&[], &invalid_count),
-        Err(RecordError::InvalidSchema { field: "count" })
+        Err(RecordError::InvalidSchema { field }) if field == "count"
     ));
 }
 

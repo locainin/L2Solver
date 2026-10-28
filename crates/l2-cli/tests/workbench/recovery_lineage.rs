@@ -8,10 +8,7 @@ use l2_workbench::{
     },
 };
 use serde_json::json;
-use std::{
-    collections::{HashMap, HashSet, VecDeque},
-    error::Error,
-};
+use std::error::Error;
 
 type TestResult<T> = Result<T, Box<dyn Error>>;
 
@@ -175,37 +172,8 @@ fn test_executor<'a>(
     coordinator: RecoveryCoordinator,
 ) -> TestResult<Executor<'a>> {
     let case_index = CaseIndex::new(case)?;
-    Ok(Executor {
-        memory: None,
-        case,
-        plan,
-        policy,
-        coordinator,
-        case_index,
-        candidate_ids: Vec::new(),
-        candidate_index: HashSet::new(),
-        snapshot_candidates: false,
-        job: None,
-        validated_artifacts: HashSet::new(),
-        transform_cohorts: Vec::new(),
-        derived_discovery: super::super::derived_discovery::DerivedDiscovery::default(),
-        transform_discoveries: HashMap::default(),
-        framing_selection_bases: HashMap::default(),
-        transform_proposal_receipts: HashMap::default(),
-        framing_discoveries: HashMap::default(),
-        record_discoveries: HashMap::default(),
-        record_discovery_context_by_report: HashMap::default(),
-        deferred_record_discovery_plan: None,
-        record_schema_report_links: HashMap::default(),
-        record_schema_associations_charged: 0,
-        record_phase_work_charged: 0,
-        pending_record_assemblies: VecDeque::default(),
-        pending_record_suffixes: VecDeque::default(),
-        pending_record_assembly_count: 0,
-        relational_samples: super::super::relational::RelationalSampleCollections::default(),
-        relational_discoveries: HashMap::default(),
-        omissions: Vec::new(),
-        complete_negative_transform_searches: 0,
-        cycle_skips: 0,
-    })
+    let mut executor = super::super::new_executor(case, plan, policy, false, None, None)?;
+    executor.coordinator = coordinator;
+    executor.case_index = case_index;
+    Ok(executor)
 }

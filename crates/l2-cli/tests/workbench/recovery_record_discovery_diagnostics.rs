@@ -59,7 +59,7 @@ fn independent_alternative_order_reaches_schema_assembly_and_exact_validated_art
     };
     let job = Job::new("alternative order inference");
     let progress = JobProgress::new(job.clone());
-    let outcome = execute_internal(&mut case, &plan, &policy, true, Some(&progress), None)?;
+    let outcome = execute_internal(&mut case, &plan, &policy, true, Some(&progress), None, None)?;
     assert!(
         outcome.candidates.iter().any(|candidate| {
             candidate.task() == &RecoveryTask::RecordDiscovery
@@ -202,7 +202,7 @@ fn late_record_family_is_learned_after_uninformative_prefix_without_using_held_o
         discover_records: true,
         ..RecoveryPlan::default()
     };
-    let outcome = execute_internal(&mut case, &plan, &policy, true, None, None)?;
+    let outcome = execute_internal(&mut case, &plan, &policy, true, None, None, None)?;
     for archive in &archives {
         assert!(
             case.blobs().iter().any(|blob| blob.bytes == *archive),
@@ -261,7 +261,7 @@ fn empty_discovery_report_is_not_counted_as_a_surviving_schema() -> TestResult<(
     };
     let job = Job::new("empty schema report");
     let progress = JobProgress::new(job.clone());
-    execute_internal(&mut case, &plan, &policy, true, Some(&progress), None)?;
+    execute_internal(&mut case, &plan, &policy, true, Some(&progress), None, None)?;
     let snapshot = job.snapshot()?;
     let records = snapshot.recovery_transitions.records();
     assert!(
@@ -304,7 +304,7 @@ fn partially_rejected_record_batches_preserve_exact_input_contradictions() -> Te
     };
     let job = Job::new("partial record rejection");
     let progress = JobProgress::new(job.clone());
-    let outcome = execute_internal(&mut case, &plan, &policy, true, Some(&progress), None)?;
+    let outcome = execute_internal(&mut case, &plan, &policy, true, Some(&progress), None, None)?;
     let snapshot = job.snapshot()?;
     let rejection = snapshot
         .recovery_transitions
@@ -391,7 +391,7 @@ fn contradictory_held_out_suffix_cannot_validate_the_training_schema() -> TestRe
         discover_records: true,
         ..RecoveryPlan::default()
     };
-    execute_internal(&mut case, &plan, &policy, true, None, None)?;
+    execute_internal(&mut case, &plan, &policy, true, None, None, None)?;
     let reports = case
         .nodes()
         .iter()
@@ -479,7 +479,7 @@ fn record_cohort_events_bind_admitted_and_omitted_frames_to_their_source() -> Te
     let job = Job::new("record cohort transitions");
     let progress = JobProgress::new(job.clone());
     let plan = recovery_plan();
-    execute_internal(&mut case, &plan, &policy, true, Some(&progress), None)?;
+    execute_internal(&mut case, &plan, &policy, true, Some(&progress), None, None)?;
     let snapshot = job.snapshot()?;
     let source_digest = source
         .strip_prefix("sha256:")

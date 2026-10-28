@@ -1,3 +1,5 @@
+mod checkpoint;
+
 use super::super::model::{
     RelationalByteRangeLocator, RelationalLengthField, RelationalOperationTemplate,
     RelationalSha256CounterXor, RelationalTransformLimits, RelationalTransformRule,
@@ -8,7 +10,7 @@ use std::{
     mem,
 };
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
 pub(super) enum ReplayDisposition {
     Rejected,
     Published,

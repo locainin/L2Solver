@@ -407,12 +407,14 @@ impl RecordAssemblyOutcome {
 }
 
 /// Record schema, input, resource, or source-consistency failure
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
 pub enum RecordError {
     /// A configured limit is zero or internally inconsistent
     InvalidLimits,
     /// One named schema field is invalid
-    InvalidSchema { field: &'static str },
+    InvalidSchema {
+        field: std::borrow::Cow<'static, str>,
+    },
     /// Selected input exceeds the configured ceiling
     InputTooLarge { length: usize, maximum: usize },
     /// Identifier width exceeds the configured ceiling

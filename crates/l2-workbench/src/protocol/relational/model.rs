@@ -21,7 +21,7 @@ pub struct RelationalRecordSample<'a> {
 }
 
 /// Bounded domains for session-relative locator and transform discovery
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct RelationalTransformLimits {
     /// Maximum distinct source/scope/framing/schema cohorts retained by recovery
     pub max_cohorts: usize,
@@ -72,7 +72,7 @@ impl Default for RelationalTransformLimits {
 }
 
 /// Finite SHA-256 counter-XOR family and parser constraints for rule discovery
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct RelationalTransformPlan {
     /// Input, candidate, work, and report bounds for this search
     pub limits: RelationalTransformLimits,
@@ -119,7 +119,7 @@ impl Default for RelationalTransformPlan {
 }
 
 /// Unit whose transformed bytes must satisfy the selected structural parser
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum RelationalParserScope {
     /// Each complete session must contain one exact parser-accepted object
@@ -129,7 +129,7 @@ pub enum RelationalParserScope {
 }
 
 /// How counter state is applied when a selector matches multiple payload records
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum RelationalCounterReset {
     /// Concatenate selected payload ranges and continue counters across the stream
@@ -139,7 +139,7 @@ pub enum RelationalCounterReset {
 }
 
 /// Coordinate system used for a relational message locator
-#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize)]
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum RelationalCoordinateBasis {
     /// Offsets are measured from the start of the matched message
@@ -149,7 +149,7 @@ pub enum RelationalCoordinateBasis {
 }
 
 /// Marker and byte range learned independently from each session's messages
-#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize)]
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize, serde::Deserialize)]
 pub struct RelationalByteRangeLocator {
     /// Coordinate system used by the marker, value, and declared-length offsets
     pub coordinate_basis: RelationalCoordinateBasis,
@@ -168,7 +168,7 @@ pub struct RelationalByteRangeLocator {
 }
 
 /// Integer field checked against the located seed length in every session
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, serde::Deserialize)]
 pub struct RelationalLengthField {
     /// Start of the length field relative to the selected message
     pub offset: usize,
@@ -207,7 +207,7 @@ const fn byte_order_rank(byte_order: crate::protocol::ByteOrder) -> u8 {
 }
 
 /// Explicit parameters for one discovered SHA-256 counter-XOR rule
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, serde::Deserialize)]
 pub struct RelationalSha256CounterXor {
     /// First block counter used for each message or continuous stream
     pub initial_counter: u64,
@@ -220,7 +220,7 @@ pub struct RelationalSha256CounterXor {
 }
 
 /// Frozen rule locating session-specific material and ciphertext ranges
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct RelationalTransformRule {
     /// Locator that selects exactly one seed-bearing message in each session
     pub seed_locator: RelationalByteRangeLocator,
@@ -388,7 +388,7 @@ impl<E> From<RelationalTransformError> for RelationalEvaluationError<E> {
 }
 
 /// Explicit family and finite parameters for a relational transformation
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, serde::Deserialize)]
 #[serde(tag = "family", content = "parameters", rename_all = "snake_case")]
 pub enum RelationalOperationTemplate {
     /// SHA-256 counter blocks `XORed` with each selected payload range
@@ -716,7 +716,7 @@ impl From<crate::job::JobError> for RelationalTransformError {
     }
 }
 
-#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd, serde::Serialize, serde::Deserialize)]
 pub(super) struct Selector {
     pub(super) direction: crate::protocol::Direction,
     pub(super) marker_offset: usize,

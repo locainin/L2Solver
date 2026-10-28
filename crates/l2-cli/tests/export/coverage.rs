@@ -27,7 +27,7 @@ fn bounded_record_learning_is_counted_without_claiming_input_loss() -> Result<()
         .push(RecoveryOmission::RecordDiscoveryLearningSample {
             source_id: Some("source".to_owned()),
             unsampled_frames: 9,
-            reason_counts: BTreeMap::from([("learning_prefix_message_count_limit", 9)]),
+            reason_counts: BTreeMap::from([("learning_prefix_message_count_limit".into(), 9)]),
             examples: Vec::new(),
         });
     let mut coverage = RecoveryCoverage::default();

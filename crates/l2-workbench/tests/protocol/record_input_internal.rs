@@ -48,9 +48,7 @@ fn rejected_schema_does_not_compute_full_input_identity() {
     schema.identifier.width = 0;
     assert!(matches!(
         input.parse(&schema, RecordLimits::default()),
-        Err(RecordError::InvalidSchema {
-            field: "identifier"
-        })
+        Err(RecordError::InvalidSchema { field }) if field == "identifier"
     ));
     assert!(input.input_sha256.get().is_none());
 }

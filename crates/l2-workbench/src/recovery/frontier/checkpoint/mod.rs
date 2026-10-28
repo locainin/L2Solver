@@ -14,6 +14,18 @@ use sha2::{Digest, Sha256};
 use std::io::{self, Write};
 
 impl RecoveryCoordinator {
+    /// Check a recipe before storing it in executor-owned checkpoint metadata
+    ///
+    /// # Errors
+    /// Returns an error for literal secret material or an invalid recipe identity
+    pub fn validate_checkpoint_recipe(
+        recipe: &crate::derivation::Recipe,
+    ) -> Result<(), RecoveryError> {
+        secrets::validate_recipe(recipe)?;
+        crate::derivation::validate_recipe_identity(recipe)
+            .map_err(RecoveryError::InvalidTaskIdentity)
+    }
+
     /// Stream a versioned checkpoint paired with the exact supplied evidence Case
     ///
     /// The byte limit applies to the encoded checkpoint, not the Case. A failed write

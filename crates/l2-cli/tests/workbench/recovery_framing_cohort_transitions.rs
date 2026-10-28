@@ -26,6 +26,7 @@ fn framing_cohort_events_bind_admission_and_missing_context_to_the_source()
         true,
         Some(&progress),
         None,
+        None,
     )?;
     let snapshot = job.snapshot()?;
     let source_digest = source

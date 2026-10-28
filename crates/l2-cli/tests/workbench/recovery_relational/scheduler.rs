@@ -70,7 +70,8 @@ fn stopped_incremental_metadata_does_not_recreate_history_during_normal_search()
     add_cohort_views(&mut executor, key, &samples, &samples);
     // Metadata exhaustion drops the extra views before normal recovery begins
     executor.relational_samples.incremental_cohorts.clear();
-    executor.relational_samples.incremental_metadata_stop = Some("incremental_metadata_limit");
+    executor.relational_samples.incremental_metadata_stop =
+        Some("incremental_metadata_limit".into());
     assert!(executor.flush_relational_cohorts(super::RelationalLane::Normal)?);
     let context = executor
         .relational_discoveries

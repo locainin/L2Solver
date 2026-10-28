@@ -168,7 +168,7 @@ impl Executor<'_> {
         // Discard every pending view: later omitted records could otherwise leave a partial session
         self.relational_samples.incremental_cohorts = Vec::new();
         self.relational_samples.histories = super::history::RelationalReplayHistories::default();
-        self.relational_samples.incremental_metadata_stop = Some(reason);
+        self.relational_samples.incremental_metadata_stop = Some(reason.into());
     }
 
     fn incremental_cohort_index(

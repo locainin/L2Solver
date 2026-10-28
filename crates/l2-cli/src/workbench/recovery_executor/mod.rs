@@ -7,6 +7,10 @@ mod cancel_boundary_tests;
 #[path = "../../../tests/workbench/recovery_case_index.rs"]
 mod case_index_tests;
 mod case_scan;
+mod checkpoint;
+#[cfg(test)]
+#[path = "../../../tests/workbench/recovery_executor_checkpoint.rs"]
+mod checkpoint_tests;
 mod derived_discovery;
 mod diagnostics;
 mod discovery;
@@ -30,6 +34,7 @@ mod policy;
 mod record_discovery;
 mod records;
 mod relational;
+mod resume;
 mod scheduler;
 mod tcp_ancestry;
 mod transform;
@@ -61,6 +66,7 @@ use model::{RecoveryExecutionOutcome, RecoveryExecutionPolicy, RecoveryPlan};
 use policy::normal_policy;
 use policy::{policy_for_profile, resolve_policy, source_priority};
 use relational::{RelationalDiscoveryContext, RelationalSampleCollections};
+pub use resume::RecoveryResume;
 use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
 
 pub(super) use super::{decode::service::DecodeBatchLimits, expand::ExpansionLimits};
@@ -84,6 +90,7 @@ pub fn recover_case(case: &mut Case) -> Result<RecoveryRunSummary, RecoveryExecu
         policy::DEFAULT_MEMORY_LIMIT_BYTES as u64,
         None,
         None,
+        None,
     )
 }
 
@@ -94,6 +101,7 @@ pub fn recover_case_with_job(
     memory_limit_bytes: u64,
     job: Option<&Job>,
     memory: Option<&MemoryBudget>,
+    resume: Option<&mut RecoveryResume<'_>>,
 ) -> Result<RecoveryRunSummary, RecoveryExecutionError> {
     if let Some(job) = job {
         job.check_cancelled()?;
@@ -106,7 +114,15 @@ pub fn recover_case_with_job(
         ..RecoveryPlan::default()
     };
     let progress = job.cloned().map(JobProgress::new);
-    let outcome = execute_internal(case, &plan, &policy, false, progress.as_ref(), memory)?;
+    let outcome = execute_internal(
+        case,
+        &plan,
+        &policy,
+        false,
+        progress.as_ref(),
+        memory,
+        resume,
+    )?;
     Ok(RecoveryRunSummary {
         case_evidence_collection_complete: case.collection_complete(),
         discovery: RecoveryDiscoveryStatus {
@@ -247,7 +263,7 @@ fn execute(
     plan: &RecoveryPlan,
     policy: &RecoveryExecutionPolicy,
 ) -> Result<RecoveryExecutionOutcome, RecoveryExecutionError> {
-    execute_internal(case, plan, policy, true, None, None)
+    execute_internal(case, plan, policy, true, None, None, None)
 }
 
 fn execute_internal(
@@ -257,12 +273,70 @@ fn execute_internal(
     snapshot_candidates: bool,
     job: Option<&JobProgress>,
     memory: Option<&MemoryBudget>,
+    mut resume: Option<&mut RecoveryResume<'_>>,
 ) -> Result<RecoveryExecutionOutcome, RecoveryExecutionError> {
     let policy = resolve_policy(policy.clone())?;
+    if let Some(active) = resume.as_deref_mut() {
+        active.prepare(case)?;
+        match active.load() {
+            Ok(Some(mut loaded)) => {
+                match checkpoint::read(
+                    &mut loaded.case,
+                    plan,
+                    &policy,
+                    &loaded.state,
+                    active.executor_limit(),
+                    memory,
+                ) {
+                    Ok((mut executor, mut cursor)) => {
+                        match RecoveryResume::restore_work(
+                            job.map(|progress| &progress.job),
+                            loaded.work,
+                        ) {
+                            Ok(()) => {
+                                drop(loaded.state);
+                                drop(loaded.state_memory);
+                                executor.job = job.cloned();
+                                if let Some(progress) = &executor.job {
+                                    progress.job.increment(Counter::CacheHits, 1)?;
+                                }
+                                execute_cursor(&mut executor, &mut cursor, Some(active))?;
+                                let outcome = finish_executor(executor)?;
+                                // Restoration is isolated until all saved state has been accepted
+                                *case = loaded.case;
+                                return Ok(outcome);
+                            }
+                            Err(error) => {
+                                active.invalid(error, job.map(|progress| &progress.job))?;
+                            }
+                        }
+                    }
+                    Err(error) => active.invalid(error, job.map(|progress| &progress.job))?,
+                }
+            }
+            Ok(None) => {}
+            Err(error) => active.invalid(error, job.map(|progress| &progress.job))?,
+        }
+    }
+    let mut executor = new_executor(case, plan, policy, snapshot_candidates, job, memory)?;
+    let mut cursor = execution_state::SchedulerCursor::default();
+    execute_cursor(&mut executor, &mut cursor, resume)?;
+    finish_executor(executor)
+}
+
+fn new_executor<'case>(
+    case: &'case mut Case,
+    plan: &'case RecoveryPlan,
+    policy: RecoveryExecutionPolicy,
+    snapshot_candidates: bool,
+    job: Option<&JobProgress>,
+    memory: Option<&MemoryBudget>,
+) -> Result<Executor<'case>, RecoveryExecutionError> {
     let resources = policy.resources;
     let case_index_ledger = CaseIndexScanLedger::new()?;
-    let mut executor = Executor {
+    Ok(Executor {
         memory: memory.cloned(),
+        checkpoint_memory: None,
         case,
         plan,
         policy,
@@ -293,15 +367,35 @@ fn execute_internal(
         omissions: Vec::new(),
         complete_negative_transform_searches: 0,
         cycle_skips: 0,
-    };
-
-    execute_executor(&mut executor)?;
-    finish_executor(executor)
+    })
 }
 
+#[cfg(test)]
 fn execute_executor(executor: &mut Executor<'_>) -> Result<(), RecoveryExecutionError> {
     let mut cursor = execution_state::SchedulerCursor::default();
-    while execution_state::step(executor, &mut cursor)? {}
+    execute_cursor(executor, &mut cursor, None)
+}
+
+fn execute_cursor(
+    executor: &mut Executor<'_>,
+    cursor: &mut execution_state::SchedulerCursor,
+    mut resume: Option<&mut RecoveryResume<'_>>,
+) -> Result<(), RecoveryExecutionError> {
+    loop {
+        if let Err(error) = executor.check_cancelled() {
+            if let Some(active) = resume.as_deref_mut() {
+                // No operation has begun, so the prior committed boundary is still safe
+                let _ = active.save(executor, cursor);
+            }
+            return Err(error);
+        }
+        if !execution_state::step(executor, cursor)? {
+            break;
+        }
+        if let Some(active) = resume.as_deref_mut().filter(|active| active.due()) {
+            active.save_or_fallback(executor, cursor)?;
+        }
+    }
     Ok(())
 }
 
@@ -467,6 +561,7 @@ fn snapshot_candidates(
 
 struct Executor<'a> {
     memory: Option<MemoryBudget>,
+    checkpoint_memory: Option<l2_workbench::job::MemoryLease>,
     case: &'a mut Case,
     plan: &'a RecoveryPlan,
     policy: RecoveryExecutionPolicy,
@@ -651,7 +746,41 @@ struct CaseIndex {
     scan_ledger: CaseIndexScanLedger,
 }
 
+#[derive(Clone, Copy, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CaseIndexCursor {
+    node_count: usize,
+    edge_count: usize,
+    scan_ledger: CaseIndexScanLedger,
+}
+
 impl CaseIndex {
+    const fn checkpoint_cursor(&self) -> CaseIndexCursor {
+        CaseIndexCursor {
+            node_count: self.node_count,
+            edge_count: self.edge_count,
+            scan_ledger: self.scan_ledger,
+        }
+    }
+
+    fn restore_from_checkpoint(
+        case: &Case,
+        cursor: CaseIndexCursor,
+    ) -> Result<Self, RecoveryExecutionError> {
+        if cursor.node_count > case.nodes().len()
+            || cursor.edge_count > case.edges().len()
+            || !cursor.scan_ledger.is_valid_checkpoint()?
+        {
+            return Err(RecoveryError::InvalidCheckpoint.into());
+        }
+        let mut index = Self::with_ledger(cursor.scan_ledger);
+        index.index_new_nodes(case, false, &mut Vec::new(), cursor.node_count)?;
+        index.index_new_edges(case, cursor.edge_count)?;
+        index.node_count = cursor.node_count;
+        index.edge_count = cursor.edge_count;
+        Ok(index)
+    }
+
     fn with_ledger(scan_ledger: CaseIndexScanLedger) -> Self {
         Self {
             scan_ledger,
@@ -713,9 +842,9 @@ impl CaseIndex {
                     source: Box::new(source),
                 })?;
         }
-        let mut work = self.index_new_nodes(case, collect_seeds, &mut seeds)?;
+        let mut work = self.index_new_nodes(case, collect_seeds, &mut seeds, case.nodes().len())?;
         work = work
-            .checked_add(self.index_new_edges(case)?)
+            .checked_add(self.index_new_edges(case, case.edges().len())?)
             .ok_or(RecoveryError::InvariantFailure)?;
 
         self.node_count = case.nodes().len();
@@ -737,9 +866,10 @@ impl CaseIndex {
         case: &Case,
         collect_seeds: bool,
         seeds: &mut Vec<RootSeed>,
+        end: usize,
     ) -> Result<usize, RecoveryExecutionError> {
         let mut work = 0_usize;
-        for node in case.nodes().iter().skip(self.node_count) {
+        for node in case.nodes().iter().take(end).skip(self.node_count) {
             // Cache this marker while visiting new nodes, before validation needs lineage
             self.has_relational_frames |= node.kind == relational::DECODED_FRAME_KIND;
             work = work
@@ -794,9 +924,13 @@ impl CaseIndex {
         Ok(work)
     }
 
-    fn index_new_edges(&mut self, case: &Case) -> Result<usize, RecoveryExecutionError> {
+    fn index_new_edges(
+        &mut self,
+        case: &Case,
+        end: usize,
+    ) -> Result<usize, RecoveryExecutionError> {
         let mut work = 0_usize;
-        for edge in case.edges().iter().skip(self.edge_count) {
+        for edge in case.edges().iter().take(end).skip(self.edge_count) {
             work = work
                 .checked_add(edge.relation.len())
                 .and_then(|total| total.checked_add(edge.reason.len()))

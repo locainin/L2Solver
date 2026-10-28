@@ -18,31 +18,33 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 const ROOT_ANCESTRY: u64 = 0;
 
-#[derive(Clone, Eq, PartialEq)]
+#[derive(Clone, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
 enum AncestryStep {
     Transform(Recipe),
     Framing(FramingKind),
 }
 
+#[derive(serde::Serialize, serde::Deserialize)]
 struct AncestryPath {
     id: u64,
     parent: u64,
     step: AncestryStep,
 }
 
-#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd, serde::Serialize, serde::Deserialize)]
 struct DerivedFramingCohortKey {
     tcp: FramingCohortKey,
     ancestry_id: u64,
 }
 
-#[derive(Clone)]
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
 struct DerivedByteContext {
     cohort: FramingCohortKey,
     input: FramingInput,
     ancestry_id: u64,
 }
 
+#[derive(serde::Serialize, serde::Deserialize)]
 struct PendingFramingInput {
     context: DerivedByteContext,
     parent: RecoveryCandidateId,
@@ -77,7 +79,7 @@ pub(super) struct DerivedFramingCohort {
     pub(super) parents: Vec<RecoveryCandidateId>,
 }
 
-#[derive(Clone, Eq, Ord, PartialEq, PartialOrd)]
+#[derive(Clone, Eq, Ord, PartialEq, PartialOrd, serde::Serialize, serde::Deserialize)]
 struct DerivedGenerationId {
     node_id: u64,
     source_id: String,
@@ -87,17 +89,31 @@ struct DerivedGenerationId {
     ancestry_id: u64,
 }
 
-#[derive(Default)]
+#[derive(Default, serde::Serialize, serde::Deserialize)]
 pub(super) struct DerivedDiscovery {
+    #[serde(with = "crate::workbench::recovery_executor::checkpoint::collections::hash_map")]
     contexts_by_node: HashMap<u64, DerivedByteContext>,
     generations: BTreeSet<DerivedGenerationId>,
     ancestry_paths: Vec<AncestryPath>,
+    #[serde(with = "crate::workbench::recovery_executor::checkpoint::collections::btree_map")]
     pending_framing: BTreeMap<DerivedFramingCohortKey, Vec<PendingFramingInput>>,
+    #[serde(with = "crate::workbench::recovery_executor::checkpoint::collections::btree_map")]
     pending_records: BTreeMap<RecordCohortKey, Vec<(RecoveryCandidateId, RecordFrameInput)>>,
-    omission_counts: BTreeMap<String, BTreeMap<&'static str, usize>>,
+    omission_counts: BTreeMap<String, BTreeMap<std::borrow::Cow<'static, str>, usize>>,
 }
 
 impl DerivedDiscovery {
+    pub(super) fn validate_checkpoint_recipes(
+        &self,
+    ) -> Result<(), l2_workbench::recovery::RecoveryError> {
+        for path in &self.ancestry_paths {
+            if let AncestryStep::Transform(recipe) = &path.step {
+                l2_workbench::recovery::RecoveryCoordinator::validate_checkpoint_recipe(recipe)?;
+            }
+        }
+        Ok(())
+    }
+
     pub(super) fn seed_tcp_contexts(
         &mut self,
         plan: &FramingDiscoveryPlan,
@@ -448,7 +464,7 @@ impl DerivedDiscovery {
             .omission_counts
             .entry(source_id.to_owned())
             .or_default()
-            .entry(reason)
+            .entry(reason.into())
             .or_default();
         *count = count
             .checked_add(1)

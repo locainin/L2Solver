@@ -6,10 +6,7 @@ use l2_workbench::{
     evidence::{Case, Edge, EvidenceError, EvidenceStatus, MAX_EDGES},
     recovery::{RecoveryCoordinator, RecoveryResource, RecoveryResult, RecoveryTask},
 };
-use std::{
-    collections::{HashMap, HashSet},
-    error::Error,
-};
+use std::error::Error;
 
 #[test]
 fn terminal_proposal_link_quota_is_aggregated_without_retrying_late_receipts()
@@ -137,7 +134,7 @@ impl ProposalLinkFixture {
             self.execution_policy.clone(),
             coordinator,
             case_index,
-        ))
+        )?)
     }
 }
 
@@ -268,38 +265,9 @@ fn test_executor<'a>(
     policy: RecoveryExecutionPolicy,
     coordinator: RecoveryCoordinator,
     case_index: CaseIndex,
-) -> Executor<'a> {
-    Executor {
-        memory: None,
-        case,
-        plan,
-        policy,
-        coordinator,
-        case_index,
-        candidate_ids: Vec::new(),
-        candidate_index: HashSet::new(),
-        snapshot_candidates: false,
-        job: None,
-        validated_artifacts: HashSet::new(),
-        transform_cohorts: Vec::new(),
-        derived_discovery: super::super::derived_discovery::DerivedDiscovery::default(),
-        transform_discoveries: HashMap::new(),
-        framing_selection_bases: HashMap::new(),
-        framing_discoveries: HashMap::new(),
-        record_discoveries: HashMap::new(),
-        record_discovery_context_by_report: HashMap::new(),
-        deferred_record_discovery_plan: None,
-        record_schema_report_links: HashMap::new(),
-        record_schema_associations_charged: 0,
-        record_phase_work_charged: 0,
-        pending_record_assemblies: std::collections::VecDeque::new(),
-        pending_record_suffixes: std::collections::VecDeque::new(),
-        pending_record_assembly_count: 0,
-        relational_samples: super::super::RelationalSampleCollections::default(),
-        relational_discoveries: HashMap::new(),
-        transform_proposal_receipts: HashMap::new(),
-        omissions: Vec::new(),
-        complete_negative_transform_searches: 0,
-        cycle_skips: 0,
-    }
+) -> Result<Executor<'a>, RecoveryExecutionError> {
+    let mut executor = super::super::new_executor(case, plan, policy, false, None, None)?;
+    executor.coordinator = coordinator;
+    executor.case_index = case_index;
+    Ok(executor)
 }

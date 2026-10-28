@@ -18,6 +18,8 @@ mod index_tests;
 mod mapping;
 #[path = "case/memory.rs"]
 mod memory;
+#[path = "case/prefix.rs"]
+mod prefix;
 #[path = "case/snapshot/mod.rs"]
 mod snapshot;
 #[path = "transaction.rs"]
@@ -26,6 +28,7 @@ mod transaction;
 mod validation;
 
 pub use mapping::{CheckedByteMappingCursor, clip_byte_mappings};
+pub use prefix::CasePrefixBinding;
 pub use snapshot::{CaseSnapshotLimits, CaseSnapshotUsage};
 
 /// Current serialized evidence schema version

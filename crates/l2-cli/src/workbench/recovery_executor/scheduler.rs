@@ -34,6 +34,7 @@ enum ChildTaskPolicy {
     DiscoveredRecords,
 }
 
+#[derive(serde::Serialize, serde::Deserialize)]
 pub(super) struct PendingRecordAssembly {
     input_node_ids: Vec<u64>,
     parent_child_pairs: Option<Vec<(RecoveryCandidateId, u64)>>,

@@ -13,7 +13,7 @@ const ZIP_END_SIGNATURE: &[u8; 4] = b"PK\x05\x06";
 const ZIP_END_FIXED_SIZE: usize = 22;
 
 /// Resource policy for one embedded-object discovery pass
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct EmbeddedDiscoveryLimits {
     /// Maximum source positions scanned for markers and ZIP end boundaries
     ///
@@ -104,7 +104,7 @@ pub struct EmbeddedCandidate {
 }
 
 /// Candidates omitted because a configured discovery budget was reached
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct EmbeddedDiscoveryOmissions {
     /// Marker candidates not retained after reaching the output limit
     pub output_candidate_count: usize,

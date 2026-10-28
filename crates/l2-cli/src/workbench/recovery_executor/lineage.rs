@@ -14,12 +14,13 @@ use std::collections::{HashMap, HashSet};
 #[path = "../../../tests/workbench/recovery_lineage.rs"]
 mod tests;
 
+#[derive(serde::Serialize, serde::Deserialize)]
 pub(super) struct TransformCohort {
     pub(super) task: RecoveryTask,
     pub(super) slots: Vec<TransformSlot>,
 }
 
-#[derive(Eq, PartialEq)]
+#[derive(Eq, PartialEq, serde::Serialize, serde::Deserialize)]
 pub(super) struct TransformSlot {
     /// Candidate that produced this ordered input
     pub(super) parent: RecoveryCandidateId,

@@ -139,7 +139,10 @@ fn incremental_metadata_charges_retained_samples_when_a_cohort_grows() -> Result
     assert_eq!(executor.relational_samples.incremental_cohorts.len(), 1);
     executor.collect_raw_cohort("source", &scope, &peer, &[&second], &scan)?;
     assert_eq!(
-        executor.relational_samples.incremental_metadata_stop,
+        executor
+            .relational_samples
+            .incremental_metadata_stop
+            .as_deref(),
         Some("incremental_metadata_limit")
     );
     assert!(executor.relational_samples.incremental_cohorts.is_empty());
@@ -235,9 +238,9 @@ fn collect_tiny_cohorts(
             matches!(
                 omission,
                 super::super::RecoveryOmission::RelationalIncrementalMetadata {
-                    reason: "incremental_metadata_limit",
+                    reason,
                     ..
-                }
+                } if reason == "incremental_metadata_limit"
             )
         })
         .count();
@@ -422,10 +425,10 @@ fn evidence_stop_reports_unsearched_incremental_cohorts_once() -> Result<(), Box
             super::super::RecoveryOmission::RelationalTransformAnalysis {
                 sessions_available: 2,
                 search_exhaustive_within_plan: false,
-                reason: Some("incremental_evidence_limit"),
+                reason: Some(reason),
                 ..
             }
-        )
+        ) if reason == "incremental_evidence_limit"
     ));
     Ok(())
 }
