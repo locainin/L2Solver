@@ -7,6 +7,33 @@ use serde_json::json;
 #[cfg(unix)]
 use std::{fs, io};
 
+#[test]
+fn checkpoint_memory_pressure_is_preserved_in_optional_and_strict_modes()
+-> Result<(), Box<dyn Error>> {
+    for strict_cache in [false, true] {
+        let temporary = tempfile::tempdir()?;
+        let cache = Cache::open_at(
+            temporary.path().join("cache"),
+            temporary.path().join("state"),
+            1024 * 1024,
+        )?;
+        let memory = l2_workbench::job::MemoryBudget::new(1);
+        cache.attach_memory_budget(memory.clone())?;
+        let job = Job::new("checkpoint admission");
+        let options = RecoveryOptions {
+            strict_cache,
+            ..RecoveryOptions::default()
+        };
+        let error = RecoveryCache::from_cache(cache, &identity()?, &options, &job)
+            .err()
+            .ok_or("memory pressure was silently treated as an optional cache miss")?;
+        assert!(crate::memory_error::find(error.as_ref()).is_some());
+        assert!(job.snapshot()?.cache_fallbacks.records().is_empty());
+        assert_eq!(memory.snapshot()?.used_bytes, 0);
+    }
+    Ok(())
+}
+
 #[cfg(unix)]
 #[test]
 fn checkpoint_start_failure_disables_optional_cache_and_keeps_strict_failure()

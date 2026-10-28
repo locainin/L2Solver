@@ -26,7 +26,8 @@ pub(super) enum CheckpointError {
 
 impl CheckpointError {
     pub(super) const fn is_cache_failure(&self) -> bool {
-        matches!(self, Self::Cache(_) | Self::WorkerStart(_))
+        matches!(self, Self::Cache(error) if !matches!(error, CacheError::Memory(_)))
+            || matches!(self, Self::WorkerStart(_))
     }
 }
 
