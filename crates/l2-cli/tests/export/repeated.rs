@@ -504,6 +504,13 @@ fn normalize_job_snapshot(snapshot: &mut serde_json::Value) -> Result<(), Box<dy
     fields.remove("created_at_unix_ms");
     fields.remove("elapsed_ms");
     fields.remove("counters");
+    // Cache reuse changes live allocations just as it changes work counters and timings
+    // Check the observation before excluding it from artifact and evidence equality
+    assert_memory_observation(
+        &fields
+            .remove("memory_admission")
+            .ok_or("memory admission observation is missing")?,
+    )?;
     // Cache fallback errors remain visible even though invocation diagnostics are not semantic output
     let fallbacks = fields
         .remove("cache_fallbacks")
@@ -536,6 +543,34 @@ fn normalize_job_snapshot(snapshot: &mut serde_json::Value) -> Result<(), Box<dy
         fields.remove("eta_seconds");
         fields.remove("message");
     }
+    Ok(())
+}
+
+fn assert_memory_observation(memory: &serde_json::Value) -> Result<(), Box<dyn Error>> {
+    let number = |name| {
+        memory
+            .get(name)
+            .and_then(serde_json::Value::as_u64)
+            .ok_or("memory observation value is missing")
+    };
+    let used = number("used_bytes")?;
+    let peak = number("peak_bytes")?;
+    let limit = number("limit_bytes")?;
+    assert!(peak > 0 && used <= peak && peak <= limit);
+    assert_eq!(number("rejected")?, 0);
+    assert_eq!(number("waiting")?, 0);
+    assert_eq!(number("timed_out")?, 0);
+    let classes = memory
+        .get("by_class")
+        .and_then(serde_json::Value::as_object)
+        .ok_or("memory classes are missing")?;
+    assert_eq!(classes.len(), 5);
+    let total = classes.values().try_fold(0_u64, |total, value| {
+        total
+            .checked_add(value.as_u64().ok_or("invalid memory class value")?)
+            .ok_or("memory class total overflow")
+    })?;
+    assert_eq!(total, used);
     Ok(())
 }
 
