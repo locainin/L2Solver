@@ -200,29 +200,91 @@ impl ReconstructionCaseOmissions {
 }
 
 /// One analyzed flow delivered to a caller without retaining earlier results
-pub struct FlowAnalysis {
+pub struct FlowAnalysis<R = BuildResult> {
     pub flow: Flow,
-    pub result: BuildResult,
+    pub result: R,
     pub coverage: PerFlowCoverage,
 }
 
 /// One bounded cross-flow analysis delivered without retaining earlier results
-pub struct CohortAnalysis {
+pub struct CohortAnalysis<R = BuildResult> {
     pub member_flows: Vec<Flow>,
     pub packet_flow_ids: Vec<(u32, i64)>,
-    pub result: BuildResult,
+    pub result: R,
     pub split: bool,
 }
 
 /// One event from a capture analysis pass
-pub enum FullSourceItem {
-    Flow(Box<FlowAnalysis>),
-    FlowPage(Box<SupplementaryFlowPage>),
-    Cohort(Box<CohortAnalysis>),
+pub enum FullSourceItem<R = BuildResult> {
+    Flow(Box<FlowAnalysis<R>>),
+    FlowPage(Box<SupplementaryFlowPage<R>>),
+    Cohort(Box<CohortAnalysis<R>>),
+}
+
+impl<R> FullSourceItem<R> {
+    /// Move analysis metadata unchanged while replacing its Case storage
+    ///
+    /// # Errors
+    /// Propagates the storage conversion error and drops the consumed input on failure
+    pub(crate) fn try_map_result<S, E>(
+        self,
+        map: impl FnOnce(R) -> Result<S, E>,
+    ) -> Result<FullSourceItem<S>, E> {
+        Ok(match self {
+            Self::Flow(analysis) => {
+                let FlowAnalysis {
+                    flow,
+                    result,
+                    coverage,
+                } = *analysis;
+                FullSourceItem::Flow(Box::new(FlowAnalysis {
+                    flow,
+                    result: map(result)?,
+                    coverage,
+                }))
+            }
+            Self::FlowPage(page) => {
+                let SupplementaryFlowPage {
+                    flow,
+                    page_index,
+                    first_packet,
+                    last_packet,
+                    selected_records,
+                    retained_records,
+                    omitted_records,
+                    result,
+                } = *page;
+                FullSourceItem::FlowPage(Box::new(SupplementaryFlowPage {
+                    flow,
+                    page_index,
+                    first_packet,
+                    last_packet,
+                    selected_records,
+                    retained_records,
+                    omitted_records,
+                    result: map(result)?,
+                }))
+            }
+            Self::Cohort(cohort) => {
+                let CohortAnalysis {
+                    member_flows,
+                    packet_flow_ids,
+                    result,
+                    split,
+                } = *cohort;
+                FullSourceItem::Cohort(Box::new(CohortAnalysis {
+                    member_flows,
+                    packet_flow_ids,
+                    result: map(result)?,
+                    split,
+                }))
+            }
+        })
+    }
 }
 
 /// One independent bounded analysis page for an indexed flow
-pub struct SupplementaryFlowPage {
+pub struct SupplementaryFlowPage<R = BuildResult> {
     pub flow: Flow,
     pub page_index: u64,
     pub first_packet: u32,
@@ -230,7 +292,7 @@ pub struct SupplementaryFlowPage {
     pub selected_records: u64,
     pub retained_records: u64,
     pub omitted_records: u64,
-    pub result: BuildResult,
+    pub result: R,
 }
 
 /// Per-flow retention and analysis status

@@ -1,16 +1,28 @@
 //! Recover Cases in bounded batches before serial export
 
+mod case_buffer;
+
 use super::{
     coverage::RecoveryCaseKind,
     provenance::cohort_scope,
     recovery_cache::{CachedRecovery, RecoveryContext, recover},
 };
 use crate::workbench;
+use case_buffer::BufferedResult;
 use l2_workbench::{
-    evidence::Case,
-    job::{Counter, Job, MemoryError, Phase, PhaseOutcome},
+    evidence::{Case, CaseSnapshotLimits},
+    investigation::BuildResult,
+    job::{Counter, Job, MemoryBudget, MemoryError, Phase, PhaseOutcome},
 };
-use std::{error::Error, fmt, io, sync::mpsc};
+use std::{
+    error::Error,
+    fmt, io,
+    path::Path,
+    sync::{
+        atomic::{AtomicUsize, Ordering},
+        mpsc,
+    },
+};
 
 // A batch holds one bounded Case and active recovery graph per worker
 const RECOVERY_WORKER_RESERVATION_BYTES: u64 = 128 * 1024 * 1024;
@@ -171,8 +183,8 @@ impl PendingCase {
 }
 
 /// One Case with cached or freshly computed recovery, ready for serial output
-pub(super) struct RecoveredCase {
-    pub(super) item: workbench::full_source::FullSourceItem,
+pub(super) struct RecoveredCase<R = BuildResult> {
+    pub(super) item: workbench::full_source::FullSourceItem<R>,
     pub(super) scope: serde_json::Value,
     pub(super) recovery: CachedRecovery,
 }
@@ -181,6 +193,7 @@ pub(super) struct RecoveredCase {
 pub(super) fn process_case_batch(
     batch: &mut Vec<PendingCase>,
     pool: &rayon::ThreadPool,
+    temporary_parent: &Path,
     context: &RecoveryContext<'_>,
     mut emit: impl FnMut(RecoveredCase) -> Result<(), Box<dyn Error>>,
 ) -> Result<(), Box<dyn Error>> {
@@ -194,12 +207,23 @@ pub(super) fn process_case_batch(
         )
         .into());
     }
-    // Send finished Cases to the collector while later recovery work is still active
-    let items = std::mem::take(batch);
+    let memory_limit = context
+        .memory
+        .map(MemoryBudget::snapshot)
+        .transpose()?
+        .map_or(context.options.memory_limit, |snapshot| {
+            snapshot.limit_bytes
+        });
+    // Later resident results share one quarter of the allowance; emit the earliest directly
+    let resident_limit = memory_limit / 4 / u64::try_from(batch.len())?;
+    let snapshot_limits = CaseSnapshotLimits::new(memory_limit, memory_limit);
+    let next = AtomicUsize::new(0);
+    // Workers finish independently; only small descriptors need to wait for source order
+    let items = std::mem::take(batch).into_iter().enumerate().collect();
     process_ordered(
         pool,
         items,
-        |pending| {
+        |(index, pending)| {
             let PendingCase {
                 mut item,
                 kind,
@@ -207,25 +231,51 @@ pub(super) fn process_case_batch(
             } = pending;
             let recovery = recover(case_mut(&mut item), kind, &scope, context)
                 .map_err(|error| classify_worker_error(error.as_ref()))?;
-            let buffered = context
-                .memory
-                .zip(case_mut(&mut item).charged_memory_bytes())
-                .map(|(memory, bytes)| memory.observe_buffered_case(bytes))
-                .transpose()
-                .map_err(|error| classify_worker_error(&error))?;
+            let retained_bytes = case_mut(&mut item).charged_memory_bytes().unwrap_or(0);
+            let spill = index > next.load(Ordering::Acquire) && retained_bytes > resident_limit;
+            let mut observation = None;
+            let item = item
+                .try_map_result(|result| {
+                    let buffered = if spill {
+                        BufferedResult::spill(
+                            result,
+                            temporary_parent,
+                            snapshot_limits,
+                            context.memory,
+                        )?
+                    } else {
+                        BufferedResult::Resident(Box::new(result))
+                    };
+                    observation = context
+                        .memory
+                        .map(|memory| buffered.observe(memory))
+                        .transpose()?;
+                    Ok::<_, Box<dyn Error>>(buffered)
+                })
+                .map_err(|error| classify_worker_error(error.as_ref()))?;
             Ok::<_, WorkerFailure>((
+                // Early collection failure must end the observation before dropping its Case
+                observation,
                 RecoveredCase {
                     item,
                     scope,
                     recovery,
                 },
-                buffered,
             ))
         },
-        |(case, buffered)| {
+        |(buffered, case): (_, RecoveredCase<BufferedResult>)| {
             // End the wait before publication; the Case still owns its allocation charges
             drop(buffered);
-            emit(case)
+            let item = case
+                .item
+                .try_map_result(|result| result.restore(context.memory))?;
+            emit(RecoveredCase {
+                item,
+                scope: case.scope,
+                recovery: case.recovery,
+            })?;
+            next.fetch_add(1, Ordering::Release);
+            Ok(())
         },
     )
 }

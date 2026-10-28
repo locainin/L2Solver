@@ -105,14 +105,7 @@ fn collect_export_inner(
             format!("Analyzing capture with {worker_count} recovery worker(s)"),
         )?;
     }
-    let coverage = collect_flow_cases(
-        &indexed,
-        options,
-        &mut collection,
-        context,
-        &pool,
-        worker_count,
-    )?;
+    let coverage = collect_flow_cases(&indexed, options, &mut collection, context, &pool, staging)?;
     let (tshark, tshark_error) = collect_tshark_and_finish(
         &options.capture,
         staging,
@@ -183,11 +176,12 @@ fn collect_flow_cases(
     collection: &mut CaseCollection,
     context: &RecoveryContext<'_>,
     pool: &rayon::ThreadPool,
-    worker_count: usize,
+    staging: &Path,
 ) -> Result<workbench::full_source::FullSourceCoverage, Box<dyn Error>> {
     let native_cache = context.cache.filter(|_| !context.options.no_cache);
     let source_id = indexed.receipt.source_id.as_str();
     let source_label = workbench::full_source::source_label(&options.capture);
+    let worker_count = pool.current_num_threads();
     let mut batch = Vec::with_capacity(worker_count);
     let mut collect_case = |mut case: RecoveredCase| {
         // Bind the request's basename after cached recovery and before evidence identity is written
@@ -215,13 +209,13 @@ fn collect_flow_cases(
             }
             batch.push(pending);
             if batch.len() == worker_count {
-                process_case_batch(&mut batch, pool, context, &mut collect_case)?;
+                process_case_batch(&mut batch, pool, staging, context, &mut collect_case)?;
             }
             Ok(())
         },
     );
     let analysis = analysis.and_then(|coverage| {
-        process_case_batch(&mut batch, pool, context, &mut collect_case)?;
+        process_case_batch(&mut batch, pool, staging, context, &mut collect_case)?;
         Ok(coverage)
     });
     let coverage = analysis?;

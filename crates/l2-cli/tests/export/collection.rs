@@ -125,9 +125,10 @@ fn real_recovery_worker_preserves_shared_memory_limit_failure() -> Result<(), Bo
             let snapshot = budget.snapshot()?;
             let remaining = snapshot.limit_bytes - snapshot.used_bytes;
             let held = budget.try_reserve(MemoryClass::Base, remaining)?;
-            let error = process_case_batch(&mut batch, &pool, &context, |_| Ok(()))
-                .err()
-                .ok_or("recovery should fail when the shared budget is full")?;
+            let error =
+                process_case_batch(&mut batch, &pool, temporary.path(), &context, |_| Ok(()))
+                    .err()
+                    .ok_or("recovery should fail when the shared budget is full")?;
             observed = crate::memory_error::find(error.as_ref());
             drop(held);
             Err(io::Error::other("stop after the first Case").into())
@@ -306,12 +307,12 @@ fn recover_indexed_cases(
             peak_case_bytes = peak_case_bytes.max(budget.snapshot()?.used(MemoryClass::Case));
             batch.push(PendingCase::new(item)?);
             if batch.len() == worker_count {
-                process_case_batch(&mut batch, &pool, &context, &mut emit)?;
+                process_case_batch(&mut batch, &pool, temporary_parent, &context, &mut emit)?;
             }
             Ok(())
         },
     )?;
-    process_case_batch(&mut batch, &pool, &context, &mut emit)?;
+    process_case_batch(&mut batch, &pool, temporary_parent, &context, &mut emit)?;
     let buffered = budget.snapshot()?.buffered_cases;
     assert_eq!(buffered.completed_waits, u64::try_from(cases.len())?);
     assert_eq!(buffered.current_cases, 0);

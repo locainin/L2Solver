@@ -64,6 +64,29 @@ fn overflowing_buffer_observation_preserves_the_previous_metrics() -> TestResult
 }
 
 #[test]
+fn completed_snapshot_storage_is_observed_separately_from_resident_charges() -> TestResult {
+    let memory = MemoryBudget::new(100);
+    let first = memory.observe_spilled_case(700)?;
+    let second = memory.observe_spilled_case(900)?;
+    let live = memory.snapshot()?;
+    assert_eq!(live.used_bytes, 0);
+    assert_eq!(live.buffered_cases.current_charged_bytes, 0);
+    assert_eq!(live.buffered_cases.current_snapshot_bytes, 1600);
+    assert_eq!(live.buffered_cases.spilled_cases, 2);
+    drop(first);
+    assert_eq!(
+        memory.snapshot()?.buffered_cases.current_snapshot_bytes,
+        900
+    );
+    drop(second);
+    let completed = memory.snapshot()?.buffered_cases;
+    assert_eq!(completed.current_snapshot_bytes, 0);
+    assert_eq!(completed.peak_snapshot_bytes, 1600);
+    assert_eq!(completed.spilled_snapshot_bytes, 1600);
+    Ok(())
+}
+
+#[test]
 fn leases_share_an_exact_limit_and_release_on_drop() -> TestResult {
     let budget = MemoryBudget::new(100);
     let mut case = budget.try_reserve(MemoryClass::Case, 40)?;
