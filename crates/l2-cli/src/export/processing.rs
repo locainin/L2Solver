@@ -268,7 +268,7 @@ pub(super) fn process_case_batch(
             drop(buffered);
             let item = case
                 .item
-                .try_map_result(|result| result.restore(context.memory))?;
+                .try_map_result(|result| result.restore(pool, context.memory))?;
             emit(RecoveredCase {
                 item,
                 scope: case.scope,

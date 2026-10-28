@@ -25,6 +25,7 @@ fn retained_result(memory: &MemoryBudget) -> Result<BuildResult, Box<dyn Error>>
 
 #[test]
 fn spilling_releases_the_case_charge_and_restores_exact_evidence_and_coverage() -> TestResult {
+    let pool = rayon::ThreadPoolBuilder::new().num_threads(1).build()?;
     let directory = tempfile::tempdir()?;
     let memory = MemoryBudget::new(16 * 1024 * 1024);
     let result = retained_result(&memory)?;
@@ -36,7 +37,7 @@ fn spilling_releases_the_case_charge_and_restores_exact_evidence_and_coverage() 
     assert_eq!(memory.snapshot()?.used_bytes, 0);
     // Anonymous descriptors cannot be mistaken for a published or reusable completed result
     assert_eq!(directory.path().read_dir()?.count(), 0);
-    let restored = buffered.restore(Some(&memory))?;
+    let restored = buffered.restore(&pool, Some(&memory))?;
     assert!(!restored.complete);
     assert_eq!(restored.case.to_json()?, expected);
     drop(restored);
@@ -58,6 +59,7 @@ fn snapshot_write_limit_failure_releases_the_original_case() -> TestResult {
 
 #[test]
 fn snapshot_restore_admission_failure_is_typed_and_drops_private_files() -> TestResult {
+    let pool = rayon::ThreadPoolBuilder::new().num_threads(1).build()?;
     let directory = tempfile::tempdir()?;
     let writer_memory = MemoryBudget::new(16 * 1024 * 1024);
     let result = retained_result(&writer_memory)?;
@@ -65,7 +67,7 @@ fn snapshot_restore_admission_failure_is_typed_and_drops_private_files() -> Test
     let buffered = BufferedResult::spill(result, directory.path(), limits, Some(&writer_memory))?;
     let reader_memory = MemoryBudget::new(1);
     let error = buffered
-        .restore(Some(&reader_memory))
+        .restore(&pool, Some(&reader_memory))
         .err()
         .ok_or("restore should exceed admission")?;
     assert!(crate::memory_error::find(error.as_ref()).is_some());
@@ -77,6 +79,7 @@ fn snapshot_restore_admission_failure_is_typed_and_drops_private_files() -> Test
 
 #[test]
 fn damaged_handoff_snapshot_is_rejected_before_collection() -> TestResult {
+    let pool = rayon::ThreadPoolBuilder::new().num_threads(1).build()?;
     let directory = tempfile::tempdir()?;
     let memory = MemoryBudget::new(16 * 1024 * 1024);
     let limits = CaseSnapshotLimits::new(4 * 1024 * 1024, 4 * 1024 * 1024);
@@ -90,7 +93,64 @@ fn damaged_handoff_snapshot_is_rejected_before_collection() -> TestResult {
         return Err("result was not spilled".into());
     };
     graph.set_len(0)?;
-    assert!(buffered.restore(Some(&memory)).is_err());
+    assert!(buffered.restore(&pool, Some(&memory)).is_err());
+    assert_eq!(memory.snapshot()?.used_bytes, 0);
+    Ok(())
+}
+
+#[test]
+fn ordered_restoration_uses_the_pool_without_blocking_a_later_worker_waiting_for_the_prefix()
+-> TestResult {
+    let directory = tempfile::tempdir()?;
+    let pool = rayon::ThreadPoolBuilder::new().num_threads(2).build()?;
+    let memory = MemoryBudget::new(16 * 1024 * 1024);
+    let limits = CaseSnapshotLimits::new(4 * 1024 * 1024, 4 * 1024 * 1024);
+    let mut items = Vec::new();
+    for index in 0..2 {
+        let buffered = BufferedResult::spill(
+            retained_result(&memory)?,
+            directory.path(),
+            limits,
+            Some(&memory),
+        )?;
+        items.push((index, buffered));
+    }
+    let (release, receiver) = std::sync::mpsc::channel();
+    let receiver = std::sync::Mutex::new(receiver);
+    let mut collected = Vec::new();
+    super::super::process_ordered(
+        &pool,
+        items,
+        |(index, buffered)| {
+            if index == 1 {
+                receiver
+                    .lock()
+                    .map_err(|error| error.to_string())?
+                    .recv_timeout(std::time::Duration::from_secs(3))
+                    .map_err(|error| error.to_string())?;
+            }
+            Ok::<_, String>((index, buffered))
+        },
+        |(index, buffered)| {
+            let restored = buffered.restore(&pool, Some(&memory))?;
+            assert_eq!(
+                restored
+                    .case
+                    .blobs()
+                    .first()
+                    .ok_or("missing restored blob")?
+                    .bytes,
+                b"retained original"
+            );
+            drop(restored);
+            collected.push(index);
+            if index == 0 {
+                release.send(())?;
+            }
+            Ok(())
+        },
+    )?;
+    assert_eq!(collected, [0, 1]);
     assert_eq!(memory.snapshot()?.used_bytes, 0);
     Ok(())
 }

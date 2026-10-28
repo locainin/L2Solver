@@ -65,6 +65,7 @@ impl BufferedResult {
 
     pub(super) fn restore(
         self,
+        pool: &rayon::ThreadPool,
         memory: Option<&MemoryBudget>,
     ) -> Result<BuildResult, Box<dyn Error>> {
         match self {
@@ -76,10 +77,15 @@ impl BufferedResult {
                 limits,
                 complete,
             } => {
-                let case = crate::case_snapshot::read_files(
-                    &mut graph, &mut blobs, usage, limits, memory,
-                )?;
-                Ok(BuildResult { case, complete })
+                // Reuse worker allocation arenas instead of building another graph in the collector
+                pool.install(move || {
+                    let case = crate::case_snapshot::read_files(
+                        &mut graph, &mut blobs, usage, limits, memory,
+                    )
+                    .map_err(|error| super::classify_worker_error(error.as_ref()))?;
+                    Ok::<_, super::WorkerFailure>(BuildResult { case, complete })
+                })
+                .map_err(Into::into)
             }
         }
     }
