@@ -1,10 +1,69 @@
-use super::{Case, CaseMemory, graph_bytes, value_bytes};
+use super::{Case, CaseMemory, graph_bytes, grow_map, value_bytes};
 use crate::{
     evidence::{CaseSnapshotLimits, Edge, EvidenceError, EvidenceStatus, SourceRange},
-    job::MemoryBudget,
+    job::{MemoryBudget, MemoryError},
     sha256,
 };
 use serde_json::json;
+use std::collections::HashMap;
+
+#[test]
+fn hash_index_admission_rejects_before_allocating_spare_buckets() -> Result<(), EvidenceError> {
+    // Rust 1.96 allocates eight 16-byte buckets plus 24 control bytes for this table
+    // A charge based on seven usable entries would miss the spare bucket and control tail
+    let budget = MemoryBudget::new(151);
+    let mut memory = Some(CaseMemory::new(&budget)?);
+    let mut index = HashMap::<u64, u64>::new();
+    let result = grow_map(&mut memory, &mut index);
+    assert!(matches!(
+        result,
+        Err(EvidenceError::Memory(MemoryError::Limit { .. }))
+    ));
+    assert_eq!(
+        index.capacity(),
+        0,
+        "rejected growth must not allocate a table"
+    );
+    assert_eq!(
+        budget.snapshot().map_err(EvidenceError::Memory)?.used_bytes,
+        0
+    );
+    Ok(())
+}
+
+#[test]
+fn hash_index_resize_keeps_old_entries_when_both_tables_cannot_fit() -> Result<(), EvidenceError> {
+    // The first table needs 152 bytes and its replacement needs 288 bytes
+    // Both remain live until the entries have moved into the replacement
+    let budget = MemoryBudget::new(400);
+    let mut memory = Some(CaseMemory::new(&budget)?);
+    let mut index = HashMap::<u64, u64>::new();
+    for value in 0..7 {
+        grow_map(&mut memory, &mut index)?;
+        index.insert(value, value + 1);
+    }
+    let capacity = index.capacity();
+    let result = grow_map(&mut memory, &mut index);
+    assert!(matches!(
+        result,
+        Err(EvidenceError::Memory(MemoryError::Limit { .. }))
+    ));
+    assert_eq!(index.capacity(), capacity);
+    assert_eq!(index.len(), 7);
+    for value in 0..7 {
+        assert_eq!(index.get(&value), Some(&(value + 1)));
+    }
+    assert_eq!(
+        budget.snapshot().map_err(EvidenceError::Memory)?.used_bytes,
+        152
+    );
+    drop(memory);
+    assert_eq!(
+        budget.snapshot().map_err(EvidenceError::Memory)?.used_bytes,
+        0
+    );
+    Ok(())
+}
 
 #[test]
 fn json_object_charge_covers_a_btree_node_for_each_nested_object() -> Result<(), EvidenceError> {

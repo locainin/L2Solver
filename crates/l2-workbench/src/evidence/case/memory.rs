@@ -1,9 +1,9 @@
 //! Logical charges for retained Case allocations
 //!
-//! Vector charges use observed capacity. Hash indexes charge one logical entry plus
-//! one control byte per reported entry capacity; actual allocator bucket overhead
-//! is outside this model. JSON objects use a conservative model of the current
-//! `serde_json` `BTreeMap` nodes, not a promise about allocator overhead or future Rust layouts
+//! Vector charges use observed capacity. Hash indexes include spare buckets,
+//! alignment, and control bytes for the current Rust hash-table layout
+//! JSON objects use a conservative model of the current `serde_json` `BTreeMap` nodes
+//! Neither model promises allocator overhead or future Rust layouts
 
 #[cfg(test)]
 #[path = "../../../tests/evidence/case_memory_internal.rs"]
@@ -12,7 +12,15 @@ mod tests;
 use super::{Case, Edge, EvidenceError, SourceRange};
 use crate::job::{MemoryBudget, MemoryClass, MemoryLease};
 use serde_json::Value;
-use std::{collections::HashMap, hash::Hash, mem::size_of};
+use std::{
+    collections::HashMap,
+    hash::Hash,
+    mem::{align_of, size_of},
+};
+
+// Rust 1.96 uses hashbrown 0.16.1, whose supported control groups are at most 16 bytes
+// Review the allocation model when changing the toolchain or hash-table implementation
+const HASH_CONTROL_GROUP_BYTES: usize = 16;
 
 #[derive(Debug)]
 pub(super) struct CaseMemory {
@@ -187,8 +195,35 @@ pub(super) fn grow_map_for<K: Eq + Hash, V>(
 }
 
 pub(super) fn map_bytes<K, V>(capacity: usize) -> Result<usize, EvidenceError> {
-    let entry = size_of::<(K, V)>().checked_add(1).ok_or_else(overflow)?;
-    capacity.checked_mul(entry).ok_or_else(overflow)
+    if capacity == 0 {
+        return Ok(0);
+    }
+    let entry = size_of::<(K, V)>();
+    // Usable capacity excludes the buckets kept empty to terminate failed lookups
+    // Small entries also need enough buckets to cover the aligned control group
+    let buckets = if capacity < 15 {
+        let minimum = match entry {
+            0..=1 => 16,
+            2..=3 => 8,
+            _ => 4,
+        };
+        capacity
+            .checked_add(1)
+            .and_then(usize::checked_next_power_of_two)
+            .ok_or_else(overflow)?
+            .max(minimum)
+    } else {
+        capacity
+            .checked_mul(8)
+            .map(|value| value / 7)
+            .and_then(usize::checked_next_power_of_two)
+            .ok_or_else(overflow)?
+    };
+    // hashbrown::raw::TableLayout places the control array after aligned bucket storage
+    let alignment = align_of::<(K, V)>().max(HASH_CONTROL_GROUP_BYTES);
+    let bucket_bytes = buckets.checked_mul(entry).ok_or_else(overflow)?;
+    let control_offset = add(bucket_bytes, alignment - 1)? & !(alignment - 1);
+    add(add(control_offset, buckets)?, HASH_CONTROL_GROUP_BYTES)
 }
 
 pub(super) fn source_payload(source: &super::Source) -> Result<usize, EvidenceError> {
