@@ -2,12 +2,15 @@
 
 mod buffering;
 mod system;
+mod working_set;
 
 pub use buffering::{BufferedCase, BufferedCaseSnapshot};
 pub use system::{CgroupMemoryEvents, CgroupMemorySnapshot, SystemMemorySnapshot};
+pub use working_set::{MemoryWorkingSet, WorkingSetSnapshot};
 
 use super::Job;
 use serde::Serialize;
+use std::collections::BTreeMap;
 use std::error::Error;
 use std::fmt;
 use std::sync::{Arc, Condvar, Mutex};
@@ -38,7 +41,7 @@ pub enum MemoryError {
     Limit {
         /// Selected aggregate byte limit
         limit: u64,
-        /// Bytes charged to all live leases
+        /// Admission bytes already committed, including other working sets
         used: u64,
         /// Additional bytes requested
         requested: u64,
@@ -49,7 +52,7 @@ pub enum MemoryError {
     TimedOut {
         /// Selected aggregate byte limit
         limit: u64,
-        /// Bytes charged to all live leases at the deadline
+        /// Admission bytes already committed at the deadline, including working sets
         used: u64,
         /// Bytes requested for the new lease
         requested: u64,
@@ -58,6 +61,17 @@ pub enum MemoryError {
     StatePoisoned,
     /// Buffered-result telemetry cannot represent another observation
     ObservationOverflow,
+    /// A working set cannot be nested inside another working set
+    NestedWorkingSet,
+    /// Allocation ownership cannot move between unrelated or active working sets
+    IncompatibleWorkingSet,
+    /// A recent kernel observation leaves insufficient room for another working set
+    Pressure {
+        /// Observed headroom after active reservations and the admission safety margin
+        available: u64,
+        /// Expected additional bytes for the proposed Case
+        requested: u64,
+    },
 }
 
 impl fmt::Display for MemoryError {
@@ -69,7 +83,7 @@ impl fmt::Display for MemoryError {
                 requested,
             } => write!(
                 formatter,
-                "memory limit {limit} bytes cannot admit {requested} bytes with {used} bytes already charged"
+                "memory limit {limit} bytes cannot admit {requested} bytes with {used} bytes already committed"
             ),
             Self::Cancelled => formatter.write_str("memory admission was cancelled"),
             Self::TimedOut {
@@ -78,10 +92,22 @@ impl fmt::Display for MemoryError {
                 requested,
             } => write!(
                 formatter,
-                "memory admission timed out requesting {requested} bytes with {used} of {limit} bytes charged"
+                "memory admission timed out requesting {requested} bytes with {used} of {limit} bytes committed"
             ),
             Self::StatePoisoned => formatter.write_str("memory admission state was poisoned"),
-            Self::ObservationOverflow => formatter.write_str("buffered Case observation overflow"),
+            Self::ObservationOverflow => formatter.write_str("memory admission telemetry overflow"),
+            Self::NestedWorkingSet => {
+                formatter.write_str("working-set admission requires the shared root budget")
+            }
+            Self::IncompatibleWorkingSet => formatter
+                .write_str("memory allocation belongs to another budget or active working set"),
+            Self::Pressure {
+                available,
+                requested,
+            } => write!(
+                formatter,
+                "memory pressure leaves {available} bytes for a recovery worker requiring {requested} bytes"
+            ),
         }
     }
 }
@@ -107,6 +133,8 @@ pub struct MemorySnapshot {
     pub timed_out: u64,
     /// Completed Cases waiting for ordered collection, already included in live charges
     pub buffered_cases: BufferedCaseSnapshot,
+    /// Future Case capacity reserved separately from live allocation charges
+    pub working_sets: WorkingSetSnapshot,
     /// Latest independently observed process and cgroup usage
     pub system: Option<SystemMemorySnapshot>,
     /// Age of the latest OS observation, which can be used to reject stale pressure data
@@ -166,6 +194,9 @@ struct State {
     buffered_cases: BufferedCaseSnapshot,
     system_memory: Option<(SystemMemorySnapshot, Instant)>,
     system_observation_failures: u64,
+    working_sets: WorkingSetSnapshot,
+    scopes: BTreeMap<u64, working_set::ScopeState>,
+    next_scope: u64,
 }
 
 #[derive(Debug)]
@@ -182,10 +213,11 @@ struct Shared {
 #[derive(Clone, Debug)]
 pub struct MemoryBudget {
     shared: Arc<Shared>,
+    scope: Option<Arc<working_set::Scope>>,
 }
 
 impl MemoryBudget {
-    /// Create a budget with the supplied maximum live charge
+    /// Create an aggregate allowance shared by live charges and reserved future capacity
     #[must_use]
     pub fn new(limit: u64) -> Self {
         Self {
@@ -201,9 +233,13 @@ impl MemoryBudget {
                     buffered_cases: BufferedCaseSnapshot::default(),
                     system_memory: None,
                     system_observation_failures: 0,
+                    working_sets: WorkingSetSnapshot::default(),
+                    scopes: BTreeMap::new(),
+                    next_scope: 0,
                 }),
                 released: Condvar::new(),
             }),
+            scope: None,
         }
     }
 
@@ -217,7 +253,7 @@ impl MemoryBudget {
             .state
             .lock()
             .map_err(|_| MemoryError::StatePoisoned)?;
-        charge(&self.shared, &mut state, class, bytes)?;
+        charge(self, &mut state, class, bytes)?;
         Ok(MemoryLease {
             budget: self.clone(),
             class,
@@ -256,8 +292,9 @@ impl MemoryBudget {
                     requested: bytes,
                 });
             }
-            if bytes <= self.shared.limit - state.used {
-                charge(&self.shared, &mut state, class, bytes)?;
+            let committed = working_set::committed_for(self, &state)?;
+            if bytes <= self.shared.limit - committed {
+                charge(self, &mut state, class, bytes)?;
                 return Ok(MemoryLease {
                     budget: self.clone(),
                     class,
@@ -269,7 +306,7 @@ impl MemoryBudget {
                 state.timed_out = state.timed_out.saturating_add(1);
                 return Err(MemoryError::TimedOut {
                     limit: self.shared.limit,
-                    used: state.used,
+                    used: committed,
                     requested: bytes,
                 });
             }
@@ -304,6 +341,7 @@ impl MemoryBudget {
             timed_out: state.timed_out,
             by_class: state.by_class,
             buffered_cases: state.buffered_cases,
+            working_sets: state.working_sets,
             system: state.system_memory.map(|(sample, _)| sample),
             system_sample_age_ms: state.system_memory.map(|(_, observed)| {
                 u64::try_from(observed.elapsed().as_millis()).unwrap_or(u64::MAX)
@@ -332,7 +370,7 @@ impl MemoryLease {
 
     pub(crate) fn absorb(&mut self, mut other: Self) {
         assert!(
-            Arc::ptr_eq(&self.budget.shared, &other.budget.shared) && self.class == other.class,
+            self.budget.same_owner(&other.budget) && self.class == other.class,
             "memory charges must share one budget and class"
         );
         // Both charges are already included in the same bounded aggregate
@@ -360,14 +398,10 @@ impl MemoryLease {
             .lock()
             .map_err(|_| MemoryError::StatePoisoned)?;
         if bytes > self.bytes {
-            charge(
-                &self.budget.shared,
-                &mut state,
-                self.class,
-                bytes - self.bytes,
-            )?;
+            charge(&self.budget, &mut state, self.class, bytes - self.bytes)?;
         } else if bytes < self.bytes {
             release(&mut state, self.class, self.bytes - bytes);
+            working_set::release_scope(&self.budget, &mut state, self.bytes - bytes);
             self.budget.shared.released.notify_all();
         }
         self.bytes = bytes;
@@ -380,25 +414,28 @@ impl Drop for MemoryLease {
         // A poisoned budget is already unusable and must not trigger a second panic here
         if let Ok(mut state) = self.budget.shared.state.lock() {
             release(&mut state, self.class, self.bytes);
+            working_set::release_scope(&self.budget, &mut state, self.bytes);
             self.budget.shared.released.notify_all();
         }
     }
 }
 
 fn charge(
-    shared: &Shared,
+    budget: &MemoryBudget,
     state: &mut State,
     class: MemoryClass,
     bytes: u64,
 ) -> Result<(), MemoryError> {
-    if bytes > shared.limit - state.used {
+    let committed = working_set::committed_for(budget, state)?;
+    if bytes > budget.shared.limit - committed {
         state.rejected = state.rejected.saturating_add(1);
         return Err(MemoryError::Limit {
-            limit: shared.limit,
-            used: state.used,
+            limit: budget.shared.limit,
+            used: committed,
             requested: bytes,
         });
     }
+    working_set::charge_scope(budget, state, bytes)?;
     // Each class is a subset of the aggregate, so neither addition can overflow
     state.used += bytes;
     *state.by_class.get_mut(class) += bytes;

@@ -34,7 +34,8 @@ fn completed_prefix_is_emitted_and_released_before_later_work_finishes() -> Test
     process_ordered(
         &pool,
         vec![0, 1],
-        |index| {
+        |_, _| Ok(Some(())),
+        |index, ()| {
             if index == 1 {
                 receiver
                     .lock()
@@ -74,7 +75,8 @@ fn earliest_input_failure_wins_even_when_a_later_failure_finishes_first() -> Tes
     let result = process_ordered(
         &pool,
         vec![0, 1, 2],
-        |index| match index {
+        |_, _| Ok(Some(())),
+        |index, ()| match index {
             1 => {
                 receiver
                     .lock()
@@ -110,7 +112,8 @@ fn ordered_collection_rejects_a_nested_pool_worker_before_starting_tasks() -> Te
         process_ordered(
             &pool,
             vec![0],
-            |index| {
+            |_, _| Ok(Some(())),
+            |index, ()| {
                 started.fetch_add(1, Ordering::SeqCst);
                 Ok::<_, String>(index)
             },
@@ -137,7 +140,13 @@ fn worker_error_keeps_the_typed_memory_limit_inside_nested_causes() -> TestResul
     };
     let nested = std::io::Error::other(EvidenceError::Memory(expected));
     let classified = classify_worker_error(&nested);
-    let result = process_ordered(&pool, vec![classified], Err::<(), _>, |()| Ok(()));
+    let result = process_ordered(
+        &pool,
+        vec![classified],
+        |_, _| Ok(Some(())),
+        |error, ()| Err::<(), _>(error),
+        |()| Ok(()),
+    );
     let error = result.err().ok_or("memory pressure should fail")?;
     assert_eq!(crate::memory_error::find(error.as_ref()), Some(expected));
     Ok(())
@@ -164,8 +173,155 @@ fn ordered_collection_preserves_typed_worker_failures() -> TestResult {
         used: 14,
         requested: 7,
     };
-    let result = process_ordered(&pool, vec![0], |_| Err::<(), _>(expected), |()| Ok(()));
+    let result = process_ordered(
+        &pool,
+        vec![0],
+        |_, _| Ok(Some(())),
+        |_, ()| Err::<(), _>(expected),
+        |()| Ok(()),
+    );
     let error = result.err().ok_or("memory pressure should fail")?;
     assert_eq!(error.downcast_ref::<MemoryError>(), Some(&expected));
+    Ok(())
+}
+
+#[test]
+fn admission_waits_for_released_prefix_bytes_instead_of_failing_the_next_case() -> TestResult {
+    use l2_workbench::job::{MemoryBudget, MemoryClass};
+    let pool = rayon::ThreadPoolBuilder::new().num_threads(4).build()?;
+    let memory = MemoryBudget::new(32 * 1024);
+    let mut emitted = Vec::new();
+    process_ordered(
+        &pool,
+        vec![0, 1, 2],
+        |_, active| match memory.try_working_set(20 * 1024) {
+            Ok(work) => Ok(Some(work)),
+            Err(MemoryError::Limit { .. }) if active > 0 => Ok(None),
+            Err(error) => Err(error.into()),
+        },
+        |index, work| {
+            let retained = work.budget().try_reserve(MemoryClass::Case, 20 * 1024)?;
+            Ok::<_, MemoryError>((index, retained))
+        },
+        |(index, retained)| {
+            emitted.push(index);
+            drop(retained);
+            Ok(())
+        },
+    )?;
+    assert_eq!(emitted, [0, 1, 2]);
+    let snapshot = memory.snapshot()?;
+    assert_eq!(snapshot.used_bytes, 0);
+    assert_eq!(snapshot.working_sets.peak_active_cases, 1);
+    assert_eq!(snapshot.working_sets.admitted_cases, 3);
+    assert!(snapshot.working_sets.admission_denials > 0);
+    Ok(())
+}
+
+#[test]
+fn later_admission_failure_does_not_hide_an_earlier_worker_failure() -> TestResult {
+    let pool = rayon::ThreadPoolBuilder::new().num_threads(2).build()?;
+    let outcome = process_ordered(
+        &pool,
+        vec![0, 1],
+        |index, _| {
+            if *index == 1 {
+                return Err("later admission failure".into());
+            }
+            Ok(Some(()))
+        },
+        |_, ()| Err::<(), _>("earlier worker failure".to_owned()),
+        |()| Ok(()),
+    );
+    assert_eq!(
+        outcome.err().ok_or("failure was lost")?.to_string(),
+        "earlier worker failure"
+    );
+    Ok(())
+}
+
+#[test]
+fn no_admissible_worker_reports_a_resource_failure_without_starting_work() -> TestResult {
+    let pool = rayon::ThreadPoolBuilder::new().num_threads(2).build()?;
+    let started = AtomicUsize::new(0);
+    let outcome = process_ordered(
+        &pool,
+        vec![0],
+        |_, _| Ok(None::<()>),
+        |_, ()| {
+            started.fetch_add(1, Ordering::SeqCst);
+            Ok::<_, String>(())
+        },
+        |()| Ok(()),
+    );
+    assert!(
+        outcome
+            .err()
+            .ok_or("blocked admission was ignored")?
+            .to_string()
+            .contains("no recovery worker can be admitted")
+    );
+    assert_eq!(started.load(Ordering::SeqCst), 0);
+    Ok(())
+}
+
+#[test]
+#[expect(
+    clippy::panic,
+    reason = "An injected worker panic verifies collector wakeup"
+)]
+fn worker_panic_wakes_the_collector_while_later_admission_is_blocked() -> TestResult {
+    let pool = rayon::ThreadPoolBuilder::new().num_threads(2).build()?;
+    let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        process_ordered(
+            &pool,
+            vec![0, 1],
+            |index, _| Ok((*index == 0).then_some(())),
+            |_, ()| -> Result<(), String> {
+                panic!("worker failure while admission remains open");
+            },
+            |()| Ok(()),
+        )
+        .err()
+        .map(|error| error.to_string())
+    }));
+    let failure = outcome
+        .err()
+        .ok_or("worker panic did not reach the collector")?;
+    assert_eq!(
+        failure.downcast_ref::<&str>().copied(),
+        Some("worker failure while admission remains open")
+    );
+    Ok(())
+}
+
+#[test]
+fn queued_native_case_bytes_flush_a_batch_before_the_requested_worker_count() -> TestResult {
+    use l2_workbench::job::{MemoryBudget, MemoryClass};
+    let memory = MemoryBudget::new(512 * 1024 * 1024);
+    let retained = memory.try_reserve(MemoryClass::Case, 128 * 1024 * 1024)?;
+    assert!(super::super::processing::batch_ready(1, 20, Some(&memory))?);
+    assert!(!super::super::processing::batch_ready(
+        0,
+        20,
+        Some(&memory)
+    )?);
+    drop(retained);
+    assert!(!super::super::processing::batch_ready(
+        1,
+        20,
+        Some(&memory)
+    )?);
+    Ok(())
+}
+
+#[test]
+fn shared_capture_index_bytes_do_not_count_as_queued_case_bytes() -> TestResult {
+    use l2_workbench::job::{MemoryBudget, MemoryClass};
+    let memory = MemoryBudget::new(512 * 1024 * 1024);
+    let index = memory.try_reserve(MemoryClass::Base, 160 * 1024 * 1024)?;
+    assert!(!super::super::processing::batch_ready(1, 4, Some(&memory))?);
+    assert!(super::super::processing::batch_ready(4, 4, Some(&memory))?);
+    drop(index);
     Ok(())
 }

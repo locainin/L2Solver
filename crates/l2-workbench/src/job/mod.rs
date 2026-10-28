@@ -12,7 +12,8 @@ pub use cache_fallback::{
 };
 pub use memory::{
     BufferedCase, BufferedCaseSnapshot, CgroupMemoryEvents, CgroupMemorySnapshot, MemoryBudget,
-    MemoryClass, MemoryError, MemoryLease, MemorySnapshot, SystemMemorySnapshot,
+    MemoryClass, MemoryError, MemoryLease, MemorySnapshot, MemoryWorkingSet, SystemMemorySnapshot,
+    WorkingSetSnapshot,
 };
 pub use model::{
     Counter, Job, JobError, JobSnapshot, Phase, PhaseOutcome, PhaseSnapshot, PhaseState,

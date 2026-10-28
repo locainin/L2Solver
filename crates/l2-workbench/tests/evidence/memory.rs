@@ -5,6 +5,9 @@ use l2_workbench::{
 };
 use serde_json::json;
 use std::error::Error;
+
+#[path = "memory/working_set.rs"]
+mod working_set;
 use std::io::{self, Read};
 use std::sync::Barrier;
 use std::sync::{

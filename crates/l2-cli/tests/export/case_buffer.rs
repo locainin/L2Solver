@@ -121,7 +121,8 @@ fn ordered_restoration_uses_the_pool_without_blocking_a_later_worker_waiting_for
     super::super::process_ordered(
         &pool,
         items,
-        |(index, buffered)| {
+        |_, _| Ok(Some(())),
+        |(index, buffered), ()| {
             if index == 1 {
                 receiver
                     .lock()

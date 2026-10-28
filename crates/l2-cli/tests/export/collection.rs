@@ -28,21 +28,11 @@ mod case_snapshot_tests;
 mod processing_tests;
 
 #[test]
-fn recovery_worker_count_respects_cpu_and_memory_bounds() {
-    const MIB: u64 = 1024 * 1024;
-
-    assert_eq!(
-        super::processing::recovery_worker_count(Some(3), 8, 512 * MIB),
-        3
-    );
-    assert_eq!(
-        super::processing::recovery_worker_count(None, 8, 256 * MIB),
-        2
-    );
-    assert_eq!(
-        super::processing::recovery_worker_count(Some(8), 2, 64 * MIB),
-        1
-    );
+fn recovery_worker_count_sets_the_cpu_bound_before_per_case_memory_admission() {
+    assert_eq!(super::processing::recovery_worker_count(Some(3), 8), 3);
+    assert_eq!(super::processing::recovery_worker_count(None, 8), 8);
+    assert_eq!(super::processing::recovery_worker_count(Some(8), 2), 2);
+    assert_eq!(super::processing::recovery_worker_count(None, 0), 1);
 }
 
 #[test]
@@ -222,14 +212,15 @@ fn collection_phases_cover_indexed_analysis_and_optional_tshark() -> Result<(), 
 #[test]
 fn one_two_and_four_workers_keep_charged_case_outputs_in_source_order() -> Result<(), Box<dyn Error>>
 {
+    const MEMORY_BYTES: u64 = 256 * 1024 * 1024;
     let temporary = tempfile::tempdir()?;
     let capture = temporary.path().join("flows.pcap");
     fs::write(&capture, four_http_flows()?)?;
 
-    let single = recover_indexed_cases(&capture, temporary.path(), 1)?;
+    let single = recover_indexed_cases(&capture, temporary.path(), 1, 1, MEMORY_BYTES)?;
     assert_eq!(single.artifacts.len(), 4);
     for jobs in [2, 4] {
-        let parallel = recover_indexed_cases(&capture, temporary.path(), jobs)?;
+        let parallel = recover_indexed_cases(&capture, temporary.path(), jobs, jobs, MEMORY_BYTES)?;
         assert_eq!(parallel.scopes, single.scopes);
         assert_eq!(parallel.cases, single.cases);
         assert_eq!(parallel.coverage, single.coverage);
@@ -245,6 +236,47 @@ fn one_two_and_four_workers_keep_charged_case_outputs_in_source_order() -> Resul
     Ok(())
 }
 
+#[test]
+fn four_requested_workers_wait_for_case_memory_without_changing_recovered_bytes()
+-> Result<(), Box<dyn Error>> {
+    let temporary = tempfile::tempdir()?;
+    let capture = temporary.path().join("flows.pcap");
+    fs::write(&capture, four_http_flows()?)?;
+    let reference = recover_indexed_cases(&capture, temporary.path(), 1, 1, 48 * 1024 * 1024)?;
+    let constrained = recover_indexed_cases(&capture, temporary.path(), 4, 4, 48 * 1024 * 1024)?;
+    assert_eq!(constrained.scopes, reference.scopes);
+    assert_eq!(constrained.cases, reference.cases);
+    assert_eq!(constrained.coverage, reference.coverage);
+    assert_eq!(constrained.artifacts, reference.artifacts);
+    assert_eq!(constrained.working_sets.peak_active_cases, 1);
+    assert_eq!(
+        constrained.working_sets.admitted_cases,
+        u64::try_from(constrained.cases.len())?
+    );
+    assert!(constrained.working_sets.admission_denials > 0);
+    assert_eq!(constrained.working_sets.active_cases, 0);
+    assert_eq!(constrained.working_sets.reserved_bytes, 0);
+    assert_eq!(constrained.remaining_live_bytes, 0);
+    Ok(())
+}
+
+#[test]
+fn a_batch_larger_than_the_pool_keeps_source_order_and_recovers_identical_artifacts()
+-> Result<(), Box<dyn Error>> {
+    let temporary = tempfile::tempdir()?;
+    let capture = temporary.path().join("flows.pcap");
+    fs::write(&capture, four_http_flows()?)?;
+    let reference = recover_indexed_cases(&capture, temporary.path(), 1, 1, 256 * 1024 * 1024)?;
+    let queued = recover_indexed_cases(&capture, temporary.path(), 2, 4, 256 * 1024 * 1024)?;
+    assert_eq!(queued.scopes, reference.scopes);
+    assert_eq!(queued.cases, reference.cases);
+    assert_eq!(queued.artifacts, reference.artifacts);
+    assert_eq!(queued.coverage, reference.coverage);
+    assert!(queued.working_sets.peak_active_cases <= 2);
+    assert_eq!(queued.remaining_live_bytes, 0);
+    Ok(())
+}
+
 struct RecoveredCaseSnapshot {
     scopes: Vec<Value>,
     cases: Vec<Vec<u8>>,
@@ -254,19 +286,21 @@ struct RecoveredCaseSnapshot {
     artifacts: ArtifactFiles,
     peak_case_bytes: u64,
     remaining_live_bytes: u64,
+    working_sets: l2_workbench::job::WorkingSetSnapshot,
 }
 
 fn recover_indexed_cases(
     capture: &std::path::Path,
     temporary_parent: &std::path::Path,
     worker_count: usize,
+    batch_length: usize,
+    memory_bytes: u64,
 ) -> Result<RecoveredCaseSnapshot, Box<dyn Error>> {
-    const SHARED_MEMORY_BYTES: u64 = 256 * 1024 * 1024;
-    let budget = MemoryBudget::new(SHARED_MEMORY_BYTES);
+    let budget = MemoryBudget::new(memory_bytes);
     let options = RecoveryOptions {
         profile: RecoveryProfile::Fast,
         jobs: Some(worker_count),
-        memory_limit: SHARED_MEMORY_BYTES,
+        memory_limit: memory_bytes,
         ..RecoveryOptions::default()
     };
     let context = RecoveryContext {
@@ -284,7 +318,7 @@ fn recover_indexed_cases(
     let artifact_directory = tempfile::tempdir_in(temporary_parent)?;
     let mut artifacts =
         ArtifactCollection::new(artifact_directory.path(), ArtifactLimits::default())?;
-    let mut batch = Vec::with_capacity(worker_count);
+    let mut batch = Vec::with_capacity(batch_length);
     let mut peak_case_bytes = 0;
     let mut emit = |case: RecoveredCase| {
         collect_test_case(case, &mut artifacts, &mut coverage, &mut scopes, &mut cases)
@@ -306,7 +340,7 @@ fn recover_indexed_cases(
         |item| {
             peak_case_bytes = peak_case_bytes.max(budget.snapshot()?.used(MemoryClass::Case));
             batch.push(PendingCase::new(item)?);
-            if batch.len() == worker_count {
+            if batch.len() == batch_length {
                 process_case_batch(&mut batch, &pool, temporary_parent, &context, &mut emit)?;
             }
             Ok(())
@@ -329,6 +363,7 @@ fn recover_indexed_cases(
         artifacts,
         peak_case_bytes,
         remaining_live_bytes: budget.snapshot()?.used_bytes,
+        working_sets: budget.snapshot()?.working_sets,
     })
 }
 

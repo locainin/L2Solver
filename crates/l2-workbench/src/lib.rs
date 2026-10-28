@@ -26,6 +26,7 @@ pub mod tcp_range;
 pub mod tshark;
 pub mod validation;
 
+mod allocation;
 mod hashing;
 mod hex;
 mod integer;

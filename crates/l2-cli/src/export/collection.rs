@@ -6,7 +6,8 @@ use super::{
     evidence::EvidenceSidecar,
     limitations::{CaseLimitationOrigin, LimitationSpool, add_source_limitations},
     processing::{
-        CollectionPhases, PendingCase, RecoveredCase, process_case_batch, recovery_worker_count,
+        CollectionPhases, PendingCase, RecoveredCase, batch_ready, process_case_batch,
+        recovery_worker_count,
     },
     provenance::{
         ArtifactSourceContext, CohortArtifactContextIndex, artifact_provenance,
@@ -93,7 +94,6 @@ fn collect_export_inner(
     let worker_count = recovery_worker_count(
         context.options.jobs,
         std::thread::available_parallelism().map_or(1, std::num::NonZeroUsize::get),
-        context.options.memory_limit,
     );
     let pool = rayon::ThreadPoolBuilder::new()
         .num_threads(worker_count)
@@ -102,7 +102,7 @@ fn collect_export_inner(
     if let Some(job) = context.job {
         job.set_current(
             Phase::Expansion,
-            format!("Analyzing capture with {worker_count} recovery worker(s)"),
+            format!("Analyzing capture with up to {worker_count} recovery worker(s)"),
         )?;
     }
     let coverage = collect_flow_cases(&indexed, options, &mut collection, context, &pool, staging)?;
@@ -208,7 +208,7 @@ fn collect_flow_cases(
                 job.increment(counter, 1)?;
             }
             batch.push(pending);
-            if batch.len() == worker_count {
+            if batch_ready(batch.len(), worker_count, context.memory)? {
                 process_case_batch(&mut batch, pool, staging, context, &mut collect_case)?;
             }
             Ok(())

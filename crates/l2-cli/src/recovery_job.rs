@@ -11,11 +11,24 @@ use crate::{
     outcome::RunOutcome,
 };
 use l2_cli::job_ui::{CancellationHandler, Renderer, RendererOptions};
-use l2_workbench::job::{Job, JobSnapshot, MemoryBudget};
+use l2_workbench::job::{Job, JobSnapshot, MemoryBudget, MemoryError};
 use std::{
     error::Error,
     io::{self, Write},
 };
+
+/// Refresh the shared observation before admitting another memory-intensive operation
+pub fn refresh_memory_observation(memory: &MemoryBudget) -> Result<(), MemoryError> {
+    #[cfg(target_os = "linux")]
+    {
+        system_memory::observe(memory)
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = memory;
+        Ok(())
+    }
+}
 
 pub fn run(
     options: &RecoveryOptions,

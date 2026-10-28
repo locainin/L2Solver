@@ -10,7 +10,7 @@
 mod tests;
 
 use super::{Case, Edge, EvidenceError, SourceRange};
-use crate::job::{MemoryBudget, MemoryClass, MemoryLease};
+use crate::job::{MemoryBudget, MemoryClass, MemoryLease, MemoryWorkingSet};
 use serde_json::Value;
 use std::{
     collections::HashMap,
@@ -44,6 +44,22 @@ impl CaseMemory {
             blobs: self.blobs.try_duplicate().map_err(EvidenceError::Memory)?,
             graph: self.graph.try_duplicate().map_err(EvidenceError::Memory)?,
         })
+    }
+
+    fn use_working_set(&mut self, budget: &MemoryBudget) -> Result<(), EvidenceError> {
+        // Check both owners before transferring either live charge
+        self.blobs
+            .validate_working_set(budget)
+            .map_err(EvidenceError::Memory)?;
+        self.graph
+            .validate_working_set(budget)
+            .map_err(EvidenceError::Memory)?;
+        self.blobs
+            .rebind_working_set(budget)
+            .map_err(EvidenceError::Memory)?;
+        self.graph
+            .rebind_working_set(budget)
+            .map_err(EvidenceError::Memory)
     }
 
     pub(super) fn try_scratch(&self, bytes: u64) -> Result<MemoryLease, EvidenceError> {
@@ -290,14 +306,8 @@ fn json_object_nodes(entries: usize) -> Result<usize, EvidenceError> {
     };
     // Charge every node as an internal node with 12 child pointers and a padded header
     // An emptied map can retain a root node after its final entry is removed
-    let slots = 11_usize
-        .checked_mul(size_of::<(String, Value)>())
-        .ok_or_else(overflow)?;
-    let header_and_children = 14_usize
-        .checked_mul(size_of::<usize>())
-        .ok_or_else(overflow)?;
     nodes
-        .checked_mul(add(slots, header_and_children)?)
+        .checked_mul(crate::allocation::btree_node_bytes::<String, Value>().ok_or_else(overflow)?)
         .ok_or_else(overflow)
 }
 
@@ -364,6 +374,35 @@ pub(super) fn graph_bytes(case: &Case) -> Result<usize, EvidenceError> {
 }
 
 impl Case {
+    /// Bind retained allocations and later growth to an admitted Case working set
+    ///
+    /// Existing charges move within the same shared ledger without a second allocation
+    /// An uncharged Case must first admit its retained buffers and graph metadata
+    ///
+    /// # Errors
+    /// Returns an error for another budget, active ownership elsewhere, or insufficient memory
+    pub fn use_working_set(&mut self, work: &MemoryWorkingSet) -> Result<(), EvidenceError> {
+        if let Some(memory) = &mut self.memory {
+            return memory.use_working_set(work.budget());
+        }
+        let bytes = self
+            .blobs
+            .iter()
+            .try_fold(0_usize, |total, blob| {
+                total.checked_add(blob.bytes.capacity())
+            })
+            .ok_or_else(overflow)?;
+        let mut memory = CaseMemory::new(&work.budget().root())?;
+        memory
+            .blobs
+            .try_resize(to_bytes(bytes)?)
+            .map_err(EvidenceError::Memory)?;
+        memory.set_graph(graph_bytes(self)?)?;
+        memory.use_working_set(work.budget())?;
+        self.memory = Some(memory);
+        Ok(())
+    }
+
     pub(super) fn prepare_blob_graph(&mut self) -> Result<(), EvidenceError> {
         grow_vec(&mut self.memory, &mut self.blobs)?;
         grow_map(&mut self.memory, &mut self.blob_index)

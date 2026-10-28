@@ -1,7 +1,7 @@
 //! Read bounded Linux memory observations without changing kernel limits
 
 mod monitor;
-pub(super) use monitor::Monitor;
+pub(super) use monitor::{Monitor, observe};
 
 #[cfg(test)]
 #[path = "../../tests/recovery_job/system_memory.rs"]

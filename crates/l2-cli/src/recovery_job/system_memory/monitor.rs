@@ -60,7 +60,9 @@ impl Drop for Monitor {
     }
 }
 
-fn observe(memory: &MemoryBudget) -> Result<(), l2_workbench::job::MemoryError> {
+pub(in crate::recovery_job) fn observe(
+    memory: &MemoryBudget,
+) -> Result<(), l2_workbench::job::MemoryError> {
     // Reopen proc metadata so moving the process between cgroups cannot leave an old path active
     let sample = Reader::open(Path::new("/proc/self")).and_then(|reader| reader.sample());
     memory.observe_system_memory(sample.ok())

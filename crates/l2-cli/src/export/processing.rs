@@ -1,6 +1,10 @@
 //! Recover Cases in bounded batches before serial export
 
+mod admission;
 mod case_buffer;
+mod ordered;
+
+pub(super) use ordered::process_ordered;
 
 use super::{
     coverage::RecoveryCaseKind,
@@ -12,20 +16,17 @@ use case_buffer::BufferedResult;
 use l2_workbench::{
     evidence::{Case, CaseSnapshotLimits},
     investigation::BuildResult,
-    job::{Counter, Job, MemoryBudget, MemoryError, Phase, PhaseOutcome},
+    job::{Counter, Job, MemoryBudget, MemoryClass, MemoryError, Phase, PhaseOutcome},
 };
 use std::{
     error::Error,
-    fmt, io,
+    fmt,
     path::Path,
-    sync::{
-        atomic::{AtomicUsize, Ordering},
-        mpsc,
-    },
+    sync::atomic::{AtomicUsize, Ordering},
 };
 
-// A batch holds one bounded Case and active recovery graph per worker
-const RECOVERY_WORKER_RESERVATION_BYTES: u64 = 128 * 1024 * 1024;
+// Pending native Cases and completed resident results each have a bounded buffering share
+const CASE_BUFFER_DIVISOR: u64 = 4;
 const COLLECTION_PHASES: [Phase; 6] = [
     Phase::Reconstruction,
     Phase::NativeExtraction,
@@ -97,21 +98,30 @@ impl Drop for CollectionPhases<'_> {
     }
 }
 
-/// Bound parallel recovery by requested workers, available CPUs, and a per-worker reserve
-///
-/// The memory limit bounds each Case's recovery materialization, not exact process RSS
-/// The reserve limits concurrent Case materialization
-pub(super) fn recovery_worker_count(
-    requested: Option<usize>,
-    available_cpus: usize,
-    memory_limit_bytes: u64,
-) -> usize {
+/// Set the maximum concurrency; each Case still needs live memory admission
+pub(super) fn recovery_worker_count(requested: Option<usize>, available_cpus: usize) -> usize {
     let cpu_limit = available_cpus.max(1);
     let requested = requested.unwrap_or(cpu_limit).max(1);
-    let memory_limit = usize::try_from(memory_limit_bytes / RECOVERY_WORKER_RESERVATION_BYTES)
-        .unwrap_or(usize::MAX)
-        .max(1);
-    requested.min(cpu_limit).min(memory_limit)
+    requested.min(cpu_limit)
+}
+
+/// Release queued native Cases before a CPU-sized batch consumes recovery's working room
+pub(super) fn batch_ready(
+    queued: usize,
+    workers: usize,
+    memory: Option<&MemoryBudget>,
+) -> Result<bool, MemoryError> {
+    if queued == 0 {
+        return Ok(false);
+    }
+    if queued >= workers {
+        return Ok(true);
+    }
+    let Some(memory) = memory else {
+        return Ok(false);
+    };
+    let snapshot = memory.snapshot()?;
+    Ok(snapshot.used(MemoryClass::Case) >= snapshot.limit_bytes / CASE_BUFFER_DIVISOR)
 }
 
 /// One analyzed Case waiting for its bounded recovery batch
@@ -200,13 +210,6 @@ pub(super) fn process_case_batch(
     if batch.is_empty() {
         return Ok(());
     }
-    if batch.len() > pool.current_num_threads() {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "recovery batch exceeds the worker count",
-        )
-        .into());
-    }
     let memory_limit = context
         .memory
         .map(MemoryBudget::snapshot)
@@ -215,7 +218,7 @@ pub(super) fn process_case_batch(
             snapshot.limit_bytes
         });
     // Later resident results share one quarter of the allowance; emit the earliest directly
-    let resident_limit = memory_limit / 4 / u64::try_from(batch.len())?;
+    let resident_limit = memory_limit / CASE_BUFFER_DIVISOR / u64::try_from(batch.len())?;
     let snapshot_limits = CaseSnapshotLimits::new(memory_limit, memory_limit);
     let next = AtomicUsize::new(0);
     // Workers finish independently; only small descriptors need to wait for source order
@@ -223,13 +226,18 @@ pub(super) fn process_case_batch(
     process_ordered(
         pool,
         items,
-        |(index, pending)| {
+        |(_, pending), active| admission::admit(pending, active, context),
+        |(index, pending), working_set| {
+            let worker_context = RecoveryContext {
+                memory: working_set.memory(),
+                ..*context
+            };
             let PendingCase {
                 mut item,
                 kind,
                 scope,
             } = pending;
-            let recovery = recover(case_mut(&mut item), kind, &scope, context)
+            let recovery = recover(case_mut(&mut item), kind, &scope, &worker_context)
                 .map_err(|error| classify_worker_error(error.as_ref()))?;
             let retained_bytes = case_mut(&mut item).charged_memory_bytes().unwrap_or(0);
             let spill = index > next.load(Ordering::Acquire) && retained_bytes > resident_limit;
@@ -241,7 +249,7 @@ pub(super) fn process_case_batch(
                             result,
                             temporary_parent,
                             snapshot_limits,
-                            context.memory,
+                            worker_context.memory,
                         )?
                     } else {
                         BufferedResult::Resident(Box::new(result))
@@ -278,61 +286,6 @@ pub(super) fn process_case_batch(
             Ok(())
         },
     )
-}
-
-/// Run a bounded batch and emit its completed prefix in source order
-pub(super) fn process_ordered<T: Send, U: Send, E: Send + Into<Box<dyn Error + Send + Sync>>>(
-    pool: &rayon::ThreadPool,
-    items: Vec<T>,
-    work: impl Fn(T) -> Result<U, E> + Sync,
-    mut emit: impl FnMut(U) -> Result<(), Box<dyn Error>>,
-) -> Result<(), Box<dyn Error>> {
-    // The collector cannot occupy a worker whose result it needs to receive
-    if pool.current_thread_index().is_some() {
-        return Err(
-            io::Error::other("ordered collection cannot run inside its recovery pool").into(),
-        );
-    }
-    let count = items.len();
-    let mut waiting = std::iter::repeat_with(|| None)
-        .take(count)
-        .collect::<Vec<_>>();
-    let (sender, receiver) = mpsc::sync_channel(count);
-    pool.in_place_scope_fifo(|scope| {
-        for (index, item) in items.into_iter().enumerate() {
-            let sender = sender.clone();
-            let work = &work;
-            scope.spawn_fifo(move |_| {
-                // Dropping the receiver ends collection after an error
-                let _ = sender.send((index, work(item)));
-            });
-        }
-        drop(sender);
-        let outcome = (|| {
-            let mut next = 0;
-            for _ in 0..count {
-                let (index, result) = receiver.recv().map_err(|_| {
-                    io::Error::other("recovery worker stopped before producing all results")
-                })?;
-                let slot = waiting.get_mut(index).ok_or_else(|| {
-                    io::Error::other("recovery worker returned an invalid result index")
-                })?;
-                *slot = Some(result);
-                // Release each available prefix Case before waiting for later results
-                while let Some(result) = waiting.get_mut(next).and_then(Option::take) {
-                    let result = result.map_err(|error| {
-                        let error: Box<dyn Error + Send + Sync> = error.into();
-                        error as Box<dyn Error>
-                    })?;
-                    emit(result)?;
-                    next += 1;
-                }
-            }
-            Ok(())
-        })();
-        drop(receiver);
-        outcome
-    })
 }
 
 #[derive(Debug)]
