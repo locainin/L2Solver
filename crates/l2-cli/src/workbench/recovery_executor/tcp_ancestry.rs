@@ -1,5 +1,11 @@
+//! Resolve TCP ancestry only when its recorded parent links are unique
+
 use l2_workbench::evidence::{Case, Edge, EvidenceStatus, Node};
 use std::collections::HashMap;
+
+#[cfg(test)]
+#[path = "../../../tests/workbench/recovery_executor/tcp_ancestry.rs"]
+mod tests;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) struct TcpAncestry {
@@ -29,14 +35,6 @@ pub(super) struct TcpAncestryIndex {
 }
 
 impl TcpAncestryIndex {
-    pub(super) fn reserve(
-        &mut self,
-        edge_count: usize,
-    ) -> Result<(), std::collections::TryReserveError> {
-        self.direction_parents.try_reserve(edge_count)?;
-        self.episode_parents.try_reserve(edge_count)
-    }
-
     pub(super) fn index_edge(
         &mut self,
         edge: &Edge,
@@ -53,6 +51,10 @@ impl TcpAncestryIndex {
             ("tcp_episode", "tcp_direction") => &mut self.episode_parents,
             _ => return Ok(()),
         };
+        // Reserve only for a new child; repeated observations share the same map slot
+        if !parents.contains_key(&child.id) {
+            parents.try_reserve(1)?;
+        }
         let links = parents.entry(child.id).or_default();
         links.try_reserve(1)?;
         links.push(ParentLink {
@@ -67,7 +69,6 @@ impl TcpAncestryIndex {
         nodes: &HashMap<u64, &Node>,
     ) -> Result<Self, std::collections::TryReserveError> {
         let mut index = Self::default();
-        index.reserve(case.edges().len())?;
         for edge in case.edges() {
             index.index_edge(edge, nodes)?;
         }

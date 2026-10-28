@@ -10,6 +10,10 @@ use l2_workbench::{
 use serde_json::{Value, json};
 use std::collections::{BTreeMap, HashMap, HashSet};
 
+#[cfg(test)]
+#[path = "../../../../tests/workbench/recovery_executor/record_discovery/input.rs"]
+mod allocation_tests;
+
 mod cap;
 use cap::cap_cohorts;
 
@@ -408,31 +412,6 @@ fn index_edges(
 ) -> Result<(EdgeIndex, usize), RecoveryExecutionError> {
     let mut index = EdgeIndex::default();
     let mut scan_work = 0_usize;
-    index
-        .tcp_ancestry
-        .reserve(case.edges().len())
-        .map_err(|error| {
-            operational(
-                "record discovery TCP ancestry index allocation failed",
-                error,
-            )
-        })?;
-    index
-        .receipt_parents_by_frame
-        .try_reserve(case.edges().len())
-        .map_err(|error| operational("record discovery receipt index allocation failed", error))?;
-    index
-        .selection_report_parents_by_receipt
-        .try_reserve(case.edges().len())
-        .map_err(|error| {
-            operational("record discovery selection index allocation failed", error)
-        })?;
-    index
-        .framing_input_link_counts
-        .try_reserve(case.edges().len())
-        .map_err(|error| {
-            operational("record discovery input-link index allocation failed", error)
-        })?;
     for edge in case.edges() {
         index
             .tcp_ancestry
@@ -446,6 +425,14 @@ fn index_edges(
             .and_then(|total| total.checked_add(17))
             .ok_or_else(|| invalid_work("record discovery edge scan work overflowed"))?;
         if edge.relation == "materialized" {
+            if !index.receipt_parents_by_frame.contains_key(&edge.to) {
+                index
+                    .receipt_parents_by_frame
+                    .try_reserve(1)
+                    .map_err(|error| {
+                        operational("record discovery receipt index allocation failed", error)
+                    })?;
+            }
             let receipt_parents = index.receipt_parents_by_frame.entry(edge.to).or_default();
             receipt_parents.try_reserve(1).map_err(|error| {
                 operational("record discovery receipt edge allocation failed", error)
@@ -453,6 +440,17 @@ fn index_edges(
             receipt_parents.push((edge.from, edge.status));
         }
         if edge.relation == "framing_rule_selected_from" {
+            if !index
+                .selection_report_parents_by_receipt
+                .contains_key(&edge.to)
+            {
+                index
+                    .selection_report_parents_by_receipt
+                    .try_reserve(1)
+                    .map_err(|error| {
+                        operational("record discovery selection index allocation failed", error)
+                    })?;
+            }
             let selection_parents = index
                 .selection_report_parents_by_receipt
                 .entry(edge.to)
@@ -463,10 +461,17 @@ fn index_edges(
             selection_parents.push((edge.from, edge.status));
         }
         if edge.relation == "framing_tested_by" && edge.status == EvidenceStatus::Observed {
-            let count = index
-                .framing_input_link_counts
-                .entry((edge.from, edge.to))
-                .or_default();
+            let key = (edge.from, edge.to);
+            // Hypothesized links do not consume an observed input slot
+            if !index.framing_input_link_counts.contains_key(&key) {
+                index
+                    .framing_input_link_counts
+                    .try_reserve(1)
+                    .map_err(|error| {
+                        operational("record discovery input-link index allocation failed", error)
+                    })?;
+            }
+            let count = index.framing_input_link_counts.entry(key).or_default();
             *count = count
                 .checked_add(1)
                 .ok_or_else(|| invalid_work("record discovery input-link count overflowed"))?;

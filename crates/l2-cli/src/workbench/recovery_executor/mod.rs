@@ -1122,6 +1122,9 @@ fn root_seed_sort_byte(seed: &RootSeed, pass: usize) -> Result<u8, RecoveryExecu
 #[path = "../../../tests/workbench/recovery_framing_discovery.rs"]
 mod framing_discovery_tests;
 #[cfg(test)]
+#[path = "../../../tests/workbench/recovery_executor/lookup_fixture.rs"]
+mod lookup_fixture;
+#[cfg(test)]
 #[path = "../../../tests/workbench/recovery_record_associations.rs"]
 mod record_association_tests;
 #[cfg(test)]
