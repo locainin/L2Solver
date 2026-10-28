@@ -269,6 +269,38 @@ fn checkpoint_rejects_running_candidate_and_foreign_case() -> TestResult {
 }
 
 #[test]
+fn restored_pre_candidate_work_remains_bound_to_its_evidence_case() -> TestResult {
+    for retain_association in [false, true] {
+        let mut case = Case::new();
+        let input = node(&mut case, b"input")?;
+        let mut coordinator = RecoveryCoordinator::new(policy());
+        assert_eq!(coordinator.charge_case_work(7), BudgetCheck::WithinBudget);
+        if retain_association {
+            coordinator.admit_transform_proposal_association(
+                input,
+                &Recipe {
+                    steps: vec![Operation::HexDecode {}],
+                    constraints: Vec::new(),
+                },
+            )?;
+        }
+        let encoded = capture(&coordinator, &case)?;
+        let restored_case = case.try_clone()?;
+        let mut restored = restore(&restored_case, &encoded)?;
+        assert_eq!(restored.work_bytes_charged(), 7);
+        // Equal bytes do not make two separate evidence Cases interchangeable
+        assert_eq!(
+            restored.enqueue(&case, input, RecoveryTask::EmbeddedDiscovery),
+            Err(l2_workbench::recovery::RecoveryError::DifferentCase)
+        );
+        assert_eq!(restored.candidate_count(), 0);
+        queued(restored.enqueue(&restored_case, input, RecoveryTask::EmbeddedDiscovery)?)?;
+        assert_eq!(restored.work_bytes_charged(), 7);
+    }
+    Ok(())
+}
+
+#[test]
 fn restore_rejects_policy_size_version_case_and_corrupt_queue() -> TestResult {
     let mut case = Case::new();
     let input = node(&mut case, b"input")?;

@@ -87,9 +87,8 @@ pub(super) fn restore(
             return Err(RecoveryError::InvalidCheckpoint);
         }
     }
-    if !coordinator.candidates.is_empty() {
-        coordinator.case_identity = Some(case.identity());
-    }
+    // Saved work keeps its evidence origin even before the first candidate is queued
+    coordinator.case_identity = Some(case.identity());
     Ok(coordinator)
 }
 
