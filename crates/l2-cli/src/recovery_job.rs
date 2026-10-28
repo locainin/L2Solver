@@ -2,6 +2,8 @@
 
 mod cache;
 mod checkpoint;
+#[cfg(target_os = "linux")]
+mod system_memory;
 pub use cache::RecoveryCache;
 
 use crate::{
@@ -22,11 +24,15 @@ pub fn run(
 ) -> Result<RunOutcome, Box<dyn Error>> {
     let memory = MemoryBudget::new(options.memory_limit);
     let job = Job::with_memory_budget(label, &memory);
+    #[cfg(target_os = "linux")]
+    let memory_monitor = system_memory::Monitor::start(&memory)?;
     let handler = CancellationHandler::install()?;
     let registration = handler.activate(job.clone())?;
     let renderer = Renderer::start(job.clone(), RendererOptions::from(options))?;
     let result = operation(&job);
     // Cleanup runs for both success and failure before the process reports an outcome
+    #[cfg(target_os = "linux")]
+    let monitoring = memory_monitor.finish();
     let rendering = renderer.finish();
     let unregistering = registration.finish();
     if job.is_cancelled() {
@@ -48,6 +54,8 @@ pub fn run(
         return Ok(RunOutcome::Interrupted);
     }
     rendering?;
+    #[cfg(target_os = "linux")]
+    monitoring?;
     unregistering?;
     if !options.quiet && options.progress != ProgressMode::Json {
         write_cache_fallback_summary(&mut io::stderr().lock(), &job.snapshot()?, options)?;

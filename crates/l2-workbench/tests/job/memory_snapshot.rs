@@ -1,5 +1,29 @@
-use l2_workbench::job::{Job, JobSnapshot, MemoryBudget, MemoryClass};
+use l2_workbench::job::{Job, JobSnapshot, MemoryBudget, MemoryClass, SystemMemorySnapshot};
 use std::error::Error;
+
+#[test]
+fn kernel_observations_do_not_replace_charges_and_failed_samples_clear_stale_data()
+-> Result<(), Box<dyn Error>> {
+    let budget = MemoryBudget::new(1000);
+    let _lease = budget.try_reserve(MemoryClass::Case, 200)?;
+    let observed = SystemMemorySnapshot {
+        process_rss_bytes: 700,
+        process_peak_rss_bytes: 800,
+        cgroup: None,
+    };
+    budget.observe_system_memory(Some(observed))?;
+    let snapshot = budget.snapshot()?;
+    assert_eq!(snapshot.system, Some(observed));
+    assert_eq!(snapshot.used_bytes, 200);
+    assert!(snapshot.system_sample_age_ms.is_some());
+    budget.observe_system_memory(None)?;
+    let snapshot = budget.snapshot()?;
+    assert_eq!(snapshot.system, None);
+    assert_eq!(snapshot.system_sample_age_ms, None);
+    assert_eq!(snapshot.system_observation_failures, 1);
+    assert_eq!(snapshot.used_bytes, 200);
+    Ok(())
+}
 
 #[test]
 fn job_snapshots_observe_shared_live_charges_and_releases() -> Result<(), Box<dyn Error>> {

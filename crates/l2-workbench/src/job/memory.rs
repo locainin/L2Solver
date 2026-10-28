@@ -1,8 +1,10 @@
 //! Shared admission for explicitly charged live memory
 
 mod buffering;
+mod system;
 
 pub use buffering::{BufferedCase, BufferedCaseSnapshot};
+pub use system::{CgroupMemoryEvents, CgroupMemorySnapshot, SystemMemorySnapshot};
 
 use super::Job;
 use serde::Serialize;
@@ -105,6 +107,12 @@ pub struct MemorySnapshot {
     pub timed_out: u64,
     /// Completed Cases waiting for ordered collection, already included in live charges
     pub buffered_cases: BufferedCaseSnapshot,
+    /// Latest independently observed process and cgroup usage
+    pub system: Option<SystemMemorySnapshot>,
+    /// Age of the latest OS observation, which can be used to reject stale pressure data
+    pub system_sample_age_ms: Option<u64>,
+    /// Failed OS observations during this invocation
+    pub system_observation_failures: u64,
     by_class: ClassCharges,
 }
 
@@ -156,6 +164,8 @@ struct State {
     timed_out: u64,
     by_class: ClassCharges,
     buffered_cases: BufferedCaseSnapshot,
+    system_memory: Option<(SystemMemorySnapshot, Instant)>,
+    system_observation_failures: u64,
 }
 
 #[derive(Debug)]
@@ -189,6 +199,8 @@ impl MemoryBudget {
                     timed_out: 0,
                     by_class: ClassCharges::default(),
                     buffered_cases: BufferedCaseSnapshot::default(),
+                    system_memory: None,
+                    system_observation_failures: 0,
                 }),
                 released: Condvar::new(),
             }),
@@ -292,6 +304,11 @@ impl MemoryBudget {
             timed_out: state.timed_out,
             by_class: state.by_class,
             buffered_cases: state.buffered_cases,
+            system: state.system_memory.map(|(sample, _)| sample),
+            system_sample_age_ms: state.system_memory.map(|(_, observed)| {
+                u64::try_from(observed.elapsed().as_millis()).unwrap_or(u64::MAX)
+            }),
+            system_observation_failures: state.system_observation_failures,
         })
     }
 }

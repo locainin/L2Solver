@@ -19,6 +19,14 @@ fn recovery_operation_uses_the_budget_observed_by_its_job() -> Result<(), Box<dy
         assert_eq!(observed.limit_bytes, options.memory_limit);
         assert_eq!(observed.used_bytes, 32);
         assert_eq!(observed.used(l2_workbench::job::MemoryClass::Executor), 32);
+        #[cfg(target_os = "linux")]
+        {
+            let system = observed
+                .system
+                .ok_or("initial kernel memory sample missing")?;
+            assert!(system.process_rss_bytes > 0);
+            assert!(observed.system_sample_age_ms.is_some());
+        }
         Ok(true)
     })?;
     assert_eq!(result, RunOutcome::Completed);
