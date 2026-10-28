@@ -7,6 +7,8 @@ use l2_workbench::job::{
     Counter, Job, JobError, JobSnapshot, Phase, PhaseOutcome, PhaseSnapshot, PhaseState,
 };
 
+#[path = "job/memory_snapshot.rs"]
+mod memory_snapshot;
 #[path = "job/model.rs"]
 mod model;
 #[path = "job/work.rs"]

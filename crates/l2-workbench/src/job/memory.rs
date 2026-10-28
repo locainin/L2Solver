@@ -1,6 +1,7 @@
 //! Shared admission for explicitly charged live memory
 
 use super::Job;
+use serde::Serialize;
 use std::error::Error;
 use std::fmt;
 use std::sync::{Arc, Condvar, Mutex};
@@ -81,7 +82,7 @@ impl Error for MemoryError {}
 /// Atomic snapshot of explicitly charged live bytes
 ///
 /// This reports the caller's charges, not allocator overhead or process RSS
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
 pub struct MemorySnapshot {
     /// Selected aggregate byte limit
     pub limit_bytes: u64,
@@ -106,7 +107,7 @@ impl MemorySnapshot {
     }
 }
 
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize)]
 struct ClassCharges {
     base: u64,
     case: u64,

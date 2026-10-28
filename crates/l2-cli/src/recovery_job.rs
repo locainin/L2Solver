@@ -9,7 +9,7 @@ use crate::{
     outcome::RunOutcome,
 };
 use l2_cli::job_ui::{CancellationHandler, Renderer, RendererOptions};
-use l2_workbench::job::{Job, JobSnapshot};
+use l2_workbench::job::{Job, JobSnapshot, MemoryBudget};
 use std::{
     error::Error,
     io::{self, Write},
@@ -20,7 +20,8 @@ pub fn run(
     label: &str,
     operation: impl FnOnce(&Job) -> Result<bool, Box<dyn Error>>,
 ) -> Result<RunOutcome, Box<dyn Error>> {
-    let job = Job::new(label);
+    let memory = MemoryBudget::new(options.memory_limit);
+    let job = Job::with_memory_budget(label, &memory);
     let handler = CancellationHandler::install()?;
     let registration = handler.activate(job.clone())?;
     let renderer = Renderer::start(job.clone(), RendererOptions::from(options))?;

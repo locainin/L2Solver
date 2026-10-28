@@ -43,7 +43,10 @@ pub fn run_with_job(
     output: &mut impl Write,
     job: &Job,
 ) -> Result<bool, Box<dyn Error>> {
-    let memory = MemoryBudget::new(options.recovery.memory_limit);
+    let memory = job
+        .memory_budget()
+        .cloned()
+        .unwrap_or_else(|| MemoryBudget::new(options.recovery.memory_limit));
     run_with_memory_budget(options, output, job, &memory)
 }
 

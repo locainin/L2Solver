@@ -128,7 +128,10 @@ pub fn run_with_job(
         }
         return Ok(reused.complete);
     }
-    let memory = MemoryBudget::new(options.recovery.memory_limit);
+    let memory = job
+        .memory_budget()
+        .cloned()
+        .unwrap_or_else(|| MemoryBudget::new(options.recovery.memory_limit));
     job.start(Phase::Preparation, None)?;
     job.set_current(Phase::Preparation, "opening recovery cache")?;
     let opened = crate::recovery_job::RecoveryCache::open(

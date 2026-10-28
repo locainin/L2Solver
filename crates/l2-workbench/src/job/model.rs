@@ -7,6 +7,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use serde::{Deserialize, Serialize};
 
 use super::recovery_transition::{RecoveryTransition, RecoveryTransitionSummary};
+use super::{MemoryBudget, MemoryError, MemorySnapshot};
 
 #[path = "work.rs"]
 mod work;
@@ -320,6 +321,11 @@ pub struct JobSnapshot {
     /// Bounded stage and outcome counts for observed recovery transitions
     #[serde(default)]
     pub recovery_transitions: RecoveryTransitionSummary,
+    /// Current invocation's explicitly charged memory, excluding allocator overhead and RSS
+    ///
+    /// Serialized observations are never restored as live allocation state
+    #[serde(default, skip_deserializing, skip_serializing_if = "Option::is_none")]
+    pub memory_admission: Option<MemorySnapshot>,
     /// Whether a cooperative cancellation request has been sent
     pub cancel_requested: bool,
 }
@@ -361,6 +367,7 @@ pub struct Job {
 struct Inner {
     state: Mutex<State>,
     cancel_requested: AtomicBool,
+    memory: Option<MemoryBudget>,
 }
 
 #[derive(Debug)]
@@ -376,6 +383,8 @@ struct State {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[non_exhaustive]
 pub enum JobError {
+    /// The shared memory observer could not read its live admission state
+    Memory(MemoryError),
     /// Shared job state was poisoned by a panicking worker
     LockPoisoned,
     /// Requested phase has already started or finished
@@ -403,6 +412,7 @@ pub enum JobError {
 impl fmt::Display for JobError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::Memory(error) => write!(formatter, "job memory observation failed: {error}"),
             Self::LockPoisoned => formatter.write_str("job state lock is poisoned"),
             Self::PhaseAlreadyStarted(phase) => {
                 write!(formatter, "{} phase has already started", phase.label())
@@ -431,15 +441,40 @@ impl fmt::Display for JobError {
     }
 }
 
-impl std::error::Error for JobError {}
+impl std::error::Error for JobError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Memory(error) => Some(error),
+            _ => None,
+        }
+    }
+}
 
 impl Job {
     /// Creates a job with all pipeline stages pending
     #[must_use]
     pub fn new(label: impl Into<String>) -> Self {
+        Self::from_parts(label.into(), None)
+    }
+
+    /// Creates a job whose snapshots observe the supplied shared admission budget
+    ///
+    /// Workers must use this same budget for the observations to describe their allocations
+    #[must_use]
+    pub fn with_memory_budget(label: impl Into<String>, memory: &MemoryBudget) -> Self {
+        Self::from_parts(label.into(), Some(memory.clone()))
+    }
+
+    /// Returns the live budget shared by this job and its workers, when configured
+    #[must_use]
+    pub fn memory_budget(&self) -> Option<&MemoryBudget> {
+        self.inner.memory.as_ref()
+    }
+
+    fn from_parts(label: String, memory: Option<MemoryBudget>) -> Self {
         let created_at = Instant::now();
         let snapshot = JobSnapshot {
-            label: label.into(),
+            label,
             created_at_unix_ms: unix_time_millis(),
             elapsed_ms: 0,
             current_phase: None,
@@ -450,6 +485,7 @@ impl Job {
                 .collect(),
             cache_fallbacks: CacheFallbackSummary::default(),
             recovery_transitions: RecoveryTransitionSummary::default(),
+            memory_admission: None,
             cancel_requested: false,
         };
 
@@ -463,6 +499,7 @@ impl Job {
                     work: WorkLedger::default(),
                 }),
                 cancel_requested: AtomicBool::new(false),
+                memory,
             }),
             work: None,
         }
@@ -737,14 +774,13 @@ impl Job {
     /// Returns a serializable point-in-time view of the shared job state
     ///
     /// # Errors
-    /// Returns [`JobError::LockPoisoned`] when a worker previously panicked while holding
-    /// the state lock
+    /// Returns an error when job state or the live memory observer is unavailable
     pub fn snapshot(&self) -> Result<JobSnapshot, JobError> {
         let state = self.lock_state()?;
         let mut snapshot = timed_snapshot(&state, self.is_cancelled());
         state.work.apply_to(&mut snapshot)?;
         drop(state);
-        Ok(snapshot)
+        self.with_memory_observation(snapshot)
     }
 
     /// Returns progress whose durable state belongs to the job rather than a Case
@@ -753,10 +789,12 @@ impl Job {
     /// prevents a background display checkpoint from duplicating restored Case work.
     ///
     /// # Errors
-    /// Returns [`JobError::LockPoisoned`] when shared state is unavailable
+    /// Returns an error when job state or the live memory observer is unavailable
     pub fn checkpoint_snapshot(&self) -> Result<JobSnapshot, JobError> {
         let state = self.lock_state()?;
-        Ok(timed_snapshot(&state, self.is_cancelled()))
+        let snapshot = timed_snapshot(&state, self.is_cancelled());
+        drop(state);
+        self.with_memory_observation(snapshot)
     }
 
     /// Restores a saved snapshot into this shared job handle
@@ -804,7 +842,7 @@ impl Job {
             timed_snapshot(&state, cancel_requested)
         };
         drop(state);
-        Ok(snapshot)
+        self.with_memory_observation(snapshot)
     }
 
     /// Requests cooperative cancellation for every clone of this job handle
@@ -831,6 +869,18 @@ impl Job {
 
     fn lock_state(&self) -> Result<std::sync::MutexGuard<'_, State>, JobError> {
         self.inner.state.lock().map_err(|_| JobError::LockPoisoned)
+    }
+
+    fn with_memory_observation(&self, mut snapshot: JobSnapshot) -> Result<JobSnapshot, JobError> {
+        // Read the budget after releasing the job lock so observation cannot block worker updates
+        snapshot.memory_admission = self
+            .inner
+            .memory
+            .as_ref()
+            .map(MemoryBudget::snapshot)
+            .transpose()
+            .map_err(JobError::Memory)?;
+        Ok(snapshot)
     }
 }
 
@@ -859,6 +909,7 @@ fn restored_snapshot(
     cancel_requested: bool,
 ) -> Result<JobSnapshot, JobError> {
     let preparation = live_preparation(state)?;
+    snapshot.memory_admission = None;
 
     // Saved source reads describe prior work, not I/O performed by this process
     let previous_reads = snapshot
