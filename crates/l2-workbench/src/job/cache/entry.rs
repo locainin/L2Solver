@@ -1,5 +1,5 @@
 use std::{
-    fs,
+    fs, io,
     path::{Path, PathBuf},
 };
 
@@ -367,21 +367,27 @@ pub(super) fn read_entry(
     let path = safe_entry_path(entries.path(), key.as_str(), &record.relative_path)?;
     let root = entries
         .open_child(key.as_str())
-        .map_err(|_| CacheError::CorruptEntry("entry directory is missing or unsafe".to_owned()))?;
+        .map_err(|error| missing_entry(error, "entry directory is missing"))?;
     let generation = path
         .file_name()
         .and_then(std::ffi::OsStr::to_str)
         .ok_or_else(|| CacheError::CorruptEntry("entry generation is invalid".to_owned()))?;
-    let directory = root.open_child(generation).map_err(|_| {
-        CacheError::CorruptEntry("entry generation is missing or unsafe".to_owned())
-    })?;
+    let directory = root
+        .open_child(generation)
+        .map_err(|error| missing_entry(error, "entry generation is missing"))?;
     let metadata: Value = serde_json::from_str(&record.metadata_json)
         .map_err(|_| CacheError::CorruptEntry("entry metadata is not valid JSON".to_owned()))?;
     let expected: Manifest = serde_json::from_str(&record.manifest_json)
         .map_err(|_| CacheError::CorruptEntry("entry manifest is not valid JSON".to_owned()))?;
-    expected
-        .validate(directory.path())
-        .map_err(|_| CacheError::CorruptEntry("entry files are missing or unsafe".to_owned()))?;
+    expected.validate(directory.path()).map_err(|error| {
+        // Keep resource and I/O failures distinct from an invalid cached tree
+        match error {
+            CacheError::UnsafePath(_) | CacheError::InvalidInput(_) => {
+                CacheError::CorruptEntry("entry files are unsafe or invalid".to_owned())
+            }
+            other => missing_entry(other, "entry files are missing"),
+        }
+    })?;
     let recorded_bytes = u64::try_from(record.bytes)
         .map_err(|_| CacheError::CorruptEntry("entry size is invalid".to_owned()))?;
     if expected.total_bytes() != recorded_bytes {
@@ -399,4 +405,12 @@ pub(super) fn read_entry(
         lock,
         memory,
     ))
+}
+
+fn missing_entry(error: CacheError, detail: &'static str) -> CacheError {
+    if matches!(&error, CacheError::Io(source) if source.kind() == io::ErrorKind::NotFound) {
+        CacheError::CorruptEntry(detail.to_owned())
+    } else {
+        error
+    }
 }
