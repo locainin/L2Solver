@@ -962,8 +962,11 @@ name = "l2-onpath"
 version = "0.1.0"
 dependencies = [
  "l2-canary",
+ "l2-core",
+ "l2-discovery",
  "l2-helper-protocol",
  "l2-segmentation",
+ "sha2 0.10.9",
 ]
 
 [[package]]

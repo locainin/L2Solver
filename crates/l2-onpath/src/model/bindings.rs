@@ -118,18 +118,7 @@ impl NeighborBinding {
     /// # Errors
     /// Rejects addresses that cannot identify one on-link neighbor
     pub fn new(endpoint: AgentId, address: IpAddr, mac: MacAddress) -> Result<Self, ModelError> {
-        if address.is_unspecified() {
-            return Err(ModelError::UnspecifiedAddress);
-        }
-        if address == IpAddr::V4(std::net::Ipv4Addr::BROADCAST) {
-            return Err(ModelError::BroadcastAddress);
-        }
-        if address.is_multicast() {
-            return Err(ModelError::MulticastAddress);
-        }
-        if address.is_loopback() {
-            return Err(ModelError::LoopbackAddress);
-        }
+        validate_neighbor_address(address)?;
         Ok(Self {
             endpoint,
             address,
@@ -163,6 +152,23 @@ impl NeighborBinding {
             IpAddr::V6(_) => AddressFamily::Ipv6,
         }
     }
+}
+
+// The same address rules apply to a present binding and an observed absent entry
+pub fn validate_neighbor_address(address: IpAddr) -> Result<(), ModelError> {
+    if address.is_unspecified() {
+        return Err(ModelError::UnspecifiedAddress);
+    }
+    if address == IpAddr::V4(std::net::Ipv4Addr::BROADCAST) {
+        return Err(ModelError::BroadcastAddress);
+    }
+    if address.is_multicast() {
+        return Err(ModelError::MulticastAddress);
+    }
+    if address.is_loopback() {
+        return Err(ModelError::LoopbackAddress);
+    }
+    Ok(())
 }
 
 /// One controlled endpoint whose binding may be armed for a bounded test

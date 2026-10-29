@@ -11,6 +11,7 @@
 mod catalog;
 mod error;
 mod model;
+pub mod neighbor;
 mod receipts;
 mod state;
 

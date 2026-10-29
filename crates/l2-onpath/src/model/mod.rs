@@ -9,6 +9,7 @@ mod plan;
 mod stimulus;
 mod timebase;
 
+pub use bindings::validate_neighbor_address;
 pub use bindings::{
     AddressFamily, ControlledEndpoint, MacAddress, NeighborBinding, ProtocolFamily,
 };
