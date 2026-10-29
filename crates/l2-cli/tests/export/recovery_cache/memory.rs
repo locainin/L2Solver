@@ -1,8 +1,99 @@
 use super::{
     RecoveryCaseKind, RecoveryContext, RecoveryOptions, case_and_scope, open_cache, recover,
 };
-use l2_workbench::job::MemoryBudget;
+use l2_workbench::job::{
+    MemoryBudget, MemoryClass,
+    cache::{Cache, CacheEntry, CacheReadPolicy},
+};
 use std::error::Error;
+
+fn cached_case_with_omissions(
+    cache: &Cache,
+    options: &RecoveryOptions,
+    count: usize,
+    length: usize,
+) -> Result<CacheEntry, Box<dyn Error>> {
+    let (mut case, scope) = case_and_scope(b"4142", 93)?;
+    let mut recovery = recover(
+        &mut case,
+        RecoveryCaseKind::Flow,
+        &scope,
+        &RecoveryContext {
+            cache: Some(cache),
+            job: None,
+            memory: None,
+            options,
+        },
+    )?;
+    recovery.omissions = (0..count).map(|_| "o".repeat(length)).collect();
+    recovery.coverage.omissions = u64::try_from(count)?;
+    let key = super::super::recovery_key(RecoveryCaseKind::Flow, &scope, options)?;
+    super::super::store_result(cache.lease(&key)?, &case, &recovery, options, None)?;
+    cache
+        .lookup(&key, CacheReadPolicy::AllowPartial)?
+        .ok_or_else(|| "cached recovery fixture was not published".into())
+}
+
+#[test]
+fn restored_omissions_remain_charged_after_the_case_is_dropped() -> Result<(), Box<dyn Error>> {
+    let temporary = tempfile::tempdir()?;
+    let cache = open_cache(temporary.path())?;
+    let options = RecoveryOptions::default();
+    let entry = cached_case_with_omissions(&cache, &options, 128, 2048)?;
+    let (_, scope) = case_and_scope(b"4142", 93)?;
+    let source = scope
+        .get("source_id")
+        .and_then(serde_json::Value::as_str)
+        .ok_or("missing source")?;
+    let budget = MemoryBudget::new(8 * 1024 * 1024);
+    let (case, recovery) = super::super::cached_result(
+        &entry,
+        source,
+        RecoveryCaseKind::Flow,
+        &options,
+        Some(&budget),
+    )?;
+    drop(case);
+    let allocated = recovery.omissions.capacity() * size_of::<String>()
+        + recovery
+            .omissions
+            .iter()
+            .map(String::capacity)
+            .sum::<usize>();
+    assert!(
+        budget.snapshot()?.used(MemoryClass::Cache) >= u64::try_from(allocated)?,
+        "returned omission strings must keep their allocation charge"
+    );
+    drop(recovery);
+    assert_eq!(budget.snapshot()?.used_bytes, 0);
+    Ok(())
+}
+
+#[test]
+fn cached_omissions_that_exceed_available_memory_are_rejected() -> Result<(), Box<dyn Error>> {
+    let temporary = tempfile::tempdir()?;
+    let cache = open_cache(temporary.path())?;
+    let options = RecoveryOptions::default();
+    let entry = cached_case_with_omissions(&cache, &options, 800, 4096)?;
+    let (_, scope) = case_and_scope(b"4142", 93)?;
+    let source = scope
+        .get("source_id")
+        .and_then(serde_json::Value::as_str)
+        .ok_or("missing source")?;
+    let budget = MemoryBudget::new(3 * 1024 * 1024);
+    let error = super::super::cached_result(
+        &entry,
+        source,
+        RecoveryCaseKind::Flow,
+        &options,
+        Some(&budget),
+    )
+    .err()
+    .ok_or("oversized omissions bypassed shared memory admission")?;
+    assert!(crate::memory_error::find(error.as_ref()).is_some());
+    assert_eq!(budget.snapshot()?.used_bytes, 0);
+    Ok(())
+}
 
 #[test]
 fn restoring_cached_recovery_holds_the_shared_memory_charge_until_case_drop()

@@ -1,5 +1,7 @@
 //! Cache exact per-scope default recovery results
 
+mod omissions;
+
 use super::coverage::{RecoveryCaseKind, RecoveryCoverage};
 use crate::{
     arguments::{RecoveryOptions, RecoveryProfile},
@@ -8,7 +10,7 @@ use crate::{
 use l2_workbench::{
     evidence::{Case, CaseSnapshotLimits, CaseSnapshotUsage, EvidenceError, MAX_CASE_JSON_BYTES},
     job::{
-        CacheFallbackKind, CacheStage, Counter, Job, MemoryBudget, PhaseState,
+        CacheFallbackKind, CacheStage, Counter, Job, MemoryBudget, MemoryLease, PhaseState,
         cache::{
             Cache, CacheEntry, CacheError, CacheReadPolicy, Lease, SourceIdentity, StageKey,
             StageStatus,
@@ -52,13 +54,16 @@ pub(super) struct RecoveryContext<'a> {
 pub(super) struct CachedRecovery {
     pub(super) coverage: RecoveryCoverage,
     pub(super) omissions: Vec<String>,
+    // The retained strings are dropped before their allocation charge
+    _omissions_memory: Option<MemoryLease>,
 }
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct RecoveryMetadata {
     coverage: RecoveryCoverage,
-    omissions: Vec<String>,
+    #[serde(rename = "omissions")]
+    _omissions: serde::de::IgnoredAny,
     #[serde(default, deserialize_with = "deserialize_metadata_field")]
     case_storage_format: MetadataField<u32>,
     #[serde(default, deserialize_with = "deserialize_metadata_field")]
@@ -152,14 +157,14 @@ pub(super) fn recover(
     drop(resume);
     let mut coverage = RecoveryCoverage::default();
     coverage.record(&summary, kind)?;
-    let omissions = summary
-        .omissions
-        .iter()
-        .map(ToString::to_string)
-        .collect::<Vec<_>>();
+    let (omissions, omissions_memory) = omissions::collect(
+        summary.omissions.iter().map(Ok::<_, Box<dyn Error>>),
+        context.memory,
+    )?;
     let result = CachedRecovery {
         coverage,
         omissions,
+        _omissions_memory: omissions_memory,
     };
 
     if let Some(lease) = lease {
@@ -311,12 +316,27 @@ fn cached_result(
     options: &RecoveryOptions,
     memory: Option<&MemoryBudget>,
 ) -> Result<(Case, CachedRecovery)> {
-    let metadata: RecoveryMetadata = serde_json::from_value(entry.metadata().clone())?;
+    // Deserialize scalar coverage from the pinned metadata without cloning its JSON tree
+    let metadata = RecoveryMetadata::deserialize(entry.metadata())?;
     let case_storage_format = metadata.case_storage_format;
     let case_snapshot_usage = metadata.case_snapshot_usage;
+    let values = entry
+        .metadata()
+        .get("omissions")
+        .and_then(Value::as_array)
+        .ok_or_else(|| invalid_cache("cached recovery omissions are not an array"))?;
+    let (omissions, omissions_memory) = omissions::collect(
+        values.iter().map(|value| {
+            value
+                .as_str()
+                .ok_or_else(|| invalid_cache("cached recovery omission is not text"))
+        }),
+        memory,
+    )?;
     let result = CachedRecovery {
         coverage: metadata.coverage,
-        omissions: metadata.omissions,
+        omissions,
+        _omissions_memory: omissions_memory,
     };
     validate_cached_coverage(&result, entry.status(), kind)?;
     let case = read_cached_case(
