@@ -1,15 +1,90 @@
 use super::zip_support::{FixtureEntry, build_zip, deflate};
 use l2_workbench::{
     artifact::zip::{
-        ZipArtifactEntry, ZipArtifactLimits, ZipMemoryError, ZipReadError, ZipReaderBudget,
-        ZipReaderLimits, inspect_zip_at_depth_with_memory,
-        inspect_zip_from_reader_with_source_sha256_and_memory,
+        ZipArtifactEntry, ZipArtifactLimits, ZipArtifactOmissionReason, ZipEntryDataFailure,
+        ZipMemoryError, ZipReadError, ZipReaderBudget, ZipReaderLimits,
+        inspect_zip_at_depth_with_memory, inspect_zip_from_reader_with_source_sha256_and_memory,
     },
     job::{MemoryBudget, MemoryClass, MemoryError},
 };
 use std::{error::Error, io::Cursor};
 
 type TestResult = Result<(), Box<dyn Error>>;
+
+#[test]
+fn high_expansion_members_remain_bounded_even_with_a_forged_size() -> TestResult {
+    const EXPANDED: usize = 8 * 1024 * 1024;
+    const LIMIT: usize = 64 * 1024;
+    const FORGED_SIZE: usize = 32 * 1024;
+    const MEMORY_LIMIT: u64 = 512 * 1024;
+    const LATER_CONTENT: &[u8] = b"recoverable member";
+
+    let payload = vec![0_u8; EXPANDED];
+    let compressed = deflate(&payload)?;
+    assert!(compressed.len() < EXPANDED / 100);
+    for forged in [false, true] {
+        let mut member = FixtureEntry::deflated(b"large.bin", &payload, compressed.clone());
+        if forged {
+            // Keep both ZIP headers consistent while understating the decoder output
+            member = member.with_declared_sizes(compressed.len(), FORGED_SIZE);
+        }
+        // A small later member must remain recoverable after the rejected expansion
+        let archive = build_zip(&[member, FixtureEntry::stored(b"later.txt", LATER_CONTENT)])?;
+        let memory = MemoryBudget::new(MEMORY_LIMIT);
+        let mut lease = memory.try_reserve(MemoryClass::Executor, 0)?;
+        let mut work = ZipReaderBudget {
+            read_bytes_remaining: 1024 * 1024,
+            expanded_bytes_remaining: LIMIT,
+        };
+        let limits = ZipReaderLimits {
+            archive: ZipArtifactLimits {
+                max_entry_expanded_bytes: LIMIT,
+                max_total_expanded_bytes: LIMIT,
+                ..ZipArtifactLimits::default()
+            },
+            ..ZipReaderLimits::default()
+        };
+        let report = inspect_zip_from_reader_with_source_sha256_and_memory(
+            &mut Cursor::new(&archive),
+            archive.len(),
+            &l2_workbench::sha256(&archive),
+            limits,
+            0,
+            &mut work,
+            &mut lease,
+        )?;
+        let entry = report.entries.first().ok_or("archive member missing")?;
+        assert_eq!(entry.content, None);
+        let later = report
+            .entries
+            .get(1)
+            .ok_or("later archive member missing")?;
+        assert_eq!(later.content.as_deref(), Some(LATER_CONTENT));
+        let (omission, charged) = if forged {
+            (
+                ZipArtifactOmissionReason::EntryDataFailure {
+                    index: 0,
+                    failure: ZipEntryDataFailure::SizeMismatch,
+                },
+                FORGED_SIZE,
+            )
+        } else {
+            (ZipArtifactOmissionReason::EntryExpandedByteLimit, 0)
+        };
+        assert_eq!(entry.omission, Some(omission));
+        assert_eq!(report.expanded_byte_count, LATER_CONTENT.len());
+        assert_eq!(
+            report.expanded_work_byte_count,
+            charged + LATER_CONTENT.len()
+        );
+        assert_eq!(
+            work.expanded_bytes_remaining,
+            LIMIT - charged - LATER_CONTENT.len()
+        );
+        assert!(memory.snapshot()?.peak_bytes <= MEMORY_LIMIT);
+    }
+    Ok(())
+}
 
 #[test]
 fn zip_member_memory_pressure_precedes_extraction_and_work_charges() -> TestResult {
