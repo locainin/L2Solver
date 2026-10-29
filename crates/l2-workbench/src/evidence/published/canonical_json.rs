@@ -6,7 +6,7 @@ use serde::{
     de::{self, MapAccess, SeqAccess, Visitor},
     ser::{SerializeMap, SerializeSeq},
 };
-use serde_json::{Value, value::RawValue};
+use serde_json::value::RawValue;
 use std::{fmt, io, marker::PhantomData};
 
 // Match the default serde_json recursion boundary for previously accepted receipts
@@ -135,7 +135,16 @@ pub(super) fn serialize_scalar<S: Serializer>(
         let value: &str = serde_json::from_str(raw.get()).map_err(serde::ser::Error::custom)?;
         return value.serialize(serializer);
     }
-    // Escaped strings need both a parser buffer and the decoded owned value
+    if bytes
+        .first()
+        .is_some_and(|byte| *byte == b'-' || byte.is_ascii_digit())
+    {
+        // Number preserves Serde's configured numeric representation
+        let value: serde_json::Number =
+            serde_json::from_str(raw.get()).map_err(serde::ser::Error::custom)?;
+        return value.serialize(serializer);
+    }
+    // Reserve for the parser buffer before decoding escaped strings
     let _charge = if bytes.first() == Some(&b'"') {
         let length = u64::try_from(bytes.len()).map_err(serde::ser::Error::custom)?;
         let cost = length
@@ -146,8 +155,36 @@ pub(super) fn serialize_scalar<S: Serializer>(
     } else {
         None
     };
-    let value: Value = serde_json::from_str(raw.get()).map_err(serde::ser::Error::custom)?;
-    value.serialize(serializer)
+    let mut input = serde_json::Deserializer::from_str(raw.get());
+    let output = input
+        .deserialize_any(ScalarWriter { serializer })
+        .map_err(serde::ser::Error::custom)?;
+    input.end().map_err(serde::ser::Error::custom)?;
+    Ok(output)
+}
+
+struct ScalarWriter<S> {
+    serializer: S,
+}
+
+impl<S: Serializer> Visitor<'_> for ScalarWriter<S> {
+    type Value = S::Ok;
+
+    fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("a JSON scalar")
+    }
+
+    fn visit_bool<E: de::Error>(self, value: bool) -> Result<Self::Value, E> {
+        self.serializer.serialize_bool(value).map_err(E::custom)
+    }
+
+    fn visit_str<E: de::Error>(self, value: &str) -> Result<Self::Value, E> {
+        self.serializer.serialize_str(value).map_err(E::custom)
+    }
+
+    fn visit_unit<E: de::Error>(self) -> Result<Self::Value, E> {
+        self.serializer.serialize_unit().map_err(E::custom)
+    }
 }
 
 pub(super) struct RawObject<'a> {

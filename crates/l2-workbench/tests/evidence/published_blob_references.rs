@@ -219,7 +219,7 @@ fn expanded_digest_references_cannot_exceed_the_node_detail_limit() -> TestResul
     )
     .err()
     .ok_or("expanded details must respect the node detail limit")?;
-    assert!(error.to_string().contains("node details have"));
+    assert!(error.to_string().contains("node details exceed their limit"));
     Ok(())
 }
 

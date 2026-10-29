@@ -2,6 +2,7 @@
 
 mod canonical;
 mod canonical_json;
+mod details_budget;
 mod format;
 mod reader;
 mod schema;

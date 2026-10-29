@@ -306,7 +306,7 @@ fn read_nodes<R: BufRead, W: Write>(
         if record.4.get().len() > MAX_NODE_DETAILS_BYTES * 16 {
             return Err(invalid("evidence node details exceed their limit"));
         }
-        let details = if header.version == LEGACY_VERSION {
+        let (details, detail_bytes) = if header.version == LEGACY_VERSION {
             let details: Details =
                 serde_json::from_str(record.4.get()).map_err(io::Error::other)?;
             details.expand(&header.strings.0)?
@@ -319,9 +319,7 @@ fn read_nodes<R: BufRead, W: Write>(
             )?
         };
         total_details = total_details
-            .checked_add(
-                super::super::case::encoded_details_length(&details).map_err(io::Error::other)?,
-            )
+            .checked_add(detail_bytes)
             .ok_or_else(|| invalid("evidence detail count overflow"))?;
         if total_details > MAX_TOTAL_DETAILS_BYTES {
             return Err(invalid("evidence Case details exceed their limit"));

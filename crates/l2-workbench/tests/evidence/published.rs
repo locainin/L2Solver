@@ -14,6 +14,8 @@ type TestResult = Result<(), Box<dyn Error>>;
 
 #[path = "published_blob_references.rs"]
 mod blob_references;
+#[path = "published_detail_preflight.rs"]
+mod detail_preflight;
 
 fn write_published_case<W: Write>(
     case: &Case,

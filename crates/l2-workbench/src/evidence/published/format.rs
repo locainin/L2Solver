@@ -8,6 +8,8 @@ use serde::{
 use serde_json::{Value, value::RawValue};
 use std::{fmt, io};
 
+use super::details_budget::count_details;
+
 pub(super) const LEGACY_VERSION: u32 = 3;
 pub(super) const COMPACT_VERSION: u32 = 4;
 pub(super) const VERSION: u32 = 5;
@@ -155,6 +157,16 @@ pub(super) enum Text {
 type Range = (usize, Option<u64>, u64, u64);
 
 impl Text {
+    fn borrowed<'a>(&'a self, dictionary: &'a [String]) -> io::Result<&'a str> {
+        match self {
+            Self::Index(index) => dictionary
+                .get(*index)
+                .map(String::as_str)
+                .ok_or_else(|| io::Error::other("missing evidence dictionary reference")),
+            Self::Inline(value) => Ok(value),
+        }
+    }
+
     pub(super) fn resolve(self, dictionary: &[String]) -> io::Result<String> {
         match self {
             Self::Index(index) => dictionary
@@ -227,13 +239,36 @@ pub(super) fn expand_compact_details(
     dictionary: &[String],
     blob: Option<&str>,
     version: u32,
-) -> io::Result<Value> {
+) -> io::Result<(Value, usize)> {
     let (kind, contents): (u8, Box<RawValue>) =
         serde_json::from_str(raw.get()).map_err(io::Error::other)?;
     match kind {
         0 => {
             let fields: CompactFields =
                 serde_json::from_str(contents.get()).map_err(io::Error::other)?;
+            let length = count_details(|budget| {
+                budget.begin_object()?;
+                for CompactField(key, kind, value) in &fields.0 {
+                    let key = key.borrowed(dictionary)?;
+                    match kind {
+                        0 if value.get().starts_with('"') => budget.raw_field(key, value)?,
+                        0 => {
+                            let index: usize =
+                                serde_json::from_str(value.get()).map_err(io::Error::other)?;
+                            let text = dictionary.get(index).ok_or_else(|| {
+                                io::Error::other("missing evidence dictionary reference")
+                            })?;
+                            budget.field(key, text)?;
+                        }
+                        1 => budget.raw_field(key, value)?,
+                        2 if version == VERSION => {
+                            budget.field(key, digest_reference(value, blob)?)?;
+                        }
+                        _ => return Err(io::Error::other("invalid evidence detail field kind")),
+                    }
+                }
+                budget.end_object()
+            })?;
             let mut output = serde_json::Map::new();
             for CompactField(key, kind, value) in fields.0 {
                 let key = key.resolve(dictionary)?;
@@ -245,12 +280,7 @@ pub(super) fn expand_compact_details(
                     ),
                     1 => serde_json::from_str(value.get()).map_err(io::Error::other)?,
                     2 if version == VERSION => {
-                        // The marker has no payload, so reject extra data
-                        serde_json::from_str::<()>(value.get()).map_err(io::Error::other)?;
-                        let digest = blob
-                            .and_then(|id| id.strip_prefix("sha256:"))
-                            .ok_or_else(|| io::Error::other("missing evidence blob digest"))?;
-                        Value::String(digest.to_owned())
+                        Value::String(digest_reference(&value, blob)?.to_owned())
                     }
                     _ => return Err(io::Error::other("invalid evidence detail field kind")),
                 };
@@ -258,11 +288,22 @@ pub(super) fn expand_compact_details(
                     return Err(io::Error::other("duplicate evidence detail field"));
                 }
             }
-            Ok(Value::Object(output))
+            Ok((Value::Object(output), length))
         }
-        1 => serde_json::from_str(contents.get()).map_err(io::Error::other),
+        1 => {
+            let length = count_details(|budget| budget.raw(&contents))?;
+            let value = serde_json::from_str(contents.get()).map_err(io::Error::other)?;
+            Ok((value, length))
+        }
         _ => Err(io::Error::other("invalid evidence details kind")),
     }
+}
+
+fn digest_reference<'a>(value: &RawValue, blob: Option<&'a str>) -> io::Result<&'a str> {
+    // The marker has no payload, so reject extra data
+    serde_json::from_str::<()>(value.get()).map_err(io::Error::other)?;
+    blob.and_then(|id| id.strip_prefix("sha256:"))
+        .ok_or_else(|| io::Error::other("missing evidence blob digest"))
 }
 
 fn deserialize_details<'de, D>(deserializer: D) -> Result<Vec<(Text, DetailValue)>, D::Error>
@@ -275,9 +316,23 @@ where
 }
 
 impl Details {
-    pub(super) fn expand(self, dictionary: &[String]) -> io::Result<Value> {
-        match self {
-            Self::Value(raw) => serde_json::from_str(raw.get()).map_err(io::Error::other),
+    pub(super) fn expand(self, dictionary: &[String]) -> io::Result<(Value, usize)> {
+        let length = count_details(|budget| match &self {
+            Self::Value(raw) => budget.raw(raw),
+            Self::Object(fields) => {
+                budget.begin_object()?;
+                for (key, value) in fields {
+                    let key = key.borrowed(dictionary)?;
+                    match value {
+                        DetailValue::Text(text) => budget.field(key, text.borrowed(dictionary)?)?,
+                        DetailValue::Value(raw) => budget.raw_field(key, raw)?,
+                    }
+                }
+                budget.end_object()
+            }
+        })?;
+        let value = match self {
+            Self::Value(raw) => serde_json::from_str(raw.get()).map_err(io::Error::other)?,
             Self::Object(fields) => {
                 let mut output = serde_json::Map::new();
                 for (key, value) in fields {
@@ -292,9 +347,10 @@ impl Details {
                         return Err(io::Error::other("duplicate evidence detail field"));
                     }
                 }
-                Ok(Value::Object(output))
+                Value::Object(output)
             }
-        }
+        };
+        Ok((value, length))
     }
 }
 
