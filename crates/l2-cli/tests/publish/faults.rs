@@ -1,28 +1,17 @@
 //! Check that write errors cannot replace a completed directory
 
-use super::publish;
+use super::{OwnedChild, publish};
 use std::{
     error::Error,
     fs, io,
     os::unix::{fs::PermissionsExt, process::ExitStatusExt},
     path::Path,
-    process::{Child, Command, Stdio},
+    process::{Command, Stdio},
     thread,
     time::{Duration, Instant},
 };
 
 type TestResult = Result<(), Box<dyn Error>>;
-
-struct OwnedChild(Child);
-
-impl Drop for OwnedChild {
-    fn drop(&mut self) {
-        if matches!(self.0.try_wait(), Ok(None)) {
-            let _ = self.0.kill();
-            let _ = self.0.wait();
-        }
-    }
-}
 
 fn old_output(destination: &Path) -> TestResult {
     publish::create_directory(destination, |staging| {

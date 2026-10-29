@@ -2,8 +2,25 @@
 mod publish;
 
 #[cfg(target_os = "linux")]
+struct OwnedChild(std::process::Child);
+
+#[cfg(target_os = "linux")]
+impl Drop for OwnedChild {
+    fn drop(&mut self) {
+        if matches!(self.0.try_wait(), Ok(None)) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
 #[path = "publish/directory.rs"]
 mod directory;
+
+#[cfg(target_os = "linux")]
+#[path = "publish/concurrent_refresh.rs"]
+mod concurrent_refresh;
 
 #[cfg(target_os = "linux")]
 #[path = "publish/faults.rs"]

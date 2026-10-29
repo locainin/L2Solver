@@ -178,6 +178,8 @@ pub fn prepare_directory_replacement(
 ///
 /// `before_commit` runs after the staged tree and destination identity are checked and
 /// immediately before the atomic exchange. A failure preserves the old destination
+/// Cooperative replacement commits in the same parent cannot overlap; contention or
+/// unsupported advisory locking fails before publication
 pub fn replace_directory_with_precommit<T>(
     prepared: &PreparedDirectoryReplacement,
     write: impl FnOnce(&Path) -> Result<T, Box<dyn Error>>,
@@ -226,6 +228,8 @@ fn replace_directory_linux<T>(
     let result = write(staging.path())?;
     sync_tree(&staging_fd, path)?;
     verify_named_directory(&prepared.parent_fd, &staging_name, staging_identity)?;
+    // Hold an independent parent description until exchange and old-tree cleanup finish
+    let _commit_lock = lock_replacement_parent(&prepared.parent_fd)?;
     verify_named_directory(
         &prepared.parent_fd,
         &prepared.name,
@@ -240,6 +244,27 @@ fn replace_directory_linux<T>(
     before_commit().map_err(super::DirectoryPublishError::BeforePublication)?;
 
     finish_directory_replacement(prepared, staging, &staging_name, staging_identity, result)
+}
+
+#[cfg(target_os = "linux")]
+fn lock_replacement_parent(parent: &rustix::fd::OwnedFd) -> io::Result<rustix::fd::OwnedFd> {
+    use rustix::fs::{FlockOperation, Mode, OFlags, flock, openat};
+
+    // A separate open creates an independent lock even for callers sharing a parent
+    let lock = openat(
+        parent,
+        ".",
+        OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC,
+        Mode::empty(),
+    )?;
+    flock(&lock, FlockOperation::NonBlockingLockExclusive).map_err(|error| {
+        let error: io::Error = error.into();
+        io::Error::new(
+            error.kind(),
+            format!("cannot lock output parent for directory replacement: {error}"),
+        )
+    })?;
+    Ok(lock)
 }
 
 #[cfg(target_os = "linux")]
