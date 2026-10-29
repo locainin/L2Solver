@@ -37,28 +37,46 @@ jobs:
             --target x86_64-unknown-linux-gnu
           rustup default stable
 
-      - name: Gate 1 of 6 - rustfmt
+      - name: Check formatting
         run: cargo fmt --all -- --check
 
-      - name: Gate 2 of 6 - clippy
+      - name: Check workspace Clippy
         run: >-
           cargo clippy --workspace --all-targets --all-features --locked --
           -D warnings
 
-      - name: Gate 3 of 6 - tests
+      - name: Run workspace tests
         run: >-
           cargo test --workspace --all-targets --all-features --locked
 
-      - name: Gate 4 of 6 - Linux release build
+      - name: Run documentation tests
+        env:
+          RUSTDOCFLAGS: -D warnings
+        run: cargo test --workspace --doc --all-features --locked
+
+      - name: Check Rust documentation warnings
+        env:
+          RUSTDOCFLAGS: -D warnings
+        run: cargo doc --workspace --all-features --no-deps --locked
+
+      - name: Build Linux release candidate
         run: >-
           cargo build --locked --release --package l2-cli
           --target x86_64-unknown-linux-gnu
 
-      - name: Install completion shells
+      - name: Install candidate check tools
         shell: bash
         run: |
           sudo apt-get update
-          sudo apt-get install -y --no-install-recommends fish zsh
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+            binutils fish python3-pytest python3-pytest-subtests tshark zsh
+
+      - name: Run Python benchmark regressions
+        run: >-
+          /usr/bin/python3 -m pytest -q tests/benchmarks
+          -p subtests
+          --ignore=tests/benchmarks/test_cgroup_enforcement.py
+          --ignore=tests/benchmarks/test_filesystem_fault_runner.py
 
       - name: Check generated completion syntax
         shell: bash
@@ -75,7 +93,7 @@ jobs:
       - name: Install pinned cargo-deny
         run: cargo install cargo-deny --locked --version 0.19.0
 
-      - name: Gate 5 of 6 - dependency policy
+      - name: Check dependency policy
         run: |
           cargo deny --frozen check
           cargo deny --frozen --manifest-path fuzz/Cargo.toml check
@@ -83,24 +101,37 @@ jobs:
       - name: Install pinned cargo-audit
         run: cargo install cargo-audit --locked --version 0.22.0
 
-      - name: Gate 6 of 6 - security advisories
+      - name: Check security advisories
         run: |
           cargo audit --file Cargo.lock
           cargo audit --file fuzz/Cargo.lock
 
       - name: Package build provenance and checksum
         run: >-
-          python3 -m benchmarks.package_release
+          /usr/bin/python3 -m benchmarks.package_release
           --binary target/x86_64-unknown-linux-gnu/release/l2solver
           --lockfile Cargo.lock
-          --output-directory dist
+          --output-directory "$RUNNER_TEMP/l2solver-dist"
 
-      - name: Upload review artifact
+      - name: Check packaged executable and record blocked release work
+        run: >-
+          /usr/bin/python3 -m benchmarks.qualification
+          --package-directory "$RUNNER_TEMP/l2solver-dist"
+          --output-directory "$RUNNER_TEMP/l2solver-qualification"
+          --candidate-only
+
+      - name: Upload unqualified review candidate
         # Pin the upload implementation to the reviewed v7.0.0 commit
         uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f
         with:
-          name: l2solver-linux-x86_64
-          path: dist/
+          name: l2solver-linux-x86_64-unqualified-review
+          path: |
+            ${{ runner.temp }}/l2solver-dist/
+            ${{ runner.temp }}/l2solver-qualification/qualification.json
+            ${{ runner.temp }}/l2solver-qualification/elf-*.txt
+            ${{ runner.temp }}/l2solver-qualification/cli/*/stdout.log
+            ${{ runner.temp }}/l2solver-qualification/cli/*/stderr.log
+            ${{ runner.temp }}/l2solver-qualification/cli/*-output/manifest.json
           if-no-files-found: error
           retention-days: 30
           compression-level: 0
