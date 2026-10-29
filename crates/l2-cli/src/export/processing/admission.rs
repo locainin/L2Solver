@@ -6,7 +6,9 @@ mod tests;
 
 use super::{PendingCase, case_mut};
 use crate::export::recovery_cache::RecoveryContext;
-use crate::recovery_job::MEMORY_OBSERVATION_INTERVAL;
+use crate::recovery_job::{
+    MAX_MEMORY_SAMPLE_AGE, MEMORY_OBSERVATION_INTERVAL, MEMORY_SAFETY_MARGIN_DIVISOR,
+};
 use l2_workbench::{
     evidence::Case,
     job::{Job, MemoryBudget, MemoryError, MemorySnapshot, MemoryWorkingSet, Phase},
@@ -14,12 +16,8 @@ use l2_workbench::{
 };
 use std::{error::Error, thread, time::Duration};
 
-// Four missed monitor intervals make an old observation unsuitable for a new admission
-const MAX_SAMPLE_AGE: Duration = MEMORY_OBSERVATION_INTERVAL.saturating_mul(4);
 // Two further samples distinguish a transient cleanup peak from sustained pressure
 const QUIESCENT_PRESSURE_RECHECKS: u8 = 2;
-// This margin covers uncharged runtime allocations; it is not an RSS guarantee
-const SAFETY_MARGIN_DIVISOR: u64 = 8;
 
 /// Hold a worker's reservation until its recovery and snapshot writes finish
 #[derive(Debug)]
@@ -140,7 +138,7 @@ fn check_pressure(snapshot: &MemorySnapshot, growth: u64) -> Result<(), MemoryEr
     let Some(system) = snapshot.system.filter(|_| {
         snapshot
             .system_sample_age_ms
-            .is_some_and(|age| Duration::from_millis(age) <= MAX_SAMPLE_AGE)
+            .is_some_and(|age| Duration::from_millis(age) <= MAX_MEMORY_SAMPLE_AGE)
     }) else {
         // Logical admission remains available; missing OS data stays visible in telemetry
         return Ok(());
@@ -166,7 +164,7 @@ fn check_pressure(snapshot: &MemorySnapshot, growth: u64) -> Result<(), MemoryEr
     // Clean-looking file pages remain charged until the kernel actually reclaims them
     let available = headroom
         .saturating_sub(snapshot.working_sets.reserved_bytes)
-        .saturating_sub(limit / SAFETY_MARGIN_DIVISOR);
+        .saturating_sub(limit / MEMORY_SAFETY_MARGIN_DIVISOR);
     if growth > available {
         return Err(MemoryError::Pressure {
             available,

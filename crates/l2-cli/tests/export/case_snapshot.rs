@@ -68,13 +68,14 @@ impl SnapshotFile for ObservedFile {
 fn constrained_budget(
     maximum: Option<u64>,
     high: Option<u64>,
+    current: u64,
 ) -> Result<MemoryBudget, Box<dyn Error>> {
     let budget = MemoryBudget::new(16 * 1024 * 1024);
     budget.observe_system_memory(Some(SystemMemorySnapshot {
         process_rss_bytes: 0,
         process_peak_rss_bytes: 0,
         cgroup: Some(CgroupMemorySnapshot {
-            current_bytes: 0,
+            current_bytes: current,
             peak_bytes: None,
             anonymous_bytes: None,
             file_bytes: None,
@@ -85,8 +86,8 @@ fn constrained_budget(
             inactive_file_bytes: None,
             effective_max_bytes: maximum,
             effective_high_bytes: high,
-            max_headroom_bytes: maximum,
-            high_headroom_bytes: high,
+            max_headroom_bytes: maximum.map(|limit| limit.saturating_sub(current)),
+            high_headroom_bytes: high.map(|limit| limit.saturating_sub(current)),
             events: CgroupMemoryEvents::default(),
         }),
     }))?;
@@ -116,7 +117,7 @@ fn constrained_snapshot_reads_advise_only_consumed_files_even_when_invalid() -> 
             graph.file.seek(SeekFrom::Start(0))?;
             graph.file.write_all(&[0])?;
         }
-        let budget = constrained_budget(maximum, high)?;
+        let budget = constrained_budget(maximum, high, 13 * 1024 * 1024)?;
         let restored = read_files(&mut graph, &mut blobs, usage, limits, Some(&budget));
         assert_eq!(restored.is_err(), damaged);
         if let Ok(restored) = restored {
@@ -131,7 +132,7 @@ fn constrained_snapshot_reads_advise_only_consumed_files_even_when_invalid() -> 
 
 #[cfg(target_os = "linux")]
 #[test]
-fn snapshot_reads_do_not_advise_pages_without_a_finite_observed_cgroup_limit() -> TestResult {
+fn snapshot_reads_keep_cached_pages_when_unconstrained_or_headroom_is_ample() -> TestResult {
     let directory = tempfile::tempdir()?;
     let limits = CaseSnapshotLimits::new(16 * 1024 * 1024, 16 * 1024 * 1024);
     let mut graph = ObservedFile {
@@ -146,7 +147,8 @@ fn snapshot_reads_do_not_advise_pages_without_a_finite_observed_cgroup_limit() -
     let usage = write_files(&mut graph.file, &mut blobs.file, &expected, limits, None)?;
     for budget in [
         MemoryBudget::new(16 * 1024 * 1024),
-        constrained_budget(None, None)?,
+        constrained_budget(None, None, 0)?,
+        constrained_budget(Some(8 * 1024 * 1024 * 1024), None, 0)?,
     ] {
         assert_eq!(
             read_files(&mut graph, &mut blobs, usage, limits, Some(&budget))?,
@@ -155,6 +157,45 @@ fn snapshot_reads_do_not_advise_pages_without_a_finite_observed_cgroup_limit() -
     }
     assert_eq!(graph.release_calls, 0);
     assert_eq!(blobs.release_calls, 0);
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn snapshot_advice_requires_fresh_low_cgroup_headroom_and_includes_active_reservations()
+-> TestResult {
+    let budget = constrained_budget(Some(8 * 1024 * 1024 * 1024), None, 0)?;
+    let mut snapshot = budget.snapshot()?;
+    assert!(!crate::case_snapshot::should_advise_snapshot_pages(
+        &snapshot
+    ));
+    let mut system = snapshot.system.ok_or("missing system memory sample")?;
+    let mut cgroup = system.cgroup.ok_or("missing cgroup sample")?;
+    cgroup.max_headroom_bytes = Some(snapshot.limit_bytes / 4);
+    system.cgroup = Some(cgroup);
+    snapshot.system = Some(system);
+    assert!(crate::case_snapshot::should_advise_snapshot_pages(
+        &snapshot
+    ));
+    snapshot.system_sample_age_ms = Some(10_000);
+    assert!(!crate::case_snapshot::should_advise_snapshot_pages(
+        &snapshot
+    ));
+    snapshot.system_sample_age_ms = None;
+    assert!(!crate::case_snapshot::should_advise_snapshot_pages(
+        &snapshot
+    ));
+    let active = budget.try_working_set(1024 * 1024)?;
+    snapshot = budget.snapshot()?;
+    let mut system = snapshot.system.ok_or("missing system memory sample")?;
+    let mut cgroup = system.cgroup.ok_or("missing cgroup sample")?;
+    cgroup.max_headroom_bytes = Some(snapshot.limit_bytes / 4 + 512 * 1024);
+    system.cgroup = Some(cgroup);
+    snapshot.system = Some(system);
+    assert!(crate::case_snapshot::should_advise_snapshot_pages(
+        &snapshot
+    ));
+    drop(active);
     Ok(())
 }
 

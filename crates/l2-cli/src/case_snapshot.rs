@@ -1,6 +1,8 @@
 //! Shared descriptor-based storage for exact cached Case snapshots
 
 use crate::input;
+#[cfg(target_os = "linux")]
+use l2_workbench::job::MemorySnapshot;
 use l2_workbench::{
     evidence::{Case, CaseSnapshotLimits, CaseSnapshotUsage},
     job::{
@@ -67,11 +69,36 @@ fn advise_file(file: &impl std::os::fd::AsFd) {
 fn constrained_cgroup(budget: Option<&MemoryBudget>) -> bool {
     budget
         .and_then(|budget| budget.snapshot().ok())
-        .and_then(|snapshot| snapshot.system)
-        .and_then(|system| system.cgroup)
-        .is_some_and(|cgroup| {
-            cgroup.effective_max_bytes.is_some() || cgroup.effective_high_bytes.is_some()
-        })
+        .is_some_and(|snapshot| should_advise_snapshot_pages(&snapshot))
+}
+
+#[cfg(target_os = "linux")]
+/// Return whether a fresh cgroup sample leaves little headroom for new work
+pub fn should_advise_snapshot_pages(snapshot: &MemorySnapshot) -> bool {
+    if snapshot.system_sample_age_ms.is_none_or(|age| {
+        std::time::Duration::from_millis(age) > crate::recovery_job::MAX_MEMORY_SAMPLE_AGE
+    }) {
+        return false;
+    }
+    let Some(cgroup) = snapshot.system.and_then(|system| system.cgroup) else {
+        return false;
+    };
+    [
+        (cgroup.effective_max_bytes, cgroup.max_headroom_bytes),
+        (cgroup.effective_high_bytes, cgroup.high_headroom_bytes),
+    ]
+    .into_iter()
+    .any(|(limit, headroom)| {
+        let (Some(limit), Some(headroom)) = (limit, headroom) else {
+            return false;
+        };
+        // Leave twice the admission safety margin plus active workers' future growth
+        let threshold = (snapshot.limit_bytes.min(limit)
+            / crate::recovery_job::MEMORY_SAFETY_MARGIN_DIVISOR)
+            .saturating_mul(2)
+            .saturating_add(snapshot.working_sets.reserved_bytes);
+        headroom <= threshold
+    })
 }
 
 pub fn read(

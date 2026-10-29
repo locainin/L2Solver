@@ -20,6 +20,10 @@ use std::{
 
 /// Cadence for kernel observations and admission rechecks after workers have stopped
 pub const MEMORY_OBSERVATION_INTERVAL: Duration = Duration::from_millis(250);
+/// Four missed monitor intervals make an old sample unsuitable for pressure decisions
+pub const MAX_MEMORY_SAMPLE_AGE: Duration = MEMORY_OBSERVATION_INTERVAL.saturating_mul(4);
+/// Fraction of the effective limit kept for allocations outside the shared ledger
+pub const MEMORY_SAFETY_MARGIN_DIVISOR: u64 = 8;
 
 /// Refresh the shared observation before admitting another memory-intensive operation
 pub fn refresh_memory_observation(memory: &MemoryBudget) -> Result<(), MemoryError> {
