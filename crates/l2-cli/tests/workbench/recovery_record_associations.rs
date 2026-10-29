@@ -188,7 +188,7 @@ fn assert_edge_quota_failure(
     outcome: &RecoveryExecutionOutcome,
     input_node_id: u64,
 ) -> TestResult<()> {
-    assert_eq!(case, before, "failed assembly transaction must roll back");
+    assert!(case == before, "failed assembly transaction must roll back");
     let candidate = selected_record_candidate(outcome, &test_support::test_schema())?;
     assert!(matches!(
         candidate.state(),
@@ -223,8 +223,12 @@ fn assert_edge_quota_failure(
 #[test]
 fn edge_quota_rolls_back_assembly_and_all_report_association_links() -> TestResult<()> {
     let (mut baseline, baseline_input) = test_support::record_case()?;
+    let baseline_reports = [
+        test_support::add_report(&mut baseline, "first report")?,
+        test_support::add_report(&mut baseline, "second report")?,
+    ];
     let before_edges = baseline.edges().len();
-    run_without_reports(&mut baseline, baseline_input, None)?;
+    run_record_with_reports(&mut baseline, baseline_input, &baseline_reports, None, None)?;
     let assembly_edge_work = baseline
         .edges()
         .len()
@@ -236,9 +240,10 @@ fn edge_quota_rolls_back_assembly_and_all_report_association_links() -> TestResu
         test_support::add_report(&mut case, "first report")?,
         test_support::add_report(&mut case, "second report")?,
     ];
+    // Leave one fewer edge than this exact discovered assembly and its links need
     let free_edges = assembly_edge_work
-        .checked_add(1)
-        .ok_or("record assembly edge allowance overflowed")?;
+        .checked_sub(1)
+        .ok_or("record assembly did not require an edge")?;
     let edge_target = l2_workbench::evidence::MAX_EDGES
         .checked_sub(free_edges)
         .ok_or("record assembly edge allowance exceeds Case quota")?;
