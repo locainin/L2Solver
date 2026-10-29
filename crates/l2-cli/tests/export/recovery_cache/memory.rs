@@ -1,18 +1,22 @@
 use super::{
     RecoveryCaseKind, RecoveryContext, RecoveryOptions, case_and_scope, open_cache, recover,
 };
-use l2_workbench::job::{
-    MemoryBudget, MemoryClass,
-    cache::{Cache, CacheEntry, CacheReadPolicy},
+use l2_workbench::{
+    evidence::Case,
+    job::{
+        MemoryBudget, MemoryClass,
+        cache::{Cache, CacheEntry, CacheReadPolicy},
+    },
 };
+use serde_json::Value;
 use std::error::Error;
 
-fn cached_case_with_omissions(
+fn recovery_with_omissions(
     cache: &Cache,
     options: &RecoveryOptions,
     count: usize,
     length: usize,
-) -> Result<CacheEntry, Box<dyn Error>> {
+) -> Result<(Case, Value, super::super::CachedRecovery), Box<dyn Error>> {
     let (mut case, scope) = case_and_scope(b"4142", 93)?;
     let mut recovery = recover(
         &mut case,
@@ -27,11 +31,53 @@ fn cached_case_with_omissions(
     )?;
     recovery.omissions = (0..count).map(|_| "o".repeat(length)).collect();
     recovery.coverage.omissions = u64::try_from(count)?;
+    Ok((case, scope, recovery))
+}
+
+fn cached_case_with_omissions(
+    cache: &Cache,
+    options: &RecoveryOptions,
+    count: usize,
+    length: usize,
+) -> Result<CacheEntry, Box<dyn Error>> {
+    let (case, scope, recovery) = recovery_with_omissions(cache, options, count, length)?;
     let key = super::super::recovery_key(RecoveryCaseKind::Flow, &scope, options)?;
     super::super::store_result(cache.lease(&key)?, &case, &recovery, options, None)?;
     cache
         .lookup(&key, CacheReadPolicy::AllowPartial)?
         .ok_or_else(|| "cached recovery fixture was not published".into())
+}
+
+#[test]
+fn oversized_metadata_copy_is_rejected_before_replacing_the_cached_result()
+-> Result<(), Box<dyn Error>> {
+    let temporary = tempfile::tempdir()?;
+    let cache = open_cache(temporary.path())?;
+    let options = RecoveryOptions::default();
+    let (case, scope, recovery) = recovery_with_omissions(&cache, &options, 800, 4096)?;
+    let key = super::super::recovery_key(RecoveryCaseKind::Flow, &scope, &options)?;
+    let previous = cache
+        .lookup(&key, CacheReadPolicy::AllowPartial)?
+        .ok_or("initial recovery was not cached")?
+        .metadata()
+        .clone();
+    let budget = MemoryBudget::new(3 * 1024 * 1024);
+    let error = super::super::store_result(
+        cache.lease(&key)?,
+        &case,
+        &recovery,
+        &options,
+        Some(&budget),
+    )
+    .err()
+    .ok_or("oversized cached metadata bypassed memory admission")?;
+    assert!(crate::memory_error::find(error.as_ref()).is_some());
+    assert_eq!(budget.snapshot()?.used_bytes, 0);
+    let current = cache
+        .lookup(&key, CacheReadPolicy::AllowPartial)?
+        .ok_or("the previous cached result was lost")?;
+    assert_eq!(current.metadata(), &previous);
+    Ok(())
 }
 
 #[test]
@@ -54,6 +100,14 @@ fn restored_omissions_remain_charged_after_the_case_is_dropped() -> Result<(), B
         Some(&budget),
     )?;
     drop(case);
+    assert_eq!(recovery.omissions.len(), 128);
+    assert!(
+        recovery
+            .omissions
+            .iter()
+            .all(|text| text.len() == 2048 && text.bytes().all(|byte| byte == b'o')),
+        "cached omission text must survive the metadata copy"
+    );
     let allocated = recovery.omissions.capacity() * size_of::<String>()
         + recovery
             .omissions

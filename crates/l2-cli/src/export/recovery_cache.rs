@@ -1,5 +1,6 @@
 //! Cache exact per-scope default recovery results
 
+mod metadata_memory;
 mod omissions;
 
 use super::coverage::{RecoveryCaseKind, RecoveryCoverage};
@@ -447,12 +448,14 @@ fn store_result(
     memory: Option<&MemoryBudget>,
 ) -> Result<()> {
     let usage = crate::case_snapshot::write(&lease, case, snapshot_limits(options), memory)?;
-    let metadata = serde_json::to_value(RecoveryMetadataRef {
+    let metadata = RecoveryMetadataRef {
         coverage: &result.coverage,
         omissions: &result.omissions,
         case_storage_format: CASE_SNAPSHOT_FORMAT,
         case_snapshot_usage: &usage,
-    })?;
+    };
+    // The JSON value owns its own copy before the cache takes over its accounting
+    let (metadata, _metadata_memory) = metadata_memory::encode(&metadata, memory)?;
     let status = if result.coverage.is_complete() {
         StageStatus::Complete
     } else {
