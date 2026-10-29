@@ -54,6 +54,24 @@ jobs:
           cargo build --locked --release --package l2-cli
           --target x86_64-unknown-linux-gnu
 
+      - name: Install completion shells
+        shell: bash
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends fish zsh
+
+      - name: Check generated completion syntax
+        shell: bash
+        run: |
+          for shell in bash zsh fish; do
+            completion=$(target/x86_64-unknown-linux-gnu/release/l2solver completions "$shell")
+            if [[ -z "$completion" ]]; then
+              printf 'empty %s completion script\n' "$shell" >&2
+              exit 1
+            fi
+            printf '%s\n' "$completion" | "$shell" -n
+          done
+
       - name: Install pinned cargo-deny
         run: cargo install cargo-deny --locked --version 0.19.0
 
