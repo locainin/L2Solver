@@ -183,6 +183,32 @@ impl PendingCase {
         Ok(Self { item, kind, scope })
     }
 
+    fn recover(
+        &mut self,
+        context: &RecoveryContext<'_>,
+        memory: Option<&MemoryBudget>,
+    ) -> Result<CachedRecovery, WorkerFailure> {
+        // Cache work spends the same admitted credit as this Case's recovery
+        let worker_cache = context
+            .cache
+            .zip(memory)
+            .map(|(cache, memory)| cache.with_memory_scope(memory))
+            .transpose()
+            .map_err(|error| classify_worker_error(&error))?;
+        let worker_context = RecoveryContext {
+            memory,
+            cache: worker_cache.as_ref().or(context.cache),
+            ..*context
+        };
+        recover(
+            case_mut(&mut self.item),
+            self.kind,
+            &self.scope,
+            &worker_context,
+        )
+        .map_err(|error| classify_worker_error(error.as_ref()))
+    }
+
     pub(super) const fn progress_counter(&self) -> Option<Counter> {
         match &self.item {
             workbench::full_source::FullSourceItem::Flow(_) => Some(Counter::Flows),
@@ -227,27 +253,11 @@ pub(super) fn process_case_batch(
         pool,
         items,
         |(_, pending), active| admission::admit(pending, active, context),
-        |(index, pending), working_set| {
-            let worker_cache = match (context.cache, working_set.memory()) {
-                (Some(cache), Some(memory)) => Some(
-                    cache
-                        .with_memory_scope(memory)
-                        .map_err(|error| classify_worker_error(&error))?,
-                ),
-                _ => None,
-            };
-            let worker_context = RecoveryContext {
-                memory: working_set.memory(),
-                cache: worker_cache.as_ref().or(context.cache),
-                ..*context
-            };
+        |(index, mut pending), working_set| {
+            let recovery = pending.recover(context, working_set.memory())?;
             let PendingCase {
-                mut item,
-                kind,
-                scope,
+                mut item, scope, ..
             } = pending;
-            let recovery = recover(case_mut(&mut item), kind, &scope, &worker_context)
-                .map_err(|error| classify_worker_error(error.as_ref()))?;
             let retained_bytes = case_mut(&mut item).charged_memory_bytes().unwrap_or(0);
             let spill = index > next.load(Ordering::Acquire) && retained_bytes > resident_limit;
             let mut observation = None;
@@ -258,7 +268,7 @@ pub(super) fn process_case_batch(
                             result,
                             temporary_parent,
                             snapshot_limits,
-                            worker_context.memory,
+                            working_set.memory(),
                         )?
                     } else {
                         BufferedResult::Resident(Box::new(result))
