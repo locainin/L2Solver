@@ -298,3 +298,40 @@ fn verified_generation_streams_restore_exact_charged_case() -> TestResult {
     assert_eq!(budget.snapshot()?.used_bytes, 0);
     Ok(())
 }
+
+#[test]
+fn understated_snapshot_receipt_stops_decoding_before_the_full_graph_is_allocated() -> TestResult {
+    let mut case = source_case()?;
+    let payload = "x".repeat(2048);
+    for index in 0..3000 {
+        case.add_node(
+            "receipt_regression",
+            None,
+            Vec::new(),
+            json!({"index": index, "payload": &payload}),
+        )?;
+    }
+    let limits = CaseSnapshotLimits::new(64 * 1024 * 1024, 64 * 1024 * 1024);
+    let mut graph = Vec::new();
+    let mut blobs = Vec::new();
+    let mut usage = write_streams(&mut graph, &mut blobs, &case, limits, None)?;
+    assert!(usage.graph_decoded_bytes > 6 * 1024 * 1024);
+    usage.graph_decoded_bytes = 1024;
+    let budget = MemoryBudget::new(64 * 1024 * 1024);
+    assert!(
+        read_streams(
+            &mut graph.as_slice(),
+            &mut blobs.as_slice(),
+            usage,
+            limits,
+            Some(&budget),
+        )
+        .is_err()
+    );
+    assert!(
+        budget.snapshot()?.peak_bytes < 3 * 1024 * 1024,
+        "an understated receipt must bound allocations during decoding"
+    );
+    assert_eq!(budget.snapshot()?.used_bytes, 0);
+    Ok(())
+}

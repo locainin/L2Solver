@@ -159,14 +159,16 @@ pub fn read_streams(
     if decoded > limits.maximum_decoded_bytes() || stored > limits.maximum_storage_bytes() {
         return Err(invalid("cached Case snapshot exceeds its size limit"));
     }
+    // Reject an understated receipt before decoding beyond its declared allocation bound
+    let receipt_limits = CaseSnapshotLimits::new(stored, decoded);
 
     let _scratch = budget
         .map(|budget| budget.try_reserve(MemoryClass::Cache, CODEC_SCRATCH_BYTES))
         .transpose()?;
     let (case, actual) = if let Some(budget) = budget {
-        Case::from_snapshot_with_memory(graph, blobs, limits, budget)?
+        Case::from_snapshot_with_memory(graph, blobs, receipt_limits, budget)?
     } else {
-        Case::from_snapshot(graph, blobs, limits)?
+        Case::from_snapshot(graph, blobs, receipt_limits)?
     };
     if actual != usage {
         return Err(invalid(
