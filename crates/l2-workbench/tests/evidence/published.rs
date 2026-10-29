@@ -12,6 +12,9 @@ use std::{
 
 type TestResult = Result<(), Box<dyn Error>>;
 
+#[path = "published_blob_references.rs"]
+mod blob_references;
+
 fn write_published_case<W: Write>(
     case: &Case,
     scope: &Value,
@@ -175,7 +178,7 @@ fn normalized_roundtrip_preserves_canonical_bytes_and_case_identity() -> TestRes
     let usage = write_published_case(&case, &scope, 2, &mut normalized)?;
     let mut decoded = Vec::new();
     decode_published_evidence(
-        4,
+        5,
         Cursor::new(&normalized),
         &mut decoded,
         PublishedEvidenceLimits::new(64 * 1024 * 1024, 16 * 1024 * 1024),
@@ -211,7 +214,7 @@ fn version_three_fixture_remains_readable_after_compact_node_encoding() -> TestR
 }
 
 #[test]
-fn writer_emits_compact_version_four_details_and_preserves_the_canonical_graph() -> TestResult {
+fn writer_emits_compact_version_five_details_and_preserves_the_canonical_graph() -> TestResult {
     let case = fixture()?;
     let scope = json!({"kind":"flow","flow_id":9});
     let (_, expected) = canonical(&case, &scope, 1)?;
@@ -222,7 +225,7 @@ fn writer_emits_compact_version_four_details_and_preserves_the_canonical_graph()
         .map(serde_json::from_str::<Value>)
         .collect::<Result<Vec<_>, _>>()?;
     let header = records.first().ok_or("header is missing")?;
-    assert_eq!(header.pointer("/value/version"), Some(&json!(4)));
+    assert_eq!(header.pointer("/value/version"), Some(&json!(5)));
     let node = records
         .iter()
         .find(|record| record.get("record") == Some(&json!("node")))
@@ -230,7 +233,7 @@ fn writer_emits_compact_version_four_details_and_preserves_the_canonical_graph()
     assert!(node.pointer("/value/4").and_then(Value::as_array).is_some());
     let mut decoded = Vec::new();
     decode_published_evidence(
-        4,
+        5,
         Cursor::new(encoded),
         &mut decoded,
         PublishedEvidenceLimits::new(1_000_000, 100_000),
@@ -257,7 +260,7 @@ fn compact_details_roundtrip_empty_and_non_object_json_values() -> TestResult {
     write_published_case(&case, &scope, 1, &mut encoded)?;
     let mut decoded = Vec::new();
     decode_published_evidence(
-        4,
+        5,
         Cursor::new(encoded),
         &mut decoded,
         PublishedEvidenceLimits::new(1_000_000, 100_000),
@@ -292,7 +295,7 @@ fn repeated_receipt_object_shapes_are_shared_and_roundtrip_exactly() -> TestResu
     assert!(std::str::from_utf8(&encoded)?.contains("\"schema_payload\""));
     let mut decoded = Vec::new();
     decode_published_evidence(
-        4,
+        5,
         Cursor::new(encoded),
         &mut decoded,
         PublishedEvidenceLimits::new(1_000_000, 500_000),
@@ -322,7 +325,7 @@ fn schema_receipts_keep_duplicate_keys_empty_objects_and_scalar_roots() -> TestR
         write_published_case(&case, &json!({}), 1, &mut encoded)?;
         let mut decoded = Vec::new();
         decode_published_evidence(
-            4,
+            5,
             Cursor::new(encoded),
             &mut decoded,
             PublishedEvidenceLimits::new(1_000_000, 100_000),
@@ -348,7 +351,7 @@ fn deeply_nested_receipt_uses_inline_payload_and_roundtrips() -> TestResult {
     assert!(!std::str::from_utf8(&encoded)?.contains("\"schema_payload\""));
     let mut decoded = Vec::new();
     decode_published_evidence(
-        4,
+        5,
         Cursor::new(encoded),
         &mut decoded,
         PublishedEvidenceLimits::new(1_000_000, 100_000),
@@ -381,7 +384,7 @@ fn schema_depth_boundary_and_quoted_brackets_are_handled_correctly() -> TestResu
         );
         let mut decoded = Vec::new();
         decode_published_evidence(
-            4,
+            5,
             Cursor::new(encoded),
             &mut decoded,
             PublishedEvidenceLimits::new(1_000_000, 100_000),
@@ -413,7 +416,7 @@ fn receipt_shapes_beyond_the_dictionary_cap_remain_inline_and_roundtrip() -> Tes
     );
     let mut decoded = Vec::new();
     decode_published_evidence(
-        4,
+        5,
         Cursor::new(encoded),
         &mut decoded,
         PublishedEvidenceLimits::new(1_000_000, 500_000),
@@ -440,7 +443,7 @@ fn decoder_rejects_missing_receipt_schema_and_field_values() -> TestResult {
         let invalid = replace_record_value(&encoded, "blob", "/value/schema_payload/root", root)?;
         assert!(
             decode_published_evidence(
-                4,
+                5,
                 Cursor::new(invalid),
                 Vec::new(),
                 PublishedEvidenceLimits::new(1_000_000, 100_000)
@@ -507,7 +510,7 @@ fn normalized_nodes_share_repeated_description_strings_without_losing_values() -
     );
     let mut decoded = Vec::new();
     decode_published_evidence(
-        4,
+        5,
         Cursor::new(normalized),
         &mut decoded,
         PublishedEvidenceLimits::new(1_000_000, 100_000),
@@ -531,7 +534,7 @@ fn noncanonical_receipt_json_keeps_the_canonical_v2_identity_and_payload() -> Te
     let usage = write_published_case(&case, &scope, 1, &mut normalized)?;
     let mut decoded = Vec::new();
     decode_published_evidence(
-        4,
+        5,
         Cursor::new(normalized),
         &mut decoded,
         PublishedEvidenceLimits::new(1_000_000, 100_000),
@@ -563,7 +566,7 @@ fn nested_receipt_scalars_and_duplicate_keys_match_legacy_canonical_json() -> Te
         write_published_case(&case, &scope, 1, &mut normalized)?;
         let mut decoded = Vec::new();
         decode_published_evidence(
-            4,
+            5,
             Cursor::new(normalized),
             &mut decoded,
             PublishedEvidenceLimits::new(1_000_000, 100_000),
@@ -581,7 +584,7 @@ fn decoder_rejects_reordered_case_ordinals() -> TestResult {
     write_published_case(&case, &json!({}), 1, &mut encoded)?;
     assert!(
         decode_published_evidence(
-            4,
+            5,
             Cursor::new(encoded),
             Vec::new(),
             PublishedEvidenceLimits::new(1_000_000, 100_000)
@@ -633,7 +636,7 @@ fn decoder_rejects_a_forged_case_with_an_invalid_source_id() -> TestResult {
         serde_json::to_writer(&mut forged, &record)?;
         forged.push(b'\n');
     }
-    assert!(decode_published_evidence(4, Cursor::new(forged), Vec::new(), limits).is_err());
+    assert!(decode_published_evidence(5, Cursor::new(forged), Vec::new(), limits).is_err());
     Ok(())
 }
 
@@ -643,10 +646,10 @@ fn decoder_rejects_dangling_references_truncation_and_limits() -> TestResult {
     write_published_case(&fixture()?, &json!({}), 1, &mut encoded)?;
     let invalid = replace_record_value(&encoded, "edge", "/value/2", json!(999_999))?;
     let limits = PublishedEvidenceLimits::new(64 * 1024 * 1024, 16 * 1024 * 1024);
-    assert!(decode_published_evidence(4, Cursor::new(invalid), Vec::new(), limits).is_err());
+    assert!(decode_published_evidence(5, Cursor::new(invalid), Vec::new(), limits).is_err());
     assert!(
         decode_published_evidence(
-            4,
+            5,
             Cursor::new(
                 encoded
                     .get(..encoded.len().saturating_sub(1))
@@ -659,7 +662,7 @@ fn decoder_rejects_dangling_references_truncation_and_limits() -> TestResult {
     );
     assert!(
         decode_published_evidence(
-            4,
+            5,
             Cursor::new(&encoded),
             Vec::new(),
             PublishedEvidenceLimits::new(32, 32)
@@ -676,7 +679,7 @@ fn decoder_rejects_a_source_range_with_a_missing_source_reference() -> TestResul
     let invalid = replace_record_value(&encoded, "node", "/value/3/0/0", json!(999_999))?;
     assert!(
         decode_published_evidence(
-            4,
+            5,
             Cursor::new(invalid),
             Vec::new(),
             PublishedEvidenceLimits::new(1_000_000, 100_000)
@@ -693,7 +696,7 @@ fn decoder_stops_reading_when_the_stream_limit_is_reached() -> TestResult {
     let mut input = Cursor::new(encoded);
     assert!(
         decode_published_evidence(
-            4,
+            5,
             &mut input,
             Vec::new(),
             PublishedEvidenceLimits::new(32, 16 * 1024 * 1024),

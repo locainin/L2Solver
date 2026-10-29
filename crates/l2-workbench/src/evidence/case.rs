@@ -1323,6 +1323,10 @@ impl Case {
             .and_then(|index| self.blobs.get(*index))
     }
 
+    pub(super) fn blob_position(&self, id: &str) -> Option<usize> {
+        self.blob_index.get(id).copied()
+    }
+
     pub(crate) fn has_edge(
         &self,
         from: u64,

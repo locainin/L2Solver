@@ -10,18 +10,22 @@ use super::super::{
 use super::{
     PublishedEvidenceLimits,
     canonical::{CountWriter, HASH_DOMAIN, PLACEHOLDER},
-    format::{Counts, Details, Header, LEGACY_VERSION, Record, VERSION, expand_compact_details},
+    format::{
+        BlobReference, COMPACT_VERSION, Counts, Details, Header, LEGACY_VERSION, Record, VERSION,
+        expand_compact_details,
+    },
 };
 use serde::Serialize;
 use sha2::{Digest, Sha256};
 use std::{
     collections::{HashMap, HashSet},
     io::{self, BufRead, Read, Write},
+    rc::Rc,
 };
 
 /// Decode supported published records to canonical version-two JSON Lines
 ///
-/// Versions three and four check record order, references, ranges, declared counts, and Case IDs
+/// Versions three through five check record order, references, ranges, declared counts, and Case IDs
 /// Version two is parsed as a stream and copied without changing its bytes. A caller that
 /// persists the output should publish it only after this function succeeds
 ///
@@ -39,7 +43,9 @@ pub fn decode_published_evidence<R: BufRead, W: Write>(
     }
     match version {
         2 => decode_legacy(input, output, limits.maximum_stream_bytes),
-        LEGACY_VERSION | VERSION => decode_normalized(input, output, limits, version),
+        LEGACY_VERSION | COMPACT_VERSION | VERSION => {
+            decode_normalized(input, output, limits, version)
+        }
         _ => Err(io::Error::other("unsupported published evidence version")),
     }
 }
@@ -168,13 +174,56 @@ fn read_sources<R: BufRead, W: Write>(
     Ok(sources)
 }
 
+struct Blobs {
+    lengths: HashMap<Rc<str>, usize>,
+    ordered: Vec<Rc<str>>,
+}
+
+impl Blobs {
+    fn resolve_reference(
+        &self,
+        reference: Option<BlobReference>,
+        version: u32,
+    ) -> io::Result<Option<String>> {
+        match reference {
+            None => Ok(None),
+            Some(BlobReference::Id(id)) => {
+                if !self.lengths.contains_key(id.as_str()) {
+                    return Err(invalid("missing node blob"));
+                }
+                Ok(Some(id))
+            }
+            Some(BlobReference::Index(index)) if version == VERSION => Ok(Some(
+                self.ordered
+                    .get(index)
+                    .ok_or_else(|| invalid("missing node blob reference"))?
+                    .to_string(),
+            )),
+            Some(BlobReference::Index(_)) => {
+                Err(invalid("node blob reference requires version five"))
+            }
+        }
+    }
+}
+
 fn read_blobs<R: BufRead, W: Write>(
     reader: &mut RecordReader<R>,
     canonical: &mut CanonicalWriter<'_, W>,
     header: &Header,
     sources: &[Source],
-) -> io::Result<HashMap<String, usize>> {
-    let mut blobs = HashMap::with_capacity(header.counts.blobs);
+) -> io::Result<Blobs> {
+    let mut blobs = Blobs {
+        lengths: HashMap::new(),
+        ordered: Vec::new(),
+    };
+    blobs
+        .lengths
+        .try_reserve(header.counts.blobs)
+        .map_err(io::Error::other)?;
+    blobs
+        .ordered
+        .try_reserve_exact(header.counts.blobs)
+        .map_err(io::Error::other)?;
     for index in 0..header.counts.blobs {
         let Record::Blob(blob) = reader.required()? else {
             return Err(invalid("expected blob record"));
@@ -183,16 +232,24 @@ fn read_blobs<R: BufRead, W: Write>(
         if header.version == LEGACY_VERSION && blob.schema_payload.is_some() {
             return Err(invalid("version three cannot contain schema payloads"));
         }
-        if blobs.insert(blob.id.clone(), blob.byte_length).is_some() {
+        let id = Rc::<str>::from(blob.id.as_str());
+        if blobs
+            .lengths
+            .insert(Rc::clone(&id), blob.byte_length)
+            .is_some()
+        {
             return Err(invalid("duplicate evidence blob"));
         }
+        // Share the validated ID between ordered and keyed lookups
+        blobs.ordered.push(id);
         comma(canonical, index)?;
         json(canonical, &blob)?;
     }
     for source in sources {
         if let Some(id) = &source.blob {
             let size = blobs
-                .get(id)
+                .lengths
+                .get(id.as_str())
                 .ok_or_else(|| invalid("missing source blob"))?;
             if id != &source.id || u64::try_from(*size).ok() != Some(source.length) {
                 return Err(invalid("source blob identity or size differs"));
@@ -207,7 +264,7 @@ fn read_nodes<R: BufRead, W: Write>(
     canonical: &mut CanonicalWriter<'_, W>,
     header: &Header,
     sources: &[Source],
-    blobs: &HashMap<String, usize>,
+    blobs: &Blobs,
 ) -> io::Result<()> {
     let mut total_ranges = 0_usize;
     let mut total_details = 0_usize;
@@ -218,9 +275,7 @@ fn read_nodes<R: BufRead, W: Write>(
         if u64::try_from(index).ok().and_then(|n| n.checked_add(1)) != Some(record.0) {
             return Err(invalid("noncanonical evidence node ID"));
         }
-        if record.2.as_ref().is_some_and(|id| !blobs.contains_key(id)) {
-            return Err(invalid("missing node blob"));
-        }
+        let blob = blobs.resolve_reference(record.2, header.version)?;
         total_ranges = total_ranges
             .checked_add(record.3.len())
             .ok_or_else(|| invalid("range count overflow"))?;
@@ -256,7 +311,12 @@ fn read_nodes<R: BufRead, W: Write>(
                 serde_json::from_str(record.4.get()).map_err(io::Error::other)?;
             details.expand(&header.strings.0)?
         } else {
-            expand_compact_details(&record.4, &header.strings.0)?
+            expand_compact_details(
+                &record.4,
+                &header.strings.0,
+                blob.as_deref(),
+                header.version,
+            )?
         };
         total_details = total_details
             .checked_add(
@@ -269,7 +329,7 @@ fn read_nodes<R: BufRead, W: Write>(
         let node = Node {
             id: record.0,
             kind: record.1.resolve(&header.strings.0)?,
-            blob: record.2,
+            blob,
             ranges,
             details,
         };

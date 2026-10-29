@@ -138,12 +138,21 @@ fn write_graph<W: Write>(
             values: &node.ranges,
             sources: case.sources(),
         };
+        // Case already indexes blob IDs in their stable serialization order
+        let blob = node
+            .blob
+            .as_deref()
+            .map(|id| {
+                case.blob_position(id)
+                    .ok_or_else(|| io::Error::other("missing node blob"))
+            })
+            .transpose()?;
         let record = (
             node.id,
             dictionary.reference(&node.kind),
-            &node.blob,
+            blob,
             ranges,
-            DetailsRef::new(&node.details, dictionary),
+            DetailsRef::new(&node.details, dictionary, node.blob.as_deref()),
         );
         write_record(output, "node", &record)?;
     }
@@ -239,9 +248,13 @@ impl Serialize for DetailsRef<'_> {
 }
 
 impl<'a> DetailsRef<'a> {
-    const fn new(value: &'a Value, dictionary: &'a Dictionary<'a>) -> Self {
+    fn new(value: &'a Value, dictionary: &'a Dictionary<'a>, blob: Option<&'a str>) -> Self {
         match value {
-            Value::Object(fields) => Self::Object(DetailEntries { fields, dictionary }),
+            Value::Object(fields) => Self::Object(DetailEntries {
+                fields,
+                dictionary,
+                digest: blob.and_then(|id| id.strip_prefix("sha256:")),
+            }),
             _ => Self::Value(value),
         }
     }
@@ -250,6 +263,7 @@ impl<'a> DetailsRef<'a> {
 struct DetailEntries<'a> {
     fields: &'a serde_json::Map<String, Value>,
     dictionary: &'a Dictionary<'a>,
+    digest: Option<&'a str>,
 }
 
 impl Serialize for DetailEntries<'_> {
@@ -258,6 +272,9 @@ impl Serialize for DetailEntries<'_> {
         for (key, value) in self.fields {
             let key = self.dictionary.reference(key);
             match value {
+                Value::String(text) if self.digest == Some(text.as_str()) => {
+                    sequence.serialize_element(&(key, 2_u8, Option::<u8>::None))?;
+                }
                 Value::String(text) => {
                     sequence.serialize_element(&(key, 0_u8, self.dictionary.reference(text)))?;
                 }

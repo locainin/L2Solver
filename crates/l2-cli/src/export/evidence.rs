@@ -13,7 +13,7 @@ use std::{
 };
 
 pub(super) const SIDECAR_FILE_NAME: &str = "evidence.jsonl.gz";
-pub(super) const ENCODING_VERSION: u32 = 4;
+pub(super) const ENCODING_VERSION: u32 = 5;
 // Compression can change which whole Cases fit without changing the record format
 pub(super) const COMPRESSION_POLICY_VERSION: u32 = 2;
 // Level 3 reduces repeated evidence while retaining a fast streaming encoder

@@ -9,7 +9,8 @@ use serde_json::{Value, value::RawValue};
 use std::{fmt, io};
 
 pub(super) const LEGACY_VERSION: u32 = 3;
-pub(super) const VERSION: u32 = 4;
+pub(super) const COMPACT_VERSION: u32 = 4;
+pub(super) const VERSION: u32 = 5;
 pub(super) const MAX_STRINGS: usize = 4096;
 pub(super) const MAX_DICTIONARY_BYTES: usize = 512 * 1024;
 
@@ -166,10 +167,17 @@ impl Text {
 }
 
 #[derive(Deserialize)]
+#[serde(untagged)]
+pub(super) enum BlobReference {
+    Index(usize),
+    Id(String),
+}
+
+#[derive(Deserialize)]
 pub(super) struct Node(
     pub(super) u64,
     pub(super) Text,
-    pub(super) Option<String>,
+    pub(super) Option<BlobReference>,
     #[serde(deserialize_with = "deserialize_ranges")] pub(super) Vec<Range>,
     pub(super) Box<RawValue>,
 );
@@ -214,7 +222,12 @@ impl<'de> Deserialize<'de> for CompactFields {
     }
 }
 
-pub(super) fn expand_compact_details(raw: &RawValue, dictionary: &[String]) -> io::Result<Value> {
+pub(super) fn expand_compact_details(
+    raw: &RawValue,
+    dictionary: &[String],
+    blob: Option<&str>,
+    version: u32,
+) -> io::Result<Value> {
     let (kind, contents): (u8, Box<RawValue>) =
         serde_json::from_str(raw.get()).map_err(io::Error::other)?;
     match kind {
@@ -231,6 +244,14 @@ pub(super) fn expand_compact_details(raw: &RawValue, dictionary: &[String]) -> i
                             .resolve(dictionary)?,
                     ),
                     1 => serde_json::from_str(value.get()).map_err(io::Error::other)?,
+                    2 if version == VERSION => {
+                        // The marker has no payload, so reject extra data
+                        serde_json::from_str::<()>(value.get()).map_err(io::Error::other)?;
+                        let digest = blob
+                            .and_then(|id| id.strip_prefix("sha256:"))
+                            .ok_or_else(|| io::Error::other("missing evidence blob digest"))?;
+                        Value::String(digest.to_owned())
+                    }
                     _ => return Err(io::Error::other("invalid evidence detail field kind")),
                 };
                 if output.insert(key, value).is_some() {

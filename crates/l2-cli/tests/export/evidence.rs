@@ -341,10 +341,10 @@ fn sidecar_writes_versioned_normalized_records_with_decodable_receipts()
             .ok_or("missing header")?,
     )?;
     assert_eq!(first.get("record"), Some(&json!("header")));
-    assert_eq!(first.pointer("/value/version"), Some(&json!(4)));
+    assert_eq!(first.pointer("/value/version"), Some(&json!(5)));
     let mut decoded = Vec::new();
     l2_workbench::evidence::decode_published_evidence(
-        4,
+        5,
         Cursor::new(raw),
         &mut decoded,
         l2_workbench::evidence::PublishedEvidenceLimits::new(16_000_000, 8_000_000),

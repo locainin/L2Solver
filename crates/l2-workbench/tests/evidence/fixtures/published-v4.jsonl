@@ -1,0 +1,6 @@
+{"record":"header","value":{"version":4,"case_id":"case-0183c09fe228acf3773e71f06a3a745babdd39dbf9b34ab267b65e29699baca9","ordinal":1,"scope":{"kind":"legacy_v4"},"metadata":{"schema_version":1,"collection_complete":true,"blob_byte_limit":null},"strings":["custom_protocol_frame","record_parse_receipt","frame_index","sha256","representation","json_blob"],"counts":{"sources":0,"blobs":2,"nodes":2,"edges":0,"limitations":0}}}
+{"record":"blob","value":{"id":"sha256:642925a558dd1d6150e9e2c4efd923e7ad5d4930e4206d62fb8b2e96077ec783","byte_length":18}}
+{"record":"blob","value":{"id":"sha256:4e6d413d8c212879e8b7dacbaf2435d519cd6a1794c6ee4b318f533ee9dc2521","byte_length":36,"schema_payload":{"schemas":[["groups"],["index"]],"root":[1,0,[[0,[[1,1,[1]],[1,1,[2]]]]]]}}}
+{"record":"node","value":[1,0,"sha256:642925a558dd1d6150e9e2c4efd923e7ad5d4930e4206d62fb8b2e96077ec783",[],[0,[[2,1,0],[3,0,"642925a558dd1d6150e9e2c4efd923e7ad5d4930e4206d62fb8b2e96077ec783"]]]]}
+{"record":"node","value":[2,1,"sha256:4e6d413d8c212879e8b7dacbaf2435d519cd6a1794c6ee4b318f533ee9dc2521",[],[0,[[4,0,5]]]]}
+{"record":"end"}
