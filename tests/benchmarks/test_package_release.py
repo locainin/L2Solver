@@ -5,6 +5,7 @@ import json
 import platform
 import tarfile
 import zlib
+from pathlib import Path
 
 import pytest
 
@@ -39,7 +40,7 @@ def test_package_records_provenance_and_one_checksum_per_deliverable(tmp_path):
     assert checksum.read_text(encoding="ascii") == f"{archive_digest}  {archive.name}\n"
 
     with tarfile.open(archive, "r:gz") as package:
-        assert package.getnames() == ["l2solver", "PROVENANCE.json"]
+        assert package.getnames() == ["l2solver", "PROVENANCE.json", "NOTICE-JEMALLOC.txt"]
         binary_info = package.getmember("l2solver")
         assert binary_info.mode == 0o755
         assert binary_info.mtime == 0
@@ -50,6 +51,15 @@ def test_package_records_provenance_and_one_checksum_per_deliverable(tmp_path):
         provenance_file = package.extractfile("PROVENANCE.json")
         assert provenance_file is not None
         provenance = json.load(provenance_file)
+
+        notice_info = package.getmember("NOTICE-JEMALLOC.txt")
+        assert notice_info.mode == 0o644
+        assert notice_info.mtime == 0
+        notices = package.extractfile(notice_info)
+        assert notices is not None
+        assert notices.read() == (
+            Path(__file__).resolve().parents[2] / "NOTICE-JEMALLOC.txt"
+        ).read_bytes()
 
     assert provenance == {
         "schema_version": 1,
@@ -142,6 +152,52 @@ def test_package_removes_partial_artifact_when_input_changes_during_write(
             lockfile,
             output,
             source_commit="d" * 40,
+            rustc_version="rustc sample",
+            cargo_version="cargo sample",
+        )
+
+    assert not output.exists()
+
+
+@pytest.mark.parametrize("kind", ["missing", "symlink"])
+def test_package_requires_regular_allocator_notices(tmp_path, monkeypatch, kind):
+    binary, lockfile = create_inputs(tmp_path)
+    notices = tmp_path / "allocator-notices"
+    if kind == "symlink":
+        notices.symlink_to(lockfile)
+    monkeypatch.setattr(packager, "NOTICE_PATH", notices)
+    output = tmp_path / "dist"
+
+    expected = FileNotFoundError if kind == "missing" else ValueError
+    with pytest.raises(expected):
+        package_release(
+            binary,
+            lockfile,
+            output,
+            source_commit="e" * 40,
+            rustc_version="rustc sample",
+            cargo_version="cargo sample",
+        )
+
+    assert not output.exists()
+
+
+@pytest.mark.parametrize("byte_length", [0, 64 * 1024 + 1])
+def test_package_rejects_empty_or_oversized_allocator_notices(
+    tmp_path, monkeypatch, byte_length
+):
+    binary, lockfile = create_inputs(tmp_path)
+    notices = tmp_path / "allocator-notices"
+    notices.write_bytes(b"x" * byte_length)
+    monkeypatch.setattr(packager, "NOTICE_PATH", notices)
+    output = tmp_path / "dist"
+
+    with pytest.raises(ValueError, match="notices must contain"):
+        package_release(
+            binary,
+            lockfile,
+            output,
+            source_commit="f" * 40,
             rustc_version="rustc sample",
             cargo_version="cargo sample",
         )

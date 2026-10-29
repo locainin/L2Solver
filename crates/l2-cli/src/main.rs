@@ -2,6 +2,8 @@
 
 #![forbid(unsafe_code)]
 
+#[cfg(target_os = "linux")]
+mod allocator;
 mod baseline;
 mod baseline_model;
 mod bounded_json;

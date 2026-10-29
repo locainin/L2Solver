@@ -1,2 +1,6 @@
 [alias]
 xtask = "run --package xtask --"
+
+[env]
+# Released Case storage must return to the kernel before later workers are admitted
+JEMALLOC_SYS_WITH_MALLOC_CONF = "dirty_decay_ms:0,muzzy_decay_ms:0"

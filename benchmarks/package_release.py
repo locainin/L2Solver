@@ -19,6 +19,7 @@ from pathlib import Path
 TARGET = "x86_64-unknown-linux-gnu"
 ARCHIVE_NAME = f"l2solver-{TARGET}.tar.gz"
 PROVENANCE_NAME = "PROVENANCE.json"
+NOTICE_PATH = Path(__file__).resolve().parents[1] / "NOTICE-JEMALLOC.txt"
 
 
 def _regular_file(path, description, *, executable=False):
@@ -103,6 +104,12 @@ def _write_archive(binary, provenance, archive):
     provenance_bytes = (json.dumps(provenance, indent=2, sort_keys=True) + "\n").encode(
         "utf-8"
     )
+    # Distribute the native allocator and Rust binding notices with the linked executable
+    notice_path, _ = _regular_file(NOTICE_PATH, "allocator notices")
+    with notice_path.open("rb") as source:
+        notices = source.read(64 * 1024 + 1)
+    if not notices or len(notices) > 64 * 1024:
+        raise ValueError("allocator notices must contain between 1 and 65536 bytes")
 
     # Fixed gzip and tar metadata make the package bytes independent of the clock
     with (
@@ -119,6 +126,10 @@ def _write_archive(binary, provenance, archive):
         package.addfile(
             _tar_entry(PROVENANCE_NAME, len(provenance_bytes), 0o644),
             io.BytesIO(provenance_bytes),
+        )
+        package.addfile(
+            _tar_entry(NOTICE_PATH.name, len(notices), 0o644),
+            io.BytesIO(notices),
         )
 
 
