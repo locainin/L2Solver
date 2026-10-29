@@ -23,6 +23,9 @@ mod memory;
 #[path = "recovery_cache/compatibility.rs"]
 mod compatibility;
 
+#[path = "recovery_cache/lifecycle.rs"]
+mod lifecycle;
+
 #[test]
 fn warm_cache_restores_the_case_and_local_coverage() -> Result<(), Box<dyn Error>> {
     let temporary = tempfile::tempdir()?;

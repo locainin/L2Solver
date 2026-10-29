@@ -18,6 +18,12 @@ fn family_observation_policy_does_not_replay_version_28_recovery_results()
     assert_older_recovery_is_not_replayed(28)
 }
 
+#[test]
+fn execution_lifecycle_policy_does_not_replay_version_29_recovery_results()
+-> Result<(), Box<dyn Error>> {
+    assert_older_recovery_is_not_replayed(29)
+}
+
 fn assert_older_recovery_is_not_replayed(version: u32) -> Result<(), Box<dyn Error>> {
     let temporary = tempfile::tempdir()?;
     let cache = open_cache(temporary.path())?;

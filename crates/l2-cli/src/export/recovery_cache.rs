@@ -30,8 +30,9 @@ use std::{
 // Advance when recovery eligibility, generation, cohorting, or parser constraints change
 // Application semantics also belong to this stage's identity
 // Work accounting changes belong here when they alter which searches can finish
+// Terminal-result policy changes must not replay earlier resumable entries
 // Capture indexing and native reconstruction keep their separate upstream versions
-pub(super) const RECOVERY_STAGE_VERSION: u32 = 29;
+pub(super) const RECOVERY_STAGE_VERSION: u32 = 30;
 const RECOVERY_STAGE: &str = "default_case_recovery";
 const RECOVERY_ALGORITHM: &str = "l2-default-case-recovery";
 const CASE_FILE: &str = "case.json";
@@ -202,8 +203,9 @@ fn lookup_result(
     if context.options.refresh {
         return Ok(None);
     }
-    // Profile and memory limits bind partial results to their exact search policy
-    match cache.lookup(key, CacheReadPolicy::AllowPartial) {
+    // A terminal search can retain partial coverage under its exact profile and limits
+    // Unfinished work is restored through its execution checkpoint instead
+    match cache.lookup(key, CacheReadPolicy::CompleteOnly) {
         Ok(Some(entry)) => {
             match cached_result(&entry, source_id, kind, context.options, context.memory) {
                 Ok(result) => return Ok(Some(result)),
@@ -341,7 +343,7 @@ fn cached_result(
         omissions,
         _omissions_memory: omissions_memory,
     };
-    validate_cached_coverage(&result, entry.status(), kind)?;
+    validate_cached_coverage(&result, kind)?;
     let case = read_cached_case(
         entry,
         case_storage_format,
@@ -370,11 +372,7 @@ fn cached_result(
     Ok((case, result))
 }
 
-fn validate_cached_coverage(
-    result: &CachedRecovery,
-    status: StageStatus,
-    kind: RecoveryCaseKind,
-) -> Result<()> {
+fn validate_cached_coverage(result: &CachedRecovery, kind: RecoveryCaseKind) -> Result<()> {
     let coverage = &result.coverage;
     let (flow_cases, cohort_cases) = match kind {
         RecoveryCaseKind::Flow => (1, 0),
@@ -390,12 +388,7 @@ fn validate_cached_coverage(
             "recovery coverage does not describe one matching Case",
         ));
     }
-    match (status, coverage.is_complete()) {
-        (StageStatus::Complete, true) | (StageStatus::Partial, false) => Ok(()),
-        _ => Err(invalid_cache(
-            "cached recovery status disagrees with its coverage",
-        )),
-    }
+    Ok(())
 }
 
 fn read_cached_case(
@@ -458,15 +451,12 @@ fn store_result(
     };
     // The JSON value owns its own copy before the cache takes over its accounting
     let (metadata, metadata_memory) = metadata_memory::encode(&metadata, memory)?;
-    let status = if result.coverage.is_complete() {
-        StageStatus::Complete
-    } else {
-        StageStatus::Partial
-    };
+    // This path follows a successful executor return, so the selected work has finished
+    // Source gaps and search limits remain partial claims in the coverage metadata
     let entry = if let Some(reservation) = metadata_memory {
-        lease.commit_with_reserved_metadata(status, metadata, reservation)?
+        lease.commit_with_reserved_metadata(StageStatus::Complete, metadata, reservation)?
     } else {
-        lease.commit(status, metadata)?
+        lease.commit(StageStatus::Complete, metadata)?
     };
     drop(entry);
     Ok(())
