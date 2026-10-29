@@ -85,6 +85,13 @@ impl InputFile<File> {
     }
 }
 
+#[cfg(target_os = "linux")]
+impl<R: std::os::fd::AsFd> std::os::fd::AsFd for InputFile<R> {
+    fn as_fd(&self) -> std::os::fd::BorrowedFd<'_> {
+        self.inner.as_fd()
+    }
+}
+
 /// Open `-` as standard input or require a regular filesystem object
 ///
 /// # Errors

@@ -29,11 +29,20 @@ type Result<T> = std::result::Result<T, Box<dyn Error>>;
 /// A checked file whose size can be read from the same open descriptor
 pub trait SnapshotFile: Read + Seek {
     fn snapshot_len(&self) -> io::Result<u64>;
+
+    /// Best-effort advice when snapshot I/O has finished
+    #[cfg(target_os = "linux")]
+    fn advise_consumed(&mut self) {}
 }
 
 impl SnapshotFile for File {
     fn snapshot_len(&self) -> io::Result<u64> {
         Ok(self.metadata()?.len())
+    }
+
+    #[cfg(target_os = "linux")]
+    fn advise_consumed(&mut self) {
+        advise_file(self);
     }
 }
 
@@ -41,6 +50,28 @@ impl SnapshotFile for input::InputFile {
     fn snapshot_len(&self) -> io::Result<u64> {
         Ok(self.metadata()?.len())
     }
+
+    #[cfg(target_os = "linux")]
+    fn advise_consumed(&mut self) {
+        advise_file(self);
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn advise_file(file: &impl std::os::fd::AsFd) {
+    // The kernel may retain pages; admission still checks measured cgroup usage
+    let _ = rustix::fs::fadvise(file, 0, None, rustix::fs::Advice::DontNeed);
+}
+
+#[cfg(target_os = "linux")]
+fn constrained_cgroup(budget: Option<&MemoryBudget>) -> bool {
+    budget
+        .and_then(|budget| budget.snapshot().ok())
+        .and_then(|snapshot| snapshot.system)
+        .and_then(|system| system.cgroup)
+        .is_some_and(|cgroup| {
+            cgroup.effective_max_bytes.is_some() || cgroup.effective_high_bytes.is_some()
+        })
 }
 
 pub fn read(
@@ -72,7 +103,14 @@ pub fn read_files<G: SnapshotFile, B: SnapshotFile>(
     // A previous restore can leave both descriptors at end of file
     graph.seek(SeekFrom::Start(0))?;
     blobs.seek(SeekFrom::Start(0))?;
-    read_streams(graph, blobs, usage, limits, budget)
+    let result = read_streams(graph, blobs, usage, limits, budget);
+    #[cfg(target_os = "linux")]
+    if constrained_cgroup(budget) {
+        // Only advise the exact descriptors used by this operation
+        graph.advise_consumed();
+        blobs.advise_consumed();
+    }
+    result
 }
 
 /// Restore an already-verified snapshot stream and check its measured usage
@@ -156,6 +194,12 @@ pub fn write_files(
     };
     graph.sync_all()?;
     blobs.sync_all()?;
+    #[cfg(target_os = "linux")]
+    if constrained_cgroup(budget) {
+        // Clean pages can be reclaimed without risking unsynced snapshot contents
+        graph.advise_consumed();
+        blobs.advise_consumed();
+    }
     Ok(usage)
 }
 
