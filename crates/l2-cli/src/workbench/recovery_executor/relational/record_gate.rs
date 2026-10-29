@@ -96,6 +96,8 @@ pub(super) struct SchemaPlanCache {
 
 pub(super) struct SchemaPlan {
     pub(super) alternatives: Vec<SchemaAlternative>,
+    // Observation work remains when no schema alternative survives
+    pub(super) observation_work_bytes: usize,
     pub(super) details: Value,
     pub(super) work_limited: bool,
     pub(super) has_unassigned_family_messages: bool,

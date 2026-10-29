@@ -9,6 +9,16 @@ use std::error::Error;
 #[test]
 fn compact_record_evidence_does_not_replay_version_27_recovery_results()
 -> Result<(), Box<dyn Error>> {
+    assert_older_recovery_is_not_replayed(27)
+}
+
+#[test]
+fn family_observation_policy_does_not_replay_version_28_recovery_results()
+-> Result<(), Box<dyn Error>> {
+    assert_older_recovery_is_not_replayed(28)
+}
+
+fn assert_older_recovery_is_not_replayed(version: u32) -> Result<(), Box<dyn Error>> {
     let temporary = tempfile::tempdir()?;
     let cache = open_cache(temporary.path())?;
     let options = RecoveryOptions::default();
@@ -30,7 +40,7 @@ fn compact_record_evidence_does_not_replay_version_27_recovery_results()
     });
     let old_key = StageKey::new(
         "default_case_recovery",
-        27,
+        version,
         "l2-default-case-recovery",
         &old_policy,
         &identity,

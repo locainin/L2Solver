@@ -332,6 +332,7 @@ fn cold_candidate_without_a_reusable_header_plan_runs_complete_input_inference()
     let mut cache = SchemaPlanCache::default();
     let placeholder = Arc::new(SchemaPlan {
         alternatives: Vec::<SchemaAlternative>::new(),
+        observation_work_bytes: 0,
         details: Value::Null,
         work_limited: false,
         has_unassigned_family_messages: false,

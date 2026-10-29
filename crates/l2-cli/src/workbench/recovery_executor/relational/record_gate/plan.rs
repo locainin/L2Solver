@@ -322,6 +322,7 @@ fn analyze_plan(
     alternatives.extend(family.alternatives);
     Ok(SchemaPlan {
         alternatives,
+        observation_work_bytes: family.observation_work_bytes,
         details: json!({
             "uniform":uniform.details,
             "family":family.details,
@@ -549,6 +550,7 @@ fn pending_plan(
 ) -> SchemaPlan {
     SchemaPlan {
         alternatives: Vec::new(),
+        observation_work_bytes: 0,
         details: json!({"reason":reason,"details":details}),
         work_limited: false,
         has_unassigned_family_messages: false,

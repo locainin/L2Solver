@@ -31,7 +31,7 @@ use std::{
 // Application semantics also belong to this stage's identity
 // Work accounting changes belong here when they alter which searches can finish
 // Capture indexing and native reconstruction keep their separate upstream versions
-pub(super) const RECOVERY_STAGE_VERSION: u32 = 28;
+pub(super) const RECOVERY_STAGE_VERSION: u32 = 29;
 const RECOVERY_STAGE: &str = "default_case_recovery";
 const RECOVERY_ALGORITHM: &str = "l2-default-case-recovery";
 const CASE_FILE: &str = "case.json";

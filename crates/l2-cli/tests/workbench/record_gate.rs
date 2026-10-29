@@ -220,6 +220,7 @@ fn family_schema_support_stays_pending_when_any_message_is_unassigned() -> TestR
     };
     let plan = SchemaPlan {
         alternatives: vec![family_alternative],
+        observation_work_bytes: 0,
         details: json!({}),
         work_limited: false,
         has_unassigned_family_messages: true,
@@ -263,6 +264,7 @@ fn schema_plan(
         GateStatus::Pending
     };
     SchemaPlan {
+        observation_work_bytes: 0,
         alternatives: vec![SchemaAlternative {
             label: "test".to_owned(),
             frame_indices: None,
@@ -378,6 +380,7 @@ fn structural_frame_with_length(
 
 fn uniform_and_pending_family_plan() -> SchemaPlan {
     SchemaPlan {
+        observation_work_bytes: 0,
         alternatives: vec![
             SchemaAlternative {
                 label: "uniform:repeated_boundaries".to_owned(),

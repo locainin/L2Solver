@@ -9,8 +9,8 @@ use l2_workbench::{
     job::Job,
     protocol::{
         DEFAULT_MAX_FAMILY_RANGES, DEFAULT_MAX_FAMILY_REPORT_BYTES, DEFAULT_MAX_FAMILY_SAMPLES,
-        Direction, MessageFamilyLimits, MessageRole, MessageSample, RecordInput,
-        RecordSchemaProposalLimits, discover_message_families,
+        Direction, MAX_MESSAGE_BYTES, MessageFamilyLimits, MessageFamilyReport, MessageRole,
+        MessageSample, RecordInput, RecordSchemaProposalLimits, discover_message_families,
     },
 };
 use serde_json::{Value, json};
@@ -25,6 +25,7 @@ pub(super) struct FamilyAnalysis {
     pub(super) alternatives: Vec<SchemaAlternative>,
     pub(super) details: Value,
     pub(super) work_bytes: usize,
+    pub(super) observation_work_bytes: usize,
     pub(super) work_limited: bool,
     pub(super) has_unassigned_messages: bool,
     pub(super) complete: bool,
@@ -65,23 +66,23 @@ struct FamilyGroupContext<'a> {
 pub(super) fn build_family_analysis(
     request: &FamilyAnalysisRequest<'_>,
 ) -> Result<FamilyAnalysis, RecoveryExecutionError> {
-    let FamilyAnalysisRequest {
-        frames,
-        inputs,
-        selection,
-        discovery_sessions,
-        base_limits,
-        work_limit,
-        observer,
-        offset_scope,
-        job,
-    } = *request;
-    let messages = family_samples(frames, selection)?;
-    let training_ids = training_sample_ids(&messages, discovery_sessions);
+    if request.work_limit == 0 {
+        return Ok(FamilyAnalysis {
+            alternatives: Vec::new(),
+            details: json!({"reason":"message_family_work_limit","work_limit":0}),
+            work_bytes: 0,
+            observation_work_bytes: 0,
+            work_limited: true,
+            has_unassigned_messages: true,
+            complete: false,
+        });
+    }
+    let messages = family_samples(request.frames, request.selection)?;
+    let training_ids = training_sample_ids(&messages, request.discovery_sessions);
     let family_report = match discover_message_families(
         &messages,
         &training_ids,
-        family_limits(base_limits, work_limit),
+        family_limits(request.base_limits, request.work_limit),
     ) {
         Ok(report) => report,
         Err(error) => {
@@ -91,40 +92,62 @@ pub(super) fn build_family_analysis(
             ));
         }
     };
-    let groups = family_groups(&family_report, &messages, selection)?;
-    let family_observer = if selection.omitted_messages == 0 {
-        observer
+    finish_family_analysis(request, &family_report, &messages, &training_ids)
+}
+
+fn finish_family_analysis(
+    request: &FamilyAnalysisRequest<'_>,
+    family_report: &MessageFamilyReport,
+    messages: &[MessageSample<'_>],
+    training_ids: &[u64],
+) -> Result<FamilyAnalysis, RecoveryExecutionError> {
+    let observation_work_bytes = family_report.observation_coverage.work_units;
+    let group_work_limit = request
+        .work_limit
+        .checked_sub(observation_work_bytes)
+        .ok_or_else(|| invalid_policy("family observation work exceeded its allowance"))?;
+    let groups = family_groups(family_report, messages, request.selection)?;
+    let family_observer = if request.selection.omitted_messages == 0 {
+        request.observer
     } else {
         None
     };
     let group_context = FamilyGroupContext {
-        frames,
-        inputs,
-        base_limits,
-        work_limit,
+        frames: request.frames,
+        inputs: request.inputs,
+        base_limits: request.base_limits,
+        work_limit: group_work_limit,
         observer: family_observer,
-        offset_scope,
-        omitted_learning_messages: selection.omitted_messages,
-        job,
+        offset_scope: request.offset_scope,
+        omitted_learning_messages: request.selection.omitted_messages,
+        job: request.job,
     };
     let group_analysis = analyze_family_groups(&groups, &group_context)?;
-    let has_unassigned_messages = groups_has_unassigned(&family_report);
-    let complete =
-        selection.omitted_messages == 0 && family_report.complete && group_analysis.complete;
+    let has_unassigned_messages = groups_has_unassigned(family_report);
+    let work_bytes = observation_work_bytes
+        .checked_add(group_analysis.work_bytes)
+        .ok_or_else(|| invalid_policy("family work count overflowed"))?;
+    let complete = request.selection.omitted_messages == 0
+        && family_report.complete
+        && group_analysis.complete;
     let details = json!({
-        "family_analysis":family_report_details(&family_report, &messages, &training_ids),
+        "family_analysis":family_report_details(family_report, messages, training_ids),
         "family_groups":group_analysis.details,
-        "family_work_bytes":group_analysis.work_bytes,
-        "family_work_limit":work_limit,
+        "family_observation_work_bytes":observation_work_bytes,
+        "family_schema_work_bytes":group_analysis.work_bytes,
+        "family_work_bytes":work_bytes,
+        "family_work_limit":request.work_limit,
         "family_search_complete":complete,
         "family_unassigned_messages":has_unassigned_messages,
-        "selection_omitted_messages":selection.omitted_messages,
+        "selection_omitted_messages":request.selection.omitted_messages,
     });
     Ok(FamilyAnalysis {
         alternatives: group_analysis.alternatives,
         details,
-        work_bytes: group_analysis.work_bytes,
-        work_limited: group_analysis.work_limited,
+        work_bytes,
+        observation_work_bytes,
+        work_limited: group_analysis.work_limited
+            || family_report.observation_coverage.omitted_work_units > 0,
         has_unassigned_messages,
         complete,
     })
@@ -152,7 +175,12 @@ fn family_limits(
 ) -> MessageFamilyLimits {
     MessageFamilyLimits {
         max_samples: DEFAULT_MAX_FAMILY_SAMPLES,
-        max_message_bytes: base_limits.discovery.record_limits.max_input_bytes,
+        // The record-input allowance spans messages; this ceiling applies to one message
+        max_message_bytes: base_limits
+            .discovery
+            .record_limits
+            .max_input_bytes
+            .min(MAX_MESSAGE_BYTES),
         max_total_bytes: base_limits
             .discovery
             .record_limits
@@ -178,6 +206,7 @@ fn unavailable_family_analysis(error: &str, training_count: usize) -> FamilyAnal
             "training_samples":training_count,
         }),
         work_bytes: 0,
+        observation_work_bytes: 0,
         work_limited: false,
         has_unassigned_messages: true,
         complete: false,

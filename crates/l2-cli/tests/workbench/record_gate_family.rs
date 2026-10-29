@@ -17,6 +17,92 @@ use std::error::Error;
 type TestResult = Result<(), Box<dyn Error>>;
 
 #[test]
+fn aggregate_input_above_one_megabyte_does_not_disable_bounded_message_families() -> TestResult {
+    let (frames, _) = large_record_sessions()?;
+    let input_bytes = frames.iter().map(|frame| frame.bytes.len()).sum::<usize>();
+    assert!(input_bytes > l2_workbench::protocol::MAX_MESSAGE_BYTES);
+    assert!(
+        frames
+            .iter()
+            .all(|frame| frame.bytes.len() <= l2_workbench::protocol::MAX_MESSAGE_BYTES)
+    );
+    let plan = build_schema_plan(
+        &frames,
+        &report_for_partition(7, 6),
+        RecordSchemaProposalLimits::default(),
+        32 * 1024 * 1024,
+        ArtifactValidationFormat::Png,
+        ArtifactValidationPolicy::default(),
+        None,
+    )?;
+    assert!(
+        plan.details.pointer("/family/family_analysis").is_some(),
+        "bounded messages were rejected as an invalid family policy: {:?}",
+        plan.details.get("family")
+    );
+    Ok(())
+}
+
+#[test]
+fn family_observation_work_is_charged_when_no_schema_group_survives() -> TestResult {
+    let frames = unique_value_sessions();
+    let plan = build_schema_plan(
+        &frames,
+        &discovery_report(),
+        RecordSchemaProposalLimits::default(),
+        64 * 1024 * 1024,
+        ArtifactValidationFormat::Png,
+        ArtifactValidationPolicy::default(),
+        None,
+    )?;
+    assert_eq!(
+        plan.details
+            .pointer("/family/family_analysis/samples_seen")
+            .and_then(Value::as_u64),
+        Some(u64::try_from(frames.len())?)
+    );
+    assert!(
+        plan.details
+            .pointer("/family/family_groups")
+            .and_then(Value::as_array)
+            .is_some_and(Vec::is_empty),
+        "this control must isolate observation work from schema-group work"
+    );
+    assert!(
+        plan.details
+            .get("family_work_bytes")
+            .and_then(Value::as_u64)
+            .is_some_and(|work| work > 0),
+        "the family observation pass consumed no accounted work: {:?}",
+        plan.details.get("family")
+    );
+    let schema_work = plan
+        .alternatives
+        .iter()
+        .try_fold(0_usize, |total, alternative| {
+            total
+                .checked_add(alternative.discovery_work_bytes)
+                .ok_or("schema work overflowed")
+        })?;
+    let screened = screen_with_schema_plan(
+        &frames,
+        ArtifactValidationFormat::Png,
+        ArtifactValidationPolicy::default(),
+        schema_work,
+        None,
+        &plan,
+        false,
+    )?;
+    assert_eq!(screened.status, GateStatus::Pending);
+    assert_eq!(
+        screened.details.get("reason").and_then(Value::as_str),
+        Some("record_schema_work_limit"),
+        "the observation charge must be admitted before any schema application"
+    );
+    Ok(())
+}
+
+#[test]
 fn distinct_training_families_can_recover_one_exact_png_without_cross_merging_schemas() -> TestResult
 {
     let frames = mixed_layout_sessions()?;
@@ -43,6 +129,7 @@ fn distinct_training_families_can_recover_one_exact_png_without_cross_merging_sc
             .filter(|alternative| alternative.label.starts_with("uniform:"))
             .cloned()
             .collect(),
+        observation_work_bytes: 0,
         details: Value::Null,
         work_limited: false,
         has_unassigned_family_messages: false,

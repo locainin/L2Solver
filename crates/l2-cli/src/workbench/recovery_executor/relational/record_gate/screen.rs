@@ -920,7 +920,7 @@ fn plan_work_bytes(plan: &SchemaPlan) -> usize {
     plan.alternatives
         .iter()
         .map(|alternative| alternative.discovery_work_bytes)
-        .fold(0_usize, usize::saturating_add)
+        .fold(plan.observation_work_bytes, usize::saturating_add)
 }
 
 fn pending_work_result(
