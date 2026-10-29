@@ -1,14 +1,14 @@
 //! Explicit virtual observer and cancellation controls
 
-/// Modeled receiver collection conditions for every planned observation
+/// Modeled collection conditions for receiver and state observations
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub enum ObservationMode {
-    /// Every forwarded unicast frame is captured at its destination
+    /// Configured receiver and state observations are available and complete
     #[default]
     Healthy,
-    /// No receiver window is available
+    /// Configured observation windows and state views are unavailable
     Unavailable,
-    /// Collection drops frames and reports loss for each receiver window
+    /// Collection reports loss that prevents a complete observation claim
     Dropped,
 }
 

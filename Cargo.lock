@@ -939,6 +939,7 @@ name = "l2-lab"
 version = "0.1.0"
 dependencies = [
  "l2-canary",
+ "l2-codecs",
  "l2-core",
  "l2-onpath",
  "l2-scenario",
