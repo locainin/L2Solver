@@ -1,0 +1,16 @@
+[package]
+name = "l2-lab"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[lints]
+workspace = true
+
+[dependencies]
+l2-canary = { version = "=0.1.0", path = "../l2-canary" }
+l2-core = { version = "=0.1.0", path = "../l2-core" }
+l2-onpath = { version = "=0.1.0", path = "../l2-onpath" }
+l2-scenario = { version = "=0.1.0", path = "../l2-scenario" }
+l2-segmentation = { version = "=0.1.0", path = "../l2-segmentation" }
+sha2 = "0.10.9"

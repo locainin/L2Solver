@@ -935,6 +935,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "l2-lab"
+version = "0.1.0"
+dependencies = [
+ "l2-canary",
+ "l2-core",
+ "l2-onpath",
+ "l2-scenario",
+ "l2-segmentation",
+ "sha2 0.10.9",
+]
+
+[[package]]
 name = "l2-live"
 version = "0.1.0"
 dependencies = [
@@ -959,6 +971,13 @@ name = "l2-pcap"
 version = "0.1.0"
 dependencies = [
  "l2-capture",
+]
+
+[[package]]
+name = "l2-scenario"
+version = "0.1.0"
+dependencies = [
+ "l2-onpath",
 ]
 
 [[package]]
