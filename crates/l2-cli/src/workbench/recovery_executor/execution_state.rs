@@ -4,6 +4,7 @@ use super::{
     Executor, RecoveryError, RecoveryExecutionError, evidence, record_candidate_progress,
     relational::RelationalLane,
 };
+use std::sync::Arc;
 
 #[derive(Default, serde::Deserialize, serde::Serialize)]
 #[serde(deny_unknown_fields)]
@@ -12,6 +13,9 @@ pub(super) struct SchedulerCursor {
     record_discovery_barrier_reached: bool,
     evidence_stop: Option<evidence::CaseEvidenceStop>,
     evidence_stop_reported: bool,
+    // The charge follows restored cursor data without entering its checkpoint
+    #[serde(skip)]
+    pub(super) checkpoint_memory: Option<Arc<l2_workbench::job::MemoryLease>>,
 }
 
 #[derive(Default, serde::Deserialize, serde::Serialize)]

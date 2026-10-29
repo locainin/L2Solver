@@ -123,3 +123,6 @@ fn default_executor_checkpoint_preserves_pending_record_assembly_and_exact_recov
     );
     Ok(())
 }
+
+#[path = "recovery_executor_checkpoint/lease_lifetime.rs"]
+mod lease_lifetime;

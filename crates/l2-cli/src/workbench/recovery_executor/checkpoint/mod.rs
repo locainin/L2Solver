@@ -11,12 +11,15 @@ use super::{
     Case, CaseIndex, Executor, RecoveryExecutionError, RecoveryExecutionPolicy, RecoveryPlan,
 };
 use l2_workbench::{
-    job::MemoryBudget,
+    job::{MemoryBudget, MemoryLease},
     recovery::{RecoveryCoordinator, RecoveryError},
 };
 use serde::{Deserialize, Serialize};
 use serde_json::value::RawValue;
-use std::io::{self, Write};
+use std::{
+    io::{self, Write},
+    sync::Arc,
+};
 
 const VERSION: u32 = 1;
 
@@ -42,6 +45,12 @@ struct Saved<'checkpoint> {
     #[serde(borrow)]
     coordinator: &'checkpoint RawValue,
     state: state::State,
+}
+
+struct AdmittedSaved<'checkpoint> {
+    // Drop decoded data before releasing its admission, including on failed restoration
+    saved: Saved<'checkpoint>,
+    memory: Option<MemoryLease>,
 }
 
 pub(super) fn write(
@@ -104,31 +113,43 @@ pub(super) fn read<'a>(
         return Err(RecoveryError::InvalidCheckpoint.into());
     }
     let metadata_admission = memory::admit(bytes, memory)?;
-    let mut saved: Saved<'_> =
-        serde_json::from_slice(bytes).map_err(|_| RecoveryError::InvalidCheckpoint)?;
-    let metadata_memory =
-        metadata_admission.map(l2_workbench::job::JsonMemoryAdmission::into_retained);
-    if saved.version != VERSION
-        || saved.plan != *plan
-        || policy_configuration(&saved.policy)? != policy_configuration(expected)?
+    let mut decoded = AdmittedSaved {
+        saved: serde_json::from_slice(bytes).map_err(|_| RecoveryError::InvalidCheckpoint)?,
+        memory: metadata_admission.map(l2_workbench::job::JsonMemoryAdmission::into_retained),
+    };
+    if decoded.saved.version != VERSION
+        || decoded.saved.plan != *plan
+        || policy_configuration(&decoded.saved.policy)? != policy_configuration(expected)?
     {
         return Err(RecoveryError::InvalidCheckpoint.into());
     }
-    saved.policy.bind_restored_case(case)?;
+    decoded.saved.policy.bind_restored_case(case)?;
     let coordinator = RecoveryCoordinator::restore(
         case,
         expected.resources,
-        saved.coordinator.get().as_bytes(),
+        decoded.saved.coordinator.get().as_bytes(),
         max_bytes,
     )?;
-    let index = CaseIndex::restore_from_checkpoint(case, saved.index)?;
-    let mut executor = saved
-        .state
-        .restore(case, plan, saved.policy, coordinator, index, memory)?;
+    let index = CaseIndex::restore_from_checkpoint(case, decoded.saved.index)?;
+    let mut executor = decoded.saved.state.restore(
+        case,
+        plan,
+        decoded.saved.policy,
+        coordinator,
+        index,
+        memory,
+    )?;
+    // The cursor and executor can outlive each other, but share one admission
+    let metadata_memory = decoded.memory.take().map(Arc::new);
+    decoded
+        .saved
+        .cursor
+        .checkpoint_memory
+        .clone_from(&metadata_memory);
     executor.checkpoint_memory = metadata_memory;
     validate::executor(&executor)?;
-    saved.cursor.validate(&executor)?;
-    Ok((executor, saved.cursor))
+    decoded.saved.cursor.validate(&executor)?;
+    Ok((executor, decoded.saved.cursor))
 }
 
 fn policy_configuration(

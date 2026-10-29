@@ -23,7 +23,7 @@ fn bounded_record_learning_is_counted_without_claiming_input_loss() -> Result<()
     let mut summary =
         recovery_run_summary(SEARCH_NON_EXHAUSTIVE, 1, 1, 0, &flow_resource_totals())?;
     summary
-        .omissions
+        .test_omissions_mut()
         .push(RecoveryOmission::RecordDiscoveryLearningSample {
             source_id: Some("source".to_owned()),
             unsampled_frames: 9,
@@ -220,7 +220,7 @@ fn recovery_status_coverage() -> Result<RecoveryCoverage, Box<dyn Error>> {
     let mut coverage = RecoveryCoverage::default();
     let mut input_partial =
         recovery_run_summary(INPUT_COVERAGE_INCOMPLETE, 3, 1, 0, &flow_resource_totals())?;
-    input_partial.omissions = vec![
+    *input_partial.test_omissions_mut() = vec![
         RecoveryOmission::FramingDiscoveryInputs {
             source_id: Some("source".to_owned()),
             omitted_runs: 2,
@@ -238,7 +238,7 @@ fn recovery_status_coverage() -> Result<RecoveryCoverage, Box<dyn Error>> {
     let mut search_partial =
         recovery_run_summary(SEARCH_NON_EXHAUSTIVE, 2, 1, 0, &flow_resource_totals())?;
     search_partial
-        .omissions
+        .test_omissions_mut()
         .push(RecoveryOmission::FramingDiscoveryAnalysis {
             source_id: "source".to_owned(),
             search_exhaustive_within_plan: false,
@@ -260,7 +260,7 @@ fn recovery_status_coverage() -> Result<RecoveryCoverage, Box<dyn Error>> {
         &cohort_resource_totals(),
     )?;
     details_partial
-        .omissions
+        .test_omissions_mut()
         .push(RecoveryOmission::RecordDiscoveryAnalysis {
             source_id: "source".to_owned(),
             search_exhaustive_within_plan: true,
@@ -312,7 +312,7 @@ fn writes_parent_and_lineage_resource_totals() -> Result<(), Box<dyn Error>> {
         1,
         &flow_resource_totals(),
     )?;
-    outcome.omissions = vec![
+    *outcome.test_omissions_mut() = vec![
         RecoveryOmission::FramingDiscoveryInputs {
             source_id: Some("source".to_owned()),
             omitted_runs: 1,
@@ -330,7 +330,7 @@ fn writes_parent_and_lineage_resource_totals() -> Result<(), Box<dyn Error>> {
             omitted_frame_examples: 0,
         },
     ];
-    let expected_omission_count = u64::try_from(outcome.omissions.len())?;
+    let expected_omission_count = u64::try_from(outcome.omissions().len())?;
     coverage.record(&outcome, RecoveryCaseKind::Flow)?;
     assert_eq!(coverage.omissions, expected_omission_count);
     let mut output = File::create(&path)?;
@@ -437,7 +437,7 @@ fn incomplete_case_evidence_collection_keeps_discovery_axes_independent()
     assert!(summary.discovery.input_coverage_complete);
     assert!(summary.discovery.search_exhaustive_within_plan);
     assert!(summary.discovery.report_details_complete);
-    assert!(summary.omissions.is_empty());
+    assert!(summary.omissions().is_empty());
 
     let mut coverage = RecoveryCoverage::default();
     coverage.record(&summary, RecoveryCaseKind::Flow)?;
@@ -467,7 +467,7 @@ fn validation_work_omission_keeps_recovery_coverage_partial() -> Result<(), Box<
         &flow_resource_totals(),
     )?;
     summary
-        .omissions
+        .test_omissions_mut()
         .push(RecoveryOmission::ArtifactValidation {
             input_node_id: 14,
             reason: l2_workbench::artifact::ArtifactResourceOmissionReason::InputTooLarge {
@@ -528,7 +528,7 @@ fn recovery_with_flow_and_cohort_totals() -> Result<RecoveryCoverage, Box<dyn Er
     let mut flow =
         recovery_run_summary(INPUT_COVERAGE_INCOMPLETE, 3, 1, 1, &flow_resource_totals())?;
     flow.complete_negative_transform_searches = 5;
-    flow.omissions
+    flow.test_omissions_mut()
         .push(RecoveryOmission::FramingDiscoveryInputs {
             source_id: Some("source".to_owned()),
             omitted_runs: 1,

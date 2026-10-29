@@ -741,6 +741,8 @@ pub(super) struct RecoveryExecutionOutcome {
     /// Whether the declared work drained without omissions or prior Case incompleteness
     #[cfg(test)]
     pub complete: bool,
+    // Moved checkpoint data remains charged until the outcome is dropped
+    pub(super) checkpoint_memory: Option<Arc<l2_workbench::job::MemoryLease>>,
 }
 
 /// Concise recovery facts required by case-wide artifact collection
@@ -750,13 +752,23 @@ pub struct RecoveryRunSummary {
     pub case_evidence_collection_complete: bool,
     /// Independent coverage, search, and report-detail facts for discovery stages
     pub discovery: RecoveryDiscoveryStatus,
-    pub omissions: Vec<RecoveryOmission>,
+    pub(super) omissions: Vec<RecoveryOmission>,
     pub candidate_count: usize,
     /// Complete transform searches that found no eligible recipes
     pub complete_negative_transform_searches: usize,
     pub validated_artifact_count: usize,
     pub cycle_skips: usize,
     pub resources: RecoveryResourceSummary,
+    // Keep the shared admission after all restored omission data
+    pub(super) _checkpoint_memory: Option<Arc<l2_workbench::job::MemoryLease>>,
+}
+
+impl RecoveryRunSummary {
+    /// Return recovery omissions while retaining their memory admission
+    #[must_use]
+    pub fn omissions(&self) -> &[RecoveryOmission] {
+        &self.omissions
+    }
 }
 
 /// Independent status facts retained for automatic recovery discovery

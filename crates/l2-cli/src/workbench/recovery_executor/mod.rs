@@ -36,6 +36,9 @@ mod records;
 mod relational;
 mod resume;
 mod scheduler;
+#[cfg(test)]
+#[path = "../../../tests/workbench/recovery_run_summary_fixture.rs"]
+mod summary_fixture;
 mod tcp_ancestry;
 mod transform;
 mod validation;
@@ -67,7 +70,10 @@ use policy::normal_policy;
 use policy::{policy_for_profile, resolve_policy, source_priority};
 use relational::{RelationalDiscoveryContext, RelationalSampleCollections};
 pub use resume::RecoveryResume;
-use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
+use std::{
+    collections::{BTreeSet, HashMap, HashSet, VecDeque},
+    sync::Arc,
+};
 
 pub(super) use super::{decode::service::DecodeBatchLimits, expand::ExpansionLimits};
 
@@ -136,6 +142,7 @@ pub fn recover_case_with_job(
         validated_artifact_count: outcome.validated_artifact_count,
         cycle_skips: outcome.cycle_skips,
         resources: outcome.resources,
+        _checkpoint_memory: outcome.checkpoint_memory,
     })
 }
 
@@ -451,6 +458,7 @@ fn finish_executor(
         resources,
         #[cfg(test)]
         complete,
+        checkpoint_memory: executor.checkpoint_memory,
     })
 }
 
@@ -561,7 +569,6 @@ fn snapshot_candidates(
 
 struct Executor<'a> {
     memory: Option<MemoryBudget>,
-    checkpoint_memory: Option<l2_workbench::job::MemoryLease>,
     case: &'a mut Case,
     plan: &'a RecoveryPlan,
     policy: RecoveryExecutionPolicy,
@@ -593,6 +600,8 @@ struct Executor<'a> {
     omissions: Vec<RecoveryOmission>,
     complete_negative_transform_searches: usize,
     cycle_skips: usize,
+    // Restored allocations are dropped before their shared admission
+    checkpoint_memory: Option<Arc<l2_workbench::job::MemoryLease>>,
 }
 
 #[derive(Clone)]

@@ -159,9 +159,11 @@ pub(super) fn recover(
     let mut coverage = RecoveryCoverage::default();
     coverage.record(&summary, kind)?;
     let (omissions, omissions_memory) = omissions::collect(
-        summary.omissions.iter().map(Ok::<_, Box<dyn Error>>),
+        summary.omissions().iter().map(Ok::<_, Box<dyn Error>>),
         context.memory,
     )?;
+    // Copied omissions keep their own charge before the checkpoint admission is released
+    drop(summary);
     let result = CachedRecovery {
         coverage,
         omissions,

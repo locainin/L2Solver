@@ -116,7 +116,7 @@ impl RecoveryCoverage {
             self.validated_artifacts,
             u64::try_from(outcome.validated_artifact_count)?,
         )?;
-        self.omissions = coverage_add(self.omissions, u64::try_from(outcome.omissions.len())?)?;
+        self.omissions = coverage_add(self.omissions, u64::try_from(outcome.omissions().len())?)?;
         self.cycle_skips = coverage_add(self.cycle_skips, u64::try_from(outcome.cycle_skips)?)?;
         self.resources.record(&outcome.resources)?;
         Ok(())
@@ -160,7 +160,7 @@ impl RecoveryCoverage {
         &mut self,
         outcome: &workbench::RecoveryRunSummary,
     ) -> Result<(), Box<dyn Error>> {
-        for omission in &outcome.omissions {
+        for omission in outcome.omissions() {
             match omission {
                 workbench::RecoveryOmission::FramingDiscoveryInputs { omitted_runs, .. } => {
                     self.omitted_framing_input_runs = coverage_add(
