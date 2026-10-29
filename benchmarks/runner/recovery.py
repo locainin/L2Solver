@@ -32,6 +32,9 @@ _CACHE_STAT_LINES = {
 _CACHE_BYTES_VALUE = re.compile(
     r"([0-9]+)(?: \([0-9]+(?:\.[0-9]+)? (?:B|KiB|MiB|GiB|TiB|PiB|EiB)\))?"
 )
+_RECOVERY_WORKER_POOL = re.compile(
+    r"Analyzing capture with up to ([1-9][0-9]*) recovery worker\(s\)"
+)
 
 
 def build_extract_command(
@@ -134,6 +137,40 @@ def _idle_placeholder(event, identity):
     )
 
 
+def _memory_admission_summary(events):
+    summary = None
+    for event in events:
+        memory = event.get("memory_admission")
+        if memory is None:
+            continue
+        if not isinstance(memory, dict) or not isinstance(memory.get("working_sets"), dict):
+            raise ValueError("invalid memory admission snapshot")
+        working_sets = memory["working_sets"]
+        values = {
+            "limit_bytes": memory.get("limit_bytes"),
+            "peak_charged_bytes": memory.get("peak_bytes"),
+            "peak_active_cases": working_sets.get("peak_active_cases"),
+            "admitted_cases": working_sets.get("admitted_cases"),
+        }
+        if any(type(value) is not int or value < 0 for value in values.values()):
+            raise ValueError("invalid memory admission measurements")
+        if (
+            values["limit_bytes"] == 0
+            or values["peak_charged_bytes"] > values["limit_bytes"]
+            or values["peak_active_cases"] > values["admitted_cases"]
+        ):
+            raise ValueError("inconsistent memory admission measurements")
+        if summary is None:
+            summary = {"samples": 1, **values}
+            continue
+        if values["limit_bytes"] != summary["limit_bytes"]:
+            raise ValueError("memory admission limit changed within one run")
+        summary["samples"] += 1
+        for key in ("peak_charged_bytes", "peak_active_cases", "admitted_cases"):
+            summary[key] = max(summary[key], values[key])
+    return summary
+
+
 def read_progress_log(path, maximum_bytes=DEFAULT_MAX_LOG_BYTES):
     if type(maximum_bytes) is not int or maximum_bytes <= 0:
         raise ValueError("progress log budget must be a positive integer")
@@ -161,6 +198,7 @@ def read_progress_log(path, maximum_bytes=DEFAULT_MAX_LOG_BYTES):
     cache_misses = []
     phases = set()
     job_identity_transitions = []
+    worker_pool_sizes = set()
     index_cache_hit = False
     for event in events:
         created_at = event.get("created_at_unix_ms")
@@ -182,6 +220,13 @@ def read_progress_log(path, maximum_bytes=DEFAULT_MAX_LOG_BYTES):
         current = event.get("current_phase")
         if current is not None:
             phases.add(current)
+        for phase in event["phases"]:
+            if not isinstance(phase, dict) or phase.get("phase") != "expansion":
+                continue
+            message = phase.get("message")
+            match = _RECOVERY_WORKER_POOL.fullmatch(message) if isinstance(message, str) else None
+            if match is not None:
+                worker_pool_sizes.add(int(match.group(1)))
         # The capture-index cache path records its hit and skips ingestion together
         ingestion_skipped = any(
             isinstance(phase, dict)
@@ -192,6 +237,9 @@ def read_progress_log(path, maximum_bytes=DEFAULT_MAX_LOG_BYTES):
         event_cache_hits = event["counters"].get("cache_hits")
         if ingestion_skipped and type(event_cache_hits) is int and event_cache_hits > 0:
             index_cache_hit = True
+
+    if len(worker_pool_sizes) > 1:
+        raise ValueError("progress log contains inconsistent recovery worker pool sizes")
 
     pending_initial_job = None
     if len(job_identity_transitions) > 1:
@@ -222,6 +270,8 @@ def read_progress_log(path, maximum_bytes=DEFAULT_MAX_LOG_BYTES):
         ),
         "pending_initial_job_created_at_unix_ms": pending_initial_job,
         "phases_seen": sorted(phases),
+        "memory_admission": _memory_admission_summary(events),
+        "recovery_worker_pool_size": next(iter(worker_pool_sizes), None),
     }
 
 
@@ -514,6 +564,14 @@ def validate_export_output(
         "evidence_bytes": evidence_file_bytes + sum(artifacts_by_name.values()),
         "files": files,
         "artifacts": artifacts,
+        # Preserve the manifest's exact distinctions between missing, omitted, and unsampled work
+        "coverage": {
+            "full_source": manifest.get("full_source_coverage"),
+            "discovery": manifest.get("discovery_coverage"),
+            "evidence": coverage,
+            "omitted_artifact_references": manifest.get("omitted_artifact_references"),
+            "incomplete_components": manifest.get("incomplete_components"),
+        },
     }
 
 

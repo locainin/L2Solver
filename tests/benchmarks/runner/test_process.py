@@ -41,6 +41,32 @@ def run_with_group_signal_observer(command, directory, timeout):
 
 
 class ProcessTests(unittest.TestCase):
+    def test_sample_callback_runs_while_child_is_monitored(self):
+        with tempfile.TemporaryDirectory() as directory:
+            samples = []
+            result = run_child(
+                [sys.executable, "-c", "import time; time.sleep(0.1)"],
+                Path(directory),
+                2,
+                sample=lambda: samples.append(True),
+            )
+
+            self.assertEqual(result[:3], (0, None, None))
+            self.assertGreater(len(samples), 0)
+
+    def test_sample_callback_failure_stops_owned_child(self):
+        with tempfile.TemporaryDirectory() as directory:
+            def fail_sample():
+                raise ValueError("observation unavailable")
+
+            with self.assertRaisesRegex(ValueError, "observation unavailable"):
+                run_child(
+                    [sys.executable, "-c", "import time; time.sleep(10)"],
+                    Path(directory),
+                    2,
+                    sample=fail_sample,
+                )
+
     def test_child_receives_explicit_environment_overrides(self):
         with tempfile.TemporaryDirectory() as directory:
             result = run_child(

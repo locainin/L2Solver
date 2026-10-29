@@ -5,9 +5,13 @@ import json
 import os
 import sys
 import time
+from fractions import Fraction
 from pathlib import Path
 
-from runner.process import DEFAULT_MAX_LOG_BYTES, run_child, validate_timeout
+if __package__:
+    from .runner.process import DEFAULT_MAX_LOG_BYTES, run_child, validate_timeout
+else:
+    from runner.process import DEFAULT_MAX_LOG_BYTES, run_child, validate_timeout
 
 
 def delegated_scope():
@@ -33,13 +37,138 @@ def delegated_scope():
     return scope
 
 
+def read_counts(path):
+    counts = {}
+    for line in path.read_text(encoding="ascii").splitlines():
+        fields = line.split()
+        if len(fields) != 2 or fields[0] in counts or not fields[1].isdigit():
+            raise ValueError(f"invalid cgroup counts in {path.name}")
+        counts[fields[0]] = int(fields[1])
+    return counts
+
+
 def event_counts(group):
+    return read_counts(group / "memory.events")
+
+
+def event_deltas(before, after):
+    required = {"high", "max", "oom", "oom_kill"}
+    if (
+        not required.issubset(before)
+        or before.keys() != after.keys()
+        or any(after[key] < before[key] for key in before)
+    ):
+        raise ValueError("cgroup memory events are incomplete or decreased")
+    return {key: after[key] - value for key, value in before.items()}
+
+
+def _read_limit(group, name):
+    try:
+        value = (group / f"memory.{name}").read_text(encoding="ascii").strip()
+    except FileNotFoundError:
+        return None
+    if value == "max":
+        return value
+    if not value.isdigit():
+        raise ValueError(f"invalid memory.{name} limit")
+    return int(value)
+
+
+def _hierarchy(group, root):
+    root = root.resolve(strict=True)
+    group = group.resolve(strict=True)
+    group.relative_to(root)
+    while True:
+        relative = group.relative_to(root)
+        yield group, "/" if group == root else "/" + relative.as_posix()
+        if group == root:
+            break
+        group = group.parent
+
+
+def hierarchy_limits(group, root=Path("/sys/fs/cgroup")):
+    """Observe limits in the visible hierarchy without changing any ancestor."""
+    limits = []
+    complete = True
+    for group, path in _hierarchy(group, root):
+        maximum = _read_limit(group, "max")
+        high = _read_limit(group, "high")
+        if path != "/" and (maximum is None or high is None):
+            complete = False
+        limits.append({"path": path, "max": maximum, "high": high})
+    finite_max = [item["max"] for item in limits if type(item["max"]) is int]
+    finite_high = [item["high"] for item in limits if type(item["high"]) is int]
     return {
-        key: int(value)
-        for key, value in (
-            line.split() for line in (group / "memory.events").read_text().splitlines()
-        )
+        "limits": limits,
+        "limits_complete": complete,
+        "effective_visible_max_bytes": min(finite_max, default=None),
+        "effective_visible_high_bytes": min(finite_high, default=None),
     }
+
+
+def cpu_hierarchy_limits(group, root=Path("/sys/fs/cgroup")):
+    """Observe visible CPU quotas without assuming hidden ancestors are unlimited."""
+    limits = []
+    finite = []
+    complete = True
+    for group, path in _hierarchy(group, root):
+        try:
+            fields = (group / "cpu.max").read_text(encoding="ascii").split()
+        except FileNotFoundError:
+            quota, period = None, None
+            if path != "/":
+                complete = False
+        else:
+            if (
+                len(fields) != 2
+                or (fields[0] != "max" and not fields[0].isdigit())
+                or (fields[0] != "max" and fields[0].isdigit() and int(fields[0]) == 0)
+                or not fields[1].isdigit()
+                or int(fields[1]) == 0
+            ):
+                raise ValueError("invalid cgroup cpu.max")
+            quota = "max" if fields[0] == "max" else int(fields[0])
+            period = int(fields[1])
+            if type(quota) is int:
+                finite.append({"quota_us": quota, "period_us": period})
+        limits.append({"path": path, "quota_us": quota, "period_us": period})
+    effective = min(
+        finite, key=lambda value: Fraction(value["quota_us"], value["period_us"]), default=None
+    )
+    return {"limits": limits, "limits_complete": complete, "effective_visible_quota": effective}
+
+
+class CgroupSamples:
+    """Sample usage and retain the stat values nearest the largest sample."""
+
+    def __init__(self, group):
+        self.group = group
+        self.samples = 0
+        self.peak_current = None
+        self.stat_at_peak = None
+        self.next_sample = None
+
+    def sample(self):
+        now = time.monotonic()
+        if self.next_sample is not None and now < self.next_sample:
+            return
+        current = (self.group / "memory.current").read_text(encoding="ascii").strip()
+        if not current.isdigit():
+            raise ValueError("invalid cgroup memory.current")
+        current = int(current)
+        stat = read_counts(self.group / "memory.stat")
+        self.samples += 1
+        self.next_sample = now + 0.05
+        if self.peak_current is None or current > self.peak_current:
+            self.peak_current = current
+            self.stat_at_peak = stat
+
+    def result(self):
+        return {
+            "samples": self.samples,
+            "peak_current_bytes": self.peak_current,
+            "memory_stat_at_peak": self.stat_at_peak,
+        }
 
 
 def run_in_scope(directory, memory_max, timeout, max_log_bytes, command):
@@ -66,6 +195,9 @@ def run_in_scope(directory, memory_max, timeout, max_log_bytes, command):
         if effective_max != memory_max:
             raise ValueError("kernel memory cap differs from the requested cap")
         initial_events = event_counts(workload)
+        initial_limits = hierarchy_limits(workload)
+        initial_cpu_limits = cpu_hierarchy_limits(workload)
+        samples = CgroupSamples(workload)
 
         # Move the launcher before exec so the monitor samples the analyzer PID
         launch = (
@@ -79,16 +211,33 @@ def run_in_scope(directory, memory_max, timeout, max_log_bytes, command):
             directory,
             timeout,
             max_log_bytes=max_log_bytes,
+            sample=samples.sample,
         )
         duration = time.monotonic() - start
         final_events = event_counts(workload)
+        deltas = event_deltas(initial_events, final_events)
+        final_limits = hierarchy_limits(workload)
+        final_cpu_limits = cpu_hierarchy_limits(workload)
+        current = (workload / "memory.current").read_text(encoding="ascii").strip()
+        if not current.isdigit():
+            raise ValueError("invalid cgroup memory.current")
         cgroup = {
             "memory_max_bytes": effective_max,
             "swap_max_bytes": 0,
             "peak_bytes": int((workload / "memory.peak").read_text()),
-            "oom": final_events["oom"] - initial_events["oom"],
-            "oom_kill": final_events["oom_kill"] - initial_events["oom_kill"],
-            "max_events": final_events["max"] - initial_events["max"],
+            "current_bytes": int(current),
+            "memory_stat": read_counts(workload / "memory.stat"),
+            "sampled": samples.result(),
+            "events_before": initial_events,
+            "events_after": final_events,
+            "event_deltas": deltas,
+            "hierarchy": initial_limits,
+            "hierarchy_after": final_limits,
+            "cpu_hierarchy": initial_cpu_limits,
+            "cpu_hierarchy_after": final_cpu_limits,
+            "oom": deltas["oom"],
+            "oom_kill": deltas["oom_kill"],
+            "max_events": deltas["max"],
         }
         receipt = {
             "command": command,

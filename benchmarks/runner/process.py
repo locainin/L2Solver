@@ -225,7 +225,7 @@ def _timeout_result(child, streams, metrics):
     )
 
 
-def monitor(child, streams, deadline, maximum_logs, interrupt_when=None):
+def monitor(child, streams, deadline, maximum_logs, interrupt_when=None, sample=None):
     metrics = {
         "peak_sampled_rss_bytes": None,
         "rss_samples": 0,
@@ -246,6 +246,9 @@ def monitor(child, streams, deadline, maximum_logs, interrupt_when=None):
         # A process observed after its deadline cannot be accepted as a successful run
         if time.monotonic() >= deadline:
             return _timeout_result(child, streams, metrics)
+        if sample is not None:
+            # A failed observer stops the owned child instead of reporting missing data as zero
+            sample()
         rss = sampled_rss(child.pid)
         if rss is not None:
             metrics["rss_samples"] += 1
@@ -323,6 +326,7 @@ def run_child(
     max_log_bytes=DEFAULT_MAX_LOG_BYTES,
     env=None,
     interrupt_when: Callable[[Mapping[str, Path]], bool] | None = None,
+    sample: Callable[[], None] | None = None,
 ):
     validate_timeout(timeout)
     if (
@@ -360,7 +364,7 @@ def run_child(
         try:
             for stream in streams:
                 os.set_blocking(stream.pipe.fileno(), False)
-            result = monitor(child, streams, deadline, max_log_bytes, interrupt_when)
+            result = monitor(child, streams, deadline, max_log_bytes, interrupt_when, sample)
         finally:
             # Also stop descendants still in the owned group after completion or cancellation
             stop_owned_processes(child)
