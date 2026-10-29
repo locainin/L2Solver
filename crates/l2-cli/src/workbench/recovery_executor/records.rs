@@ -270,12 +270,19 @@ impl Executor<'_> {
             .get(&candidate_id)
             .map(|reports| reports.as_slice().to_vec())
             .unwrap_or_default();
+        // Caller-supplied schemas keep the existing individual issue evidence
+        let issues = if !report_nodes.is_empty() && !self.plan.record_schemas.contains(schema) {
+            record_service::service::RecordGroupIssues::Receipt
+        } else {
+            record_service::service::RecordGroupIssues::Individual
+        };
         let committed = match self.commit_record_artifacts(
             candidate_id,
             input_node_ids,
             origins,
             &report_nodes,
             prepared,
+            issues,
         ) {
             Ok(committed) => committed,
             Err(RecoveryExecutionError::Evidence(evidence_error)) => {
@@ -319,9 +326,10 @@ impl Executor<'_> {
         origins: &[u64],
         report_nodes: &[u64],
         prepared: record_service::service::PreparedRecordService,
+        issues: record_service::service::RecordGroupIssues,
     ) -> Result<RecordCommitArtifacts, RecoveryExecutionError> {
         self.case_transaction_and_finish(candidate_id, |case| {
-            let recovery_outcome = record_service::service::commit_recovery(case, prepared)
+            let recovery_outcome = record_service::service::commit_recovery(case, prepared, issues)
                 .map_err(map_record_commit_error)?;
             let outcome = &recovery_outcome.outcome;
             let rejected_inputs = &recovery_outcome.rejected_inputs;

@@ -1,10 +1,11 @@
 use super::super::file_signatures;
 use super::analysis::Analysis;
+use super::service::RecordGroupIssues;
 use l2_workbench::{
     evidence::{Case, Edge, EvidenceStatus},
     protocol::{RecordError, RecordGroupReceipt},
 };
-use serde_json::json;
+use serde_json::{Value, json};
 use std::{
     collections::{BTreeSet, HashMap},
     error::Error,
@@ -27,6 +28,7 @@ struct GroupContext<'a> {
 pub(super) fn add_receipt_node(
     case: &mut Case,
     analysis: &Analysis,
+    issues: RecordGroupIssues,
 ) -> Result<u64, Box<dyn Error>> {
     let complete_groups = analysis
         .assembly
@@ -45,22 +47,43 @@ pub(super) fn add_receipt_node(
         .iter()
         .map(|group| group.receipt().record_count)
         .sum::<usize>();
+    let mut details = serde_json::Map::from_iter([
+        (
+            "input_node".to_owned(),
+            json!(
+                (analysis.inputs.len() == 1)
+                    .then(|| analysis.inputs.first().map(|input| input.node))
+                    .flatten()
+            ),
+        ),
+        ("input_count".to_owned(), json!(analysis.inputs.len())),
+        (
+            "input_length".to_owned(),
+            json!(analysis.assembly.report().input_length),
+        ),
+        ("record_count".to_owned(), json!(record_count)),
+        (
+            "group_count".to_owned(),
+            json!(analysis.assembly.groups().len()),
+        ),
+        ("complete_group_count".to_owned(), json!(complete_groups)),
+        (
+            "incomplete_group_count".to_owned(),
+            json!(incomplete_groups),
+        ),
+        ("representation".to_owned(), json!("json_blob")),
+    ]);
+    if matches!(issues, RecordGroupIssues::Receipt) {
+        details.insert(
+            "group_issue_representation".to_owned(),
+            json!("parse_receipt"),
+        );
+    }
     Ok(case.add_bytes_node(
         "record_parse_receipt",
         &analysis.receipt,
         Vec::new(),
-        json!({
-            "input_node":(analysis.inputs.len() == 1)
-                .then(|| analysis.inputs.first().map(|input| input.node))
-                .flatten(),
-            "input_count":analysis.inputs.len(),
-            "input_length":analysis.assembly.report().input_length,
-            "record_count":record_count,
-            "group_count":analysis.assembly.groups().len(),
-            "complete_group_count":complete_groups,
-            "incomplete_group_count":incomplete_groups,
-            "representation":"json_blob"
-        }),
+        Value::Object(details),
     )?)
 }
 
@@ -68,6 +91,7 @@ pub(super) fn record_groups(
     case: &mut Case,
     receipt_node: u64,
     analysis: &Analysis,
+    issues: RecordGroupIssues,
 ) -> Result<GroupNodes, Box<dyn Error>> {
     let group_input_nodes = group_input_nodes(analysis)?;
     let force_unresolved = !analysis.rejected_inputs.is_empty();
@@ -76,9 +100,11 @@ pub(super) fn record_groups(
         .try_reserve_exact(analysis.assembly.groups().len())
         .map_err(|_| RecordError::AllocationFailed)?;
     let mut issue_nodes = Vec::new();
-    issue_nodes
-        .try_reserve_exact(analysis.assembly.groups().len())
-        .map_err(|_| RecordError::AllocationFailed)?;
+    if matches!(issues, RecordGroupIssues::Individual) {
+        issue_nodes
+            .try_reserve_exact(analysis.assembly.groups().len())
+            .map_err(|_| RecordError::AllocationFailed)?;
+    }
     for (group_index, group) in analysis.assembly.groups().iter().enumerate() {
         let input_nodes = group_input_nodes
             .get(group_index)
@@ -108,7 +134,10 @@ pub(super) fn record_groups(
             };
             let group_node = add_candidate_group(case, &context, group.candidate_bytes())?;
             group_nodes.push(group_node);
-            if !force_unresolved || complete_bytes.is_none() {
+            // The full receipt already keeps every group and its exact contradictions
+            if matches!(issues, RecordGroupIssues::Individual)
+                && (!force_unresolved || complete_bytes.is_none())
+            {
                 let issue_node = add_group_issue(case, &context)?;
                 issue_nodes.push(issue_node);
             }

@@ -43,6 +43,15 @@ struct CommittedRecordService {
     rejected_inputs: Vec<analysis::RejectedInput>,
 }
 
+/// Select whether group issues are separate nodes or entries in the parse receipt
+#[derive(Clone, Copy)]
+pub(in crate::workbench) enum RecordGroupIssues {
+    /// Preserve separate nodes for explicitly selected schemas
+    Individual,
+    /// Keep each group issue inside the existing parse receipt
+    Receipt,
+}
+
 /// Detached record parsing and assembly results before evidence nodes are written
 pub(in crate::workbench) struct PreparedRecordService {
     analysis: analysis::Analysis,
@@ -129,14 +138,16 @@ pub(in crate::workbench) fn commit(
     case: &mut Case,
     prepared: PreparedRecordService,
 ) -> Result<RecordServiceOutcome, Box<dyn Error>> {
-    commit_with_rejections(case, prepared).map(|committed| committed.outcome)
+    commit_with_rejections(case, prepared, RecordGroupIssues::Individual)
+        .map(|committed| committed.outcome)
 }
 
 pub(in crate::workbench) fn commit_recovery(
     case: &mut Case,
     prepared: PreparedRecordService,
+    issues: RecordGroupIssues,
 ) -> Result<RecoveryRecordServiceOutcome, Box<dyn Error>> {
-    let committed = commit_with_rejections(case, prepared)?;
+    let committed = commit_with_rejections(case, prepared, issues)?;
     Ok(RecoveryRecordServiceOutcome {
         outcome: committed.outcome,
         rejected_inputs: committed.rejected_inputs,
@@ -146,6 +157,7 @@ pub(in crate::workbench) fn commit_recovery(
 fn commit_with_rejections(
     case: &mut Case,
     prepared: PreparedRecordService,
+    issues: RecordGroupIssues,
 ) -> Result<CommittedRecordService, Box<dyn Error>> {
     let PreparedRecordService {
         analysis,
@@ -154,9 +166,9 @@ fn commit_with_rejections(
     } = prepared;
 
     let outcome = case.transaction(|case| {
-        let receipt_node_id = evidence::add_receipt_node(case, &analysis)?;
+        let receipt_node_id = evidence::add_receipt_node(case, &analysis, issues)?;
         evidence::add_receipt_edges(case, receipt_node_id, &analysis)?;
-        let group_nodes = evidence::record_groups(case, receipt_node_id, &analysis)?;
+        let group_nodes = evidence::record_groups(case, receipt_node_id, &analysis, issues)?;
         case.add_limitation(RECORDS_LIMITATION)?;
 
         Ok::<_, Box<dyn Error>>(RecordServiceOutcome {

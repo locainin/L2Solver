@@ -6,6 +6,9 @@ use l2_workbench::{
 use serde_json::Value;
 use std::error::Error;
 
+#[path = "records_recovery_issue_receipts.rs"]
+mod recovery_issue_receipts;
+
 const fn schema_bytes() -> &'static [u8] {
     br#"{
         "records_offset":1,
