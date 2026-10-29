@@ -217,6 +217,10 @@ pub struct MemoryBudget {
 }
 
 impl MemoryBudget {
+    pub(crate) fn same_ledger(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.shared, &other.shared)
+    }
+
     /// Create an aggregate allowance shared by live charges and reserved future capacity
     #[must_use]
     pub fn new(limit: u64) -> Self {
@@ -365,8 +369,7 @@ impl MemoryLease {
     }
 
     pub(crate) fn matches_budget(&self, budget: Option<&MemoryBudget>, class: MemoryClass) -> bool {
-        self.class == class
-            && budget.is_none_or(|budget| Arc::ptr_eq(&self.budget.shared, &budget.shared))
+        self.class == class && budget.is_none_or(|budget| self.budget.same_ledger(budget))
     }
 
     pub(crate) fn try_duplicate(&self) -> Result<Self, MemoryError> {

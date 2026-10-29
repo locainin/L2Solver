@@ -33,6 +33,7 @@ const MAINTENANCE_BYTES: u64 = 64 * 1024;
 #[derive(Clone)]
 pub struct Cache {
     pub(super) inner: Arc<CacheInner>,
+    pub(super) memory_scope: Option<MemoryBudget>,
 }
 
 pub(super) struct CacheInner {
@@ -64,7 +65,7 @@ impl std::fmt::Debug for Cache {
             .field("cache_root", &self.inner.cache_root.path())
             .field("state_root", &self.inner.state_root.path())
             .field("max_bytes", &self.inner.max_bytes)
-            .finish()
+            .finish_non_exhaustive()
     }
 }
 
@@ -76,33 +77,6 @@ impl CacheInner {
         self.staging.check_location()?;
         self.locks.check_location()?;
         Ok(())
-    }
-
-    pub(super) fn memory_budget(&self) -> Option<&MemoryBudget> {
-        self.memory_budget.get_or_init(|| None).as_ref()
-    }
-
-    fn maintenance_charge(&self) -> Result<Option<MemoryLease>> {
-        memory::reserve(
-            self.memory_budget.get().and_then(Option::as_ref),
-            MAINTENANCE_BYTES,
-        )
-    }
-
-    pub(super) fn encode_checkpoint(
-        &self,
-        snapshot: &JobSnapshot,
-    ) -> Result<(String, Option<MemoryLease>)> {
-        let budget = self.memory_budget();
-        let charge = if budget.is_some() {
-            memory::reserve(
-                budget,
-                memory::checkpoint_charge(memory::json_size(snapshot)?)?,
-            )?
-        } else {
-            None
-        };
-        Ok((serde_json::to_string(snapshot)?, charge))
     }
 
     fn lock(&self, key: &StageKey, exclusive: bool) -> Result<LockGuard> {
@@ -244,6 +218,38 @@ impl CacheInner {
 }
 
 impl Cache {
+    fn configured_memory_budget(&self) -> Option<&MemoryBudget> {
+        self.memory_scope
+            .as_ref()
+            .or_else(|| self.inner.memory_budget.get().and_then(Option::as_ref))
+    }
+
+    pub(super) fn memory_budget(&self) -> Option<&MemoryBudget> {
+        // Data access fixes the shared choice, while startup maintenance leaves it attachable
+        let _ = self.inner.memory_budget.get_or_init(|| None);
+        self.configured_memory_budget()
+    }
+
+    fn maintenance_charge(&self) -> Result<Option<MemoryLease>> {
+        memory::reserve(self.configured_memory_budget(), MAINTENANCE_BYTES)
+    }
+
+    pub(super) fn encode_checkpoint(
+        &self,
+        snapshot: &JobSnapshot,
+    ) -> Result<(String, Option<MemoryLease>)> {
+        let budget = self.memory_budget();
+        let charge = if budget.is_some() {
+            memory::reserve(
+                budget,
+                memory::checkpoint_charge(memory::json_size(snapshot)?)?,
+            )?
+        } else {
+            None
+        };
+        Ok((serde_json::to_string(snapshot)?, charge))
+    }
+
     /// Opens a cache in explicit cache and state directories
     ///
     /// The cache directory stores stage files. The state directory stores the versioned `SQLite`
@@ -311,7 +317,10 @@ impl Cache {
         });
         inner.check_locations()?;
         database::initialize(&inner.state_root, &inner.locks)?;
-        let cache = Self { inner };
+        let cache = Self {
+            inner,
+            memory_scope: None,
+        };
         match cache.prune() {
             Ok(_) | Err(CacheError::CacheBusy) => {}
             Err(error) => return Err(error),
@@ -374,6 +383,34 @@ impl Cache {
             .map_err(|_| CacheError::InvalidInput("cache memory budget is already fixed"))
     }
 
+    /// Returns a handle that charges this worker's budget for cache operations
+    ///
+    /// The new handle shares cache data and locks, while other handles keep their own budgets
+    /// The supplied budget must belong to the cache's already attached aggregate ledger
+    /// Dropping a worker guard releases its unused credit; live entries retain their charges
+    ///
+    /// # Errors
+    /// Returns an error when the cache has no attached budget or uses a different ledger
+    pub fn with_memory_scope(&self, budget: &MemoryBudget) -> Result<Self> {
+        let attached = self
+            .inner
+            .memory_budget
+            .get()
+            .and_then(Option::as_ref)
+            .ok_or(CacheError::InvalidInput(
+                "cache memory budget is not attached",
+            ))?;
+        if !attached.same_ledger(budget) {
+            return Err(CacheError::InvalidInput(
+                "cache memory scope belongs to another budget",
+            ));
+        }
+        Ok(Self {
+            inner: Arc::clone(&self.inner),
+            memory_scope: Some(budget.clone()),
+        })
+    }
+
     /// Returns the configured maximum size in bytes
     #[must_use]
     pub fn max_bytes(&self) -> u64 {
@@ -400,7 +437,7 @@ impl Cache {
         self.inner.check_locations()?;
         let lock = self.inner.lock(key, false)?;
         // The database snapshot and OS lock keep lengths and their row contents consistent
-        let budget = self.inner.memory_budget();
+        let budget = self.memory_budget();
         let mut connection =
             database::open_connection(&self.inner.state_root, Durability::Recomputable)?;
         let transaction = connection.transaction()?;
@@ -475,11 +512,11 @@ impl Cache {
         let lock = self.inner.lock(key, true)?;
         {
             let _quota_lock = self.inner.quota_lock()?;
-            let _memory = self.inner.maintenance_charge()?;
+            let _memory = self.maintenance_charge()?;
             self.clear_stale_execution(key.as_str())?;
             retired::cleanup_key(&self.inner, key.as_str())?;
         }
-        let _memory = self.inner.maintenance_charge()?;
+        let _memory = self.maintenance_charge()?;
         let staging_key = self.inner.staging.open_child_or_create(key.as_str())?;
         let active_checkpoint = self.inner.active_checkpoint(key.as_str())?;
         // A checkpointed work directory remains available to the next lease
@@ -525,7 +562,7 @@ impl Cache {
         self.inner.check_locations()?;
         // Shared ownership prevents pruning until the full-synchronous checkpoint commits
         let _pin = self.inner.lock(key, false)?;
-        let (snapshot_json, charge) = self.inner.encode_checkpoint(snapshot)?;
+        let (snapshot_json, charge) = self.encode_checkpoint(snapshot)?;
         let result = self.inner.record_checkpoint(key, status, &snapshot_json);
         drop(snapshot_json);
         drop(charge);
@@ -542,7 +579,7 @@ impl Cache {
     pub fn read_checkpoint(&self, key: &StageKey) -> Result<Option<Checkpoint>> {
         key.validate()?;
         self.inner.check_locations()?;
-        let budget = self.inner.memory_budget();
+        let budget = self.memory_budget();
         let mut connection =
             database::open_connection(&self.inner.state_root, Durability::Checkpoint)?;
         let transaction = connection.transaction()?;
@@ -670,23 +707,6 @@ impl Cache {
         &self,
         key: &StageKey,
         incoming_bytes: u64,
-    ) -> Result<LockGuard> {
-        self.reserve_capacity_inner(key, incoming_bytes, self.inner.memory_budget())
-    }
-
-    pub(super) fn reserve_capacity_with_memory(
-        &self,
-        key: &StageKey,
-        incoming_bytes: u64,
-        budget: &MemoryBudget,
-    ) -> Result<LockGuard> {
-        self.reserve_capacity_inner(key, incoming_bytes, Some(budget))
-    }
-
-    fn reserve_capacity_inner(
-        &self,
-        key: &StageKey,
-        incoming_bytes: u64,
         budget: Option<&MemoryBudget>,
     ) -> Result<LockGuard> {
         let quota_lock = self.inner.quota_lock()?;
@@ -730,7 +750,7 @@ impl Cache {
         evict: bool,
     ) -> Result<()> {
         let _quota_lock = self.inner.quota_lock()?;
-        let _memory = self.inner.maintenance_charge()?;
+        let _memory = self.maintenance_charge()?;
         self.inner.check_locations()?;
         // Speculative reservation credit never causes an unrelated result to be evicted
         if evict {
@@ -887,7 +907,7 @@ impl Cache {
 
     fn evict(&self, limit: Option<u64>) -> Result<PruneReport> {
         let _quota_lock = self.inner.quota_lock()?;
-        let _memory = self.inner.maintenance_charge()?;
+        let _memory = self.maintenance_charge()?;
         self.inner.check_locations()?;
         self.cleanup_stale_reservations()?;
         self.cleanup_retired_generations()?;
@@ -1039,7 +1059,7 @@ impl Cache {
 
     pub(super) fn clear_execution_debris(&self, key: &str) -> Result<()> {
         let _quota_lock = self.inner.quota_lock()?;
-        let _memory = self.inner.maintenance_charge()?;
+        let _memory = self.maintenance_charge()?;
         self.clear_stale_execution(key)?;
         retired::cleanup_key(&self.inner, key)
     }

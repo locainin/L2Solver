@@ -313,7 +313,7 @@ impl Lease {
             return Err(CacheError::CorruptCheckpoint);
         }
         self.cache.inner.check_locations()?;
-        let memory_budget = self.cache.inner.memory_budget();
+        let memory_budget = self.cache.memory_budget();
         // These buffers are owned by the cache, independently of the caller's codecs
         let _writer_memory = memory::reserve(memory_budget, WRITER_MEMORY_BYTES)?;
         self.cache.clear_execution_debris(self.key.as_str())?;
@@ -380,7 +380,7 @@ impl Lease {
         limits: ExecutionCheckpointLimits,
     ) -> Result<Option<ActiveExecution<'_>>> {
         self.cache.inner.check_locations()?;
-        let memory_budget = self.cache.inner.memory_budget();
+        let memory_budget = self.cache.memory_budget();
         let mut connection =
             database::open_connection(&self.cache.inner.state_root, Durability::Checkpoint)?;
         let transaction = connection.transaction()?;

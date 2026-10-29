@@ -38,6 +38,21 @@ impl ChargedMetadata {
     const fn new(value: Value, memory: Option<MemoryLease>) -> Self {
         Self { value, memory }
     }
+
+    fn validate_scope(&self, scope: Option<&MemoryBudget>) -> Result<()> {
+        // An adopted charge must not move another worker's credit into this operation
+        if let Some(scope) = scope
+            && self
+                .memory
+                .as_ref()
+                .is_some_and(|lease| !lease.budget().same_owner(scope))
+        {
+            return Err(CacheError::InvalidInput(
+                "metadata reservation belongs to another cache scope",
+            ));
+        }
+        Ok(())
+    }
 }
 
 /// An exclusive work area for one stable stage key
@@ -167,7 +182,7 @@ impl Lease {
     pub fn preserve(mut self, snapshot: &JobSnapshot) -> Result<()> {
         self.cache.inner.check_locations()?;
         self.directory.check_location()?;
-        let (snapshot_json, memory) = self.cache.inner.encode_checkpoint(snapshot)?;
+        let (snapshot_json, memory) = self.cache.encode_checkpoint(snapshot)?;
         self.cleanup_on_drop = false;
         let result = self.cache.inner.record_checkpoint(
             &self.key,
@@ -195,7 +210,8 @@ impl Lease {
     /// Commit metadata while transferring its existing shared-memory charge to the entry
     ///
     /// The charge must use the cache allocation class and the cache's shared budget when one is
-    /// attached. Callers must reserve it before constructing the owned metadata value
+    /// attached. A scoped cache also requires the same worker scope. Callers must reserve it
+    /// before constructing the owned metadata value
     ///
     /// # Errors
     /// Returns an error for an incompatible reservation or any failure also reported by `commit`
@@ -217,8 +233,9 @@ impl Lease {
         let mut metadata = ChargedMetadata::new(metadata, reservation);
         self.cache.inner.check_locations()?;
         self.directory.check_location()?;
+        metadata.validate_scope(self.cache.memory_scope.as_ref())?;
         let transient_memory = memory::reserve_metadata(
-            self.cache.inner.memory_budget(),
+            self.cache.memory_budget(),
             &metadata.value,
             MAX_METADATA_BYTES,
             &mut metadata.memory,
@@ -316,11 +333,7 @@ fn prepare_commit(
     let prepared = prepare_manifest(directory, budget)?;
     let entry_bytes = prepared.manifest.total_bytes();
     let bytes = i64::try_from(entry_bytes).map_err(|_| CacheError::SizeOverflow)?;
-    let lock = if let Some(budget) = budget {
-        cache.reserve_capacity_with_memory(key, entry_bytes, budget)?
-    } else {
-        cache.reserve_capacity(key, entry_bytes)?
-    };
+    let lock = cache.reserve_capacity(key, entry_bytes, budget)?;
     Ok((prepared, bytes, lock))
 }
 

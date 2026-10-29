@@ -26,6 +26,8 @@ type ArtifactFiles = Vec<(String, Vec<u8>)>;
 mod case_snapshot_tests;
 #[path = "processing.rs"]
 mod processing_tests;
+#[path = "collection/scoped_cache.rs"]
+mod scoped_cache_tests;
 
 #[test]
 fn recovery_worker_count_sets_the_cpu_bound_before_per_case_memory_admission() {

@@ -140,8 +140,8 @@ impl MemoryBudget {
         }
     }
 
-    pub(super) fn same_owner(&self, other: &Self) -> bool {
-        Arc::ptr_eq(&self.shared, &other.shared)
+    pub(crate) fn same_owner(&self, other: &Self) -> bool {
+        self.same_ledger(other)
             && match (&self.scope, &other.scope) {
                 (None, None) => true,
                 (Some(left), Some(right)) => Arc::ptr_eq(left, right),
@@ -233,7 +233,7 @@ impl Drop for Scope {
 
 impl MemoryLease {
     pub(crate) fn validate_working_set(&self, budget: &MemoryBudget) -> Result<(), MemoryError> {
-        if !Arc::ptr_eq(&self.budget.shared, &budget.shared) || budget.scope.is_none() {
+        if !self.budget.same_ledger(budget) || budget.scope.is_none() {
             return Err(MemoryError::IncompatibleWorkingSet);
         }
         if self.budget.same_owner(budget) {

@@ -228,8 +228,17 @@ pub(super) fn process_case_batch(
         items,
         |(_, pending), active| admission::admit(pending, active, context),
         |(index, pending), working_set| {
+            let worker_cache = match (context.cache, working_set.memory()) {
+                (Some(cache), Some(memory)) => Some(
+                    cache
+                        .with_memory_scope(memory)
+                        .map_err(|error| classify_worker_error(&error))?,
+                ),
+                _ => None,
+            };
             let worker_context = RecoveryContext {
                 memory: working_set.memory(),
+                cache: worker_cache.as_ref().or(context.cache),
                 ..*context
             };
             let PendingCase {
