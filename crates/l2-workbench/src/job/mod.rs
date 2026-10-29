@@ -3,6 +3,7 @@
 pub mod cache;
 
 mod cache_fallback;
+mod json_memory;
 mod memory;
 mod model;
 mod recovery_transition;
@@ -10,6 +11,7 @@ mod recovery_transition;
 pub use cache_fallback::{
     CacheFallbackKind, CacheFallbackRecord, CacheFallbackSummary, CacheStage,
 };
+pub use json_memory::{JsonMemoryAdmission, JsonMemoryError, admit_json};
 pub use memory::{
     BufferedCase, BufferedCaseSnapshot, CgroupMemoryEvents, CgroupMemorySnapshot, MemoryBudget,
     MemoryClass, MemoryError, MemoryLease, MemorySnapshot, MemoryWorkingSet, SystemMemorySnapshot,

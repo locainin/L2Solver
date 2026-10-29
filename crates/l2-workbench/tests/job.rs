@@ -382,3 +382,6 @@ mod recovery_transition;
 
 #[path = "job/memory.rs"]
 mod memory;
+
+#[path = "job/json_memory.rs"]
+mod json_memory;

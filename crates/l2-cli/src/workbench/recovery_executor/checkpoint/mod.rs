@@ -103,9 +103,11 @@ pub(super) fn read<'a>(
     if bytes.len() > max_bytes {
         return Err(RecoveryError::InvalidCheckpoint.into());
     }
-    let (_scratch, metadata_memory) = memory::admit(bytes, memory)?;
+    let metadata_admission = memory::admit(bytes, memory)?;
     let mut saved: Saved<'_> =
         serde_json::from_slice(bytes).map_err(|_| RecoveryError::InvalidCheckpoint)?;
+    let metadata_memory =
+        metadata_admission.map(l2_workbench::job::JsonMemoryAdmission::into_retained);
     if saved.version != VERSION
         || saved.plan != *plan
         || policy_configuration(&saved.policy)? != policy_configuration(expected)?
