@@ -9,8 +9,8 @@ use l2_workbench::{
     job::{
         CacheFallbackKind, CacheStage, Counter, Job, Phase, PhaseOutcome,
         cache::{
-            Cache, CacheEntry, CacheError, CacheReadPolicy, Lease, SourceFingerprint,
-            SourceIdentity, StageKey, StageStatus, Value,
+            Cache, CacheEntry, CacheError, CacheReadPolicy, CommitOutcome, Lease,
+            SourceFingerprint, SourceIdentity, StageKey, StageStatus, Value,
         },
     },
     store::{Options, SCHEMA_VERSION, Store},
@@ -36,6 +36,8 @@ const CACHE_CONTENTION_POLL: Duration = Duration::from_millis(20);
 const CACHE_BUSY_FALLBACK_MESSAGE: &str = "Cache is busy; building a temporary index";
 const CACHE_INVALID_FALLBACK_MESSAGE: &str =
     "Cached capture index is invalid; building a temporary index";
+const CACHE_QUOTA_FALLBACK_MESSAGE: &str =
+    "Cache quota reached; continuing with the available capture index";
 
 pub const NATIVE_CASE_VERSION: u32 = 2;
 
@@ -121,6 +123,7 @@ enum ContentIndexLookup {
 enum UncachedReason {
     Contention,
     InvalidEntry,
+    Quota,
 }
 
 /// Index a capture or reopen its complete content-addressed disk index
@@ -356,6 +359,7 @@ fn inspect_cached_alias(
                 &indexed.receipt,
                 job,
                 deadline,
+                strict_cache,
             )?;
             count_cache_hit(job)?;
             skip_ingestion(job)?;
@@ -408,6 +412,11 @@ fn record_capture_fallback(job: Option<&Job>, reason: UncachedReason) -> Result<
             CacheFallbackKind::InvalidEntry,
             CACHE_INVALID_FALLBACK_MESSAGE,
             "cached capture index could not be validated",
+        ),
+        UncachedReason::Quota => (
+            CacheFallbackKind::CommitQuotaExceeded,
+            CACHE_QUOTA_FALLBACK_MESSAGE,
+            CACHE_QUOTA_FALLBACK_MESSAGE,
         ),
     };
     if let Some(job) = job {
@@ -562,11 +571,14 @@ fn open_cached_winner(
         Err(error) => return Err(error),
     };
     check_fingerprint_unchanged(work.path, Some(&work.fingerprint))?;
-    let alias_entry = work.alias_lease.commit(
-        StageStatus::Complete,
+    // The content winner already owns this index; aliases carry metadata only
+    fs::remove_dir_all(&work.index_directory)?;
+    commit_source_alias(
+        work.alias_lease,
         alias_metadata_value(&work.fingerprint, &indexed.receipt)?,
+        work.strict_cache,
+        work.job,
     )?;
-    drop(alias_entry);
     check_fingerprint_unchanged(work.path, Some(&work.fingerprint))?;
     count_cache_hit(work.job)?;
     Ok(indexed)
@@ -575,19 +587,34 @@ fn open_cached_winner(
 fn commit_content_index(
     lease: Lease,
     receipt: &IngestReceipt,
-    work: CachedIndexWork<'_>,
+    mut work: CachedIndexWork<'_>,
 ) -> Result<IndexedSource> {
     if !work.cache_miss_counted {
         count_cache_miss(work.job)?;
+        work.cache_miss_counted = true;
     }
     let destination = lease.directory().join(INDEX_DIRECTORY);
     fs::rename(&work.index_directory, &destination)?;
-    let entry = lease.commit(StageStatus::Complete, json!({"receipt": receipt}))?;
-    let alias_entry = work.alias_lease.commit(
-        StageStatus::Complete,
+    let metadata = json!({"receipt": receipt});
+    let entry = if work.strict_cache {
+        lease.commit(StageStatus::Complete, metadata)?
+    } else {
+        match lease.commit_or_retain(StageStatus::Complete, metadata)? {
+            CommitOutcome::Committed(entry) => entry,
+            CommitOutcome::QuotaExceeded(lease) => {
+                // Move the completed index back before releasing the denied cache lease
+                fs::rename(&destination, &work.index_directory)?;
+                drop(lease);
+                return use_uncached_index(receipt.clone(), work, UncachedReason::Quota);
+            }
+        }
+    };
+    commit_source_alias(
+        work.alias_lease,
         alias_metadata_value(&work.fingerprint, receipt)?,
+        work.strict_cache,
+        work.job,
     )?;
-    drop(alias_entry);
     let receipt = receipt_from_index_entry(&entry, &receipt.source_id)?;
     let indexed = indexed_from_cache(entry, receipt)?;
     check_fingerprint_unchanged(work.path, Some(&work.fingerprint))?;
@@ -898,6 +925,7 @@ fn ensure_source_alias(
     receipt: &IngestReceipt,
     job: Option<&Job>,
     deadline: Instant,
+    strict_cache: bool,
 ) -> Result<()> {
     let value = alias_metadata_value(fingerprint, receipt)?;
     loop {
@@ -915,8 +943,7 @@ fn ensure_source_alias(
 
         match cache.lease(alias_key) {
             Ok(lease) => {
-                drop(lease.commit(StageStatus::Complete, value)?);
-                return Ok(());
+                return commit_source_alias(lease, value, strict_cache, job);
             }
             Err(CacheError::LockBusy) => {
                 if !wait_for_cache_key(cache, alias_key, job, deadline, true)? {
@@ -926,6 +953,22 @@ fn ensure_source_alias(
             Err(error) => return Err(error.into()),
         }
     }
+}
+
+fn commit_source_alias(
+    lease: Lease,
+    metadata: Value,
+    strict_cache: bool,
+    job: Option<&Job>,
+) -> Result<()> {
+    match lease.commit(StageStatus::Complete, metadata) {
+        Ok(entry) => drop(entry),
+        Err(CacheError::QuotaExceeded { .. }) if !strict_cache => {
+            record_capture_fallback(job, UncachedReason::Quota)?;
+        }
+        Err(error) => return Err(error.into()),
+    }
+    Ok(())
 }
 
 pub(super) fn count_cache_hit(job: Option<&Job>) -> Result<()> {

@@ -65,6 +65,15 @@ pub struct Lease {
     directory: HeldDirectory,
 }
 
+/// A committed result or private work retained after a cache quota denial
+#[derive(Debug)]
+pub enum CommitOutcome {
+    /// The stage files and metadata were committed and pinned
+    Committed(CacheEntry),
+    /// No generation was published and the caller still owns its private work
+    QuotaExceeded(Lease),
+}
+
 pub(super) struct EntryRecord {
     pub(super) stage: String,
     pub(super) status: StageStatus,
@@ -203,8 +212,27 @@ impl Lease {
     /// # Errors
     /// Returns an error when the work directory contains unsafe files, has changed location,
     /// exceeds the configured cache quota, or cannot be committed to the `SQLite` index
-    pub fn commit(self, status: StageStatus, metadata: Value) -> Result<CacheEntry> {
+    pub fn commit(mut self, status: StageStatus, metadata: Value) -> Result<CacheEntry> {
         self.commit_inner(status, metadata, None)
+    }
+
+    /// Commit a stage while keeping its private files available on quota denial
+    ///
+    /// Quota is checked before any generation is published. Other failures keep the same
+    /// cleanup and uncertain-commit behavior as [`Self::commit`]
+    ///
+    /// # Errors
+    /// Returns non-quota errors also reported by [`Self::commit`]
+    pub fn commit_or_retain(
+        mut self,
+        status: StageStatus,
+        metadata: Value,
+    ) -> Result<CommitOutcome> {
+        match self.commit_inner(status, metadata, None) {
+            Ok(entry) => Ok(CommitOutcome::Committed(entry)),
+            Err(CacheError::QuotaExceeded { .. }) => Ok(CommitOutcome::QuotaExceeded(self)),
+            Err(error) => Err(error),
+        }
     }
 
     /// Commit metadata while transferring its existing shared-memory charge to the entry
@@ -216,7 +244,7 @@ impl Lease {
     /// # Errors
     /// Returns an error for an incompatible reservation or any failure also reported by `commit`
     pub fn commit_with_reserved_metadata(
-        self,
+        mut self,
         status: StageStatus,
         metadata: Value,
         reservation: MemoryLease,
@@ -225,7 +253,7 @@ impl Lease {
     }
 
     fn commit_inner(
-        mut self,
+        &mut self,
         status: StageStatus,
         metadata: Value,
         reservation: Option<MemoryLease>,

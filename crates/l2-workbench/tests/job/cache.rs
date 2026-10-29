@@ -26,6 +26,9 @@ mod execution;
 #[path = "cache/memory.rs"]
 mod memory;
 
+#[path = "cache/commit.rs"]
+mod commit;
+
 #[path = "cache/scoped_memory.rs"]
 mod scoped_memory;
 

@@ -30,6 +30,9 @@ mod native_case_cache_tests;
 #[path = "full_source/cache/corruption.rs"]
 mod cache_corruption_tests;
 
+#[path = "full_source/cache/quota.rs"]
+mod cache_quota_tests;
+
 #[test]
 fn published_capture_index_can_be_reused_without_reingestion() -> Result<(), Box<dyn Error>> {
     let directory = tempfile::tempdir()?;

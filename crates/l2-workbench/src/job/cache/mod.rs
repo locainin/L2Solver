@@ -13,7 +13,7 @@ mod memory;
 mod model;
 mod retired;
 
-pub use entry::{CacheEntry, Lease};
+pub use entry::{CacheEntry, CommitOutcome, Lease};
 pub use error::{CacheError, Result};
 pub use execution::{ActiveExecution, ExecutionCheckpointLimits, ExecutionWriter};
 pub use fingerprint::{FileTimestamp, SourceFingerprint, SourceIdentity};
