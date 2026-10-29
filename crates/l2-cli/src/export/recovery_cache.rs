@@ -455,13 +455,18 @@ fn store_result(
         case_snapshot_usage: &usage,
     };
     // The JSON value owns its own copy before the cache takes over its accounting
-    let (metadata, _metadata_memory) = metadata_memory::encode(&metadata, memory)?;
+    let (metadata, metadata_memory) = metadata_memory::encode(&metadata, memory)?;
     let status = if result.coverage.is_complete() {
         StageStatus::Complete
     } else {
         StageStatus::Partial
     };
-    drop(lease.commit(status, metadata)?);
+    let entry = if let Some(reservation) = metadata_memory {
+        lease.commit_with_reserved_metadata(status, metadata, reservation)?
+    } else {
+        lease.commit(status, metadata)?
+    };
+    drop(entry);
     Ok(())
 }
 

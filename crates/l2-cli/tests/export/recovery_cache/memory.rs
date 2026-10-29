@@ -81,6 +81,50 @@ fn oversized_metadata_copy_is_rejected_before_replacing_the_cached_result()
 }
 
 #[test]
+fn shared_cache_and_worker_can_commit_metadata_once_within_the_aggregate_limit()
+-> Result<(), Box<dyn Error>> {
+    let fixture_dir = tempfile::tempdir()?;
+    let fixture_cache = open_cache(fixture_dir.path())?;
+    let options = RecoveryOptions::default();
+    let (case, scope, recovery) = recovery_with_omissions(&fixture_cache, &options, 1, 40 * 1024)?;
+    let destination = tempfile::tempdir()?;
+    let budget = MemoryBudget::new(5_950_000);
+    let cache = Cache::open_at_with_memory_budget(
+        destination.path().join("cache"),
+        destination.path().join("state"),
+        options.cache_max_bytes,
+        budget.clone(),
+    )?;
+    let key = super::super::recovery_key(RecoveryCaseKind::Flow, &scope, &options)?;
+    let worker = budget.try_working_set(512 * 1024)?;
+    super::super::store_result(
+        cache.lease(&key)?,
+        &case,
+        &recovery,
+        &options,
+        Some(worker.budget()),
+    )?;
+    drop(worker);
+    assert_eq!(budget.snapshot()?.used_bytes, 0);
+    let entry = cache
+        .lookup(&key, CacheReadPolicy::AllowPartial)?
+        .ok_or("the budgeted recovery result was not committed")?;
+    assert_eq!(
+        entry
+            .metadata()
+            .get("omissions")
+            .and_then(Value::as_array)
+            .and_then(|values| values.first())
+            .and_then(Value::as_str)
+            .map(str::len),
+        Some(40 * 1024)
+    );
+    drop(entry);
+    assert_eq!(budget.snapshot()?.used_bytes, 0);
+    Ok(())
+}
+
+#[test]
 fn restored_omissions_remain_charged_after_the_case_is_dropped() -> Result<(), Box<dyn Error>> {
     let temporary = tempfile::tempdir()?;
     let cache = open_cache(temporary.path())?;

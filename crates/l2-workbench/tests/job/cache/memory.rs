@@ -146,6 +146,119 @@ fn committed_entry_holds_and_releases_its_metadata_charge() -> Result<(), Box<dy
     Ok(())
 }
 
+#[test]
+fn adopted_metadata_charge_stays_live_after_the_worker_finishes() -> Result<(), Box<dyn Error>> {
+    let temporary = tempfile::tempdir()?;
+    let key = stage_key("memory-adopted-metadata")?;
+    let cache = cache_at(temporary.path(), 64 * 1024)?;
+    let budget = MemoryBudget::new(4 * 1024 * 1024);
+    cache.attach_memory_budget(budget.clone())?;
+    let worker = budget.try_working_set(64 * 1024)?;
+    let reservation = worker.budget().try_reserve(MemoryClass::Cache, 8 * 1024)?;
+    let lease = cache.lease(&key)?;
+    fs::write(lease.directory().join("result"), b"result")?;
+    let entry = lease.commit_with_reserved_metadata(
+        StageStatus::Complete,
+        json!({"payload": "x".repeat(1024)}),
+        reservation,
+    )?;
+    drop(worker);
+    assert!(
+        budget.snapshot()?.used(MemoryClass::Cache) >= 8 * 1024,
+        "the entry must own the adopted charge"
+    );
+    assert_eq!(
+        entry
+            .metadata()
+            .get("payload")
+            .and_then(|v| v.as_str())
+            .map(str::len),
+        Some(1024)
+    );
+    drop(entry);
+    assert_eq!(budget.snapshot()?.used_bytes, 0);
+    Ok(())
+}
+
+#[test]
+fn metadata_adoption_rejects_other_ledgers_and_non_cache_charges() -> Result<(), Box<dyn Error>> {
+    let temporary = tempfile::tempdir()?;
+    let key = stage_key("memory-invalid-adoption")?;
+    let cache = cache_at(temporary.path(), 64 * 1024)?;
+    let budget = MemoryBudget::new(4 * 1024 * 1024);
+    let other = MemoryBudget::new(4 * 1024 * 1024);
+    cache.attach_memory_budget(budget.clone())?;
+    for reservation in [
+        other.try_reserve(MemoryClass::Cache, 1024)?,
+        budget.try_reserve(MemoryClass::Executor, 1024)?,
+    ] {
+        let lease = cache.lease(&key)?;
+        fs::write(lease.directory().join("result"), b"result")?;
+        assert!(matches!(
+            lease.commit_with_reserved_metadata(
+                StageStatus::Complete,
+                json!({"payload": "value"}),
+                reservation,
+            ),
+            Err(CacheError::InvalidInput(_))
+        ));
+    }
+    assert_eq!(budget.snapshot()?.used_bytes, 0);
+    assert_eq!(other.snapshot()?.used_bytes, 0);
+    assert!(cache.lookup(&key, CacheReadPolicy::CompleteOnly)?.is_none());
+    Ok(())
+}
+
+#[test]
+fn cache_without_attached_budget_can_adopt_the_callers_cache_charge() -> Result<(), Box<dyn Error>>
+{
+    let temporary = tempfile::tempdir()?;
+    let key = stage_key("memory-adopted-unattached")?;
+    let cache = cache_at(temporary.path(), 64 * 1024)?;
+    let budget = MemoryBudget::new(4 * 1024 * 1024);
+    let reservation = budget.try_reserve(MemoryClass::Cache, 1024)?;
+    let lease = cache.lease(&key)?;
+    fs::write(lease.directory().join("result"), b"result")?;
+    let entry = lease.commit_with_reserved_metadata(
+        StageStatus::Complete,
+        json!({"payload": "value"}),
+        reservation,
+    )?;
+    assert!(budget.snapshot()?.used(MemoryClass::Cache) >= 1024);
+    drop(entry);
+    assert_eq!(budget.snapshot()?.used_bytes, 0);
+    Ok(())
+}
+
+#[test]
+fn rejected_metadata_charge_growth_preserves_the_previous_entry() -> Result<(), Box<dyn Error>> {
+    let temporary = tempfile::tempdir()?;
+    let key = stage_key("memory-adoption-denied")?;
+    let cache = cache_at(temporary.path(), 64 * 1024)?;
+    save_fixture(&cache, &key, 10)?;
+    let budget = MemoryBudget::new(64 * 1024);
+    let reservation = budget.try_reserve(MemoryClass::Cache, 1024)?;
+    let lease = cache.lease(&key)?;
+    fs::write(lease.directory().join("result"), b"replacement")?;
+    assert!(matches!(
+        lease.commit_with_reserved_metadata(
+            StageStatus::Complete,
+            json!({"payload": "x".repeat(4096)}),
+            reservation,
+        ),
+        Err(CacheError::Memory(MemoryError::Limit { .. }))
+    ));
+    assert_eq!(budget.snapshot()?.used_bytes, 0);
+    let entry = cache
+        .lookup(&key, CacheReadPolicy::CompleteOnly)?
+        .ok_or("the previous cache entry was lost")?;
+    assert_eq!(
+        entry.metadata().get("payload").and_then(|v| v.as_str()),
+        Some("xxxxxxxxxx")
+    );
+    Ok(())
+}
+
 #[cfg(target_os = "linux")]
 #[test]
 fn denied_lookup_does_not_read_the_large_metadata_column() -> Result<(), Box<dyn Error>> {

@@ -360,6 +360,11 @@ pub struct MemoryLease {
 }
 
 impl MemoryLease {
+    pub(crate) fn matches_budget(&self, budget: Option<&MemoryBudget>, class: MemoryClass) -> bool {
+        self.class == class
+            && budget.is_none_or(|budget| Arc::ptr_eq(&self.budget.shared, &budget.shared))
+    }
+
     pub(crate) fn try_duplicate(&self) -> Result<Self, MemoryError> {
         self.budget.try_reserve(self.class, self.bytes)
     }

@@ -28,6 +28,18 @@ pub struct CacheEntry {
     _memory: Option<MemoryLease>,
 }
 
+struct ChargedMetadata {
+    value: Value,
+    // Drop the metadata before releasing its accounting on every error path
+    memory: Option<MemoryLease>,
+}
+
+impl ChargedMetadata {
+    const fn new(value: Value, memory: Option<MemoryLease>) -> Self {
+        Self { value, memory }
+    }
+}
+
 /// An exclusive work area for one stable stage key
 pub struct Lease {
     pub(super) cache: Cache,
@@ -176,15 +188,42 @@ impl Lease {
     /// # Errors
     /// Returns an error when the work directory contains unsafe files, has changed location,
     /// exceeds the configured cache quota, or cannot be committed to the `SQLite` index
-    pub fn commit(mut self, status: StageStatus, metadata: Value) -> Result<CacheEntry> {
+    pub fn commit(self, status: StageStatus, metadata: Value) -> Result<CacheEntry> {
+        self.commit_inner(status, metadata, None)
+    }
+
+    /// Commit metadata while transferring its existing shared-memory charge to the entry
+    ///
+    /// The charge must use the cache allocation class and the cache's shared budget when one is
+    /// attached. Callers must reserve it before constructing the owned metadata value
+    ///
+    /// # Errors
+    /// Returns an error for an incompatible reservation or any failure also reported by `commit`
+    pub fn commit_with_reserved_metadata(
+        self,
+        status: StageStatus,
+        metadata: Value,
+        reservation: MemoryLease,
+    ) -> Result<CacheEntry> {
+        self.commit_inner(status, metadata, Some(reservation))
+    }
+
+    fn commit_inner(
+        mut self,
+        status: StageStatus,
+        metadata: Value,
+        reservation: Option<MemoryLease>,
+    ) -> Result<CacheEntry> {
+        let mut metadata = ChargedMetadata::new(metadata, reservation);
         self.cache.inner.check_locations()?;
         self.directory.check_location()?;
-        let (metadata_memory, transient_memory) = memory::reserve_metadata(
+        let transient_memory = memory::reserve_metadata(
             self.cache.inner.memory_budget(),
-            &metadata,
+            &metadata.value,
             MAX_METADATA_BYTES,
+            &mut metadata.memory,
         )?;
-        let metadata_json = serde_json::to_string(&metadata)?;
+        let metadata_json = serde_json::to_string(&metadata.value)?;
         if metadata_json.len() > MAX_METADATA_BYTES {
             return Err(CacheError::MetadataTooLarge {
                 limit_bytes: MAX_METADATA_BYTES,
@@ -249,6 +288,7 @@ impl Lease {
         drop(metadata_json);
         drop(prepared);
         drop(transient_memory);
+        let (metadata, metadata_memory) = (metadata.value, metadata.memory);
         Ok(CacheEntry::new(
             self.key.clone(),
             status,

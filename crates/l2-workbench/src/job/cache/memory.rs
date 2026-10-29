@@ -63,10 +63,19 @@ pub(super) fn reserve_metadata(
     budget: Option<&MemoryBudget>,
     metadata: &Value,
     limit: usize,
-) -> Result<(Option<MemoryLease>, Option<MemoryLease>)> {
-    let Some(budget) = budget else {
-        return Ok((None, None));
-    };
+    retained: &mut Option<MemoryLease>,
+) -> Result<Option<MemoryLease>> {
+    if retained
+        .as_ref()
+        .is_some_and(|lease| !lease.matches_budget(budget, MemoryClass::Cache))
+    {
+        return Err(CacheError::InvalidInput(
+            "metadata reservation belongs to another budget or class",
+        ));
+    }
+    if budget.is_none() && retained.is_none() {
+        return Ok(None);
+    }
     let encoded = json_size(metadata)?;
     if encoded > u64::try_from(limit).map_err(|_| CacheError::SizeOverflow)? {
         return Err(CacheError::MetadataTooLarge {
@@ -74,10 +83,25 @@ pub(super) fn reserve_metadata(
             actual_bytes: usize::try_from(encoded).map_err(|_| CacheError::SizeOverflow)?,
         });
     }
-    Ok((
-        reserve(Some(budget), metadata_charge(encoded)?)?,
-        reserve(Some(budget), lookup_transient_charge(encoded, 0, 0, 0)?)?,
-    ))
+    let required = metadata_charge(encoded)?;
+    if let Some(lease) = retained.as_mut() {
+        // Keep the original charge continuously while it grows to the cache allowance
+        if lease.bytes() < required {
+            lease.try_resize(required)?;
+        }
+    } else {
+        *retained = reserve(budget, required)?;
+    }
+    let transient = lookup_transient_charge(encoded, 0, 0, 0)?;
+    let transient = if let Some(budget) = budget {
+        reserve(Some(budget), transient)?
+    } else {
+        retained
+            .as_ref()
+            .map(|lease| lease.try_sibling(transient).map_err(CacheError::from))
+            .transpose()?
+    };
+    Ok(transient)
 }
 
 struct Counter {
