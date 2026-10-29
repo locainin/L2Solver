@@ -93,15 +93,11 @@ pub(super) fn reserve_metadata(
         *retained = reserve(budget, required)?;
     }
     let transient = lookup_transient_charge(encoded, 0, 0, 0)?;
-    let transient = if let Some(budget) = budget {
-        reserve(Some(budget), transient)?
-    } else {
-        retained
-            .as_ref()
-            .map(|lease| lease.try_sibling(transient).map_err(CacheError::from))
-            .transpose()?
-    };
-    Ok(transient)
+    // A scoped retained lease can spend its worker's already-admitted future credit
+    retained
+        .as_ref()
+        .map(|lease| lease.try_sibling(transient).map_err(CacheError::from))
+        .transpose()
 }
 
 struct Counter {

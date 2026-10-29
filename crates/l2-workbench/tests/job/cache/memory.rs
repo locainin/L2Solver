@@ -181,6 +181,40 @@ fn adopted_metadata_charge_stays_live_after_the_worker_finishes() -> Result<(), 
 }
 
 #[test]
+fn adopted_metadata_uses_remaining_worker_credit_for_its_transient_buffer()
+-> Result<(), Box<dyn Error>> {
+    commit_adopted_metadata_with_headroom(70 * 1024)
+}
+
+#[test]
+fn adopted_metadata_uses_worker_credit_for_manifest_and_quota_checks() -> Result<(), Box<dyn Error>>
+{
+    commit_adopted_metadata_with_headroom(16 * 1024)
+}
+
+fn commit_adopted_metadata_with_headroom(headroom: u64) -> Result<(), Box<dyn Error>> {
+    let temporary = tempfile::tempdir()?;
+    let key = stage_key("memory-adopted-transient-credit")?;
+    let cache = cache_at(temporary.path(), 64 * 1024)?;
+    let budget = MemoryBudget::new(4 * 1024 * 1024);
+    cache.attach_memory_budget(budget.clone())?;
+    let lease = cache.lease(&key)?;
+    fs::write(lease.directory().join("result"), b"result")?;
+    let worker = budget.try_working_set(4 * 1024 * 1024 - headroom)?;
+    let reservation = worker.budget().try_reserve(MemoryClass::Cache, 1024)?;
+    let entry = lease.commit_with_reserved_metadata(
+        StageStatus::Complete,
+        json!({"payload": "x".repeat(4096)}),
+        reservation,
+    )?;
+    drop(worker);
+    assert!(budget.snapshot()?.used(MemoryClass::Cache) > 0);
+    drop(entry);
+    assert_eq!(budget.snapshot()?.used_bytes, 0);
+    Ok(())
+}
+
+#[test]
 fn metadata_adoption_rejects_other_ledgers_and_non_cache_charges() -> Result<(), Box<dyn Error>> {
     let temporary = tempfile::tempdir()?;
     let key = stage_key("memory-invalid-adoption")?;

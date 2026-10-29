@@ -671,8 +671,26 @@ impl Cache {
         key: &StageKey,
         incoming_bytes: u64,
     ) -> Result<LockGuard> {
+        self.reserve_capacity_inner(key, incoming_bytes, self.inner.memory_budget())
+    }
+
+    pub(super) fn reserve_capacity_with_memory(
+        &self,
+        key: &StageKey,
+        incoming_bytes: u64,
+        budget: &MemoryBudget,
+    ) -> Result<LockGuard> {
+        self.reserve_capacity_inner(key, incoming_bytes, Some(budget))
+    }
+
+    fn reserve_capacity_inner(
+        &self,
+        key: &StageKey,
+        incoming_bytes: u64,
+        budget: Option<&MemoryBudget>,
+    ) -> Result<LockGuard> {
         let quota_lock = self.inner.quota_lock()?;
-        let _memory = self.inner.maintenance_charge()?;
+        let _memory = memory::reserve(budget, MAINTENANCE_BYTES)?;
         self.inner.check_locations()?;
         if incoming_bytes > self.inner.max_bytes {
             return Err(CacheError::QuotaExceeded {

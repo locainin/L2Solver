@@ -360,6 +360,10 @@ pub struct MemoryLease {
 }
 
 impl MemoryLease {
+    pub(crate) const fn budget(&self) -> &MemoryBudget {
+        &self.budget
+    }
+
     pub(crate) fn matches_budget(&self, budget: Option<&MemoryBudget>, class: MemoryClass) -> bool {
         self.class == class
             && budget.is_none_or(|budget| Arc::ptr_eq(&self.budget.shared, &budget.shared))

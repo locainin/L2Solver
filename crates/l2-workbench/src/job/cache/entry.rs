@@ -230,10 +230,10 @@ impl Lease {
                 actual_bytes: metadata_json.len(),
             });
         }
-        let prepared = prepare_manifest(self.directory.path(), self.cache.inner.memory_budget())?;
-        let entry_bytes = prepared.manifest.total_bytes();
-        let bytes = i64::try_from(entry_bytes).map_err(|_| CacheError::SizeOverflow)?;
-        let _quota_lock = self.cache.reserve_capacity(&self.key, entry_bytes)?;
+        // Manifest and quota scratch belong to the same worker as the metadata it commits
+        let budget = metadata.memory.as_ref().map(MemoryLease::budget);
+        let (prepared, bytes, _quota_lock) =
+            prepare_commit(&self.cache, self.directory.path(), &self.key, budget)?;
         self.cache.inner.check_locations()?;
         self.directory.check_location()?;
 
@@ -305,6 +305,23 @@ struct PreparedManifest {
     json: String,
     _manifest_memory: Option<MemoryLease>,
     _json_memory: Option<MemoryLease>,
+}
+
+fn prepare_commit(
+    cache: &Cache,
+    directory: &Path,
+    key: &StageKey,
+    budget: Option<&MemoryBudget>,
+) -> Result<(PreparedManifest, i64, LockGuard)> {
+    let prepared = prepare_manifest(directory, budget)?;
+    let entry_bytes = prepared.manifest.total_bytes();
+    let bytes = i64::try_from(entry_bytes).map_err(|_| CacheError::SizeOverflow)?;
+    let lock = if let Some(budget) = budget {
+        cache.reserve_capacity_with_memory(key, entry_bytes, budget)?
+    } else {
+        cache.reserve_capacity(key, entry_bytes)?
+    };
+    Ok((prepared, bytes, lock))
 }
 
 fn prepare_manifest(directory: &Path, budget: Option<&MemoryBudget>) -> Result<PreparedManifest> {
