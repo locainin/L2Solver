@@ -11,6 +11,9 @@ use l2_workbench::protocol::{
 };
 use std::convert::Infallible;
 
+#[path = "history/checkpoint_validation.rs"]
+mod checkpoint_validation;
+
 fn search(
     samples: &[RelationalRecordSample<'_>],
     plan: &RelationalTransformPlan,

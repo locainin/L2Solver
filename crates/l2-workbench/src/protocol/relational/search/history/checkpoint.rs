@@ -56,8 +56,17 @@ impl Serialize for RelationalReplayHistory {
 impl<'de> Deserialize<'de> for RelationalReplayHistory {
     fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
         let saved = Snapshot::deserialize(deserializer)?;
+        // Published rules may be registered before a search, but rejections need replay limits
         if saved.version != VERSION
             || saved.entry_capacity < saved.entries.len()
+            || saved
+                .limits
+                .is_some_and(|(seed, total)| seed == 0 || total == 0)
+            || (saved.limits.is_none()
+                && saved
+                    .entries
+                    .iter()
+                    .any(|(_, disposition)| *disposition == ReplayDisposition::Rejected))
             || saved
                 .entry_capacity
                 .checked_mul(mem::size_of::<Entry>())
