@@ -60,6 +60,28 @@ struct Emission {
     capture_index: Option<usize>,
 }
 
+struct Transcript {
+    emissions: Vec<Emission>,
+    captured: Vec<CapturedFrame>,
+}
+
+impl Transcript {
+    fn new(capacity: usize) -> Result<Self, LabError> {
+        let mut emissions = Vec::new();
+        emissions
+            .try_reserve_exact(capacity)
+            .map_err(|_| LabError::Allocation)?;
+        let mut captured = Vec::new();
+        captured
+            .try_reserve_exact(capacity)
+            .map_err(|_| LabError::Allocation)?;
+        Ok(Self {
+            emissions,
+            captured,
+        })
+    }
+}
+
 impl<'a> VirtualLab<'a> {
     /// Bind each planned agent to one unique modeled access port
     ///
@@ -93,6 +115,28 @@ impl<'a> VirtualLab<'a> {
         budget: Budget,
         options: RunOptions,
     ) -> Result<VirtualRun, LabError> {
+        let (schedule, mut transcript) = self.admit(budget, synthetic_key)?;
+        let execution = self.dispatch(schedule, synthetic_key, options, &mut transcript)?;
+        let capture = VirtualCapture::new(transcript.captured)?;
+        let evaluation = self.evaluate(
+            &transcript.emissions,
+            &capture,
+            synthetic_key,
+            options.observer,
+            execution.stop_reason(),
+        )?;
+        Ok(VirtualRun {
+            capture,
+            evaluation,
+            execution,
+        })
+    }
+
+    fn admit(
+        &self,
+        budget: Budget,
+        synthetic_key: &[u8],
+    ) -> Result<(Schedule, Transcript), LabError> {
         let schedule = self.schedule(budget)?;
         let first = self
             .plan
@@ -102,20 +146,25 @@ impl<'a> VirtualLab<'a> {
             .ok_or(LabError::Invariant)?;
         // Validate key material and reserve bounded transcript storage before dispatch
         let _validated_key = frame::session_key(first, synthetic_key)?;
-        let mut emissions = Vec::new();
-        emissions
-            .try_reserve_exact(self.plan.probes().len())
-            .map_err(|_| LabError::Allocation)?;
-        let mut captured = Vec::new();
-        captured
-            .try_reserve_exact(self.plan.probes().len())
-            .map_err(|_| LabError::Allocation)?;
+        let transcript = Transcript::new(self.plan.probes().len())?;
+        Ok((schedule, transcript))
+    }
+
+    fn dispatch(
+        &self,
+        schedule: Schedule,
+        synthetic_key: &[u8],
+        options: RunOptions,
+        transcript: &mut Transcript,
+    ) -> Result<RunReport, LabError> {
         let mut runner = schedule.start();
         let mut probes = self.plan.probes().iter().copied();
-        let mut dispatched = 0_u64;
         loop {
             let control = match options.cancellation {
-                Cancellation::After(limit) if dispatched >= limit => Control::Cancel,
+                // The plan caps emissions at 4096, so this count fits in u64
+                Cancellation::After(limit) if transcript.emissions.len() as u64 >= limit => {
+                    Control::Cancel
+                }
                 Cancellation::Never | Cancellation::After(_) => Control::Continue,
             };
             let Some(dispatch) = runner.next(control) else {
@@ -131,26 +180,12 @@ impl<'a> VirtualLab<'a> {
                 dispatch.frame_bytes(),
                 synthetic_key,
                 options.observer,
-                &mut captured,
+                &mut transcript.captured,
             )?;
-            emissions.push(emission);
-            dispatched += 1;
+            transcript.emissions.push(emission);
         }
         // The bridge has immutable ports and no queues or mutable device state
-        let execution = runner.report(Cleanup::Confirmed)?;
-        let capture = VirtualCapture::new(captured)?;
-        let evaluation = self.evaluate(
-            &emissions,
-            &capture,
-            synthetic_key,
-            options.observer,
-            execution.stop_reason(),
-        )?;
-        Ok(VirtualRun {
-            capture,
-            evaluation,
-            execution,
-        })
+        Ok(runner.report(Cleanup::Confirmed)?)
     }
 
     fn schedule(&self, budget: Budget) -> Result<Schedule, LabError> {
@@ -222,51 +257,87 @@ impl<'a> VirtualLab<'a> {
     ) -> Result<EvaluationReport, LabError> {
         let mut evaluator = Evaluator::new(self.plan);
         for emission in emissions {
-            let claims = receipts::claims(
-                emission.probe,
-                &emission.frame,
-                emission.at_millis,
-                observer,
-            )?;
-            evaluator.record_commitment(claims.commitment)?;
-            evaluator.record_tx(claims.transmit)?;
-            if let Some(index) = emission.capture_index {
-                let record = capture.records().get(index).ok_or(LabError::Invariant)?;
-                if record.receiver() != emission.probe.destination_agent_id() {
-                    return Err(LabError::Invariant);
-                }
-                let window = claims.window.ok_or(LabError::Invariant)?;
-                let decoded = l2_core::decode(record.frame())?;
-                let key = frame::session_key(emission.probe, material)?;
-                let number = u64::try_from(index).map_err(|_| LabError::Invariant)? + 1;
-                let reference = PacketReference::new(capture.source(), number)
-                    .map_err(|_| LabError::Invariant)?;
-                let disposition = evaluator.observe_wire(
-                    decoded.payload,
-                    &key,
-                    window,
-                    emission.probe.destination_interface(),
-                    claims.observed_at,
-                    reference,
-                )?;
-                if disposition != ObservationDisposition::Accepted {
-                    return Err(LabError::Invariant);
-                }
-            } else if let Some(window) = claims.window {
-                evaluator.record_window(window)?;
-            }
+            record_emission(&mut evaluator, emission, capture, material, observer)?;
         }
-        let quality = match observer {
-            ObservationMode::Healthy => CaptureQuality::Complete,
-            ObservationMode::Unavailable => CaptureQuality::Incomplete,
-            ObservationMode::Dropped => CaptureQuality::Dropped,
-        };
-        let context = EvaluationContext::new(
-            true,
-            observer != ObservationMode::Unavailable,
-            quality,
-            stop == StopReason::Cancelled,
-        );
-        Ok(evaluator.evaluate(&context))
+        Ok(evaluator.evaluate(&evaluation_context(observer, stop)))
     }
+}
+
+fn record_emission(
+    evaluator: &mut Evaluator,
+    emission: &Emission,
+    capture: &VirtualCapture,
+    material: &[u8],
+    observer: ObservationMode,
+) -> Result<(), LabError> {
+    let claims = receipts::claims(
+        emission.probe,
+        &emission.frame,
+        emission.at_millis,
+        observer,
+    )?;
+    evaluator.record_commitment(claims.commitment)?;
+    evaluator.record_tx(claims.transmit)?;
+    if let Some(index) = emission.capture_index {
+        record_arrival(evaluator, emission, capture, material, index, &claims)?;
+    } else if let Some(window) = claims.window {
+        evaluator.record_window(window)?;
+    }
+    Ok(())
+}
+
+fn record_arrival(
+    evaluator: &mut Evaluator,
+    emission: &Emission,
+    capture: &VirtualCapture,
+    material: &[u8],
+    index: usize,
+    claims: &receipts::Claims,
+) -> Result<(), LabError> {
+    let (record, reference) = captured_delivery(capture, emission, index)?;
+    let window = claims.window.ok_or(LabError::Invariant)?;
+    let decoded = l2_core::decode(record.frame())?;
+    let key = frame::session_key(emission.probe, material)?;
+    let disposition = evaluator.observe_wire(
+        decoded.payload,
+        &key,
+        window,
+        emission.probe.destination_interface(),
+        claims.observed_at,
+        reference,
+    )?;
+    if disposition != ObservationDisposition::Accepted {
+        return Err(LabError::Invariant);
+    }
+    Ok(())
+}
+
+fn captured_delivery<'a>(
+    capture: &'a VirtualCapture,
+    emission: &Emission,
+    index: usize,
+) -> Result<(&'a CapturedFrame, PacketReference), LabError> {
+    let record = capture.records().get(index).ok_or(LabError::Invariant)?;
+    if record.receiver() != emission.probe.destination_agent_id() {
+        return Err(LabError::Invariant);
+    }
+    // Captures are bounded by the plan's 4096 probes and references are one based
+    let number = index as u64 + 1;
+    let reference =
+        PacketReference::new(capture.source(), number).map_err(|_| LabError::Invariant)?;
+    Ok((record, reference))
+}
+
+fn evaluation_context(observer: ObservationMode, stop: StopReason) -> EvaluationContext {
+    let quality = match observer {
+        ObservationMode::Healthy => CaptureQuality::Complete,
+        ObservationMode::Unavailable => CaptureQuality::Incomplete,
+        ObservationMode::Dropped => CaptureQuality::Dropped,
+    };
+    EvaluationContext::new(
+        true,
+        observer != ObservationMode::Unavailable,
+        quality,
+        stop == StopReason::Cancelled,
+    )
 }

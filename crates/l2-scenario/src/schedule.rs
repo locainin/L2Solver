@@ -31,22 +31,7 @@ impl Schedule {
         if stimuli.len() as u64 > budget.packets() {
             return Err(AdmissionError::PacketLimit);
         }
-        let mut bytes = 0_u64;
-        for stimulus in stimuli {
-            if stimulus.sequence() == 0 || stimulus.frame_bytes() == 0 {
-                return Err(AdmissionError::InvalidStimulus);
-            }
-            // Compare each addition against the canonical budget before storing work
-            bytes = bytes
-                .checked_add(stimulus.frame_bytes())
-                .ok_or(AdmissionError::ByteLimit)?;
-            if bytes > budget.bytes() {
-                return Err(AdmissionError::ByteLimit);
-            }
-            if stimulus.at_millis() > budget.duration_millis() {
-                return Err(AdmissionError::DurationLimit);
-            }
-        }
+        validate_costs(stimuli, budget)?;
         let mut owned = Vec::new();
         owned
             .try_reserve_exact(stimuli.len())
@@ -69,4 +54,24 @@ impl Schedule {
     pub const fn start(self) -> Runner {
         Runner::new(self)
     }
+}
+
+// Cost validation stays pure and completes before schedule storage is allocated
+fn validate_costs(stimuli: &[Stimulus], budget: Budget) -> Result<(), AdmissionError> {
+    let mut bytes = 0_u64;
+    for stimulus in stimuli {
+        if stimulus.sequence() == 0 || stimulus.frame_bytes() == 0 {
+            return Err(AdmissionError::InvalidStimulus);
+        }
+        bytes = bytes
+            .checked_add(stimulus.frame_bytes())
+            .ok_or(AdmissionError::ByteLimit)?;
+        if bytes > budget.bytes() {
+            return Err(AdmissionError::ByteLimit);
+        }
+        if stimulus.at_millis() > budget.duration_millis() {
+            return Err(AdmissionError::DurationLimit);
+        }
+    }
+    Ok(())
 }
