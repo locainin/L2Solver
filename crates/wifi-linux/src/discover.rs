@@ -16,6 +16,8 @@ use wl_nl80211::{
 };
 
 const MAX_PHYSICAL_DUMP_RECORDS: usize = 4_096;
+// The current kernel UAPI assigns this value to the non-netdev PD interface
+const NL80211_IFTYPE_PD: u32 = 14;
 
 /// Query Linux `nl80211` without changing radio or interface state
 ///
@@ -117,7 +119,9 @@ async fn collect(handle: &wl_nl80211::Nl80211Handle) -> Result<WirelessInventory
         }
     }
 
-    WirelessInventory::new(physical.finish()?, interfaces.finish())
+    let physical = physical.finish()?;
+    let interfaces = interfaces.finish(&physical)?;
+    WirelessInventory::new(physical, interfaces)
 }
 
 fn validate_dump_termination(error: Option<Nl80211Error>) -> Result<(), DiscoveryError> {
@@ -223,7 +227,12 @@ impl PhysicalAccumulator {
 }
 
 struct InterfaceAccumulator {
-    records: Vec<InterfaceInfo>,
+    records: Vec<InterfaceRecord>,
+}
+
+enum InterfaceRecord {
+    Netdev(InterfaceInfo),
+    NonNetdev(u32),
 }
 
 impl InterfaceAccumulator {
@@ -239,8 +248,22 @@ impl InterfaceAccumulator {
         Ok(())
     }
 
-    fn finish(self) -> Vec<InterfaceInfo> {
-        self.records
+    fn finish(self, physical: &[PhyCapabilities]) -> Result<Vec<InterfaceInfo>, DiscoveryError> {
+        let mut interfaces = Vec::new();
+        for record in self.records {
+            match record {
+                InterfaceRecord::Netdev(interface) => interfaces.push(interface),
+                InterfaceRecord::NonNetdev(phy) => {
+                    if !physical.iter().any(|radio| radio.id() == phy) {
+                        return Err(DiscoveryError::InvalidValue {
+                            field: "physical radio ID",
+                            reason: "non-netdev interface refers to an unknown physical radio",
+                        });
+                    }
+                }
+            }
+        }
+        Ok(interfaces)
     }
 }
 
@@ -343,28 +366,49 @@ fn add_mode(modes: &mut Vec<WirelessMode>, mode: WirelessMode) -> Result<(), Dis
     Ok(())
 }
 
-fn interface(attributes: Vec<Nl80211Attr>) -> Result<InterfaceInfo, DiscoveryError> {
+fn interface(attributes: Vec<Nl80211Attr>) -> Result<InterfaceRecord, DiscoveryError> {
     let mut index = None;
     let mut name = None;
     let mut phy = None;
     let mut mode = None;
+    let mut wdev = None;
     for attribute in attributes {
         match attribute {
             Nl80211Attr::IfIndex(value) => set_once(&mut index, value, "interface index")?,
             Nl80211Attr::IfName(value) => set_once(&mut name, value, "interface name")?,
             Nl80211Attr::Wiphy(value) => set_once(&mut phy, value, "physical radio ID")?,
+            Nl80211Attr::Wdev(value) => set_once(&mut wdev, value, "wireless device ID")?,
             Nl80211Attr::IfType(value) => {
                 set_once(&mut mode, interface_mode(value), "interface mode")?;
             }
             _ => {}
         }
     }
-    InterfaceInfo::new(
+    // These kernel interface types represent wireless devices without a netdev
+    if matches!(
+        mode,
+        Some(
+            WirelessMode::P2pDevice
+                | WirelessMode::NeighborAwareness
+                | WirelessMode::Other(NL80211_IFTYPE_PD)
+        )
+    ) {
+        if index.is_some() || name.is_some() {
+            return Err(DiscoveryError::InvalidValue {
+                field: "non-netdev interface",
+                reason: "non-netdev interface has a network-device identity",
+            });
+        }
+        let phy = phy.ok_or(DiscoveryError::MissingAttribute("physical radio ID"))?;
+        wdev.ok_or(DiscoveryError::MissingAttribute("wireless device ID"))?;
+        return Ok(InterfaceRecord::NonNetdev(phy));
+    }
+    Ok(InterfaceRecord::Netdev(InterfaceInfo::new(
         index.ok_or(DiscoveryError::MissingAttribute("interface index"))?,
         name.ok_or(DiscoveryError::MissingAttribute("interface name"))?,
         phy.ok_or(DiscoveryError::MissingAttribute("physical radio ID"))?,
         mode.ok_or(DiscoveryError::MissingAttribute("interface mode"))?,
-    )
+    )?))
 }
 
 fn unique_attribute_u32(

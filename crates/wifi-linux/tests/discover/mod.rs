@@ -184,6 +184,133 @@ fn interface_dump_limit_while_collecting() {
 }
 
 #[test]
+fn non_netdev_records_do_not_hide_the_selected_network_interface()
+-> Result<(), Box<dyn std::error::Error>> {
+    use wl_nl80211::Nl80211InterfaceType;
+
+    let physical = vec![message(vec![Nl80211Attr::Wiphy(7)])];
+    let mut devices: Vec<_> = [
+        Nl80211InterfaceType::P2pDevice,
+        Nl80211InterfaceType::Nan,
+        Nl80211InterfaceType::Other(14),
+    ]
+    .into_iter()
+    .enumerate()
+    .map(|(index, mode)| {
+        message(vec![
+            Nl80211Attr::Wiphy(7),
+            Nl80211Attr::Wdev(u64::try_from(index).unwrap_or_default() + 1),
+            Nl80211Attr::IfType(mode),
+        ])
+    })
+    .collect();
+    devices.push(message(vec![
+        Nl80211Attr::Wiphy(7),
+        Nl80211Attr::IfIndex(9),
+        Nl80211Attr::IfName("wlan0".into()),
+        Nl80211Attr::IfType(Nl80211InterfaceType::Station),
+    ]));
+    let inventory = normalize_messages(physical, devices)?;
+    assert_eq!(inventory.interfaces().len(), 1);
+    assert_eq!(
+        inventory
+            .interfaces()
+            .first()
+            .map(crate::InterfaceInfo::index),
+        Some(9)
+    );
+    Ok(())
+}
+
+#[test]
+fn malformed_non_netdev_and_missing_netdev_identity_are_rejected() {
+    use wl_nl80211::Nl80211InterfaceType;
+
+    let cases = [
+        vec![
+            Nl80211Attr::Wiphy(7),
+            Nl80211Attr::IfType(Nl80211InterfaceType::P2pDevice),
+        ],
+        vec![
+            Nl80211Attr::Wdev(2),
+            Nl80211Attr::IfType(Nl80211InterfaceType::Nan),
+        ],
+        vec![
+            Nl80211Attr::Wiphy(7),
+            Nl80211Attr::Wdev(2),
+            Nl80211Attr::Wdev(3),
+            Nl80211Attr::IfType(Nl80211InterfaceType::Other(14)),
+        ],
+        vec![
+            Nl80211Attr::Wiphy(7),
+            Nl80211Attr::Wdev(2),
+            Nl80211Attr::IfIndex(9),
+            Nl80211Attr::IfType(Nl80211InterfaceType::P2pDevice),
+        ],
+        vec![
+            Nl80211Attr::Wiphy(7),
+            Nl80211Attr::Wdev(2),
+            Nl80211Attr::IfName("unexpected".into()),
+            Nl80211Attr::IfType(Nl80211InterfaceType::Nan),
+        ],
+        vec![
+            Nl80211Attr::Wiphy(7),
+            Nl80211Attr::Wdev(2),
+            Nl80211Attr::IfType(Nl80211InterfaceType::Other(13)),
+        ],
+    ];
+    for attributes in cases {
+        let mut interfaces = discover::InterfaceAccumulator::new();
+        assert!(interfaces.push(message(attributes)).is_err());
+    }
+}
+
+#[test]
+fn skipped_non_netdev_records_still_count_toward_dump_budget() {
+    use wl_nl80211::Nl80211InterfaceType;
+
+    let mut interfaces = discover::InterfaceAccumulator::new();
+    let mut result = Ok(());
+    for _ in 0..=4_096 {
+        result = interfaces.push(message(vec![
+            Nl80211Attr::Wiphy(7),
+            Nl80211Attr::Wdev(2),
+            Nl80211Attr::IfType(Nl80211InterfaceType::P2pDevice),
+        ]));
+        if result.is_err() {
+            break;
+        }
+    }
+    assert_eq!(
+        result,
+        Err(DiscoveryError::ResourceLimit {
+            field: "interfaces",
+            count: 4_097,
+            maximum: 4_096,
+        })
+    );
+}
+
+#[test]
+fn non_netdev_record_with_unknown_radio_is_rejected() {
+    use wl_nl80211::Nl80211InterfaceType;
+
+    let physical = vec![message(vec![Nl80211Attr::Wiphy(7)])];
+    let devices = vec![message(vec![
+        Nl80211Attr::Wiphy(9),
+        Nl80211Attr::Wdev(2),
+        Nl80211Attr::IfType(Nl80211InterfaceType::P2pDevice),
+    ])];
+    assert!(matches!(
+        normalize_messages(physical, devices),
+        Err(DiscoveryError::InvalidValue {
+            field: "physical radio ID",
+            ..
+        })
+    ));
+}
+
+#[test]
 fn duplicate_scalar_attributes_rejected_either() {
     for indexes in [[1, 2], [2, 1]] {
         let interface = message(vec![
@@ -284,5 +411,7 @@ fn normalize_messages(
     for record in interface_records {
         interfaces.push(record)?;
     }
-    WirelessInventory::new(physical.finish()?, interfaces.finish())
+    let physical = physical.finish()?;
+    let interfaces = interfaces.finish(&physical)?;
+    WirelessInventory::new(physical, interfaces)
 }
