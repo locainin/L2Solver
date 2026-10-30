@@ -1,0 +1,237 @@
+use std::{error::Error, process::Command, sync::atomic::AtomicBool};
+
+use clap::Parser;
+use l2_active_cli::{ActiveOutcome, Cli, execute};
+
+#[test]
+fn receive_only_commands_require_explicit_interface_and_bounded_limits()
+-> Result<(), Box<dyn Error>> {
+    for protocol in ["stp", "discovery"] {
+        let missing = Command::new(env!("CARGO_BIN_EXE_l2solver-active"))
+            .args([protocol, "observe"])
+            .output()?;
+        assert_eq!(missing.status.code(), Some(2));
+        assert!(String::from_utf8_lossy(&missing.stderr).contains("interface"));
+        let invalid = Command::new(env!("CARGO_BIN_EXE_l2solver-active"))
+            .args([
+                protocol,
+                "observe",
+                "--interface",
+                "test0",
+                "--timeout-ms",
+                "0",
+            ])
+            .output()?;
+        assert_eq!(invalid.status.code(), Some(2));
+        assert!(String::from_utf8_lossy(&invalid.stderr).contains("timeout"));
+    }
+    Ok(())
+}
+
+#[test]
+fn cancelled_receive_only_commands_do_not_open_or_send() -> Result<(), Box<dyn Error>> {
+    for protocol in ["stp", "discovery"] {
+        let cli = Cli::try_parse_from([
+            "l2solver-active",
+            protocol,
+            "observe",
+            "--interface",
+            "l2s-no-test",
+            "--format",
+            "json",
+        ])?;
+        let mut bytes = Vec::new();
+        assert_eq!(
+            execute(&cli.active, &AtomicBool::new(true), &mut bytes)?,
+            ActiveOutcome::Cancelled
+        );
+        let report: serde_json::Value = serde_json::from_slice(&bytes)?;
+        assert_eq!(
+            report.get("operation").and_then(serde_json::Value::as_str),
+            Some(format!("{protocol}_observe").as_str())
+        );
+        assert_eq!(
+            report
+                .pointer("/tx/attempted")
+                .and_then(serde_json::Value::as_bool),
+            Some(false)
+        );
+        assert_eq!(
+            report
+                .pointer("/cleanup/state")
+                .and_then(serde_json::Value::as_str),
+            Some("not_started")
+        );
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+#[ignore = "uses verified isolated veth namespaces and a built active helper"]
+fn receive_only_cli_commands_observe_owned_veth_frames_and_release_memberships()
+-> Result<(), Box<dyn Error>> {
+    for (fixture, child, marker) in [
+        (
+            "../l2-active-linux/tests/stp/namespace.py",
+            "listen::stp_namespace_child",
+            "stp_observed=true",
+        ),
+        (
+            "../l2-active-linux/tests/listen/namespace.py",
+            "listen::discovery_namespace_child",
+            "cdp_sent=1",
+        ),
+    ] {
+        let fixture = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join(fixture);
+        let output = Command::new("python3")
+            .arg(fixture)
+            .arg("--")
+            .arg(std::env::current_exe()?)
+            .args(["--ignored", "--exact", child])
+            .output()?;
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(String::from_utf8_lossy(&output.stdout).contains(marker));
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+#[ignore = "invoked only by the verified owned STP fixture"]
+fn stp_namespace_child() -> Result<(), Box<dyn Error>> {
+    observe_fixture("stp", "STP", "0180c2000000")
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+#[ignore = "invoked only by the verified owned discovery fixture"]
+fn discovery_namespace_child() -> Result<(), Box<dyn Error>> {
+    observe_fixture("discovery", "DISCOVERY", "0180c200000e")
+}
+
+#[cfg(target_os = "linux")]
+fn observe_fixture(protocol: &str, prefix: &str, group: &str) -> Result<(), Box<dyn Error>> {
+    use std::{fs, process::Stdio};
+
+    crate::namespace::assert_owned()?;
+    let interface = std::env::var(format!("L2_TEST_{prefix}_INTERFACE"))?;
+    let ready =
+        std::env::var_os(format!("L2_TEST_{prefix}_READY")).ok_or("missing readiness path")?;
+    let observed =
+        std::env::var_os(format!("L2_TEST_{prefix}_OBSERVED")).ok_or("missing observation path")?;
+    let helper = std::env::var_os("L2_TEST_ACTIVE_HELPER").ok_or("missing helper")?;
+    let index: u32 = fs::read_to_string(
+        std::path::Path::new("/sys/class/net")
+            .join(&interface)
+            .join("ifindex"),
+    )?
+    .trim()
+    .parse()?;
+    let baseline = memberships(index, group)?;
+    let mut child = Command::new(crate::namespace::binary())
+        .args([
+            protocol,
+            "observe",
+            "--interface",
+            &interface,
+            "--timeout-ms",
+            "2000",
+            "--format",
+            "json",
+            "--helper",
+        ])
+        .arg(helper)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()?;
+    if let Err(error) = await_membership(&mut child, index, group, baseline)
+        .and_then(|()| fs::write(ready, "ready").map_err(Into::into))
+    {
+        let _ = child.kill();
+        let output = child.wait_with_output()?;
+        return Err(format!("{error}: {}", String::from_utf8_lossy(&output.stderr)).into());
+    }
+    let output = child.wait_with_output()?;
+    let report = crate::namespace::completed(&output, &format!("{protocol}_observe"))?;
+    assert_eq!(
+        report
+            .pointer("/tx/attempted")
+            .and_then(serde_json::Value::as_bool),
+        Some(false)
+    );
+    verify_observations(protocol, &report)?;
+    fs::write(observed, "observed")?;
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn await_membership(
+    child: &mut std::process::Child,
+    index: u32,
+    group: &str,
+    baseline: u32,
+) -> Result<(), Box<dyn Error>> {
+    use std::time::{Duration, Instant};
+
+    let deadline = Instant::now() + Duration::from_millis(1500);
+    while memberships(index, group)? <= baseline {
+        if child.try_wait()?.is_some() || Instant::now() >= deadline {
+            return Err("listener did not join the expected group".into());
+        }
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn verify_observations(protocol: &str, report: &serde_json::Value) -> Result<(), Box<dyn Error>> {
+    let observations = report
+        .get("observations")
+        .and_then(serde_json::Value::as_array)
+        .ok_or("missing observations")?;
+    assert!(!observations.is_empty());
+    if protocol == "discovery" {
+        assert!(
+            observations
+                .iter()
+                .any(
+                    |item| item.get("protocol").and_then(serde_json::Value::as_str) == Some("lldp")
+                )
+        );
+        assert!(
+            observations
+                .iter()
+                .any(
+                    |item| item.get("protocol").and_then(serde_json::Value::as_str) == Some("cdp")
+                )
+        );
+    } else {
+        assert!(observations.iter().any(|item| {
+            item.get("disposition").and_then(serde_json::Value::as_str) == Some("decoded")
+        }));
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn memberships(index: u32, group: &str) -> Result<u32, Box<dyn Error>> {
+    for line in std::fs::read_to_string("/proc/net/dev_mcast")?.lines() {
+        let mut fields = line.split_whitespace();
+        let Some(raw_index) = fields.next() else {
+            continue;
+        };
+        let _name = fields.next();
+        let users = fields.next();
+        let _global = fields.next();
+        let address = fields.next();
+        if raw_index.parse::<u32>()? == index && address == Some(group) {
+            return Ok(users.ok_or("missing multicast user count")?.parse()?);
+        }
+    }
+    Ok(0)
+}

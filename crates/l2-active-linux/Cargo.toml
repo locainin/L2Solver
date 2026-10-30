@@ -1,0 +1,18 @@
+[package]
+name = "l2-active-linux"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[lints]
+workspace = true
+
+[dependencies]
+l2-active = { version = "=0.1.0", path = "../l2-active" }
+l2-capture = { version = "=0.1.0", path = "../l2-capture" }
+l2-onpath = { version = "=0.1.0", path = "../l2-onpath" }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+nix = { version = "=0.31.3", features = ["net", "socket", "poll", "user", "uio", "process", "fs"] }
+rscap = "=0.3.2"
+rustix = { version = "=1.1.4", features = ["fs", "time", "thread"] }

@@ -1,0 +1,16 @@
+[package]
+name = "l2-active"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[lints]
+workspace = true
+
+[dependencies]
+l2-capture = { version = "=0.1.0", path = "../l2-capture" }
+l2-codecs = { version = "=0.1.0", path = "../l2-codecs" }
+l2-core = { version = "=0.1.0", path = "../l2-core" }
+l2-discovery = { version = "=0.1.0", path = "../l2-discovery" }
+l2-onpath = { version = "=0.1.0", path = "../l2-onpath" }
+smoltcp = { version = "=0.14.0", default-features = false, features = ["medium-ethernet", "proto-ipv4", "proto-ipv6", "proto-dhcpv4", "socket-udp"] }

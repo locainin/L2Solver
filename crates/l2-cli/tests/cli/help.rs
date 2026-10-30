@@ -24,7 +24,7 @@ fn long_help_points_developer_namespace() -> Result<(), Box<dyn std::error::Erro
     assert!(text.contains("Exit status:"));
     assert!(text.contains("3  Assessment, collection, export, or workbench result is incomplete"));
     assert!(text.contains(
-        "4  Findings found with --fail-on-findings/--ci, or baseline changes with --fail-on-change"
+        "4  Active identity findings; findings with --fail-on-findings/--ci; or baseline changes with --fail-on-change"
     ));
     assert!(!text.contains("3  Assessment incomplete"));
     assert!(!text.contains("4  Confirmed findings when --fail-on-findings is selected"));

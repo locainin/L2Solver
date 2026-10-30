@@ -2,6 +2,7 @@
 
 #![forbid(unsafe_code)]
 
+mod active;
 #[cfg(target_os = "linux")]
 mod allocator;
 mod baseline;
@@ -75,13 +76,19 @@ fn run(command: &Command) -> Result<RunOutcome, Box<dyn Error>> {
     let mut stdout = output::BrokenPipeWriter::new(buffer);
     // Closed output becomes a sink while the command finishes its semantic result
     let outcome = execute(command, &mut stdout)?;
-    stdout.flush()?;
+    stdout.flush().map_err(|error| -> Box<dyn Error> {
+        match command {
+            Command::Active(_) => Box::new(l2_active_cli::Error::Output(error)),
+            _ => Box::new(error),
+        }
+    })?;
     Ok(outcome)
 }
 
 fn execute(command: &Command, output: &mut impl Write) -> Result<RunOutcome, Box<dyn Error>> {
     // One dispatcher keeps exit semantics identical across compatibility aliases
     match command {
+        Command::Active(options) => active::run(options, output),
         Command::Export(options) => {
             recovery_job::run(&options.recovery, "capture extraction", |job| {
                 export::run_with_job(options, output, job)
@@ -332,6 +339,17 @@ fn main() -> ExitCode {
             outcome.exit_code()
         }
         Err(error) => {
+            // Preserve the active command's structured diagnostic when selected
+            if let Command::Active(options) = &command
+                && let Some(active_error) = error.downcast_ref::<l2_active_cli::Error>()
+            {
+                let _ = l2_active_cli::write_error(
+                    active_error,
+                    options.format,
+                    &mut io::stderr().lock(),
+                );
+                return ExitCode::FAILURE;
+            }
             // Preserve failure even when stderr itself is unavailable
             if structured_progress(&command) {
                 let _ = writeln!(

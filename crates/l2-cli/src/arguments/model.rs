@@ -364,6 +364,7 @@ pub enum CompletionShell {
 // Compatibility forms are normalized into this one command model
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Command {
+    Active(l2_active_cli::ActiveArgs),
     Export(ExportOptions),
     Refine(RefineOptions),
     Cache(CacheCommand),

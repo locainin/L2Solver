@@ -14,52 +14,7 @@ pub struct BoundedWriter<W> {
     artifact: &'static str,
 }
 
-/// Standard-output writer that becomes a sink after its reader closes
-pub struct BrokenPipeWriter<W> {
-    inner: W,
-    closed: bool,
-}
-
-impl<W> BrokenPipeWriter<W> {
-    #[must_use]
-    pub const fn new(inner: W) -> Self {
-        Self {
-            inner,
-            closed: false,
-        }
-    }
-}
-
-impl<W: Write> Write for BrokenPipeWriter<W> {
-    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
-        if self.closed {
-            return Ok(bytes.len());
-        }
-        match self.inner.write(bytes) {
-            Ok(written) => Ok(written),
-            Err(error) if error.kind() == io::ErrorKind::BrokenPipe => {
-                // The command keeps computing its semantic result after output closes
-                self.closed = true;
-                Ok(bytes.len())
-            }
-            Err(error) => Err(error),
-        }
-    }
-
-    fn flush(&mut self) -> io::Result<()> {
-        if self.closed {
-            return Ok(());
-        }
-        match self.inner.flush() {
-            Ok(()) => Ok(()),
-            Err(error) if error.kind() == io::ErrorKind::BrokenPipe => {
-                self.closed = true;
-                Ok(())
-            }
-            Err(error) => Err(error),
-        }
-    }
-}
+pub use l2_active_cli::BrokenPipeWriter;
 
 impl<W> BoundedWriter<W> {
     #[must_use]

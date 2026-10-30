@@ -30,7 +30,7 @@ Exit status:
   1  Runtime, I/O, or internal failure
   2  Usage error
   3  Assessment, collection, export, or workbench result is incomplete
-  4  Findings found with --fail-on-findings/--ci, or baseline changes with --fail-on-change";
+  4  Active identity findings; findings with --fail-on-findings/--ci; or baseline changes with --fail-on-change";
 
 const DEV_HELP: &str =
     "Developer:\n  l2solver dev --help       Internal diagnostics and fixture tooling";
@@ -62,6 +62,8 @@ struct Cli {
 
 #[derive(Debug, Subcommand)]
 enum TopCommand {
+    /// Run a bounded active network operation
+    Active(l2_active_cli::ActiveArgs),
     /// Recover artifacts from a PCAP/PCAPNG capture
     #[command(
         arg_required_else_help = true,
@@ -481,6 +483,7 @@ pub fn command() -> clap::Command {
 impl TopCommand {
     fn finish(self) -> Result<Command, clap::Error> {
         match self {
+            Self::Active(arguments) => Ok(Command::Active(arguments)),
             Self::Extract(arguments) => Ok(Command::Export(ExportOptions {
                 capture: arguments.capture,
                 output: arguments.output,

@@ -19,6 +19,16 @@ allow = [
 ]
 confidence-threshold = 0.93
 
+[[licenses.exceptions]]
+name = "smoltcp"
+version = "=0.14.0"
+allow = ["0BSD"]
+
+[[licenses.exceptions]]
+name = "managed"
+version = "=0.8.0"
+allow = ["0BSD"]
+
 [licenses.private]
 ignore = true
 

@@ -1,3 +1,5 @@
+#[path = "cli/active.rs"]
+mod active;
 #[path = "cli/cache_fallback.rs"]
 mod cache_fallback;
 #[path = "cli/cache_lifecycle.rs"]

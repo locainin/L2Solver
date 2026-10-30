@@ -1,0 +1,28 @@
+[package]
+name = "l2-active-cli"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[[bin]]
+name = "l2solver-active"
+path = "src/main.rs"
+
+[lints]
+workspace = true
+
+[dependencies]
+clap = { version = "4.6", features = ["derive", "string"] }
+ctrlc = "3"
+getrandom = "0.3.4"
+l2-active = { version = "=0.1.0", path = "../l2-active" }
+l2-active-linux = { version = "=0.1.0", path = "../l2-active-linux" }
+l2-capture = { version = "=0.1.0", path = "../l2-capture" }
+l2-onpath = { version = "=0.1.0", path = "../l2-onpath" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+[target.'cfg(target_os = "linux")'.dependencies]
+tokio = { version = "1.47", features = ["net", "rt", "time"] }
+wifi-linux = { version = "=0.1.0", path = "../wifi-linux" }
+
