@@ -6,4 +6,4 @@ mod session;
 mod wire;
 
 pub use plan::{NdpPlanError, NdpProbe};
-pub use report::{NdpObservation, NdpReport, NdpStatus};
+pub use report::{NdpObservation, NdpReport};

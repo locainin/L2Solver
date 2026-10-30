@@ -3,18 +3,7 @@
 use l2_capture::CapturedFrame;
 use l2_onpath::MacAddress;
 
-use crate::RunSummary;
-
-/// What the captured matching reply fields establish
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum ArpStatus {
-    /// At least one matching reply was observed
-    Observed,
-    /// A matching reply claimed a MAC other than the configured expectation
-    UnexpectedIdentity,
-    /// No qualifying reply was observed
-    Inconclusive,
-}
+use crate::{NeighborStatus, RunSummary, neighbor};
 
 /// One distinct source MAC claim and the exact captured reply that carried it
 #[derive(Debug)]
@@ -51,18 +40,8 @@ pub struct ArpReport {
 impl ArpReport {
     /// Classify retained facts without claiming that ARP is authenticated
     #[must_use]
-    pub fn status(&self) -> ArpStatus {
-        if self.observations.is_empty() {
-            return ArpStatus::Inconclusive;
-        }
-        if self
-            .observations
-            .iter()
-            .any(|item| self.expected_match(item.mac) == Some(false))
-        {
-            return ArpStatus::UnexpectedIdentity;
-        }
-        ArpStatus::Observed
+    pub fn status(&self) -> NeighborStatus {
+        neighbor::classify(self.expected, self.observations.iter().map(|item| item.mac))
     }
 
     /// Borrow the canonical resource and collection summary

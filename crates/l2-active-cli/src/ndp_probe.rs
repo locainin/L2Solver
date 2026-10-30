@@ -1,4 +1,4 @@
-//! Prepare one link-local IPv6 probe with a pinned native interface
+//! Prepare one IPv6 neighbor probe with a pinned native interface
 
 use std::{
     io::Write,

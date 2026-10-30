@@ -5,8 +5,8 @@ use std::io;
 mod tests;
 
 pub const OPEN: u8 = 1;
-// Version 7 requires inbound-only filters bound to the selected endpoint
-pub const VERSION: u8 = 7;
+// Version 8 requires direct-route checks for non-link-local NDP
+pub const VERSION: u8 = 8;
 pub const SEND: u8 = 2;
 pub const RECEIVE: u8 = 3;
 pub const LOSS: u8 = 4;
@@ -135,6 +135,8 @@ pub fn error_record(error: &io::Error) -> Vec<u8> {
         io::ErrorKind::Interrupted => 5,
         io::ErrorKind::TimedOut => 6,
         io::ErrorKind::NotConnected => 7,
+        io::ErrorKind::NetworkUnreachable => 8,
+        io::ErrorKind::HostUnreachable => 9,
         _ => 0,
     };
     let message: String = error.to_string().chars().take(128).collect();
@@ -153,6 +155,8 @@ pub fn read_error(reader: &mut Reader<'_>) -> io::Result<io::Error> {
         5 => io::ErrorKind::Interrupted,
         6 => io::ErrorKind::TimedOut,
         7 => io::ErrorKind::NotConnected,
+        8 => io::ErrorKind::NetworkUnreachable,
+        9 => io::ErrorKind::HostUnreachable,
         0 => io::ErrorKind::Other,
         _ => return Err(invalid_record()),
     };

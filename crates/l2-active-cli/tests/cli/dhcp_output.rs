@@ -26,6 +26,7 @@ fn options() -> Result<DhcpProbeArgs, Box<dyn StdError>> {
         "--expected-server",
         "192.0.2.1",
     ])?;
+    assert_eq!(cli.active.format, OutputFormat::Text);
     let ActiveCommand::Dhcp {
         command: DhcpCommand::Probe(options),
     } = cli.active.command
@@ -33,6 +34,35 @@ fn options() -> Result<DhcpProbeArgs, Box<dyn StdError>> {
         return Err("expected DHCP probe".into());
     };
     Ok(options)
+}
+
+#[test]
+fn default_text_reports_observed_offer_and_collection_limits() -> Result<(), Box<dyn StdError>> {
+    let plan = probe()?;
+    let mut link = support::Link::new(vec![frame(OFFER)?], Some(0))?;
+    let report = plan.run(&mut link, &AtomicBool::new(false))?;
+    let mut bytes = Vec::new();
+    assert_eq!(
+        write(
+            &options()?,
+            &plan,
+            &report,
+            None,
+            OutputFormat::Text,
+            &mut bytes
+        )?,
+        ActiveOutcome::Completed
+    );
+    let text = String::from_utf8(bytes)?;
+    assert!(text.contains("DHCP probe on test0: observed"), "{text}");
+    assert!(
+        text.contains("Offer: server 192.0.2.1  address 192.0.2.10  lease 3600s  expected: yes"),
+        "{text}"
+    );
+    assert!(text.contains("socket acceptance: confirmed"), "{text}");
+    assert!(text.contains("Helper cleanup: confirmed"), "{text}");
+    assert!(text.contains("unauthenticated claims"), "{text}");
+    Ok(())
 }
 
 fn probe() -> Result<DhcpProbe, Box<dyn StdError>> {

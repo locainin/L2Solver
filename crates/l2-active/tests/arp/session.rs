@@ -1,6 +1,6 @@
 use std::{error::Error, net::Ipv4Addr, sync::atomic::AtomicBool};
 
-use l2_active::{ArpStatus, ReceiveEvent, StopReason};
+use l2_active::{NeighborStatus, ReceiveEvent, StopReason};
 
 use super::fixture::{
     LOCAL_IP, Link, OTHER_MAC, REMOTE_MAC, TARGET_IP, captured, identity, probe, reply,
@@ -16,7 +16,7 @@ fn exact_correlated_reply_is_retained_as_an_observation() -> Result<(), Box<dyn 
     let mut link = Link::new(vec![ReceiveEvent::Frame(frame)], Some(0))?;
     let probe = probe(Some(REMOTE_MAC), 10, 1024)?;
     let report = probe.run(&mut link, &AtomicBool::new(false))?;
-    assert_eq!(report.status(), ArpStatus::Observed);
+    assert_eq!(report.status(), NeighborStatus::Observed);
     assert_eq!(report.summary().stop_reason(), StopReason::Deadline);
     assert_eq!(
         report
@@ -53,7 +53,7 @@ fn mismatched_identity_is_reported_as_a_scoped_observation() -> Result<(), Box<d
     let frame = captured(reply(OTHER_MAC, TARGET_IP, LOCAL_IP), Some(identity()?), 60)?;
     let mut link = Link::new(vec![ReceiveEvent::Frame(frame)], Some(0))?;
     let report = probe(Some(REMOTE_MAC), 10, 1024)?.run(&mut link, &AtomicBool::new(false))?;
-    assert_eq!(report.status(), ArpStatus::UnexpectedIdentity);
+    assert_eq!(report.status(), NeighborStatus::UnexpectedIdentity);
     assert_eq!(
         report.expected_match(
             report
@@ -72,12 +72,12 @@ fn silence_loss_and_cancellation_never_establish_a_success() -> Result<(), Box<d
     for loss in [None, Some(1), Some(0)] {
         let mut link = Link::new(vec![], loss)?;
         let report = probe(None, 10, 1024)?.run(&mut link, &AtomicBool::new(false))?;
-        assert_eq!(report.status(), ArpStatus::Inconclusive);
+        assert_eq!(report.status(), NeighborStatus::Inconclusive);
         assert_eq!(report.summary().capture_loss(), loss);
     }
     let mut link = Link::new(vec![], None)?;
     let report = probe(None, 10, 1024)?.run(&mut link, &AtomicBool::new(true))?;
-    assert_eq!(report.status(), ArpStatus::Inconclusive);
+    assert_eq!(report.status(), NeighborStatus::Inconclusive);
     assert_eq!(report.summary().stop_reason(), StopReason::Cancelled);
     assert_eq!(report.summary().sent_packets(), 0);
     assert!(link.sent.is_empty());
@@ -131,7 +131,7 @@ fn unrelated_truncated_or_wrong_interface_frames_are_not_attributed() -> Result<
         None,
     )?;
     let report = probe(None, 10, 1024)?.run(&mut link, &AtomicBool::new(false))?;
-    assert_eq!(report.status(), ArpStatus::Inconclusive);
+    assert_eq!(report.status(), NeighborStatus::Inconclusive);
     assert!(report.observations().is_empty());
     assert_eq!(report.summary().received_packets(), 3);
     assert_eq!(report.summary().received_bytes(), 180);
@@ -183,6 +183,26 @@ fn two_distinct_mac_claims_are_reported_even_without_an_expected_identity()
     let report = probe(None, 10, 1024)?.run(&mut link, &AtomicBool::new(false))?;
     assert_eq!(report.observations().len(), 2);
     assert!(report.has_conflicting_identities());
+    assert_eq!(report.status(), NeighborStatus::Observed);
+    Ok(())
+}
+
+#[test]
+fn unexpected_arp_identity_takes_precedence_in_either_observation_order()
+-> Result<(), Box<dyn Error>> {
+    for claims in [[REMOTE_MAC, OTHER_MAC], [OTHER_MAC, REMOTE_MAC]] {
+        let events = claims
+            .into_iter()
+            .map(|mac| {
+                captured(reply(mac, TARGET_IP, LOCAL_IP), Some(identity()?), 60)
+                    .map(ReceiveEvent::Frame)
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let mut link = Link::new(events, Some(0))?;
+        let report = probe(Some(REMOTE_MAC), 10, 1024)?.run(&mut link, &AtomicBool::new(false))?;
+        assert_eq!(report.status(), NeighborStatus::UnexpectedIdentity);
+        assert!(report.has_conflicting_identities());
+    }
     Ok(())
 }
 
@@ -224,7 +244,7 @@ fn broadcast_reply_is_supported_when_arp_target_fields_match() -> Result<(), Box
         Some(0),
     )?;
     let report = probe(None, 10, 1024)?.run(&mut link, &AtomicBool::new(false))?;
-    assert_eq!(report.status(), ArpStatus::Observed);
+    assert_eq!(report.status(), NeighborStatus::Observed);
     Ok(())
 }
 
@@ -249,7 +269,7 @@ fn malformed_wrong_operation_and_mismatched_hardware_are_ignored() -> Result<(),
         .collect::<Result<Vec<_>, Box<dyn Error>>>()?;
     let mut link = Link::new(events, Some(0))?;
     let report = probe(None, 10, 1024)?.run(&mut link, &AtomicBool::new(false))?;
-    assert_eq!(report.status(), ArpStatus::Inconclusive);
+    assert_eq!(report.status(), NeighborStatus::Inconclusive);
     assert_eq!(report.summary().received_packets(), 4);
     Ok(())
 }
@@ -271,7 +291,7 @@ fn backend_that_exceeds_the_byte_allowance_is_reported_with_actual_accounting()
     assert_eq!(report.summary().stop_reason(), StopReason::BackendViolation);
     assert_eq!(report.summary().received_bytes(), 100);
     assert_eq!(report.summary().received_packets(), 1);
-    assert_eq!(report.status(), ArpStatus::Inconclusive);
+    assert_eq!(report.status(), NeighborStatus::Inconclusive);
     Ok(())
 }
 
@@ -336,7 +356,7 @@ fn interface_down_stops_collection_without_discarding_prior_evidence() -> Result
         None,
     )?;
     let report = probe(None, 10, 1024)?.run(&mut link, &AtomicBool::new(false))?;
-    assert_eq!(report.status(), ArpStatus::Observed);
+    assert_eq!(report.status(), NeighborStatus::Observed);
     assert_eq!(report.summary().stop_reason(), StopReason::InterfaceDown);
     assert_eq!(report.observations().len(), 1);
     Ok(())
@@ -367,7 +387,7 @@ fn known_outbound_frames_are_charged_without_marking_inbound_capture_incomplete(
     assert_eq!(report.summary().outbound_packets(), 1);
     assert_eq!(report.summary().unscoped_packets(), 0);
     assert_eq!(report.summary().truncated_packets(), 0);
-    assert_eq!(report.status(), ArpStatus::Observed);
+    assert_eq!(report.status(), NeighborStatus::Observed);
     Ok(())
 }
 
@@ -381,7 +401,7 @@ fn pre_send_drain_counts_against_the_same_packet_and_byte_budget() -> Result<(),
     let mut link = Link::new(vec![ReceiveEvent::Frame(frame)], Some(0))?;
     link.pre_send = Some(l2_active::PreSendUsage::new(1, 60));
     let report = probe(None, 2, 120)?.run(&mut link, &AtomicBool::new(false))?;
-    assert_eq!(report.status(), ArpStatus::Observed);
+    assert_eq!(report.status(), NeighborStatus::Observed);
     assert_eq!(report.summary().stop_reason(), StopReason::PacketLimit);
     assert_eq!(report.summary().received_packets(), 1);
     assert_eq!(report.summary().received_bytes(), 60);
@@ -407,7 +427,7 @@ fn unknown_pre_send_usage_stops_capture_without_inventing_a_total() -> Result<()
     assert_eq!(report.summary().sent_packets(), 1);
     assert_eq!(report.summary().total_received_packets(), None);
     assert_eq!(report.summary().total_received_bytes(), None);
-    assert_eq!(report.status(), ArpStatus::Inconclusive);
+    assert_eq!(report.status(), NeighborStatus::Inconclusive);
     Ok(())
 }
 
@@ -427,7 +447,7 @@ fn impossible_pre_send_usage_is_rejected_without_claiming_valid_accounting()
             .bytes(),
         1
     );
-    assert_eq!(report.status(), ArpStatus::Inconclusive);
+    assert_eq!(report.status(), NeighborStatus::Inconclusive);
     Ok(())
 }
 
@@ -500,7 +520,7 @@ fn early_backend_deadline_does_not_claim_the_requested_window_completed()
         Some(0),
     )?;
     let report = probe(None, 10, 1024)?.run(&mut link, &AtomicBool::new(false))?;
-    assert_eq!(report.status(), ArpStatus::Observed);
+    assert_eq!(report.status(), NeighborStatus::Observed);
     assert_eq!(report.summary().stop_reason(), StopReason::BackendDeadline);
     Ok(())
 }
@@ -544,7 +564,7 @@ fn final_backlog_and_query_failure_remain_visible_beside_observed_replies()
     let mut link = Link::new(vec![ReceiveEvent::Frame(frame)], Some(0))?;
     link.backlog = Some(true);
     let report = probe(None, 10, 1024)?.run(&mut link, &AtomicBool::new(false))?;
-    assert_eq!(report.status(), ArpStatus::Observed);
+    assert_eq!(report.status(), NeighborStatus::Observed);
     assert_eq!(report.summary().capture_backlog(), Some(true));
 
     let mut link = Link::new(vec![], None)?;

@@ -9,6 +9,66 @@ use super::fixture::{AUTHENTICATOR, CLIENT, GROUP, REQUEST, START, capture, prob
 use crate::support::{Link, captured, identity};
 
 #[test]
+fn version_three_request_is_observed() -> Result<(), Box<dyn Error>> {
+    let mut version_three = REQUEST.to_vec();
+    *version_three.get_mut(14).ok_or("missing version")? = 3;
+    let mut link = Link::new(vec![ReceiveEvent::Frame(capture(&version_three)?)], Some(0))?;
+    let report = probe(1, 4_096)?.run(&mut link, &AtomicBool::new(false))?;
+    assert_eq!(report.status(), Dot1xStatus::Observed);
+    assert_eq!(
+        report
+            .observations()
+            .first()
+            .ok_or("missing request")?
+            .version(),
+        3
+    );
+    Ok(())
+}
+
+#[test]
+fn non_request_eap_lengths_keep_malformed_and_unrelated_evidence_separate()
+-> Result<(), Box<dyn Error>> {
+    let mut frames = Vec::new();
+    for length in [0_u16, 1, 2, 6] {
+        let mut invalid = REQUEST.to_vec();
+        *invalid.get_mut(18).ok_or("missing code")? = 2;
+        invalid
+            .get_mut(20..22)
+            .ok_or("missing length")?
+            .copy_from_slice(&length.to_be_bytes());
+        frames.push(invalid);
+    }
+    let mut success = REQUEST.to_vec();
+    *success.get_mut(18).ok_or("missing code")? = 3;
+    success
+        .get_mut(16..18)
+        .ok_or("missing body length")?
+        .copy_from_slice(&4_u16.to_be_bytes());
+    success
+        .get_mut(20..22)
+        .ok_or("missing length")?
+        .copy_from_slice(&4_u16.to_be_bytes());
+    frames.push(success);
+    let events = frames
+        .iter()
+        .map(|frame| Ok(ReceiveEvent::Frame(capture(frame)?)))
+        .collect::<Result<Vec<_>, Box<dyn Error>>>()?;
+    let mut link = Link::new(events, Some(0))?;
+    let report = probe(5, 4_096)?.run(&mut link, &AtomicBool::new(false))?;
+    assert_eq!(report.status(), Dot1xStatus::Inconclusive);
+    assert_eq!(report.unrelated_packets(), 1);
+    assert_eq!(report.malformed().len(), 4);
+    assert!(
+        report
+            .malformed()
+            .iter()
+            .all(|item| item.reason() == MalformedReason::EapHeader)
+    );
+    Ok(())
+}
+
+#[test]
 fn scoped_requests_preserve_source_identifier_type_and_exact_evidence() -> Result<(), Box<dyn Error>>
 {
     let mut link = Link::new(vec![ReceiveEvent::Frame(capture(REQUEST)?)], Some(0))?;

@@ -10,6 +10,8 @@ pub const fn io_code(kind: io::ErrorKind) -> &'static str {
         io::ErrorKind::InvalidInput => "invalid_input",
         io::ErrorKind::TimedOut => "timeout",
         io::ErrorKind::Interrupted => "cancelled",
+        io::ErrorKind::NetworkUnreachable => "network_unreachable",
+        io::ErrorKind::HostUnreachable => "host_unreachable",
         _ => "io_error",
     }
 }

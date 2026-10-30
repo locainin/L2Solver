@@ -165,24 +165,6 @@ fn outbound(
     Ok(CapturedFrame::new(bytes.to_vec(), metadata)?)
 }
 
-fn assert_frame_hex(
-    value: &serde_json::Value,
-    original: &CapturedFrame,
-) -> Result<(), Box<dyn StdError>> {
-    let encoded = value
-        .get("frame_hex")
-        .and_then(serde_json::Value::as_str)
-        .ok_or("missing frame bytes")?;
-    assert_eq!(encoded.len(), original.bytes().len() * 2);
-    for (pair, expected) in encoded.as_bytes().chunks_exact(2).zip(original.bytes()) {
-        assert_eq!(
-            u8::from_str_radix(std::str::from_utf8(pair)?, 16)?,
-            *expected
-        );
-    }
-    Ok(())
-}
-
 #[test]
 fn text_reports_conflicting_replies_and_unconfirmed_cleanup() -> Result<(), Box<dyn StdError>> {
     let identity = LinuxInterfaceIdentity::new(1, 2, 3, 4, 5)?;
@@ -212,6 +194,43 @@ fn text_reports_conflicting_replies_and_unconfirmed_cleanup() -> Result<(), Box<
     assert!(text.contains("Helper cleanup: unconfirmed (helper close was not acknowledged)"));
     assert!(text.contains("physical delivery unconfirmed"));
     assert!(text.contains("ARP replies are unauthenticated"));
+    Ok(())
+}
+
+#[test]
+fn conflicting_claims_without_an_expected_mac_are_a_finding() -> Result<(), Box<dyn StdError>> {
+    let identity = LinuxInterfaceIdentity::new(1, 2, 3, 4, 5)?;
+    let probe = prepared(None)?;
+    let mut link = Link::new(
+        identity,
+        [captured(identity, EXPECTED)?, captured(identity, OTHER)?],
+    );
+    let report = probe.run(&mut link, &AtomicBool::new(false))?;
+    let mut bytes = Vec::new();
+    let outcome = output::write(
+        &InterfaceSelector::new("test0")?,
+        &probe,
+        &report,
+        None,
+        OutputFormat::Json,
+        &mut bytes,
+    )?;
+    assert_eq!(outcome, ActiveOutcome::Findings);
+    let value: serde_json::Value = serde_json::from_slice(&bytes)?;
+    assert_eq!(
+        value.get("status").and_then(serde_json::Value::as_str),
+        Some("observed")
+    );
+    assert_eq!(
+        value
+            .get("conflicting_identities")
+            .and_then(serde_json::Value::as_bool),
+        Some(true)
+    );
+    assert_eq!(
+        value.pointer("/replies/0/matches_expected"),
+        Some(&serde_json::Value::Null)
+    );
     Ok(())
 }
 
@@ -285,7 +304,7 @@ fn json_reports_actual_reply_claims_and_socket_acceptance_without_implying_authe
             reply.get("mac").and_then(serde_json::Value::as_str) == Some("02:00:00:00:00:03")
         })
         .ok_or("missing unexpected reply")?;
-    assert_frame_hex(observed, &captured(identity, OTHER)?)?;
+    crate::fixture_assert::frame_hex(observed, captured(identity, OTHER)?.bytes())?;
     assert_eq!(
         value
             .get("authenticated")

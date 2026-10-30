@@ -1,6 +1,6 @@
 #![cfg(target_os = "linux")]
 
-use l2_active::{ActiveLink, ArpProbe, ArpStatus, Limits, ReceiveEvent, StopReason};
+use l2_active::{ActiveLink, ArpProbe, Limits, NeighborStatus, ReceiveEvent, StopReason};
 use l2_active_linux::{HelperLink, InterfaceInfo, InterfaceSelector, discover};
 use l2_onpath::MacAddress;
 use std::{
@@ -74,7 +74,11 @@ fn owned_namespace_child_performs_one_arp_probe() -> Result<(), Box<dyn Error>> 
     let report = probe.run_until(&mut link, &cancelled, admitted)?;
     assert_eq!(report.summary().sent_packets(), 1);
     assert_eq!(report.summary().sent_bytes(), 60);
-    assert_eq!(report.status(), ArpStatus::Observed, "report: {report:?}");
+    assert_eq!(
+        report.status(),
+        NeighborStatus::Observed,
+        "report: {report:?}"
+    );
     assert_eq!(
         report.summary().stop_reason(),
         StopReason::Deadline,
@@ -128,7 +132,7 @@ fn quiet_probe(
     let later_deadline = Instant::now() + quiet.limits().timeout();
     let quiet_report = quiet.run_until(&mut quiet_link, &cancelled, later_deadline)?;
     assert_eq!(quiet_report.summary().sent_packets(), 1);
-    assert_eq!(quiet_report.status(), ArpStatus::Inconclusive);
+    assert_eq!(quiet_report.status(), NeighborStatus::Inconclusive);
     assert_eq!(
         quiet_report.summary().stop_reason(),
         StopReason::BackendDeadline,

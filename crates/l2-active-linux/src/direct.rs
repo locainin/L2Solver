@@ -1,5 +1,5 @@
 use crate::{
-    InterfaceSelector, discover,
+    InterfaceInfo, InterfaceSelector, discover,
     intent::{Intent, IntentKind},
     packet::{self, PacketAuxdata},
     pin::PinnedInterface,
@@ -73,7 +73,7 @@ impl DirectLink {
                 "selected interface changed during admission",
             ));
         }
-        intent.validate(&info, selector)?;
+        verify_admission(&intent, &info, selector, deadline, &AtomicBool::new(false))?;
         if Instant::now() >= deadline {
             return Err(io::Error::new(
                 io::ErrorKind::TimedOut,
@@ -208,7 +208,13 @@ impl ActiveLink for DirectLink {
         if current.identity() != self.pinned.identity {
             return Err(io::Error::other("interface changed before transmission"));
         }
-        self.intent.validate(&current, &self.selector)?;
+        verify_admission(
+            &self.intent,
+            &current,
+            &self.selector,
+            deadline.min(self.deadline),
+            cancelled,
+        )?;
         self.check_time(deadline, cancelled)?;
         self.attempted = true;
         let sent = self.socket.send(frame)?;
@@ -325,4 +331,28 @@ impl ActiveLink for DirectLink {
         }
         Ok(Some(events.contains(PollFlags::POLLIN)))
     }
+}
+
+fn verify_admission(
+    intent: &Intent,
+    info: &InterfaceInfo,
+    selector: &InterfaceSelector,
+    deadline: Instant,
+    cancelled: &AtomicBool,
+) -> io::Result<()> {
+    intent.validate(info, selector)?;
+    if let IntentKind::Ndp { source, target, .. } = intent.kind()
+        && !source.is_unicast_link_local()
+    {
+        // A configured prefix alone cannot establish a global on-link target
+        crate::route::verify_on_link(
+            selector,
+            info.identity(),
+            *source,
+            *target,
+            deadline,
+            cancelled,
+        )?;
+    }
+    Ok(())
 }

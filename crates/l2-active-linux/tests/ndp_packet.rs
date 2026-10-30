@@ -1,6 +1,6 @@
 #![cfg(target_os = "linux")]
 
-use l2_active::{ActiveLink, Limits, NdpStatus, StopReason};
+use l2_active::{ActiveLink, Limits, NeighborStatus, StopReason};
 use l2_active_linux::{HelperLink, InterfaceSelector, ndp};
 use l2_onpath::MacAddress;
 use std::{
@@ -156,7 +156,7 @@ fn owned_namespace_child_performs_one_link_local_ndp_probe() -> Result<(), Box<d
         StopReason::Deadline,
         "{report:?}"
     );
-    assert_eq!(report.status(), NdpStatus::Observed, "{report:?}");
+    assert_eq!(report.status(), NeighborStatus::Observed, "{report:?}");
     if let Ok(candidate) = std::env::var("L2_TEST_NDP_FILTER_NOISE") {
         let expected = match candidate.as_str() {
             "fragment" | "other-target" => 0,

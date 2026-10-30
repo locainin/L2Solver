@@ -22,6 +22,7 @@ fn options() -> Result<Dot1xProbeArgs, Box<dyn StdError>> {
         "--allow-eapol-start",
         "--dedicated-interface",
     ])?;
+    assert_eq!(cli.active.format, OutputFormat::Text);
     let ActiveCommand::Dot1x {
         command: Dot1xCommand::Probe(options),
     } = cli.active.command
@@ -29,6 +30,37 @@ fn options() -> Result<Dot1xProbeArgs, Box<dyn StdError>> {
         return Err("expected 802.1X probe".into());
     };
     Ok(options)
+}
+
+#[test]
+fn default_text_reports_request_without_claiming_authentication() -> Result<(), Box<dyn StdError>> {
+    let plan = probe()?;
+    let mut link = support::Link::new(vec![frame(REQUEST)?], Some(0))?;
+    let report = plan.run(&mut link, &AtomicBool::new(false))?;
+    let mut bytes = Vec::new();
+    assert_eq!(
+        write(
+            &options()?,
+            &plan,
+            &report,
+            None,
+            OutputFormat::Text,
+            &mut bytes
+        )?,
+        ActiveOutcome::Completed
+    );
+    let text = String::from_utf8(bytes)?;
+    assert!(text.contains("802.1X probe on test0: observed"), "{text}");
+    assert!(
+        text.contains(
+            "source 02:00:00:00:00:02  destination selected_interface  identifier 41  type 1"
+        ),
+        "{text}"
+    );
+    assert!(text.contains("socket acceptance: confirmed"), "{text}");
+    assert!(text.contains("Helper cleanup: confirmed"), "{text}");
+    assert!(text.contains("do not prove causation"), "{text}");
+    Ok(())
 }
 
 fn probe() -> Result<Dot1xProbe, Box<dyn StdError>> {

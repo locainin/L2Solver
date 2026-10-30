@@ -30,6 +30,18 @@ fn ndp_probe_requires_explicit_interface_and_ipv6_target() -> Result<(), Box<dyn
 }
 
 #[test]
+fn ndp_help_explains_global_route_requirement() -> Result<(), Box<dyn Error>> {
+    let output = Command::new(env!("CARGO_BIN_EXE_l2solver-active"))
+        .args(["ndp", "probe", "--help"])
+        .output()?;
+    assert!(output.status.success());
+    let help = String::from_utf8(output.stdout)?;
+    assert!(help.contains("direct route"), "{help}");
+    assert!(!help.contains("link-local IPv6 neighbor"), "{help}");
+    Ok(())
+}
+
+#[test]
 fn cancelled_ndp_probe_reports_no_send_without_opening_the_interface() -> Result<(), Box<dyn Error>>
 {
     let options = Cli::try_parse_from([
@@ -68,31 +80,113 @@ fn cancelled_ndp_probe_reports_no_send_without_opening_the_interface() -> Result
     Ok(())
 }
 
+#[test]
+fn global_target_parses_as_a_candidate_requiring_route_authorization() -> Result<(), Box<dyn Error>>
+{
+    let cli = Cli::try_parse_from([
+        "l2solver-active",
+        "ndp",
+        "probe",
+        "--interface",
+        "test0",
+        "--target",
+        "2001:db8:1::2",
+    ])?;
+    let l2_active_cli::ActiveCommand::Ndp {
+        command: l2_active_cli::NdpCommand::Probe(options),
+    } = cli.active.command
+    else {
+        return Err("expected NDP probe".into());
+    };
+    assert_eq!(options.target.to_string(), "2001:db8:1::2");
+    Ok(())
+}
+
 #[cfg(target_os = "linux")]
 #[test]
-fn global_target_is_reported_unsupported_without_opening_the_helper() -> Result<(), Box<dyn Error>>
-{
-    let output = Command::new(env!("CARGO_BIN_EXE_l2solver-active"))
+#[ignore = "uses verified isolated veth namespaces and a built active helper"]
+fn global_ndp_cli_requires_a_direct_route_and_observes_the_reply() -> Result<(), Box<dyn Error>> {
+    let fixture = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../l2-active/tests/ndp/fixtures/global_veth.py");
+    for case in ["direct", "no_route"] {
+        let output = Command::new("python3")
+            .arg(&fixture)
+            .arg("--")
+            .arg(std::env::current_exe()?)
+            .args(["--ignored", "--exact", "ndp::owned_global_namespace_child"])
+            .env("L2_TEST_NDP_GLOBAL_CASE", case)
+            .output()?;
+        assert!(
+            output.status.success(),
+            "{case}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(
+            String::from_utf8_lossy(&output.stdout)
+                .contains("route_case_confirmed=true cleanup_confirmed=true")
+        );
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+#[ignore = "invoked only by the verified owned global-NDP fixture"]
+fn owned_global_namespace_child() -> Result<(), Box<dyn Error>> {
+    crate::namespace::assert_owned()?;
+    let case = std::env::var("L2_TEST_NDP_GLOBAL_CASE")?;
+    let interface = std::env::var("L2_TEST_NDP_INTERFACE")?;
+    let helper = std::env::var_os("L2_TEST_ACTIVE_HELPER").ok_or("missing helper")?;
+    let output = Command::new(crate::namespace::binary())
         .args([
             "ndp",
             "probe",
             "--interface",
-            "lo",
+            &interface,
+            "--source-ip",
+            "2001:db8:1::1",
             "--target",
-            "2001:db8::1",
+            "2001:db8:1::2",
+            "--expected-mac",
+            "02:00:00:00:00:02",
+            "--timeout-ms",
+            "1500",
             "--format",
             "json",
+            "--helper",
         ])
+        .arg(helper)
         .output()?;
-    assert_eq!(output.status.code(), Some(1));
-    let error: serde_json::Value = serde_json::from_slice(&output.stderr)?;
+    if case == "no_route" {
+        assert_eq!(output.status.code(), Some(1));
+        let error: serde_json::Value = serde_json::from_slice(&output.stderr)?;
+        let code = error.get("code").and_then(serde_json::Value::as_str);
+        assert!(
+            matches!(
+                code,
+                Some("network_unreachable" | "host_unreachable" | "unsupported")
+            ),
+            "{error}"
+        );
+        assert_eq!(
+            error.get("stage").and_then(serde_json::Value::as_str),
+            Some("helper")
+        );
+        return Ok(());
+    }
+    let report = crate::namespace::completed(&output, "ndp_probe")?;
+    crate::namespace::accepted(&report, 86);
     assert_eq!(
-        error.get("code").and_then(serde_json::Value::as_str),
-        Some("unsupported")
+        report
+            .pointer("/scope/source_ip")
+            .and_then(serde_json::Value::as_str),
+        Some("2001:db8:1::1")
     );
     assert_eq!(
-        error.get("stage").and_then(serde_json::Value::as_str),
-        Some("scope")
+        report
+            .pointer("/replies/0/mac")
+            .and_then(serde_json::Value::as_str),
+        Some("02:00:00:00:00:02")
     );
     Ok(())
 }

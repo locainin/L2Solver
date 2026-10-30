@@ -10,13 +10,15 @@ mod error;
 mod limits;
 mod link;
 mod ndp;
+mod neighbor;
 mod report;
 mod session;
 pub mod stp;
 
-pub use arp::{ArpObservation, ArpProbe, ArpReport, ArpStatus, validate_ipv4_target};
+pub use arp::{ArpObservation, ArpProbe, ArpReport, validate_ipv4_target};
 pub use error::{PlanError, RunError};
 pub use limits::{Limits, MAX_RECEIVED_BYTES, MAX_RECEIVED_PACKETS, MAX_TIMEOUT};
 pub use link::{ActiveLink, PreSendUsage, ReceiveEvent};
-pub use ndp::{NdpObservation, NdpPlanError, NdpProbe, NdpReport, NdpStatus};
+pub use ndp::{NdpObservation, NdpPlanError, NdpProbe, NdpReport};
+pub use neighbor::NeighborStatus;
 pub use report::{RunSummary, StopReason};

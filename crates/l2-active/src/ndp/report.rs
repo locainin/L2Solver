@@ -5,18 +5,7 @@ use std::net::Ipv6Addr;
 use l2_capture::CapturedFrame;
 use l2_onpath::MacAddress;
 
-use crate::RunSummary;
-
-/// What correlated, unauthenticated advertisements establish
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum NdpStatus {
-    /// At least one matching target MAC claim was observed
-    Observed,
-    /// At least one claim differed from the selected expected MAC
-    UnexpectedIdentity,
-    /// No qualifying advertisement was observed
-    Inconclusive,
-}
+use crate::{NeighborStatus, RunSummary, neighbor};
 
 /// One distinct claimed MAC and the exact captured advertisement
 #[derive(Debug)]
@@ -61,18 +50,8 @@ pub struct NdpReport {
 impl NdpReport {
     /// Classify observed claims without treating absence as proof
     #[must_use]
-    pub fn status(&self) -> NdpStatus {
-        if self.observations.is_empty() {
-            return NdpStatus::Inconclusive;
-        }
-        if self
-            .observations
-            .iter()
-            .any(|item| self.expected.is_some_and(|expected| expected != item.mac))
-        {
-            return NdpStatus::UnexpectedIdentity;
-        }
-        NdpStatus::Observed
+    pub fn status(&self) -> NeighborStatus {
+        neighbor::classify(self.expected, self.observations.iter().map(|item| item.mac))
     }
 
     /// Borrow distinct MAC claims and their captured frames

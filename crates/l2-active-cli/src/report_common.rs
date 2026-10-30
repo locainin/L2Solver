@@ -34,7 +34,7 @@ pub fn outcome(
     if summary.stop_reason() == StopReason::Cancelled {
         return ActiveOutcome::Cancelled;
     }
-    if !complete(summary, mode, close_error) || evidence == Evidence::Inconclusive {
+    if !complete(summary, mode, close_error) {
         return ActiveOutcome::Incomplete;
     }
     match evidence {

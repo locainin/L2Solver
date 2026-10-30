@@ -12,6 +12,9 @@ pub mod ndp;
 mod pin;
 
 #[cfg(target_os = "linux")]
+mod route;
+
+#[cfg(target_os = "linux")]
 mod packet;
 
 #[cfg(target_os = "linux")]

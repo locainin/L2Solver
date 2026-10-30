@@ -6,12 +6,14 @@ use l2_active_cli::{Error as ActiveError, OutputFormat, write_error};
 use l2_active_linux::{InterfaceSelector, discover};
 
 #[test]
-fn json_errors_distinguish_permissions_unsupported_and_timeout() -> Result<(), Box<dyn Error>> {
+fn json_errors_preserve_runtime_error_categories() -> Result<(), Box<dyn Error>> {
     for (kind, expected) in [
         (ErrorKind::PermissionDenied, "permission_denied"),
         (ErrorKind::Unsupported, "unsupported"),
         (ErrorKind::TimedOut, "timeout"),
         (ErrorKind::Interrupted, "cancelled"),
+        (ErrorKind::NetworkUnreachable, "network_unreachable"),
+        (ErrorKind::HostUnreachable, "host_unreachable"),
     ] {
         let error = ActiveError::Helper(std::io::Error::new(kind, "detail"));
         let mut output = Vec::new();

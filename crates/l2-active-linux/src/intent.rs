@@ -164,8 +164,6 @@ impl Intent {
             target,
         } = self.kind
         {
-            // A selected interface zones link-local addresses without a route lookup
-            require_link_local(source, target)?;
             let current = crate::ndp::discover(selector)?;
             if current.interface().identity() != info.identity() {
                 return Err(io::Error::other("interface changed during IPv6 admission"));
@@ -182,17 +180,6 @@ impl Intent {
             }
         }
         Ok(())
-    }
-}
-
-fn require_link_local(source: Ipv6Addr, target: Ipv6Addr) -> io::Result<()> {
-    if source.is_unicast_link_local() && target.is_unicast_link_local() {
-        Ok(())
-    } else {
-        Err(io::Error::new(
-            io::ErrorKind::Unsupported,
-            "global NDP requires verified on-link route support",
-        ))
     }
 }
 

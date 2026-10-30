@@ -13,6 +13,9 @@ l2-capture = { version = "=0.1.0", path = "../l2-capture" }
 l2-onpath = { version = "=0.1.0", path = "../l2-onpath" }
 
 [target.'cfg(target_os = "linux")'.dependencies]
+netlink-packet-core = "=0.9.0"
+netlink-packet-route = "=0.33.0"
+netlink-sys = "=0.9.0"
 nix = { version = "=0.31.3", features = ["net", "socket", "poll", "user", "uio", "process", "fs"] }
 rscap = "=0.3.2"
 rustix = { version = "=1.1.4", features = ["fs", "time", "thread"] }

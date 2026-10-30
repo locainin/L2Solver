@@ -61,7 +61,7 @@ pub enum ActiveCommand {
         #[command(subcommand)]
         command: DhcpCommand,
     },
-    /// Probe an explicit link-local IPv6 neighbor
+    /// Probe an explicit IPv6 neighbor on the selected interface
     Ndp {
         /// Select a bounded NDP operation
         #[command(subcommand)]
@@ -162,18 +162,18 @@ pub struct ListenArgs {
     pub session: SessionArgs,
 }
 
-/// One explicit link-local target and optional selected source
+/// One explicit IPv6 target and optional selected source
 #[derive(Clone, Debug, Eq, Args, PartialEq)]
 pub struct NdpProbeArgs {
     /// Explicit interface carrying the solicitation
     #[arg(long, value_name = "INTERFACE", value_parser = interface_selector)]
     pub interface: InterfaceSelector,
 
-    /// One link-local IPv6 neighbor on this interface
+    /// One IPv6 neighbor on this interface; global targets require a direct route
     #[arg(long, value_name = "IPV6")]
     pub target: Ipv6Addr,
 
-    /// Select an assigned link-local IPv6 source when needed
+    /// Select an assigned IPv6 source when needed
     #[arg(long, value_name = "IPV6")]
     pub source_ip: Option<Ipv6Addr>,
 

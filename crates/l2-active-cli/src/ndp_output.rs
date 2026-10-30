@@ -1,17 +1,22 @@
 //! Present actual neighbor advertisements and their collection quality
 
+#[cfg(test)]
+#[path = "../tests/cli/ndp_output.rs"]
+mod tests;
+
 use std::{
     io::{self, Write},
     net::Ipv6Addr,
 };
 
-use l2_active::{NdpProbe, NdpReport, NdpStatus};
+use l2_active::{NdpProbe, NdpReport};
 use serde::Serialize;
 
 use super::{
     ActiveOutcome, Error, NdpProbeArgs, OutputFormat,
     mac::format_mac,
-    report_common::{self, Evidence, InterfaceView, LimitsView, QualityView, SendMode},
+    neighbor_output::{evidence, status_name},
+    report_common::{self, InterfaceView, LimitsView, QualityView, SendMode},
 };
 
 const LIMITATION: &str = "Neighbor advertisements are unauthenticated claims and cannot establish freshness or ownership; silence is inconclusive and link state is sampled";
@@ -61,12 +66,7 @@ pub fn write(
     format: OutputFormat,
     output: &mut impl Write,
 ) -> Result<ActiveOutcome, Error> {
-    let evidence = match report.status() {
-        NdpStatus::Inconclusive => Evidence::Inconclusive,
-        NdpStatus::UnexpectedIdentity => Evidence::Findings,
-        NdpStatus::Observed if report.has_conflicting_identities() => Evidence::Findings,
-        NdpStatus::Observed => Evidence::Observed,
-    };
+    let evidence = evidence(report.status(), report.has_conflicting_identities());
     let summary = report.summary();
     let outcome = report_common::outcome(summary, SendMode::Single, evidence, close_error);
     match format {
@@ -156,12 +156,4 @@ fn reply_views(probe: &NdpProbe, report: &NdpReport) -> Result<Vec<Reply>, Error
         });
     }
     Ok(replies)
-}
-
-const fn status_name(status: NdpStatus) -> &'static str {
-    match status {
-        NdpStatus::Observed => "observed",
-        NdpStatus::UnexpectedIdentity => "unexpected_identity",
-        NdpStatus::Inconclusive => "inconclusive",
-    }
 }

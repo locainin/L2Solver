@@ -123,24 +123,100 @@ fn multiple_eligible_sources_require_an_explicit_assigned_choice() -> Result<(),
 }
 
 #[test]
-fn matching_global_prefix_does_not_establish_an_on_link_target() -> Result<(), Box<dyn Error>> {
+fn global_assignment_prepares_a_candidate_without_claiming_route_authority()
+-> Result<(), Box<dyn Error>> {
     let info = fixture(vec![assignment("2001:db8::1", 64, 0, 0x80)?])?;
     let source = "2001:db8::1".parse()?;
     let target = "2001:db8::2".parse()?;
     for requested in [None, Some(source)] {
-        assert_eq!(
-            prepare(&info, requested, target, None, limits()?)
-                .err()
-                .map(|error| error.kind()),
-            Some(io::ErrorKind::Unsupported)
-        );
+        let candidate = prepare(&info, requested, target, None, limits()?)?;
+        assert_eq!(candidate.source_ip(), source);
+        assert_eq!(candidate.target(), target);
     }
     assert_eq!(
         prepare(&info, Some(source), TARGET.parse()?, None, limits()?)
             .err()
             .map(|error| error.kind()),
-        Some(io::ErrorKind::Unsupported)
+        Some(io::ErrorKind::InvalidInput)
     );
+    Ok(())
+}
+
+#[test]
+fn global_candidate_rejects_unusable_flags_and_inconsistent_scope() -> Result<(), Box<dyn Error>> {
+    let target = "2001:db8::2".parse()?;
+    for (scope, flags) in [(0, 0x04), (0, 0x08), (0, 0x20), (0, 0x40), (0x20, 0x80)] {
+        let info = fixture(vec![assignment("2001:db8::1", 64, scope, flags)?])?;
+        assert_eq!(
+            prepare(&info, None, target, None, limits()?)
+                .err()
+                .map(|error| error.kind()),
+            Some(io::ErrorKind::InvalidInput)
+        );
+    }
+    Ok(())
+}
+
+#[test]
+fn global_candidate_requires_one_selected_matching_source() -> Result<(), Box<dyn Error>> {
+    let first: Ipv6Addr = "2001:db8::1".parse()?;
+    let second: Ipv6Addr = "2001:db8::3".parse()?;
+    let target = "2001:db8::2".parse()?;
+    let info = fixture(vec![
+        assignment("2001:db8::1", 64, 0, 0x80)?,
+        assignment("2001:db8::3", 64, 0, 0x80)?,
+    ])?;
+    assert_eq!(
+        prepare(&info, None, target, None, limits()?)
+            .err()
+            .map(|error| error.kind()),
+        Some(io::ErrorKind::InvalidInput)
+    );
+    assert_eq!(
+        prepare(&info, Some(second), target, None, limits()?)?.source_ip(),
+        second
+    );
+    assert_eq!(
+        prepare(&info, Some("2001:db8::4".parse()?), target, None, limits()?)
+            .err()
+            .map(|error| error.kind()),
+        Some(io::ErrorKind::InvalidInput)
+    );
+    assert_eq!(
+        prepare(
+            &info,
+            Some(first),
+            "2001:db8:0:1::2".parse()?,
+            None,
+            limits()?
+        )
+        .err()
+        .map(|error| error.kind()),
+        Some(io::ErrorKind::InvalidInput)
+    );
+    Ok(())
+}
+
+#[test]
+fn global_and_link_local_candidates_cannot_mix_address_scopes() -> Result<(), Box<dyn Error>> {
+    let info = fixture(vec![
+        assignment(SOURCE, 64, 0x20, 0x80)?,
+        assignment("2001:db8::1", 64, 0, 0x80)?,
+    ])?;
+    for (source, target) in [("fe80::1", "2001:db8::2"), ("2001:db8::1", "fe80::2")] {
+        assert_eq!(
+            prepare(
+                &info,
+                Some(source.parse()?),
+                target.parse()?,
+                None,
+                limits()?
+            )
+            .err()
+            .map(|error| error.kind()),
+            Some(io::ErrorKind::InvalidInput)
+        );
+    }
     Ok(())
 }
 

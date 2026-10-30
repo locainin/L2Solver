@@ -1,5 +1,19 @@
-use super::{Reader, Writer};
+use super::{ERROR, Reader, Writer, error_record, read_error};
 use std::io;
+
+#[test]
+fn route_unreachable_errors_keep_their_kind_across_the_helper_channel() -> io::Result<()> {
+    for kind in [
+        io::ErrorKind::NetworkUnreachable,
+        io::ErrorKind::HostUnreachable,
+    ] {
+        let encoded = error_record(&io::Error::new(kind, "route unavailable"));
+        let mut reader = Reader::new(&encoded);
+        assert_eq!(reader.u8()?, ERROR);
+        assert_eq!(read_error(&mut reader)?.kind(), kind);
+    }
+    Ok(())
+}
 
 #[test]
 fn finite_wire_values_round_trip_and_require_full_consumption() -> io::Result<()> {

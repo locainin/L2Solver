@@ -9,14 +9,15 @@ use std::{
     net::Ipv4Addr,
 };
 
-use l2_active::{ArpProbe, ArpReport, ArpStatus};
+use l2_active::{ArpProbe, ArpReport};
 use l2_active_linux::InterfaceSelector;
 use serde::Serialize;
 
 use super::{
     ActiveOutcome, Error, OutputFormat,
     mac::format_mac,
-    report_common::{self, Evidence, InterfaceView, LimitsView, QualityView, SendMode},
+    neighbor_output::{evidence, status_name},
+    report_common::{self, InterfaceView, LimitsView, QualityView, SendMode},
 };
 
 const LIMITATION: &str = "ARP replies are unauthenticated and do not establish freshness or protection; link state and queue readiness are sampled and cannot exclude brief outages, prior loss, or later arrivals";
@@ -64,12 +65,7 @@ pub fn write(
     output: &mut impl Write,
 ) -> Result<ActiveOutcome, Error> {
     let summary = report.summary();
-    let evidence = match report.status() {
-        ArpStatus::Inconclusive => Evidence::Inconclusive,
-        ArpStatus::UnexpectedIdentity => Evidence::Findings,
-        ArpStatus::Observed if report.has_conflicting_identities() => Evidence::Findings,
-        ArpStatus::Observed => Evidence::Observed,
-    };
+    let evidence = evidence(report.status(), report.has_conflicting_identities());
     let outcome = report_common::outcome(summary, SendMode::Single, evidence, close_error);
     match format {
         OutputFormat::Text => write_text(interface, probe, report, close_error, outcome, output)?,
@@ -180,12 +176,4 @@ fn write_json(
     };
     serde_json::to_writer(&mut *output, &value).map_err(Error::Json)?;
     writeln!(output).map_err(Error::Output)
-}
-
-const fn status_name(status: ArpStatus) -> &'static str {
-    match status {
-        ArpStatus::Observed => "observed",
-        ArpStatus::UnexpectedIdentity => "unexpected_identity",
-        ArpStatus::Inconclusive => "inconclusive",
-    }
 }

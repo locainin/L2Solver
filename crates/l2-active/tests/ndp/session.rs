@@ -1,6 +1,6 @@
 use std::{error::Error, sync::atomic::AtomicBool, time::Instant};
 
-use l2_active::{NdpStatus, PreSendUsage, ReceiveEvent, StopReason};
+use l2_active::{NeighborStatus, PreSendUsage, ReceiveEvent, StopReason};
 use l2_capture::Direction;
 use l2_onpath::MacAddress;
 
@@ -16,7 +16,7 @@ fn observed_advertisement_retains_actual_frame_and_distinct_mac_claims()
     let second = with_mac(OTHER_MAC)?;
     let mut link = Link::new(vec![event(first.clone())?, event(second)?], Some(0))?;
     let report = probe(Some(REMOTE_MAC), 10, 4096)?.run(&mut link, &AtomicBool::new(false))?;
-    assert_eq!(report.status(), NdpStatus::UnexpectedIdentity);
+    assert_eq!(report.status(), NeighborStatus::UnexpectedIdentity);
     assert!(report.has_conflicting_identities());
     assert_eq!(report.observations().len(), 2);
     let observation = report.observations().first().ok_or("missing observation")?;
@@ -24,6 +24,27 @@ fn observed_advertisement_retains_actual_frame_and_distinct_mac_claims()
     assert_eq!(observation.frame().bytes(), first);
     assert_eq!(report.summary().received_packets(), 2);
     assert_eq!(report.summary().sent_packets(), 1);
+    Ok(())
+}
+
+#[test]
+fn ndp_status_distinguishes_expected_mismatch_from_unconfigured_conflict()
+-> Result<(), Box<dyn Error>> {
+    for (expected, status) in [
+        (Some(REMOTE_MAC), NeighborStatus::UnexpectedIdentity),
+        (None, NeighborStatus::Observed),
+    ] {
+        for claims in [[REMOTE_MAC, OTHER_MAC], [OTHER_MAC, REMOTE_MAC]] {
+            let events = claims
+                .into_iter()
+                .map(|mac| event(with_mac(mac)?))
+                .collect::<Result<Vec<_>, Box<dyn Error>>>()?;
+            let mut link = Link::new(events, Some(0))?;
+            let report = probe(expected, 10, 4096)?.run(&mut link, &AtomicBool::new(false))?;
+            assert_eq!(report.status(), status);
+            assert!(report.has_conflicting_identities());
+        }
+    }
     Ok(())
 }
 
@@ -53,7 +74,7 @@ fn malformed_unrelated_or_unsupported_advertisements_are_counted_but_not_accepte
     let count = u32::try_from(cases.len())?;
     let mut link = Link::new(cases, Some(0))?;
     let report = probe(None, 32, 4096)?.run(&mut link, &AtomicBool::new(false))?;
-    assert_eq!(report.status(), NdpStatus::Inconclusive);
+    assert_eq!(report.status(), NeighborStatus::Inconclusive);
     assert!(report.observations().is_empty());
     assert_eq!(report.summary().received_packets(), count);
     assert_eq!(report.unmatched_packets(), count);
@@ -71,7 +92,7 @@ fn truncated_capture_and_wrong_interface_do_not_become_observations() -> Result<
     let unscoped = ReceiveEvent::Frame(captured(RESPONSE.to_vec(), None, 86)?);
     let mut link = Link::new(vec![truncated, unscoped], Some(0))?;
     let report = probe(None, 10, 4096)?.run(&mut link, &AtomicBool::new(false))?;
-    assert_eq!(report.status(), NdpStatus::Inconclusive);
+    assert_eq!(report.status(), NeighborStatus::Inconclusive);
     assert_eq!(report.summary().truncated_packets(), 1);
     assert_eq!(report.summary().unscoped_packets(), 1);
     Ok(())
@@ -85,7 +106,7 @@ fn in_band_vlan_tag_is_not_accepted_as_an_untagged_reply() -> Result<(), Box<dyn
     tagged.extend_from_slice(RESPONSE.get(12..).ok_or("missing IPv6 payload")?);
     let mut link = Link::new(vec![event(tagged)?], Some(0))?;
     let report = probe(None, 10, 4096)?.run(&mut link, &AtomicBool::new(false))?;
-    assert_eq!(report.status(), NdpStatus::Inconclusive);
+    assert_eq!(report.status(), NeighborStatus::Inconclusive);
     assert_eq!(report.unmatched_packets(), 1);
     Ok(())
 }
@@ -96,7 +117,7 @@ fn advertisement_to_another_ethernet_destination_is_unmatched() -> Result<(), Bo
     *frame.get_mut(5).ok_or("missing destination")? = 7;
     let mut link = Link::new(vec![event(frame)?], Some(0))?;
     let report = probe(None, 10, 4096)?.run(&mut link, &AtomicBool::new(false))?;
-    assert_eq!(report.status(), NdpStatus::Inconclusive);
+    assert_eq!(report.status(), NeighborStatus::Inconclusive);
     assert_eq!(report.unmatched_packets(), 1);
     Ok(())
 }
@@ -118,7 +139,7 @@ fn outbound_and_unknown_direction_frames_are_not_receiver_observations()
     )?);
     let mut link = Link::new(vec![outgoing, unknown], Some(0))?;
     let report = probe(None, 10, 4096)?.run(&mut link, &AtomicBool::new(false))?;
-    assert_eq!(report.status(), NdpStatus::Inconclusive);
+    assert_eq!(report.status(), NeighborStatus::Inconclusive);
     assert_eq!(report.summary().outbound_packets(), 1);
     assert_eq!(report.summary().unscoped_packets(), 1);
     assert_eq!(report.unmatched_packets(), 0);
@@ -132,7 +153,7 @@ fn cancellation_and_packet_budget_stop_actual_dispatch_or_collection() -> Result
     let report = probe(None, 1, 4096)?.run(&mut cancelled_link, &AtomicBool::new(true))?;
     assert!(cancelled_link.sent.is_empty());
     assert_eq!(report.summary().stop_reason(), StopReason::Cancelled);
-    assert_eq!(report.status(), NdpStatus::Inconclusive);
+    assert_eq!(report.status(), NeighborStatus::Inconclusive);
 
     let mut limited = Link::new(
         vec![event(vec![0; 60])?, event(RESPONSE.to_vec())?],
@@ -142,7 +163,7 @@ fn cancellation_and_packet_budget_stop_actual_dispatch_or_collection() -> Result
     assert_eq!(report.summary().stop_reason(), StopReason::PacketLimit);
     assert_eq!(report.summary().received_packets(), 1);
     assert_eq!(report.summary().capture_loss(), Some(3));
-    assert_eq!(report.status(), NdpStatus::Inconclusive);
+    assert_eq!(report.status(), NeighborStatus::Inconclusive);
     Ok(())
 }
 
@@ -153,7 +174,7 @@ fn expired_shared_deadline_prevents_ndp_send() -> Result<(), Box<dyn Error>> {
         probe(None, 10, 4096)?.run_until(&mut link, &AtomicBool::new(false), Instant::now())?;
     assert!(link.sent.is_empty());
     assert_eq!(report.summary().stop_reason(), StopReason::Deadline);
-    assert_eq!(report.status(), NdpStatus::Inconclusive);
+    assert_eq!(report.status(), NeighborStatus::Inconclusive);
     Ok(())
 }
 
@@ -170,7 +191,7 @@ fn every_truncated_packet_prefix_is_ignored_without_panicking() -> Result<(), Bo
     let count = u32::try_from(events.len())?;
     let mut link = Link::new(events, Some(0))?;
     let report = probe(None, 100, 8192)?.run(&mut link, &AtomicBool::new(false))?;
-    assert_eq!(report.status(), NdpStatus::Inconclusive);
+    assert_eq!(report.status(), NeighborStatus::Inconclusive);
     assert_eq!(report.summary().received_packets(), count);
     assert_eq!(report.unmatched_packets(), count);
     Ok(())
@@ -207,7 +228,7 @@ fn duplicate_or_invalid_target_options_do_not_create_a_claim() -> Result<(), Box
         Some(0),
     )?;
     let report = probe(None, 10, 4096)?.run(&mut link, &AtomicBool::new(false))?;
-    assert_eq!(report.status(), NdpStatus::Inconclusive);
+    assert_eq!(report.status(), NeighborStatus::Inconclusive);
     assert_eq!(report.unmatched_packets(), 3);
     Ok(())
 }
@@ -223,7 +244,7 @@ fn valid_unknown_option_and_repeated_reply_preserve_one_claim() -> Result<(), Bo
     fix_checksum(&mut extra)?;
     let mut link = Link::new(vec![event(extra)?, event(RESPONSE.to_vec())?], Some(0))?;
     let report = probe(Some(REMOTE_MAC), 10, 4096)?.run(&mut link, &AtomicBool::new(false))?;
-    assert_eq!(report.status(), NdpStatus::Observed);
+    assert_eq!(report.status(), NeighborStatus::Observed);
     assert_eq!(report.observations().len(), 1);
     assert!(!report.has_conflicting_identities());
     assert_eq!(report.unmatched_packets(), 0);
@@ -240,7 +261,7 @@ fn wrong_ipv6_source_or_destination_is_not_accepted() -> Result<(), Box<dyn Erro
     fix_checksum(&mut destination)?;
     let mut link = Link::new(vec![event(unspecified)?, event(destination)?], Some(0))?;
     let report = probe(None, 10, 4096)?.run(&mut link, &AtomicBool::new(false))?;
-    assert_eq!(report.status(), NdpStatus::Inconclusive);
+    assert_eq!(report.status(), NeighborStatus::Inconclusive);
     assert_eq!(report.unmatched_packets(), 2);
     Ok(())
 }
@@ -252,7 +273,7 @@ fn proxy_advertisement_retains_its_actual_ipv6_source() -> Result<(), Box<dyn Er
     fix_checksum(&mut proxy)?;
     let mut link = Link::new(vec![event(proxy)?], Some(0))?;
     let report = probe(None, 10, 4096)?.run(&mut link, &AtomicBool::new(false))?;
-    assert_eq!(report.status(), NdpStatus::Observed);
+    assert_eq!(report.status(), NeighborStatus::Observed);
     let observation = report.observations().first().ok_or("missing observation")?;
     assert_eq!(
         observation.source_ip(),
@@ -271,7 +292,7 @@ fn capture_byte_ceiling_stops_before_later_replies() -> Result<(), Box<dyn Error
     assert_eq!(report.summary().stop_reason(), StopReason::ByteLimit);
     assert_eq!(report.summary().received_bytes(), 60);
     assert_eq!(report.summary().received_packets(), 1);
-    assert_eq!(report.status(), NdpStatus::Inconclusive);
+    assert_eq!(report.status(), NeighborStatus::Inconclusive);
     Ok(())
 }
 
@@ -289,7 +310,7 @@ fn queue_drain_usage_shares_the_receive_packet_budget() -> Result<(), Box<dyn Er
         report.summary().pre_send_usage(),
         Some(PreSendUsage::new(1, 60))
     );
-    assert_eq!(report.status(), NdpStatus::Inconclusive);
+    assert_eq!(report.status(), NeighborStatus::Inconclusive);
     Ok(())
 }
 
@@ -297,7 +318,7 @@ fn queue_drain_usage_shares_the_receive_packet_budget() -> Result<(), Box<dyn Er
 fn observed_reply_is_retained_when_capture_loss_is_reported() -> Result<(), Box<dyn Error>> {
     let mut link = Link::new(vec![event(RESPONSE.to_vec())?], Some(4))?;
     let report = probe(Some(REMOTE_MAC), 10, 4096)?.run(&mut link, &AtomicBool::new(false))?;
-    assert_eq!(report.status(), NdpStatus::Observed);
+    assert_eq!(report.status(), NeighborStatus::Observed);
     assert_eq!(report.observations().len(), 1);
     assert_eq!(report.summary().capture_loss(), Some(4));
     Ok(())

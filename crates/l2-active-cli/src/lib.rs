@@ -3,6 +3,10 @@
 #![forbid(unsafe_code)]
 
 #[cfg(all(test, target_os = "linux"))]
+#[path = "../tests/cli/fixture_assert.rs"]
+mod fixture_assert;
+
+#[cfg(all(test, target_os = "linux"))]
 #[path = "../../l2-active/tests/support/mod.rs"]
 mod test_support;
 
@@ -27,6 +31,8 @@ mod mac;
 #[cfg(target_os = "linux")]
 mod ndp_output;
 mod ndp_probe;
+#[cfg(target_os = "linux")]
+mod neighbor_output;
 mod pipe;
 mod preflight;
 mod probe;

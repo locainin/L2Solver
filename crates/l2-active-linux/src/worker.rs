@@ -39,6 +39,10 @@ mod tests;
 #[path = "../tests/worker/discovery.rs"]
 mod discovery_tests;
 
+#[cfg(test)]
+#[path = "../tests/worker/operation.rs"]
+mod operation_tests;
+
 enum OpenKind {
     Arp(Ipv4Addr, Ipv4Addr),
     Dhcp(NonZeroU32),

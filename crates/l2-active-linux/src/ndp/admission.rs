@@ -5,18 +5,17 @@ use l2_onpath::MacAddress;
 
 use super::{Ipv6Assignment, NdpInterfaceInfo};
 
-/// Select a kernel-assigned IPv6 source and prepare one on-link solicitation
+/// Select a kernel-assigned IPv6 source and prepare a solicitation candidate
 ///
 /// Only an up, multicast-capable Ethernet interface with an IPv6-sized MTU is
-/// eligible and this native profile permits only link-local source and target
-/// addresses. Tentative, optimistic, DAD-failed and deprecated sources are
+/// eligible. Tentative, optimistic, DAD-failed and deprecated sources are
 /// excluded, and multiple compatible assignments require an explicit source
-/// The privileged sender must repeat discovery and admission just before use
+/// A matching global prefix does not prove an on-link route. The privileged
+/// sender must repeat discovery and verify the route before any global send
 ///
 /// # Errors
-/// Returns `Unsupported` for an unsuitable link or a non-link-local request
-/// or `InvalidInput` if the source is absent, ambiguous, unusable or does not
-/// cover the target
+/// Returns `Unsupported` for an unsuitable link or `InvalidInput` if the
+/// source is absent, ambiguous, unusable or does not cover the target
 pub fn prepare(
     info: &NdpInterfaceInfo,
     requested: Option<Ipv6Addr>,
@@ -24,15 +23,6 @@ pub fn prepare(
     expected: Option<MacAddress>,
     limits: Limits,
 ) -> io::Result<NdpProbe> {
-    // An assigned global prefix alone does not establish an on-link route
-    if !target.is_unicast_link_local()
-        || requested.is_some_and(|source| !source.is_unicast_link_local())
-    {
-        return Err(io::Error::new(
-            io::ErrorKind::Unsupported,
-            "native NDP currently requires link-local source and target addresses",
-        ));
-    }
     let interface = info.interface();
     if !interface.is_ethernet()
         || !interface.is_up()
@@ -90,7 +80,10 @@ pub fn prepare(
 const fn eligible(assignment: Ipv6Assignment) -> bool {
     // Exclude optimistic, DAD-failed, deprecated and tentative addresses
     const UNUSABLE_FLAGS: u8 = 0x04 | 0x08 | 0x20 | 0x40;
-    assignment.address().is_unicast_link_local()
-        && assignment.flags() & UNUSABLE_FLAGS == 0
-        && assignment.scope() == 0x20
+    let scope = if assignment.address().is_unicast_link_local() {
+        0x20
+    } else {
+        0
+    };
+    assignment.flags() & UNUSABLE_FLAGS == 0 && assignment.scope() == scope
 }
