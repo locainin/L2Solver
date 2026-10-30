@@ -25,4 +25,3 @@ serde_json = "1"
 [target.'cfg(target_os = "linux")'.dependencies]
 tokio = { version = "1.47", features = ["net", "rt", "time"] }
 wifi-linux = { version = "=0.1.0", path = "../wifi-linux" }
-
