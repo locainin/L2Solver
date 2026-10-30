@@ -9,8 +9,6 @@ use super::model::{Identity, Observed, Protocol};
 const LLDP_DESTINATION: [u8; 6] = [0x01, 0x80, 0xc2, 0x00, 0x00, 0x0e];
 const CDP_DESTINATION: [u8; 6] = [0x01, 0x00, 0x0c, 0xcc, 0xcc, 0xcc];
 const CDP_SNAP: [u8; 8] = [0xaa, 0xaa, 0x03, 0x00, 0x00, 0x0c, 0x20, 0x00];
-const MAX_CDP_TLVS: usize = 128;
-const MAX_CDP_ID_LEN: usize = 255;
 
 #[derive(Clone, Copy)]
 struct Neighbor<'a> {
@@ -155,79 +153,9 @@ fn parse_lldp(payload: &[u8]) -> Option<Advertisement<'_>> {
 }
 
 fn parse_cdp(payload: &[u8]) -> Option<Advertisement<'_>> {
-    let (header, remaining) = payload.split_first_chunk::<4>()?;
-    let [version, hold, _, _] = *header;
-    if !matches!(version, 1 | 2) || !cdp_checksum_valid(payload) {
-        return None;
-    }
+    let frame = l2_codecs::decode_cdp(payload, l2_codecs::CdpLimits::new(128, 255)).ok()?;
     Some(Advertisement {
-        identity: cdp_identity(remaining)?,
-        hold_seconds: u16::from(hold),
+        identity: Identity::new(frame.device.value, frame.port.value),
+        hold_seconds: u16::from(frame.hold_seconds),
     })
-}
-
-fn cdp_identity(mut remaining: &[u8]) -> Option<Identity<'_>> {
-    let mut device = None;
-    let mut port = None;
-    let mut count = 0;
-    while !remaining.is_empty() {
-        count += 1;
-        if count > MAX_CDP_TLVS {
-            return None;
-        }
-        let (kind, value, next) = cdp_tlv(remaining)?;
-        remaining = next;
-        record_cdp_identity(kind, value, &mut device, &mut port)?;
-    }
-    Some(Identity::new(device?, port?))
-}
-
-fn cdp_tlv(input: &[u8]) -> Option<(u16, &[u8], &[u8])> {
-    let (header, body) = input.split_first_chunk::<4>()?;
-    let [type_high, type_low, length_high, length_low] = *header;
-    let kind = u16::from_be_bytes([type_high, type_low]);
-    let length = usize::from(u16::from_be_bytes([length_high, length_low]));
-    let (value, remaining) = body.split_at_checked(length.checked_sub(4)?)?;
-    Some((kind, value, remaining))
-}
-
-const fn record_cdp_identity<'a>(
-    kind: u16,
-    value: &'a [u8],
-    device: &mut Option<&'a [u8]>,
-    port: &mut Option<&'a [u8]>,
-) -> Option<()> {
-    // Identity TLVs are unique and bounded; unknown types remain opaque
-    let slot = match kind {
-        1 => device,
-        3 => port,
-        _ => return Some(()),
-    };
-    if slot.is_some() || value.is_empty() || value.len() > MAX_CDP_ID_LEN {
-        return None;
-    }
-    *slot = Some(value);
-    Some(())
-}
-
-fn cdp_checksum_valid(payload: &[u8]) -> bool {
-    let mut pairs = payload.chunks_exact(2);
-    let mut sum = 0_u32;
-    for pair in &mut pairs {
-        if let [high, low] = *pair {
-            sum += u32::from(u16::from_be_bytes([high, low]));
-        }
-    }
-    if let [last] = pairs.remainder() {
-        // CDP uses a signed low octet for an odd final byte, unlike IP padding
-        sum += if *last >= 0x80 {
-            0xff00 | u32::from(*last - 1)
-        } else {
-            u32::from(*last)
-        };
-    }
-    while sum >> 16 != 0 {
-        sum = (sum & 0xffff) + (sum >> 16);
-    }
-    sum == 0xffff
 }
