@@ -157,7 +157,7 @@ struct RawPhy {
     name: Option<String>,
     modes: Vec<WirelessMode>,
     bands: Vec<crate::Band>,
-    iftype_evidence: bool,
+    supported_iftypes_seen: bool,
 }
 
 struct PhysicalAccumulator {
@@ -274,7 +274,7 @@ impl RawPhy {
             name: None,
             modes: Vec::new(),
             bands: Vec::new(),
-            iftype_evidence: false,
+            supported_iftypes_seen: false,
         }
     }
 
@@ -298,13 +298,13 @@ impl RawPhy {
                     self.name = Some(value);
                 }
                 Nl80211Attr::SupportedIftypes(values) => {
-                    self.iftype_evidence = true;
+                    self.supported_iftypes_seen = true;
                     for mode in values.into_iter().map(supported_mode) {
                         add_mode(&mut self.modes, mode)?;
                     }
                 }
                 Nl80211Attr::SoftwareIftypes(values) => {
-                    self.iftype_evidence = true;
+                    // Software-managed modes are a subset, not a complete list
                     for mode in values.into_iter().map(interface_mode) {
                         add_mode(&mut self.modes, mode)?;
                     }
@@ -337,7 +337,7 @@ impl RawPhy {
     fn finish(self) -> Result<PhyCapabilities, DiscoveryError> {
         let monitor_mode = if self.modes.contains(&WirelessMode::Monitor) {
             CapabilityState::Supported
-        } else if self.iftype_evidence {
+        } else if self.supported_iftypes_seen {
             CapabilityState::Unsupported
         } else {
             CapabilityState::Unknown

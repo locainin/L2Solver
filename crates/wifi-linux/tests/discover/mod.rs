@@ -55,6 +55,79 @@ fn wiphy_dump_unique_radio_limit() -> Result<(), Box<dyn std::error::Error>> {
 }
 
 #[test]
+fn software_only_modes_without_monitor_leave_monitor_support_unknown()
+-> Result<(), Box<dyn std::error::Error>> {
+    let inventory = normalize_messages(
+        vec![message(vec![
+            Nl80211Attr::Wiphy(7),
+            Nl80211Attr::SoftwareIftypes(vec![wl_nl80211::Nl80211InterfaceType::ApVlan]),
+        ])],
+        vec![],
+    )?;
+    assert_eq!(
+        inventory
+            .phys()
+            .first()
+            .map(crate::PhyCapabilities::monitor_mode),
+        Some(crate::CapabilityState::Unknown)
+    );
+    Ok(())
+}
+
+#[test]
+fn full_supported_modes_can_explicitly_exclude_monitor() -> Result<(), Box<dyn std::error::Error>> {
+    let inventory = normalize_messages(
+        vec![message(vec![
+            Nl80211Attr::Wiphy(7),
+            Nl80211Attr::SupportedIftypes(vec![Nl80211IfMode::Station]),
+        ])],
+        vec![],
+    )?;
+    assert_eq!(
+        inventory
+            .phys()
+            .first()
+            .map(crate::PhyCapabilities::monitor_mode),
+        Some(crate::CapabilityState::Unsupported)
+    );
+    Ok(())
+}
+
+#[test]
+fn monitor_in_either_mode_list_is_positive_evidence_in_any_fragment_order()
+-> Result<(), Box<dyn std::error::Error>> {
+    use wl_nl80211::Nl80211InterfaceType;
+
+    let full = message(vec![
+        Nl80211Attr::Wiphy(7),
+        Nl80211Attr::SupportedIftypes(vec![Nl80211IfMode::Station]),
+    ]);
+    let software = message(vec![
+        Nl80211Attr::Wiphy(7),
+        Nl80211Attr::SoftwareIftypes(vec![Nl80211InterfaceType::Monitor]),
+    ]);
+    for records in [
+        vec![software.clone()],
+        vec![full.clone(), software.clone()],
+        vec![software, full],
+        vec![message(vec![
+            Nl80211Attr::Wiphy(7),
+            Nl80211Attr::SupportedIftypes(vec![Nl80211IfMode::Monitor]),
+        ])],
+    ] {
+        let inventory = normalize_messages(records, vec![])?;
+        assert_eq!(
+            inventory
+                .phys()
+                .first()
+                .map(crate::PhyCapabilities::monitor_mode),
+            Some(crate::CapabilityState::Supported)
+        );
+    }
+    Ok(())
+}
+
+#[test]
 fn conflicting_names_radio_rejected_either() {
     for names in [["phy-old", "phy-new"], ["phy-new", "phy-old"]] {
         let records = names
