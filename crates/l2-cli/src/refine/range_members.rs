@@ -3,7 +3,7 @@
 use l2_workbench::artifact::{
     AnalysisFormat, AnalysisOmission, AnalysisStage, AnalyzedArtifact, ArtifactAnalysis,
     ArtifactAnalysisOptions, ArtifactOrigin, ArtifactValidationState, ValidationSummary,
-    analyze_artifacts, archive_member_origin, zip::ZipArtifactReport,
+    analyze_artifacts_with_memory, archive_member_origin, zip::ZipArtifactReport,
 };
 use l2_workbench::job::MemoryLease;
 use std::{error::Error, io};
@@ -106,6 +106,9 @@ impl MemberMerger<'_> {
             })?;
             return Ok(());
         }
+        let preview_bytes = entry.metadata.raw_name.len().min(32) * 2;
+        // Admit the name digest and preview before constructing member provenance
+        super::analysis_memory::charge(self.omission_memory, 128 + preview_bytes)?;
         let origin = archive_member_origin(self.parent_index, self.archive_length, &entry.metadata);
         if self.options.limits.max_depth == 0
             || bytes.len() > self.options.limits.max_input_bytes
@@ -116,16 +119,28 @@ impl MemberMerger<'_> {
         let mut child_options = self.options;
         child_options.limits.max_artifacts = remaining_count;
         child_options.limits.max_total_output_bytes = remaining_output;
-        child_options.limits.max_total_work_bytes = self
+        let remaining_work = self
             .options
             .limits
             .max_total_work_bytes
             .saturating_sub(self.report.work_bytes);
+        if bytes.len() > remaining_work {
+            return self.push_omission(AnalysisOmission::WorkLimit {
+                artifact_index: self.parent_index,
+                stage: AnalysisStage::ArtifactIdentity,
+                requested: bytes.len(),
+                remaining: remaining_work,
+            });
+        }
+        // The analyzer hashes the exact member once before inspecting it
+        self.report.work_bytes += bytes.len();
+        child_options.limits.max_total_work_bytes = remaining_work - bytes.len();
         child_options.limits.max_zip_expanded_bytes = self.zip_remaining;
         child_options.limits.max_signature_scan_bytes = self.signature_remaining;
         child_options.limits.max_depth = self.options.limits.max_depth.saturating_sub(1);
-        let child = analyze_artifacts(&bytes, child_options)?;
-        self.merge_child(child, &origin, entry.metadata.index)
+        let child =
+            analyze_artifacts_with_memory(&bytes, None, child_options, self.omission_memory)?;
+        self.merge_child(child, origin, entry.metadata.index)
     }
 
     fn append_unanalyzed(
@@ -154,10 +169,14 @@ impl MemberMerger<'_> {
             .checked_add(1)
             .ok_or("artifact index overflows")?;
         let length = bytes.len();
-        self.report.artifacts.try_reserve(1)?;
+        super::analysis_memory::grow_vec(&mut self.report.artifacts, self.omission_memory, 1)?;
+        let mut origins = Vec::new();
+        super::analysis_memory::grow_vec(&mut origins, self.omission_memory, 1)?;
+        origins.push(origin);
+        super::analysis_memory::charge(self.omission_memory, 128)?;
         self.report.artifacts.push(AnalyzedArtifact {
             index,
-            origins: vec![origin],
+            origins,
             sha256: l2_workbench::sha256(&bytes),
             signature_match_count: 0,
             signatures_scanned: false,
@@ -194,7 +213,7 @@ impl MemberMerger<'_> {
     fn merge_child(
         &mut self,
         mut child: ArtifactAnalysis,
-        origin: &ArtifactOrigin,
+        origin: ArtifactOrigin,
         entry_index: usize,
     ) -> Result<(), Box<dyn Error>> {
         let signature_work = child
@@ -223,12 +242,19 @@ impl MemberMerger<'_> {
             .zip_expanded_work_bytes
             .checked_add(child.zip_expanded_work_bytes)
             .ok_or("ZIP expansion work overflows")?;
+        let mut index_memory = self
+            .omission_memory
+            .split_off(0)
+            .ok_or("index lease missing")?;
         let mut indices = Vec::new();
-        indices.try_reserve_exact(child.artifacts.len())?;
+        super::analysis_memory::grow_vec(&mut indices, &mut index_memory, child.artifacts.len())?;
+        let mut origin = Some(origin);
         for mut artifact in child.artifacts.drain(..) {
             for candidate in &mut artifact.origins {
                 match candidate {
-                    ArtifactOrigin::Source => *candidate = origin.clone(),
+                    ArtifactOrigin::Source => {
+                        *candidate = origin.take().ok_or("duplicate member source origin")?;
+                    }
                     ArtifactOrigin::EmbeddedObject { parent_index, .. }
                     | ArtifactOrigin::ArchiveMember { parent_index, .. }
                     | ArtifactOrigin::Transformation { parent_index, .. } => {
@@ -242,12 +268,23 @@ impl MemberMerger<'_> {
             indices.push(self.merge_artifact(artifact)?);
         }
         for omission in child.omissions {
-            self.push_omission(rebase_omission(omission, &indices, entry_index)?)?;
+            let omission = rebase_omission(omission, &indices, entry_index, self.omission_memory)?;
+            // The child analyzer already admitted any owned omission payload
+            super::analysis_memory::reserve_omission(
+                &mut self.report.omissions,
+                self.omission_memory,
+            )?;
+            self.report.omissions.push(omission);
         }
         for mut region in child.region_transform_reports {
             region.artifact_index = *indices
                 .get(region.artifact_index)
                 .ok_or("region artifact index missing")?;
+            super::analysis_memory::grow_vec(
+                &mut self.report.region_transform_reports,
+                self.omission_memory,
+                1,
+            )?;
             self.report.region_transform_reports.push(region);
         }
         Ok(())
@@ -270,7 +307,11 @@ impl MemberMerger<'_> {
                             maximum: self.options.limits.max_artifacts,
                         });
                     } else {
-                        existing.origins.try_reserve(1)?;
+                        super::analysis_memory::grow_vec(
+                            &mut existing.origins,
+                            self.omission_memory,
+                            1,
+                        )?;
                         existing.origins.push(origin);
                     }
                 }
@@ -283,7 +324,7 @@ impl MemberMerger<'_> {
                 .checked_add(1)
                 .ok_or("artifact index overflows")?;
             artifact.index = index;
-            self.report.artifacts.try_reserve(1)?;
+            super::analysis_memory::grow_vec(&mut self.report.artifacts, self.omission_memory, 1)?;
             self.report.artifacts.push(artifact);
             Ok(index)
         }
@@ -301,7 +342,8 @@ fn rebase_omission(
     mut omission: AnalysisOmission,
     indices: &[usize],
     entry_index: usize,
-) -> Result<AnalysisOmission, io::Error> {
+    memory: &mut MemoryLease,
+) -> Result<AnalysisOmission, Box<dyn Error>> {
     let index = match &mut omission {
         AnalysisOmission::OutputLimit { parent_index, .. } => Some(parent_index),
         AnalysisOmission::DepthLimit { artifact_index, .. }
@@ -324,7 +366,10 @@ fn rebase_omission(
     ) {
         omission = AnalysisOmission::SourceRangeValidationLimit {
             format: AnalysisFormat::Zip,
-            reason: format!("member {entry_index}: {omission:?}"),
+            reason: super::analysis_memory::format_message(
+                format_args!("member {entry_index}: {omission:?}"),
+                memory,
+            )?,
         };
     }
     Ok(omission)

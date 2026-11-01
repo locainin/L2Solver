@@ -24,16 +24,9 @@ pub(super) fn charge_omission_payload(
     omission: &AnalysisOmission,
     memory: &mut MemoryLease,
 ) -> Result<(), Box<dyn Error>> {
-    let bytes = match omission {
-        AnalysisOmission::SourceRangeValidationLimit { reason, .. }
-        | AnalysisOmission::SourceStreamTransform { reason, .. }
-        | AnalysisOmission::ValidationLimit { reason, .. } => reason.capacity(),
-        AnalysisOmission::TransformFailed { message, .. } => message.capacity(),
-        AnalysisOmission::DerivedStreamRangeCoverage { output_sha256, .. } => {
-            output_sha256.capacity()
-        }
-        _ => 0,
-    };
+    let bytes = omission
+        .owned_heap_bytes()
+        .ok_or("omission payload size overflows")?;
     charge(memory, bytes)
 }
 
@@ -41,20 +34,82 @@ pub(super) fn reserve_omission(
     omissions: &mut Vec<AnalysisOmission>,
     memory: &mut MemoryLease,
 ) -> Result<(), Box<dyn Error>> {
-    // Reserve geometric growth before allocating a larger omission vector
-    let growth = if omissions.len() == omissions.capacity() {
-        omissions.capacity().max(4)
-    } else {
-        0
+    grow_vec(omissions, memory, 1)
+}
+
+pub(super) fn grow_vec<T>(
+    values: &mut Vec<T>,
+    memory: &mut MemoryLease,
+    additional: usize,
+) -> Result<(), Box<dyn Error>> {
+    let needed = values
+        .len()
+        .checked_add(additional)
+        .ok_or("analysis vector size overflows")?;
+    if needed <= values.capacity() {
+        return Ok(());
+    }
+    let wanted = values.capacity().saturating_mul(2).max(4).max(needed);
+    grow_vec_to(values, memory, wanted)
+}
+
+pub(super) fn grow_vec_exact<T>(
+    values: &mut Vec<T>,
+    memory: &mut MemoryLease,
+    additional: usize,
+) -> Result<(), Box<dyn Error>> {
+    let needed = values
+        .len()
+        .checked_add(additional)
+        .ok_or("analysis vector size overflows")?;
+    if needed <= values.capacity() {
+        return Ok(());
+    }
+    grow_vec_to(values, memory, needed)
+}
+
+fn grow_vec_to<T>(
+    values: &mut Vec<T>,
+    memory: &mut MemoryLease,
+    wanted: usize,
+) -> Result<(), Box<dyn Error>> {
+    let old = values
+        .capacity()
+        .checked_mul(std::mem::size_of::<T>())
+        .ok_or("analysis vector capacity overflows")?;
+    let requested = wanted
+        .checked_mul(std::mem::size_of::<T>())
+        .ok_or("analysis vector capacity overflows")?;
+    let before = memory.bytes();
+    // The new allocation is admitted while the old vector is still live
+    charge(memory, requested)?;
+    let mut next = Vec::new();
+    if let Err(error) = next.try_reserve_exact(wanted) {
+        drop(next);
+        memory.try_resize(before)?;
+        return Err(Box::new(error));
+    }
+    let admitted = next
+        .capacity()
+        .checked_mul(std::mem::size_of::<T>())
+        .and_then(|bytes| u64::try_from(bytes).ok())
+        .and_then(|bytes| before.checked_add(bytes));
+    let Some(admitted) = admitted else {
+        drop(next);
+        memory.try_resize(before)?;
+        return Err("analysis vector memory overflows".into());
     };
-    let bytes = growth
-        .checked_mul(std::mem::size_of::<AnalysisOmission>())
-        .ok_or("analysis omission memory overflows")?;
-    charge(memory, bytes)?;
-    let previous_capacity = omissions.capacity();
-    omissions.try_reserve_exact(growth)?;
-    let extra = omissions.capacity() - previous_capacity - growth;
-    charge(memory, extra * std::mem::size_of::<AnalysisOmission>())?;
+    if let Err(error) = memory.try_resize(admitted) {
+        drop(next);
+        memory.try_resize(before)?;
+        return Err(Box::new(error));
+    }
+    next.append(values);
+    *values = next;
+    let remaining = admitted
+        .checked_sub(u64::try_from(old)?)
+        .ok_or("analysis vector charge is inconsistent")?;
+    memory.try_resize(remaining)?;
     Ok(())
 }
 
@@ -62,10 +117,27 @@ pub(super) fn copy_message(
     value: &str,
     memory: &mut MemoryLease,
 ) -> Result<String, Box<dyn Error>> {
+    let before = memory.bytes();
     charge(memory, value.len())?;
     let mut copy = String::new();
-    copy.try_reserve_exact(value.len())?;
-    charge(memory, copy.capacity() - value.len())?;
+    if let Err(error) = copy.try_reserve_exact(value.len()) {
+        drop(copy);
+        memory.try_resize(before)?;
+        return Err(Box::new(error));
+    }
+    let admitted = u64::try_from(copy.capacity())
+        .ok()
+        .and_then(|bytes| before.checked_add(bytes));
+    let Some(admitted) = admitted else {
+        drop(copy);
+        memory.try_resize(before)?;
+        return Err("analysis string memory overflows".into());
+    };
+    if let Err(error) = memory.try_resize(admitted) {
+        drop(copy);
+        memory.try_resize(before)?;
+        return Err(Box::new(error));
+    }
     copy.push_str(value);
     Ok(copy)
 }
@@ -125,15 +197,27 @@ pub(super) fn charge_existing_omissions(
     omissions: &Vec<AnalysisOmission>,
     memory: &mut MemoryLease,
 ) -> Result<(), Box<dyn Error>> {
-    let bytes = omissions
+    let bytes = omissions_owned_bytes(omissions)?;
+    charge(memory, bytes)
+}
+
+pub(super) fn omissions_owned_bytes(
+    omissions: &Vec<AnalysisOmission>,
+) -> Result<usize, Box<dyn Error>> {
+    let mut bytes = omissions
         .capacity()
         .checked_mul(std::mem::size_of::<AnalysisOmission>())
         .ok_or("analysis omission memory overflows")?;
-    charge(memory, bytes)?;
     for omission in omissions {
-        charge_omission_payload(omission, memory)?;
+        bytes = bytes
+            .checked_add(
+                omission
+                    .owned_heap_bytes()
+                    .ok_or("omission payload size overflows")?,
+            )
+            .ok_or("analysis omission memory overflows")?;
     }
-    Ok(())
+    Ok(bytes)
 }
 
 pub(super) fn reserve(

@@ -393,8 +393,11 @@ fn per_input_cache_ignores_previous_algorithm_and_reuses_current() -> Result<(),
             .commit(l2_workbench::job::cache::StageStatus::Complete, json!({}))?,
     );
 
-    let first = analyze_source_cached(&source, options, &recovery, Some(&cache), &job)?;
-    let second = analyze_source_cached(&source, options, &recovery, Some(&cache), &job)?;
+    let memory = l2_workbench::job::MemoryBudget::new(16 * 1024 * 1024);
+    let (first, first_memory) =
+        analyze_source_cached(&source, options, &recovery, Some(&cache), &job, &memory)?;
+    let (second, second_memory) =
+        analyze_source_cached(&source, options, &recovery, Some(&cache), &job, &memory)?;
     let snapshot = job.snapshot()?;
 
     assert_eq!(first, second);
@@ -419,6 +422,10 @@ fn per_input_cache_ignores_previous_algorithm_and_reuses_current() -> Result<(),
         Some(&1)
     );
     assert!(snapshot.cache_fallbacks.records().is_empty());
+    drop(first);
+    drop(second);
+    drop(first_memory);
+    drop(second_memory);
     Ok(())
 }
 
@@ -440,6 +447,7 @@ fn cache_receipts_over_work_or_expansion_limits_are_rejected_and_can_fall_back()
         let bytes = structural_png()?;
         let source = loaded_source("source.png", &bytes);
         let mut recovery = RecoveryOptions::default();
+        let memory = l2_workbench::job::MemoryBudget::new(16 * 1024 * 1024);
         let options = analyzer_options(&recovery, false, 4096, 8192);
         let digest = source.digest().ok_or("source digest missing")?;
         let mut report = analyze_artifacts_with_source_sha256(&bytes, digest, options)?;
@@ -456,13 +464,15 @@ fn cache_receipts_over_work_or_expansion_limits_are_rejected_and_can_fall_back()
                 options,
                 &recovery,
                 Some(&cache),
-                &Job::new("strict cache")
+                &Job::new("strict cache"),
+                &memory,
             )
             .is_err()
         );
         recovery.strict_cache = false;
         let job = Job::new("cache fallback");
-        let actual = analyze_source_cached(&source, options, &recovery, Some(&cache), &job)?;
+        let (actual, _memory) =
+            analyze_source_cached(&source, options, &recovery, Some(&cache), &job, &memory)?;
         assert!(actual.work_bytes <= options.limits.max_total_work_bytes);
         assert!(actual.zip_expanded_work_bytes <= options.limits.max_zip_expanded_bytes);
         assert!(!job.snapshot()?.cache_fallbacks.records().is_empty());
@@ -937,7 +947,7 @@ fn refresh_replaces_only_the_owned_result_with_current_source_bytes() -> Result<
     Ok(())
 }
 
-fn structural_png() -> Result<Vec<u8>, Box<dyn Error>> {
+pub(super) fn structural_png() -> Result<Vec<u8>, Box<dyn Error>> {
     let mut bytes = l2_workbench::artifact::PNG_SIGNATURE.to_vec();
     let mut header = [0_u8; 13];
     header[..4].copy_from_slice(&1_u32.to_be_bytes());
@@ -948,7 +958,7 @@ fn structural_png() -> Result<Vec<u8>, Box<dyn Error>> {
     Ok(bytes)
 }
 
-fn structural_zip() -> Result<Vec<u8>, Box<dyn Error>> {
+pub(super) fn structural_zip() -> Result<Vec<u8>, Box<dyn Error>> {
     use std::io::Cursor;
 
     let mut archive = zip::ZipWriter::new(Cursor::new(Vec::new()));

@@ -1,5 +1,9 @@
 //! Secure bounded source admission for standalone files and artifact manifests
 
+#[cfg(test)]
+#[path = "../../tests/refine/input_memory.rs"]
+mod tests;
+
 use super::{
     invalid_input,
     read_budget::{SourceReadBudget, analysis_reservation},
@@ -257,14 +261,21 @@ pub(super) struct RangeSource {
     metadata: MetadataFingerprint,
 }
 
+pub(super) struct AdmittedPngBoundary {
+    pub(super) boundary: l2_workbench::artifact::StreamPngBoundary,
+    // The digest must be dropped before its charge is released
+    pub(super) memory: MemoryLease,
+}
+
 pub(super) struct RangeAnalysis {
     pub(super) report: l2_workbench::artifact::ArtifactAnalysis,
     pub(super) archive: Option<l2_workbench::artifact::zip::ZipArtifactReport>,
     pub(super) retain_source: bool,
-    pub(super) png: Option<l2_workbench::artifact::StreamPngBoundary>,
+    pub(super) png: Option<AdmittedPngBoundary>,
     pub(super) observation: Option<super::range_transform::Observation>,
     pub(super) report_memory: MemoryLease,
     pub(super) omission_memory: MemoryLease,
+    pub(super) source_digest_memory: MemoryLease,
 }
 
 impl LoadedSource {
@@ -370,6 +381,9 @@ impl LoadedSource {
             mut omission_memory,
             scanned,
             observation,
+            mut png,
+            source_digest_memory,
+            probe,
         } = analyze_source_stream(
             &mut reader,
             source.length,
@@ -385,7 +399,6 @@ impl LoadedSource {
             tail.work_bytes,
             tail.omission,
         )?;
-        let mut png = scanned.png;
         options.limits.max_total_work_bytes = complete_work_limit;
         let mut file = reader.into_inner();
         confirm_range_content(&file, source, spec, &report.source_sha256)?;
@@ -393,8 +406,7 @@ impl LoadedSource {
             &mut file,
             ObservedArchiveEnds {
                 tail: tail.candidate,
-                prefix_sha256: scanned.prefix_sha256,
-                stream: scanned.zip_observation,
+                probe,
             },
             &mut report,
             options,
@@ -412,6 +424,7 @@ impl LoadedSource {
             observation,
             report_memory,
             omission_memory,
+            source_digest_memory,
         })
     }
 }
@@ -537,18 +550,19 @@ fn record_tail_work(
 }
 
 fn retain_png_range(
-    png: Option<l2_workbench::artifact::StreamPngBoundary>,
+    png: Option<AdmittedPngBoundary>,
     report: &mut l2_workbench::artifact::ArtifactAnalysis,
     input: &InputSet,
     omission_memory: &mut MemoryLease,
-) -> Result<Option<l2_workbench::artifact::StreamPngBoundary>, Box<dyn Error>> {
+) -> Result<Option<AdmittedPngBoundary>, Box<dyn Error>> {
     let Some(boundary) = png else { return Ok(None) };
     if report.artifacts.iter().any(|artifact| {
-        artifact.sha256 == boundary.sha256 && artifact.bytes.len() == boundary.range.length
+        artifact.sha256 == boundary.boundary.sha256
+            && artifact.bytes.len() == boundary.boundary.range.length
     }) {
         return Ok(None);
     }
-    let length = u64::try_from(boundary.range.length)?;
+    let length = u64::try_from(boundary.boundary.range.length)?;
     if input.reserve_source_output(length)? {
         return Ok(Some(boundary));
     }
@@ -565,9 +579,19 @@ fn retain_png_range(
 
 struct ScannedSource {
     scanned: l2_workbench::artifact::StreamSourceAnalysis,
+    png: Option<AdmittedPngBoundary>,
+    probe: AdmittedArchiveProbe,
     observation: Option<super::range_transform::Observation>,
     report_memory: MemoryLease,
     omission_memory: MemoryLease,
+    source_digest_memory: MemoryLease,
+}
+
+struct AdmittedArchiveProbe {
+    prefix_sha256: Option<String>,
+    stream: Option<l2_workbench::artifact::ZipEndObservation>,
+    // Keep the source buffers alive until their accounting is released
+    memory: MemoryLease,
 }
 
 fn analyze_source_stream(
@@ -586,7 +610,8 @@ fn analyze_source_stream(
     reader.read_exact(prefix)?;
     // Feed the already-read prefix to the analyzer without reopening the source
     let is_png = count == signature.len() && signature == l2_workbench::artifact::PNG_SIGNATURE;
-    let (scratch, mut retained) = super::analysis_memory::reserve(memory, length, options, is_png)?;
+    let (mut scratch, mut retained) =
+        super::analysis_memory::reserve(memory, length, options, is_png)?;
     let mut omissions = memory.try_reserve(MemoryClass::Executor, 0)?;
     let prefix = signature
         .get(..count)
@@ -617,7 +642,7 @@ fn analyze_source_stream(
         max_candidates: (options.limits.max_input_bytes / 256).min(64),
     };
     let mut png_metadata = memory.try_reserve(MemoryClass::Executor, 0)?;
-    let result = l2_workbench::artifact::analyze_artifacts_observing_zip_ends(
+    let mut result = l2_workbench::artifact::analyze_artifacts_observing_zip_ends(
         &mut complete,
         length,
         stream_options,
@@ -632,13 +657,75 @@ fn analyze_source_stream(
     .map_err(stream_error)?;
     // Scanner scratch covers these records until their retained lease is charged
     super::analysis_memory::charge_existing_omissions(&result.analysis.omissions, &mut omissions)?;
+    let source_bytes = u64::try_from(result.analysis.source_sha256.capacity())?;
+    let png_bytes = u64::try_from(result.png.as_ref().map_or(0, |png| png.sha256.capacity()))?;
+    let probe_bytes = u64::try_from(scanner_probe_bytes(&result)?)?;
+    let total = source_bytes
+        .checked_add(png_bytes)
+        .and_then(|bytes| bytes.checked_add(probe_bytes))
+        .ok_or("scanner output charge overflows")?;
+    // Split the existing workspace charge while every returned buffer is still alive
+    let Some(mut outputs) = scratch.split_off(total) else {
+        return Err("scanner output charge is missing".into());
+    };
+    let Some(source_digest_memory) = outputs.split_off(source_bytes) else {
+        drop(result);
+        drop(outputs);
+        return Err("scanner source digest charge is missing".into());
+    };
+    let Some(png_memory) = outputs.split_off(png_bytes) else {
+        drop(result);
+        drop(source_digest_memory);
+        drop(outputs);
+        return Err("scanner PNG digest charge is missing".into());
+    };
+    let png = match result.png.take() {
+        Some(boundary) => Some(AdmittedPngBoundary {
+            boundary,
+            memory: png_memory,
+        }),
+        None => {
+            drop(png_memory);
+            None
+        }
+    };
+    let probe = AdmittedArchiveProbe {
+        prefix_sha256: result.prefix_sha256.take(),
+        stream: result.zip_observation.take(),
+        memory: outputs,
+    };
     drop(scratch);
     Ok(ScannedSource {
         scanned: result,
+        png,
+        probe,
         observation: complete.finish(),
         report_memory: retained,
         omission_memory: omissions,
+        source_digest_memory,
     })
+}
+
+fn scanner_probe_bytes(
+    result: &l2_workbench::artifact::StreamSourceAnalysis,
+) -> Result<usize, Box<dyn Error>> {
+    let mut bytes = result.prefix_sha256.as_ref().map_or(0, String::capacity);
+    if let Some(observation) = &result.zip_observation {
+        let candidates = observation
+            .candidates
+            .capacity()
+            .checked_mul(std::mem::size_of::<l2_workbench::artifact::StreamZipEnd>())
+            .ok_or("ZIP observation size overflows")?;
+        bytes = bytes
+            .checked_add(candidates)
+            .ok_or("ZIP observation size overflows")?;
+        for candidate in &observation.candidates {
+            bytes = bytes
+                .checked_add(candidate.sha256.capacity())
+                .ok_or("ZIP observation size overflows")?;
+        }
+    }
+    Ok(bytes)
 }
 
 pub(super) fn stream_error(error: io::Error) -> Box<dyn Error> {
@@ -673,13 +760,12 @@ fn confirm_range_source_name(
 
 struct ObservedArchiveEnds {
     tail: Option<super::range_zip::ZipCandidate>,
-    prefix_sha256: Option<String>,
-    stream: Option<l2_workbench::artifact::ZipEndObservation>,
+    probe: AdmittedArchiveProbe,
 }
 
 fn inspect_source_archive(
     file: &mut File,
-    ends: ObservedArchiveEnds,
+    mut ends: ObservedArchiveEnds,
     report: &mut l2_workbench::artifact::ArtifactAnalysis,
     options: l2_workbench::artifact::ArtifactAnalysisOptions,
     input: &InputSet,
@@ -687,7 +773,7 @@ fn inspect_source_archive(
     memory: (&mut MemoryLease, &mut MemoryLease),
 ) -> Result<(Option<l2_workbench::artifact::zip::ZipArtifactReport>, bool), Box<dyn Error>> {
     let (memory, omission_memory) = memory;
-    let candidates = source_zip_candidates(ends, report, omission_memory)?;
+    let candidates = source_zip_candidates(&mut ends, report, omission_memory)?;
     for candidate in candidates {
         let Some(archive) = super::range_zip::inspect(
             file,
@@ -721,11 +807,11 @@ fn inspect_source_archive(
 }
 
 fn source_zip_candidates(
-    ends: ObservedArchiveEnds,
+    ends: &mut ObservedArchiveEnds,
     report: &mut l2_workbench::artifact::ArtifactAnalysis,
     omission_memory: &mut MemoryLease,
 ) -> Result<Vec<l2_workbench::artifact::StreamZipEnd>, Box<dyn Error>> {
-    let mut candidates = if let Some(observation) = ends.stream {
+    let mut candidates = if let Some(observation) = ends.probe.stream.take() {
         if observation.unscanned_bytes > 0 || observation.omitted_candidates > 0 {
             super::analysis_memory::reserve_omission(&mut report.omissions, omission_memory)?;
             let reason = super::analysis_memory::format_message(
@@ -747,19 +833,21 @@ fn source_zip_candidates(
         Vec::new()
     };
     let mut multiple = false;
-    if let Some(tail) = ends.tail {
+    if let Some(tail) = ends.tail.take() {
         multiple = tail.multiple_boundaries;
         if !candidates
             .iter()
             .any(|candidate| candidate.end == tail.length)
         {
             let sha256 = if tail.length == report.source_length {
-                report.source_sha256.clone()
+                super::analysis_memory::copy_message(&report.source_sha256, &mut ends.probe.memory)?
             } else {
-                ends.prefix_sha256
+                ends.probe
+                    .prefix_sha256
+                    .take()
                     .ok_or_else(|| invalid_input("ZIP boundary digest is missing"))?
             };
-            candidates.try_reserve(1)?;
+            super::analysis_memory::grow_vec_exact(&mut candidates, &mut ends.probe.memory, 1)?;
             candidates.push(l2_workbench::artifact::StreamZipEnd {
                 end: tail.length,
                 sha256,
@@ -1406,18 +1494,55 @@ fn open_identity_source(input_set: &InputSet, spec: &InputSpec) -> Result<File, 
 }
 
 pub(super) fn read_snapshot(
-    mut file: impl Read + MetadataReader,
+    file: impl Read + MetadataReader,
     maximum: usize,
     expected_length: Option<usize>,
     expected_sha256: Option<&str>,
 ) -> Result<(Vec<u8>, String), Box<dyn Error>> {
+    read_snapshot_inner(file, maximum, expected_length, expected_sha256, None)
+}
+
+// The caller retains this charge with the returned buffers and rolls it back after errors
+pub(super) fn read_snapshot_with_memory(
+    file: impl Read + MetadataReader,
+    maximum: usize,
+    expected_length: Option<usize>,
+    expected_sha256: Option<&str>,
+    memory: &mut MemoryLease,
+) -> Result<(Vec<u8>, String), Box<dyn Error>> {
+    read_snapshot_inner(
+        file,
+        maximum,
+        expected_length,
+        expected_sha256,
+        Some(memory),
+    )
+}
+
+fn read_snapshot_inner(
+    mut file: impl Read + MetadataReader,
+    maximum: usize,
+    expected_length: Option<usize>,
+    expected_sha256: Option<&str>,
+    mut memory: Option<&mut MemoryLease>,
+) -> Result<(Vec<u8>, String), Box<dyn Error>> {
     let before = file.file_metadata()?;
     let length = checked_length(&before, expected_length, maximum)?;
 
+    if let Some(lease) = memory.as_deref_mut() {
+        let requested = length
+            .checked_add(128)
+            .ok_or("snapshot memory size overflows")?;
+        // The byte copy and digest formatting may coexist until both are returned
+        super::analysis_memory::charge(lease, requested)?;
+    }
     let mut bytes = Vec::new();
     bytes
         .try_reserve_exact(length)
         .map_err(|_| io::Error::other("input artifact allocation failed"))?;
+    if let Some(lease) = memory {
+        super::analysis_memory::charge(lease, bytes.capacity() - length)?;
+    }
     bytes.resize(length, 0);
     if let Err(error) = file.read_exact(&mut bytes) {
         if error.kind() != io::ErrorKind::UnexpectedEof {

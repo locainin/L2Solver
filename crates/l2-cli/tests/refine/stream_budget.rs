@@ -467,7 +467,6 @@ fn with_stream_source(
     use crate::refine::analysis::AnalyzedSources;
     use l2_workbench::{
         artifact::{AnalysisStatus, ArtifactAnalysis, ArtifactAnalysisOptions},
-        evidence::Case,
         job::MemoryClass,
     };
     use std::{fs, io};
@@ -480,14 +479,7 @@ fn with_stream_source(
     let source = sources.first().ok_or("source missing")?;
     let mut report_memory = memory.try_reserve(MemoryClass::Executor, 0)?;
     let mut omission_memory = memory.try_reserve(MemoryClass::Executor, 0)?;
-    let mut analysis = AnalyzedSources {
-        case: Case::with_blob_limit_and_memory_budget(4096, memory)?,
-        source_records: Vec::new(),
-        artifact_records: Vec::new(),
-        file_artifacts: Vec::new(),
-        complete: true,
-        _source_records_memory: memory.try_reserve(MemoryClass::Executor, 0)?,
-    };
+    let mut analysis = AnalyzedSources::new(4096, 0, memory)?;
     let mut report = ArtifactAnalysis {
         source_sha256: l2_workbench::sha256(bytes),
         source_length: bytes.len(),

@@ -12,7 +12,7 @@ use crate::workbench::artifact_export::AnalyzerValidationReceipt;
 use l2_workbench::{
     artifact::{
         AnalysisStatus, ArtifactAnalysisOptions, ArtifactOrigin, ArtifactValidationState,
-        analyze_artifacts_with_source_sha256,
+        analyze_artifacts_with_memory,
     },
     evidence::{Case, MAX_NODES, SourceRange},
     job::{
@@ -34,6 +34,21 @@ use std::{
 pub(super) const REFINE_ANALYZER_ALGORITHM_VERSION: u32 = 14;
 pub(super) const CACHE_ANALYSIS_SCHEMA_VERSION: u32 = 1;
 const MAX_CACHE_RECEIPT_BYTES: usize = 8 * 1024 * 1024;
+
+#[cfg(test)]
+#[path = "../../tests/refine/analysis_memory_lifetime.rs"]
+mod memory_lifetime_tests;
+#[cfg(test)]
+#[path = "../../tests/refine/analysis_retained.rs"]
+mod retained_tests;
+
+// Report buffers must disappear before either of their live memory charges
+struct SourceReport {
+    report: l2_workbench::artifact::ArtifactAnalysis,
+    _source_digest_memory: Option<MemoryLease>,
+    _report_memory: Option<MemoryLease>,
+    omission_memory: Option<MemoryLease>,
+}
 
 pub(super) fn analyze_sources(
     sources: &[LoadedSource],
@@ -72,29 +87,31 @@ pub(super) fn analyze_sources(
                 .max_total_work_bytes
                 .min(streaming.work_remaining());
         }
-        let (mut report, report_memory, omission_memory) =
-            if source.bytes().is_some() && remaining == 0 {
-                (no_case_space(source, policy.case_blob_limit)?, None, None)
-            } else if source.bytes().is_some() {
-                (
-                    analyze_source_cached(source, options, recovery, cache, job)?,
-                    None,
-                    None,
-                )
-            } else {
-                let (report, lease, omissions) = analyze_file_source(FileAnalysis {
-                    analysis: &mut analysis,
-                    input: input_set,
-                    source_index,
-                    source,
-                    options,
-                    job,
-                    memory,
-                    streaming: &mut streaming,
-                    profile: recovery.profile,
-                })?;
-                (report, Some(lease), Some(omissions))
-            };
+        let mut source_report = if source.bytes().is_some() && remaining == 0 {
+            no_case_space(source, policy.case_blob_limit, memory)?
+        } else if source.bytes().is_some() {
+            let (report, lease) =
+                analyze_source_cached(source, options, recovery, cache, job, memory)?;
+            SourceReport {
+                report,
+                _source_digest_memory: None,
+                _report_memory: Some(lease),
+                omission_memory: None,
+            }
+        } else {
+            analyze_file_source(FileAnalysis {
+                analysis: &mut analysis,
+                input: input_set,
+                source_index,
+                source,
+                options,
+                job,
+                memory,
+                streaming: &mut streaming,
+                profile: recovery.profile,
+            })?
+        };
+        let report = &mut source_report.report;
         if source.bytes().is_some() {
             streaming.charge_range_work(report.work_bytes)?;
             streaming.charge_zip_work(report.zip_expanded_work_bytes)?;
@@ -110,8 +127,7 @@ pub(super) fn analyze_sources(
             .flat_map(|artifact| &artifact.origins)
             .filter(|origin| matches!(origin, ArtifactOrigin::ArchiveMember { .. }))
             .count();
-        analysis.append_source(source_index, source, report, omission_memory, memory)?;
-        drop(report_memory);
+        analysis.append_source(source_index, source, source_report, memory)?;
         job.advance(Phase::Expansion, u64::try_from(expanded_members)?)?;
         job.advance(Phase::TransformDiscovery, 1)?;
     }
@@ -130,16 +146,7 @@ struct FileAnalysis<'a> {
     profile: RecoveryProfile,
 }
 
-fn analyze_file_source(
-    context: FileAnalysis<'_>,
-) -> Result<
-    (
-        l2_workbench::artifact::ArtifactAnalysis,
-        MemoryLease,
-        MemoryLease,
-    ),
-    Box<dyn Error>,
-> {
+fn analyze_file_source(context: FileAnalysis<'_>) -> Result<SourceReport, Box<dyn Error>> {
     let FileAnalysis {
         analysis,
         input,
@@ -170,9 +177,21 @@ fn analyze_file_source(
     )?;
     let retained =
         retain_source_formats(analysis, source_index, source, range, options, streaming)?;
-    let mut omission_memory = retained.omission_memory;
-    let mut report_memory = retained.report_memory;
-    let mut report = retained.report;
+    let mut source_report = SourceReport {
+        report: retained.report,
+        _source_digest_memory: Some(retained.source_digest_memory),
+        _report_memory: Some(retained.report_memory),
+        omission_memory: Some(retained.omission_memory),
+    };
+    let report = &mut source_report.report;
+    let report_memory = source_report
+        ._report_memory
+        .as_mut()
+        .ok_or("report memory is missing")?;
+    let omission_memory = source_report
+        .omission_memory
+        .as_mut()
+        .ok_or("omission memory is missing")?;
     let observation = retained.observation;
     // Source hashing is required even when syntax observation is skipped
     report.work_bytes = report
@@ -187,20 +206,20 @@ fn analyze_file_source(
             source_index,
             source,
             observation,
-            report: &mut report,
+            report,
             options,
             job,
             memory,
-            report_memory: &mut report_memory,
-            omission_memory: &mut omission_memory,
+            report_memory,
+            omission_memory,
             budget: streaming,
             profile,
         })?;
     } else {
-        super::analysis_memory::reserve_omission(&mut report.omissions, &mut omission_memory)?;
+        super::analysis_memory::reserve_omission(&mut report.omissions, omission_memory)?;
         let reason = super::analysis_memory::copy_message(
             "stream observation work budget is exhausted",
-            &mut omission_memory,
+            omission_memory,
         )?;
         report.omissions.push(
             l2_workbench::artifact::AnalysisOmission::SourceStreamTransform {
@@ -209,8 +228,8 @@ fn analyze_file_source(
             },
         );
     }
-    record_analysis_work(job, &report)?;
-    Ok((report, report_memory, omission_memory))
+    record_analysis_work(job, report)?;
+    Ok(source_report)
 }
 
 struct RetainedSource {
@@ -218,6 +237,7 @@ struct RetainedSource {
     observation: Option<super::range_transform::Observation>,
     report_memory: MemoryLease,
     omission_memory: MemoryLease,
+    source_digest_memory: MemoryLease,
 }
 
 fn retain_source_formats(
@@ -282,6 +302,7 @@ fn retain_source_formats(
         observation: range.observation,
         report_memory: range.report_memory,
         omission_memory,
+        source_digest_memory: range.source_digest_memory,
     })
 }
 
@@ -325,19 +346,33 @@ fn record_unpublished_archive_members(
 fn no_case_space(
     source: &LoadedSource,
     maximum: usize,
-) -> Result<l2_workbench::artifact::ArtifactAnalysis, Box<dyn Error>> {
-    Ok(l2_workbench::artifact::ArtifactAnalysis {
-        source_sha256: source
+    memory: &MemoryBudget,
+) -> Result<SourceReport, Box<dyn Error>> {
+    let mut lease = memory.try_reserve(MemoryClass::Executor, 0)?;
+    let source_sha256 = super::analysis_memory::copy_message(
+        source
             .digest()
-            .ok_or_else(|| invalid_input("memory source digest is missing"))?
-            .to_owned(),
+            .ok_or_else(|| invalid_input("memory source digest is missing"))?,
+        &mut lease,
+    )?;
+    let mut omissions = Vec::new();
+    super::analysis_memory::grow_vec_exact(&mut omissions, &mut lease, 1)?;
+    omissions.push(l2_workbench::artifact::AnalysisOmission::CaseBlobLimit { maximum });
+    let report = l2_workbench::artifact::ArtifactAnalysis {
+        source_sha256,
         source_length: source.length(),
         artifacts: Vec::new(),
         status: AnalysisStatus::Partial,
-        omissions: vec![l2_workbench::artifact::AnalysisOmission::CaseBlobLimit { maximum }],
+        omissions,
         region_transform_reports: Vec::new(),
         work_bytes: 0,
         zip_expanded_work_bytes: 0,
+    };
+    Ok(SourceReport {
+        report,
+        _source_digest_memory: None,
+        _report_memory: Some(lease),
+        omission_memory: None,
     })
 }
 
@@ -348,10 +383,13 @@ pub(super) struct AnalyzedSources {
     pub(super) file_artifacts: Vec<FileArtifact>,
     pub(super) complete: bool,
     pub(super) _source_records_memory: MemoryLease,
+    memory: MemoryBudget,
+    // Retained metadata vectors drop before this shared charge
+    retained_memory: MemoryLease,
 }
 
 impl AnalyzedSources {
-    fn new(
+    pub(super) fn new(
         case_blob_limit: usize,
         source_count: usize,
         memory: &MemoryBudget,
@@ -376,6 +414,8 @@ impl AnalyzedSources {
             file_artifacts: Vec::new(),
             complete: true,
             _source_records_memory: source_records_memory,
+            memory: memory.clone(),
+            retained_memory: memory.try_reserve(MemoryClass::Executor, 0)?,
         })
     }
 
@@ -393,15 +433,16 @@ impl AnalyzedSources {
         };
         let node_id =
             self.append_file_node(source_index, artifact_index, source, source_sha256, range)?;
-        self.file_artifacts.try_reserve(1)?;
+        super::analysis_memory::grow_vec(&mut self.file_artifacts, &mut self.retained_memory, 1)?;
         self.file_artifacts.push(FileArtifact::zip(
             node_id,
             source_index,
             artifact_index,
             archive.archive_size,
-            archive.archive_sha256.clone(),
+            &archive.archive_sha256,
             archive.entry_count,
-        ));
+            &self.memory,
+        )?);
         Ok(())
     }
 
@@ -421,7 +462,7 @@ impl AnalyzedSources {
             source_sha256,
             &derived.file.steps,
         )?;
-        self.file_artifacts.try_reserve(1)?;
+        super::analysis_memory::grow_vec(&mut self.file_artifacts, &mut self.retained_memory, 1)?;
         self.file_artifacts.push(FileArtifact::derived_zip(
             node_id,
             source_index,
@@ -429,7 +470,7 @@ impl AnalyzedSources {
             archive,
             source.length(),
             derived,
-        ));
+        )?);
         Ok(())
     }
 
@@ -449,7 +490,7 @@ impl AnalyzedSources {
             source_sha256,
             &derived.file.steps,
         )?;
-        self.file_artifacts.try_reserve(1)?;
+        super::analysis_memory::grow_vec(&mut self.file_artifacts, &mut self.retained_memory, 1)?;
         self.file_artifacts.push(FileArtifact::derived_png(
             node_id,
             source_index,
@@ -457,7 +498,7 @@ impl AnalyzedSources {
             boundary,
             source.length(),
             derived,
-        ));
+        )?);
         Ok(())
     }
 
@@ -485,7 +526,7 @@ impl AnalyzedSources {
             artifact,
             derived,
         )?;
-        self.file_artifacts.try_reserve(1)?;
+        super::analysis_memory::grow_vec(&mut self.file_artifacts, &mut self.retained_memory, 1)?;
         self.file_artifacts.push(file);
         Ok(())
     }
@@ -526,22 +567,22 @@ impl AnalyzedSources {
         artifact_index: usize,
         source: &LoadedSource,
         source_sha256: &str,
-        boundary: l2_workbench::artifact::StreamPngBoundary,
+        boundary: super::input::AdmittedPngBoundary,
     ) -> Result<(), Box<dyn Error>> {
         let node_id = self.append_file_node(
             source_index,
             artifact_index,
             source,
             source_sha256,
-            boundary.range,
+            boundary.boundary.range,
         )?;
-        self.file_artifacts.try_reserve(1)?;
+        super::analysis_memory::grow_vec(&mut self.file_artifacts, &mut self.retained_memory, 1)?;
         self.file_artifacts.push(FileArtifact::png(
             node_id,
             source_index,
             artifact_index,
             boundary,
-        ));
+        )?);
         Ok(())
     }
 
@@ -640,29 +681,49 @@ impl AnalyzedSources {
         &mut self,
         source_index: usize,
         source: &LoadedSource,
-        report: l2_workbench::artifact::ArtifactAnalysis,
-        omission_memory: Option<MemoryLease>,
+        mut source_report: SourceReport,
         memory: &MemoryBudget,
     ) -> Result<(), Box<dyn Error>> {
-        self.append_artifacts(source_index, &report.artifacts)?;
-        let mut omission_memory = if let Some(lease) = omission_memory {
-            lease
-        } else {
-            let mut lease = memory.try_reserve(MemoryClass::Executor, 0)?;
-            super::analysis_memory::charge_existing_omissions(&report.omissions, &mut lease)?;
-            lease
-        };
-        let label = super::analysis_memory::copy_message(&source.label, &mut omission_memory)?;
-        let sha256 =
-            super::analysis_memory::copy_message(&report.source_sha256, &mut omission_memory)?;
+        self.append_artifacts(source_index, &mut source_report)?;
+        let report = &source_report.report;
+        if source_report.omission_memory.is_none() {
+            let bytes = u64::try_from(super::analysis_memory::omissions_owned_bytes(
+                &report.omissions,
+            )?)?;
+            let lease = if let Some(report_memory) = &mut source_report._report_memory {
+                report_memory
+                    .split_off(bytes)
+                    .ok_or("omission charge is missing from the report")?
+            } else {
+                let mut lease = memory.try_reserve(MemoryClass::Executor, 0)?;
+                super::analysis_memory::charge_existing_omissions(&report.omissions, &mut lease)?;
+                lease
+            };
+            source_report.omission_memory = Some(lease);
+        }
+        let omission_memory = source_report
+            .omission_memory
+            .as_mut()
+            .ok_or("source omission memory is missing")?;
+        let label = super::analysis_memory::copy_message(&source.label, omission_memory)?;
+        let sha256 = super::analysis_memory::copy_message(&report.source_sha256, omission_memory)?;
         // The fixed scratch bound covers the short formatted reason during construction
         let reason_scratch = memory.try_reserve(MemoryClass::Executor, 1024)?;
-        let reason = analysis_reason(&report);
+        let reason = analysis_reason(report);
         if let Some(reason) = &reason {
-            super::analysis_memory::charge(&mut omission_memory, reason.capacity())?;
+            super::analysis_memory::charge(omission_memory, reason.capacity())?;
         }
         drop(reason_scratch);
         self.complete &= report.status == AnalysisStatus::Complete;
+        let retained = super::analysis_memory::omissions_owned_bytes(&report.omissions)?
+            .checked_add(label.capacity())
+            .and_then(|bytes| bytes.checked_add(sha256.capacity()))
+            .and_then(|bytes| bytes.checked_add(reason.as_ref().map_or(0, String::capacity)))
+            .ok_or("source record memory overflows")?;
+        let omission_memory = source_report
+            .omission_memory
+            .take()
+            .ok_or("source omission memory is missing")?;
         self.source_records.push(SourceRecord {
             label,
             sha256: Some(sha256),
@@ -670,18 +731,34 @@ impl AnalyzedSources {
             status: report.status,
             work_bytes_charged: Some(report.work_bytes),
             zip_expanded_work_bytes_charged: Some(report.zip_expanded_work_bytes),
-            omissions: report.omissions,
+            omissions: std::mem::take(&mut source_report.report.omissions),
             reason,
             _omission_memory: omission_memory,
         });
+        // The report's buffers are gone before returning unused child-analysis credit
+        drop(source_report);
+        let record = self
+            .source_records
+            .last_mut()
+            .ok_or("source record is missing")?;
+        if record._omission_memory.bytes() < u64::try_from(retained)? {
+            return Err("source record memory charge is incomplete".into());
+        }
+        record
+            ._omission_memory
+            .try_resize(u64::try_from(retained)?)?;
         Ok(())
     }
 
     fn append_artifacts(
         &mut self,
         source_index: usize,
-        artifacts: &[l2_workbench::artifact::AnalyzedArtifact],
+        source_report: &mut SourceReport,
     ) -> Result<(), Box<dyn Error>> {
+        let protected = u64::try_from(super::analysis_memory::omissions_owned_bytes(
+            &source_report.report.omissions,
+        )?)?;
+        let artifacts = std::mem::take(&mut source_report.report.artifacts);
         let origin_count = artifacts
             .iter()
             .try_fold(0_usize, |count, artifact| {
@@ -693,9 +770,11 @@ impl AnalyzedSources {
                 "refined output exceeds the provenance record limit",
             ));
         }
-        self.artifact_records
-            .try_reserve(origin_count)
-            .map_err(|_| io::Error::other("artifact provenance allocation failed"))?;
+        super::analysis_memory::grow_vec(
+            &mut self.artifact_records,
+            &mut self.retained_memory,
+            origin_count,
+        )?;
         for artifact in artifacts {
             if self.case.nodes().len() >= MAX_NODES {
                 return Err(invalid_input(
@@ -708,13 +787,36 @@ impl AnalyzedSources {
                 Vec::new(),
                 json!({"source_index":source_index,"artifact_index":artifact.index}),
             )?;
-            for origin in &artifact.origins {
+            let origin_total = artifact.origins.len();
+            let mut digest = Some(artifact.sha256);
+            for (index, origin) in artifact.origins.into_iter().enumerate() {
+                let mut transferred = origin
+                    .owned_heap_bytes()
+                    .ok_or("artifact origin size overflows")?;
+                let sha256 = if index + 1 == origin_total {
+                    let value = digest.take().ok_or("artifact digest is missing")?;
+                    transferred = transferred
+                        .checked_add(value.capacity())
+                        .ok_or("artifact metadata size overflows")?;
+                    value
+                } else {
+                    super::analysis_memory::copy_message(
+                        digest.as_deref().ok_or("artifact digest is missing")?,
+                        &mut self.retained_memory,
+                    )?
+                };
+                transfer_report_memory(
+                    source_report,
+                    &mut self.retained_memory,
+                    transferred,
+                    protected,
+                )?;
                 self.artifact_records.push(ArtifactRecord {
                     node_id,
                     source_index,
                     artifact_index: artifact.index,
-                    origin: origin.clone(),
-                    sha256: artifact.sha256.clone(),
+                    origin,
+                    sha256,
                     byte_length: artifact.bytes.len(),
                     validation: artifact.validation,
                     signature_match_count: artifact.signature_match_count,
@@ -723,6 +825,50 @@ impl AnalyzedSources {
         }
         Ok(())
     }
+}
+
+fn transfer_report_memory(
+    report: &mut SourceReport,
+    target: &mut MemoryLease,
+    bytes: usize,
+    protected: u64,
+) -> Result<(), Box<dyn Error>> {
+    let mut remaining = u64::try_from(bytes)?;
+    let omissions_separate = report.omission_memory.is_some();
+    if let Some(source) = &mut report._report_memory {
+        let keep = if omissions_separate { 0 } else { protected };
+        remaining -= transfer_lease(source, target, remaining, keep)?;
+    }
+    if let Some(source) = &mut report.omission_memory {
+        remaining -= transfer_lease(source, target, remaining, protected)?;
+    }
+    if remaining != 0 {
+        return Err("artifact metadata charge is missing from the report".into());
+    }
+    Ok(())
+}
+
+fn transfer_lease(
+    source: &mut MemoryLease,
+    target: &mut MemoryLease,
+    requested: u64,
+    keep: u64,
+) -> Result<u64, Box<dyn Error>> {
+    let available = source
+        .bytes()
+        .checked_sub(keep)
+        .ok_or("report omission charge is incomplete")?;
+    let amount = available.min(requested);
+    let part = source
+        .split_off(amount)
+        .ok_or("report metadata charge is missing")?;
+    if let Err(part) = target.try_absorb(part) {
+        source
+            .try_absorb(part)
+            .map_err(|_| "split charge could not be restored")?;
+        return Err("report metadata memory scope differs from its owner".into());
+    }
+    Ok(amount)
 }
 
 fn analysis_reason(report: &l2_workbench::artifact::ArtifactAnalysis) -> Option<String> {
@@ -841,40 +987,49 @@ pub(super) fn analyze_source_cached(
     recovery: &RecoveryOptions,
     cache: Option<&Cache>,
     job: &Job,
-) -> Result<l2_workbench::artifact::ArtifactAnalysis, Box<dyn Error>> {
+    memory: &MemoryBudget,
+) -> Result<(l2_workbench::artifact::ArtifactAnalysis, MemoryLease), Box<dyn Error>> {
     let bytes = source.bytes().ok_or_else(|| {
         invalid_input("file-backed source cannot use the in-memory analysis cache")
     })?;
     let digest = source
         .digest()
         .ok_or_else(|| invalid_input("memory source digest is missing"))?;
+    let mut report_memory = memory.try_reserve(MemoryClass::Executor, 0)?;
     let Some(cache) = cache else {
-        let report = analyze_artifacts_with_source_sha256(bytes, digest, options)?;
+        let report =
+            analyze_artifacts_with_memory(bytes, Some(digest), options, &mut report_memory)?;
         record_analysis_work(job, &report)?;
-        return Ok(report);
+        return Ok((report, report_memory));
     };
 
     let key = analysis_cache_key(digest, options, recovery.profile)?;
 
     if !recovery.refresh {
         match cache.lookup(&key, CacheReadPolicy::AllowPartial) {
-            Ok(Some(entry)) => match load_cached_analysis(&entry, source, options) {
-                Ok(report) => {
-                    job.increment(Counter::CacheHits, 1)?;
-                    return Ok(report);
+            Ok(Some(entry)) => {
+                match load_cached_analysis(&entry, source, options, memory, &mut report_memory) {
+                    Ok(report) => {
+                        job.increment(Counter::CacheHits, 1)?;
+                        return Ok((report, report_memory));
+                    }
+                    Err(error)
+                        if recovery.strict_cache
+                            || crate::memory_error::find(error.as_ref()).is_some() =>
+                    {
+                        return Err(error);
+                    }
+                    Err(_) => {
+                        // The rejected receipt and every partially restored blob are gone
+                        report_memory.try_resize(0)?;
+                        note_cache_fallback(
+                            job,
+                            CacheFallbackKind::InvalidEntry,
+                            format_args!("cached file analysis was rejected"),
+                        )?;
+                    }
                 }
-                Err(error)
-                    if recovery.strict_cache
-                        || crate::memory_error::find(error.as_ref()).is_some() =>
-                {
-                    return Err(error);
-                }
-                Err(_) => note_cache_fallback(
-                    job,
-                    CacheFallbackKind::InvalidEntry,
-                    format_args!("cached file analysis was rejected"),
-                )?,
-            },
+            }
             Ok(None) => {}
             Err(error) if recovery.strict_cache || crate::memory_error::find(&error).is_some() => {
                 return Err(error.into());
@@ -903,10 +1058,10 @@ pub(super) fn analyze_source_cached(
         }
     };
 
-    let report = analyze_artifacts_with_source_sha256(bytes, digest, options)?;
+    let report = analyze_artifacts_with_memory(bytes, Some(digest), options, &mut report_memory)?;
     record_analysis_work(job, &report)?;
     if let Some(lease) = lease
-        && let Err(error) = store_cached_analysis(lease, &report)
+        && let Err(error) = store_cached_analysis(lease, &report, memory)
     {
         if recovery.strict_cache || crate::memory_error::find(error.as_ref()).is_some() {
             return Err(error);
@@ -917,7 +1072,7 @@ pub(super) fn analyze_source_cached(
             format_args!("file analysis cache commit failed"),
         )?;
     }
-    Ok(report)
+    Ok((report, report_memory))
 }
 
 fn analysis_cache_key(
@@ -977,15 +1132,21 @@ struct CacheAnalysisReceipt {
 fn store_cached_analysis(
     lease: Lease,
     report: &l2_workbench::artifact::ArtifactAnalysis,
+    memory: &MemoryBudget,
 ) -> Result<(), Box<dyn Error>> {
     let directory = lease.directory();
+    let _scratch = memory.try_reserve(MemoryClass::Executor, 4096)?;
+    let mut lengths_memory = memory.try_reserve(MemoryClass::Executor, 0)?;
+    let mut artifact_lengths = Vec::new();
+    super::analysis_memory::grow_vec_exact(
+        &mut artifact_lengths,
+        &mut lengths_memory,
+        report.artifacts.len(),
+    )?;
+    artifact_lengths.extend(report.artifacts.iter().map(|artifact| artifact.bytes.len()));
     let receipt = CacheAnalysisReceiptRef {
         schema_version: CACHE_ANALYSIS_SCHEMA_VERSION,
-        artifact_lengths: report
-            .artifacts
-            .iter()
-            .map(|artifact| artifact.bytes.len())
-            .collect(),
+        artifact_lengths,
         analysis: report,
     };
     let mut receipt_file = File::options()
@@ -1024,14 +1185,17 @@ fn load_cached_analysis(
     entry: &CacheEntry,
     source: &LoadedSource,
     options: ArtifactAnalysisOptions,
+    memory: &MemoryBudget,
+    report_memory: &mut MemoryLease,
 ) -> Result<l2_workbench::artifact::ArtifactAnalysis, Box<dyn Error>> {
-    let receipt = read_cache_receipt(entry, source, options)?;
+    let receipt = read_cache_receipt(entry, source, options, memory, report_memory)?;
     let mut report = receipt.analysis;
     restore_cached_artifact_bytes(
         entry,
         &mut report,
         receipt.artifact_lengths,
         options.limits.max_total_output_bytes,
+        report_memory,
     )?;
     validate_cached_lineage(&report)?;
     validate_cached_source_artifact(&report, source)?;
@@ -1042,6 +1206,8 @@ fn read_cache_receipt(
     entry: &CacheEntry,
     source: &LoadedSource,
     options: ArtifactAnalysisOptions,
+    memory: &MemoryBudget,
+    report_memory: &mut MemoryLease,
 ) -> Result<CacheAnalysisReceipt, Box<dyn Error>> {
     let metadata = entry.metadata();
     if metadata
@@ -1056,13 +1222,30 @@ fn read_cache_receipt(
     }
 
     let receipt_path = entry.directory().join("analysis.json");
-    let (receipt_bytes, _) = super::input::read_snapshot(
+    let before = report_memory.bytes();
+    let (receipt_bytes, receipt_sha256) = super::input::read_snapshot_with_memory(
         crate::input::regular_no_follow(&receipt_path)?,
         MAX_CACHE_RECEIPT_BYTES,
         None,
         None,
+        report_memory,
     )?;
+    let read_charge = report_memory.bytes() - before;
+    let admission = l2_workbench::job::admit_json(&receipt_bytes, memory, MemoryClass::Executor)?;
     let receipt: CacheAnalysisReceipt = serde_json::from_slice(&receipt_bytes)?;
+    let retained = admission.into_retained();
+    if let Err(retained) = report_memory.try_absorb(retained) {
+        drop(receipt);
+        drop(retained);
+        return Err("cache JSON memory scope differs from its report".into());
+    }
+    drop(receipt_bytes);
+    drop(receipt_sha256);
+    let remaining = report_memory
+        .bytes()
+        .checked_sub(read_charge)
+        .ok_or("cache receipt memory charge is inconsistent")?;
+    report_memory.try_resize(remaining)?;
     if receipt.schema_version != CACHE_ANALYSIS_SCHEMA_VERSION
         || metadata
             .get("artifact_count")
@@ -1098,6 +1281,7 @@ fn restore_cached_artifact_bytes(
     report: &mut l2_workbench::artifact::ArtifactAnalysis,
     artifact_lengths: Vec<usize>,
     total_limit: usize,
+    report_memory: &mut MemoryLease,
 ) -> Result<(), Box<dyn Error>> {
     let mut output_bytes = 0_usize;
     for (index, (artifact, expected_length)) in report
@@ -1122,17 +1306,24 @@ fn restore_cached_artifact_bytes(
         let artifact_path = entry
             .directory()
             .join(cache_artifact_file_name(artifact.index));
-        let (bytes, digest) = super::input::read_snapshot(
+        let before = report_memory.bytes();
+        let (bytes, digest) = super::input::read_snapshot_with_memory(
             crate::input::regular_no_follow(&artifact_path)?,
             expected_length,
             Some(expected_length),
             Some(&artifact.sha256),
+            report_memory,
         )?;
         if digest != artifact.sha256 {
             return Err(invalid_cache_entry(
                 "file analysis artifact hash is invalid",
             ));
         }
+        let retained = before
+            .checked_add(u64::try_from(bytes.capacity())?)
+            .ok_or("cached artifact memory overflows")?;
+        drop(digest);
+        report_memory.try_resize(retained)?;
         artifact.bytes = bytes;
         output_bytes = next_total;
     }

@@ -1,5 +1,6 @@
 //! Metadata for validated original ranges kept outside the in-memory Case blob store
 
+use super::{analysis_memory as retained, input::AdmittedPngBoundary};
 use crate::workbench::artifact_export::{
     ArtifactProvenance, ReconstructionStatus, StructuralValidation,
 };
@@ -10,9 +11,12 @@ use l2_workbench::artifact::{
 use l2_workbench::derivation::StreamReceipt;
 use l2_workbench::job::{MemoryBudget, MemoryClass, MemoryLease};
 use serde::Serialize;
-use std::{error::Error, fs::File, rc::Rc};
+use std::{error::Error, fmt::Write, fs::File, mem::size_of, rc::Rc};
 
+// This allowance covers stream metadata and derived names, digests and provenance
+// Derived origin capacity and the shared file-artifact vector are charged separately
 pub(super) const STREAM_METADATA_BYTES: u64 = 16 * 1024;
+const FILE_ORIGIN_KIND: &str = "file_range_artifact";
 
 pub(super) enum FileBacking {
     Source,
@@ -93,6 +97,7 @@ pub(super) struct FileArtifact {
     pub(super) file_name: String,
     pub(super) provenance: Vec<ArtifactProvenance>,
     derived_memory: Option<MemoryLease>,
+    source_memory: Option<MemoryLease>,
 }
 
 impl FileArtifact {
@@ -101,27 +106,39 @@ impl FileArtifact {
         source_index: usize,
         artifact_index: usize,
         length: usize,
-        sha256: String,
+        sha256: &str,
         entry_count: usize,
-    ) -> Self {
-        Self::new(
+        memory: &MemoryBudget,
+    ) -> Result<Self, Box<dyn Error>> {
+        let lease = source_metadata_lease(memory, node_id, sha256.len(), FileFormat::Zip)?;
+        let digest = copy_text(sha256)?;
+        let result = Self::new(
             node_id,
             source_index,
             artifact_index,
             FileRange { offset: 0, length },
-            sha256,
+            digest,
             entry_count,
             FileFormat::Zip,
-        )
+        )?;
+        result.with_source_memory(lease)
     }
 
     pub(super) fn png(
         node_id: u64,
         source_index: usize,
         artifact_index: usize,
-        boundary: StreamPngBoundary,
-    ) -> Self {
-        Self::new(
+        mut admitted: AdmittedPngBoundary,
+    ) -> Result<Self, Box<dyn Error>> {
+        let required = source_metadata_bytes(
+            node_id,
+            admitted.boundary.sha256.capacity(),
+            FileFormat::Png,
+        )?;
+        // Grow the existing digest charge without reserving the same bytes twice
+        admitted.memory.try_resize(required)?;
+        let AdmittedPngBoundary { boundary, memory } = admitted;
+        let result = Self::new(
             node_id,
             source_index,
             artifact_index,
@@ -129,7 +146,8 @@ impl FileArtifact {
             boundary.sha256,
             boundary.chunk_count,
             FileFormat::Png,
-        )
+        )?;
+        result.with_source_memory(memory)
     }
 
     pub(super) fn derived_zip(
@@ -139,16 +157,21 @@ impl FileArtifact {
         archive: &l2_workbench::artifact::zip::ZipArtifactReport,
         source_length: usize,
         derived: DerivedArtifact,
-    ) -> Self {
-        Self::zip(
+    ) -> Result<Self, Box<dyn Error>> {
+        let digest = copy_text(&archive.archive_sha256)?;
+        Ok(Self::new(
             node_id,
             source_index,
             artifact_index,
-            archive.archive_size,
-            archive.archive_sha256.clone(),
+            FileRange {
+                offset: 0,
+                length: archive.archive_size,
+            },
+            digest,
             archive.entry_count,
-        )
-        .with_derived(source_length, derived)
+            FileFormat::Zip,
+        )?
+        .with_derived(source_length, derived))
     }
 
     pub(super) fn derived_png(
@@ -158,9 +181,17 @@ impl FileArtifact {
         boundary: StreamPngBoundary,
         source_length: usize,
         derived: DerivedArtifact,
-    ) -> Self {
-        Self::png(node_id, source_index, artifact_index, boundary)
-            .with_derived(source_length, derived)
+    ) -> Result<Self, Box<dyn Error>> {
+        Ok(Self::new(
+            node_id,
+            source_index,
+            artifact_index,
+            boundary.range,
+            boundary.sha256,
+            boundary.chunk_count,
+            FileFormat::Png,
+        )?
+        .with_derived(source_length, derived))
     }
 
     pub(super) fn derived_ranges(
@@ -214,7 +245,7 @@ impl FileArtifact {
             artifact.sha256.clone(),
             artifact.validation.structure_count,
             format,
-        )
+        )?
         .with_derived(source_length, derived);
         result.origins = origins;
         result.validation = artifact.validation;
@@ -251,13 +282,12 @@ impl FileArtifact {
                 additional += 1;
             }
         }
-        let previous_capacity = self.origins.capacity();
-        let available = previous_capacity - self.origins.len();
-        let growth = additional.saturating_sub(available);
-        self.charge_origin_growth(growth)?;
-        self.origins.try_reserve_exact(additional)?;
-        let extra = self.origins.capacity() - previous_capacity - growth;
-        self.charge_origin_growth(extra)?;
+        let memory = self
+            .derived_memory
+            .as_mut()
+            .ok_or("derived metadata lease is missing")?;
+        // Both origin buffers remain charged until the old one has been dropped
+        retained::grow_vec_exact(&mut self.origins, memory, additional)?;
         for origin in &artifact.origins {
             let ArtifactOrigin::SourceRange { range, .. } = origin else {
                 return Err("derived range origin is invalid".into());
@@ -291,23 +321,6 @@ impl FileArtifact {
         )
     }
 
-    fn charge_origin_growth(&mut self, growth: usize) -> Result<(), Box<dyn Error>> {
-        let bytes = growth
-            .checked_mul(std::mem::size_of::<FileOrigin>())
-            .and_then(|bytes| u64::try_from(bytes).ok())
-            .ok_or("derived origin capacity overflows")?;
-        let memory = self
-            .derived_memory
-            .as_mut()
-            .ok_or("derived metadata lease is missing")?;
-        let total = memory
-            .bytes()
-            .checked_add(bytes)
-            .ok_or("derived metadata charge overflows")?;
-        memory.try_resize(total)?;
-        Ok(())
-    }
-
     fn with_derived(mut self, source_length: usize, derived: DerivedArtifact) -> Self {
         self.origins = vec![FileOrigin::Stream(StreamOrigin {
             kind: "stream_transformation",
@@ -326,6 +339,47 @@ impl FileArtifact {
         self
     }
 
+    fn with_source_memory(mut self, mut memory: MemoryLease) -> Result<Self, Box<dyn Error>> {
+        let actual = self
+            .sha256
+            .capacity()
+            .checked_add(self.file_name.capacity())
+            .and_then(|bytes| {
+                bytes.checked_add(
+                    self.origins
+                        .capacity()
+                        .checked_mul(size_of::<FileOrigin>())?,
+                )
+            })
+            .and_then(|bytes| {
+                bytes.checked_add(
+                    self.provenance
+                        .capacity()
+                        .checked_mul(size_of::<ArtifactProvenance>())?,
+                )
+            })
+            .and_then(|bytes| {
+                bytes.checked_add(
+                    self.provenance
+                        .first()
+                        .map_or(0, |origin| origin.kind.capacity()),
+                )
+            })
+            .and_then(|bytes| u64::try_from(bytes).ok());
+        let Some(actual) = actual else {
+            drop(self);
+            drop(memory);
+            return Err("source artifact metadata size overflows".into());
+        };
+        if let Err(error) = memory.try_resize(actual) {
+            drop(self);
+            drop(memory);
+            return Err(Box::new(error));
+        }
+        self.source_memory = Some(memory);
+        Ok(self)
+    }
+
     fn new(
         node_id: u64,
         source_index: usize,
@@ -334,7 +388,7 @@ impl FileArtifact {
         sha256: String,
         structure_count: usize,
         kind: FileFormat,
-    ) -> Self {
+    ) -> Result<Self, Box<dyn Error>> {
         let (format, boundary, embedded, extension, evidence) = match kind {
             FileFormat::Png => (
                 AnalysisFormat::Png,
@@ -351,7 +405,31 @@ impl FileArtifact {
                 "zip_structure",
             ),
         };
-        Self {
+        // Every source-owned buffer was admitted before reaching these allocations
+        let mut origins = Vec::new();
+        origins.try_reserve_exact(1)?;
+        origins.push(FileOrigin::Source(ArtifactOrigin::SourceRange {
+            range,
+            format: embedded,
+        }));
+        let mut provenance = Vec::new();
+        provenance.try_reserve_exact(1)?;
+        provenance.push(ArtifactProvenance {
+            id: node_id,
+            kind: copy_text(FILE_ORIGIN_KIND)?,
+            archive_path: None,
+            completion_basis: None,
+            reconstruction_status: ReconstructionStatus::Unknown,
+            structural_validation: StructuralValidation::Validated {
+                format: evidence,
+                evidence_node: None,
+            },
+            extension_evidence_node: None,
+        });
+        let mut file_name = String::new();
+        file_name.try_reserve_exact(file_name_length(node_id, extension)?)?;
+        write!(&mut file_name, "artifact-{node_id}-record.{extension}")?;
+        Ok(Self {
             source_index,
             artifact_index,
             range,
@@ -365,26 +443,13 @@ impl FileArtifact {
             },
             signature_match_count: 0,
             signatures_scanned: false,
-            origins: vec![FileOrigin::Source(ArtifactOrigin::SourceRange {
-                range,
-                format: embedded,
-            })],
+            origins,
             backing: FileBacking::Source,
-            file_name: format!("artifact-{node_id}-record.{extension}"),
-            provenance: vec![ArtifactProvenance {
-                id: node_id,
-                kind: String::from("file_range_artifact"),
-                archive_path: None,
-                completion_basis: None,
-                reconstruction_status: ReconstructionStatus::Unknown,
-                structural_validation: StructuralValidation::Validated {
-                    format: evidence,
-                    evidence_node: None,
-                },
-                extension_evidence_node: None,
-            }],
+            file_name,
+            provenance,
             derived_memory: None,
-        }
+            source_memory: None,
+        })
     }
 }
 
@@ -392,4 +457,55 @@ impl FileArtifact {
 enum FileFormat {
     Png,
     Zip,
+}
+
+fn file_name_length(node_id: u64, extension: &str) -> Result<usize, Box<dyn Error>> {
+    let digits = if node_id == 0 {
+        1
+    } else {
+        usize::try_from(node_id.ilog10() + 1)?
+    };
+    "artifact-"
+        .len()
+        .checked_add(digits)
+        .and_then(|length| length.checked_add("-record.".len()))
+        .and_then(|length| length.checked_add(extension.len()))
+        .ok_or_else(|| "source artifact filename size overflows".into())
+}
+
+fn source_metadata_lease(
+    memory: &MemoryBudget,
+    node_id: u64,
+    digest_bytes: usize,
+    format: FileFormat,
+) -> Result<MemoryLease, Box<dyn Error>> {
+    Ok(memory.try_reserve(
+        MemoryClass::Executor,
+        source_metadata_bytes(node_id, digest_bytes, format)?,
+    )?)
+}
+
+fn source_metadata_bytes(
+    node_id: u64,
+    digest_bytes: usize,
+    format: FileFormat,
+) -> Result<u64, Box<dyn Error>> {
+    let extension = match format {
+        FileFormat::Png => "png",
+        FileFormat::Zip => "zip",
+    };
+    let bytes = digest_bytes
+        .checked_add(file_name_length(node_id, extension)?)
+        .and_then(|bytes| bytes.checked_add(FILE_ORIGIN_KIND.len()))
+        .and_then(|bytes| bytes.checked_add(size_of::<FileOrigin>()))
+        .and_then(|bytes| bytes.checked_add(size_of::<ArtifactProvenance>()))
+        .ok_or("source artifact metadata size overflows")?;
+    Ok(u64::try_from(bytes)?)
+}
+
+fn copy_text(value: &str) -> Result<String, Box<dyn Error>> {
+    let mut copy = String::new();
+    copy.try_reserve_exact(value.len())?;
+    copy.push_str(value);
+    Ok(copy)
 }

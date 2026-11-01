@@ -20,6 +20,7 @@ fn cached_refinement_preserves_memory_pressure_in_optional_and_strict_modes()
         &RecoveryOptions::default(),
         Some(&cache),
         &Job::new("populate"),
+        &MemoryBudget::new(16 * 1024 * 1024),
     )?;
     drop(cache);
     let cache = Cache::open_at(root, state, 1024 * 1024)?;
@@ -31,9 +32,10 @@ fn cached_refinement_preserves_memory_pressure_in_optional_and_strict_modes()
             ..RecoveryOptions::default()
         };
         let job = Job::new("cache pressure");
-        let error = super::analyze_source_cached(&source, options, &recovery, Some(&cache), &job)
-            .err()
-            .ok_or("memory pressure was swallowed as an optional cache failure")?;
+        let error =
+            super::analyze_source_cached(&source, options, &recovery, Some(&cache), &job, &budget)
+                .err()
+                .ok_or("memory pressure was swallowed as an optional cache failure")?;
         assert!(matches!(
             crate::memory_error::find(error.as_ref()),
             Some(MemoryError::Limit { .. })
@@ -41,6 +43,85 @@ fn cached_refinement_preserves_memory_pressure_in_optional_and_strict_modes()
         assert!(job.snapshot()?.cache_fallbacks.records().is_empty());
         assert_eq!(budget.snapshot()?.used_bytes, 0);
     }
+    Ok(())
+}
+
+#[test]
+fn uncached_refinement_admits_the_analyzer_source_copy() -> Result<(), Box<dyn Error>> {
+    let source = super::loaded_source("source.bin", b"unchanged source bytes");
+    let memory = MemoryBudget::new(1);
+    let error = super::analyze_source_cached(
+        &source,
+        l2_workbench::artifact::ArtifactAnalysisOptions::default(),
+        &RecoveryOptions::default(),
+        None,
+        &Job::new("memory pressure"),
+        &memory,
+    )
+    .err()
+    .ok_or("source analysis did not respect shared memory")?;
+    assert!(matches!(
+        crate::memory_error::find(error.as_ref()),
+        Some(MemoryError::Limit { .. })
+    ));
+    assert_eq!(memory.snapshot()?.used_bytes, 0);
+    Ok(())
+}
+
+#[test]
+fn cached_analysis_memory_denial_is_not_treated_as_a_corrupt_cache() -> Result<(), Box<dyn Error>> {
+    use l2_workbench::job::cache::Cache;
+
+    let directory = tempfile::tempdir()?;
+    let cache = Cache::open_at(
+        directory.path().join("cache"),
+        directory.path().join("state"),
+        1024 * 1024,
+    )?;
+    let source = super::loaded_source("source.bin", &super::structural_png()?);
+    let options = l2_workbench::artifact::ArtifactAnalysisOptions::default();
+    let ample = MemoryBudget::new(16 * 1024 * 1024);
+    let (report, lease) = super::analyze_source_cached(
+        &source,
+        options,
+        &RecoveryOptions::default(),
+        Some(&cache),
+        &Job::new("populate"),
+        &ample,
+    )?;
+    drop(report);
+    drop(lease);
+    let sample = MemoryBudget::new(16 * 1024 * 1024);
+    let (report, lease) = super::analyze_source_cached(
+        &source,
+        options,
+        &RecoveryOptions::default(),
+        Some(&cache),
+        &Job::new("cache hit"),
+        &sample,
+    )?;
+    let peak = sample.snapshot()?.peak_bytes;
+    drop(report);
+    drop(lease);
+    assert!(peak > 0);
+    let constrained = MemoryBudget::new(peak - 1);
+    let job = Job::new("constrained cache hit");
+    let error = super::analyze_source_cached(
+        &source,
+        options,
+        &RecoveryOptions::default(),
+        Some(&cache),
+        &job,
+        &constrained,
+    )
+    .err()
+    .ok_or("cache restoration bypassed memory admission")?;
+    assert!(matches!(
+        crate::memory_error::find(error.as_ref()),
+        Some(MemoryError::Limit { .. })
+    ));
+    assert!(job.snapshot()?.cache_fallbacks.records().is_empty());
+    assert_eq!(constrained.snapshot()?.used_bytes, 0);
     Ok(())
 }
 
@@ -316,6 +397,87 @@ fn range_zip_expansion_is_admitted_before_member_reads_and_retries_without_omiss
     drop(omissions);
     drop(input);
     assert_eq!(memory.snapshot()?.used_bytes, 0);
+    Ok(())
+}
+
+#[test]
+fn refinement_vector_growth_requires_memory_for_both_live_buffers() -> Result<(), Box<dyn Error>> {
+    let budget = MemoryBudget::new(128);
+    let mut lease = budget.try_reserve(MemoryClass::Executor, 0)?;
+    let mut values = Vec::<u64>::new();
+    crate::refine::analysis_memory::grow_vec(&mut values, &mut lease, 1)?;
+    values.extend([1, 2, 3, 4]);
+    crate::refine::analysis_memory::grow_vec(&mut values, &mut lease, 1)?;
+    assert!(budget.snapshot()?.peak_bytes >= 96);
+    assert_eq!(values, [1, 2, 3, 4]);
+    values.extend([5, 6, 7, 8]);
+    let old_charge = lease.bytes();
+    let blocker = budget.try_reserve(MemoryClass::Cache, 128 - old_charge)?;
+    let error = crate::refine::analysis_memory::grow_vec(&mut values, &mut lease, 1)
+        .err()
+        .ok_or("replacement bypassed the shared memory limit")?;
+    assert!(matches!(
+        crate::memory_error::find(error.as_ref()),
+        Some(MemoryError::Limit { .. })
+    ));
+    assert_eq!(values, [1, 2, 3, 4, 5, 6, 7, 8]);
+    assert_eq!(lease.bytes(), old_charge);
+    drop(blocker);
+    drop(values);
+    drop(lease);
+    assert_eq!(budget.snapshot()?.used_bytes, 0);
+    Ok(())
+}
+
+#[test]
+fn zip_member_analysis_requires_memory_before_copying_the_member() -> Result<(), Box<dyn Error>> {
+    use l2_workbench::artifact::{
+        ArtifactAnalysisOptions, analyze_artifacts,
+        zip::{ZipArtifactLimits, inspect_zip_at_depth_with_memory},
+    };
+    use std::io::{Cursor, Write};
+
+    let mut writer = zip::ZipWriter::new(Cursor::new(Vec::new()));
+    let stored =
+        zip::write::SimpleFileOptions::default().compression_method(zip::CompressionMethod::Stored);
+    writer.start_file("payload.bin", stored)?;
+    writer.write_all(&[0x91])?;
+    let archive_bytes = writer.finish()?.into_inner();
+    let memory = MemoryBudget::new(2 * 1024 * 1024);
+    let mut retained = memory.try_reserve(MemoryClass::Executor, 0)?;
+    let mut omissions = memory.try_reserve(MemoryClass::Executor, 0)?;
+    let mut work = 1024;
+    let archive = inspect_zip_at_depth_with_memory(
+        &archive_bytes,
+        ZipArtifactLimits::default(),
+        0,
+        &mut work,
+        &mut retained,
+    )?;
+    let options = ArtifactAnalysisOptions::default();
+    let mut report = analyze_artifacts(b"", options)?;
+    report.artifacts.clear();
+    report.omissions.clear();
+    let snapshot = memory.snapshot()?;
+    let blocker = memory.try_reserve(
+        MemoryClass::Cache,
+        snapshot.limit_bytes - snapshot.used_bytes,
+    )?;
+    let error = crate::refine::range_members::append_members(
+        &mut report,
+        archive,
+        0,
+        options,
+        &mut omissions,
+    )
+    .err()
+    .ok_or("member analysis copied bytes despite exhausted shared memory")?;
+    assert!(matches!(
+        crate::memory_error::find(error.as_ref()),
+        Some(MemoryError::Limit { .. })
+    ));
+    assert!(report.artifacts.is_empty());
+    drop(blocker);
     Ok(())
 }
 
