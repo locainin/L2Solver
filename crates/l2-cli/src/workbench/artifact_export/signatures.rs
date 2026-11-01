@@ -9,7 +9,9 @@ use super::{
     },
 };
 use l2_workbench::{
-    artifact::{ArtifactValidationFormat, ArtifactValidationOutcome},
+    artifact::{
+        ArtifactValidationFormat, ArtifactValidationOutcome, signature_evidence_matches_start,
+    },
     evidence::{Case, EvidenceStatus, Node},
     job::MemoryError,
 };
@@ -21,16 +23,11 @@ pub(super) struct SignatureExtension {
     pub(super) evidence_node: u64,
 }
 
-struct SignatureSourceEvidence {
-    sha256: String,
-    canonical_matches: Vec<serde_json::Value>,
-}
 pub(super) fn record_signature_extensions<'a>(
     case: &'a Case,
     validation: &mut SelectionValidation<'_, 'a>,
 ) -> Result<HashMap<u64, SignatureExtension>, MemoryError> {
     let mut extensions_by_node: HashMap<u64, SignatureExtension> = HashMap::new();
-    let mut signature_sources: HashMap<&str, SignatureSourceEvidence> = HashMap::new();
     for evidence in case.nodes().iter().filter(|candidate| {
         candidate.kind == "file_signature_match"
             && candidate
@@ -68,19 +65,7 @@ pub(super) fn record_signature_extensions<'a>(
         let Some(bytes) = node_bytes(case, input) else {
             continue;
         };
-        let source_evidence = signature_sources.entry(blob_id).or_insert_with(|| {
-            let report = l2_workbench::artifact::scan_file_signatures(bytes);
-            let sha256 = report.source_sha256;
-            let canonical_matches = serde_json::to_value(report.matches)
-                .ok()
-                .and_then(|value| value.as_array().cloned())
-                .unwrap_or_default();
-            SignatureSourceEvidence {
-                sha256,
-                canonical_matches,
-            }
-        });
-        if !signature_evidence_matches_input(evidence, blob_id, source_evidence) {
+        if !signature_evidence_matches_input(evidence, blob_id, bytes) {
             continue;
         }
         let (extension, candidate_validation) =
@@ -141,11 +126,11 @@ fn signature_extension_validation<'a>(
     Ok((extension, validation_result))
 }
 
-fn signature_evidence_matches_input(
-    evidence: &Node,
-    blob_id: &str,
-    source_evidence: &SignatureSourceEvidence,
-) -> bool {
+fn signature_evidence_matches_input(evidence: &Node, blob_id: &str, bytes: &[u8]) -> bool {
+    // A Case binds its blob IDs to the exact bytes when inserting or restoring them
+    let Some(sha256) = blob_id.strip_prefix("sha256:") else {
+        return false;
+    };
     if evidence.blob.as_deref() != Some(blob_id)
         || evidence
             .details
@@ -156,7 +141,7 @@ fn signature_evidence_matches_input(
             .details
             .get("input_sha256")
             .and_then(serde_json::Value::as_str)
-            != Some(source_evidence.sha256.as_str())
+            != Some(sha256)
         || evidence
             .details
             .get("coordinate_base")
@@ -171,31 +156,7 @@ fn signature_evidence_matches_input(
         return false;
     }
 
-    source_evidence
-        .canonical_matches
-        .iter()
-        .any(|canonical| signature_fields_match(&evidence.details, canonical))
-}
-
-fn signature_fields_match(evidence: &serde_json::Value, canonical: &serde_json::Value) -> bool {
-    const SIGNATURE_FIELDS: &[&str] = &[
-        "ambiguous",
-        "description",
-        "extensions",
-        "interpretation",
-        "match_kind",
-        "media_types",
-        "pattern_hex",
-        "possible_formats",
-        "range",
-        "reference",
-        "rule_id",
-        "observed_hex",
-    ];
-
-    SIGNATURE_FIELDS
-        .iter()
-        .all(|field| evidence.get(*field) == canonical.get(*field))
+    signature_evidence_matches_start(bytes, &evidence.details)
 }
 
 fn validate_signature_extension<'a>(

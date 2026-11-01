@@ -1,9 +1,11 @@
 //! File-signature observations at format-defined offsets
 
 mod catalogue;
+mod evidence;
 mod model;
 mod scan;
 
+pub use evidence::signature_evidence_matches_start;
 pub use model::{
     FileSignatureCatalogue, FileSignatureEvidence, FileSignatureMatch, FileSignatureMatchKind,
     FileSignatureReport,

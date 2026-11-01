@@ -13,6 +13,7 @@ mod png_stream;
 mod r2;
 mod range_analysis;
 mod rgb_reachability;
+mod signature_evidence;
 mod signatures;
 mod support;
 mod validator;

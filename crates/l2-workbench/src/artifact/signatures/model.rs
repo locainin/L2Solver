@@ -28,6 +28,15 @@ pub enum FileSignatureMatchKind {
     Masked,
 }
 
+impl FileSignatureMatchKind {
+    pub(super) const fn label(self) -> &'static str {
+        match self {
+            Self::Exact => "exact",
+            Self::Masked => "masked",
+        }
+    }
+}
+
 /// One exact or deliberately masked byte-pattern observation at its defined offset
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 #[non_exhaustive]

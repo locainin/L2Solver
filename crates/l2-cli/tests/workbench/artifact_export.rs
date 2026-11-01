@@ -15,6 +15,8 @@ mod case_indexes;
 mod der_memory;
 #[path = "artifact_export/selection_memory.rs"]
 mod selection_memory;
+#[path = "artifact_export/signature_evidence.rs"]
+mod signature_evidence;
 #[path = "artifact_export/zip_memory.rs"]
 mod zip_memory;
 

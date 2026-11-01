@@ -71,6 +71,21 @@ pub(in crate::artifact) fn matches_zip_signature(bytes: &[u8]) -> bool {
 
 fn visit_file_signature_matches(
     bytes: &[u8],
+    visit: impl FnMut(&'static SignatureRule, usize, &[u8]),
+) {
+    visit_signatures(bytes, false, visit);
+}
+
+pub(super) fn visit_start_matches(
+    bytes: &[u8],
+    visit: impl FnMut(&'static SignatureRule, usize, &[u8]),
+) {
+    visit_signatures(bytes, true, visit);
+}
+
+fn visit_signatures(
+    bytes: &[u8],
+    start_only: bool,
     mut visit: impl FnMut(&'static SignatureRule, usize, &[u8]),
 ) {
     for rule in rules() {
@@ -83,11 +98,16 @@ fn visit_file_signature_matches(
         match rule.offsets {
             SignatureOffsets::Declared(offsets) => {
                 for offset in offsets {
-                    inspect_offset(*offset);
+                    if !start_only || *offset == 0 {
+                        inspect_offset(*offset);
+                    }
                 }
             }
             SignatureOffsets::Hdf5Superblocks => {
                 inspect_offset(0);
+                if start_only {
+                    continue;
+                }
                 let Some(last_start) = bytes.len().checked_sub(rule.pattern.length()) else {
                     continue;
                 };
@@ -101,6 +121,9 @@ fn visit_file_signature_matches(
                 }
             }
             SignatureOffsets::Iso9660VolumeDescriptors => {
+                if start_only {
+                    continue;
+                }
                 // This strategy uses 2048-byte logical sectors, beginning at sector 16
                 let Some(mut descriptor_start) = 16_usize.checked_mul(ISO_9660_LOGICAL_SECTOR_SIZE)
                 else {
@@ -141,10 +164,6 @@ fn matching_bytes<'a>(bytes: &'a [u8], offset: usize, pattern: &Pattern) -> Opti
 }
 
 fn observation(rule: &'static SignatureRule, offset: usize, observed: &[u8]) -> FileSignatureMatch {
-    let match_kind = match rule.pattern {
-        Pattern::Exact(_) => FileSignatureMatchKind::Exact,
-        Pattern::Masked(_) => FileSignatureMatchKind::Masked,
-    };
     FileSignatureMatch {
         rule_id: rule.id,
         description: rule.description,
@@ -158,13 +177,24 @@ fn observation(rule: &'static SignatureRule, offset: usize, observed: &[u8]) -> 
         },
         pattern_hex: pattern_hex(&rule.pattern),
         observed_hex: bytes_hex(observed),
-        match_kind,
+        match_kind: match_kind(&rule.pattern),
         ambiguous: rule.ambiguous,
-        interpretation: if rule.ambiguous {
-            AMBIGUOUS_INTERPRETATION
-        } else {
-            EXACT_INTERPRETATION
-        },
+        interpretation: interpretation(rule.ambiguous),
+    }
+}
+
+pub(super) const fn match_kind(pattern: &Pattern) -> FileSignatureMatchKind {
+    match pattern {
+        Pattern::Exact(_) => FileSignatureMatchKind::Exact,
+        Pattern::Masked(_) => FileSignatureMatchKind::Masked,
+    }
+}
+
+pub(super) const fn interpretation(ambiguous: bool) -> &'static str {
+    if ambiguous {
+        AMBIGUOUS_INTERPRETATION
+    } else {
+        EXACT_INTERPRETATION
     }
 }
 
@@ -173,16 +203,7 @@ fn pattern_hex(pattern: &Pattern) -> String {
         Pattern::Exact(bytes) => bytes_hex(bytes),
         Pattern::Masked(bytes) => {
             let mut output = String::with_capacity(bytes.len().saturating_mul(3));
-            for (index, byte) in bytes.iter().enumerate() {
-                if index != 0 {
-                    output.push(' ');
-                }
-                if let Some(byte) = byte {
-                    push_hex_byte(&mut output, *byte);
-                } else {
-                    output.push_str("??");
-                }
-            }
+            output.extend(hex_bytes(bytes.iter().copied()).map(char::from));
             output
         }
     }
@@ -190,23 +211,37 @@ fn pattern_hex(pattern: &Pattern) -> String {
 
 fn bytes_hex(bytes: &[u8]) -> String {
     let mut output = String::with_capacity(bytes.len().saturating_mul(3));
-    for (index, byte) in bytes.iter().enumerate() {
-        if index != 0 {
-            output.push(' ');
-        }
-        push_hex_byte(&mut output, *byte);
-    }
+    output.extend(hex_bytes(bytes.iter().copied().map(Some)).map(char::from));
     output
 }
 
-fn push_hex_byte(output: &mut String, byte: u8) {
-    output.push(hex_digit(byte >> 4));
-    output.push(hex_digit(byte & 0x0f));
+pub(super) fn pattern_hex_matches(pattern: &Pattern, expected: &str) -> bool {
+    match pattern {
+        Pattern::Exact(bytes) => bytes_hex_matches(bytes, expected),
+        Pattern::Masked(bytes) => expected.bytes().eq(hex_bytes(bytes.iter().copied())),
+    }
 }
 
-const fn hex_digit(nibble: u8) -> char {
+pub(super) fn bytes_hex_matches(bytes: &[u8], expected: &str) -> bool {
+    expected
+        .bytes()
+        .eq(hex_bytes(bytes.iter().copied().map(Some)))
+}
+
+fn hex_bytes(bytes: impl Iterator<Item = Option<u8>>) -> impl Iterator<Item = u8> {
+    bytes.enumerate().flat_map(|(index, byte)| {
+        let (high, low) = byte.map_or((b'?', b'?'), |byte| {
+            (hex_digit(byte >> 4), hex_digit(byte & 0x0f))
+        });
+        [(index != 0).then_some(b' '), Some(high), Some(low)]
+            .into_iter()
+            .flatten()
+    })
+}
+
+const fn hex_digit(nibble: u8) -> u8 {
     match nibble {
-        0..=9 => (b'0' + nibble) as char,
-        _ => (b'a' + nibble - 10) as char,
+        0..=9 => b'0' + nibble,
+        _ => b'a' + nibble - 10,
     }
 }

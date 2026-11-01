@@ -76,6 +76,7 @@ pub use range_analyzer::{
 pub use signatures::{
     FILE_SIGNATURE_RELATION_REASON, FileSignatureCatalogue, FileSignatureEvidence,
     FileSignatureMatch, FileSignatureMatchKind, FileSignatureReport, scan_file_signatures,
+    signature_evidence_matches_start,
 };
 pub use source_hash::{StreamZipEnd, ZipEndObservation, ZipEndScanLimits};
 pub use validator::{
