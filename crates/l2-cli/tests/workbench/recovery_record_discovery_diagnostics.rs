@@ -37,6 +37,102 @@ fn message_parts(archive: &[u8], identifier: [u8; 3]) -> TestResult<Vec<Vec<u8>>
 }
 
 #[test]
+fn funnel_keeps_separate_cohorts_and_sessions_with_observed_schema_survivors() -> TestResult<()> {
+    let first = aligned_archive(b"funnel first cohort private bytes")?;
+    let second = aligned_archive(b"funnel second cohort private bytes")?;
+    let mut case = Case::new();
+    let source = capture(&mut case, "funnel separate cohorts")?;
+    let sessions = add_unframed_sessions(
+        &mut case,
+        &source,
+        vec![
+            (
+                "first",
+                vec![
+                    message_parts(&first, *b"A5m")?,
+                    message_parts(&first, *b"B6n")?,
+                ],
+            ),
+            (
+                "second",
+                vec![
+                    message_parts(&second, *b"C7p")?,
+                    message_parts(&second, *b"D8q")?,
+                ],
+            ),
+        ],
+    )?;
+    let mut policy = normal_policy(&case)?;
+    policy.record_schema_proposal_limits.discovery.max_messages = 4;
+    let plan = RecoveryPlan {
+        framings: vec![FramingKind::FixedSize { bytes: 11 }],
+        discover_records: true,
+        ..RecoveryPlan::default()
+    };
+    let job = Job::new("cohort funnel");
+    let progress = JobProgress::new(job.clone());
+    execute_internal(&mut case, &plan, &policy, true, Some(&progress), None, None)?;
+
+    let encoded = serde_json::to_string(&job.snapshot()?.recovery_transitions)?;
+    assert!(
+        !encoded.contains("private bytes"),
+        "diagnostics must not contain captured bytes"
+    );
+    let summary: serde_json::Value = serde_json::from_str(&encoded)?;
+    assert_distinct_funnel_cohorts(&summary, &source, &sessions)
+}
+
+fn assert_distinct_funnel_cohorts(
+    summary: &serde_json::Value,
+    source: &str,
+    sessions: &[super::UnframedSession],
+) -> TestResult<()> {
+    let cohorts = summary
+        .get("cohorts")
+        .and_then(serde_json::Value::as_array)
+        .ok_or("per-cohort funnel is missing")?;
+    assert_eq!(cohorts.len(), 2, "distinct scopes must not be merged");
+    let source_digest = source
+        .strip_prefix("sha256:")
+        .ok_or("invalid source identity")?;
+    for group in sessions.chunks_exact(2) {
+        let session_nodes = group
+            .iter()
+            .map(|session| session.episode_node)
+            .collect::<Vec<_>>();
+        let cohort = cohorts
+            .iter()
+            .find(|cohort| cohort.get("sessions") == Some(&serde_json::json!(session_nodes)))
+            .ok_or("funnel must retain each cohort's distinct session identities")?;
+        assert_eq!(
+            cohort.get("source_sha256"),
+            Some(&serde_json::json!(source_digest))
+        );
+        assert!(
+            cohort
+                .get("cohort_sha256")
+                .and_then(serde_json::Value::as_str)
+                .is_some()
+        );
+        let stages = cohort
+            .get("stages")
+            .and_then(serde_json::Value::as_array)
+            .ok_or("cohort stages are missing")?;
+        assert!(
+            stages.iter().any(|stage| {
+                stage.get("stage") == Some(&serde_json::json!("schema"))
+                    && stage
+                        .get("candidates_with_survivors")
+                        .and_then(serde_json::Value::as_u64)
+                        .is_some_and(|count| count > 0)
+            }),
+            "a surviving schema must be attributed to its cohort"
+        );
+    }
+    Ok(())
+}
+
+#[test]
 fn independent_alternative_order_reaches_schema_assembly_and_exact_validated_artifacts()
 -> TestResult<()> {
     let archives = [
@@ -276,6 +372,37 @@ fn empty_discovery_report_is_not_counted_as_a_surviving_schema() -> TestResult<(
             .any(|record| record.stage() == RecoveryTransitionStage::Schema
                 && record.outcome() == RecoveryTransitionOutcome::Hypothesis),
         "an empty discovery report is not evidence of a surviving schema"
+    );
+    let report_node = case
+        .nodes()
+        .iter()
+        .find(|node| node.kind == "recovery_record_discovery_report")
+        .ok_or("schema report missing")?;
+    let report = decode_report(&case, report_node.id)?;
+    let reason = report
+        .get("no_candidate_reason")
+        .and_then(serde_json::Value::as_str)
+        .ok_or("schema failure reason missing")?;
+    let summary = serde_json::to_value(&snapshot.recovery_transitions)?;
+    let cohort = summary
+        .get("cohorts")
+        .and_then(serde_json::Value::as_array)
+        .and_then(|cohorts| cohorts.first())
+        .ok_or("schema cohort missing")?;
+    let stages = cohort
+        .get("stages")
+        .and_then(serde_json::Value::as_array)
+        .ok_or("cohort stages missing")?;
+    let schema = stages
+        .iter()
+        .find(|stage| stage.get("stage") == Some(&serde_json::json!("schema")))
+        .ok_or("schema stage missing")?;
+    assert!(
+        schema
+            .get("no_survivor_reasons")
+            .and_then(serde_json::Value::as_array)
+            .is_some_and(|reasons| reasons.contains(&serde_json::json!(reason))),
+        "the funnel must retain the observed report reason"
     );
     Ok(())
 }

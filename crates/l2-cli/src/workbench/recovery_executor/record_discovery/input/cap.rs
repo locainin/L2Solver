@@ -23,7 +23,7 @@ struct CappedCohort {
     omission_batches: Vec<OmissionBatch>,
 }
 
-pub(super) fn learning_sample(
+pub(in crate::workbench::recovery_executor::record_discovery) fn learning_sample(
     inputs: &[RecordFrameInput],
     maximum_messages: usize,
     maximum_bytes: usize,

@@ -1,6 +1,8 @@
 use super::super::case_scan::{ScanAdmission, case_scan_work_bounds, preflight_scan};
 use super::super::derived_discovery::DerivedFramingCohort;
-use super::super::diagnostics::{record_cohort_enqueue, record_cohort_omission};
+use super::super::diagnostics::{
+    FunnelCohortKey, record_cohort_enqueue, record_cohort_omission, register_funnel_cohort,
+};
 use super::super::evidence::case_evidence_quota;
 use super::super::{
     Executor, RecoveryCandidateId, RecoveryExecutionError, RecoveryOmission, RecoveryStage,
@@ -211,6 +213,7 @@ impl Executor<'_> {
                 &node_ids,
                 result,
             )?;
+            register_framing_funnel(self, cohort_key, inputs, result)?;
             if let Some(candidate_id) = candidate_id {
                 self.framing_discoveries.insert(
                     candidate_id,
@@ -520,6 +523,31 @@ impl Executor<'_> {
             });
         Ok(())
     }
+}
+
+fn register_framing_funnel(
+    executor: &Executor<'_>,
+    key: &super::input::FramingCohortKey,
+    inputs: &[FramingInput],
+    result: EnqueueOutcome,
+) -> Result<(), RecoveryExecutionError> {
+    register_funnel_cohort(
+        executor,
+        FunnelCohortKey {
+            source_id: &key.source_id,
+            scope: &key.scope,
+            endpoints: &key.endpoint_pair,
+            direction: key.direction,
+        },
+        inputs
+            .iter()
+            .map(|input| l2_workbench::job::RecoveryFunnelInput {
+                node_id: input.node_id,
+                session_node_id: input.episode_node_id,
+            }),
+        inputs.len(),
+        result,
+    )
 }
 
 const fn framing_report_quota_request(

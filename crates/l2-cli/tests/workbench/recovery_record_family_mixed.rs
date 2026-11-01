@@ -499,6 +499,49 @@ fn family_memory_limit_reports_incomplete_analysis_without_leaking_a_lease() -> 
 }
 
 #[test]
+fn funnel_distinguishes_uniform_failure_from_the_family_schema_survivor() -> TestResult<()> {
+    let MixedFixture {
+        mut case,
+        sessions: _,
+        archives: _,
+        plan,
+        policy,
+    } = mixed_fixture(HeldoutChange::None)?;
+    let job = l2_workbench::job::Job::new("mixed family funnel");
+    let progress = super::super::JobProgress::new(job.clone());
+    super::super::execute_internal(&mut case, &plan, &policy, true, Some(&progress), None, None)?;
+    let transitions = serde_json::to_value(job.snapshot()?.recovery_transitions)?;
+    let stages = transitions
+        .get("cohorts")
+        .and_then(Value::as_array)
+        .ok_or("cohort funnels are missing")?
+        .iter()
+        .flat_map(|cohort| {
+            cohort
+                .get("stages")
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+        })
+        .filter(|stage| stage.get("stage") == Some(&json!("schema")))
+        .collect::<Vec<_>>();
+    assert!(
+        stages.iter().any(|stage| {
+            stage
+                .get("observed_candidates")
+                .and_then(Value::as_u64)
+                .is_some_and(|count| count >= 2)
+                && stage
+                    .get("candidates_with_survivors")
+                    .and_then(Value::as_u64)
+                    .is_some_and(|count| count > 0)
+        }),
+        "the uniform and family learning batches must be counted separately: {stages:?}"
+    );
+    Ok(())
+}
+
+#[test]
 fn checkpoint_restores_pending_family_assemblies_with_the_same_provenance() -> TestResult<()> {
     use super::super::execution_state::{SchedulerCursor, step};
     use super::super::{CaseIndex, CaseIndexScanLedger, checkpoint, finish_executor, test_support};

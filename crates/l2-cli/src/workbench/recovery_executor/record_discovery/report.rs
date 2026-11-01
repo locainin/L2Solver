@@ -2,7 +2,10 @@ pub(in crate::workbench::recovery_executor) mod checkpoint;
 mod family;
 
 use super::super::case_scan::{ScanAdmission, case_scan_work_bounds, preflight_scan};
-use super::super::diagnostics::{record_cohort_enqueue, record_cohort_omission};
+use super::super::diagnostics::{
+    FunnelCohortKey, FunnelSchemaReport, record_cohort_enqueue, record_cohort_omission,
+    record_funnel_schema_report, register_funnel_cohort,
+};
 use super::super::discovery::OrderedUnique;
 use super::super::evidence::{add_transaction_links, case_evidence_quota};
 use super::super::{
@@ -458,16 +461,17 @@ impl Executor<'_> {
                 &node_ids,
                 result,
             )?;
+            let application_inputs = plan
+                .application_cohorts
+                .get(key)
+                .ok_or(RecoveryError::InvariantFailure)?;
+            register_record_funnel(self, key, application_inputs, result)?;
             if let Some(candidate_id) = candidate_id {
                 let omitted_frames = plan
                     .cohort_omitted_frames
                     .get(key)
                     .copied()
                     .unwrap_or_default();
-                let application_inputs = plan
-                    .application_cohorts
-                    .get(key)
-                    .ok_or(RecoveryError::InvariantFailure)?;
                 let eligibility_omissions = plan
                     .omissions
                     .get(&Some(key.source_id.clone()))
@@ -674,6 +678,7 @@ impl Executor<'_> {
             &node_ids,
             outcome,
         )?;
+        register_record_funnel(self, &context.key, &context.application_inputs, outcome)?;
         if let Some(candidate_id) = candidate_id {
             let mut later = context;
             later.inputs = inputs;
@@ -964,6 +969,24 @@ impl Executor<'_> {
         for (node_id, report) in node_ids.iter().copied().zip(reports) {
             self.record_discovery_context_by_report
                 .insert(node_id, report.context.clone());
+            let key = &report.context.key;
+            record_funnel_schema_report(
+                self,
+                FunnelSchemaReport {
+                    key: FunnelCohortKey {
+                        source_id: &key.source_id,
+                        scope: &key.scope_json,
+                        endpoints: &key.endpoints_json,
+                        direction: key.direction,
+                    },
+                    candidate_id,
+                    report_node: node_id,
+                    result: report.analysis.result,
+                    reason: report.analysis.no_candidate_reason,
+                    exhaustive: report.analysis.search_exhaustive_within_plan,
+                    inputs: &report.context.inputs,
+                },
+            )?;
         }
         Ok(node_ids)
     }
@@ -1184,6 +1207,31 @@ impl Executor<'_> {
                 omitted_length_checks,
             });
     }
+}
+
+fn register_record_funnel(
+    executor: &Executor<'_>,
+    key: &RecordCohortKey,
+    inputs: &[RecordFrameInput],
+    result: EnqueueOutcome,
+) -> Result<(), RecoveryExecutionError> {
+    register_funnel_cohort(
+        executor,
+        FunnelCohortKey {
+            source_id: &key.source_id,
+            scope: &key.scope_json,
+            endpoints: &key.endpoints_json,
+            direction: key.direction,
+        },
+        inputs
+            .iter()
+            .map(|input| l2_workbench::job::RecoveryFunnelInput {
+                node_id: input.node_id,
+                session_node_id: input.session_node_id,
+            }),
+        inputs.len(),
+        result,
+    )
 }
 
 fn build_compact_report(

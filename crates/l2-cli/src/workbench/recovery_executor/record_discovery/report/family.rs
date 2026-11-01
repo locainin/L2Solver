@@ -233,6 +233,22 @@ fn propose_groups(
             }),
         });
     }
+    let mut training_sessions = sample
+        .iter()
+        .filter(|input| {
+            partition
+                .training_session_nodes
+                .contains(&input.session_node_id)
+        })
+        .map(|input| input.session_node_id);
+    let first_session = training_sessions.next();
+    if first_session.is_none() || !training_sessions.any(|session| Some(session) != first_session) {
+        // A bounded sample cannot support a multi-session selector without two sessions
+        return Ok(FamilyGroups {
+            groups: Vec::new(),
+            incomplete: true,
+        });
+    }
     let family_limits = MessageFamilyLimits {
         max_message_bytes: limits
             .discovery

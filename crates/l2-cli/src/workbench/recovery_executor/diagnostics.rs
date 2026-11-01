@@ -1,10 +1,16 @@
 //! Summarize completed candidate work without retaining candidate histories
 
+#[cfg(test)]
+#[path = "../../../tests/workbench/recovery_executor/diagnostics.rs"]
+mod tests;
+
 use super::{RecoveryExecutionError, RecoveryOmission};
 use l2_workbench::{
     evidence::Case,
     job::{
-        Job, RecoveryCandidateSample, RecoveryTransition, RecoveryTransitionOutcome,
+        Job, MAX_RECOVERY_FUNNEL_INPUTS, RecoveryCandidateSample, RecoveryFunnelAdmission,
+        RecoveryFunnelEvent, RecoveryFunnelIdentity, RecoveryFunnelInput,
+        RecoveryFunnelRegistration, RecoveryTransition, RecoveryTransitionOutcome,
         RecoveryTransitionSample, RecoveryTransitionSourceRange, RecoveryTransitionStage,
     },
     recovery::{
@@ -52,6 +58,23 @@ pub(super) fn record_candidate(
         outcome,
         sample: Some(RecoveryTransitionSample::Candidate(sample)),
     })?;
+    // A merged discovery may produce a different report for each source cohort
+    if candidate.task() != &RecoveryTask::RecordDiscovery
+        || outcome != RecoveryTransitionOutcome::ReportRetained
+    {
+        let mut funnel_outcome =
+            funnel_candidate_outcome(case, candidate.task(), outcome, evidence_node_id);
+        if matches!(candidate.task(), RecoveryTask::AssembleRecords(_))
+            && funnel_outcome == RecoveryTransitionOutcome::Derived
+            && omissions
+                .iter()
+                .any(|omission| matches!(omission, RecoveryOmission::RecordInputRejected { .. }))
+        {
+            // A partial parse cannot establish assembly of the complete session
+            funnel_outcome = RecoveryTransitionOutcome::ReportRetained;
+        }
+        record_funnel_candidate(job, case, candidate, stage, funnel_outcome, sample)?;
+    }
 
     // A discovery receipt can describe an empty search instead of a surviving schema
     if candidate.task() == &RecoveryTask::RecordDiscovery
@@ -71,6 +94,45 @@ pub(super) fn record_candidate(
         })?;
     }
     record_omission_transitions(job, case, candidate, stage, sample, omissions)
+}
+
+fn funnel_candidate_outcome(
+    case: &Case,
+    task: &RecoveryTask,
+    outcome: RecoveryTransitionOutcome,
+    evidence_node_id: Option<u64>,
+) -> RecoveryTransitionOutcome {
+    if outcome != RecoveryTransitionOutcome::Derived {
+        return outcome;
+    }
+    let details = evidence_node_id
+        .and_then(|id| case.node(id))
+        .map(|node| &node.details);
+    let complete_output = match task {
+        RecoveryTask::MaterializeFraming(_) => details
+            .and_then(|details| details.get("frame_count"))
+            .and_then(serde_json::Value::as_u64)
+            .is_some_and(|count| count > 0),
+        RecoveryTask::AssembleRecords(_) => details.is_some_and(|details| {
+            let groups = details
+                .get("group_count")
+                .and_then(serde_json::Value::as_u64);
+            let complete = details
+                .get("complete_group_count")
+                .and_then(serde_json::Value::as_u64);
+            let incomplete = details
+                .get("incomplete_group_count")
+                .and_then(serde_json::Value::as_u64);
+            groups.is_some_and(|count| count > 0) && groups == complete && incomplete == Some(0)
+        }),
+        _ => true,
+    };
+    if complete_output {
+        outcome
+    } else {
+        // A receipt can describe an empty output or an incomplete record group
+        RecoveryTransitionOutcome::ReportRetained
+    }
 }
 
 fn record_omission_transitions(
@@ -106,6 +168,16 @@ fn record_omission_transitions(
                     outcome: RecoveryTransitionOutcome::InputContradicted,
                     sample: Some(RecoveryTransitionSample::Candidate(rejected)),
                 })?;
+                job.record_recovery_funnel_candidate(RecoveryFunnelEvent {
+                    stage: RecoveryTransitionStage::Assembly,
+                    outcome: RecoveryTransitionOutcome::InputContradicted,
+                    candidate: &rejected,
+                    input_nodes: &[*input_node_id],
+                    parent_candidates: &[],
+                    attribution_complete: true,
+                    attribution: l2_workbench::job::RecoveryFunnelAttribution::ExactInputs,
+                    validated_artifact_sha256: None,
+                })?;
             }
             RecoveryOmission::RecordDiscoveryAnalysis {
                 search_exhaustive_within_plan: false,
@@ -124,9 +196,237 @@ fn record_omission_transitions(
                     outcome: RecoveryTransitionOutcome::WorkOmitted,
                     sample: Some(RecoveryTransitionSample::Candidate(sample)),
                 })?;
+                if candidate.task() != &RecoveryTask::RecordDiscovery {
+                    record_funnel_candidate(
+                        job,
+                        case,
+                        candidate,
+                        stage,
+                        RecoveryTransitionOutcome::WorkOmitted,
+                        sample,
+                    )?;
+                }
             }
             _ => {}
         }
+    }
+    Ok(())
+}
+
+fn record_funnel_candidate(
+    job: &Job,
+    case: &Case,
+    candidate: &RecoveryCandidate,
+    stage: RecoveryTransitionStage,
+    outcome: RecoveryTransitionOutcome,
+    sample: RecoveryCandidateSample,
+) -> Result<(), RecoveryExecutionError> {
+    // A capped association list bounds diagnostic work independently of recovery work
+    let mut inputs = candidate
+        .inputs()
+        .iter()
+        .flat_map(|input| input.origin_node_ids().iter().copied())
+        .take(MAX_RECOVERY_FUNNEL_INPUTS + 1)
+        .collect::<Vec<_>>();
+    let mut parents = candidate
+        .parent_ids()
+        .iter()
+        .take(MAX_RECOVERY_FUNNEL_INPUTS + 1)
+        .map(|id| u64::try_from(id.index()).map_err(|_| RecoveryError::InvariantFailure))
+        .collect::<Result<Vec<_>, _>>()?;
+    let attribution_complete =
+        inputs.len() <= MAX_RECOVERY_FUNNEL_INPUTS && parents.len() <= MAX_RECOVERY_FUNNEL_INPUTS;
+    inputs.truncate(MAX_RECOVERY_FUNNEL_INPUTS);
+    parents.truncate(MAX_RECOVERY_FUNNEL_INPUTS);
+    job.record_recovery_funnel_candidate(RecoveryFunnelEvent {
+        stage,
+        outcome,
+        candidate: &sample,
+        input_nodes: &inputs,
+        parent_candidates: &parents,
+        attribution_complete,
+        attribution: l2_workbench::job::RecoveryFunnelAttribution::CandidateAndParents,
+        validated_artifact_sha256: (outcome == RecoveryTransitionOutcome::Validated)
+            .then(|| validated_full_input_digest(case, sample))
+            .flatten(),
+    })?;
+    Ok(())
+}
+
+fn validated_full_input_digest(case: &Case, sample: RecoveryCandidateSample) -> Option<[u8; 32]> {
+    if sample.input_count != 1 {
+        return None;
+    }
+    let receipt = case.node(sample.evidence_node_id?)?;
+    let range = receipt.details.get("range")?;
+    let offset = range.get("offset")?.as_u64()?;
+    let length = range.get("length")?.as_u64()?;
+    let input = case.node(sample.input_node_id)?;
+    let blob = case.blob(input.blob.as_deref()?)?;
+    // A validated subrange cannot establish publication of the complete input blob
+    (offset == 0 && usize::try_from(length).ok()? == blob.bytes.len())
+        .then_some(sample.input_blob_sha256)
+}
+
+#[derive(Clone, Copy)]
+pub(super) struct FunnelCohortKey<'a> {
+    pub source_id: &'a str,
+    pub scope: &'a str,
+    pub endpoints: &'a str,
+    pub direction: l2_workbench::protocol::Direction,
+}
+
+pub(super) fn register_funnel_cohort(
+    executor: &super::Executor<'_>,
+    key: FunnelCohortKey<'_>,
+    inputs: impl Iterator<Item = RecoveryFunnelInput>,
+    total_inputs: usize,
+    result: l2_workbench::recovery::EnqueueOutcome,
+) -> Result<(), RecoveryExecutionError> {
+    let Some(progress) = &executor.job else {
+        return Ok(());
+    };
+    let identity = funnel_identity(key)?;
+    let inputs = inputs.take(MAX_RECOVERY_FUNNEL_INPUTS).collect::<Vec<_>>();
+    let candidate_id = match result {
+        l2_workbench::recovery::EnqueueOutcome::Queued(id)
+        | l2_workbench::recovery::EnqueueOutcome::Merged(id)
+        | l2_workbench::recovery::EnqueueOutcome::MergedNeedsContext(id) => Some(id),
+        _ => None,
+    };
+    let candidate = candidate_id
+        .map(|id| {
+            let candidate = executor
+                .coordinator
+                .candidate(id)
+                .ok_or(RecoveryError::UnknownCandidate { id })?;
+            candidate_sample(executor.case, id, candidate, None)
+        })
+        .transpose()?;
+    let admission = match result {
+        l2_workbench::recovery::EnqueueOutcome::Queued(_)
+        | l2_workbench::recovery::EnqueueOutcome::Merged(_)
+        | l2_workbench::recovery::EnqueueOutcome::MergedNeedsContext(_) => {
+            RecoveryFunnelAdmission::Admitted(
+                candidate.as_ref().ok_or(RecoveryError::InvariantFailure)?,
+            )
+        }
+        l2_workbench::recovery::EnqueueOutcome::CycleSkipped { .. } => {
+            RecoveryFunnelAdmission::CycleSkipped
+        }
+        l2_workbench::recovery::EnqueueOutcome::ResourceExhausted { .. } => {
+            RecoveryFunnelAdmission::ResourceExhausted
+        }
+    };
+    progress
+        .job
+        .register_recovery_cohort(RecoveryFunnelRegistration {
+            identity,
+            inputs: &inputs,
+            total_inputs,
+            admission,
+        })?;
+    Ok(())
+}
+
+fn funnel_identity(
+    key: FunnelCohortKey<'_>,
+) -> Result<RecoveryFunnelIdentity, RecoveryExecutionError> {
+    let source_sha256 = parse_digest(key.source_id)?;
+    let mut digest = Sha256::new();
+    digest.update(b"l2-recovery-funnel-cohort-v1\0");
+    digest.update(source_sha256);
+    for field in [key.scope, key.endpoints] {
+        digest.update(
+            u64::try_from(field.len())
+                .map_err(|_| RecoveryError::InvariantFailure)?
+                .to_be_bytes(),
+        );
+        digest.update(field.as_bytes());
+    }
+    let mut writer = DigestWriter(digest);
+    serde_json::to_writer(&mut writer, &key.direction)
+        .map_err(|_| RecoveryError::IdentityEncoding)?;
+    Ok(RecoveryFunnelIdentity {
+        source_sha256,
+        cohort_sha256: writer.0.finalize().into(),
+    })
+}
+
+#[derive(Clone, Copy)]
+pub(super) struct FunnelSchemaReport<'a> {
+    pub key: FunnelCohortKey<'a>,
+    pub candidate_id: RecoveryCandidateId,
+    pub report_node: u64,
+    pub result: &'a str,
+    pub reason: Option<&'a str>,
+    pub exhaustive: bool,
+    pub inputs: &'a [super::record_discovery::RecordFrameInput],
+}
+
+pub(super) fn record_funnel_schema_report(
+    executor: &super::Executor<'_>,
+    report: FunnelSchemaReport<'_>,
+) -> Result<(), RecoveryExecutionError> {
+    let Some(progress) = &executor.job else {
+        return Ok(());
+    };
+    let FunnelSchemaReport {
+        key,
+        candidate_id,
+        report_node,
+        result,
+        reason,
+        exhaustive,
+        inputs,
+    } = report;
+    let identity = funnel_identity(key)?;
+    let candidate = executor
+        .coordinator
+        .candidate(candidate_id)
+        .ok_or(RecoveryError::UnknownCandidate { id: candidate_id })?;
+    let mut sample = candidate_sample(executor.case, candidate_id, candidate, Some(report_node))?;
+    let first = inputs.first().ok_or(RecoveryError::InvariantFailure)?;
+    // A family report represents its selected input batch, not the enclosing mixed batch
+    sample.input_node_id = first.node_id;
+    sample.input_blob_sha256 = parse_digest(&first.blob_id)?;
+    sample.source_range = source_range(executor.case, first.node_id)?;
+    sample.input_count =
+        u64::try_from(inputs.len()).map_err(|_| RecoveryError::InvariantFailure)?;
+    sample.input_batch_sha256 = input_batch_digest(
+        inputs.len(),
+        inputs
+            .iter()
+            .map(|input| (input.blob_id.as_str(), std::slice::from_ref(&input.node_id))),
+    )?;
+    let mut outcomes = vec![RecoveryTransitionOutcome::ReportRetained];
+    if result == "hypotheses_found" {
+        outcomes.push(RecoveryTransitionOutcome::Hypothesis);
+    }
+    match reason {
+        Some("insufficient_training_messages") => {
+            outcomes.push(RecoveryTransitionOutcome::InsufficientTrainingMessages);
+        }
+        Some("no_structural_candidate_space") => {
+            outcomes.push(RecoveryTransitionOutcome::NoStructuralCandidateSpace);
+        }
+        Some("no_schema_survived_strict_parsing") => {
+            outcomes.push(RecoveryTransitionOutcome::NoSchemaSurvivedStrictParsing);
+        }
+        _ => {}
+    }
+    outcomes.push(if exhaustive {
+        RecoveryTransitionOutcome::SearchCompleteWithinPlan
+    } else {
+        RecoveryTransitionOutcome::WorkOmitted
+    });
+    for outcome in outcomes {
+        progress.job.record_recovery_funnel_cohort_candidate(
+            identity,
+            RecoveryTransitionStage::Schema,
+            outcome,
+            sample,
+        )?;
     }
     Ok(())
 }
@@ -176,24 +476,13 @@ pub(super) fn candidate_sample(
         .origin_node_ids()
         .first()
         .ok_or(RecoveryError::InvariantFailure)?;
-    let mut batch = Sha256::new();
-    batch.update(b"l2-recovery-input-batch-v1\0");
-    batch.update(
-        u64::try_from(candidate.inputs().len())
-            .map_err(|_| RecoveryError::InvariantFailure)?
-            .to_be_bytes(),
-    );
-    for input in candidate.inputs() {
-        batch.update(parse_digest(input.blob_id())?);
-        batch.update(
-            u64::try_from(input.origin_node_ids().len())
-                .map_err(|_| RecoveryError::InvariantFailure)?
-                .to_be_bytes(),
-        );
-        for node_id in input.origin_node_ids() {
-            batch.update(node_id.to_be_bytes());
-        }
-    }
+    let batch = input_batch_digest(
+        candidate.inputs().len(),
+        candidate
+            .inputs()
+            .iter()
+            .map(|input| (input.blob_id(), input.origin_node_ids())),
+    )?;
     let mut task = DigestWriter(Sha256::new());
     serde_json::to_writer(&mut task, candidate.task())
         .map_err(|_| RecoveryError::IdentityEncoding)?;
@@ -202,13 +491,38 @@ pub(super) fn candidate_sample(
             .map_err(|_| RecoveryError::InvariantFailure)?,
         input_node_id,
         input_blob_sha256: parse_digest(first.blob_id())?,
-        input_batch_sha256: batch.finalize().into(),
+        input_batch_sha256: batch,
         task_sha256: task.0.finalize().into(),
         source_range: source_range(case, input_node_id)?,
         input_count: u64::try_from(candidate.inputs().len())
             .map_err(|_| RecoveryError::InvariantFailure)?,
         evidence_node_id,
     })
+}
+
+fn input_batch_digest<'a>(
+    input_count: usize,
+    inputs: impl Iterator<Item = (&'a str, &'a [u64])>,
+) -> Result<[u8; 32], RecoveryError> {
+    let mut batch = Sha256::new();
+    batch.update(b"l2-recovery-input-batch-v1\0");
+    batch.update(
+        u64::try_from(input_count)
+            .map_err(|_| RecoveryError::InvariantFailure)?
+            .to_be_bytes(),
+    );
+    for (blob_id, origins) in inputs {
+        batch.update(parse_digest(blob_id)?);
+        batch.update(
+            u64::try_from(origins.len())
+                .map_err(|_| RecoveryError::InvariantFailure)?
+                .to_be_bytes(),
+        );
+        for node_id in origins {
+            batch.update(node_id.to_be_bytes());
+        }
+    }
+    Ok(batch.finalize().into())
 }
 
 fn source_range(

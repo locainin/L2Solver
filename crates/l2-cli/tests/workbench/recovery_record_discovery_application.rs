@@ -1,4 +1,6 @@
-use super::super::{RecoveryExecutionOutcome, RecoveryOmission, execute, normal_policy};
+use super::super::{
+    JobProgress, RecoveryExecutionOutcome, RecoveryOmission, execute_internal, normal_policy,
+};
 use super::{
     RecoveryPlan, TestResult, UnframedSession, add_unframed_sessions, candidate_frame_ids, capture,
     decode_report, receipt_has_exact_artifact, record, report_node, report_schemas,
@@ -6,6 +8,7 @@ use super::{
 };
 use l2_workbench::{
     evidence::Case,
+    job::Job,
     protocol::{FramingKind, RecordSchema},
     recovery::RecoveryTask,
 };
@@ -32,7 +35,7 @@ fn bounded_learning_applies_the_frozen_schema_to_full_sessions() -> TestResult<(
         sessions,
         archives,
         outcome,
-    } = execute_bounded_learning_archive_fixture(false)?;
+    } = execute_bounded_learning_archive_fixture(false, None)?;
     let BoundedLearningEvidence {
         report_node_id,
         report,
@@ -84,7 +87,7 @@ fn a_corrupt_late_frame_is_rejected_after_bounded_schema_learning() -> TestResul
         sessions,
         archives,
         outcome,
-    } = execute_bounded_learning_archive_fixture(true)?;
+    } = execute_bounded_learning_archive_fixture(true, None)?;
     let BoundedLearningEvidence {
         report_node_id,
         report,
@@ -154,8 +157,51 @@ fn a_corrupt_late_frame_is_rejected_after_bounded_schema_learning() -> TestResul
     Ok(())
 }
 
+#[test]
+fn rejected_frame_does_not_claim_a_complete_session_in_the_funnel() -> TestResult<()> {
+    let job = Job::new("partial record assembly");
+    let run = execute_bounded_learning_archive_fixture(true, Some(&job))?;
+    let frame = materialized_frames_for_run(&run.case, run.sessions[1].run_node)?
+        .last()
+        .copied()
+        .ok_or("corrupt held-out frame is missing")?;
+    assert!(run.outcome.omissions.iter().any(|omission| matches!(
+        omission,
+        RecoveryOmission::RecordInputRejected { input_node_id, .. } if *input_node_id == frame
+    )));
+    let summary = serde_json::to_value(job.snapshot()?.recovery_transitions)?;
+    let hypotheses = summary
+        .pointer("/cohorts/0/hypotheses")
+        .and_then(Value::as_array)
+        .ok_or("cohort candidate outcomes are missing")?;
+    let contradicted = hypotheses
+        .iter()
+        .filter(|item| {
+            item.get("stage") == Some(&json!("assembly"))
+                && item
+                    .get("outcomes")
+                    .and_then(Value::as_u64)
+                    .is_some_and(|outcomes| outcomes & (1 << 5) != 0)
+        })
+        .collect::<Vec<_>>();
+    assert!(
+        !contradicted.is_empty(),
+        "the rejected frame must be attributed to its cohort"
+    );
+    assert!(
+        contradicted.iter().all(|item| {
+            item.get("outcomes")
+                .and_then(Value::as_u64)
+                .is_some_and(|outcomes| outcomes & 1 == 0)
+        }),
+        "a candidate with a rejected input cannot count as complete-session assembly"
+    );
+    Ok(())
+}
+
 fn execute_bounded_learning_archive_fixture(
     corrupt_second_session_tail: bool,
+    job: Option<&Job>,
 ) -> TestResult<BoundedLearningRun> {
     let archives = [
         aligned_stored_zip(b"first session member")?,
@@ -191,7 +237,16 @@ fn execute_bounded_learning_archive_fixture(
         discover_records: true,
         ..RecoveryPlan::default()
     };
-    let outcome = execute(&mut case, &plan, &policy)?;
+    let progress = job.cloned().map(JobProgress::new);
+    let outcome = execute_internal(
+        &mut case,
+        &plan,
+        &policy,
+        true,
+        progress.as_ref(),
+        None,
+        None,
+    )?;
     Ok(BoundedLearningRun {
         case,
         sessions,
