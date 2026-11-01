@@ -83,6 +83,36 @@ def test_missing_optional_generation_test_cannot_report_qualification(
 
 
 @pytest.mark.skipif(sys.platform != "linux", reason="requires Linux user namespaces")
+def test_missing_optional_case_buffer_test_cannot_report_qualification(
+    tmp_path, user_namespace, empty_test_binary
+):
+    publication_binary = tmp_path / "publication-tests"
+    publication_binary.write_text(
+        '#!/bin/sh\nif [ "$1" = --list ]; then printf \'%s: test\\n\' "$3"; fi\n'
+    )
+    publication_binary.chmod(0o700)
+
+    result = subprocess.run(
+        [
+            "bash",
+            str(ROOT / "tests/run-publish-filesystem-faults.sh"),
+            str(publication_binary),
+            str(tmp_path),
+            "",
+            "",
+            str(empty_test_binary),
+        ],
+        capture_output=True,
+        text=True,
+        timeout=20,
+        check=False,
+    )
+
+    assert result.returncode != 0
+    assert "required test" in result.stderr
+
+
+@pytest.mark.skipif(sys.platform != "linux", reason="requires Linux user namespaces")
 def test_failed_filesystem_trial_cleans_its_temporary_mountpoints(
     tmp_path, user_namespace
 ):

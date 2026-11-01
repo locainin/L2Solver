@@ -9,6 +9,9 @@ use std::error::Error;
 
 type TestResult = Result<(), Box<dyn Error>>;
 
+#[path = "case_buffer/qualification.rs"]
+mod qualification;
+
 fn retained_result(memory: &MemoryBudget) -> Result<BuildResult, Box<dyn Error>> {
     let mut case = Case::with_memory_budget(memory)?;
     case.add_bytes_node(
