@@ -169,6 +169,7 @@ impl State {
             omissions: self.omissions,
             complete_negative_transform_searches: self.complete_negative_transform_searches,
             cycle_skips: self.cycle_skips,
+            family_memory: Vec::new(),
         })
     }
 }

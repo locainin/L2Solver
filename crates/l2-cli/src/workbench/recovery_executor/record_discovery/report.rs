@@ -1,4 +1,5 @@
 pub(in crate::workbench::recovery_executor) mod checkpoint;
+mod family;
 
 use super::super::case_scan::{ScanAdmission, case_scan_work_bounds, preflight_scan};
 use super::super::diagnostics::{record_cohort_enqueue, record_cohort_omission};
@@ -132,7 +133,7 @@ impl RecordDiscoveryContext {
     }
 }
 
-#[derive(Default)]
+#[derive(Clone, Default)]
 struct SessionPartition {
     basis: &'static str,
     training_count: usize,
@@ -149,6 +150,7 @@ struct RecordAnalysis {
     strategy_not_run_reason: Option<&'static str>,
     partition: SessionPartition,
     strategies: Option<RecordSchemaMultiStrategyAnalysisReport>,
+    family_selection: Option<family::FamilySelection>,
 }
 
 struct RecordReportOutput {
@@ -584,6 +586,7 @@ impl Executor<'_> {
         for report in reports {
             let context = &report.context;
             if report.analysis.result != STATUS_NO_CANDIDATES
+                || report.analysis.family_selection.is_some()
                 || context.sampling != LearningSample::SessionPrefix
                 || context.omitted_frames == 0
                 || !matches!(context.key.origin, RecordCohortOrigin::TcpMaterialized)
@@ -747,7 +750,7 @@ impl Executor<'_> {
     }
 
     fn analyze_record_contexts(
-        &self,
+        &mut self,
         contexts: Vec<(RecordDiscoveryContext, usize)>,
         proposal_limits: l2_workbench::protocol::RecordSchemaProposalLimits,
     ) -> Result<Vec<RecordReportOutput>, RecoveryExecutionError> {
@@ -759,13 +762,20 @@ impl Executor<'_> {
             let partition = partition_inputs(&context.inputs)?;
             let include_repeated_boundaries =
                 !matches!(&context.key.origin, RecordCohortOrigin::TcpMaterialized);
-            let analysis = self.analyze_record_cohort(
+            let mut analysis = self.analyze_record_cohort(
                 &context.inputs,
                 partition,
                 proposal_limits,
                 context.omitted_frames > 0,
                 include_repeated_boundaries,
             )?;
+            let family_reports = if analysis.result == STATUS_NO_CANDIDATES
+                && matches!(&context.key.origin, RecordCohortOrigin::TcpMaterialized)
+            {
+                self.analyze_message_families(&context, &mut analysis, proposal_limits)?
+            } else {
+                Vec::new()
+            };
             let full_report = build_report(&context, &analysis, work_bound_bytes)?;
             let bytes = serde_json::to_vec(&full_report).map_err(|source| {
                 operational("record discovery report serialization failed", source)
@@ -776,6 +786,7 @@ impl Executor<'_> {
                 bytes,
                 work_bound_bytes,
             });
+            reports.extend(family_reports);
         }
         Ok(reports)
     }
@@ -783,7 +794,7 @@ impl Executor<'_> {
     fn record_report_omissions(&mut self, reports: &[RecordReportOutput], report_truncated: bool) {
         for report in reports {
             self.record_analysis_omission(&report.context, &report.analysis);
-            if report_truncated {
+            if report_truncated || report.analysis.family_selection.is_some() {
                 let (
                     omitted_input_frames,
                     omitted_schema_proposals,
@@ -915,10 +926,21 @@ impl Executor<'_> {
                 });
                 let node_id =
                     case.add_bytes_node(REPORT_KIND, &report.bytes, Vec::new(), details)?;
+                let family_origins = if report.analysis.family_selection.is_some() {
+                    let mut ids = Vec::new();
+                    ids.try_reserve_exact(report.context.inputs.len())
+                        .map_err(|source| {
+                            operational("family report origin allocation failed", source)
+                        })?;
+                    ids.extend(report.context.inputs.iter().map(|input| input.node_id));
+                    Some(ids)
+                } else {
+                    None
+                };
                 add_transaction_links(
                     case,
                     node_id,
-                    origins,
+                    family_origins.as_deref().unwrap_or(origins),
                     "record_discovery_input",
                     l2_workbench::evidence::EvidenceStatus::Unresolved,
                     "This report analyzes these exact materialized frame inputs",
@@ -1037,6 +1059,7 @@ impl Executor<'_> {
                 strategy_not_run_reason: None,
                 partition,
                 strategies: None,
+                family_selection: None,
             });
         }
         let strategies = analyze_strategies(
@@ -1090,6 +1113,7 @@ impl Executor<'_> {
             strategy_not_run_reason,
             partition,
             strategies: Some(strategies),
+            family_selection: None,
         })
     }
 
@@ -1181,7 +1205,7 @@ fn build_compact_report(
     ) = report_detail_counts(analysis, context);
     let input_frame_refs =
         report_input_frame_refs(&context.inputs, analysis.partition.training_count);
-    Ok(json!({
+    let mut report = json!({
         "version":REPORT_VERSION,
         "case_scope":"current_case",
         "result":analysis.result,
@@ -1208,7 +1232,9 @@ fn build_compact_report(
             "schema_falsification_details":omitted_falsification_details,
         },
         "work_bound_bytes":requested_work,
-    }))
+    });
+    add_family_selection(&mut report, analysis)?;
+    Ok(report)
 }
 
 fn report_detail_counts(
@@ -1424,7 +1450,7 @@ fn build_report(
                 "discovery":report.discovery.as_ref().map(discovery_json),
             })
         });
-    Ok(json!({
+    let mut report = json!({
         "version":REPORT_VERSION,
         "case_scope":"current_case",
         "result":analysis.result,
@@ -1448,7 +1474,24 @@ fn build_report(
         "schema_discovery":schema_discovery,
         "repeated_boundary_analysis":repeated_boundary_analysis,
         "work_bound_bytes":requested_work,
-    }))
+    });
+    add_family_selection(&mut report, analysis)?;
+    Ok(report)
+}
+
+fn add_family_selection(
+    report: &mut Value,
+    analysis: &RecordAnalysis,
+) -> Result<(), RecoveryExecutionError> {
+    if let Some(selection) = &analysis.family_selection {
+        let details = serde_json::to_value(selection)
+            .map_err(|source| operational("family selection serialization failed", source))?;
+        report
+            .as_object_mut()
+            .ok_or(RecoveryError::InvariantFailure)?
+            .insert("family_selection".to_owned(), details);
+    }
+    Ok(())
 }
 
 fn report_partition(context: &RecordDiscoveryContext, analysis: &RecordAnalysis) -> Value {

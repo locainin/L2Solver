@@ -23,6 +23,30 @@ struct CappedCohort {
     omission_batches: Vec<OmissionBatch>,
 }
 
+pub(super) fn learning_sample(
+    inputs: &[RecordFrameInput],
+    maximum_messages: usize,
+    maximum_bytes: usize,
+) -> Result<Vec<&RecordFrameInput>, RecoveryExecutionError> {
+    let ranges = cohort_session_ranges(inputs)?;
+    let prefix = learning_prefix(inputs, &ranges, maximum_messages, maximum_bytes)?;
+    let mut selected = Vec::new();
+    selected
+        .try_reserve_exact(prefix.messages)
+        .map_err(|error| operational("family learning sample allocation failed", error))?;
+    for ((start, _), count) in ranges.iter().zip(&prefix.retained_by_session) {
+        let end = start
+            .checked_add(*count)
+            .ok_or(RecoveryError::InvariantFailure)?;
+        selected.extend(
+            inputs
+                .get(*start..end)
+                .ok_or(RecoveryError::InvariantFailure)?,
+        );
+    }
+    Ok(selected)
+}
+
 pub(super) fn cap_cohorts(
     plan: &mut RecordDiscoveryPlan,
     limits: RecordSchemaProposalLimits,

@@ -26,6 +26,9 @@ mod compact;
 #[path = "recovery_record_issue_receipts.rs"]
 mod issue_receipts;
 
+#[path = "recovery_record_family_mixed.rs"]
+mod mixed_families;
+
 const REPORT_KIND: &str = "recovery_record_discovery_report";
 type TestResult<T> = Result<T, Box<dyn Error>>;
 type AcceptedFrameMember = (u64, u64, u64, u64, u64, String);

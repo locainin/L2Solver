@@ -374,6 +374,7 @@ fn new_executor<'case>(
         omissions: Vec::new(),
         complete_negative_transform_searches: 0,
         cycle_skips: 0,
+        family_memory: Vec::new(),
     })
 }
 
@@ -602,6 +603,8 @@ struct Executor<'a> {
     cycle_skips: usize,
     // Restored allocations are dropped before their shared admission
     checkpoint_memory: Option<Arc<l2_workbench::job::MemoryLease>>,
+    // Family report contexts remain live until the executor is dropped
+    family_memory: Vec<l2_workbench::job::MemoryLease>,
 }
 
 #[derive(Clone)]

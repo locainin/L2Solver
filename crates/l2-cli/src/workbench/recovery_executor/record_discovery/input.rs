@@ -16,6 +16,7 @@ mod allocation_tests;
 
 mod cap;
 use cap::cap_cohorts;
+pub(super) use cap::learning_sample;
 
 const MAX_OMISSION_EXAMPLES: usize = 32;
 
