@@ -18,6 +18,9 @@ mod r2;
 mod range_analyzer;
 mod signatures;
 mod source_hash;
+#[cfg(test)]
+#[path = "../../tests/artifact/support.rs"]
+mod test_support;
 mod validator;
 pub mod zip;
 

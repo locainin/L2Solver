@@ -238,6 +238,20 @@ impl ArtifactValidator {
         unmetered_outcome(self.validate_internal(bytes, None, None), bytes, None)
     }
 
+    /// Select a validator while admitting parser buffers to the shared lease
+    ///
+    /// The caller keeps the lease until the returned report and moved data are dropped
+    ///
+    /// # Errors
+    /// Returns a shared-memory admission failure from a metered parser
+    pub fn validate_with_memory<'a>(
+        &self,
+        bytes: &'a [u8],
+        memory: &mut MemoryLease,
+    ) -> Result<ArtifactValidationOutcome<'a>, MemoryError> {
+        self.validate_internal(bytes, None, Some(memory))
+    }
+
     /// Select a validator and consume a caller-shared ZIP expansion budget
     ///
     /// The ZIP parser deducts each member's declared expanded size before extraction.
@@ -427,24 +441,7 @@ impl ArtifactValidator {
 
         Ok(match format {
             ArtifactValidationFormat::Der => {
-                let parsed = if let Some(lease) = memory {
-                    match parse_der_with_memory(bytes, input_range, self.policy.der_limits, lease) {
-                        Ok(report) => Ok(report),
-                        Err(DerMemoryError::Format(error)) => Err(error),
-                        Err(DerMemoryError::Memory(error)) => return Err(error),
-                    }
-                } else {
-                    parse_der(bytes, input_range, self.policy.der_limits)
-                };
-                match parsed {
-                    Ok(report) => ArtifactValidationOutcome::Validated {
-                        format,
-                        range: report.boundary_range,
-                        boundary: ArtifactBoundaryEvidence::DerEncodedLength,
-                        structure: ArtifactStructure::Der(report),
-                    },
-                    Err(error) => classify_der_error(format, input_range, error),
-                }
+                validate_der(bytes, input_range, self.policy.der_limits, memory)?
             }
             ArtifactValidationFormat::Png => {
                 match parse_png_optional_memory(bytes, self.policy.png_limits, memory) {
@@ -503,6 +500,33 @@ impl ArtifactValidator {
             )?,
         })
     }
+}
+
+fn validate_der<'a>(
+    bytes: &'a [u8],
+    input_range: FileRange,
+    limits: DerLimits,
+    memory: Option<&mut MemoryLease>,
+) -> Result<ArtifactValidationOutcome<'a>, MemoryError> {
+    let format = ArtifactValidationFormat::Der;
+    let parsed = if let Some(lease) = memory {
+        match parse_der_with_memory(bytes, input_range, limits, lease) {
+            Ok(report) => Ok(report),
+            Err(DerMemoryError::Format(error)) => Err(error),
+            Err(DerMemoryError::Memory(error)) => return Err(error),
+        }
+    } else {
+        parse_der(bytes, input_range, limits)
+    };
+    Ok(match parsed {
+        Ok(report) => ArtifactValidationOutcome::Validated {
+            format,
+            range: report.boundary_range,
+            boundary: ArtifactBoundaryEvidence::DerEncodedLength,
+            structure: ArtifactStructure::Der(report),
+        },
+        Err(error) => classify_der_error(format, input_range, error),
+    })
 }
 
 fn unmetered_outcome<'a>(

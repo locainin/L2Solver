@@ -24,6 +24,8 @@ type ArtifactFiles = Vec<(String, Vec<u8>)>;
 
 #[path = "case_snapshot.rs"]
 mod case_snapshot_tests;
+#[path = "native_validation_memory.rs"]
+mod native_validation_memory;
 #[path = "processing.rs"]
 mod processing_tests;
 #[path = "collection/scoped_cache.rs"]

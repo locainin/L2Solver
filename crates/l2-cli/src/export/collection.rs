@@ -19,7 +19,7 @@ use super::{
 use crate::{arguments::ExportOptions, workbench};
 use l2_workbench::{
     evidence::{Blob, Case, EvidenceStatus, Node},
-    job::{MemoryBudget, Phase},
+    job::{MemoryBudget, MemoryError, Phase},
     reconstruction::Limits,
     tshark::SourceIdentity,
 };
@@ -578,7 +578,7 @@ pub(super) fn collect_case_artifacts_with_context(
     ) -> Result<ArtifactSourceContext, Box<dyn Error>>,
 ) -> Result<(), Box<dyn Error>> {
     let index = CaseArtifactIndex::new(case)?;
-    collect_native_case_artifacts(collection, case, &index, &mut context_for_node)?;
+    collect_native_case_artifacts(collection, case, &index, memory, &mut context_for_node)?;
     collect_selected_case_artifacts(collection, case, &index, memory, &mut context_for_node)
 }
 
@@ -650,6 +650,7 @@ fn collect_native_case_artifacts(
     collection: &mut ArtifactCollection,
     case: &Case,
     index: &CaseArtifactIndex<'_>,
+    memory: Option<&MemoryBudget>,
     context_for_node: &mut impl FnMut(
         &Node,
         &HashMap<u64, &Node>,
@@ -682,7 +683,8 @@ fn collect_native_case_artifacts(
                 .unwrap_or_default(),
             &index.nodes_by_id,
         )?;
-        collection.add_bytes(&blob.bytes, &file_name(number, node, &blob.bytes), &origin)?;
+        let name = file_name(number, node, &blob.bytes, memory)?;
+        collection.add_bytes(&blob.bytes, &name, &origin)?;
     }
     Ok(())
 }
@@ -842,14 +844,20 @@ fn export_description(node: &Node) -> Option<&'static str> {
     }
 }
 
-fn file_name(number: u64, node: &Node, bytes: &[u8]) -> String {
+fn file_name(
+    number: u64,
+    node: &Node,
+    bytes: &[u8],
+    memory: Option<&MemoryBudget>,
+) -> Result<String, MemoryError> {
     let prefix = match node.kind.as_str() {
         "http_body" => "http",
         "ftp_data_candidate" => "ftp",
         _ => "file",
     };
-    let extension = workbench::artifact_export::validated_extension(bytes).unwrap_or("bin");
-    format!("{number:06}-{prefix}.{extension}")
+    let extension =
+        workbench::artifact_export::validated_extension(bytes, memory)?.unwrap_or("bin");
+    Ok(format!("{number:06}-{prefix}.{extension}"))
 }
 
 fn recovered_file_name(number: u64, selected_name: &str) -> String {

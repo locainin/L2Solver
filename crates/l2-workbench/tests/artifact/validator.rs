@@ -5,6 +5,7 @@ use l2_workbench::artifact::{
     ArtifactValidationPolicy, ArtifactValidationPolicyError, ArtifactValidator, DerError,
     DerLimits, FileRange, PNG_SIGNATURE, PngError, PngLimits,
 };
+use l2_workbench::job::{MemoryBudget, MemoryClass, MemoryError};
 use std::error::Error;
 
 use super::{png, support, zip_support};
@@ -88,7 +89,7 @@ fn der_requires_explicit_format() {
 }
 
 #[test]
-fn der_rejection_stays_typed() {
+fn der_rejection_stays_typed() -> Result<(), Box<dyn Error>> {
     let der = [0x04, 0x02, 0x7f];
     assert!(matches!(
         ArtifactValidator::default().validate_as(ArtifactValidationFormat::Der, &der),
@@ -98,6 +99,41 @@ fn der_rejection_stays_typed() {
             ..
         }
     ));
+    let budget = MemoryBudget::new(64 * 1024);
+    let mut lease = budget.try_reserve(MemoryClass::Publication, 11)?;
+    let blocker = budget.try_reserve(MemoryClass::Cache, budget.snapshot()?.limit_bytes - 11)?;
+    let valid = [0x30, 0x05, 0x06, 0x03, 0x55, 0x04, 0x03];
+    assert!(matches!(
+        ArtifactValidator::default().validate_as_with_memory(
+            ArtifactValidationFormat::Der,
+            &valid,
+            &mut lease,
+        ),
+        Err(MemoryError::Limit { .. })
+    ));
+    assert_eq!(lease.bytes(), 11);
+    drop(blocker);
+
+    // The second child ends before its declared value can be read
+    let truncated = [0x30, 0x04, 0x05, 0x00, 0x05, 0x01];
+    let outcome = ArtifactValidator::default().validate_as_with_memory(
+        ArtifactValidationFormat::Der,
+        &truncated,
+        &mut lease,
+    )?;
+    assert!(matches!(
+        outcome,
+        ArtifactValidationOutcome::Rejected {
+            format: ArtifactValidationFormat::Der,
+            reason: ArtifactValidationFailure::Der(DerError::InvalidDer),
+            ..
+        }
+    ));
+    assert_eq!(lease.bytes(), 11);
+    drop(outcome);
+    drop(lease);
+    assert_eq!(budget.snapshot()?.used_bytes, 0);
+    Ok(())
 }
 
 #[test]

@@ -5,14 +5,13 @@ use crate::{
         ArtifactBoundaryEvidence, ArtifactResourceOmissionReason, ArtifactStructure,
         ArtifactValidationFailure, ArtifactValidationFormat, ArtifactValidationOutcome,
         ArtifactValidationPolicy, ArtifactValidator, PngChunk, PngError,
+        test_support as executable_support,
     },
     job::{MemoryBudget, MemoryClass, MemoryError},
 };
 
 #[path = "embedded_memory_internal.rs"]
 mod embedded_memory;
-#[path = "support.rs"]
-mod executable_support;
 #[path = "png_memory_internal.rs"]
 mod png_memory;
 #[path = "signature_detection_internal.rs"]

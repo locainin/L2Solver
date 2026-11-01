@@ -5,12 +5,10 @@ use crate::{
         ArtifactError, ArtifactReference, ArtifactReport, ArtifactSection, FileMapping,
         elf::SectionHeader,
         inspect::{InspectMemoryError, inspect, inspect_with_memory, legacy_error},
+        test_support as support,
     },
     job::{MemoryBudget, MemoryClass, MemoryError},
 };
-
-#[path = "support.rs"]
-mod support;
 
 type TestResult = Result<(), Box<dyn Error>>;
 

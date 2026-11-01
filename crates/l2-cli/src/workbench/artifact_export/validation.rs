@@ -735,9 +735,18 @@ fn is_exactly_validated(
     validator: &ArtifactValidator,
     format: ArtifactValidationFormat,
     bytes: &[u8],
-) -> bool {
-    matches!(
-        validator.validate_as(format, bytes),
+    memory: Option<&MemoryBudget>,
+) -> Result<bool, MemoryError> {
+    let mut lease = memory
+        .map(|budget| budget.try_reserve(MemoryClass::Publication, 0))
+        .transpose()?;
+    let outcome = if let Some(lease) = lease.as_mut() {
+        validator.validate_as_with_memory(format, bytes, lease)?
+    } else {
+        validator.validate_as(format, bytes)
+    };
+    Ok(matches!(
+        outcome,
         ArtifactValidationOutcome::Validated {
             format: validated_format,
             range,
@@ -746,7 +755,7 @@ fn is_exactly_validated(
         } if validated_format == format
             && range == complete_range(bytes)
             && boundary_matches_format(format, boundary)
-    )
+    ))
 }
 
 pub(super) const fn boundary_matches_format(
@@ -781,32 +790,53 @@ pub(super) const fn validation_format_label(
 }
 
 /// Return an extension only when the complete input passes its canonical parser
-pub fn validated_extension(bytes: &[u8]) -> Option<&'static str> {
+///
+/// # Errors
+/// Returns a shared-memory admission failure from a metered parser
+pub fn validated_extension(
+    bytes: &[u8],
+    memory: Option<&MemoryBudget>,
+) -> Result<Option<&'static str>, MemoryError> {
     let validator = ArtifactValidator::default();
-    let detected_extension = match validator.validate(bytes) {
-        ArtifactValidationOutcome::Validated {
-            format,
-            range,
-            boundary,
-            ..
-        } if range == complete_range(bytes) && boundary_matches_format(format, boundary) => {
-            match format {
-                ArtifactValidationFormat::Png => Some("png"),
-                ArtifactValidationFormat::Zip => Some("zip"),
-                ArtifactValidationFormat::Der
-                | ArtifactValidationFormat::Elf
-                | ArtifactValidationFormat::PortableExecutable => None,
+    let detected_extension = {
+        let mut lease = memory
+            .map(|budget| budget.try_reserve(MemoryClass::Publication, 0))
+            .transpose()?;
+        let outcome = if let Some(lease) = lease.as_mut() {
+            validator.validate_with_memory(bytes, lease)?
+        } else {
+            validator.validate(bytes)
+        };
+        match outcome {
+            ArtifactValidationOutcome::Validated {
+                format,
+                range,
+                boundary,
+                ..
+            } if range == complete_range(bytes) && boundary_matches_format(format, boundary) => {
+                match format {
+                    ArtifactValidationFormat::Png => Some("png"),
+                    ArtifactValidationFormat::Zip => Some("zip"),
+                    ArtifactValidationFormat::Der
+                    | ArtifactValidationFormat::Elf
+                    | ArtifactValidationFormat::PortableExecutable => None,
+                }
             }
+            ArtifactValidationOutcome::Validated { .. }
+            | ArtifactValidationOutcome::BoundaryUnproven { .. }
+            | ArtifactValidationOutcome::Rejected { .. }
+            | ArtifactValidationOutcome::Unsupported { .. }
+            | ArtifactValidationOutcome::Omitted { .. } => None,
         }
-        ArtifactValidationOutcome::Validated { .. }
-        | ArtifactValidationOutcome::BoundaryUnproven { .. }
-        | ArtifactValidationOutcome::Rejected { .. }
-        | ArtifactValidationOutcome::Unsupported { .. }
-        | ArtifactValidationOutcome::Omitted { .. } => None,
     };
-    detected_extension.or_else(|| {
-        is_exactly_validated(&validator, ArtifactValidationFormat::Der, bytes).then_some("der")
-    })
+    if detected_extension.is_some() {
+        return Ok(detected_extension);
+    }
+    // The automatic report and lease are dropped before DER fallback starts
+    Ok(
+        is_exactly_validated(&validator, ArtifactValidationFormat::Der, bytes, memory)?
+            .then_some("der"),
+    )
 }
 
 fn is_plain_utf8_text(bytes: &[u8]) -> bool {
