@@ -6,8 +6,13 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
 
-use super::recovery_transition::{RecoveryTransition, RecoveryTransitionSummary};
-use super::{MemoryBudget, MemoryError, MemorySnapshot};
+use super::recovery_transition::{
+    FunnelOmissionReason, MAX_FUNNEL_COHORTS, RecoveryCandidateSample, RecoveryFunnelEvent,
+    RecoveryFunnelIdentity, RecoveryFunnelRegistration, RecoveryTransition,
+    RecoveryTransitionOutcome, RecoveryTransitionStage, RecoveryTransitionSummary,
+    cohort_capacity_charge,
+};
+use super::{MemoryBudget, MemoryClass, MemoryError, MemoryLease, MemorySnapshot};
 
 #[path = "work.rs"]
 mod work;
@@ -331,6 +336,23 @@ pub struct JobSnapshot {
 }
 
 impl JobSnapshot {
+    fn snapshot_copy(&self, cohort_limit: usize, memory_limit: usize) -> Self {
+        Self {
+            label: self.label.clone(),
+            created_at_unix_ms: self.created_at_unix_ms,
+            elapsed_ms: self.elapsed_ms,
+            current_phase: self.current_phase,
+            phases: self.phases.clone(),
+            counters: self.counters.clone(),
+            cache_fallbacks: self.cache_fallbacks.clone(),
+            recovery_transitions: self
+                .recovery_transitions
+                .snapshot_copy(cohort_limit, memory_limit),
+            memory_admission: self.memory_admission,
+            cancel_requested: self.cancel_requested,
+        }
+    }
+
     /// Check the phase topology and progress values required for a saved job snapshot
     #[must_use]
     pub fn is_valid_checkpoint(&self) -> bool {
@@ -377,6 +399,68 @@ struct State {
     elapsed_base_ms: u64,
     phase_started_at: BTreeMap<Phase, Instant>,
     work: WorkLedger,
+    funnel_memory: Option<MemoryLease>,
+}
+
+impl State {
+    fn funnel_cohort_count(&self) -> usize {
+        self.snapshot
+            .recovery_transitions
+            .funnel_cohort_count()
+            .saturating_add(self.work.funnel_cohort_count(None))
+    }
+
+    fn ensure_funnel_slots(&mut self, memory: Option<&MemoryBudget>, requested: usize) -> usize {
+        let requested = requested.min(MAX_FUNNEL_COHORTS);
+        let Some(memory) = memory else {
+            return requested;
+        };
+        let Ok(per_cohort) = u64::try_from(cohort_capacity_charge()) else {
+            return 0;
+        };
+        let Some(bytes) = u64::try_from(requested)
+            .ok()
+            .and_then(|count| count.checked_mul(per_cohort))
+        else {
+            return 0;
+        };
+        if let Some(lease) = &mut self.funnel_memory {
+            if lease.bytes() >= bytes || lease.try_resize(bytes).is_ok() {
+                return requested;
+            }
+            return usize::try_from(lease.bytes() / per_cohort).unwrap_or(MAX_FUNNEL_COHORTS);
+        }
+        if requested == 0 {
+            return 0;
+        }
+        match memory.try_reserve(MemoryClass::Executor, bytes) {
+            Ok(lease) => {
+                self.funnel_memory = Some(lease);
+                requested
+            }
+            Err(_) => 0,
+        }
+    }
+
+    fn release_funnel_slots(&mut self) {
+        let desired = self.funnel_cohort_count();
+        let Some(lease) = &mut self.funnel_memory else {
+            return;
+        };
+        let Some(bytes) = u64::try_from(cohort_capacity_charge())
+            .ok()
+            .and_then(|unit| {
+                u64::try_from(desired)
+                    .ok()
+                    .and_then(|count| count.checked_mul(unit))
+            })
+        else {
+            return;
+        };
+        if bytes < lease.bytes() {
+            let _ = lease.try_resize(bytes);
+        }
+    }
 }
 
 /// Errors returned when a progress update cannot be applied
@@ -497,6 +581,7 @@ impl Job {
                     elapsed_base_ms: 0,
                     phase_started_at: BTreeMap::new(),
                     work: WorkLedger::default(),
+                    funnel_memory: None,
                 }),
                 cancel_requested: AtomicBool::new(false),
                 memory,
@@ -728,6 +813,94 @@ impl Job {
         Ok(())
     }
 
+    /// Associates source-backed session inputs with one bounded cohort funnel
+    ///
+    /// # Errors
+    /// Returns an error when shared job state cannot be accessed
+    pub fn register_recovery_cohort(
+        &self,
+        registration: RecoveryFunnelRegistration<'_>,
+    ) -> Result<(), JobError> {
+        let mut state = self.lock_state()?;
+        if let Some(work) = &self.work {
+            return work.register_cohort(&mut state, registration);
+        }
+        if !state
+            .snapshot
+            .recovery_transitions
+            .has_funnel_cohort(registration.identity)
+        {
+            let required = state.funnel_cohort_count().saturating_add(1);
+            if state.ensure_funnel_slots(self.inner.memory.as_ref(), required) < required {
+                let reason = if required > MAX_FUNNEL_COHORTS {
+                    FunnelOmissionReason::CohortLimit
+                } else {
+                    FunnelOmissionReason::MemoryAdmission
+                };
+                state
+                    .snapshot
+                    .recovery_transitions
+                    .omit_funnel_registration(reason);
+                return Ok(());
+            }
+        }
+        state
+            .snapshot
+            .recovery_transitions
+            .register_cohort(registration);
+        drop(state);
+        Ok(())
+    }
+
+    /// Attributes a candidate outcome to its known source cohorts
+    ///
+    /// # Errors
+    /// Returns an error when shared job state cannot be accessed
+    pub fn record_recovery_funnel_candidate(
+        &self,
+        event: RecoveryFunnelEvent<'_>,
+    ) -> Result<(), JobError> {
+        let mut state = self.lock_state()?;
+        if let Some(work) = &self.work {
+            return work.record_funnel_candidate(&mut state, event);
+        }
+        state
+            .snapshot
+            .recovery_transitions
+            .record_funnel_candidate(event);
+        drop(state);
+        Ok(())
+    }
+
+    /// Records a discovery outcome for the exact cohort whose report produced it
+    ///
+    /// # Errors
+    /// Returns an error when shared job state cannot be accessed
+    pub fn record_recovery_funnel_cohort_candidate(
+        &self,
+        identity: RecoveryFunnelIdentity,
+        transition_stage: RecoveryTransitionStage,
+        outcome: RecoveryTransitionOutcome,
+        candidate: RecoveryCandidateSample,
+    ) -> Result<(), JobError> {
+        let mut state = self.lock_state()?;
+        if let Some(work) = &self.work {
+            return work.record_funnel_cohort_candidate(
+                &mut state,
+                identity,
+                transition_stage,
+                outcome,
+                candidate,
+            );
+        }
+        state
+            .snapshot
+            .recovery_transitions
+            .record_funnel_cohort_candidate(identity, transition_stage, outcome, candidate);
+        drop(state);
+        Ok(())
+    }
+
     /// Records the final outcome for a stage
     ///
     /// A skipped stage may finish while pending; other outcomes require a running stage
@@ -777,8 +950,14 @@ impl Job {
     /// Returns an error when job state or the live memory observer is unavailable
     pub fn snapshot(&self) -> Result<JobSnapshot, JobError> {
         let state = self.lock_state()?;
-        let mut snapshot = timed_snapshot(&state, self.is_cancelled());
-        state.work.apply_to(&mut snapshot)?;
+        let admission =
+            reserve_funnel_snapshot(self.inner.memory.as_ref(), state.funnel_cohort_count());
+        let memory_limit = admission.cohort_limit;
+        let mut snapshot = timed_snapshot(&state, self.is_cancelled(), memory_limit);
+        state.work.apply_to(&mut snapshot, memory_limit)?;
+        snapshot
+            .recovery_transitions
+            .freeze_funnel(admission.memory);
         drop(state);
         self.with_memory_observation(snapshot)
     }
@@ -792,7 +971,14 @@ impl Job {
     /// Returns an error when job state or the live memory observer is unavailable
     pub fn checkpoint_snapshot(&self) -> Result<JobSnapshot, JobError> {
         let state = self.lock_state()?;
-        let snapshot = timed_snapshot(&state, self.is_cancelled());
+        let count = state.snapshot.recovery_transitions.funnel_cohort_count();
+        let admission = reserve_funnel_snapshot(self.inner.memory.as_ref(), count);
+        let memory_limit = admission.cohort_limit;
+        let mut snapshot = timed_snapshot(&state, self.is_cancelled(), memory_limit);
+        snapshot.recovery_transitions.limit_checkpoint();
+        snapshot
+            .recovery_transitions
+            .freeze_funnel(admission.memory);
         drop(state);
         self.with_memory_observation(snapshot)
     }
@@ -808,11 +994,34 @@ impl Job {
     /// # Errors
     /// Returns an error if shared state is unavailable, a measurement overflows, or other live
     /// pipeline work or scoped work has already started
-    pub fn restore(&self, snapshot: JobSnapshot) -> Result<(), JobError> {
+    pub fn restore(&self, mut snapshot: JobSnapshot) -> Result<(), JobError> {
         let mut state = self.lock_state()?;
-        let snapshot = restored_snapshot(&state, snapshot, self.is_cancelled())?;
+        live_preparation(&state)?;
+        let existing = state.snapshot.recovery_transitions.funnel_cohort_count();
+        let cohort_limit = MAX_FUNNEL_COHORTS.saturating_sub(existing);
+        let required = existing.saturating_add(
+            snapshot
+                .recovery_transitions
+                .funnel_cohort_count()
+                .min(cohort_limit),
+        );
+        let allowed = state
+            .ensure_funnel_slots(self.inner.memory.as_ref(), required)
+            .saturating_sub(existing);
+        snapshot
+            .recovery_transitions
+            .thaw_funnel(cohort_limit, allowed);
+        let snapshot =
+            match restored_snapshot(&state, snapshot, self.is_cancelled(), MAX_FUNNEL_COHORTS) {
+                Ok(snapshot) => snapshot,
+                Err(error) => {
+                    state.release_funnel_slots();
+                    return Err(error);
+                }
+            };
         state.elapsed_base_ms = snapshot.elapsed_ms;
         state.snapshot = snapshot;
+        state.release_funnel_slots();
         // Preparation retains its original runtime clock through the restore
         state
             .phase_started_at
@@ -832,15 +1041,28 @@ impl Job {
     pub fn preview_checkpoint(&self, saved: Option<&JobSnapshot>) -> Result<JobSnapshot, JobError> {
         let state = self.lock_state()?;
         let cancel_requested = self.is_cancelled();
-        let snapshot = if let Some(saved) = saved {
-            let mut snapshot = restored_snapshot(&state, saved.clone(), cancel_requested)?;
+        let live_count = state.snapshot.recovery_transitions.funnel_cohort_count();
+        let saved_limit = MAX_FUNNEL_COHORTS.saturating_sub(live_count);
+        let saved_count = saved.map_or(0, |snapshot| {
+            snapshot.recovery_transitions.funnel_cohort_count()
+        });
+        let count = live_count.saturating_add(saved_count.min(saved_limit));
+        let admission = reserve_funnel_snapshot(self.inner.memory.as_ref(), count);
+        let memory_limit = admission.cohort_limit;
+        let mut snapshot = if let Some(saved) = saved {
+            let snapshot = saved.snapshot_copy(saved_limit, memory_limit);
+            let mut snapshot = restored_snapshot(&state, snapshot, cancel_requested, memory_limit)?;
             let elapsed_base_ms = snapshot.elapsed_ms;
             apply_timing(&state, &mut snapshot, elapsed_base_ms);
             snapshot
         } else {
             live_preparation(&state)?;
-            timed_snapshot(&state, cancel_requested)
+            timed_snapshot(&state, cancel_requested, memory_limit)
         };
+        snapshot.recovery_transitions.limit_checkpoint();
+        snapshot
+            .recovery_transitions
+            .freeze_funnel(admission.memory);
         drop(state);
         self.with_memory_observation(snapshot)
     }
@@ -907,6 +1129,7 @@ fn restored_snapshot(
     state: &State,
     mut snapshot: JobSnapshot,
     cancel_requested: bool,
+    memory_limit: usize,
 ) -> Result<JobSnapshot, JobError> {
     let preparation = live_preparation(state)?;
     snapshot.memory_admission = None;
@@ -934,9 +1157,12 @@ fn restored_snapshot(
     snapshot
         .cache_fallbacks
         .merge(state.snapshot.cache_fallbacks.clone());
-    snapshot
-        .recovery_transitions
-        .merge(state.snapshot.recovery_transitions.clone());
+    snapshot.recovery_transitions.merge(
+        state
+            .snapshot
+            .recovery_transitions
+            .snapshot_copy(MAX_FUNNEL_COHORTS, memory_limit),
+    );
     snapshot.cancel_requested = cancel_requested;
     for phase in &mut snapshot.phases {
         if phase.state == PhaseState::InProgress {
@@ -961,11 +1187,50 @@ fn restored_snapshot(
     Ok(snapshot)
 }
 
-fn timed_snapshot(state: &State, cancel_requested: bool) -> JobSnapshot {
-    let mut snapshot = state.snapshot.clone();
+fn timed_snapshot(state: &State, cancel_requested: bool, memory_limit: usize) -> JobSnapshot {
+    let mut snapshot = state
+        .snapshot
+        .snapshot_copy(MAX_FUNNEL_COHORTS, memory_limit);
     snapshot.cancel_requested = cancel_requested;
     apply_timing(state, &mut snapshot, state.elapsed_base_ms);
     snapshot
+}
+
+struct FunnelSnapshotAdmission {
+    memory: Option<MemoryLease>,
+    cohort_limit: usize,
+}
+
+fn reserve_funnel_snapshot(memory: Option<&MemoryBudget>, count: usize) -> FunnelSnapshotAdmission {
+    if count == 0 {
+        return FunnelSnapshotAdmission {
+            memory: None,
+            cohort_limit: MAX_FUNNEL_COHORTS,
+        };
+    }
+    let Some(memory) = memory else {
+        return FunnelSnapshotAdmission {
+            memory: None,
+            cohort_limit: MAX_FUNNEL_COHORTS,
+        };
+    };
+    let lease = u64::try_from(cohort_capacity_charge())
+        .ok()
+        .and_then(|unit| {
+            u64::try_from(count)
+                .ok()
+                .and_then(|count| unit.checked_mul(count))
+        })
+        .and_then(|bytes| memory.try_reserve(MemoryClass::Executor, bytes).ok());
+    let cohort_limit = if lease.is_some() {
+        MAX_FUNNEL_COHORTS
+    } else {
+        0
+    };
+    FunnelSnapshotAdmission {
+        memory: lease,
+        cohort_limit,
+    }
 }
 
 fn apply_timing(state: &State, snapshot: &mut JobSnapshot, elapsed_base_ms: u64) {

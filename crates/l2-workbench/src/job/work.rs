@@ -1,13 +1,22 @@
 //! Independently restorable progress for concurrent recovery work
 
+use super::super::recovery_transition::{FunnelOmissionReason, MAX_FUNNEL_COHORTS};
 use super::{
     Arc, BTreeMap, Counter, Inner, Job, JobError, JobSnapshot, Phase, PhaseState,
     RecoveryTransition, RecoveryTransitionSummary, State, find_phase_mut, next_counter_value,
-    next_phase_value,
+    next_phase_value, reserve_funnel_snapshot,
+};
+use super::{
+    RecoveryCandidateSample, RecoveryFunnelEvent, RecoveryFunnelIdentity,
+    RecoveryFunnelRegistration, RecoveryTransitionOutcome, RecoveryTransitionStage,
 };
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 
 const WORK_SNAPSHOT_VERSION: u32 = 1;
+
+#[path = "work/checkpoint.rs"]
+mod checkpoint;
 
 /// Measurements committed alongside one recovery execution generation
 ///
@@ -22,6 +31,16 @@ pub struct WorkSnapshot {
 }
 
 impl WorkSnapshot {
+    /// Returns a bounded, serializable view for durable checkpoint metadata
+    ///
+    /// The allowance covers optional recovery diagnostics. Work counters and the small
+    /// omission marker remain present even when the allowance is zero. Values above the
+    /// policy ceiling are capped. The returned view borrows this immutable snapshot.
+    #[must_use]
+    pub fn checkpoint_view(&self, max_diagnostic_bytes: usize) -> impl Serialize + '_ {
+        checkpoint::View::new(self, max_diagnostic_bytes)
+    }
+
     /// Returns this contribution's observed count for one measurement
     #[must_use]
     pub fn counter(&self, counter: Counter) -> u64 {
@@ -94,11 +113,27 @@ impl Job {
     pub fn work_snapshot(&self) -> Result<WorkSnapshot, JobError> {
         let owner = self.work.as_ref().ok_or(JobError::WorkScopeRequired)?;
         let state = self.lock_state()?;
-        Ok(WorkSnapshot {
+        let counts = owner.counts(&state)?;
+        let admission = reserve_funnel_snapshot(
+            self.inner.memory.as_ref(),
+            counts.recovery_transitions.funnel_cohort_count(),
+        );
+        let memory_limit = admission.cohort_limit;
+        let mut recovery_transitions = counts
+            .recovery_transitions
+            .snapshot_copy(MAX_FUNNEL_COHORTS, memory_limit);
+        recovery_transitions.freeze_funnel(admission.memory);
+        let snapshot = WorkSnapshot {
             schema_version: WORK_SNAPSHOT_VERSION,
             scope_id: owner.id.clone(),
-            counts: owner.counts(&state)?.clone(),
-        })
+            counts: WorkCounts {
+                counters: counts.counters.clone(),
+                phase_work: counts.phase_work.clone(),
+                recovery_transitions,
+            },
+        };
+        drop(state);
+        Ok(snapshot)
     }
 
     /// Replaces this work contribution with its committed generation's measurements
@@ -109,7 +144,7 @@ impl Job {
     /// # Errors
     /// Returns an error for a wrong identity or format, an overflowing aggregate, or an
     /// unavailable work scope. All checks complete before any live measurement changes.
-    pub fn restore_work(&self, snapshot: WorkSnapshot) -> Result<(), JobError> {
+    pub fn restore_work(&self, mut snapshot: WorkSnapshot) -> Result<(), JobError> {
         let owner = self.work.as_ref().ok_or(JobError::WorkScopeRequired)?;
         if snapshot.schema_version != WORK_SNAPSHOT_VERSION || snapshot.scope_id != owner.id {
             return Err(JobError::InvalidWorkSnapshot);
@@ -126,13 +161,34 @@ impl Job {
                 .work
                 .check_phase(&state.snapshot, Some(&owner.id), phase, amount)?;
         }
+        let other_cohorts = state
+            .snapshot
+            .recovery_transitions
+            .funnel_cohort_count()
+            .saturating_add(state.work.funnel_cohort_count(Some(&owner.id)));
+        let required = other_cohorts
+            .saturating_add(snapshot.counts.recovery_transitions.funnel_cohort_count());
+        let allowed = state
+            .ensure_funnel_slots(self.inner.memory.as_ref(), required)
+            .saturating_sub(other_cohorts);
+        let max_scope = MAX_FUNNEL_COHORTS.saturating_sub(other_cohorts);
+        snapshot
+            .counts
+            .recovery_transitions
+            .thaw_funnel(max_scope, allowed);
         *owner.counts_mut(&mut state)? = snapshot.counts;
+        state.release_funnel_slots();
         drop(state);
         Ok(())
     }
 }
 
 impl WorkLedger {
+    pub(super) fn funnel_cohort_count(&self, skip: Option<&str>) -> usize {
+        self.contributions(skip).fold(0_usize, |total, counts| {
+            total.saturating_add(counts.recovery_transitions.funnel_cohort_count())
+        })
+    }
     pub(super) fn is_empty(&self) -> bool {
         self.active.is_empty() && self.finished == WorkCounts::default()
     }
@@ -187,7 +243,11 @@ impl WorkLedger {
         Ok(())
     }
 
-    pub(super) fn apply_to(&self, snapshot: &mut JobSnapshot) -> Result<(), JobError> {
+    pub(super) fn apply_to(
+        &self,
+        snapshot: &mut JobSnapshot,
+        memory_limit: usize,
+    ) -> Result<(), JobError> {
         for counts in self.contributions(None) {
             for (&counter, &amount) in &counts.counters {
                 let current = snapshot.counters.get(&counter).copied().unwrap_or_default();
@@ -201,9 +261,11 @@ impl WorkLedger {
                     entry.refresh_measurements();
                 }
             }
-            snapshot
-                .recovery_transitions
-                .merge(counts.recovery_transitions.clone());
+            snapshot.recovery_transitions.merge(
+                counts
+                    .recovery_transitions
+                    .snapshot_copy(MAX_FUNNEL_COHORTS, memory_limit),
+            );
         }
         Ok(())
     }
@@ -315,6 +377,75 @@ impl WorkOwner {
         self.counts_mut(state)?.recovery_transitions.record(event);
         Ok(())
     }
+
+    pub(super) fn register_cohort(
+        &self,
+        state: &mut State,
+        mut registration: RecoveryFunnelRegistration<'_>,
+    ) -> Result<(), JobError> {
+        registration.identity = self.scoped_funnel_identity(registration.identity);
+        if !self
+            .counts(state)?
+            .recovery_transitions
+            .has_funnel_cohort(registration.identity)
+        {
+            let required = state.funnel_cohort_count().saturating_add(1);
+            if state.ensure_funnel_slots(self.inner.memory.as_ref(), required) < required {
+                let reason = if required > MAX_FUNNEL_COHORTS {
+                    FunnelOmissionReason::CohortLimit
+                } else {
+                    FunnelOmissionReason::MemoryAdmission
+                };
+                self.counts_mut(state)?
+                    .recovery_transitions
+                    .omit_funnel_registration(reason);
+                return Ok(());
+            }
+        }
+        self.counts_mut(state)?
+            .recovery_transitions
+            .register_cohort(registration);
+        Ok(())
+    }
+
+    pub(super) fn record_funnel_candidate(
+        &self,
+        state: &mut State,
+        event: RecoveryFunnelEvent<'_>,
+    ) -> Result<(), JobError> {
+        self.counts_mut(state)?
+            .recovery_transitions
+            .record_funnel_candidate(event);
+        Ok(())
+    }
+
+    pub(super) fn record_funnel_cohort_candidate(
+        &self,
+        state: &mut State,
+        identity: RecoveryFunnelIdentity,
+        transition_stage: RecoveryTransitionStage,
+        outcome: RecoveryTransitionOutcome,
+        candidate: RecoveryCandidateSample,
+    ) -> Result<(), JobError> {
+        let identity = self.scoped_funnel_identity(identity);
+        self.counts_mut(state)?
+            .recovery_transitions
+            .record_funnel_cohort_candidate(identity, transition_stage, outcome, candidate);
+        Ok(())
+    }
+
+    fn scoped_funnel_identity(
+        &self,
+        mut identity: RecoveryFunnelIdentity,
+    ) -> RecoveryFunnelIdentity {
+        // Case node IDs are local to this independently checkpointed work scope
+        let mut digest = Sha256::new();
+        digest.update(b"l2-recovery-funnel-work-scope-v1\0");
+        digest.update(self.id.as_bytes());
+        digest.update(identity.cohort_sha256);
+        identity.cohort_sha256 = digest.finalize().into();
+        identity
+    }
 }
 
 impl WorkCounts {
@@ -347,6 +478,7 @@ impl Drop for WorkOwner {
             && let Some(counts) = state.work.active.remove(&self.id)
         {
             state.work.finished.retire(counts);
+            state.release_funnel_slots();
         }
     }
 }

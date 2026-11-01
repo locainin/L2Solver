@@ -1,12 +1,23 @@
 //! Bounded summaries of observed recovery transitions
 
 use serde::{
-    Deserialize, Deserializer, Serialize,
+    Deserialize, Deserializer, Serialize, Serializer,
     de::{self, IgnoredAny, SeqAccess, Visitor},
 };
 use std::fmt;
 
+pub(super) mod checkpoint;
 mod digest;
+mod funnel;
+mod publication;
+
+pub(super) use funnel::{
+    FunnelOmissionReason, MAX_COHORTS as MAX_FUNNEL_COHORTS, cohort_capacity_charge,
+};
+pub use funnel::{
+    MAX_RECOVERY_FUNNEL_INPUTS, RecoveryFunnelAdmission, RecoveryFunnelAttribution,
+    RecoveryFunnelEvent, RecoveryFunnelIdentity, RecoveryFunnelInput, RecoveryFunnelRegistration,
+};
 
 const MAX_RECORDS: usize =
     RecoveryTransitionStage::ALL.len() * RecoveryTransitionOutcome::ALL.len();
@@ -84,10 +95,18 @@ pub enum RecoveryTransitionOutcome {
     PublishedReplacementUncertain,
     /// Publication failed before its atomic commit
     PublicationFailed,
+    /// Schema proposal had too few training messages
+    InsufficientTrainingMessages,
+    /// Schema proposal found no supported structural field combination
+    NoStructuralCandidateSpace,
+    /// The generated schema candidates did not survive strict parsing
+    NoSchemaSurvivedStrictParsing,
+    /// Every candidate in this explicitly bounded search plan was evaluated
+    SearchCompleteWithinPlan,
 }
 
 impl RecoveryTransitionOutcome {
-    const ALL: [Self; 16] = [
+    const ALL: [Self; 20] = [
         Self::Derived,
         Self::ReportRetained,
         Self::Hypothesis,
@@ -104,6 +123,10 @@ impl RecoveryTransitionOutcome {
         Self::PublishedDurabilityUncertain,
         Self::PublishedReplacementUncertain,
         Self::PublicationFailed,
+        Self::InsufficientTrainingMessages,
+        Self::NoStructuralCandidateSpace,
+        Self::NoSchemaSurvivedStrictParsing,
+        Self::SearchCompleteWithinPlan,
     ];
 }
 
@@ -398,12 +421,169 @@ impl<'de> Deserialize<'de> for RecoveryTransitionRecord {
 /// Constant-bounded event counts and examples for a recovery job
 ///
 /// These are observed transitions, not an exhaustive history or proof of ground truth
-#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct RecoveryTransitionSummary {
     records: Vec<RecoveryTransitionRecord>,
+    funnel: funnel::Funnel,
+    checkpoint_omitted_transition_records: u64,
+}
+
+impl Serialize for RecoveryTransitionSummary {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        #[derive(Serialize)]
+        struct Wire<'a> {
+            records: &'a [RecoveryTransitionRecord],
+            #[serde(flatten)]
+            funnel: funnel::FunnelView<'a>,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            publication_attribution: Option<publication::Attribution>,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            checkpoint_projection_version: Option<u32>,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            checkpoint_omitted_transition_records: Option<u64>,
+        }
+        let publication_attribution = publication::attribution(self, false, false);
+        let publication_incomplete = publication_attribution
+            .as_ref()
+            .is_some_and(|coverage| !coverage.complete);
+        Wire {
+            records: &self.records,
+            funnel: self.funnel.view(publication_incomplete),
+            publication_attribution,
+            checkpoint_projection_version: (self.checkpoint_omitted_transition_records > 0
+                || self.funnel.has_checkpoint_projection())
+            .then_some(1),
+            checkpoint_omitted_transition_records: (self.checkpoint_omitted_transition_records > 0)
+                .then_some(self.checkpoint_omitted_transition_records),
+        }
+        .serialize(serializer)
+    }
+}
+
+pub(super) struct CheckpointSummary<'a> {
+    summary: &'a RecoveryTransitionSummary,
+    include_cohorts: bool,
+}
+
+struct CheckpointRecords<'a> {
+    records: &'a [RecoveryTransitionRecord],
+    include_all: bool,
+}
+
+impl Serialize for CheckpointRecords<'_> {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        use serde::ser::SerializeSeq;
+        let retained = self.records.iter().filter(|record| {
+            self.include_all || record.stage == RecoveryTransitionStage::Publication
+        });
+        let mut sequence = serializer.serialize_seq(Some(retained.clone().count()))?;
+        for record in retained {
+            sequence.serialize_element(record)?;
+        }
+        sequence.end()
+    }
+}
+
+impl Serialize for CheckpointSummary<'_> {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        #[derive(Serialize)]
+        struct Wire<'a> {
+            records: CheckpointRecords<'a>,
+            #[serde(flatten)]
+            funnel: funnel::CheckpointFunnel<'a>,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            publication_attribution: Option<publication::Attribution>,
+            checkpoint_projection_version: u32,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            checkpoint_omitted_transition_records: Option<u64>,
+        }
+        let newly_omitted = if self.include_cohorts {
+            0
+        } else {
+            self.summary
+                .records
+                .iter()
+                .filter(|record| record.stage != RecoveryTransitionStage::Publication)
+                .count()
+        };
+        let omitted = self
+            .summary
+            .checkpoint_omitted_transition_records
+            .saturating_add(u64::try_from(newly_omitted).unwrap_or(u64::MAX));
+        Wire {
+            records: CheckpointRecords {
+                records: &self.summary.records,
+                include_all: self.include_cohorts,
+            },
+            funnel: self.summary.funnel.checkpoint_view(self.include_cohorts),
+            publication_attribution: publication::attribution(
+                self.summary,
+                true,
+                newly_omitted > 0,
+            ),
+            checkpoint_projection_version: 1,
+            checkpoint_omitted_transition_records: (omitted > 0).then_some(omitted),
+        }
+        .serialize(serializer)
+    }
 }
 
 impl RecoveryTransitionSummary {
+    pub(super) fn funnel_cohort_count(&self) -> usize {
+        self.funnel.cohorts().len()
+    }
+
+    pub(super) fn snapshot_copy(&self, cohort_limit: usize, memory_limit: usize) -> Self {
+        Self {
+            records: self.records.clone(),
+            funnel: self.funnel.snapshot_copy(cohort_limit, memory_limit),
+            checkpoint_omitted_transition_records: self.checkpoint_omitted_transition_records,
+        }
+    }
+
+    pub(super) const fn checkpoint_view(&self, include_cohorts: bool) -> CheckpointSummary<'_> {
+        CheckpointSummary {
+            summary: self,
+            include_cohorts,
+        }
+    }
+
+    pub(super) fn limit_checkpoint(&mut self) {
+        let maximum = checkpoint::MAX_DIAGNOSTIC_BYTES;
+        if checkpoint::encoded_fits(self, maximum) {
+            return;
+        }
+        self.funnel.compact_checkpoint();
+        if checkpoint::encoded_fits(self, maximum) {
+            return;
+        }
+        let previous_records = self.records.len();
+        // Keep the bounded publication examples needed to describe missing correlation
+        self.records
+            .retain(|record| record.stage == RecoveryTransitionStage::Publication);
+        let omitted_records = previous_records - self.records.len();
+        self.checkpoint_omitted_transition_records = self
+            .checkpoint_omitted_transition_records
+            .saturating_add(u64::try_from(omitted_records).unwrap_or(u64::MAX));
+        self.funnel.omit_checkpoint_cohorts();
+    }
+
+    pub(super) fn freeze_funnel(&mut self, memory: Option<super::MemoryLease>) {
+        self.funnel.freeze(memory);
+    }
+
+    pub(super) fn thaw_funnel(&mut self, cohort_limit: usize, memory_limit: usize) {
+        self.funnel.thaw(cohort_limit, memory_limit);
+    }
+
+    pub(super) fn has_funnel_cohort(&self, identity: RecoveryFunnelIdentity) -> bool {
+        self.funnel.contains(identity)
+    }
+
+    pub(super) const fn omit_funnel_registration(&mut self, reason: FunnelOmissionReason) {
+        self.funnel.omit(reason, 1);
+    }
+
     /// Returns records ordered by stage and outcome
     #[must_use]
     pub fn records(&self) -> &[RecoveryTransitionRecord] {
@@ -417,12 +597,48 @@ impl RecoveryTransitionSummary {
             count: 1,
             sample: event.sample,
         });
+        if event.stage == RecoveryTransitionStage::Publication
+            && let Some(RecoveryTransitionSample::Publication(sample)) = event.sample
+        {
+            self.funnel.record_publication(event.outcome, sample);
+        }
     }
 
     pub(super) fn merge(&mut self, other: Self) {
+        self.checkpoint_omitted_transition_records = self
+            .checkpoint_omitted_transition_records
+            .saturating_add(other.checkpoint_omitted_transition_records);
         for record in other.records {
             self.merge_record(record);
         }
+        self.funnel.merge(other.funnel);
+        // Publication may arrive before or after the independently checkpointed Case work
+        for record in &self.records {
+            if record.stage == RecoveryTransitionStage::Publication
+                && let Some(RecoveryTransitionSample::Publication(sample)) = record.sample
+            {
+                self.funnel.record_publication(record.outcome, sample);
+            }
+        }
+    }
+
+    pub(super) fn register_cohort(&mut self, registration: RecoveryFunnelRegistration<'_>) {
+        self.funnel.register(registration);
+    }
+
+    pub(super) fn record_funnel_candidate(&mut self, event: RecoveryFunnelEvent<'_>) {
+        self.funnel.record(event);
+    }
+
+    pub(super) fn record_funnel_cohort_candidate(
+        &mut self,
+        identity: RecoveryFunnelIdentity,
+        stage: RecoveryTransitionStage,
+        outcome: RecoveryTransitionOutcome,
+        candidate: RecoveryCandidateSample,
+    ) {
+        self.funnel
+            .record_for_cohort(identity, stage, outcome, candidate);
     }
 
     fn merge_record(&mut self, record: RecoveryTransitionRecord) {
@@ -474,10 +690,57 @@ impl<'de> Deserialize<'de> for RecoveryTransitionSummary {
         struct WireSummary {
             #[serde(default)]
             records: BoundedRecords,
+            #[serde(default, deserialize_with = "funnel::bounded_cohorts")]
+            cohorts: Vec<funnel::Cohort>,
+            #[serde(default)]
+            funnel_omitted_events: u64,
+            #[serde(default)]
+            funnel_omission_reasons: Option<funnel::FunnelOmissionReasons>,
+            #[serde(default)]
+            funnel_stages: Option<de::IgnoredAny>,
+            #[serde(default)]
+            publication_attribution: Option<de::IgnoredAny>,
+            #[serde(default)]
+            checkpoint_projection_version: Option<u32>,
+            #[serde(default)]
+            checkpoint_omitted_transition_records: u64,
         }
-        let mut records = WireSummary::deserialize(deserializer)?.records.0;
+        let wire = WireSummary::deserialize(deserializer)?;
+        let _ = wire.funnel_stages;
+        let _ = wire.publication_attribution;
+        let omission_reasons = wire.funnel_omission_reasons.unwrap_or_else(|| {
+            funnel::FunnelOmissionReasons::from_legacy(wire.funnel_omitted_events)
+        });
+        if omission_reasons.total() != wire.funnel_omitted_events {
+            return Err(de::Error::custom(
+                "recovery funnel omission counts disagree",
+            ));
+        }
+        let mut records = wire.records.0;
         records.sort_unstable_by_key(|record| (record.stage, record.outcome));
-        Ok(Self { records })
+        let mut identities = std::collections::BTreeSet::new();
+        for cohort in &wire.cohorts {
+            if !identities.insert(cohort.identity()) {
+                return Err(de::Error::custom("duplicate recovery funnel cohort"));
+            }
+        }
+        let mut cohorts = wire.cohorts;
+        cohorts.sort_unstable_by_key(funnel::Cohort::identity);
+        let funnel = funnel::Funnel::from_checkpoint(cohorts, omission_reasons);
+        if !matches!(wire.checkpoint_projection_version, None | Some(1))
+            || (wire.checkpoint_projection_version.is_none()
+                && (wire.checkpoint_omitted_transition_records != 0
+                    || funnel.has_checkpoint_projection()))
+        {
+            return Err(de::Error::custom(
+                "invalid recovery funnel projection version",
+            ));
+        }
+        Ok(Self {
+            records,
+            funnel,
+            checkpoint_omitted_transition_records: wire.checkpoint_omitted_transition_records,
+        })
     }
 }
 

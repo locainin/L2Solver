@@ -25,7 +25,9 @@ pub use model::{
 };
 
 pub use recovery_transition::{
-    RecoveryArtifactSample, RecoveryCandidateSample, RecoveryCohortReason, RecoveryCohortSample,
+    MAX_RECOVERY_FUNNEL_INPUTS, RecoveryArtifactSample, RecoveryCandidateSample,
+    RecoveryCohortReason, RecoveryCohortSample, RecoveryFunnelAdmission, RecoveryFunnelAttribution,
+    RecoveryFunnelEvent, RecoveryFunnelIdentity, RecoveryFunnelInput, RecoveryFunnelRegistration,
     RecoveryPublicationSample, RecoveryPublicationSourceBasis, RecoveryTransition,
     RecoveryTransitionOutcome, RecoveryTransitionRecord, RecoveryTransitionSample,
     RecoveryTransitionSourceRange, RecoveryTransitionStage, RecoveryTransitionSummary,

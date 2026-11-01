@@ -15,6 +15,8 @@ mod checkpoint_relational_output;
 mod memory_snapshot;
 #[path = "job/model.rs"]
 mod model;
+#[path = "job/recovery_funnel_memory.rs"]
+mod recovery_funnel_memory;
 #[path = "job/work.rs"]
 mod work;
 
@@ -381,6 +383,8 @@ mod cache;
 #[path = "job/cache_fallback.rs"]
 mod cache_fallback;
 
+#[path = "job/recovery_funnel_attribution.rs"]
+mod recovery_funnel_attribution;
 #[path = "job/recovery_transition.rs"]
 mod recovery_transition;
 
