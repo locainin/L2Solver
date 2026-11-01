@@ -132,7 +132,7 @@ fn observe_fixture(protocol: &str, prefix: &str, group: &str) -> Result<(), Box<
     )?
     .trim()
     .parse()?;
-    let baseline = memberships(index, group)?;
+    let baseline = crate::namespace::memberships(index, group)?;
     let mut child = crate::namespace::command()
         .args([
             protocol,
@@ -149,7 +149,7 @@ fn observe_fixture(protocol: &str, prefix: &str, group: &str) -> Result<(), Box<
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()?;
-    if let Err(error) = await_membership(&mut child, index, group, baseline)
+    if let Err(error) = crate::namespace::await_membership(&mut child, index, group, baseline)
         .and_then(|()| fs::write(ready, "ready").map_err(Into::into))
     {
         let _ = child.kill();
@@ -166,25 +166,6 @@ fn observe_fixture(protocol: &str, prefix: &str, group: &str) -> Result<(), Box<
     );
     verify_observations(protocol, &report)?;
     fs::write(observed, "observed")?;
-    Ok(())
-}
-
-#[cfg(target_os = "linux")]
-fn await_membership(
-    child: &mut std::process::Child,
-    index: u32,
-    group: &str,
-    baseline: u32,
-) -> Result<(), Box<dyn Error>> {
-    use std::time::{Duration, Instant};
-
-    let deadline = Instant::now() + Duration::from_millis(1500);
-    while memberships(index, group)? <= baseline {
-        if child.try_wait()?.is_some() || Instant::now() >= deadline {
-            return Err("listener did not join the expected group".into());
-        }
-        std::thread::sleep(Duration::from_millis(5));
-    }
     Ok(())
 }
 
@@ -216,22 +197,4 @@ fn verify_observations(protocol: &str, report: &serde_json::Value) -> Result<(),
         }));
     }
     Ok(())
-}
-
-#[cfg(target_os = "linux")]
-fn memberships(index: u32, group: &str) -> Result<u32, Box<dyn Error>> {
-    for line in std::fs::read_to_string("/proc/net/dev_mcast")?.lines() {
-        let mut fields = line.split_whitespace();
-        let Some(raw_index) = fields.next() else {
-            continue;
-        };
-        let _name = fields.next();
-        let users = fields.next();
-        let _global = fields.next();
-        let address = fields.next();
-        if raw_index.parse::<u32>()? == index && address == Some(group) {
-            return Ok(users.ok_or("missing multicast user count")?.parse()?);
-        }
-    }
-    Ok(0)
 }

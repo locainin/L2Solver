@@ -76,3 +76,38 @@ pub fn accepted(report: &serde_json::Value, bytes: u64) {
         Some(bytes)
     );
 }
+
+pub fn await_membership(
+    child: &mut std::process::Child,
+    index: u32,
+    group: &str,
+    baseline: u32,
+) -> Result<(), Box<dyn Error>> {
+    use std::time::{Duration, Instant};
+
+    let deadline = Instant::now() + Duration::from_millis(1500);
+    while memberships(index, group)? <= baseline {
+        if child.try_wait()?.is_some() || Instant::now() >= deadline {
+            return Err("listener did not join the expected group".into());
+        }
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    Ok(())
+}
+
+pub fn memberships(index: u32, group: &str) -> Result<u32, Box<dyn Error>> {
+    for line in std::fs::read_to_string("/proc/net/dev_mcast")?.lines() {
+        let mut fields = line.split_whitespace();
+        let Some(raw_index) = fields.next() else {
+            continue;
+        };
+        let _name = fields.next();
+        let users = fields.next();
+        let _global = fields.next();
+        let address = fields.next();
+        if raw_index.parse::<u32>()? == index && address == Some(group) {
+            return Ok(users.ok_or("missing multicast user count")?.parse()?);
+        }
+    }
+    Ok(0)
+}
