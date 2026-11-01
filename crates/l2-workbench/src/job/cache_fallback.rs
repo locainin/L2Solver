@@ -70,6 +70,8 @@ pub enum CacheFallbackKind {
     CommitQuotaExceeded,
     /// The cache filesystem rejected a write
     CommitStorageIo,
+    /// A legacy job could not safely checkpoint its active state
+    CheckpointUnsupported,
     /// The persistent cache could not be opened
     CacheUnavailable,
     /// Another process held a cache lock beyond the wait bound
@@ -77,7 +79,7 @@ pub enum CacheFallbackKind {
 }
 
 impl CacheFallbackKind {
-    const ALL: [Self; 10] = [
+    const ALL: [Self; 11] = [
         Self::InvalidEntry,
         Self::LookupFailed,
         Self::LeaseUnavailable,
@@ -86,6 +88,7 @@ impl CacheFallbackKind {
         Self::CommitMetadataTooLarge,
         Self::CommitQuotaExceeded,
         Self::CommitStorageIo,
+        Self::CheckpointUnsupported,
         Self::CacheUnavailable,
         Self::ContentionFallback,
     ];
@@ -102,6 +105,7 @@ impl CacheFallbackKind {
             Self::CommitMetadataTooLarge => "cache metadata size limit",
             Self::CommitQuotaExceeded => "cache quota exceeded",
             Self::CommitStorageIo => "cache storage I/O failed",
+            Self::CheckpointUnsupported => "active checkpoint state unsupported",
             Self::CacheUnavailable => "cache unavailable",
             Self::ContentionFallback => "lock contention fallback",
         }

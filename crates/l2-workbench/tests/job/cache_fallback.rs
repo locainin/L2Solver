@@ -312,6 +312,7 @@ fn cache_fallback_categories() -> Vec<serde_json::Value> {
         CacheFallbackKind::CommitMetadataTooLarge,
         CacheFallbackKind::CommitQuotaExceeded,
         CacheFallbackKind::CommitStorageIo,
+        CacheFallbackKind::CheckpointUnsupported,
         CacheFallbackKind::CacheUnavailable,
         CacheFallbackKind::ContentionFallback,
     ];

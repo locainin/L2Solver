@@ -40,6 +40,8 @@ mod scoped_memory;
 
 #[path = "cache/maintenance.rs"]
 mod maintenance;
+#[path = "cache/snapshot_version.rs"]
+mod snapshot_version;
 #[cfg(target_os = "linux")]
 #[path = "cache/terminal_fsync.rs"]
 mod terminal_fsync;
@@ -609,12 +611,12 @@ fn checkpoint_snapshot_versions_are_validated_before_restore() -> Result<(), Box
 }
 
 #[test]
-fn checkpoint_version_four_round_trips_transitions_and_reads_legacy_versions()
+fn checkpoint_version_five_round_trips_transitions_and_reads_legacy_versions()
 -> Result<(), Box<dyn Error>> {
     let temporary = tempfile::tempdir()?;
     let cache = cache_at(temporary.path(), 1024)?;
-    let current_key = stage_key("version-four-transitions")?;
-    let current_job = Job::new("version four checkpoint");
+    let current_key = stage_key("version-five-transitions")?;
+    let current_job = Job::new("version five checkpoint");
     current_job.record_cache_fallback(
         CacheStage::CaseRecovery,
         CacheFallbackKind::CommitCaseTooLarge,
@@ -630,8 +632,8 @@ fn checkpoint_version_four_round_trips_transitions_and_reads_legacy_versions()
     cache.write_checkpoint(&current_key, &current_snapshot, CheckpointStatus::Active)?;
     let current = cache
         .read_checkpoint(&current_key)?
-        .ok_or_else(|| missing("version-four checkpoint should be available"))?;
-    assert_eq!(current.snapshot_version, 4);
+        .ok_or_else(|| missing("version-five checkpoint should be available"))?;
+    assert_eq!(current.snapshot_version, 5);
     assert_eq!(current.snapshot, current_snapshot);
     for version in [1, 2, 3] {
         assert_legacy_checkpoint(&cache, temporary.path(), version)?;

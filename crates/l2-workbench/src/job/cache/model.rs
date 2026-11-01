@@ -2,12 +2,14 @@ use crate::job::{JobSnapshot, cache::key::StageKey};
 
 /// Version of the serialized [`JobSnapshot`] checkpoint representation
 ///
-/// Version 4 adds tagged cohort and publication transition examples
-/// Versions 1 through 3 remain readable with their earlier snapshot shapes
-pub const JOB_SNAPSHOT_VERSION: u32 = 4;
+/// Version 5 adds bounded recovery funnel state to checkpoint snapshots
+/// Version 4 added tagged cohort and publication transition examples
+/// Versions 1 through 4 remain eligible for reading with their earlier snapshot shapes
+/// Readers that do not support version 5 may reject these snapshots
+pub const JOB_SNAPSHOT_VERSION: u32 = 5;
 
 pub(super) const fn supports_job_snapshot_version(version: u32) -> bool {
-    matches!(version, 1 | 2 | 3 | JOB_SNAPSHOT_VERSION)
+    matches!(version, 1 | 2 | 3 | 4 | JOB_SNAPSHOT_VERSION)
 }
 
 /// Whether a cached stage contains its complete result or only resumable work
