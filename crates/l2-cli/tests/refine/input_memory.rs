@@ -154,7 +154,8 @@ fn enlarged_manifest_is_rejected_before_a_recheck_reads_it() -> Result<(), Box<d
     std::fs::write(&manifest, &replacement)?;
     let before = job.snapshot()?.counters;
     let error = super::ensure_manifest_unchanged(&input, &job)
-        .expect_err("a differently sized manifest must be rejected");
+        .err()
+        .ok_or("a differently sized manifest must be rejected")?;
     assert!(error.to_string().contains("manifest changed"));
     let after = job.snapshot()?.counters;
     assert_eq!(

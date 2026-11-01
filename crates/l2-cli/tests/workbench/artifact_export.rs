@@ -249,7 +249,7 @@ fn analyzer_receipt_for_another_blob_cannot_promote_garbage_to_validated_png()
         let node_id = case.add_bytes_node("record_object", &bytes, Vec::new(), json!({}))?;
         let receipt = AnalyzerValidationReceipt::new(
             node_id,
-            sha256,
+            &sha256,
             bytes.len(),
             ValidationSummary {
                 state: ArtifactValidationState::Validated,

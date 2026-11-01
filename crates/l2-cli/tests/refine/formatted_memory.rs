@@ -59,7 +59,8 @@ fn failed_formatting_releases_only_its_message_charge() -> Result<(), Box<dyn Er
     let memory = MemoryBudget::new(198);
     let mut lease = memory.try_reserve(MemoryClass::Executor, 7)?;
     let error = format_message(format_args!("{Fragments}"), &mut lease)
-        .expect_err("overlapping message buffers must exceed the limit");
+        .err()
+        .ok_or("overlapping message buffers must exceed the limit")?;
     assert!(matches!(
         crate::memory_error::find(error.as_ref()),
         Some(MemoryError::Limit { .. })

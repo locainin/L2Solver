@@ -1,6 +1,7 @@
 //! Refinement identity, provenance manifest, and user-facing summaries
 
 use super::{
+    analysis_memory,
     analysis::{
         CACHE_ANALYSIS_SCHEMA_VERSION, REFINE_ANALYZER_ALGORITHM_VERSION, recovery_profile_name,
     },
@@ -16,13 +17,12 @@ use crate::{
 };
 use l2_workbench::{
     artifact::{AnalysisOmission, AnalysisStatus, ArtifactOrigin},
-    job::cache::SourceIdentity,
+    job::{MemoryBudget, MemoryClass, MemoryLease, cache::SourceIdentity},
     recovery::proposals::TRANSFORM_PROPOSAL_FORMAT_VERSION,
 };
 use serde::Serialize;
 use serde_json::json;
 use std::{
-    collections::HashMap,
     error::Error,
     fs::File,
     io::{self, Write},
@@ -66,13 +66,16 @@ pub(super) struct RefineManifest<'a> {
     complete: bool,
     sources: &'a [SourceRecord],
     artifacts: Vec<PublishedArtifactRecord<'a>>,
+    // Manifest records drop before their shared memory charge
+    #[serde(skip)]
+    _memory: MemoryLease,
 }
 
 #[derive(Serialize)]
 struct PublishedArtifactRecord<'a> {
     file: &'a str,
     byte_length: usize,
-    sha256: String,
+    sha256: &'a str,
     origins: Vec<PublishedOriginRecord<'a>>,
     nodes: &'a [artifact_export::ArtifactProvenance],
 }
@@ -221,44 +224,27 @@ pub(super) fn make_manifest<'a>(
     sources: &'a [SourceRecord],
     artifacts: &'a [ArtifactRecord],
     complete: bool,
+    budget: &MemoryBudget,
 ) -> Result<RefineManifest<'a>, Box<dyn Error>> {
-    let mut records_by_node: HashMap<u64, Vec<&ArtifactRecord>> = HashMap::new();
-    records_by_node
-        .try_reserve(artifacts.len())
-        .map_err(|_| io::Error::other("manifest provenance allocation failed"))?;
-    for artifact in artifacts {
-        let records = records_by_node.entry(artifact.node_id).or_default();
-        records
-            .try_reserve(1)
-            .map_err(|_| io::Error::other("manifest provenance allocation failed"))?;
-        records.push(artifact);
-    }
-
+    let mut memory = budget.try_reserve(MemoryClass::Publication, 0)?;
     let mut published = Vec::new();
-    published
-        .try_reserve_exact(
-            selected
-                .len()
-                .checked_add(file_artifacts.len())
-                .ok_or_else(|| invalid_input("artifact count overflows"))?,
-        )
-        .map_err(|_| io::Error::other("manifest artifact allocation failed"))?;
+    let artifact_count = selected
+        .len()
+        .checked_add(file_artifacts.len())
+        .ok_or_else(|| invalid_input("artifact count overflows"))?;
+    analysis_memory::grow_vec_exact(&mut published, &mut memory, artifact_count)?;
     for selected_artifact in selected {
         let provenance = selected_artifact.provenance();
         let origin_count = provenance
             .iter()
-            .filter_map(|item| records_by_node.get(&item.id))
-            .try_fold(0_usize, |count, records| count.checked_add(records.len()))
+            .try_fold(0_usize, |count, item| {
+                count.checked_add(records_for_node(artifacts, item.id).count())
+            })
             .ok_or_else(|| invalid_input("artifact origin count overflows"))?;
         let mut origins = Vec::new();
-        origins
-            .try_reserve_exact(origin_count)
-            .map_err(|_| io::Error::other("manifest origin allocation failed"))?;
+        analysis_memory::grow_vec_exact(&mut origins, &mut memory, origin_count)?;
         for item in provenance {
-            let Some(records) = records_by_node.get(&item.id) else {
-                continue;
-            };
-            for artifact in records {
+            for artifact in records_for_node(artifacts, item.id) {
                 let source = sources
                     .get(artifact.source_index)
                     .ok_or_else(|| invalid_input("artifact source index is missing"))?;
@@ -275,12 +261,12 @@ pub(super) fn make_manifest<'a>(
         published.push(PublishedArtifactRecord {
             file: selected_artifact.file_name(),
             byte_length: selected_artifact.bytes().len(),
-            sha256: selected_artifact.sha256().to_owned(),
+            sha256: selected_artifact.sha256(),
             origins,
             nodes: provenance,
         });
     }
-    append_file_records(&mut published, file_artifacts, sources)?;
+    append_file_records(&mut published, file_artifacts, sources, &mut memory)?;
     Ok(RefineManifest {
         schema_version: if sources.iter().all(|source| source.sha256.is_some()) {
             1
@@ -290,20 +276,34 @@ pub(super) fn make_manifest<'a>(
         complete,
         sources,
         artifacts: published,
+        _memory: memory,
     })
+}
+
+fn records_for_node(
+    artifacts: &[ArtifactRecord],
+    node_id: u64,
+) -> impl Iterator<Item = &ArtifactRecord> {
+    // Analysis appends each node's records together in increasing node order
+    let start = artifacts.partition_point(|artifact| artifact.node_id < node_id);
+    artifacts
+        .iter()
+        .skip(start)
+        .take_while(move |artifact| artifact.node_id == node_id)
 }
 
 fn append_file_records<'a>(
     published: &mut Vec<PublishedArtifactRecord<'a>>,
     file_artifacts: &'a [FileArtifact],
     sources: &'a [SourceRecord],
+    memory: &mut MemoryLease,
 ) -> Result<(), Box<dyn Error>> {
     for artifact in file_artifacts {
         let source = sources
             .get(artifact.source_index)
             .ok_or_else(|| invalid_input("artifact source index is missing"))?;
         let mut origins = Vec::new();
-        origins.try_reserve_exact(artifact.origins.len())?;
+        analysis_memory::grow_vec_exact(&mut origins, memory, artifact.origins.len())?;
         for origin in &artifact.origins {
             origins.push(PublishedOriginRecord {
                 source_index: artifact.source_index,
@@ -317,7 +317,7 @@ fn append_file_records<'a>(
         published.push(PublishedArtifactRecord {
             file: &artifact.file_name,
             byte_length: artifact.range.length,
-            sha256: artifact.sha256.clone(),
+            sha256: &artifact.sha256,
             origins,
             nodes: &artifact.provenance,
         });
@@ -339,62 +339,58 @@ pub(super) fn write_manifest(
     Ok(())
 }
 
-pub(super) fn write_summary_file(staging: &Path, summary: &str) -> Result<(), Box<dyn Error>> {
-    let mut file = File::options()
-        .write(true)
-        .create_new(true)
-        .open(staging.join("summary.txt"))?;
-    file.write_all(summary.as_bytes())?;
-    file.sync_all()?;
-    Ok(())
-}
-
-pub(super) fn format_summary(
+pub(super) fn write_summary_file(
+    staging: &Path,
     destination: &Path,
     selected: &[SelectedArtifact<'_>],
     file_artifacts: &[FileArtifact],
     sources: &[SourceRecord],
     complete: bool,
-) -> String {
+) -> Result<(), Box<dyn Error>> {
+    let mut file = File::options()
+        .write(true)
+        .create_new(true)
+        .open(staging.join("summary.txt"))?;
     let status = if complete { "complete" } else { "incomplete" };
-    let mut summary = format!(
-        "Refined artifacts\nDirectory: {}\nSources: {}; files: {}; status: {status}\n",
-        destination.display().to_string().escape_debug(),
+    // Write each line directly so the full summary is never retained in memory
+    writeln!(
+        file,
+        "Refined artifacts\nDirectory: {}\nSources: {}; files: {}; status: {status}",
+        destination.to_string_lossy().escape_debug(),
         sources.len(),
         selected.len() + file_artifacts.len(),
-    );
+    )?;
     for source in sources {
-        summary.push_str("Source: ");
-        summary.push_str(&source.label.escape_debug().to_string());
-        summary.push_str("; SHA-256: ");
-        summary.push_str(source.sha256.as_deref().unwrap_or("not read"));
-        summary.push_str("; bytes: ");
-        summary.push_str(&source.byte_length.to_string());
-        summary.push_str("; analysis: ");
-        summary.push_str(match source.status {
+        let analysis = match source.status {
             AnalysisStatus::Complete => "complete",
             AnalysisStatus::Unsupported => "unsupported",
             AnalysisStatus::Partial => "partial",
-        });
+        };
+        write!(
+            file,
+            "Source: {}; SHA-256: {}; bytes: {}; analysis: {analysis}",
+            source.label.escape_debug(),
+            source.sha256.as_deref().unwrap_or("not read"),
+            source.byte_length,
+        )?;
         if let Some(reason) = &source.reason {
-            summary.push_str("; reason: ");
-            summary.push_str(&reason.escape_debug().to_string());
+            write!(file, "; reason: {}", reason.escape_debug())?;
         }
-        summary.push('\n');
+        writeln!(file)?;
     }
     for artifact in selected {
-        summary.push_str("  ");
-        summary.push_str(artifact.file_name());
-        summary.push_str(" <- ");
-        summary.push_str(&artifact.provenance().len().to_string());
-        summary.push_str(" source reference(s)\n");
+        writeln!(
+            file,
+            "  {} <- {} source reference(s)",
+            artifact.file_name(),
+            artifact.provenance().len(),
+        )?;
     }
     for artifact in file_artifacts {
-        summary.push_str("  ");
-        summary.push_str(&artifact.file_name);
-        summary.push_str(" <- 1 source reference(s)\n");
+        writeln!(file, "  {} <- 1 source reference(s)", artifact.file_name)?;
     }
-    summary
+    file.sync_all()?;
+    Ok(())
 }
 
 pub(super) fn write_summary(

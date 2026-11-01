@@ -126,19 +126,26 @@ fn exact_origin_growth_requires_old_and_new_buffers_to_overlap() -> TestResult {
     Ok(())
 }
 
-#[test]
-fn moved_origin_and_digest_stay_charged_until_analysis_drops() -> TestResult {
-    let input = artifact(member_origin(40));
-    let budget = MemoryBudget::new(64 * 1024);
-    let mut analysis = AnalyzedSources::new(4_096, 0, &budget)?;
+fn analysis_with_one_record(budget: &MemoryBudget) -> Result<AnalyzedSources, Box<dyn Error>> {
+    analysis_with_record_origins(budget, 1)
+}
+
+fn analysis_with_record_origins(
+    budget: &MemoryBudget,
+    count: usize,
+) -> Result<AnalyzedSources, Box<dyn Error>> {
+    let mut input = artifact(member_origin(40));
+    input.origins = (0..count).map(|_| member_origin(40)).collect();
+    let mut analysis = AnalyzedSources::new(4_096, 0, budget)?;
     let owned = input.bytes.capacity()
         + input.sha256.capacity()
         + input.origins.capacity() * size_of::<ArtifactOrigin>()
         + input
             .origins
-            .first()
-            .ok_or("origin missing")?
-            .owned_heap_bytes()
+            .iter()
+            .try_fold(0_usize, |total, origin| {
+                total.checked_add(origin.owned_heap_bytes()?)
+            })
             .ok_or("origin size overflow")?;
     let artifacts = vec![input];
     let owned = owned + artifacts.capacity() * size_of::<AnalyzedArtifact>();
@@ -160,6 +167,13 @@ fn moved_origin_and_digest_stay_charged_until_analysis_drops() -> TestResult {
     };
     analysis.append_artifacts(0, &mut report)?;
     drop(report);
+    Ok(analysis)
+}
+
+#[test]
+fn moved_origin_and_digest_stay_charged_until_analysis_drops() -> TestResult {
+    let budget = MemoryBudget::new(64 * 1024);
+    let analysis = analysis_with_one_record(&budget)?;
     let record = analysis
         .artifact_records
         .first()
@@ -176,6 +190,43 @@ fn moved_origin_and_digest_stay_charged_until_analysis_drops() -> TestResult {
     );
     drop(analysis);
     assert_eq!(budget.snapshot()?.used_bytes, 0);
+    Ok(())
+}
+
+#[test]
+fn validation_receipts_require_and_retain_the_shared_publication_charge() -> TestResult {
+    let budget = MemoryBudget::new(64 * 1024);
+    let analysis = analysis_with_one_record(&budget)?;
+    let baseline = budget.snapshot()?.used_bytes;
+    let blocker = budget.try_reserve(MemoryClass::Cache, budget.snapshot()?.limit_bytes - baseline)?;
+
+    let error = analysis
+        .analyzer_validation_receipts()
+        .err()
+        .ok_or("receipt creation ignored the shared memory budget")?;
+    assert!(matches!(
+        crate::memory_error::find(error.as_ref()),
+        Some(MemoryError::Limit { .. })
+    ));
+    drop(blocker);
+    assert_eq!(budget.snapshot()?.used_bytes, baseline);
+
+    let receipts = analysis.analyzer_validation_receipts()?;
+    assert_eq!(receipts.len(), 1);
+    assert!(budget.snapshot()?.used(MemoryClass::Publication) > 0);
+    drop(receipts);
+    assert_eq!(budget.snapshot()?.used_bytes, baseline);
+    drop(analysis);
+    assert_eq!(budget.snapshot()?.used_bytes, 0);
+    Ok(())
+}
+
+#[test]
+fn validation_receipts_keep_one_entry_for_multiple_origins_of_one_node() -> TestResult {
+    let budget = MemoryBudget::new(64 * 1024);
+    let analysis = analysis_with_record_origins(&budget, 3)?;
+    assert_eq!(analysis.artifact_records.len(), 3);
+    assert_eq!(analysis.analyzer_validation_receipts()?.len(), 1);
     Ok(())
 }
 

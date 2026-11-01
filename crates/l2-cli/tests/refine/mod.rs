@@ -18,6 +18,7 @@ use super::{
 mod early_reuse;
 mod large_formats;
 mod memory;
+mod publication_memory;
 mod range_analysis;
 mod range_archive_provenance;
 mod range_members;

@@ -29,18 +29,18 @@ pub struct SelectedArtifact<'a> {
 
 /// Existing analyzer validation bound to the exact case blob it inspected
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct AnalyzerValidationReceipt {
+pub struct AnalyzerValidationReceipt<'a> {
     node_id: u64,
-    sha256: String,
+    sha256: &'a str,
     byte_length: usize,
     summary: ValidationSummary,
 }
 
-impl AnalyzerValidationReceipt {
+impl<'a> AnalyzerValidationReceipt<'a> {
     /// Bind a validation summary to the analyzed node, digest, and byte length
     pub const fn new(
         node_id: u64,
-        sha256: String,
+        sha256: &'a str,
         byte_length: usize,
         summary: ValidationSummary,
     ) -> Self {
@@ -98,7 +98,7 @@ pub fn select_artifacts(case: &Case) -> Result<Vec<SelectedArtifact<'_>>, Box<dy
 /// Reuse trusted analyzer validation when publishing the same case blobs
 pub fn select_artifacts_with_analyzer_receipts<'a>(
     case: &'a Case,
-    receipts: &[AnalyzerValidationReceipt],
+    receipts: &[AnalyzerValidationReceipt<'_>],
 ) -> Result<Vec<SelectedArtifact<'a>>, Box<dyn Error>> {
     let mut work = SelectionWorkCache::default();
     select_artifacts_with_receipts_and_cache(case, receipts, &mut work)
@@ -113,7 +113,7 @@ pub(super) fn select_artifacts_with_cache<'a>(
 
 fn select_artifacts_with_receipts_and_cache<'a>(
     case: &'a Case,
-    receipts: &[AnalyzerValidationReceipt],
+    receipts: &[AnalyzerValidationReceipt<'_>],
     work: &mut SelectionWorkCache<'a>,
 ) -> Result<Vec<SelectedArtifact<'a>>, Box<dyn Error>> {
     // Indexes resolve node references without rescanning the case for each object
@@ -201,9 +201,9 @@ fn select_artifacts_with_receipts_and_cache<'a>(
     Ok(artifacts)
 }
 
-fn analyzer_receipts_by_node(
-    receipts: &[AnalyzerValidationReceipt],
-) -> Result<HashMap<u64, &AnalyzerValidationReceipt>, Box<dyn Error>> {
+fn analyzer_receipts_by_node<'a, 'digest>(
+    receipts: &'a [AnalyzerValidationReceipt<'digest>],
+) -> Result<HashMap<u64, &'a AnalyzerValidationReceipt<'digest>>, Box<dyn Error>> {
     let mut by_node = HashMap::new();
     by_node.try_reserve(receipts.len())?;
     for receipt in receipts {
@@ -217,7 +217,7 @@ fn export_specs<'a>(
     nodes_by_id: &HashMap<u64, &'a Node>,
     bytes_by_id: &HashMap<&'a str, &'a [u8]>,
     edges: ExportEdges<'_>,
-    analysis_receipts: &HashMap<u64, &AnalyzerValidationReceipt>,
+    analysis_receipts: &HashMap<u64, &AnalyzerValidationReceipt<'_>>,
     validation: &mut SelectionValidation<'_, 'a>,
 ) -> HashMap<u64, ExportSpec> {
     let signature_extensions =
@@ -262,7 +262,7 @@ fn direct_export_specs<'a>(
     case: &'a Case,
     signature_extensions: &HashMap<u64, SignatureExtension>,
     bytes_by_id: &HashMap<&'a str, &'a [u8]>,
-    analysis_receipts: &HashMap<u64, &AnalyzerValidationReceipt>,
+    analysis_receipts: &HashMap<u64, &AnalyzerValidationReceipt<'_>>,
     validation: &mut SelectionValidation<'_, 'a>,
 ) -> HashMap<u64, ExportSpec> {
     let mut specs = HashMap::new();
@@ -323,7 +323,7 @@ fn direct_export_specs<'a>(
 
 fn analyzer_export_validation(
     node: &Node,
-    receipt: &AnalyzerValidationReceipt,
+    receipt: &AnalyzerValidationReceipt<'_>,
     bytes_by_id: &HashMap<&str, &[u8]>,
 ) -> Option<AnalyzerExportValidation> {
     let blob_id = node.blob.as_deref()?;

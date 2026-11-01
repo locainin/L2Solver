@@ -56,7 +56,7 @@ fn failed_source_append_releases_report_memory_after_its_buffers() -> Result<(),
         MemoryClass::Cache,
         snapshot.limit_bytes - snapshot.used_bytes,
     )?;
-    let blocked = blocker.bytes();
+    let reserved_bytes = blocker.bytes();
     let outcome = sources.append_source(
         0,
         &source,
@@ -69,7 +69,7 @@ fn failed_source_append_releases_report_memory_after_its_buffers() -> Result<(),
         &memory,
     );
     assert!(outcome.is_err());
-    assert_eq!(memory.snapshot()?.used_bytes, baseline + blocked);
+    assert_eq!(memory.snapshot()?.used_bytes, baseline + reserved_bytes);
     drop(blocker);
     drop(sources);
     assert_eq!(memory.snapshot()?.used_bytes, 0);

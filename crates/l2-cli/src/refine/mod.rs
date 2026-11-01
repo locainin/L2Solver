@@ -262,6 +262,7 @@ fn analyze_and_publish<W: Write>(
         &analyzed.case,
         &validation_receipts,
     )?;
+    drop(validation_receipts);
     job.start(Phase::Reports, Some(1))?;
     let manifest = output::make_manifest(
         &selected,
@@ -269,14 +270,8 @@ fn analyze_and_publish<W: Write>(
         &analyzed.source_records,
         &analyzed.artifact_records,
         analyzed.complete,
+        memory,
     )?;
-    let summary = output::format_summary(
-        destination,
-        &selected,
-        &analyzed.file_artifacts,
-        &analyzed.source_records,
-        analyzed.complete,
-    );
     job.advance(Phase::Reports, 1)?;
     job.finish(Phase::Reports, PhaseOutcome::Completed)?;
 
@@ -294,7 +289,14 @@ fn analyze_and_publish<W: Write>(
                 publication_buffer.bytes_mut(),
             )?;
             output::write_manifest(staging, &manifest)?;
-            output::write_summary_file(staging, &summary)?;
+            output::write_summary_file(
+                staging,
+                destination,
+                &selected,
+                &analyzed.file_artifacts,
+                &analyzed.source_records,
+                analyzed.complete,
+            )?;
             if !analyzed.file_artifacts.is_empty() {
                 ensure_input_unchanged(input_set, sampled, policy, job)?;
             }

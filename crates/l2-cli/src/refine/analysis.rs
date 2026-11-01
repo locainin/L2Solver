@@ -24,11 +24,11 @@ use l2_workbench::{
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::{
-    collections::HashSet,
     error::Error,
     fmt,
     fs::File,
     io::{self, Write},
+    ops::Deref,
 };
 
 pub(super) const REFINE_ANALYZER_ALGORITHM_VERSION: u32 = 14;
@@ -388,6 +388,20 @@ pub(super) struct AnalyzedSources {
     retained_memory: MemoryLease,
 }
 
+pub(super) struct AnalyzerValidationReceipts<'a> {
+    receipts: Vec<AnalyzerValidationReceipt<'a>>,
+    // The vector drops before its shared memory charge
+    _memory: MemoryLease,
+}
+
+impl<'a> Deref for AnalyzerValidationReceipts<'a> {
+    type Target = [AnalyzerValidationReceipt<'a>];
+
+    fn deref(&self) -> &Self::Target {
+        &self.receipts
+    }
+}
+
 impl AnalyzedSources {
     pub(super) fn new(
         case_blob_limit: usize,
@@ -618,28 +632,32 @@ impl AnalyzedSources {
 
     pub(super) fn analyzer_validation_receipts(
         &self,
-    ) -> Result<Vec<AnalyzerValidationReceipt>, Box<dyn Error>> {
-        let mut seen_nodes = HashSet::new();
-        seen_nodes.try_reserve(self.artifact_records.len())?;
+    ) -> Result<AnalyzerValidationReceipts<'_>, Box<dyn Error>> {
+        let mut memory = self.memory.try_reserve(MemoryClass::Publication, 0)?;
         let mut receipts = Vec::new();
-        receipts
-            .try_reserve_exact(self.artifact_records.len())
-            .map_err(|_| io::Error::other("artifact validation allocation failed"))?;
-
-        for artifact in &self.artifact_records {
-            if artifact.validation.state != ArtifactValidationState::Validated
-                || !seen_nodes.insert(artifact.node_id)
-            {
+        // append_artifacts adds each node's origins together in increasing node order
+        for group in self
+            .artifact_records
+            .chunk_by(|left, right| left.node_id == right.node_id)
+        {
+            let Some(artifact) = group
+                .iter()
+                .find(|artifact| artifact.validation.state == ArtifactValidationState::Validated)
+            else {
                 continue;
-            }
+            };
+            super::analysis_memory::grow_vec(&mut receipts, &mut memory, 1)?;
             receipts.push(AnalyzerValidationReceipt::new(
                 artifact.node_id,
-                artifact.sha256.clone(),
+                &artifact.sha256,
                 artifact.byte_length,
                 artifact.validation,
             ));
         }
-        Ok(receipts)
+        Ok(AnalyzerValidationReceipts {
+            receipts,
+            _memory: memory,
+        })
     }
 
     fn append_skipped_source(
