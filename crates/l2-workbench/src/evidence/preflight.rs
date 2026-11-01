@@ -4,6 +4,7 @@ use super::{
     CaseResourceLimits, EvidenceError, MAX_BLOBS, MAX_NODE_DETAILS_BYTES, MAX_NODES,
     MAX_TOTAL_DETAILS_BYTES, bounded,
 };
+use crate::serialization::base64::decoded_length;
 use serde::Deserialize;
 use serde_json::value::RawValue;
 
@@ -47,8 +48,7 @@ pub(super) fn check_details(bytes: &[u8]) -> Result<(), EvidenceError> {
     }
     let mut blob_bytes = 0_usize;
     for blob in raw.blobs {
-        let decoded =
-            bounded::decoded_base64_length(blob.encoded).ok_or(EvidenceError::InvalidJson)?;
+        let decoded = decoded_length(blob.encoded).ok_or(EvidenceError::InvalidJson)?;
         blob_bytes = blob_bytes
             .checked_add(decoded)
             .ok_or(EvidenceError::ArithmeticOverflow {

@@ -4,6 +4,7 @@ use super::{
     RelationalTransformEvaluationOptions, TestResult, assert_resume_rejected, borrow_samples,
     checkpoint_fixture, decode_assessment, evaluate, rehash, search_plan, synthetic_sessions,
 };
+use base64::{Engine as _, engine::general_purpose::STANDARD};
 use l2_workbench::job::{JsonMemoryError, MemoryBudget};
 use l2_workbench::protocol::{Direction, RelationalCounterReset};
 use sha2::{Digest, Sha256};
@@ -177,7 +178,7 @@ fn changed_output_with_matching_hash_is_not_a_valid_rule_result() -> TestResult<
         .ok_or("missing candidates")?;
     let candidate = candidates
         .iter_mut()
-        .find(|candidate| candidate.pointer("/outputs/discovery/0/bytes/0").is_some())
+        .find(|candidate| candidate.pointer("/outputs/discovery/0/bytes").is_some())
         .ok_or("fixture has no retained output")?;
     let output = candidate
         .pointer_mut("/outputs/discovery/0")
@@ -186,16 +187,10 @@ fn changed_output_with_matching_hash_is_not_a_valid_rule_result() -> TestResult<
         .get("session")
         .ok_or("missing output session")?
         .clone();
-    let payload = output
-        .get_mut("bytes")
-        .and_then(serde_json::Value::as_array_mut)
-        .ok_or("missing output bytes")?;
-    let byte = payload.first_mut().ok_or("empty output")?;
-    *byte = serde_json::json!(byte.as_u64().ok_or("bad output byte")? ^ 1);
-    let bytes = payload
-        .iter()
-        .map(|value| u8::try_from(value.as_u64().ok_or("bad output byte")?).map_err(Into::into))
-        .collect::<TestResult<Vec<u8>>>()?;
+    let payload = output.get_mut("bytes").ok_or("missing output bytes")?;
+    let mut bytes = STANDARD.decode(payload.as_str().ok_or("invalid output encoding")?)?;
+    *bytes.first_mut().ok_or("empty output")? ^= 1;
+    *payload = serde_json::json!(STANDARD.encode(&bytes));
     let digest = format!("{:x}", Sha256::digest(&bytes));
     let checks = candidate
         .pointer_mut("/candidate/discovery/checks")
@@ -238,10 +233,10 @@ fn cancellation_stops_restored_assessment_conversion_between_candidates() -> Tes
         CHECKPOINT_LIMIT,
         &memory,
         &mut RelationalRestoreBudget::new(usize::MAX, usize::MAX),
-        |candidate, outputs, value, work| {
+        |context, candidate, outputs, value, work| {
             decoded += 1;
             job.request_cancel();
-            decode_assessment(candidate, outputs, value, work)
+            decode_assessment(context, candidate, outputs, value, work)
         },
     );
     assert!(matches!(result, Err(RelationalCursorError::Search(_))));
@@ -341,7 +336,8 @@ fn valid_output_replays_across_record_and_chunk_boundaries_in_both_reset_modes()
             candidates.iter().any(|candidate| {
                 candidate
                     .pointer("/outputs/discovery/0/bytes")
-                    .and_then(serde_json::Value::as_array)
+                    .and_then(serde_json::Value::as_str)
+                    .and_then(|bytes| STANDARD.decode(bytes).ok())
                     .is_some_and(|bytes| bytes.len() > 4_096)
             }),
             "fixture did not retain a multi-chunk output"

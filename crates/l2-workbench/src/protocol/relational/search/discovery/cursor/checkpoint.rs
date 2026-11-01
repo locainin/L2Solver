@@ -4,9 +4,9 @@ use super::{
     CURSOR_VERSION, CandidateId, LocatorCandidate, LocatorPairSchedule, PairPosition, PairStage,
     Position, RankedPairEntry, RelationalCandidateOutputs, RelationalCursorError, RelationalFit,
     RelationalFitStatus, RelationalRestoreBudget, RelationalSearchCursor, RelationalSearchSession,
-    RelationalSessionId, RelationalTransformCandidate, RelationalTransformRule,
-    RelationalTransformStatus, RetainedCandidate, SearchState, history_identity,
-    restoration_scratch_bytes, validate_cursor,
+    RelationalSessionId, RelationalTransformCandidate, RelationalTransformEvaluationContext,
+    RelationalTransformRule, RelationalTransformStatus, RetainedCandidate, SearchState,
+    history_identity, restoration_scratch_bytes, validate_cursor,
 };
 use crate::job::{
     Job, JobError, JsonMemoryError, MemoryBudget, MemoryClass, MemoryError, MemoryLease, admit_json,
@@ -268,7 +268,10 @@ impl<T> Serialize for RetainedSeq<'_, T> {
                 candidate: CandidateRef::from(&candidate.candidate),
                 priority: candidate.priority,
                 assessment,
-                outputs: &candidate.outputs,
+                outputs: candidate
+                    .outputs
+                    .as_ref()
+                    .map(super::output_codec::CandidateOutputsRef::from),
                 captured_output_bytes: candidate.captured_output_bytes,
                 output_capture_omitted: candidate.output_capture_omitted,
                 search_order: candidate.search_order,
@@ -282,7 +285,7 @@ struct RetainedRef<'a> {
     candidate: CandidateRef<'a>,
     priority: u8,
     assessment: &'a EncodedAssessment,
-    outputs: &'a Option<RelationalCandidateOutputs>,
+    outputs: Option<super::output_codec::CandidateOutputsRef<'a>>,
     captured_output_bytes: usize,
     output_capture_omitted: bool,
     search_order: usize,
@@ -699,6 +702,8 @@ impl RelationalSearchSession<'_, '_> {
     /// cancellation immediately before and after each parse
     /// The decoder receives the same work meter and can return `RestoreWorkLimit` if its own
     /// evidence validation cannot fit in the remaining allowance
+    /// Its context borrows the validated session partition and reports remaining search work at
+    /// the checkpoint boundary, not the work remaining during the original candidate evaluation
     ///
     /// # Errors
     /// Returns an error for incompatible data, denied memory, cancellation, or decoder failure
@@ -716,6 +721,7 @@ impl RelationalSearchSession<'_, '_> {
     ) -> Result<(RelationalSearchCursor<T>, MemoryLease), RelationalCursorError<E>>
     where
         F: FnMut(
+            &RelationalTransformEvaluationContext<'_>,
             &RelationalTransformCandidate,
             Option<&RelationalCandidateOutputs>,
             Value,
@@ -730,7 +736,7 @@ impl RelationalSearchSession<'_, '_> {
             return Err(RelationalCursorError::InvalidCheckpoint);
         }
         check_job(self.job)?;
-        // Reserve the parsed representation before serde creates any owned values
+        // Admit escaped-string scratch and retained bytes before the Base64 decoder runs
         let admission =
             admit_json(bytes, memory, MemoryClass::Executor).map_err(|error| match error {
                 JsonMemoryError::InvalidJson { .. } => RelationalCursorError::InvalidCheckpoint,
@@ -876,7 +882,13 @@ impl RelationalSearchSession<'_, '_> {
                 self.prepared = Some(prepared);
                 return Err(error);
             }
+            let context = RelationalTransformEvaluationContext {
+                discovery_sessions: &prepared.discovery_sessions,
+                heldout_sessions: &prepared.heldout_sessions,
+                work_bytes_remaining: self.plan.limits.max_work_bytes - saved.search.work_bytes,
+            };
             let decoded = decode(
+                &context,
                 &retained.candidate,
                 retained.outputs.as_ref(),
                 retained.assessment,

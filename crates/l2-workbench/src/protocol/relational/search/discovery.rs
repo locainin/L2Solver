@@ -80,6 +80,7 @@ struct RetainedCandidate<T> {
     candidate: RelationalTransformCandidate,
     priority: u8,
     assessment: T,
+    #[serde(deserialize_with = "cursor::deserialize_outputs")]
     outputs: Option<RelationalCandidateOutputs>,
     captured_output_bytes: usize,
     output_capture_omitted: bool,

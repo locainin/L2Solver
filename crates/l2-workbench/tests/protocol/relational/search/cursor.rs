@@ -8,7 +8,7 @@ use l2_workbench::{
     protocol::{
         RelationalCandidateOutputs, RelationalCursorError, RelationalReplayHistory,
         RelationalRestoreBudget, RelationalSearchSession, RelationalSearchStep,
-        RelationalTransformCandidate,
+        RelationalTransformCandidate, RelationalTransformEvaluationContext,
         infer_relational_transform_candidates_with_evaluator_and_history,
     },
 };
@@ -28,6 +28,8 @@ type CheckpointFixture = (
 
 #[path = "cursor/absolute_resume.rs"]
 mod absolute_resume;
+#[path = "cursor/compact.rs"]
+mod compact;
 #[path = "cursor/corruption.rs"]
 mod corruption;
 #[path = "cursor/resources.rs"]
@@ -44,6 +46,7 @@ fn evaluate(candidate: &RelationalTransformCandidate) -> RelationalCandidateEval
 }
 
 fn decode_assessment(
+    _: &RelationalTransformEvaluationContext<'_>,
     _: &RelationalTransformCandidate,
     _: Option<&RelationalCandidateOutputs>,
     value: serde_json::Value,
@@ -103,9 +106,9 @@ fn assert_resume_rejected(
         CHECKPOINT_LIMIT,
         &memory,
         &mut RelationalRestoreBudget::new(usize::MAX, usize::MAX),
-        |candidate, outputs, value, work| {
+        |context, candidate, outputs, value, work| {
             calls += 1;
-            decode_assessment(candidate, outputs, value, work)
+            decode_assessment(context, candidate, outputs, value, work)
         },
     );
     assert!(matches!(
@@ -147,20 +150,22 @@ fn rejects_corrupt_and_oversized_checkpoints() -> TestResult<()> {
             )
             .is_err()
     );
-    let mut incompatible: serde_json::Value = serde_json::from_slice(&bytes)?;
-    *incompatible.get_mut("version").ok_or("missing version")? = serde_json::json!(999);
-    let incompatible = serde_json::to_vec(&incompatible)?;
-    assert!(
-        session
-            .restore_checkpoint(
-                &incompatible,
-                CHECKPOINT_LIMIT,
-                &memory,
-                &mut RelationalRestoreBudget::new(usize::MAX, usize::MAX),
-                decode_assessment
-            )
-            .is_err()
-    );
+    for version in [2, 999] {
+        let mut incompatible: serde_json::Value = serde_json::from_slice(&bytes)?;
+        *incompatible.get_mut("version").ok_or("missing version")? = serde_json::json!(version);
+        let incompatible = serde_json::to_vec(&incompatible)?;
+        assert!(
+            session
+                .restore_checkpoint(
+                    &incompatible,
+                    CHECKPOINT_LIMIT,
+                    &memory,
+                    &mut RelationalRestoreBudget::new(usize::MAX, usize::MAX),
+                    decode_assessment
+                )
+                .is_err()
+        );
+    }
     Ok(())
 }
 

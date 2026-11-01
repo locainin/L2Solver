@@ -1,5 +1,7 @@
 use std::io::{self, Write};
 
+pub mod base64;
+
 /// Count encoded bytes without allocating an output document
 pub struct CountWriter {
     maximum: usize,

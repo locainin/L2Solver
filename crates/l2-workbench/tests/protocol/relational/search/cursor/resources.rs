@@ -105,7 +105,7 @@ fn assessment_decoder_shares_the_same_restore_work_allowance() -> TestResult<()>
         CHECKPOINT_LIMIT,
         &memory,
         &mut work,
-        |_, _, value, budget| {
+        |_, _, _, value, budget| {
             calls += 1;
             if !budget.try_charge_verification(1) || !budget.try_charge_verification(1) {
                 return Err(RelationalCursorError::RestoreWorkLimit);

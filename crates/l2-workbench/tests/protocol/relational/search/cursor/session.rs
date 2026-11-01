@@ -2,7 +2,7 @@ use super::{
     CHECKPOINT_LIMIT, Infallible, Job, RelationalParserScope, RelationalReplayHistory,
     RelationalRestoreBudget, RelationalSearchStep, RelationalTransformEvaluationOptions, SCOPE,
     TestResult, borrow_samples, decode_assessment, evaluate,
-    infer_relational_transform_candidates_with_evaluator_and_history, search_plan,
+    infer_relational_transform_candidates_with_evaluator_and_history, rehash, search_plan,
     synthetic_sessions,
 };
 use l2_workbench::{
@@ -12,7 +12,7 @@ use l2_workbench::{
     protocol::{
         Direction, RelationalCandidateEvaluationReport, RelationalCounterReset,
         RelationalCursorError, RelationalRecordSample, RelationalSearchSession,
-        RelationalTransformPlan, RelationalTransformRule,
+        RelationalSessionId, RelationalTransformPlan, RelationalTransformRule,
     },
 };
 
@@ -47,6 +47,259 @@ fn retained_candidates_plan() -> RelationalTransformPlan {
     plan.limits.max_candidates = 160;
     plan.limits.max_retained_candidates = 6;
     plan
+}
+
+#[test]
+fn cursor_partition_survives_rejected_step_and_restore() -> TestResult<()> {
+    let records = synthetic_sessions(false)?;
+    let samples = borrow_samples(&records)?;
+    let plan = retained_candidates_plan();
+    let options = RelationalTransformEvaluationOptions::default();
+    let mut session = RelationalSearchSession::new(&samples, &plan, None, options, None)?;
+    // A rejected slice leaves preparation available for a later attempt
+    assert!(
+        session
+            .step(None, 0, |_, candidate, _, _| {
+                Ok::<_, Infallible>(evaluate(candidate))
+            })
+            .is_err()
+    );
+    let mut calls = 0;
+    let mut expected = None;
+    let RelationalSearchStep::Paused(cursor) =
+        session.step(None, 1, |context, candidate, _, _| {
+            calls += 1;
+            assert_eq!(
+                context
+                    .discovery_sessions
+                    .iter()
+                    .map(|id| id.session)
+                    .collect::<Vec<_>>(),
+                [1, 2]
+            );
+            assert_eq!(
+                context
+                    .heldout_sessions
+                    .iter()
+                    .map(|id| id.session)
+                    .collect::<Vec<_>>(),
+                [3, 4]
+            );
+            let partition = (
+                context.discovery_sessions.to_vec(),
+                context.heldout_sessions.to_vec(),
+            );
+            if let Some(expected) = &expected {
+                assert_eq!(&partition, expected);
+            } else {
+                expected = Some(partition);
+            }
+            Ok::<_, Infallible>(evaluate(candidate))
+        })?
+    else {
+        return Err("fixture did not pause".into());
+    };
+    assert!(calls > 0, "fixture did not evaluate a candidate");
+    let expected = expected.ok_or("fixture did not supply a partition")?;
+    let (discovery, heldout) = cursor.session_partition();
+    assert_eq!(discovery, expected.0.as_slice());
+    assert_eq!(heldout, expected.1.as_slice());
+
+    let memory = MemoryBudget::new(64 * 1024 * 1024);
+    let (bytes, _encoded_lease) =
+        session.encode_checkpoint(&cursor, CHECKPOINT_LIMIT, &memory, |value, writer| {
+            serde_json::to_writer(writer, value)
+        })?;
+    drop(cursor);
+    drop(session);
+
+    assert_partition_after_restore(&samples, &plan, options, &bytes, &memory, &expected)?;
+    Ok(())
+}
+
+fn assert_partition_after_restore(
+    samples: &[RelationalRecordSample<'_>],
+    plan: &RelationalTransformPlan,
+    options: RelationalTransformEvaluationOptions,
+    bytes: &[u8],
+    memory: &MemoryBudget,
+    expected: &(Vec<RelationalSessionId>, Vec<RelationalSessionId>),
+) -> TestResult<()> {
+    let mut restored = RelationalSearchSession::new(samples, plan, None, options, None)?;
+    let mut invalid: serde_json::Value = serde_json::from_slice(bytes)?;
+    *invalid
+        .pointer_mut("/payload/search/work_bytes")
+        .ok_or("missing saved work")? = serde_json::json!(plan.limits.max_work_bytes + 1);
+    assert!(
+        restored
+            .restore_checkpoint(
+                &rehash(invalid)?,
+                CHECKPOINT_LIMIT,
+                memory,
+                &mut RelationalRestoreBudget::new(usize::MAX, usize::MAX),
+                decode_assessment
+            )
+            .is_err()
+    );
+    let (cursor, _restored_lease) = restored.restore_checkpoint(
+        bytes,
+        CHECKPOINT_LIMIT,
+        memory,
+        &mut RelationalRestoreBudget::new(usize::MAX, usize::MAX),
+        decode_assessment,
+    )?;
+    let (discovery, heldout) = cursor.session_partition();
+    assert_eq!(discovery, expected.0.as_slice());
+    assert_eq!(heldout, expected.1.as_slice());
+    Ok(())
+}
+
+#[test]
+fn restored_assessments_receive_the_validated_session_partition_and_remaining_work()
+-> TestResult<()> {
+    let records = synthetic_sessions(false)?;
+    let samples = borrow_samples(&records)?;
+    let plan = retained_candidates_plan();
+    let options = RelationalTransformEvaluationOptions::default();
+    let mut original = RelationalSearchSession::new(&samples, &plan, None, options, None)?;
+    let RelationalSearchStep::Paused(cursor) = original.step(None, 32, |_, candidate, _, _| {
+        Ok::<_, Infallible>(evaluate(candidate))
+    })?
+    else {
+        return Err("fixture did not pause".into());
+    };
+    let memory = MemoryBudget::new(64 * 1024 * 1024);
+    let (bytes, _encoded_lease) =
+        original.encode_checkpoint(&cursor, CHECKPOINT_LIMIT, &memory, |value, writer| {
+            serde_json::to_writer(writer, value)
+        })?;
+    let document: serde_json::Value = serde_json::from_slice(&bytes)?;
+    let saved_work = usize::try_from(
+        document
+            .pointer("/payload/search/work_bytes")
+            .and_then(serde_json::Value::as_u64)
+            .ok_or("missing saved search work")?,
+    )?;
+    drop(cursor);
+    drop(original);
+
+    let mut restored = RelationalSearchSession::new(&samples, &plan, None, options, None)?;
+    let mut calls = 0;
+    let (_cursor, _lease) = restored.restore_checkpoint(
+        &bytes,
+        CHECKPOINT_LIMIT,
+        &memory,
+        &mut RelationalRestoreBudget::new(usize::MAX, usize::MAX),
+        |context, candidate, outputs, value, work| {
+            calls += 1;
+            let discovery = context
+                .discovery_sessions
+                .iter()
+                .map(|session| session.session)
+                .collect::<Vec<_>>();
+            let heldout = context
+                .heldout_sessions
+                .iter()
+                .map(|session| session.session)
+                .collect::<Vec<_>>();
+            assert_eq!(discovery, [1, 2]);
+            assert_eq!(heldout, [3, 4]);
+            assert!(
+                context
+                    .discovery_sessions
+                    .iter()
+                    .chain(context.heldout_sessions)
+                    .all(|session| session.source == "synthetic-source"
+                        && session.scope == "synthetic-scope")
+            );
+            assert_eq!(
+                context.work_bytes_remaining,
+                plan.limits.max_work_bytes - saved_work
+            );
+            decode_assessment(context, candidate, outputs, value, work)
+        },
+    )?;
+    assert!(calls > 0, "fixture had no retained assessments");
+    Ok(())
+}
+
+#[test]
+fn restored_empty_cursor_exposes_the_validated_session_partition() -> TestResult<()> {
+    let mut records = synthetic_sessions(false)?;
+    for (_, _, bytes) in &mut records {
+        // Short decoys would fit in the final counter block
+        bytes.resize(64, 0x77);
+    }
+    let samples = borrow_samples(&records)?;
+    let mut plan = retained_candidates_plan();
+    // A one-byte counter starting at its maximum cannot process these long sessions
+    plan.counter_widths = vec![CounterWidth::OneByte];
+    plan.initial_counters = vec![u64::from(u8::MAX)];
+    plan.counter_resets = vec![RelationalCounterReset::Continuous];
+    plan.limits.max_locator_offset = 1;
+    let options = RelationalTransformEvaluationOptions::default();
+    let mut original = RelationalSearchSession::new(&samples, &plan, None, options, None)?;
+    let mut evaluated = 0;
+    let RelationalSearchStep::Paused(cursor) = original.step(None, 1, |_, candidate, _, _| {
+        evaluated += 1;
+        Ok::<_, Infallible>(evaluate(candidate))
+    })?
+    else {
+        return Err("empty fixture did not pause".into());
+    };
+    assert_eq!(evaluated, 0);
+    let memory = MemoryBudget::new(64 * 1024 * 1024);
+    let (bytes, _encoded_lease) =
+        original.encode_checkpoint(&cursor, CHECKPOINT_LIMIT, &memory, |value, writer| {
+            serde_json::to_writer(writer, value)
+        })?;
+    let envelope: serde_json::Value = serde_json::from_slice(&bytes)?;
+    assert_eq!(
+        envelope
+            .pointer("/payload/search/candidates")
+            .and_then(serde_json::Value::as_array)
+            .map(Vec::len),
+        Some(0)
+    );
+    drop(cursor);
+    drop(original);
+
+    let mut restored = RelationalSearchSession::new(&samples, &plan, None, options, None)?;
+    let mut decoded = 0;
+    let (cursor, _lease) = restored.restore_checkpoint(
+        &bytes,
+        CHECKPOINT_LIMIT,
+        &memory,
+        &mut RelationalRestoreBudget::new(usize::MAX, usize::MAX),
+        |context, candidate, outputs, value, work| {
+            decoded += 1;
+            decode_assessment(context, candidate, outputs, value, work)
+        },
+    )?;
+    assert_eq!(decoded, 0);
+    let (discovery, heldout) = cursor.session_partition();
+    assert_eq!(
+        discovery
+            .iter()
+            .map(|session| session.session)
+            .collect::<Vec<_>>(),
+        [1, 2]
+    );
+    assert_eq!(
+        heldout
+            .iter()
+            .map(|session| session.session)
+            .collect::<Vec<_>>(),
+        [3, 4]
+    );
+    assert!(
+        discovery
+            .iter()
+            .chain(heldout)
+            .all(|session| session.source == "synthetic-source"
+                && session.scope == "synthetic-scope")
+    );
+    Ok(())
 }
 
 #[test]
@@ -169,7 +422,7 @@ fn decoded_metadata_is_admitted_before_assessment_conversion() -> TestResult<()>
         CHECKPOINT_LIMIT,
         &memory,
         &mut RelationalRestoreBudget::new(usize::MAX, usize::MAX),
-        |_, _, value, _| {
+        |_, _, _, value, _| {
             decoded += 1;
             serde_json::from_value::<usize>(value).map_err(RelationalCursorError::Assessment)
         },
@@ -216,9 +469,9 @@ fn restored_dimensions_need_separate_admission_before_assessment_conversion() ->
         CHECKPOINT_LIMIT,
         &memory,
         &mut RelationalRestoreBudget::new(usize::MAX, usize::MAX),
-        |candidate, outputs, value, work| {
+        |context, candidate, outputs, value, work| {
             decoded += 1;
-            decode_assessment(candidate, outputs, value, work)
+            decode_assessment(context, candidate, outputs, value, work)
         },
     );
     assert!(matches!(result, Err(RelationalCursorError::Memory(_))));

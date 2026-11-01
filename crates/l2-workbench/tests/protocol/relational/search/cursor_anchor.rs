@@ -76,7 +76,7 @@ fn resuming_preserves_anchor_ranking_prefix_work_and_candidate_order() -> TestRe
                         4 * 1024 * 1024,
                         &memory,
                         &mut RelationalRestoreBudget::new(usize::MAX, usize::MAX),
-                        |_, _, value, _| {
+                        |_, _, _, value, _| {
                             serde_json::from_value::<u8>(value)
                                 .map_err(RelationalCursorError::Assessment)
                         },

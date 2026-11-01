@@ -1,6 +1,8 @@
 //! Shared progress and cancellation state for one recovery job
 
 pub mod cache;
+pub mod checkpoint_bytes;
+pub mod checkpoint_relational_output;
 
 mod cache_fallback;
 mod json_memory;

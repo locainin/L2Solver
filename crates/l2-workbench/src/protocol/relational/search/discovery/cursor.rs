@@ -29,8 +29,8 @@ use std::{
 #[path = "../../../../../tests/protocol/relational/search/cursor/scheduler.rs"]
 mod scheduler_tests;
 
-// Change this version when saved search order or continuation semantics change
-const CURSOR_VERSION: u32 = 2;
+// Change this version when the saved format or continuation semantics change
+const CURSOR_VERSION: u32 = 3;
 
 mod budget;
 mod output;
@@ -65,6 +65,15 @@ impl<T> RelationalSearchCursor<T> {
     #[must_use]
     pub const fn candidates_examined(&self) -> usize {
         self.search.candidates_examined
+    }
+
+    /// Borrow the frozen discovery and held-out complete-session partition
+    #[must_use]
+    pub fn session_partition(&self) -> (&[RelationalSessionId], &[RelationalSessionId]) {
+        (
+            &self.prepared.discovery_sessions,
+            &self.prepared.heldout_sessions,
+        )
     }
 }
 
@@ -512,6 +521,8 @@ macro_rules! move_search {
 
 mod checkpoint;
 pub(super) use checkpoint::deserialize_candidate;
+mod output_codec;
+pub(super) use output_codec::deserialize_outputs;
 
 fn attach_history<'h, T>(
     mut search: SearchState<'_, T>,

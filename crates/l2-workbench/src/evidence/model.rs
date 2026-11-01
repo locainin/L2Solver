@@ -10,8 +10,8 @@ pub struct Blob {
     /// Exact retained source bytes
     #[serde(
         rename = "bytes_base64",
-        serialize_with = "super::bounded::serialize_blob_bytes",
-        deserialize_with = "super::bounded::deserialize_blob_bytes"
+        serialize_with = "crate::serialization::base64::serialize",
+        deserialize_with = "crate::serialization::base64::deserialize"
     )]
     pub bytes: Vec<u8>,
 }
