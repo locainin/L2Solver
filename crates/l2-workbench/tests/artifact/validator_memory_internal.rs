@@ -34,6 +34,9 @@ mod image_support {
 
 type TestResult = Result<(), Box<dyn Error>>;
 
+#[path = "der_memory_internal.rs"]
+mod der_memory;
+
 #[test]
 fn executable_validation_admits_parser_metadata_and_preserves_results() -> TestResult {
     for image in [

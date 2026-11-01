@@ -9,6 +9,11 @@ use der::{
 };
 
 use super::FileRange;
+use admission::{Admission, Metered, Unmetered};
+
+mod admission;
+
+pub(super) use admission::DerMemoryError;
 
 /// Default maximum for one DER object's encoded length
 pub const MAX_DER_OBJECT_BYTES: usize = 4 * 1024 * 1024;
@@ -147,6 +152,8 @@ pub enum DerError {
     DepthLimitExceeded { maximum: usize },
     /// The object contained more values than the configured node count
     NodeLimitExceeded { maximum: usize },
+    /// The parser could not allocate a bounded inventory or value
+    AllocationFailure,
 }
 
 impl fmt::Display for DerError {
@@ -176,6 +183,7 @@ impl fmt::Display for DerError {
             Self::NodeLimitExceeded { maximum } => {
                 write!(formatter, "DER value count exceeds maximum {maximum}")
             }
+            Self::AllocationFailure => formatter.write_str("DER parser allocation failed"),
         }
     }
 }
@@ -198,6 +206,30 @@ pub fn parse_der(
     boundary: FileRange,
     limits: DerLimits,
 ) -> Result<DerReport, DerError> {
+    parse_der_with_admission(input, boundary, limits, &mut Unmetered)
+}
+
+pub(super) fn parse_der_with_memory(
+    input: &[u8],
+    boundary: FileRange,
+    limits: DerLimits,
+    memory: &mut crate::job::MemoryLease,
+) -> Result<DerReport, DerMemoryError> {
+    let before = memory.bytes();
+    let result = parse_der_with_admission(input, boundary, limits, &mut Metered(&mut *memory));
+    if result.is_err() {
+        // The partial report has dropped before its charge is released
+        memory.try_resize(before)?;
+    }
+    result
+}
+
+fn parse_der_with_admission<A: Admission>(
+    input: &[u8],
+    boundary: FileRange,
+    limits: DerLimits,
+    admission: &mut A,
+) -> Result<DerReport, A::Error> {
     validate_limits(limits)?;
 
     let boundary_end =
@@ -220,41 +252,53 @@ pub fn parse_der(
         return Err(DerError::ObjectTooLarge {
             length: encoded.len(),
             maximum: limits.max_object_bytes,
-        });
+        }
+        .into());
     }
 
     let root_length = first_value_length(encoded)?;
     if root_length != encoded.len() {
-        return Err(DerError::InvalidDer);
+        return Err(DerError::InvalidDer.into());
     }
     let root = AnyRef::from_der(encoded).map_err(|_| DerError::InvalidDer)?;
-    let mut nodes = Vec::new();
-    visit_node(root, encoded, boundary.offset, None, 0, limits, &mut nodes)?;
+    let mut context = DerContext {
+        limits,
+        nodes: Vec::new(),
+        admission,
+    };
+    visit_node(root, encoded, boundary.offset, None, 0, &mut context)?;
 
     Ok(DerReport {
         boundary_range: boundary,
-        nodes,
+        nodes: context.nodes,
     })
 }
 
-fn visit_node<'a>(
+struct DerContext<'a, A> {
+    limits: DerLimits,
+    nodes: Vec<DerNode>,
+    admission: &'a mut A,
+}
+
+fn visit_node<'a, A: Admission>(
     value: AnyRef<'a>,
     encoded: &'a [u8],
     source_offset: usize,
     parent_index: Option<usize>,
     depth: usize,
-    limits: DerLimits,
-    nodes: &mut Vec<DerNode>,
-) -> Result<(), DerError> {
-    if depth > limits.max_depth {
+    context: &mut DerContext<'_, A>,
+) -> Result<(), A::Error> {
+    if depth > context.limits.max_depth {
         return Err(DerError::DepthLimitExceeded {
-            maximum: limits.max_depth,
-        });
+            maximum: context.limits.max_depth,
+        }
+        .into());
     }
-    if nodes.len() >= limits.max_nodes {
+    if context.nodes.len() >= context.limits.max_nodes {
         return Err(DerError::NodeLimitExceeded {
-            maximum: limits.max_nodes,
-        });
+            maximum: context.limits.max_nodes,
+        }
+        .into());
     }
 
     let tag = value.tag();
@@ -270,21 +314,22 @@ fn visit_node<'a>(
         .checked_add(raw_value.len())
         .ok_or(DerError::InvalidDer)?;
     if encoded_length != encoded.len() {
-        return Err(DerError::InvalidDer);
+        return Err(DerError::InvalidDer.into());
     }
 
     let value_offset = source_offset
         .checked_add(header_length)
         .ok_or(DerError::InvalidDer)?;
-    let index = nodes.len();
-    let preview_length = raw_value.len().min(limits.max_value_preview_bytes);
-    let preview = raw_value
+    let index = context.nodes.len();
+    context.admission.reserve_node(&mut context.nodes)?;
+    let preview_length = raw_value.len().min(context.limits.max_value_preview_bytes);
+    let preview_bytes = raw_value
         .get(..preview_length)
-        .ok_or(DerError::InvalidDer)?
-        .to_vec();
-    let metadata = metadata_for(tag, value, encoded)?;
+        .ok_or(DerError::InvalidDer)?;
+    let preview = context.admission.copy_preview(preview_bytes)?;
+    let metadata = metadata_for(tag, value, encoded, &mut *context.admission)?;
 
-    nodes.push(DerNode {
+    context.nodes.push(DerNode {
         parent_index,
         depth,
         tag: DerTag {
@@ -307,21 +352,20 @@ fn visit_node<'a>(
     });
 
     if tag.is_constructed() {
-        visit_children(tag, raw_value, value_offset, index, depth, limits, nodes)?;
+        visit_children(tag, raw_value, value_offset, index, depth, context)?;
     }
 
     Ok(())
 }
 
-fn visit_children<'a>(
+fn visit_children<'a, A: Admission>(
     parent_tag: Tag,
     bytes: &'a [u8],
     source_offset: usize,
     parent_index: usize,
     parent_depth: usize,
-    limits: DerLimits,
-    nodes: &mut Vec<DerNode>,
-) -> Result<(), DerError> {
+    context: &mut DerContext<'_, A>,
+) -> Result<(), A::Error> {
     let mut cursor = 0_usize;
     let mut previous_set_value: Option<AnyRef<'a>> = None;
 
@@ -341,7 +385,7 @@ fn visit_children<'a>(
             if let Some(previous) = previous_set_value {
                 let order = previous.der_cmp(&child).map_err(|_| DerError::InvalidDer)?;
                 if order == Ordering::Greater {
-                    return Err(DerError::InvalidDer);
+                    return Err(DerError::InvalidDer.into());
                 }
             }
             previous_set_value = Some(child);
@@ -357,14 +401,13 @@ fn visit_children<'a>(
             child_source_offset,
             Some(parent_index),
             next_depth,
-            limits,
-            nodes,
+            context,
         )?;
         cursor = child_end;
     }
 
     if cursor != bytes.len() {
-        return Err(DerError::InvalidDer);
+        return Err(DerError::InvalidDer.into());
     }
     Ok(())
 }
@@ -386,14 +429,19 @@ struct DerValueMetadata {
     octet_string: Option<DerOctetStringMetadata>,
 }
 
-fn metadata_for(tag: Tag, value: AnyRef<'_>, encoded: &[u8]) -> Result<DerValueMetadata, DerError> {
+fn metadata_for<A: Admission>(
+    tag: Tag,
+    value: AnyRef<'_>,
+    encoded: &[u8],
+    admission: &mut A,
+) -> Result<DerValueMetadata, A::Error> {
     let raw_value = value.value();
     let mut metadata = DerValueMetadata::default();
 
     if tag.is_constructed() {
         // Universal constructed values are supported only when they are SEQUENCE or SET
         if tag.is_universal() && !matches!(tag, Tag::Sequence | Tag::Set) {
-            return Err(DerError::InvalidDer);
+            return Err(DerError::InvalidDer.into());
         }
         return Ok(metadata);
     }
@@ -427,7 +475,7 @@ fn metadata_for(tag: Tag, value: AnyRef<'_>, encoded: &[u8]) -> Result<DerValueM
         Tag::ObjectIdentifier => {
             let decoded = ObjectIdentifier::<MAX_OID_VALUE_BYTES>::from_der(encoded)
                 .map_err(|_| DerError::InvalidDer)?;
-            metadata.oid = Some(decoded.to_string());
+            metadata.oid = Some(admission.format_oid(&decoded)?);
         }
         Tag::Utf8String => {
             Utf8StringRef::from_der(encoded).map_err(|_| DerError::InvalidDer)?;
@@ -452,11 +500,11 @@ fn metadata_for(tag: Tag, value: AnyRef<'_>, encoded: &[u8]) -> Result<DerValueM
         | Tag::VideotexString
         | Tag::VisibleString
         | Tag::GeneralString
-        | Tag::BmpString => return Err(DerError::InvalidDer),
+        | Tag::BmpString => return Err(DerError::InvalidDer.into()),
         // Application, context-specific, and private values are opaque without a schema
         _ if !tag.is_universal() => (),
         // Unknown universal tags must never receive a canonical-value claim
-        _ => return Err(DerError::InvalidDer),
+        _ => return Err(DerError::InvalidDer.into()),
     }
 
     Ok(metadata)

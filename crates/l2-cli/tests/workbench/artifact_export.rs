@@ -11,6 +11,8 @@ use serde_json::json;
 
 #[path = "artifact_export/case_indexes.rs"]
 mod case_indexes;
+#[path = "artifact_export/der_memory.rs"]
+mod der_memory;
 #[path = "artifact_export/selection_memory.rs"]
 mod selection_memory;
 #[path = "artifact_export/zip_memory.rs"]

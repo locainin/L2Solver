@@ -10,6 +10,7 @@ use super::{
     parse_der,
 };
 use super::{
+    der::{DerMemoryError, parse_der_with_memory},
     png::parse_png_optional_memory,
     signatures::matches_zip_signature,
     zip::{
@@ -376,7 +377,6 @@ impl ArtifactValidator {
 
     /// Validate one format using a shared lease for supported parser buffers
     ///
-    /// ZIP, PNG, and executable buffers are admitted; DER inventories are not yet metered
     /// The caller keeps the lease until the returned report and moved data are dropped
     ///
     /// # Errors
@@ -427,7 +427,16 @@ impl ArtifactValidator {
 
         Ok(match format {
             ArtifactValidationFormat::Der => {
-                match parse_der(bytes, input_range, self.policy.der_limits) {
+                let parsed = if let Some(lease) = memory {
+                    match parse_der_with_memory(bytes, input_range, self.policy.der_limits, lease) {
+                        Ok(report) => Ok(report),
+                        Err(DerMemoryError::Format(error)) => Err(error),
+                        Err(DerMemoryError::Memory(error)) => return Err(error),
+                    }
+                } else {
+                    parse_der(bytes, input_range, self.policy.der_limits)
+                };
+                match parsed {
                     Ok(report) => ArtifactValidationOutcome::Validated {
                         format,
                         range: report.boundary_range,
@@ -582,6 +591,11 @@ const fn classify_der_error<'a>(
             format: Some(format),
             input_range,
             reason: ArtifactResourceOmissionReason::InvalidParserPolicy { format },
+        },
+        DerError::AllocationFailure => ArtifactValidationOutcome::Omitted {
+            format: Some(format),
+            input_range,
+            reason: ArtifactResourceOmissionReason::AllocationFailure,
         },
         error @ (DerError::InvalidBoundary { .. } | DerError::InvalidDer) => {
             ArtifactValidationOutcome::Rejected {
