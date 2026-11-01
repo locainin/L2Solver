@@ -1,5 +1,6 @@
 use super::Case;
 use crate::evidence::{ByteMapping, Edge, EvidenceError, EvidenceStatus};
+use crate::job::MemoryLease;
 use serde_json::{Value, json};
 use std::ops::Range;
 
@@ -11,18 +12,63 @@ pub fn clip_byte_mappings(
     mappings: &[ByteMapping],
     output_range: Range<usize>,
 ) -> Result<Vec<ByteMapping>, EvidenceError> {
+    clip_byte_mappings_inner(mappings, output_range, None)
+}
+
+/// Clip mappings while admitting their output vector and source names
+///
+/// Keep the shared lease until the returned mappings and moved data are dropped
+///
+/// # Errors
+/// Returns an error for invalid ranges, allocation failure, or refused memory admission
+pub fn clip_byte_mappings_with_memory(
+    mappings: &[ByteMapping],
+    output_range: Range<usize>,
+    memory: &mut MemoryLease,
+) -> Result<Vec<ByteMapping>, EvidenceError> {
+    let before = memory.bytes();
+    let result = clip_byte_mappings_inner(mappings, output_range, Some(&mut *memory));
+    if result.is_err() {
+        // The partial output has dropped before its charge is released
+        memory.try_resize(before).map_err(EvidenceError::Memory)?;
+    }
+    result
+}
+
+fn clip_byte_mappings_inner(
+    mappings: &[ByteMapping],
+    output_range: Range<usize>,
+    mut memory: Option<&mut MemoryLease>,
+) -> Result<Vec<ByteMapping>, EvidenceError> {
     if output_range.start > output_range.end {
         return Err(EvidenceError::InvalidSourceRange);
     }
     let mut clipped = Vec::new();
     for mapping in mappings {
         let mapping_end = checked_mapping_end(mapping)?;
-        if let Some(mapping) = clip_mapping(mapping, mapping_end, &output_range)? {
-            clipped
-                .try_reserve(1)
-                .map_err(|_| EvidenceError::AllocationFailed {
-                    field: "clipped byte mappings",
-                })?;
+        if let Some(mapping) =
+            clip_mapping(mapping, mapping_end, &output_range, memory.as_deref_mut())?
+        {
+            if let Some(lease) = memory.as_deref_mut() {
+                crate::allocation::reserve_one_with_memory(&mut clipped, lease).map_err(
+                    |error| match error {
+                        crate::allocation::VectorAllocationError::Memory(error) => {
+                            EvidenceError::Memory(error)
+                        }
+                        crate::allocation::VectorAllocationError::Allocation => {
+                            EvidenceError::AllocationFailed {
+                                field: "clipped byte mappings",
+                            }
+                        }
+                    },
+                )?;
+            } else {
+                clipped
+                    .try_reserve(1)
+                    .map_err(|_| EvidenceError::AllocationFailed {
+                        field: "clipped byte mappings",
+                    })?;
+            }
             clipped.push(mapping);
         }
     }
@@ -126,7 +172,7 @@ impl<'a> CheckedByteMappingCursor<'a> {
                 self.advance_mapping();
                 continue;
             }
-            if let Some(mapping) = clip_mapping(mapping, end, &output_range)? {
+            if let Some(mapping) = clip_mapping(mapping, end, &output_range, None)? {
                 clipped
                     .try_reserve(1)
                     .map_err(|_| EvidenceError::AllocationFailed {
@@ -169,6 +215,7 @@ fn clip_mapping(
     mapping: &ByteMapping,
     mapping_end: usize,
     output_range: &Range<usize>,
+    memory: Option<&mut MemoryLease>,
 ) -> Result<Option<ByteMapping>, EvidenceError> {
     let first = mapping.offset.max(output_range.start);
     let last = mapping_end.min(output_range.end);
@@ -178,7 +225,7 @@ fn clip_mapping(
     Ok(Some(ByteMapping {
         offset: first - output_range.start,
         range: crate::evidence::SourceRange {
-            source: mapping.range.source.clone(),
+            source: copy_mapping_source(&mapping.range.source, memory)?,
             packet: mapping.range.packet,
             offset: mapping
                 .range
@@ -191,6 +238,36 @@ fn clip_mapping(
             length: u64::try_from(last - first).map_err(|_| EvidenceError::InvalidSourceRange)?,
         },
     }))
+}
+
+fn copy_mapping_source(
+    source: &str,
+    memory: Option<&mut MemoryLease>,
+) -> Result<String, EvidenceError> {
+    let Some(memory) = memory else {
+        return Ok(source.to_owned());
+    };
+    let requested = u64::try_from(source.len()).map_err(|_| EvidenceError::ArithmeticOverflow {
+        field: "clipped mapping source bytes",
+    })?;
+    let mut pending = memory
+        .try_sibling(requested)
+        .map_err(EvidenceError::Memory)?;
+    let mut copy = String::new();
+    copy.try_reserve_exact(source.len())
+        .map_err(|_| EvidenceError::AllocationFailed {
+            field: "clipped mapping source",
+        })?;
+    pending
+        .try_resize(u64::try_from(copy.capacity()).map_err(|_| {
+            EvidenceError::ArithmeticOverflow {
+                field: "clipped mapping source bytes",
+            }
+        })?)
+        .map_err(EvidenceError::Memory)?;
+    copy.push_str(source);
+    memory.absorb(pending);
+    Ok(copy)
 }
 
 struct Checkpoint {

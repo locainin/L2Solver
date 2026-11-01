@@ -22,6 +22,7 @@ pub use case::{
     MAX_NODE_DETAILS_BYTES, MAX_NODE_KIND_BYTES, MAX_NODE_RANGES, MAX_NODES, MAX_REASON_BYTES,
     MAX_RELATION_BYTES, MAX_SOURCE_ALIASES, MAX_SOURCE_LABEL_BYTES, MAX_SOURCES,
     MAX_TOTAL_DETAILS_BYTES, MAX_TOTAL_SOURCE_RANGES, SCHEMA_VERSION, clip_byte_mappings,
+    clip_byte_mappings_with_memory,
 };
 pub use error::EvidenceError;
 pub use model::{Blob, ByteMapping, Edge, EvidenceStatus, Node, Source, SourceRange};

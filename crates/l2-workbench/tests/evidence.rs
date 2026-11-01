@@ -10,6 +10,8 @@ mod graph;
 mod import_scan;
 #[path = "evidence/mapping.rs"]
 mod mapping;
+#[path = "evidence/mapping_memory.rs"]
+mod mapping_memory;
 #[path = "evidence/memory.rs"]
 mod memory;
 #[path = "evidence/prefix.rs"]

@@ -14,6 +14,9 @@ use l2_workbench::{
 use serde_json::{Value, json};
 use std::error::Error;
 
+#[path = "mapping_memory.rs"]
+mod mapping_memory;
+
 #[test]
 fn summary_prefers_exact_selected_packet_ranges() -> Result<(), Box<dyn Error>> {
     let mut case = Case::new();
@@ -214,7 +217,10 @@ fn full_identity_range_keeps_all_direct_source_ranges() -> Result<(), Box<dyn Er
     let selected = selected_origin(&mut case, input, bytes, 0, bytes.len())?;
     let index = CaseArtifactIndex::new(&case)?;
 
-    assert_eq!(selected_artifact_source_ranges(&selected, &index)?, [first]);
+    assert_eq!(
+        selected_artifact_source_ranges(&selected, &index, None)?.ranges,
+        [first]
+    );
     Ok(())
 }
 
@@ -235,7 +241,7 @@ fn single_identity_source_range_clips_a_validated_subobject() -> Result<(), Box<
     let index = CaseArtifactIndex::new(&case)?;
 
     assert_eq!(
-        selected_artifact_source_ranges(&selected, &index)?,
+        selected_artifact_source_ranges(&selected, &index, None)?.ranges,
         [source_range(8, 506, 3)]
     );
     Ok(())
@@ -265,7 +271,7 @@ fn checked_mapping_receipt_clips_across_source_ranges() -> Result<(), Box<dyn Er
     let index = CaseArtifactIndex::new(&case)?;
 
     assert_eq!(
-        selected_artifact_source_ranges(&selected, &index)?,
+        selected_artifact_source_ranges(&selected, &index, None)?.ranges,
         [source_range(9, 301, 1), source_range(10, 400, 2)]
     );
     Ok(())
@@ -293,8 +299,10 @@ fn mapping_receipt_with_a_gap_has_no_exact_object_range() -> Result<(), Box<dyn 
     )?;
     let selected = selected_origin(&mut case, input, input_bytes, 0, input_bytes.len())?;
     let index = CaseArtifactIndex::new(&case)?;
-
-    assert!(selected_artifact_source_ranges(&selected, &index)?.is_empty());
+    let budget = l2_workbench::job::MemoryBudget::new(1024 * 1024);
+    let source_ranges = selected_artifact_source_ranges(&selected, &index, Some(&budget))?;
+    assert!(source_ranges.ranges.is_empty());
+    assert_eq!(budget.snapshot()?.used_bytes, 0);
     Ok(())
 }
 
@@ -315,7 +323,11 @@ fn transformed_artifact_bytes_do_not_inherit_input_ranges() -> Result<(), Box<dy
     let selected = selected_origin(&mut case, input, b"WXYZ", 0, input_bytes.len())?;
     let index = CaseArtifactIndex::new(&case)?;
 
-    assert!(selected_artifact_source_ranges(&selected, &index)?.is_empty());
+    assert!(
+        selected_artifact_source_ranges(&selected, &index, None)?
+            .ranges
+            .is_empty()
+    );
     Ok(())
 }
 
@@ -928,7 +940,11 @@ fn assert_forged_receipt_is_ignored(
     let selected = selected_origin(&mut case, input, b"cde", 2, 3)?;
     let index = CaseArtifactIndex::new(&case)?;
 
-    assert!(selected_artifact_source_ranges(&selected, &index)?.is_empty());
+    assert!(
+        selected_artifact_source_ranges(&selected, &index, None)?
+            .ranges
+            .is_empty()
+    );
     Ok(())
 }
 

@@ -4,7 +4,13 @@
 use super::COHORT_ARTIFACT_LOOKUP_BUILDS;
 use super::{artifact_collection::ArtifactProvenance, collection::CaseArtifactIndex};
 use crate::workbench;
-use l2_workbench::evidence::{Blob, ByteMapping, Case, Node, SourceRange, clip_byte_mappings};
+use l2_workbench::{
+    evidence::{
+        Blob, ByteMapping, Case, Node, SourceRange, clip_byte_mappings,
+        clip_byte_mappings_with_memory,
+    },
+    job::{JsonMemoryAdmission, MemoryBudget, MemoryClass, MemoryLease, admit_json},
+};
 use std::{
     collections::{BTreeSet, HashMap, HashSet},
     error::Error,
@@ -221,9 +227,32 @@ struct ValidatedArtifactInput<'a> {
     end: usize,
 }
 
+pub(super) struct SelectedSourceRanges {
+    pub(super) ranges: Vec<SourceRange>,
+    // The source ranges drop before their shared charge
+    _memory: Option<MemoryLease>,
+}
+
 pub(super) fn selected_artifact_source_ranges(
     selected_origin: &workbench::artifact_export::ArtifactProvenance,
     index: &CaseArtifactIndex<'_>,
+    budget: Option<&MemoryBudget>,
+) -> Result<SelectedSourceRanges, Box<dyn Error>> {
+    let mut memory = budget
+        .map(|budget| budget.try_reserve(MemoryClass::Publication, 0))
+        .transpose()?;
+    let ranges = selected_source_ranges(selected_origin, index, budget, &mut memory)?;
+    Ok(SelectedSourceRanges {
+        ranges,
+        _memory: memory,
+    })
+}
+
+fn selected_source_ranges(
+    selected_origin: &workbench::artifact_export::ArtifactProvenance,
+    index: &CaseArtifactIndex<'_>,
+    budget: Option<&MemoryBudget>,
+    memory: &mut Option<MemoryLease>,
 ) -> Result<Vec<SourceRange>, Box<dyn Error>> {
     let Some(input) = validated_artifact_input(selected_origin, index)? else {
         return Ok(Vec::new());
@@ -252,17 +281,9 @@ pub(super) fn selected_artifact_source_ranges(
         .get(&input.input_node.id)
         .copied()
     else {
-        return exact_direct_input_ranges(
-            input.validation_node,
-            input.input_node,
-            input.input_blob_id,
-            input.input_blob.bytes.len(),
-            input.offset,
-            input.length,
-            input.end,
-        );
+        return exact_direct_input_ranges(&input, memory);
     };
-    source_ranges_from_mapping_receipt(receipt_node, &input, index)
+    source_ranges_from_mapping_receipt(receipt_node, &input, index, budget, memory)
 }
 
 fn validated_artifact_input<'a>(
@@ -332,6 +353,8 @@ fn source_ranges_from_mapping_receipt(
     receipt_node: &Node,
     input: &ValidatedArtifactInput<'_>,
     index: &CaseArtifactIndex<'_>,
+    budget: Option<&MemoryBudget>,
+    memory: &mut Option<MemoryLease>,
 ) -> Result<Vec<SourceRange>, Box<dyn Error>> {
     let receipt_blob_id = receipt_node
         .blob
@@ -341,13 +364,60 @@ fn source_ranges_from_mapping_receipt(
         .case
         .blob(receipt_blob_id)
         .ok_or("byte mapping receipt bytes are missing")?;
-    let mappings: Vec<ByteMapping> = serde_json::from_slice(&receipt_blob.bytes)?;
-    validate_mapping_receipt(&mappings, input)?;
-    let clipped = clip_byte_mappings(&mappings, input.offset..input.end)?;
-    if !mappings_cover_object(&clipped, input.length)? {
+    let decoded = decode_mapping_receipt(&receipt_blob.bytes, budget)?;
+    validate_mapping_receipt(&decoded.mappings, input)?;
+    let before_clip = memory.as_ref().map(MemoryLease::bytes);
+    let clipped = if let Some(lease) = memory.as_mut() {
+        clip_byte_mappings_with_memory(&decoded.mappings, input.offset..input.end, lease)?
+    } else {
+        clip_byte_mappings(&decoded.mappings, input.offset..input.end)?
+    };
+    if !mappings_cover_object(&clipped, input.length, memory)? {
+        drop(clipped);
+        if let (Some(lease), Some(before)) = (memory.as_mut(), before_clip) {
+            lease.try_resize(before)?;
+        }
         return Ok(Vec::new());
     }
-    Ok(clipped.into_iter().map(|mapping| mapping.range).collect())
+    let clipped_vector_bytes = clipped
+        .capacity()
+        .checked_mul(std::mem::size_of::<ByteMapping>())
+        .ok_or("clipped mapping vector size overflows")?;
+    let mut ranges = Vec::new();
+    crate::retained_memory::grow_vec_exact_optional(&mut ranges, memory, clipped.len())?;
+    for mapping in clipped {
+        ranges.push(mapping.range);
+    }
+    if let Some(lease) = memory {
+        // Source names moved into the output, but the clipped vector has dropped
+        let remaining = lease
+            .bytes()
+            .checked_sub(u64::try_from(clipped_vector_bytes)?)
+            .ok_or("clipped mapping vector charge is inconsistent")?;
+        lease.try_resize(remaining)?;
+    }
+    Ok(ranges)
+}
+
+struct DecodedMappings {
+    mappings: Vec<ByteMapping>,
+    // The typed mappings drop before their decoded JSON allowance
+    _memory: Option<MemoryLease>,
+}
+
+fn decode_mapping_receipt(
+    bytes: &[u8],
+    budget: Option<&MemoryBudget>,
+) -> Result<DecodedMappings, Box<dyn Error>> {
+    // ByteMapping numeric fields do not size any allocations during decoding
+    let admission = budget
+        .map(|budget| admit_json(bytes, budget, MemoryClass::Publication))
+        .transpose()?;
+    let mappings = serde_json::from_slice(bytes)?;
+    Ok(DecodedMappings {
+        mappings,
+        _memory: admission.map(JsonMemoryAdmission::into_retained),
+    })
 }
 
 fn validate_mapping_receipt(
@@ -368,66 +438,92 @@ fn validate_mapping_receipt(
 }
 
 fn exact_direct_input_ranges(
-    validation_node: &Node,
-    input_node: &Node,
-    input_blob_id: &str,
-    input_length: usize,
-    offset: usize,
-    length: usize,
-    end: usize,
+    input: &ValidatedArtifactInput<'_>,
+    memory: &mut Option<MemoryLease>,
 ) -> Result<Vec<SourceRange>, Box<dyn Error>> {
-    if length == 0 {
+    if input.length == 0 {
         return Ok(Vec::new());
     }
-    if validation_node.blob.as_deref() == Some(input_blob_id) && offset == 0 && end == input_length
+    if input.validation_node.blob.as_deref() == Some(input.input_blob_id)
+        && input.offset == 0
+        && input.end == input.input_blob.bytes.len()
     {
-        return Ok(input_node.ranges.clone());
+        let mut ranges = Vec::new();
+        crate::retained_memory::grow_vec_exact_optional(
+            &mut ranges,
+            memory,
+            input.input_node.ranges.len(),
+        )?;
+        for range in &input.input_node.ranges {
+            ranges.push(copy_source_range(range, memory)?);
+        }
+        return Ok(ranges);
     }
-    let [input_range] = input_node.ranges.as_slice() else {
+    let [input_range] = input.input_node.ranges.as_slice() else {
         return Ok(Vec::new());
     };
-    if usize::try_from(input_range.length)? != input_length {
+    if usize::try_from(input_range.length)? != input.input_blob.bytes.len() {
         return Ok(Vec::new());
     }
     let source_offset = input_range
         .offset
-        .checked_add(u64::try_from(offset)?)
+        .checked_add(u64::try_from(input.offset)?)
         .ok_or("clipped source range offset overflowed")?;
     source_offset
-        .checked_add(u64::try_from(length)?)
+        .checked_add(u64::try_from(input.length)?)
         .ok_or("clipped source range end overflowed")?;
-    Ok(vec![SourceRange {
-        source: input_range.source.clone(),
-        packet: input_range.packet,
-        offset: source_offset,
-        length: u64::try_from(length)?,
-    }])
+    let mut ranges = Vec::new();
+    crate::retained_memory::grow_vec_exact_optional(&mut ranges, memory, 1)?;
+    let mut range = copy_source_range(input_range, memory)?;
+    range.offset = source_offset;
+    range.length = u64::try_from(input.length)?;
+    ranges.push(range);
+    Ok(ranges)
+}
+
+fn copy_source_range(
+    range: &SourceRange,
+    memory: &mut Option<MemoryLease>,
+) -> Result<SourceRange, Box<dyn Error>> {
+    Ok(SourceRange {
+        source: crate::retained_memory::copy_optional(&range.source, memory)?,
+        packet: range.packet,
+        offset: range.offset,
+        length: range.length,
+    })
 }
 
 fn mappings_cover_object(
     mappings: &[ByteMapping],
     object_length: usize,
+    memory: &mut Option<MemoryLease>,
 ) -> Result<bool, Box<dyn Error>> {
-    let mut intervals = mappings
-        .iter()
-        .map(|mapping| {
-            let length = usize::try_from(mapping.range.length)?;
-            let end = mapping
-                .offset
-                .checked_add(length)
-                .ok_or("clipped object mapping range overflowed")?;
-            Ok((mapping.offset, end))
-        })
-        .collect::<Result<Vec<_>, Box<dyn Error>>>()?;
+    let before = memory.as_ref().map(MemoryLease::bytes);
+    let mut intervals = Vec::new();
+    crate::retained_memory::grow_vec_exact_optional(&mut intervals, memory, mappings.len())?;
+    for mapping in mappings {
+        let length = usize::try_from(mapping.range.length)?;
+        let end = mapping
+            .offset
+            .checked_add(length)
+            .ok_or("clipped object mapping range overflowed")?;
+        intervals.push((mapping.offset, end));
+    }
     intervals.sort_unstable();
     let mut covered_end = 0_usize;
+    let mut complete = true;
     for (start, end) in intervals {
         if start > covered_end {
-            return Ok(false);
+            complete = false;
+            break;
         }
         covered_end = covered_end.max(end);
     }
-    Ok(covered_end >= object_length)
+    if let (Some(lease), Some(before)) = (memory, before) {
+        // The sorted interval vector has dropped
+        lease.try_resize(before)?;
+    }
+    Ok(complete && covered_end >= object_length)
 }
 
 pub(super) fn artifact_provenance(

@@ -160,17 +160,17 @@ fn select_artifacts_with_receipts_and_cache<'a>(
             .ok_or("recovered artifact node bytes are missing")?;
         let provenance = ArtifactProvenance {
             id: node.id,
-            kind: copy_text(&node.kind, &mut retained)?,
+            kind: crate::retained_memory::copy_optional(&node.kind, &mut retained)?,
             archive_path: spec
                 .archive_path
                 .as_deref()
-                .map(|path| copy_text(path, &mut retained))
+                .map(|path| crate::retained_memory::copy_optional(path, &mut retained))
                 .transpose()?,
             completion_basis: node
                 .details
                 .get("completion_basis")
                 .and_then(serde_json::Value::as_str)
-                .map(|basis| copy_text(basis, &mut retained))
+                .map(|basis| crate::retained_memory::copy_optional(basis, &mut retained))
                 .transpose()?,
             reconstruction_status: reconstruction_status(node),
             structural_validation: spec.structural_validation.clone(),
@@ -183,18 +183,18 @@ fn select_artifacts_with_receipts_and_cache<'a>(
                 .get_mut(index)
                 .ok_or("artifact index is missing")?
                 .provenance;
-            grow(origins, &mut retained)?;
+            crate::retained_memory::grow_vec_optional(origins, &mut retained, 1)?;
             origins.push(provenance);
             continue;
         }
 
         let index = artifacts.len();
         artifact_by_blob.try_reserve(1)?;
-        grow(&mut artifacts, &mut retained)?;
+        crate::retained_memory::grow_vec_optional(&mut artifacts, &mut retained, 1)?;
         let mut origins = Vec::new();
-        grow(&mut origins, &mut retained)?;
+        crate::retained_memory::grow_vec_optional(&mut origins, &mut retained, 1)?;
         origins.push(provenance);
-        let file_name = copy_text(&spec.file_name, &mut retained)?;
+        let file_name = crate::retained_memory::copy_optional(&spec.file_name, &mut retained)?;
         artifact_by_blob.insert(blob_id, index);
         artifacts.push(SelectedArtifact {
             bytes,
@@ -207,26 +207,6 @@ fn select_artifacts_with_receipts_and_cache<'a>(
         artifacts,
         _memory: retained,
     })
-}
-
-fn grow<T>(values: &mut Vec<T>, memory: &mut Option<MemoryLease>) -> Result<(), Box<dyn Error>> {
-    if let Some(memory) = memory {
-        crate::retained_memory::grow_vec(values, memory, 1)
-    } else {
-        values.try_reserve(1)?;
-        Ok(())
-    }
-}
-
-fn copy_text(value: &str, memory: &mut Option<MemoryLease>) -> Result<String, Box<dyn Error>> {
-    if let Some(memory) = memory {
-        crate::retained_memory::copy_message(value, memory)
-    } else {
-        let mut copy = String::new();
-        copy.try_reserve_exact(value.len())?;
-        copy.push_str(value);
-        Ok(copy)
-    }
 }
 
 fn analyzer_receipts_by_node<'a, 'digest>(

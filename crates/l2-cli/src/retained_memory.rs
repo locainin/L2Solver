@@ -3,6 +3,46 @@
 use l2_workbench::job::MemoryLease;
 use std::error::Error;
 
+pub(crate) fn grow_vec_optional<T>(
+    values: &mut Vec<T>,
+    memory: &mut Option<MemoryLease>,
+    additional: usize,
+) -> Result<(), Box<dyn Error>> {
+    if let Some(memory) = memory {
+        grow_vec(values, memory, additional)
+    } else {
+        values.try_reserve(additional)?;
+        Ok(())
+    }
+}
+
+pub(crate) fn copy_optional(
+    value: &str,
+    memory: &mut Option<MemoryLease>,
+) -> Result<String, Box<dyn Error>> {
+    if let Some(memory) = memory {
+        copy_message(value, memory)
+    } else {
+        let mut copy = String::new();
+        copy.try_reserve_exact(value.len())?;
+        copy.push_str(value);
+        Ok(copy)
+    }
+}
+
+pub(crate) fn grow_vec_exact_optional<T>(
+    values: &mut Vec<T>,
+    memory: &mut Option<MemoryLease>,
+    additional: usize,
+) -> Result<(), Box<dyn Error>> {
+    if let Some(memory) = memory {
+        grow_vec_exact(values, memory, additional)
+    } else {
+        values.try_reserve_exact(additional)?;
+        Ok(())
+    }
+}
+
 pub(crate) fn charge(memory: &mut MemoryLease, bytes: usize) -> Result<(), Box<dyn Error>> {
     let total = memory
         .bytes()

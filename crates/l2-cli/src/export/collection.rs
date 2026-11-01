@@ -688,7 +688,7 @@ fn collect_selected_case_artifacts(
                 .ok_or("recovered artifact provenance references a missing node")?;
             let number = collection.next_file_number()?;
             let mut selection = serde_json::to_value(selected_origin)?;
-            let source_ranges = selected_artifact_source_ranges(selected_origin, index)?;
+            let source_ranges = selected_artifact_source_ranges(selected_origin, index, memory)?;
             if let Some(fields) = selection.as_object_mut() {
                 fields.insert(
                     "selected_file_name".to_owned(),
@@ -714,8 +714,11 @@ fn collect_selected_case_artifacts(
                         }),
                     );
                 }
-                if !source_ranges.is_empty() {
-                    fields.insert("source_ranges".to_owned(), serde_json::json!(source_ranges));
+                if !source_ranges.ranges.is_empty() {
+                    fields.insert(
+                        "source_ranges".to_owned(),
+                        serde_json::json!(&source_ranges.ranges),
+                    );
                 }
             }
             let context = context_for_node(node, case)?;

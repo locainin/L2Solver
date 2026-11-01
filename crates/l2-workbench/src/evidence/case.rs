@@ -27,7 +27,7 @@ mod transaction;
 #[path = "case/validation.rs"]
 mod validation;
 
-pub use mapping::{CheckedByteMappingCursor, clip_byte_mappings};
+pub use mapping::{CheckedByteMappingCursor, clip_byte_mappings, clip_byte_mappings_with_memory};
 pub use prefix::CasePrefixBinding;
 pub use snapshot::{CaseSnapshotLimits, CaseSnapshotUsage};
 
