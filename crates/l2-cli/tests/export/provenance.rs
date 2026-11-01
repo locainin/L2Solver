@@ -15,6 +15,10 @@ use l2_workbench::{
 use serde_json::{Value, json};
 use std::error::Error;
 
+#[path = "cohort_index_memory.rs"]
+mod cohort_index_memory;
+#[path = "index_memory.rs"]
+mod index_memory;
 #[path = "mapping_memory.rs"]
 mod mapping_memory;
 
@@ -207,7 +211,7 @@ fn source_provenance(
         Some(node),
         None,
         selection,
-        &[],
+        std::iter::empty(),
         case,
     )
 }
@@ -228,7 +232,7 @@ fn full_identity_range_keeps_all_direct_source_ranges() -> Result<(), Box<dyn Er
         json!({}),
     )?;
     let selected = selected_origin(&mut case, input, bytes, 0, bytes.len())?;
-    let index = CaseArtifactIndex::new(&case)?;
+    let index = CaseArtifactIndex::new(&case, None)?;
 
     assert_eq!(
         selected_artifact_source_ranges(&selected, &index, None)?.ranges,
@@ -251,7 +255,7 @@ fn single_identity_source_range_clips_a_validated_subobject() -> Result<(), Box<
         json!({}),
     )?;
     let selected = selected_origin(&mut case, input, object, 6, object.len())?;
-    let index = CaseArtifactIndex::new(&case)?;
+    let index = CaseArtifactIndex::new(&case, None)?;
 
     assert_eq!(
         selected_artifact_source_ranges(&selected, &index, None)?.ranges,
@@ -281,7 +285,7 @@ fn checked_mapping_receipt_clips_across_source_ranges() -> Result<(), Box<dyn Er
         json!({}),
     )?;
     let selected = selected_origin(&mut case, input, b"BCD", 1, 3)?;
-    let index = CaseArtifactIndex::new(&case)?;
+    let index = CaseArtifactIndex::new(&case, None)?;
 
     assert_eq!(
         selected_artifact_source_ranges(&selected, &index, None)?.ranges,
@@ -311,7 +315,7 @@ fn mapping_receipt_with_a_gap_has_no_exact_object_range() -> Result<(), Box<dyn 
         json!({}),
     )?;
     let selected = selected_origin(&mut case, input, input_bytes, 0, input_bytes.len())?;
-    let index = CaseArtifactIndex::new(&case)?;
+    let index = CaseArtifactIndex::new(&case, None)?;
     let budget = l2_workbench::job::MemoryBudget::new(1024 * 1024);
     let source_ranges = selected_artifact_source_ranges(&selected, &index, Some(&budget))?;
     assert!(source_ranges.ranges.is_empty());
@@ -334,7 +338,7 @@ fn transformed_artifact_bytes_do_not_inherit_input_ranges() -> Result<(), Box<dy
         json!({}),
     )?;
     let selected = selected_origin(&mut case, input, b"WXYZ", 0, input_bytes.len())?;
-    let index = CaseArtifactIndex::new(&case)?;
+    let index = CaseArtifactIndex::new(&case, None)?;
 
     assert!(
         selected_artifact_source_ranges(&selected, &index, None)?
@@ -388,8 +392,8 @@ fn mapping_receipt_requires_the_exact_observed_edge_for_the_same_nodes()
             reason: "Unrelated evidence does not validate a mapping receipt".to_owned(),
         })?;
     }
-    let index = CaseArtifactIndex::new(&case)?;
-    assert!(!index.mapping_receipts_by_output.contains_key(&input));
+    let index = CaseArtifactIndex::new(&case, None)?;
+    assert!(index.mapping_receipt(input).is_none());
     drop(index);
 
     case.add_edge(Edge {
@@ -399,12 +403,9 @@ fn mapping_receipt_requires_the_exact_observed_edge_for_the_same_nodes()
         status: EvidenceStatus::Observed,
         reason: "The output has a byte mapping receipt".to_owned(),
     })?;
-    let index = CaseArtifactIndex::new(&case)?;
+    let index = CaseArtifactIndex::new(&case, None)?;
     assert_eq!(
-        index
-            .mapping_receipts_by_output
-            .get(&input)
-            .map(|node| node.id),
+        index.mapping_receipt(input).map(|node| node.id),
         Some(receipt)
     );
     Ok(())
@@ -527,7 +528,7 @@ fn duplicate_observed_mapping_receipts_are_rejected_deterministically() -> Resul
         reason: "duplicate test receipt".to_owned(),
     })?;
 
-    let error = CaseArtifactIndex::new(&case)
+    let error = CaseArtifactIndex::new(&case, None)
         .err()
         .ok_or("duplicate mapped receipts must be rejected")?;
     assert_eq!(
@@ -596,7 +597,7 @@ fn cohort_artifact_context_falls_back_when_packet_witnesses_are_incomplete()
         .case
         .node(no_witness_node_id)
         .ok_or("artifact with no packet witnesses is missing")?;
-    let context_index = CohortArtifactContextIndex::new(&cohort)?;
+    let context_index = CohortArtifactContextIndex::new(&cohort, None)?;
 
     let context = context_index.for_node(
         incomplete_witness_node,
@@ -643,7 +644,7 @@ fn cohort_artifact_context_uses_single_flow_context_for_one_supported_flow()
         .case
         .node(node_id)
         .ok_or("artifact node is missing")?;
-    let context = CohortArtifactContextIndex::new(&cohort)?.for_node(
+    let context = CohortArtifactContextIndex::new(&cohort, None)?.for_node(
         node,
         &cohort.result.case,
         Some("cohort-case"),
@@ -672,7 +673,7 @@ fn cohort_context_follows_plural_frame_node_references() -> Result<(), Box<dyn E
         .node(output_node)
         .cloned()
         .ok_or("relational output node is missing")?;
-    let context_index = CohortArtifactContextIndex::new(&cohort)?;
+    let context_index = CohortArtifactContextIndex::new(&cohort, None)?;
     let context = context_index.for_node(
         &candidate_node,
         &cohort.result.case,
@@ -697,7 +698,7 @@ fn cohort_context_follows_plural_frame_node_references() -> Result<(), Box<dyn E
         Some(&candidate_node),
         None,
         None,
-        &[],
+        std::iter::empty(),
         &cohort.result.case,
     )?;
     let canonical_inputs = provenance
@@ -875,7 +876,7 @@ fn cohort_context_for_node(
         .case
         .node(node_id)
         .ok_or("artifact node is missing")?;
-    let context_index = CohortArtifactContextIndex::new(&cohort)?;
+    let context_index = CohortArtifactContextIndex::new(&cohort, None)?;
     context_index.for_node(
         node,
         &cohort.result.case,
@@ -951,7 +952,7 @@ fn assert_forged_receipt_is_ignored(
         })?;
     }
     let selected = selected_origin(&mut case, input, b"cde", 2, 3)?;
-    let index = CaseArtifactIndex::new(&case)?;
+    let index = CaseArtifactIndex::new(&case, None)?;
 
     assert!(
         selected_artifact_source_ranges(&selected, &index, None)?

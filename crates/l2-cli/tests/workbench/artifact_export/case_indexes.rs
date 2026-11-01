@@ -51,7 +51,7 @@ fn selection_requires_the_matching_observed_parse_edge() -> Result<(), Box<dyn E
         artifact
             .provenance()
             .first()
-            .and_then(|origin| origin.validated_as()),
+            .and_then(super::super::provenance::ArtifactProvenance::validated_as),
         Some("der_structure")
     );
     Ok(())

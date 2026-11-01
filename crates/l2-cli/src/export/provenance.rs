@@ -12,41 +12,80 @@ use l2_workbench::{
     job::{JsonMemoryAdmission, MemoryBudget, MemoryClass, MemoryLease, admit_json},
 };
 use std::{
-    collections::{BTreeSet, HashMap, HashSet},
+    collections::{BTreeSet, HashSet},
     error::Error,
 };
 
-pub(super) struct CohortArtifactContextIndex {
-    member_flows_by_id: HashMap<i64, serde_json::Value>,
-    packet_to_flow: HashMap<u64, i64>,
-    cohort_scope: serde_json::Value,
+pub(super) struct CohortArtifactContextIndex<'a> {
+    cohort: &'a workbench::full_source::CohortAnalysis,
+    member_flows_by_id: Vec<(i64, usize)>,
+    packet_to_flow: Vec<(u32, usize)>,
+    // Index vectors drop before the shared charge
+    _memory: Option<MemoryLease>,
 }
 
-impl CohortArtifactContextIndex {
+impl<'a> CohortArtifactContextIndex<'a> {
     pub(super) fn new(
-        cohort: &workbench::full_source::CohortAnalysis,
+        cohort: &'a workbench::full_source::CohortAnalysis,
+        budget: Option<&MemoryBudget>,
     ) -> Result<Self, Box<dyn Error>> {
         #[cfg(test)]
         COHORT_ARTIFACT_LOOKUP_BUILDS.with(|builds| builds.set(builds.get() + 1));
 
-        // Cache both lookup directions and serialized member flow records once
-        let member_flows_by_id = cohort
-            .member_flows
-            .iter()
-            .map(|flow| Ok((flow.id, serde_json::to_value(flow)?)))
-            .collect::<Result<HashMap<_, _>, serde_json::Error>>()?;
-        let packet_to_flow = cohort
-            .packet_flow_ids
-            .iter()
-            .map(|(packet, flow)| (u64::from(*packet), *flow))
-            .collect::<HashMap<_, _>>();
-        let cohort_scope = cohort_scope(cohort)?;
+        if cohort.member_flows.is_empty() {
+            return Err("cohort analysis has no member flows".into());
+        }
+        let mut memory = budget
+            .map(|budget| budget.try_reserve(MemoryClass::Publication, 0))
+            .transpose()?;
+        let mut member_flows_by_id = Vec::new();
+        for (index, flow) in cohort.member_flows.iter().enumerate() {
+            crate::retained_memory::grow_vec_optional(&mut member_flows_by_id, &mut memory, 1)?;
+            member_flows_by_id.push((flow.id, index));
+        }
+        // Original positions break ties so the last entry wins
+        member_flows_by_id.sort_unstable();
+        let mut packet_to_flow = Vec::new();
+        for (index, (packet, _)) in cohort.packet_flow_ids.iter().enumerate() {
+            crate::retained_memory::grow_vec_optional(&mut packet_to_flow, &mut memory, 1)?;
+            packet_to_flow.push((*packet, index));
+        }
+        packet_to_flow.sort_unstable();
 
         Ok(Self {
+            cohort,
             member_flows_by_id,
             packet_to_flow,
-            cohort_scope,
+            _memory: memory,
         })
+    }
+
+    fn packet_flow(&self, packet: u64) -> Option<i64> {
+        let packet = u32::try_from(packet).ok()?;
+        let last = self
+            .packet_to_flow
+            .partition_point(|(candidate, _)| *candidate <= packet)
+            .checked_sub(1)?;
+        let (candidate, index) = self.packet_to_flow.get(last)?;
+        if *candidate != packet {
+            return None;
+        }
+        self.cohort
+            .packet_flow_ids
+            .get(*index)
+            .map(|(_, flow)| *flow)
+    }
+
+    fn member_flow(&self, flow: i64) -> Option<&l2_workbench::store::Flow> {
+        let last = self
+            .member_flows_by_id
+            .partition_point(|(candidate, _)| *candidate <= flow)
+            .checked_sub(1)?;
+        let (candidate, index) = self.member_flows_by_id.get(last)?;
+        if *candidate != flow {
+            return None;
+        }
+        self.cohort.member_flows.get(*index)
     }
 
     pub(super) fn for_node(
@@ -60,26 +99,29 @@ impl CohortArtifactContextIndex {
         let mut visited_nodes = HashSet::new();
         collect_node_packets(node, case, &mut visited_nodes, &mut packet_numbers)?;
 
+        let mut complete = true;
         let mut supporting_ids = packet_numbers
             .iter()
-            .filter_map(|packet| self.packet_to_flow.get(packet).copied())
+            .filter_map(|packet| {
+                self.packet_flow(*packet).or_else(|| {
+                    complete = false;
+                    None
+                })
+            })
             .collect::<BTreeSet<_>>();
         // Missing packet witnesses cannot safely narrow support to one indexed flow
-        if supporting_ids.is_empty()
-            || packet_numbers
-                .iter()
-                .any(|packet| !self.packet_to_flow.contains_key(packet))
-        {
-            supporting_ids.extend(self.member_flows_by_id.keys().copied());
+        if supporting_ids.is_empty() || !complete {
+            supporting_ids.extend(self.member_flows_by_id.iter().map(|(flow, _)| *flow));
         }
+        // Serialize only flows needed by this artifact instead of caching every JSON copy
         let supporting_flows = supporting_ids
             .iter()
-            .filter_map(|flow_id| self.member_flows_by_id.get(flow_id).cloned())
-            .collect::<Vec<_>>();
+            .filter_map(|flow_id| self.member_flow(*flow_id))
+            .map(serde_json::to_value)
+            .collect::<Result<Vec<_>, _>>()?;
 
         if supporting_ids.len() == 1
-            && let Some(flow_id) = supporting_ids.first()
-            && let Some(flow) = self.member_flows_by_id.get(flow_id)
+            && let Some(flow) = supporting_flows.first()
         {
             return Ok(ArtifactSourceContext {
                 flow: Some(flow.clone()),
@@ -93,7 +135,7 @@ impl CohortArtifactContextIndex {
         Ok(ArtifactSourceContext {
             flow: None,
             supporting_flows,
-            cohort_scope: Some(self.cohort_scope.clone()),
+            cohort_scope: Some(cohort_scope(self.cohort)?),
             case_id: case_id.map(str::to_owned),
             case_scope: case_scope.clone(),
         })
@@ -281,11 +323,7 @@ fn selected_source_ranges(
     if selected_blob.bytes.as_slice() != validated_bytes {
         return Ok(Vec::new());
     }
-    let Some(receipt_node) = index
-        .mapping_receipts_by_output
-        .get(&input.input_node.id)
-        .copied()
-    else {
+    let Some(receipt_node) = index.mapping_receipt(input.input_node.id) else {
         return exact_direct_input_ranges(&input, memory);
     };
     source_ranges_from_mapping_receipt(receipt_node, &input, index, budget, memory)
@@ -531,13 +569,13 @@ fn mappings_cover_object(
     Ok(complete && covered_end >= object_length)
 }
 
-pub(super) fn artifact_provenance(
+pub(super) fn artifact_provenance<'a>(
     category: &str,
     context: &ArtifactSourceContext,
     node: Option<&Node>,
     description: Option<String>,
     selection: Option<ArtifactSelection>,
-    signature_candidates: &[&Node],
+    signature_candidates: impl Iterator<Item = &'a Node>,
     case: &Case,
 ) -> Result<ArtifactProvenance, Box<dyn Error>> {
     let graph_retained = context.case_id.is_some();
@@ -572,10 +610,7 @@ pub(super) fn artifact_provenance(
     };
     let canonical_source_ranges = (!source_ranges.is_empty()).then_some(&source_ranges);
     let signature_candidates = if graph_retained {
-        signature_candidates
-            .iter()
-            .map(|candidate| (*candidate).clone())
-            .collect()
+        signature_candidates.cloned().collect()
     } else {
         Vec::new()
     };

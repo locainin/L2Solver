@@ -23,7 +23,7 @@ use super::{
 use crate::{arguments::ExportOptions, workbench};
 use l2_workbench::{
     evidence::{Case, EvidenceStatus, Node},
-    job::{MemoryBudget, MemoryError, Phase},
+    job::{MemoryBudget, MemoryClass, MemoryError, MemoryLease, Phase},
     reconstruction::Limits,
     tshark::SourceIdentity,
 };
@@ -563,7 +563,7 @@ pub(super) fn collect_cohort_artifacts(
     memory: Option<&MemoryBudget>,
 ) -> Result<(), Box<dyn Error>> {
     // Native and recovered artifacts share this collection-scoped lookup
-    let context_index = CohortArtifactContextIndex::new(cohort)?;
+    let context_index = CohortArtifactContextIndex::new(cohort, memory)?;
     collect_case_artifacts_with_context(collection, &cohort.result.case, memory, |node, case| {
         context_index.for_node(node, case, case_id, case_scope)
     })
@@ -575,20 +575,28 @@ pub(super) fn collect_case_artifacts_with_context(
     memory: Option<&MemoryBudget>,
     mut context_for_node: impl FnMut(&Node, &Case) -> Result<ArtifactSourceContext, Box<dyn Error>>,
 ) -> Result<(), Box<dyn Error>> {
-    let index = CaseArtifactIndex::new(case)?;
-    collect_native_case_artifacts(collection, &index, memory, &mut context_for_node)?;
-    collect_selected_case_artifacts(collection, &index, memory, &mut context_for_node)
+    let mut index = CaseArtifactIndex::new(case, memory)?;
+    collect_native_case_artifacts(collection, &mut index, memory, &mut context_for_node)?;
+    collect_selected_case_artifacts(collection, &mut index, memory, &mut context_for_node)
 }
 
 pub(super) struct CaseArtifactIndex<'a> {
     pub(super) case: &'a Case,
-    signature_candidates: HashMap<u64, Vec<&'a Node>>,
-    pub(super) mapping_receipts_by_output: HashMap<u64, &'a Node>,
+    signature_candidates: Option<Vec<(u64, &'a Node)>>,
+    mapping_receipts_by_output: Vec<(u64, &'a Node)>,
+    // Index storage drops before its shared charge
+    memory: Option<MemoryLease>,
 }
 
 impl<'a> CaseArtifactIndex<'a> {
-    pub(super) fn new(case: &'a Case) -> Result<Self, Box<dyn Error>> {
-        let mut mapping_receipts_by_output = HashMap::new();
+    pub(super) fn new(
+        case: &'a Case,
+        budget: Option<&MemoryBudget>,
+    ) -> Result<Self, Box<dyn Error>> {
+        let mut memory = budget
+            .map(|budget| budget.try_reserve(MemoryClass::Publication, 0))
+            .transpose()?;
+        let mut mapping_receipts_by_output = Vec::new();
         // Imported receipt details are provenance only when their link is observed
         for node in case
             .nodes()
@@ -611,24 +619,100 @@ impl<'a> CaseArtifactIndex<'a> {
             {
                 continue;
             }
-            if mapping_receipts_by_output
-                .insert(output_node, node)
-                .is_some()
-            {
+            crate::retained_memory::grow_vec_optional(
+                &mut mapping_receipts_by_output,
+                &mut memory,
+                1,
+            )?;
+            mapping_receipts_by_output.push((output_node, node));
+        }
+        mapping_receipts_by_output.sort_unstable_by_key(|(output, node)| (*output, node.id));
+        let mut previous = None;
+        for (output, _) in &mapping_receipts_by_output {
+            if previous == Some(*output) {
                 return Err("multiple byte mapping receipts reference one output node".into());
             }
+            previous = Some(*output);
         }
+
         Ok(Self {
             case,
-            signature_candidates: signature_candidates(case),
+            signature_candidates: None,
             mapping_receipts_by_output,
+            memory,
         })
     }
+
+    fn signatures_for(
+        &mut self,
+        input: u64,
+        retained: bool,
+    ) -> Result<impl Iterator<Item = &'a Node> + '_, Box<dyn Error>> {
+        if retained && self.signature_candidates.is_none() {
+            let before = self.memory.as_ref().map_or(0, MemoryLease::bytes);
+            match signature_candidates(self.case, &mut self.memory) {
+                Ok(candidates) => self.signature_candidates = Some(candidates),
+                Err(error) => {
+                    if let Some(memory) = &mut self.memory {
+                        memory.try_resize(before)?;
+                    }
+                    return Err(error);
+                }
+            }
+        }
+        let candidates = if retained {
+            self.signature_candidates.as_deref().unwrap_or_default()
+        } else {
+            &[]
+        };
+        let start = candidates.partition_point(|(candidate, _)| *candidate < input);
+        let end = candidates.partition_point(|(candidate, _)| *candidate <= input);
+        Ok(candidates
+            .iter()
+            .skip(start)
+            .take(end - start)
+            .map(|(_, node)| *node))
+    }
+
+    pub(super) fn mapping_receipt(&self, output: u64) -> Option<&'a Node> {
+        let position = self
+            .mapping_receipts_by_output
+            .binary_search_by_key(&output, |(candidate, _)| *candidate)
+            .ok()?;
+        self.mapping_receipts_by_output
+            .get(position)
+            .map(|(_, node)| *node)
+    }
+}
+
+fn signature_candidates<'a>(
+    case: &'a Case,
+    memory: &mut Option<MemoryLease>,
+) -> Result<Vec<(u64, &'a Node)>, Box<dyn Error>> {
+    let mut candidates = Vec::new();
+    for node in case
+        .nodes()
+        .iter()
+        .filter(|node| node.kind == "file_signature_match")
+    {
+        let Some(input_node) = node
+            .details
+            .get("input_node")
+            .and_then(serde_json::Value::as_u64)
+        else {
+            continue;
+        };
+        crate::retained_memory::grow_vec_optional(&mut candidates, memory, 1)?;
+        candidates.push((input_node, node));
+    }
+    // Case node IDs follow insertion order, preserving candidate order within each input
+    candidates.sort_unstable_by_key(|(input, node)| (*input, node.id));
+    Ok(candidates)
 }
 
 fn collect_native_case_artifacts(
     collection: &mut ArtifactCollection,
-    index: &CaseArtifactIndex<'_>,
+    index: &mut CaseArtifactIndex<'_>,
     memory: Option<&MemoryBudget>,
     context_for_node: &mut impl FnMut(&Node, &Case) -> Result<ArtifactSourceContext, Box<dyn Error>>,
 ) -> Result<(), Box<dyn Error>> {
@@ -651,10 +735,7 @@ fn collect_native_case_artifacts(
             Some(node),
             Some(description.to_owned()),
             None,
-            index
-                .signature_candidates
-                .get(&node.id)
-                .map_or(&[], Vec::as_slice),
+            index.signatures_for(node.id, context.case_id.is_some())?,
             case,
         )?;
         let name = file_name(number, node, &blob.bytes, memory)?;
@@ -665,7 +746,7 @@ fn collect_native_case_artifacts(
 
 fn collect_selected_case_artifacts(
     collection: &mut ArtifactCollection,
-    index: &CaseArtifactIndex<'_>,
+    index: &mut CaseArtifactIndex<'_>,
     memory: Option<&MemoryBudget>,
     context_for_node: &mut impl FnMut(&Node, &Case) -> Result<ArtifactSourceContext, Box<dyn Error>>,
 ) -> Result<(), Box<dyn Error>> {
@@ -727,10 +808,7 @@ fn collect_selected_case_artifacts(
                 Some(node),
                 None,
                 Some(selection),
-                index
-                    .signature_candidates
-                    .get(&node.id)
-                    .map_or(&[], Vec::as_slice),
+                index.signatures_for(node.id, context.case_id.is_some())?,
                 case,
             )?;
             collection.add_bytes(
@@ -763,25 +841,6 @@ fn archive_member_ancestor_path<'a>(
             .get("input_node")
             .and_then(serde_json::Value::as_u64)?;
     }
-}
-
-fn signature_candidates(case: &Case) -> HashMap<u64, Vec<&Node>> {
-    let mut candidates = HashMap::<u64, Vec<&Node>>::new();
-    for node in case
-        .nodes()
-        .iter()
-        .filter(|node| node.kind == "file_signature_match")
-    {
-        let Some(input_node) = node
-            .details
-            .get("input_node")
-            .and_then(serde_json::Value::as_u64)
-        else {
-            continue;
-        };
-        candidates.entry(input_node).or_default().push(node);
-    }
-    candidates
 }
 
 fn native_category(node: &Node) -> &'static str {

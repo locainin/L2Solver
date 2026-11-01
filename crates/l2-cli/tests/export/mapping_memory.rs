@@ -113,7 +113,7 @@ fn mapping_receipt_keeps_exact_ranges_and_releases_its_charge() -> TestResult {
     let mut found = false;
     artifacts.visit_artifact_origins(|_, _, origin| {
         found = true;
-        assert_eq!(origin.source_ranges.len(), (CHILDREN * 2 + 4) / 2);
+        assert_eq!(origin.source_ranges.len(), CHILDREN + 2);
         assert_eq!(
             origin.source_ranges.first().map(|range| range.offset),
             Some(0)
@@ -159,7 +159,7 @@ fn retained_case_keeps_the_exact_selected_mapping_ranges_in_its_selection() -> T
             .and_then(|selection| selection.get("source_ranges"))
             .and_then(serde_json::Value::as_array)
             .ok_or("selection source ranges are missing")?;
-        assert_eq!(ranges.len(), (CHILDREN * 2 + 4) / 2);
+        assert_eq!(ranges.len(), CHILDREN + 2);
         assert_eq!(
             ranges.first().and_then(|range| range.get("offset")),
             Some(&json!(0))
@@ -183,10 +183,10 @@ fn selected_source_ranges_remain_charged_until_the_ranges_drop() -> TestResult {
         .first()
         .and_then(|artifact| artifact.provenance().first())
         .ok_or("selected source provenance is missing")?;
-    let index = super::CaseArtifactIndex::new(&case)?;
+    let index = super::CaseArtifactIndex::new(&case, None)?;
     let budget = MemoryBudget::new(8 * 1024 * 1024);
     let ranges = super::selected_artifact_source_ranges(origin, &index, Some(&budget))?;
-    assert_eq!(ranges.ranges.len(), (CHILDREN * 2 + 4) / 2);
+    assert_eq!(ranges.ranges.len(), CHILDREN + 2);
     assert!(budget.snapshot()?.used(MemoryClass::Publication) > 0);
     drop(ranges);
     assert_eq!(budget.snapshot()?.used_bytes, 0);
@@ -213,7 +213,7 @@ fn direct_source_ranges_respect_pressure_and_release_their_charge() -> TestResul
         json!({}),
     )?;
     let selected = super::selected_origin(&mut case, input, bytes, 0, bytes.len())?;
-    let index = super::CaseArtifactIndex::new(&case)?;
+    let index = super::CaseArtifactIndex::new(&case, None)?;
     let budget = MemoryBudget::new(64 * 1024);
     let blocker = budget.try_reserve(MemoryClass::Cache, budget.snapshot()?.limit_bytes)?;
     let error = super::selected_artifact_source_ranges(&selected, &index, Some(&budget))
