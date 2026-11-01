@@ -109,16 +109,26 @@ fn real_full_tmpfs_spill_preserves_previous_output_and_cleans_private_files() ->
         },
         || Ok(()),
     );
+    let Err(publish::DirectoryPublishError::BeforePublication(error)) = outcome else {
+        return Err("full filesystem did not stop publication".into());
+    };
     assert!(matches!(
-        outcome,
-        Err(publish::DirectoryPublishError::BeforePublication(_))
+        error.downcast_ref::<l2_workbench::evidence::EvidenceError>(),
+        Some(l2_workbench::evidence::EvidenceError::WriteFailed)
     ));
+    println!("real_spill_failure={error:?}");
     assert_previous_and_clean(root.path(), &destination, &memory)?;
     let mut probe = tempfile::NamedTempFile::new_in(root.path())?;
     let error = probe
+        .as_file_mut()
         .write_all(&vec![0_u8; 2 * MIB])
         .err()
         .ok_or("private tmpfs was not full")?;
+    println!(
+        "private_tmpfs_probe_error={error:?} kind={:?} raw={:?}",
+        error.kind(),
+        error.raw_os_error()
+    );
     assert_eq!(error.raw_os_error(), Some(libc::ENOSPC));
     drop(probe);
     assert_previous_and_clean(root.path(), &destination, &memory)?;

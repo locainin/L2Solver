@@ -247,6 +247,8 @@ fn corrupted_ordered_spill_does_not_replace_previous_output_or_leak_files() -> T
     Ok(())
 }
 
+#[path = "batch.rs"]
+mod batch;
 #[path = "cancellation.rs"]
 mod cancellation;
 #[cfg(unix)]
