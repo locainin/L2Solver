@@ -7,6 +7,7 @@ mod crypto;
 use super::{CounterByteOrder, CounterWidth, OperandRef, Operation, SeedCounterOrder, StepFailure};
 
 pub use bits::select_bit_plane_chunks;
+pub(super) use codec::base64_engine;
 
 pub(super) fn crypto_work_overhead(input_length: usize, operation: &Operation) -> Option<usize> {
     crypto::work_overhead(input_length, operation)

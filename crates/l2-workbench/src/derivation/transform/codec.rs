@@ -129,7 +129,10 @@ pub(super) fn base64_decode(
     Ok(decoded)
 }
 
-fn base64_engine(alphabet_kind: Base64Alphabet, padding: Base64Padding) -> GeneralPurpose {
+pub(in crate::derivation) fn base64_engine(
+    alphabet_kind: Base64Alphabet,
+    padding: Base64Padding,
+) -> GeneralPurpose {
     let alphabet = match alphabet_kind {
         Base64Alphabet::Standard => &alphabet::STANDARD,
         Base64Alphabet::UrlSafe => &alphabet::URL_SAFE,

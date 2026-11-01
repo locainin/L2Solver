@@ -16,6 +16,10 @@ mod operations;
 mod schema;
 #[path = "derivation/secret_handling.rs"]
 mod secret_handling;
+#[path = "derivation/streaming.rs"]
+mod streaming;
+#[path = "derivation/streaming_files.rs"]
+mod streaming_files;
 #[path = "derivation/support.rs"]
 mod support;
 #[path = "derivation/transforms.rs"]

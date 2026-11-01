@@ -5,6 +5,7 @@ mod execute;
 mod identity;
 mod model;
 mod operands;
+mod stream;
 mod transform;
 
 pub use execute::{DerivationError, run, run_with_case, run_with_limits, run_with_selected_input};
@@ -14,6 +15,10 @@ pub use model::{
     DerivationLimits, DerivationReport, DerivationStatus, HexCase, OperandLocation,
     OperandProvenance, OperandRef, OperandSlot, Operation, Recipe, SecretBytes, SeedCounterOrder,
     StepFailure, StepReport, StepStatus,
+};
+pub use stream::{
+    STREAM_WORKSPACE_BYTES, StreamInput, StreamLimits, StreamReceipt, StreamTransformError,
+    stream_transform,
 };
 
 pub(crate) fn validate_recipe_identity(recipe: &Recipe) -> Result<(), DerivationError> {
