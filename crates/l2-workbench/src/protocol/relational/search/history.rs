@@ -90,6 +90,12 @@ impl RelationalReplayHistory {
         self.entries.capacity() * mem::size_of::<Entry>() + self.marker_bytes
     }
 
+    /// Maximum heap storage allowed for this history's exact rule identities
+    #[must_use]
+    pub const fn maximum_bytes(&self) -> usize {
+        self.max_bytes
+    }
+
     /// Adjust the heap-storage ceiling without discarding previously recorded identities
     ///
     /// Returns false and leaves the ceiling unchanged if existing storage exceeds the new limit.
@@ -131,6 +137,13 @@ impl RelationalReplayHistory {
     }
 
     // Ignore randomized hash buckets while binding the lookup prefix and capacity
+    pub(super) fn checkpoint_scratch_bytes(&self) -> Option<u64> {
+        self.entries
+            .len()
+            .checked_mul(size_of::<[u8; 32]>())
+            .and_then(|bytes| u64::try_from(bytes).ok())
+    }
+
     pub(super) fn checkpoint_identity(
         &self,
     ) -> Result<[u8; 32], super::super::model::RelationalTransformError> {

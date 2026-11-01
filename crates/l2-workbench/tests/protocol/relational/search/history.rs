@@ -440,16 +440,20 @@ fn storage_limit_can_grow_and_cannot_shrink_below_allocated_bytes() -> TestResul
     let RelationalOperationTemplate::Sha256CounterXor(mut operation) = rule.operation;
     operation.counter_width = CounterWidth::EightBytes;
     let mut history = RelationalReplayHistory::new(0);
+    assert_eq!(history.maximum_bytes(), 0);
     assert!(history.set_max_bytes(4_096));
+    assert_eq!(history.maximum_bytes(), 4_096);
     assert!(history.register_published_rule(&rule));
     let used = history.storage_bytes();
     assert!(used > 0);
     assert!(!history.set_max_bytes(used - 1));
+    assert_eq!(history.maximum_bytes(), 4_096);
 
     operation.initial_counter += 1;
     rule.operation = RelationalOperationTemplate::Sha256CounterXor(operation);
     assert!(history.register_published_rule(&rule));
     assert!(history.set_max_bytes(history.storage_bytes()));
+    assert_eq!(history.maximum_bytes(), history.storage_bytes());
     operation.initial_counter += 1;
     rule.operation = RelationalOperationTemplate::Sha256CounterXor(operation);
     assert!(!history.register_published_rule(&rule));

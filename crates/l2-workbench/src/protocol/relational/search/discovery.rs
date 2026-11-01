@@ -33,8 +33,7 @@ use std::{
 
 mod cursor;
 pub use cursor::{
-    RelationalCursorError, RelationalSearchCursor, RelationalSearchStep,
-    step_relational_transform_candidates_with_evaluator_and_history,
+    RelationalCursorError, RelationalSearchCursor, RelationalSearchSession, RelationalSearchStep,
 };
 
 #[derive(serde::Deserialize)]
@@ -916,9 +915,11 @@ impl<'a> LocatorPairSchedule<'a> {
         let header_aligned = RankedPairStream::new(&domain, PairStreamKind::HeaderAligned)?;
         let aligned = RankedPairStream::new(&domain, PairStreamKind::Aligned)?;
         let fallback = RankedPairStream::new(&domain, PairStreamKind::Fallback)?;
-        let initial_pair_count = seed_candidates
+        // Only absolute payloads participate in this pair schedule
+        let initial_pair_count = domain
+            .seeds
             .len()
-            .saturating_mul(payload_candidates.len())
+            .saturating_mul(domain.payloads.len())
             .min(INITIAL_RANK_ORDERED_PAIR_WINDOW);
         Ok(Self {
             domain,

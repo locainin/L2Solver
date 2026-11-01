@@ -3,8 +3,12 @@
 use super::{
     CURSOR_VERSION, CandidateId, LocatorCandidate, Position, RelationalCandidateOutputs,
     RelationalCursorError, RelationalFit, RelationalFitStatus, RelationalSearchCursor,
-    RelationalSessionId, RelationalTransformCandidate, RelationalTransformRule,
-    RelationalTransformStatus, RetainedCandidate, SearchState,
+    RelationalSearchSession, RelationalSessionId, RelationalTransformCandidate,
+    RelationalTransformRule, RelationalTransformStatus, RetainedCandidate, SearchState,
+    history_identity, restoration_scratch_bytes, validate_cursor,
+};
+use crate::job::{
+    JsonMemoryError, MemoryBudget, MemoryClass, MemoryError, MemoryLease, admit_json,
 };
 use serde::{
     Deserialize, Deserializer, Serialize, Serializer,
@@ -237,9 +241,22 @@ pub(in super::super) fn deserialize_candidate<'de, D: Deserializer<'de>>(
     })
 }
 
+struct EncodedAssessment {
+    bytes: Vec<u8>,
+    _memory: MemoryLease,
+}
+
+impl Serialize for EncodedAssessment {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        let value: &RawValue =
+            serde_json::from_slice(&self.bytes).map_err(serde::ser::Error::custom)?;
+        value.serialize(serializer)
+    }
+}
+
 struct RetainedSeq<'a, T> {
     candidates: &'a [RetainedCandidate<T>],
-    assessments: &'a [Value],
+    assessments: &'a [EncodedAssessment],
 }
 impl<T> Serialize for RetainedSeq<'_, T> {
     fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
@@ -262,7 +279,7 @@ impl<T> Serialize for RetainedSeq<'_, T> {
 struct RetainedRef<'a> {
     candidate: CandidateRef<'a>,
     priority: u8,
-    assessment: &'a Value,
+    assessment: &'a EncodedAssessment,
     outputs: &'a Option<RelationalCandidateOutputs>,
     captured_output_bytes: usize,
     output_capture_omitted: bool,
@@ -271,7 +288,7 @@ struct RetainedRef<'a> {
 
 struct SearchRef<'a, T> {
     search: &'a SearchState<'static, T>,
-    assessments: &'a [Value],
+    assessments: &'a [EncodedAssessment],
 }
 impl<T> Serialize for SearchRef<'_, T> {
     fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
@@ -361,29 +378,36 @@ struct EnvelopeRef<'a> {
 }
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
-struct EnvelopeOwned {
+struct EnvelopeOwned<'a> {
     version: u32,
     digest: [u8; 32],
-    payload: Box<RawValue>,
+    #[serde(borrow)]
+    payload: &'a RawValue,
 }
 
 struct LimitedWriter {
     bytes: Vec<u8>,
     limit: usize,
+    memory: MemoryLease,
     failed_allocation: bool,
     exceeded: bool,
+    memory_error: Option<MemoryError>,
 }
 impl LimitedWriter {
-    const fn new(limit: usize) -> Self {
-        Self {
+    fn new(limit: usize, memory: &MemoryBudget) -> Result<Self, MemoryError> {
+        Ok(Self {
             bytes: Vec::new(),
             limit,
+            memory: memory.try_reserve(MemoryClass::Executor, 0)?,
             failed_allocation: false,
             exceeded: false,
-        }
+            memory_error: None,
+        })
     }
     const fn failure<E>(&self) -> RelationalCursorError<E> {
-        if self.failed_allocation {
+        if let Some(error) = self.memory_error {
+            RelationalCursorError::Memory(JsonMemoryError::Memory(error))
+        } else if self.failed_allocation {
             RelationalCursorError::AllocationFailed
         } else if self.exceeded {
             RelationalCursorError::CheckpointTooLarge
@@ -398,9 +422,37 @@ impl Write for LimitedWriter {
             self.exceeded = true;
             return Err(io::Error::other("checkpoint byte limit"));
         }
-        if self.bytes.try_reserve(bytes.len()).is_err() {
-            self.failed_allocation = true;
-            return Err(io::Error::other("checkpoint allocation"));
+        let needed = self.bytes.len() + bytes.len();
+        if needed > self.bytes.capacity() {
+            let old_capacity = self.bytes.capacity();
+            let target = old_capacity
+                .checked_mul(2)
+                .unwrap_or(self.limit)
+                .max(needed)
+                .min(self.limit);
+            // Admit old and replacement buffers together while the allocator grows the Vec
+            let peak = old_capacity
+                .checked_add(target)
+                .and_then(|size| u64::try_from(size).ok())
+                .ok_or_else(|| io::Error::other("checkpoint capacity overflow"))?;
+            if let Err(error) = self.memory.try_resize(peak) {
+                self.memory_error = Some(error);
+                return Err(io::Error::other("checkpoint memory admission"));
+            }
+            if self
+                .bytes
+                .try_reserve_exact(target.saturating_sub(self.bytes.len()))
+                .is_err()
+            {
+                self.failed_allocation = true;
+                return Err(io::Error::other("checkpoint allocation"));
+            }
+            let actual = u64::try_from(self.bytes.capacity())
+                .map_err(|_| io::Error::other("checkpoint capacity overflow"))?;
+            if let Err(error) = self.memory.try_resize(actual) {
+                self.memory_error = Some(error);
+                return Err(io::Error::other("checkpoint memory admission"));
+            }
         }
         self.bytes.extend_from_slice(bytes);
         Ok(bytes.len())
@@ -410,79 +462,158 @@ impl Write for LimitedWriter {
     }
 }
 
-impl<T> RelationalSearchCursor<T> {
-    /// Encode a bounded checkpoint using a caller-owned assessment representation
+const fn memory_failure<E>(error: MemoryError) -> RelationalCursorError<E> {
+    RelationalCursorError::Memory(JsonMemoryError::Memory(error))
+}
+
+fn reserve<E>(memory: &MemoryBudget, bytes: u64) -> Result<MemoryLease, RelationalCursorError<E>> {
+    memory
+        .try_reserve(MemoryClass::Executor, bytes)
+        .map_err(memory_failure)
+}
+
+fn admit_parse_scratch<E>(
+    memory: &mut MemoryLease,
+    bytes: usize,
+) -> Result<(), RelationalCursorError<E>> {
+    let required = u64::try_from(bytes)
+        .ok()
+        .and_then(|bytes| bytes.checked_mul(3))
+        .ok_or(RelationalCursorError::CheckpointTooLarge)?;
+    memory
+        .try_resize(memory.bytes().max(required))
+        .map_err(memory_failure)
+}
+
+impl RelationalSearchSession<'_, '_> {
+    /// Encode a bounded cursor and the exact active history identity
     ///
-    /// The assessment encoder must produce a compact value and must not rely on live state.
+    /// The encoder writes one JSON value to a bounded writer without cloning the assessment.
+    /// The cursor must have been returned by this session at a completed-candidate boundary.
+    /// Keep the returned lease until the encoded bytes are no longer retained.
     ///
     /// # Errors
-    /// Returns an error for unsupported candidate evidence, allocation, the byte limit, or the encoder
-    pub fn encode_checkpoint<E, F>(
+    /// Returns an error for an incompatible cursor, allocation, byte limit, or encoder failure
+    #[expect(
+        clippy::too_many_lines,
+        reason = "keep admitted checkpoint buffers in one encoding transaction"
+    )]
+    pub fn encode_checkpoint<T, E, F>(
         &self,
+        cursor: &RelationalSearchCursor<T>,
         max_bytes: usize,
+        memory: &MemoryBudget,
         mut encode: F,
-    ) -> Result<Vec<u8>, RelationalCursorError<E>>
+    ) -> Result<(Vec<u8>, MemoryLease), RelationalCursorError<E>>
     where
-        F: FnMut(&T) -> Result<Value, E>,
+        F: FnMut(&T, &mut dyn Write) -> Result<(), E>,
     {
+        if self.complete || cursor.session_id != self.session_id || cursor.identity != self.identity
+        {
+            return Err(RelationalCursorError::InvalidCheckpoint);
+        }
+        let history_bytes = match self.history.as_deref() {
+            Some(history) => history
+                .checkpoint_scratch_bytes()
+                .ok_or(RelationalCursorError::CheckpointTooLarge)?,
+            None => 0,
+        };
+        let history_memory = reserve(memory, history_bytes)?;
+        let history_identity =
+            history_identity(self.history.as_deref()).map_err(RelationalCursorError::Search)?;
+        drop(history_memory);
+        let assessment_slots = cursor
+            .search
+            .candidates
+            .len()
+            .checked_mul(2 * size_of::<EncodedAssessment>())
+            .and_then(|bytes| u64::try_from(bytes).ok())
+            .ok_or(RelationalCursorError::CheckpointTooLarge)?;
+        let _assessment_slots = reserve(memory, assessment_slots)?;
+        let mut parse_memory = reserve(memory, 0)?;
         let mut assessments = Vec::new();
         assessments
-            .try_reserve_exact(self.search.candidates.len())
+            .try_reserve_exact(cursor.search.candidates.len())
             .map_err(|_| RelationalCursorError::AllocationFailed)?;
-        for candidate in &self.search.candidates {
-            assessments
-                .push(encode(&candidate.assessment).map_err(RelationalCursorError::Assessment)?);
+        let mut assessment_bytes = 0_usize;
+        for candidate in &cursor.search.candidates {
+            // The combined assessment stream cannot grow beyond the checkpoint ceiling
+            let mut writer = LimitedWriter::new(max_bytes.saturating_sub(assessment_bytes), memory)
+                .map_err(memory_failure)?;
+            let result = encode(&candidate.assessment, &mut writer);
+            if writer.failed_allocation || writer.exceeded || writer.memory_error.is_some() {
+                return Err(writer.failure());
+            }
+            result.map_err(RelationalCursorError::Assessment)?;
+            assessment_bytes = assessment_bytes
+                .checked_add(writer.bytes.len())
+                .ok_or(RelationalCursorError::CheckpointTooLarge)?;
+            admit_parse_scratch(&mut parse_memory, writer.bytes.len())?;
+            let _: &RawValue = serde_json::from_slice(&writer.bytes)
+                .map_err(|_| RelationalCursorError::InvalidCheckpoint)?;
+            assessments.push(EncodedAssessment {
+                bytes: writer.bytes,
+                _memory: writer.memory,
+            });
         }
         let payload = CursorRef {
             identity: self.identity,
-            history_identity: self.history_identity,
+            history_identity,
             search: SearchRef {
-                search: &self.search,
+                search: &cursor.search,
                 assessments: &assessments,
             },
-            payload_locators: &self.payload_locators,
-            absolute_locators_complete: self.absolute_locators_complete,
-            initial_pairs: &self.initial_pairs,
-            pre_evaluated: &self.pre_evaluated,
-            position: &self.position,
+            payload_locators: &cursor.prepared.payload_locators,
+            absolute_locators_complete: cursor.prepared.absolute_locators_complete,
+            initial_pairs: &cursor.initial_pairs,
+            pre_evaluated: &cursor.pre_evaluated,
+            position: &cursor.position,
         };
-        let mut writer = LimitedWriter::new(max_bytes);
+        let mut writer = LimitedWriter::new(max_bytes, memory).map_err(memory_failure)?;
         if serde_json::to_writer(&mut writer, &payload).is_err() {
             return Err(writer.failure());
         }
         let digest = Sha256::digest(&writer.bytes).into();
-        let text = String::from_utf8(writer.bytes)
+        admit_parse_scratch(&mut parse_memory, writer.bytes.len())?;
+        let raw: &RawValue = serde_json::from_slice(&writer.bytes)
             .map_err(|_| RelationalCursorError::InvalidCheckpoint)?;
-        let raw =
-            RawValue::from_string(text).map_err(|_| RelationalCursorError::InvalidCheckpoint)?;
-        let mut writer = LimitedWriter::new(max_bytes);
+        let mut output = LimitedWriter::new(max_bytes, memory).map_err(memory_failure)?;
         if serde_json::to_writer(
-            &mut writer,
+            &mut output,
             &EnvelopeRef {
                 version: CURSOR_VERSION,
                 digest,
-                payload: &raw,
+                payload: raw,
             },
         )
         .is_err()
         {
-            return Err(writer.failure());
+            return Err(output.failure());
         }
-        Ok(writer.bytes)
+        Ok((output.bytes, output.memory))
     }
 
-    /// Decode a bounded checkpoint and validate every caller-owned assessment
+    /// Admit and restore a checkpoint before converting caller-owned assessments
     ///
-    /// The decoder receives the retained rule and same-pass captured outputs for cross-checking.
-    /// Input, plan, history, and search positions are checked again when the search is resumed.
+    /// The history must come from the same committed generation as the cursor. Cohort identity,
+    /// plan, history, search positions, and captured output provenance are checked before the
+    /// callback can inspect a candidate. The returned lease must remain live until the restored
+    /// cursor and its retained results have been consumed. Caller-specific assessment allocations
+    /// need separate admission because their representation is controlled by the callback.
     ///
     /// # Errors
-    /// Returns an error for corrupt or unsupported data, a byte limit, allocation, or the decoder
-    pub fn decode_checkpoint<E, F>(
+    /// Returns an error for incompatible data, denied memory, cancellation, or decoder failure
+    #[expect(
+        clippy::too_many_lines,
+        reason = "keep validation and rollback in one restoration transaction"
+    )]
+    pub fn restore_checkpoint<T, E, F>(
+        &mut self,
         bytes: &[u8],
         max_bytes: usize,
+        memory: &MemoryBudget,
         mut decode: F,
-    ) -> Result<Self, RelationalCursorError<E>>
+    ) -> Result<(RelationalSearchCursor<T>, MemoryLease), RelationalCursorError<E>>
     where
         F: FnMut(
             &RelationalTransformCandidate,
@@ -493,7 +624,18 @@ impl<T> RelationalSearchCursor<T> {
         if bytes.len() > max_bytes {
             return Err(RelationalCursorError::CheckpointTooLarge);
         }
-        let envelope: EnvelopeOwned =
+        // A restore starts a fresh session so no other live cursor can share this history
+        if self.complete || self.prepared.is_none() {
+            return Err(RelationalCursorError::InvalidCheckpoint);
+        }
+        if let Some(job) = self.job {
+            job.check_cancelled()
+                .map_err(|error| RelationalCursorError::Search(error.into()))?;
+        }
+        // Reserve the parsed representation before serde creates any owned values
+        let admission = admit_json(bytes, memory, MemoryClass::Executor)
+            .map_err(RelationalCursorError::Memory)?;
+        let envelope: EnvelopeOwned<'_> =
             serde_json::from_slice(bytes).map_err(|_| RelationalCursorError::InvalidCheckpoint)?;
         if envelope.version != CURSOR_VERSION
             || <[u8; 32]>::from(Sha256::digest(envelope.payload.get().as_bytes()))
@@ -503,17 +645,102 @@ impl<T> RelationalSearchCursor<T> {
         }
         let mut saved: CursorOwned = serde_json::from_str(envelope.payload.get())
             .map_err(|_| RelationalCursorError::InvalidCheckpoint)?;
+        if saved.identity != self.identity {
+            return Err(RelationalCursorError::InvalidCheckpoint);
+        }
+        let history_bytes = match self.history.as_deref() {
+            Some(history) => history
+                .checkpoint_scratch_bytes()
+                .ok_or(RelationalCursorError::CheckpointTooLarge)?,
+            None => 0,
+        };
+        let history_memory = reserve(memory, history_bytes)?;
+        let identity =
+            history_identity(self.history.as_deref()).map_err(RelationalCursorError::Search)?;
+        drop(history_memory);
+        if saved.history_identity != identity {
+            return Err(RelationalCursorError::InvalidCheckpoint);
+        }
+        if saved.payload_locators.len() > self.plan.limits.max_locator_candidates
+            || saved.search.candidates.len() > self.plan.limits.max_retained_candidates
+            || saved.pre_evaluated.len()
+                > self
+                    .plan
+                    .limits
+                    .max_candidates
+                    .saturating_add(super::INITIAL_RANK_ORDERED_PAIR_WINDOW)
+        {
+            return Err(RelationalCursorError::InvalidCheckpoint);
+        }
+        let base = self
+            .prepared
+            .as_ref()
+            .ok_or(RelationalCursorError::InvalidCheckpoint)?;
+        let validation_bytes = restoration_scratch_bytes(
+            base,
+            &saved.payload_locators,
+            &saved.search,
+            &saved.position,
+            saved.pre_evaluated.len(),
+        )
+        .map_err(RelationalCursorError::Search)?;
+        let _validation_memory = reserve(memory, validation_bytes)?;
+        let mut pre_evaluated = BTreeSet::new();
+        for id in saved.pre_evaluated {
+            if !pre_evaluated.insert(id) {
+                return Err(RelationalCursorError::InvalidCheckpoint);
+            }
+        }
+        let mut prepared = self
+            .prepared
+            .take()
+            .ok_or(RelationalCursorError::InvalidCheckpoint)?;
+        let original_payloads =
+            std::mem::replace(&mut prepared.payload_locators, saved.payload_locators);
+        let original_complete = std::mem::replace(
+            &mut prepared.absolute_locators_complete,
+            saved.absolute_locators_complete,
+        );
+        if let Err(error) = validate_cursor(
+            self.samples,
+            &saved.search,
+            &prepared,
+            &saved.initial_pairs,
+            &pre_evaluated,
+            &saved.position,
+            self.plan,
+            self.options,
+        ) {
+            prepared.payload_locators = original_payloads;
+            prepared.absolute_locators_complete = original_complete;
+            self.prepared = Some(prepared);
+            return Err(RelationalCursorError::Search(error));
+        }
         let mut candidates = Vec::new();
-        candidates
+        if candidates
             .try_reserve_exact(saved.search.candidates.len())
-            .map_err(|_| RelationalCursorError::AllocationFailed)?;
+            .is_err()
+        {
+            prepared.payload_locators = original_payloads;
+            prepared.absolute_locators_complete = original_complete;
+            self.prepared = Some(prepared);
+            return Err(RelationalCursorError::AllocationFailed);
+        }
+        // All library-owned source ranges and digests have passed before this bridge runs
         for retained in std::mem::take(&mut saved.search.candidates) {
-            let assessment = decode(
+            let assessment = match decode(
                 &retained.candidate,
                 retained.outputs.as_ref(),
                 retained.assessment,
-            )
-            .map_err(RelationalCursorError::Assessment)?;
+            ) {
+                Ok(assessment) => assessment,
+                Err(error) => {
+                    prepared.payload_locators = original_payloads;
+                    prepared.absolute_locators_complete = original_complete;
+                    self.prepared = Some(prepared);
+                    return Err(RelationalCursorError::Assessment(error));
+                }
+            };
             candidates.push(RetainedCandidate {
                 candidate: retained.candidate,
                 priority: retained.priority,
@@ -524,21 +751,15 @@ impl<T> RelationalSearchCursor<T> {
                 search_order: retained.search_order,
             });
         }
-        let mut pre_evaluated = BTreeSet::new();
-        for id in saved.pre_evaluated {
-            if !pre_evaluated.insert(id) {
-                return Err(RelationalCursorError::InvalidCheckpoint);
-            }
-        }
-        Ok(Self {
-            identity: saved.identity,
-            history_identity: saved.history_identity,
+        let cursor = RelationalSearchCursor {
+            identity: self.identity,
+            session_id: self.session_id,
             search: move_search!(saved.search, candidates, None),
-            payload_locators: saved.payload_locators,
-            absolute_locators_complete: saved.absolute_locators_complete,
+            prepared,
             initial_pairs: saved.initial_pairs,
             pre_evaluated,
             position: saved.position,
-        })
+        };
+        Ok((cursor, admission.into_retained()))
     }
 }

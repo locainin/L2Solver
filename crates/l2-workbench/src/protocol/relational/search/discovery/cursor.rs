@@ -2,16 +2,18 @@
 
 use super::{
     CandidateId, CandidateParameters, INITIAL_RANK_ORDERED_PAIR_WINDOW, LocatorCandidate,
-    LocatorPairSchedule, PAIR_STREAM_ROTATION, PairDomain, PreparedSearch, RankedPairEntry,
-    RankedPairStream, RelationalAppliedOutput, RelationalCandidateEvaluation,
-    RelationalCandidateEvaluationReport, RelationalCandidateOutputs, RelationalEvaluationError,
-    RelationalFit, RelationalFitStatus, RelationalRecordSample, RelationalReplayHistory,
-    RelationalSessionId, RelationalSha256CounterXor, RelationalTransformCandidate,
-    RelationalTransformError, RelationalTransformEvaluationContext,
-    RelationalTransformEvaluationOptions, RelationalTransformPlan, RelationalTransformRule,
-    RelationalTransformStatus, RetainedCandidate, RetentionMode, SearchContext, SearchSettings,
-    SearchState, SessionGroup, build_report, candidate_parameters, candidate_status,
-    locator_pair_overlaps, pair_stream_cue_rank, prepare_search, validate_plan,
+    LocatorPair, LocatorPairSchedule, PAIR_STREAM_ROTATION, PairDomain, PairStreamRow,
+    PayloadFamilyIndex, PayloadHeaderGroup, PayloadRankGroup, PreparedSearch, RankedLocatorFamily,
+    RankedPairEntry, RankedPairStream, RankedPayloadLocator, RelationalAppliedOutput,
+    RelationalCandidateEvaluation, RelationalCandidateEvaluationReport, RelationalCandidateOutputs,
+    RelationalEvaluationError, RelationalFit, RelationalFitStatus, RelationalOperationTemplate,
+    RelationalRecordSample, RelationalReplayHistory, RelationalSessionId,
+    RelationalSha256CounterXor, RelationalTransformCandidate, RelationalTransformError,
+    RelationalTransformEvaluationContext, RelationalTransformEvaluationOptions,
+    RelationalTransformPlan, RelationalTransformRule, RelationalTransformStatus, RetainedCandidate,
+    RetentionMode, SearchContext, SearchSettings, SearchState, SeedHeaderGroup, SeedRankGroup,
+    SessionGroup, build_report, candidate_parameters, candidate_status, locator_pair_overlaps,
+    pair_stream_cue_rank, prepare_search, validate_plan,
 };
 use crate::{derivation::CounterWidth, job::Job};
 use serde::{Deserialize, Serialize};
@@ -24,6 +26,7 @@ use std::{
     io::{self, Write},
 };
 
+// Change this version when saved search order or continuation semantics change
 const CURSOR_VERSION: u32 = 1;
 
 /// A saved search boundary, including retained candidate evidence and caller assessments
@@ -32,10 +35,9 @@ const CURSOR_VERSION: u32 = 1;
 /// generation. The first boundary follows the initial candidate and prefix-ranking stages.
 pub struct RelationalSearchCursor<T> {
     identity: [u8; 32],
-    history_identity: Option<[u8; 32]>,
+    session_id: u64,
     search: SearchState<'static, T>,
-    payload_locators: Vec<LocatorCandidate>,
-    absolute_locators_complete: bool,
+    prepared: PreparedSearch,
     initial_pairs: Vec<(usize, usize)>,
     pre_evaluated: BTreeSet<CandidateId>,
     position: Position,
@@ -77,6 +79,10 @@ pub enum RelationalCursorError<E> {
     InvalidCheckpoint,
     /// The encoded checkpoint exceeds the caller's byte ceiling
     CheckpointTooLarge,
+    /// Aggregate metadata admission rejected the decoded checkpoint
+    Memory(crate::job::JsonMemoryError),
+    /// Preparing the restored search failed or was cancelled
+    Search(RelationalTransformError),
     /// Bounded storage could not be reserved
     AllocationFailed,
     /// The caller rejected an assessment during conversion
@@ -90,6 +96,8 @@ impl<E: fmt::Display> fmt::Display for RelationalCursorError<E> {
             Self::CheckpointTooLarge => {
                 f.write_str("relational search checkpoint exceeds its byte limit")
             }
+            Self::Memory(error) => write!(f, "relational checkpoint memory: {error}"),
+            Self::Search(error) => write!(f, "relational checkpoint search: {error}"),
             Self::AllocationFailed => f.write_str("relational search checkpoint allocation failed"),
             Self::Assessment(error) => write!(f, "relational assessment checkpoint: {error}"),
         }
@@ -99,6 +107,8 @@ impl<E: Error + 'static> Error for RelationalCursorError<E> {
     fn source(&self) -> Option<&(dyn Error + 'static)> {
         match self {
             Self::Assessment(error) => Some(error),
+            Self::Memory(error) => Some(error),
+            Self::Search(error) => Some(error),
             _ => None,
         }
     }
@@ -217,6 +227,16 @@ impl ParameterPosition {
         reason = "validate all parameter dimensions together"
     )]
     fn valid(&self, plan: &RelationalTransformPlan) -> bool {
+        if self.width == 0
+            && self.initial == 0
+            && self.order == 0
+            && self.seed_order == 0
+            && self.reset == 0
+            && self.format == 0
+            && self.candidate_index == 0
+        {
+            return true;
+        }
         let Some(&width) = plan.counter_widths.get(self.width) else {
             return false;
         };
@@ -342,12 +362,38 @@ impl SavedSchedule {
         schedule.stream_cursor = self.stream_cursor;
         Ok(schedule)
     }
+
+    fn validate(
+        &self,
+        seeds: &[LocatorCandidate],
+        payloads: &[LocatorCandidate],
+    ) -> Result<(), RelationalTransformError> {
+        let schedule = LocatorPairSchedule::new(seeds, payloads)?;
+        if self.initial_pair_cursor > schedule.initial_pair_count
+            || self.stream_cursor >= PAIR_STREAM_ROTATION.len()
+        {
+            return Err(invalid_cursor());
+        }
+        validate_stream(&schedule.domain, &schedule.header_aligned, &self.header)?;
+        validate_stream(&schedule.domain, &schedule.aligned, &self.aligned)?;
+        validate_stream(&schedule.domain, &schedule.fallback, &self.fallback)
+    }
 }
 
 fn restore_stream(
     domain: &PairDomain<'_>,
     stream: &mut RankedPairStream,
     entries: Vec<Reverse<RankedPairEntry>>,
+) -> Result<(), RelationalTransformError> {
+    validate_stream(domain, stream, &entries)?;
+    stream.pending = BinaryHeap::from(entries);
+    Ok(())
+}
+
+fn validate_stream(
+    domain: &PairDomain<'_>,
+    stream: &RankedPairStream,
+    entries: &[Reverse<RankedPairEntry>],
 ) -> Result<(), RelationalTransformError> {
     if entries.len() > stream.rows.len() {
         return Err(invalid_cursor());
@@ -365,7 +411,7 @@ fn restore_stream(
     seen.try_reserve_exact(stream.rows.len())
         .map_err(|_| RelationalTransformError::AllocationFailed)?;
     seen.resize(stream.rows.len(), false);
-    for Reverse(entry) in &entries {
+    for Reverse(entry) in entries {
         let row = *stream.rows.get(entry.row_index).ok_or(invalid_cursor())?;
         let payload = domain
             .payloads
@@ -388,7 +434,6 @@ fn restore_stream(
         }
         *observed = true;
     }
-    stream.pending = BinaryHeap::from(entries);
     Ok(())
 }
 
@@ -411,6 +456,7 @@ fn identity(
     samples: &[RelationalRecordSample<'_>],
     plan: &RelationalTransformPlan,
     options: RelationalTransformEvaluationOptions,
+    job: Option<&Job>,
 ) -> Result<[u8; 32], RelationalTransformError> {
     let mut writer = HashWriter(Sha256::new());
     writer.0.update(b"l2-relational-search-cursor-v1");
@@ -433,7 +479,13 @@ fn identity(
             sample.bytes,
         ] {
             writer.0.update(bytes.len().to_le_bytes());
-            writer.0.update(bytes);
+            // Check between bounded chunks while hashing large immutable cohorts
+            for chunk in bytes.chunks(64 * 1024) {
+                if let Some(job) = job {
+                    job.check_cancelled()?;
+                }
+                writer.0.update(chunk);
+            }
         }
     }
     Ok(writer.0.finalize().into())
@@ -488,201 +540,16 @@ fn history_identity(
         .transpose()
 }
 
-/// Continue an across-session search for at least the requested number of complete candidates
-///
-/// The initial locator, anchor, and prefix-ranking stages finish before the first pause. A later
-/// step may finish earlier when the search reaches a selected limit. The caller must restore the
-/// history and job contribution from the same committed generation before resuming.
-///
-/// # Errors
-/// Returns an error for incompatible inputs or cursor state, cancellation, or evaluator failure
-#[expect(
-    clippy::too_many_arguments,
-    reason = "the step mirrors the existing evaluator API and adds its continuation"
-)]
-#[expect(
-    clippy::too_many_lines,
-    reason = "keep checkpoint restoration and search transitions together"
-)]
-pub fn step_relational_transform_candidates_with_evaluator_and_history<T, E, F>(
-    samples: &[RelationalRecordSample<'_>],
-    plan: &RelationalTransformPlan,
-    job: Option<&Job>,
-    options: RelationalTransformEvaluationOptions,
-    mut history: Option<&mut RelationalReplayHistory>,
-    cursor: Option<RelationalSearchCursor<T>>,
-    candidate_budget: usize,
-    mut evaluator: F,
-) -> Result<RelationalSearchStep<T>, RelationalEvaluationError<E>>
-where
-    F: FnMut(
-        &RelationalTransformEvaluationContext<'_>,
-        &RelationalTransformCandidate,
-        &[RelationalAppliedOutput],
-        &[RelationalAppliedOutput],
-    ) -> Result<RelationalCandidateEvaluation<T>, E>,
-{
-    if let Some(job) = job {
-        job.check_cancelled()
-            .map_err(RelationalTransformError::from)?;
-    }
-    validate_plan(plan)?;
-    if candidate_budget == 0
-        || plan.parser_scope != super::super::super::model::RelationalParserScope::AcrossSessions
-    {
-        return Err(RelationalEvaluationError::Search(
-            RelationalTransformError::InvalidPlan(
-                "resumable relational search requires a positive step and across-session parser scope",
-            ),
-        ));
-    }
-    if options.max_retained_output_bytes > plan.limits.max_total_bytes {
-        return Err(RelationalEvaluationError::Search(
-            RelationalTransformError::InvalidPlan(
-                "retained evaluator outputs exceed the aggregate byte limit",
-            ),
-        ));
-    }
-    let mut prepared = prepare_search(samples, plan)?;
-    let identity = identity(samples, plan, options)?;
-    let parameters = candidate_parameters(plan)?;
-    let settings = SearchSettings {
-        retention_mode: RetentionMode::EvaluatorPriority,
-        max_retained_output_bytes: options.max_retained_output_bytes,
-        capture_outputs_for_evaluator: true,
-    };
+mod session;
+mod validation;
+pub use session::RelationalSearchSession;
+use validation::restoration_scratch_bytes;
+use validation::validate_cursor;
 
-    let first_step = cursor.is_none();
-    let (mut search, initial_pairs, pre_evaluated, mut position) = if let Some(cursor) = cursor {
-        if cursor.identity != identity
-            || cursor.history_identity != history_identity(history.as_deref())?
-        {
-            return Err(RelationalEvaluationError::Search(invalid_cursor()));
-        }
-        prepared.payload_locators = cursor.payload_locators;
-        prepared.absolute_locators_complete = cursor.absolute_locators_complete;
-        validate_cursor(
-            samples,
-            &cursor.search,
-            &prepared,
-            &cursor.initial_pairs,
-            &cursor.pre_evaluated,
-            &cursor.position,
-            plan,
-            options,
-        )?;
-        (
-            attach_history(cursor.search, history),
-            cursor.initial_pairs,
-            cursor.pre_evaluated,
-            cursor.position,
-        )
-    } else {
-        if let Some(history) = history.as_deref_mut() {
-            history.prepare(plan.limits);
-        }
-        let mut search = SearchState::new(history);
-        search.prefix_probe_complete = false;
-        search.locator_candidates_examined =
-            prepared.seed_locators.len() + prepared.payload_locators.len();
-        let mut context = SearchContext {
-            samples,
-            plan,
-            job,
-            prepared: &mut prepared,
-            settings,
-            candidate_parameters: &parameters,
-            anchor_work_limit: plan.limits.max_work_bytes,
-            anchor_candidate_limit: plan.limits.max_candidates,
-            active_work_limit: plan.limits.max_work_bytes,
-            active_candidate_limit: plan.limits.max_candidates,
-        };
-        let Some(mut initial) = context.search_initial_pair_window(&mut search, &mut evaluator)?
-        else {
-            if let Some(history) = search.history.as_deref_mut() {
-                history.finish();
-            }
-            return Ok(RelationalSearchStep::Complete(build_report(
-                search,
-                prepared,
-                plan.limits,
-            )?));
-        };
-        context.prepare_anchored_payloads(&mut search)?;
-        if !context.search_ranked_anchor_candidates(
-            &mut search,
-            &mut initial.pre_evaluated,
-            &mut evaluator,
-        )? {
-            if let Some(history) = search.history.as_deref_mut() {
-                history.finish();
-            }
-            return Ok(RelationalSearchStep::Complete(build_report(
-                search,
-                prepared,
-                plan.limits,
-            )?));
-        }
-        (
-            search,
-            initial.pairs,
-            initial.pre_evaluated,
-            Position {
-                stage: PairStage::Initial { next: 0 },
-                current: None,
-            },
-        )
-    };
-    let started_at = search.candidates_examined;
-    // Include initial and ranked work in the first requested step
-    let pause_at = if first_step {
-        candidate_budget
-    } else {
-        started_at.saturating_add(candidate_budget)
-    };
-    let context = SearchContext {
-        samples,
-        plan,
-        job,
-        prepared: &mut prepared,
-        settings,
-        candidate_parameters: &parameters,
-        anchor_work_limit: plan.limits.max_work_bytes,
-        anchor_candidate_limit: plan.limits.max_candidates,
-        active_work_limit: plan.limits.max_work_bytes,
-        active_candidate_limit: plan.limits.max_candidates,
-    };
-    let completed = drive(
-        &context,
-        &mut search,
-        &initial_pairs,
-        &pre_evaluated,
-        &mut position,
-        pause_at,
-        &mut evaluator,
-    )?;
-    if completed {
-        if let Some(history) = search.history.as_deref_mut() {
-            history.finish();
-        }
-        return Ok(RelationalSearchStep::Complete(build_report(
-            search,
-            prepared,
-            plan.limits,
-        )?));
-    }
-    let history_identity = history_identity(search.history.as_deref())?;
-    let search = attach_history(search, None);
-    Ok(RelationalSearchStep::Paused(RelationalSearchCursor {
-        identity,
-        history_identity,
-        search,
-        payload_locators: prepared.payload_locators,
-        absolute_locators_complete: prepared.absolute_locators_complete,
-        initial_pairs,
-        pre_evaluated,
-        position,
-    }))
+#[derive(Clone, Copy)]
+struct StepBounds {
+    candidate_end: usize,
+    traversal: usize,
 }
 
 #[expect(
@@ -695,7 +562,7 @@ fn drive<T, E, F>(
     initial: &[(usize, usize)],
     pre_evaluated: &BTreeSet<CandidateId>,
     position: &mut Position,
-    pause_at: usize,
+    bounds: StepBounds,
     evaluator: &mut F,
 ) -> Result<bool, RelationalEvaluationError<E>>
 where
@@ -719,8 +586,11 @@ where
         },
         _ => None,
     };
+    let mut traversed = 0_usize;
     loop {
-        if search.candidates_examined >= pause_at {
+        check_traversal_cancellation(context.job, traversed)?;
+        // Cached rejections and skipped pairs still consume bounded traversal time
+        if search.candidates_examined >= bounds.candidate_end || traversed >= bounds.traversal {
             if let PairStage::Absolute { schedule: saved } = &mut position.stage {
                 *saved = schedule.take().map(SavedSchedule::save);
             }
@@ -731,6 +601,7 @@ where
                 PairStage::Initial { next } => {
                     if let Some(&pair) = initial.get(*next) {
                         *next += 1;
+                        traversed += 1;
                         Some(pair)
                     } else {
                         position.stage = PairStage::Absolute { schedule: None };
@@ -741,14 +612,17 @@ where
                         continue;
                     }
                 }
-                PairStage::Absolute { .. } => {
-                    let Some(active) = schedule.as_mut() else {
-                        return Err(invalid_cursor().into());
-                    };
+                PairStage::Absolute { schedule: saved } => {
                     let next = loop {
-                        let Some(pair) = active.next() else {
+                        check_traversal_cancellation(context.job, traversed)?;
+                        if traversed >= bounds.traversal {
+                            *saved = schedule.take().map(SavedSchedule::save);
+                            return Ok(false);
+                        }
+                        let Some(pair) = schedule.as_mut().ok_or(invalid_cursor())?.next() else {
                             break None;
                         };
+                        traversed += 1;
                         if initial.contains(&pair) {
                             continue;
                         }
@@ -773,6 +647,11 @@ where
                 PairStage::Anchored { next } => {
                     let mut pair = None;
                     while let Some(payload) = context.prepared.payload_locators.get(*next) {
+                        check_traversal_cancellation(context.job, traversed)?;
+                        if traversed >= bounds.traversal {
+                            return Ok(false);
+                        }
+                        traversed += 1;
                         let index = *next;
                         *next += 1;
                         if let Some(seed) = payload.anchor_seed_index {
@@ -795,7 +674,14 @@ where
             }
         }
         let current = position.current.as_mut().ok_or(invalid_cursor())?;
+        if traversed >= bounds.traversal {
+            if let PairStage::Absolute { schedule: saved } = &mut position.stage {
+                *saved = schedule.take().map(SavedSchedule::save);
+            }
+            return Ok(false);
+        }
         let action = current.parameters.next(context.plan)?;
+        traversed += 1;
         match action {
             None => position.current = None,
             Some(ParameterAction::Alias) => context.count_equivalent_candidate_aliases(search)?,
@@ -825,263 +711,14 @@ where
     }
 }
 
-#[expect(
-    clippy::too_many_arguments,
-    reason = "validate one cursor against its complete search context"
-)]
-#[expect(
-    clippy::too_many_lines,
-    reason = "check related cursor invariants before doing more work"
-)]
-fn validate_cursor<T>(
-    samples: &[RelationalRecordSample<'_>],
-    search: &SearchState<'_, T>,
-    prepared: &PreparedSearch,
-    initial: &[(usize, usize)],
-    pre_evaluated: &BTreeSet<CandidateId>,
-    position: &Position,
-    plan: &RelationalTransformPlan,
-    options: RelationalTransformEvaluationOptions,
+fn check_traversal_cancellation(
+    job: Option<&Job>,
+    traversed: usize,
 ) -> Result<(), RelationalTransformError> {
-    let limits = plan.limits;
-    if search.candidates_examined > limits.max_candidates
-        || search.work_bytes > limits.max_work_bytes
-        || search.candidates.len() > limits.max_retained_candidates
-        || search.output_bytes_retained > options.max_retained_output_bytes
-        || search.prefix_probe_work_bytes > search.work_bytes
-        || prepared.payload_locators.len() > limits.max_locator_candidates
-        || initial.len() > INITIAL_RANK_ORDERED_PAIR_WINDOW
-        || search.locator_candidates_examined
-            != prepared
-                .seed_locators
-                .len()
-                .saturating_add(prepared.payload_locators.len())
-        || search.output_capture_omissions > search.candidates.len()
-        || search.search_limit != search.search_limits.first().copied()
+    if traversed.is_multiple_of(256)
+        && let Some(job) = job
     {
-        return Err(invalid_cursor());
-    }
-    for locator in &prepared.payload_locators {
-        if locator.locator.marker.len() > limits.max_marker_bytes
-            || locator.selector.marker.len() > limits.max_marker_bytes
-            || locator
-                .anchor_seed_index
-                .is_some_and(|index| index >= prepared.seed_locators.len())
-        {
-            return Err(invalid_cursor());
-        }
-    }
-    let in_domain = |seed: usize, payload: usize| {
-        seed < prepared.seed_locators.len() && payload < prepared.payload_locators.len()
-    };
-    if initial
-        .iter()
-        .any(|&(seed, payload)| !in_domain(seed, payload))
-        || pre_evaluated.len()
-            > limits
-                .max_candidates
-                .saturating_add(INITIAL_RANK_ORDERED_PAIR_WINDOW)
-        || pre_evaluated
-            .iter()
-            .any(|id| !in_domain(id.seed, id.payload) || id.parameter >= limits.max_candidates)
-        || position
-            .current
-            .as_ref()
-            .is_some_and(|pair| !in_domain(pair.seed, pair.payload) || !pair.parameters.valid(plan))
-    {
-        return Err(invalid_cursor());
-    }
-    match &position.stage {
-        PairStage::Initial { next } if *next > initial.len() => return Err(invalid_cursor()),
-        PairStage::Anchored { next } if *next > prepared.payload_locators.len() => {
-            return Err(invalid_cursor());
-        }
-        _ => {}
-    }
-    let mut bytes = 0_usize;
-    let mut omissions = 0_usize;
-    let mut orders = BTreeSet::new();
-    for retained in &search.candidates {
-        if retained.search_order == 0
-            || retained.search_order > search.candidates_examined
-            || !orders.insert(retained.search_order)
-            || retained.candidate.rule.parser_scope != plan.parser_scope
-            || retained.candidate.status
-                != candidate_status(
-                    &retained.candidate.discovery,
-                    &retained.candidate.heldout,
-                    plan.parser_scope,
-                )
-        {
-            return Err(invalid_cursor());
-        }
-        validate_fit(&retained.candidate.discovery, &prepared.discovery_groups)?;
-        validate_fit(&retained.candidate.heldout, &prepared.heldout_groups)?;
-        if let Some(outputs) = &retained.outputs {
-            validate_outputs(
-                samples,
-                &prepared.discovery_groups,
-                &retained.candidate.discovery,
-                &outputs.discovery,
-            )?;
-            validate_outputs(
-                samples,
-                &prepared.heldout_groups,
-                &retained.candidate.heldout,
-                &outputs.heldout,
-            )?;
-        }
-        let actual = retained
-            .outputs
-            .as_ref()
-            .map_or(Some(0), |outputs| {
-                outputs
-                    .discovery
-                    .iter()
-                    .chain(&outputs.heldout)
-                    .try_fold(0_usize, |sum, output| sum.checked_add(output.bytes.len()))
-            })
-            .ok_or(invalid_cursor())?;
-        if actual != retained.captured_output_bytes
-            || (retained.output_capture_omitted && retained.outputs.is_some())
-        {
-            return Err(invalid_cursor());
-        }
-        bytes = bytes.checked_add(actual).ok_or(invalid_cursor())?;
-        omissions += usize::from(retained.output_capture_omitted);
-    }
-    if bytes != search.output_bytes_retained || omissions != search.output_capture_omissions {
-        return Err(invalid_cursor());
-    }
-    Ok(())
-}
-
-fn validate_fit(
-    fit: &RelationalFit,
-    groups: &[SessionGroup],
-) -> Result<(), RelationalTransformError> {
-    if fit.checks.is_empty() {
-        return if fit.status == RelationalFitStatus::NotEvaluated
-            && fit.supported_sessions.is_empty()
-            && fit.contradicted_sessions.is_empty()
-            && fit.unresolved_sessions.is_empty()
-        {
-            Ok(())
-        } else {
-            Err(invalid_cursor())
-        };
-    }
-    if fit.checks.len() != groups.len()
-        || fit
-            .checks
-            .iter()
-            .zip(groups)
-            .any(|(check, group)| check.session != group.id)
-    {
-        return Err(invalid_cursor());
-    }
-    let supported = fit
-        .checks
-        .iter()
-        .filter(|check| check.status == RelationalFitStatus::TransformConstraintsSatisfied)
-        .map(|check| &check.session);
-    let contradicted = fit
-        .checks
-        .iter()
-        .filter(|check| check.status == RelationalFitStatus::Contradicted)
-        .map(|check| &check.session);
-    let unresolved = fit
-        .checks
-        .iter()
-        .filter(|check| check.status == RelationalFitStatus::UnresolvedOnBudget)
-        .map(|check| &check.session);
-    if !supported.eq(fit.supported_sessions.iter())
-        || !contradicted.eq(fit.contradicted_sessions.iter())
-        || !unresolved.eq(fit.unresolved_sessions.iter())
-    {
-        return Err(invalid_cursor());
-    }
-    let expected = if !fit.contradicted_sessions.is_empty() {
-        RelationalFitStatus::Contradicted
-    } else if !fit.unresolved_sessions.is_empty() {
-        RelationalFitStatus::UnresolvedOnBudget
-    } else if fit.supported_sessions.len() == fit.checks.len() {
-        RelationalFitStatus::TransformConstraintsSatisfied
-    } else {
-        return Err(invalid_cursor());
-    };
-    if fit.status != expected {
-        return Err(invalid_cursor());
-    }
-    Ok(())
-}
-
-fn validate_outputs(
-    samples: &[RelationalRecordSample<'_>],
-    groups: &[SessionGroup],
-    fit: &RelationalFit,
-    outputs: &[RelationalAppliedOutput],
-) -> Result<(), RelationalTransformError> {
-    if outputs.len() != fit.supported_sessions.len() {
-        return Err(invalid_cursor());
-    }
-    for (output, session) in outputs.iter().zip(&fit.supported_sessions) {
-        let group = groups
-            .iter()
-            .find(|group| group.id == *session)
-            .ok_or(invalid_cursor())?;
-        let check = fit
-            .checks
-            .iter()
-            .find(|check| check.session == *session)
-            .ok_or(invalid_cursor())?;
-        let digest = check.output_sha256.as_deref().ok_or(invalid_cursor())?;
-        if output.session != *session
-            || output.session_order != group.session_order
-            || check.seed_sample != Some(output.seed_sample)
-            || check.output_length != Some(output.bytes.len())
-            || !output.parser_validation_deferred
-            || !crate::hashing::sha256_matches(&output.bytes, digest)
-            || output.payload_mappings.len() != check.payload_samples.len()
-            || !group.sample_indices.iter().any(|&index| {
-                samples
-                    .get(index)
-                    .is_some_and(|sample| sample.sample == output.seed_sample)
-            })
-        {
-            return Err(invalid_cursor());
-        }
-        let mut output_end = 0_usize;
-        for (mapping, sample_id) in output.payload_mappings.iter().zip(&check.payload_samples) {
-            let sample = group
-                .sample_indices
-                .iter()
-                .filter_map(|&index| samples.get(index))
-                .find(|sample| sample.sample == *sample_id)
-                .ok_or(invalid_cursor())?;
-            let source_length = mapping
-                .source_range
-                .end
-                .checked_sub(mapping.source_range.start)
-                .ok_or(invalid_cursor())?;
-            let output_length = mapping
-                .output_range
-                .end
-                .checked_sub(mapping.output_range.start)
-                .ok_or(invalid_cursor())?;
-            if mapping.sample != *sample_id
-                || mapping.source_range.end > sample.bytes.len()
-                || mapping.output_range.start != output_end
-                || mapping.output_range.end > output.bytes.len()
-                || source_length != output_length
-            {
-                return Err(invalid_cursor());
-            }
-            output_end = mapping.output_range.end;
-        }
-        if output_end != output.bytes.len() {
-            return Err(invalid_cursor());
-        }
+        job.check_cancelled()?;
     }
     Ok(())
 }

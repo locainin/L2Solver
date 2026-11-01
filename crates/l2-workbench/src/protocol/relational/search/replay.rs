@@ -33,6 +33,11 @@ struct LocatedPayload<'a> {
     bytes: &'a [u8],
 }
 
+// Include the matching index, payload vector, and failure receipts with collection slack
+pub(super) const fn saved_output_validation_record_bytes() -> usize {
+    2 * size_of::<LocatedPayload<'static>>() + 4 * size_of::<usize>() + 2 * size_of::<u64>()
+}
+
 struct LocatedSeed<'a> {
     sample: u64,
     sample_index: usize,
@@ -669,7 +674,12 @@ fn payload_locator_matches(
     if !matches {
         return Ok(Vec::new());
     }
-    Ok(vec![seed.sample_index])
+    let mut retained = Vec::new();
+    retained
+        .try_reserve_exact(1)
+        .map_err(|_| RelationalTransformError::AllocationFailed)?;
+    retained.push(seed.sample_index);
+    Ok(retained)
 }
 
 fn resolve_coordinate_offset(
@@ -992,6 +1002,28 @@ fn prepare_session_inputs<'a>(
         Err(failure) => return Ok(Err(failure)),
     };
     Ok(Ok(SessionTransformInputs { seed, payloads }))
+}
+
+// Re-resolve the frozen locators without repeating the saved transform
+pub(super) fn saved_output_matches_locators(
+    samples: &[RelationalRecordSample<'_>],
+    group: &SessionGroup,
+    rule: &RelationalTransformRule,
+    limits: RelationalTransformLimits,
+    output: &RelationalAppliedOutput,
+) -> Result<bool, RelationalTransformError> {
+    let Ok(inputs) = prepare_session_inputs(samples, group, None, rule, limits)? else {
+        return Ok(false);
+    };
+    Ok(inputs.seed.sample == output.seed_sample
+        && inputs.payloads.len() == output.payload_mappings.len()
+        && inputs
+            .payloads
+            .iter()
+            .zip(&output.payload_mappings)
+            .all(|(payload, mapping)| {
+                payload.sample == mapping.sample && payload.source_range == mapping.source_range
+            }))
 }
 
 fn locate_session_seed<'a>(
@@ -1538,10 +1570,15 @@ fn locator_matches(
     index: Option<&SelectorIndex>,
     locator: &RelationalByteRangeLocator,
 ) -> Result<Vec<usize>, RelationalTransformError> {
+    let mut marker = Vec::new();
+    marker
+        .try_reserve_exact(locator.marker.len())
+        .map_err(|_| RelationalTransformError::AllocationFailed)?;
+    marker.extend_from_slice(&locator.marker);
     let selector = Selector {
         direction: locator.direction,
         marker_offset: locator.marker_offset,
-        marker: locator.marker.clone(),
+        marker,
     };
     if let Some(index) = index {
         let Some(matches) = index.get(&selector) else {

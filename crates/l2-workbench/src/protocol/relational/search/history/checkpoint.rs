@@ -5,7 +5,7 @@ use crate::protocol::RelationalTransformRule;
 use serde::{Deserialize, Deserializer, Serialize, Serializer, ser::SerializeSeq};
 use std::mem;
 
-const VERSION: u32 = 2;
+const VERSION: u32 = 3;
 
 #[derive(Serialize)]
 struct SnapshotRef<'a> {
@@ -13,6 +13,7 @@ struct SnapshotRef<'a> {
     max_bytes: usize,
     entry_capacity: usize,
     sorted_len: usize,
+    marker_bytes: usize,
     entries: Entries<'a>,
     complete: bool,
     limits: Option<(usize, usize)>,
@@ -37,6 +38,8 @@ struct Snapshot {
     entry_capacity: usize,
     #[serde(default)]
     sorted_len: Option<usize>,
+    #[serde(default)]
+    marker_bytes: Option<usize>,
     entries: Vec<(RelationalTransformRule, ReplayDisposition)>,
     complete: bool,
     limits: Option<(usize, usize)>,
@@ -49,6 +52,7 @@ impl Serialize for RelationalReplayHistory {
             max_bytes: self.max_bytes,
             entry_capacity: self.entries.capacity(),
             sorted_len: self.sorted_len,
+            marker_bytes: self.marker_bytes,
             entries: Entries(&self.entries),
             complete: self.complete,
             limits: self.limits,
@@ -61,9 +65,9 @@ impl<'de> Deserialize<'de> for RelationalReplayHistory {
     fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
         let saved = Snapshot::deserialize(deserializer)?;
         // Published rules may be registered before a search, but rejections need replay limits
-        let sorted_len = match (saved.version, saved.sorted_len) {
-            (1, None) => saved.entries.len(),
-            (VERSION, Some(length)) => length,
+        let sorted_len = match (saved.version, saved.sorted_len, saved.marker_bytes) {
+            (1, None, None) => saved.entries.len(),
+            (2, Some(length), None) | (VERSION, Some(length), Some(_)) => length,
             _ => {
                 return Err(serde::de::Error::custom(
                     "unsupported replay history checkpoint",
@@ -94,6 +98,11 @@ impl<'de> Deserialize<'de> for RelationalReplayHistory {
             .entries
             .try_reserve_exact(saved.entry_capacity)
             .map_err(serde::de::Error::custom)?;
+        if history.entries.capacity() != saved.entry_capacity {
+            return Err(serde::de::Error::custom(
+                "replay history capacity changed on restore",
+            ));
+        }
         history.complete = saved.complete;
         history.limits = saved.limits;
         for (rule, disposition) in saved.entries {
@@ -116,6 +125,14 @@ impl<'de> Deserialize<'de> for RelationalReplayHistory {
                 ));
             }
         }
+        if saved
+            .marker_bytes
+            .is_some_and(|bytes| bytes != history.marker_bytes)
+        {
+            return Err(serde::de::Error::custom(
+                "replay history marker storage changed on restore",
+            ));
+        }
         // Preserve which entries were visible to lookup when the search began
         history
             .entries
@@ -123,23 +140,30 @@ impl<'de> Deserialize<'de> for RelationalReplayHistory {
             .ok_or_else(|| serde::de::Error::custom("invalid replay history prefix"))?
             .sort_unstable_by_key(|entry| entry.hash);
         history.sorted_len = sorted_len;
-        let mut ordered = Vec::new();
-        ordered
-            .try_reserve_exact(history.entries.len())
-            .map_err(serde::de::Error::custom)?;
-        ordered.extend(history.entries.iter());
-        ordered.sort_unstable_by_key(|entry| entry.hash);
-        for group in ordered.chunk_by(|left, right| left.hash == right.hash) {
-            for (index, entry) in group.iter().enumerate() {
-                if group
-                    .iter()
-                    .take(index)
-                    .any(|prior| prior.rule == entry.rule)
-                {
-                    return Err(serde::de::Error::custom("repeated replay history rule"));
-                }
-            }
+        if has_duplicate_rules(&history).map_err(serde::de::Error::custom)? {
+            return Err(serde::de::Error::custom("repeated replay history rule"));
         }
         Ok(history)
     }
+}
+
+fn has_duplicate_rules(
+    history: &RelationalReplayHistory,
+) -> Result<bool, std::collections::TryReserveError> {
+    let mut ordered = Vec::new();
+    ordered.try_reserve_exact(history.entries.len())?;
+    ordered.extend(history.entries.iter());
+    ordered.sort_unstable_by_key(|entry| entry.hash);
+    for group in ordered.chunk_by(|left, right| left.hash == right.hash) {
+        for (index, entry) in group.iter().enumerate() {
+            if group
+                .iter()
+                .take(index)
+                .any(|prior| prior.rule == entry.rule)
+            {
+                return Ok(true);
+            }
+        }
+    }
+    Ok(false)
 }
