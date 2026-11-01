@@ -9,6 +9,7 @@ pub use model::{
     FileSignatureReport,
 };
 pub use scan::scan_file_signatures;
+pub(in crate::artifact) use scan::{count_file_signature_matches, matches_zip_signature};
 
 pub use catalogue::{ELF_MAGIC, MZ_MAGIC};
 

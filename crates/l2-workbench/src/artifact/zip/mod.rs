@@ -11,6 +11,7 @@ pub use model::{
     ZipArtifactLimits, ZipArtifactOmission, ZipArtifactOmissionReason, ZipArtifactReport,
     ZipEntryDataFailure, ZipMemoryError, ZipReadError, ZipReaderBudget, ZipReaderLimits,
 };
+pub(in crate::artifact) use parse::has_zip_end_record_with_memory;
 pub use parse::{
     has_zip_end_record, inspect_zip, inspect_zip_at_depth, inspect_zip_at_depth_with_memory,
     inspect_zip_at_depth_with_operation_budget, inspect_zip_from_reader_with_source_sha256,

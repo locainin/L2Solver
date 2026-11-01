@@ -1,6 +1,6 @@
 use std::io::{Cursor, Read, Seek};
 
-use crate::job::MemoryLease;
+use crate::job::{MemoryError, MemoryLease};
 use crc32fast::hash as crc32;
 use flate2::read::DeflateDecoder;
 use zip::read::{ArchiveOffset, Config};
@@ -56,6 +56,17 @@ pub fn inspect_zip_with_limits(
 pub fn has_zip_end_record(bytes: &[u8]) -> bool {
     let view = View::new(Cursor::new(bytes), bytes.len(), usize::MAX);
     !matches!(find_eocd(&view), EocdSelection::None)
+}
+
+pub(in crate::artifact) fn has_zip_end_record_with_memory(
+    bytes: &[u8],
+    memory: &MemoryLease,
+) -> Result<bool, MemoryError> {
+    let charge = u64::try_from(scan_scratch_bytes(bytes.len()))
+        .map_err(|_| MemoryError::ObservationOverflow)?;
+    // The tail and a ZIP64 search buffer can exist at the same time
+    let _scratch = memory.try_sibling(charge)?;
+    Ok(has_zip_end_record(bytes))
 }
 
 /// Inspect a ZIP archive at a known nested depth
@@ -345,7 +356,12 @@ fn inspect_view<R: Read + Seek>(
 }
 
 fn scan_scratch_bytes(length: usize) -> usize {
-    length.min((MAX_EOCD_COMMENT_SIZE + EOCD_FIXED_SIZE).max(ZIP64_SCAN_BLOCK_BYTES))
+    let tail = length.min(MAX_EOCD_COMMENT_SIZE + EOCD_FIXED_SIZE);
+    // A ZIP64 locator can lead to a second live buffer while the tail is held
+    let zip64 = length
+        .checked_sub(EOCD_FIXED_SIZE + ZIP64_LOCATOR_SIZE)
+        .map_or(0, |bytes| bytes.min(ZIP64_SCAN_BLOCK_BYTES).max(4));
+    tail + zip64
 }
 
 fn planned_member_outputs(

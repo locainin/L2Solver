@@ -41,10 +41,45 @@ pub fn scan_file_signatures(bytes: &[u8]) -> FileSignatureReport {
 
 fn file_signature_matches(bytes: &[u8]) -> Vec<FileSignatureMatch> {
     let mut matches = Vec::new();
+    visit_file_signature_matches(bytes, |rule, offset, observed| {
+        matches.push(observation(rule, offset, observed));
+    });
+    // Offset order makes the evidence easy to read while the stable ID breaks ties
+    matches.sort_by(|left, right| {
+        left.range
+            .offset
+            .cmp(&right.range.offset)
+            .then_with(|| left.rule_id.cmp(right.rule_id))
+    });
+    matches
+}
+
+pub(in crate::artifact) fn count_file_signature_matches(bytes: &[u8]) -> usize {
+    let mut count = 0;
+    visit_file_signature_matches(bytes, |_, _, _| count += 1);
+    count
+}
+
+pub(in crate::artifact) fn matches_zip_signature(bytes: &[u8]) -> bool {
+    let (prefix, _) = bytes.split_at(bytes.len().min(8));
+    let mut found = false;
+    visit_file_signature_matches(prefix, |rule, _, _| {
+        found |= rule.formats.contains(&"zip_container");
+    });
+    found
+}
+
+fn visit_file_signature_matches(
+    bytes: &[u8],
+    mut visit: impl FnMut(&'static SignatureRule, usize, &[u8]),
+) {
     for rule in rules() {
         let mut inspect_offset = |offset| {
             if let Some(observed) = matching_bytes(bytes, offset, &rule.pattern) {
-                matches.push(observation(rule, offset, observed));
+                visit(rule, offset, observed);
+                true
+            } else {
+                false
             }
         };
         match rule.offsets {
@@ -74,11 +109,9 @@ fn file_signature_matches(bytes: &[u8]) -> Vec<FileSignatureMatch> {
                     continue;
                 };
                 while let Some(identifier_offset) = descriptor_start.checked_add(1) {
-                    let Some(observed) = matching_bytes(bytes, identifier_offset, &rule.pattern)
-                    else {
+                    if !inspect_offset(identifier_offset) {
                         break;
-                    };
-                    matches.push(observation(rule, identifier_offset, observed));
+                    }
 
                     // Type 255 marks the end of this descriptor set
                     if bytes.get(descriptor_start) == Some(&u8::MAX) {
@@ -94,14 +127,6 @@ fn file_signature_matches(bytes: &[u8]) -> Vec<FileSignatureMatch> {
             }
         }
     }
-    // Offset order makes the evidence easy to read while the stable ID breaks ties
-    matches.sort_by(|left, right| {
-        left.range
-            .offset
-            .cmp(&right.range.offset)
-            .then_with(|| left.rule_id.cmp(right.rule_id))
-    });
-    matches
 }
 
 fn matching_bytes<'a>(bytes: &'a [u8], offset: usize, pattern: &Pattern) -> Option<&'a [u8]> {

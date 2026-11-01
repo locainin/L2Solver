@@ -1,6 +1,8 @@
 use core::fmt;
 
 use super::FileRange;
+use super::png_stream::PngReadError;
+use crate::job::MemoryLease;
 
 /// The fixed byte prefix present at the start of every PNG file
 pub const PNG_SIGNATURE: [u8; 8] = [137, 80, 78, 71, 13, 10, 26, 10];
@@ -165,17 +167,65 @@ impl std::error::Error for PngError {}
 /// Returns an error for malformed signatures, chunk boundaries, type codes,
 /// checksums, the checked IHDR/IEND boundaries, or exceeded limits
 pub fn parse_png(bytes: &[u8], limits: PngLimits) -> Result<PngReport<'_>, PngError> {
+    parse_png_optional_memory(bytes, limits, None).map_err(|error| match error {
+        PngReadError::Format(error) => error,
+        PngReadError::Io(_) => PngError::TruncatedChunk,
+        PngReadError::Memory(_) => PngError::AllocationFailure,
+    })
+}
+
+pub(super) fn parse_png_optional_memory<'a>(
+    bytes: &'a [u8],
+    limits: PngLimits,
+    mut memory: Option<&mut MemoryLease>,
+) -> Result<PngReport<'a>, PngReadError> {
+    let before = memory.as_deref().map_or(0, MemoryLease::bytes);
+    let result = parse_png_inner(bytes, limits, memory.as_deref_mut(), before);
+    // The inner call has dropped temporary vectors before restoring a failed charge
+    if result.is_err()
+        && let Some(lease) = memory
+    {
+        lease.try_resize(before).map_err(PngReadError::Memory)?;
+    }
+    result
+}
+
+fn parse_png_inner<'a>(
+    bytes: &'a [u8],
+    limits: PngLimits,
+    mut memory: Option<&mut MemoryLease>,
+    before: u64,
+) -> Result<PngReport<'a>, PngReadError> {
     let mut reader = std::io::Cursor::new(bytes);
-    let parsed = super::png_stream::parse_png_from_reader(&mut reader, bytes.len(), limits)
-        .map_err(|error| match error {
-            super::png_stream::PngReadError::Format(error) => error,
-            super::png_stream::PngReadError::Io(_) => PngError::TruncatedChunk,
-            super::png_stream::PngReadError::Memory(_) => PngError::AllocationFailure,
-        })?;
+    let mut range_memory = memory
+        .as_deref()
+        .map(|lease| lease.try_sibling(0))
+        .transpose()
+        .map_err(PngReadError::Memory)?;
+    let parsed = if let Some(lease) = range_memory.as_mut() {
+        super::png_stream::parse_png_from_reader_with_memory(
+            &mut reader,
+            bytes.len(),
+            limits,
+            lease,
+        )?
+    } else {
+        super::png_stream::parse_png_from_reader(&mut reader, bytes.len(), limits)?
+    };
+
+    // Both the range index and the borrowed report are live during this conversion
+    if let Some(lease) = memory.as_deref_mut() {
+        let requested = png_report_charge(before, parsed.chunks.len())?;
+        lease.try_resize(requested).map_err(PngReadError::Memory)?;
+    }
     let mut chunks = Vec::new();
     chunks
         .try_reserve_exact(parsed.chunks.len())
         .map_err(|_| PngError::AllocationFailure)?;
+    if let Some(lease) = memory {
+        let actual = png_report_charge(before, chunks.capacity())?;
+        lease.try_resize(actual).map_err(PngReadError::Memory)?;
+    }
     for chunk in parsed.chunks {
         let end = chunk
             .payload_range
@@ -204,4 +254,12 @@ pub fn parse_png(bytes: &[u8], limits: PngLimits) -> Result<PngReport<'_>, PngEr
         bytes_after_iend,
         bytes_after_iend_range: parsed.bytes_after_iend_range,
     })
+}
+
+fn png_report_charge(before: u64, capacity: usize) -> Result<u64, PngError> {
+    capacity
+        .checked_mul(std::mem::size_of::<PngChunk<'_>>())
+        .and_then(|bytes| u64::try_from(bytes).ok())
+        .and_then(|bytes| before.checked_add(bytes))
+        .ok_or(PngError::AllocationFailure)
 }

@@ -1,17 +1,24 @@
 use core::fmt;
 
+#[cfg(test)]
+#[path = "../../tests/artifact/validator_memory_internal.rs"]
+mod memory_tests;
+
 use super::{
     ArtifactError, ArtifactFormat, ArtifactReport, DerError, DerLimits, DerReport, FileRange,
     MAX_DER_DEPTH, PNG_SIGNATURE, PngError, PngLimits, PngReport, candidate_executable_format,
-    parse_der, parse_png,
+    parse_der,
 };
 use super::{
-    scan_file_signatures,
+    png::parse_png_optional_memory,
+    signatures::matches_zip_signature,
     zip::{
         ZipArtifactError, ZipArtifactLimits, ZipArtifactOmissionReason, ZipArtifactReport,
+        ZipMemoryError, inspect_zip_at_depth_with_memory,
         inspect_zip_at_depth_with_operation_budget, inspect_zip_with_limits,
     },
 };
+use crate::job::{MemoryError, MemoryLease};
 
 /// Format selected for structural artifact validation
 #[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
@@ -227,7 +234,7 @@ impl ArtifactValidator {
     /// ```
     #[must_use]
     pub fn validate<'a>(&self, bytes: &'a [u8]) -> ArtifactValidationOutcome<'a> {
-        self.validate_internal(bytes, None)
+        unmetered_outcome(self.validate_internal(bytes, None, None), bytes, None)
     }
 
     /// Select a validator and consume a caller-shared ZIP expansion budget
@@ -240,48 +247,87 @@ impl ArtifactValidator {
         bytes: &'a [u8],
         zip_budget_remaining: &mut usize,
     ) -> ArtifactValidationOutcome<'a> {
-        self.validate_internal(bytes, Some(zip_budget_remaining))
+        unmetered_outcome(
+            self.validate_internal(bytes, Some(zip_budget_remaining), None),
+            bytes,
+            None,
+        )
+    }
+
+    /// The caller keeps the lease until every returned report and moved member is dropped
+    pub(crate) fn validate_with_zip_budget_and_memory<'a>(
+        &self,
+        bytes: &'a [u8],
+        zip_budget_remaining: &mut usize,
+        memory: &mut MemoryLease,
+    ) -> Result<ArtifactValidationOutcome<'a>, MemoryError> {
+        self.validate_internal(bytes, Some(zip_budget_remaining), Some(memory))
     }
 
     fn validate_internal<'a>(
         &self,
         bytes: &'a [u8],
         mut zip_budget_remaining: Option<&mut usize>,
-    ) -> ArtifactValidationOutcome<'a> {
+        mut memory: Option<&mut MemoryLease>,
+    ) -> Result<ArtifactValidationOutcome<'a>, MemoryError> {
         let input_range = complete_range(bytes);
         if bytes.len() > self.policy.max_input_bytes {
-            return omitted_input(None, input_range, bytes.len(), self.policy.max_input_bytes);
+            return Ok(omitted_input(
+                None,
+                input_range,
+                bytes.len(),
+                self.policy.max_input_bytes,
+            ));
         }
 
         let executable = candidate_executable_format(bytes).map(validation_format);
-        let zip_candidate = has_zip_signature(bytes) || super::zip::has_zip_end_record(bytes);
         let candidates = [
             bytes
                 .starts_with(&PNG_SIGNATURE)
                 .then_some(ArtifactValidationFormat::Png),
             executable,
-            zip_candidate.then_some(ArtifactValidationFormat::Zip),
+            Some(ArtifactValidationFormat::Zip),
         ];
-        let mut first_unproven = None;
+        // Keep the report before its lease so the report drops first on every exit
+        let mut first_unproven: Option<(ArtifactValidationOutcome<'a>, Option<MemoryLease>)> = None;
         let mut first_omission = None;
         let mut first_rejection = None;
 
         for format in candidates.into_iter().flatten() {
-            let outcome = if format == ArtifactValidationFormat::Zip {
-                zip_budget_remaining.as_deref_mut().map_or_else(
-                    || self.validate_as_with_operation_budget(format, bytes, None),
-                    |remaining| {
-                        self.validate_as_with_operation_budget(format, bytes, Some(remaining))
-                    },
-                )
-            } else {
-                self.validate_as_with_operation_budget(format, bytes, None)
-            };
+            if format == ArtifactValidationFormat::Zip && !matches_zip_signature(bytes) {
+                // A successful earlier candidate wins before ZIP detection needs its tail buffer
+                let has_end = if let Some(lease) = memory.as_deref() {
+                    super::zip::has_zip_end_record_with_memory(bytes, lease)?
+                } else {
+                    super::zip::has_zip_end_record(bytes)
+                };
+                if !has_end {
+                    continue;
+                }
+            }
+            let mut candidate_memory = memory
+                .as_deref()
+                .map(|lease| lease.try_sibling(0))
+                .transpose()?;
+            let outcome = self.validate_as_with_operation_budget(
+                format,
+                bytes,
+                zip_budget_remaining.as_deref_mut(),
+                candidate_memory.as_mut(),
+            )?;
             match outcome {
-                outcome @ ArtifactValidationOutcome::Validated { .. } => return outcome,
+                outcome @ ArtifactValidationOutcome::Validated { .. } => {
+                    // The selected report owns its vectors beyond this parser call
+                    if let (Some(lease), Some(candidate)) =
+                        (memory.as_deref_mut(), candidate_memory.take())
+                    {
+                        lease.absorb(candidate);
+                    }
+                    return Ok(outcome);
+                }
                 outcome @ ArtifactValidationOutcome::BoundaryUnproven { .. } => {
                     if first_unproven.is_none() {
-                        first_unproven = Some(outcome);
+                        first_unproven = Some((outcome, candidate_memory.take()));
                     }
                 }
                 outcome @ ArtifactValidationOutcome::Omitted { .. } => {
@@ -298,10 +344,16 @@ impl ArtifactValidator {
             }
         }
 
-        first_omission
-            .or(first_unproven)
-            .or(first_rejection)
-            .unwrap_or(ArtifactValidationOutcome::Unsupported { input_range })
+        if let Some(outcome) = first_omission {
+            return Ok(outcome);
+        }
+        if let Some((outcome, candidate)) = first_unproven {
+            if let (Some(lease), Some(candidate)) = (memory, candidate) {
+                lease.absorb(candidate);
+            }
+            return Ok(outcome);
+        }
+        Ok(first_rejection.unwrap_or(ArtifactValidationOutcome::Unsupported { input_range }))
     }
 
     /// Validate the complete input as one explicitly selected format
@@ -315,7 +367,11 @@ impl ArtifactValidator {
         format: ArtifactValidationFormat,
         bytes: &'a [u8],
     ) -> ArtifactValidationOutcome<'a> {
-        self.validate_as_with_operation_budget(format, bytes, None)
+        unmetered_outcome(
+            self.validate_as_with_operation_budget(format, bytes, None, None),
+            bytes,
+            Some(format),
+        )
     }
 
     /// Validate one explicit format while consuming a shared ZIP expansion budget
@@ -329,7 +385,11 @@ impl ArtifactValidator {
         bytes: &'a [u8],
         zip_budget_remaining: &mut usize,
     ) -> ArtifactValidationOutcome<'a> {
-        self.validate_as_with_operation_budget(format, bytes, Some(zip_budget_remaining))
+        unmetered_outcome(
+            self.validate_as_with_operation_budget(format, bytes, Some(zip_budget_remaining), None),
+            bytes,
+            Some(format),
+        )
     }
 
     fn validate_as_with_operation_budget<'a>(
@@ -337,18 +397,19 @@ impl ArtifactValidator {
         format: ArtifactValidationFormat,
         bytes: &'a [u8],
         zip_budget_remaining: Option<&mut usize>,
-    ) -> ArtifactValidationOutcome<'a> {
+        memory: Option<&mut MemoryLease>,
+    ) -> Result<ArtifactValidationOutcome<'a>, MemoryError> {
         let input_range = complete_range(bytes);
         if bytes.len() > self.policy.max_input_bytes {
-            return omitted_input(
+            return Ok(omitted_input(
                 Some(format),
                 input_range,
                 bytes.len(),
                 self.policy.max_input_bytes,
-            );
+            ));
         }
 
-        match format {
+        Ok(match format {
             ArtifactValidationFormat::Der => {
                 match parse_der(bytes, input_range, self.policy.der_limits) {
                     Ok(report) => ArtifactValidationOutcome::Validated {
@@ -360,25 +421,49 @@ impl ArtifactValidator {
                     Err(error) => classify_der_error(format, input_range, error),
                 }
             }
-            ArtifactValidationFormat::Png => match parse_png(bytes, self.policy.png_limits) {
-                Ok(report) => png_result(report),
-                Err(error) => classify_png_error(format, input_range, error),
-            },
+            ArtifactValidationFormat::Png => {
+                match parse_png_optional_memory(bytes, self.policy.png_limits, memory) {
+                    Ok(report) => png_result(report),
+                    Err(super::PngReadError::Format(error)) => {
+                        classify_png_error(format, input_range, error)
+                    }
+                    Err(super::PngReadError::Io(_)) => {
+                        classify_png_error(format, input_range, PngError::TruncatedChunk)
+                    }
+                    Err(super::PngReadError::Memory(error)) => return Err(error),
+                }
+            }
             ArtifactValidationFormat::Zip => {
-                let result = zip_budget_remaining.map_or_else(
-                    || inspect_zip_with_limits(bytes, self.policy.zip_limits),
-                    |remaining| {
-                        inspect_zip_at_depth_with_operation_budget(
-                            bytes,
-                            self.policy.zip_limits,
-                            0,
-                            remaining,
+                let result = if let Some(lease) = memory {
+                    let mut unlimited = usize::MAX;
+                    inspect_zip_at_depth_with_memory(
+                        bytes,
+                        self.policy.zip_limits,
+                        0,
+                        zip_budget_remaining.unwrap_or(&mut unlimited),
+                        lease,
+                    )
+                } else {
+                    zip_budget_remaining
+                        .map_or_else(
+                            || inspect_zip_with_limits(bytes, self.policy.zip_limits),
+                            |remaining| {
+                                inspect_zip_at_depth_with_operation_budget(
+                                    bytes,
+                                    self.policy.zip_limits,
+                                    0,
+                                    remaining,
+                                )
+                            },
                         )
-                    },
-                );
+                        .map_err(ZipMemoryError::Archive)
+                };
                 match result {
                     Ok(report) => zip_result(format, input_range, self.policy.zip_limits, report),
-                    Err(error) => classify_zip_error(format, input_range, error),
+                    Err(ZipMemoryError::Archive(error)) => {
+                        classify_zip_error(format, input_range, error)
+                    }
+                    Err(ZipMemoryError::Memory(error)) => return Err(error),
                 }
             }
             ArtifactValidationFormat::Elf => {
@@ -390,8 +475,20 @@ impl ArtifactValidator {
                 bytes,
                 input_range,
             ),
-        }
+        })
     }
+}
+
+fn unmetered_outcome<'a>(
+    result: Result<ArtifactValidationOutcome<'a>, MemoryError>,
+    bytes: &'a [u8],
+    format: Option<ArtifactValidationFormat>,
+) -> ArtifactValidationOutcome<'a> {
+    result.unwrap_or(ArtifactValidationOutcome::Omitted {
+        format,
+        input_range: complete_range(bytes),
+        reason: ArtifactResourceOmissionReason::AllocationFailure,
+    })
 }
 
 fn validate_policy(policy: ArtifactValidationPolicy) -> Result<(), ArtifactValidationPolicyError> {
@@ -421,18 +518,6 @@ const fn validation_format(format: ArtifactFormat) -> ArtifactValidationFormat {
         ArtifactFormat::Elf => ArtifactValidationFormat::Elf,
         ArtifactFormat::PortableExecutable => ArtifactValidationFormat::PortableExecutable,
     }
-}
-
-fn has_zip_signature(bytes: &[u8]) -> bool {
-    // The catalogue scan is kept to the prefix because auto-detection is a file-start check
-    let prefix_length = bytes.len().min(8);
-    let Some(prefix) = bytes.get(..prefix_length) else {
-        return false;
-    };
-    scan_file_signatures(prefix)
-        .matches
-        .iter()
-        .any(|signature| signature.possible_formats.contains(&"zip_container"))
 }
 
 const fn complete_range(bytes: &[u8]) -> FileRange {

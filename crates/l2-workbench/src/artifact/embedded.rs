@@ -3,10 +3,11 @@ use core::fmt;
 use serde::{Deserialize, Serialize};
 
 use super::zip::{
-    ZipArtifactError, ZipArtifactLimits, ZipArtifactOmissionReason,
-    inspect_zip_at_depth_with_operation_budget,
+    ZipArtifactError, ZipArtifactLimits, ZipArtifactOmissionReason, ZipMemoryError,
+    inspect_zip_at_depth_with_memory, inspect_zip_at_depth_with_operation_budget,
 };
-use super::{FileRange, PngError, PngLimits, PngReport, parse_png};
+use super::{FileRange, PngError, PngLimits, PngReadError, PngReport};
+use crate::job::{MemoryError, MemoryLease};
 
 const ZIP_LOCAL_FILE_SIGNATURE: &[u8; 4] = b"PK\x03\x04";
 const ZIP_END_SIGNATURE: &[u8; 4] = b"PK\x05\x06";
@@ -150,6 +151,47 @@ impl fmt::Display for EmbeddedDiscoveryError {
 
 impl std::error::Error for EmbeddedDiscoveryError {}
 
+#[derive(Debug)]
+pub(super) enum EmbeddedDiscoveryMemoryError {
+    Discovery(EmbeddedDiscoveryError),
+    Memory(MemoryError),
+}
+
+impl fmt::Display for EmbeddedDiscoveryMemoryError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Discovery(error) => error.fmt(formatter),
+            Self::Memory(error) => error.fmt(formatter),
+        }
+    }
+}
+
+impl std::error::Error for EmbeddedDiscoveryMemoryError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Discovery(error) => Some(error),
+            Self::Memory(error) => Some(error),
+        }
+    }
+}
+
+impl From<EmbeddedDiscoveryError> for EmbeddedDiscoveryMemoryError {
+    fn from(error: EmbeddedDiscoveryError) -> Self {
+        Self::Discovery(error)
+    }
+}
+
+impl From<MemoryError> for EmbeddedDiscoveryMemoryError {
+    fn from(error: MemoryError) -> Self {
+        Self::Memory(error)
+    }
+}
+
+struct DiscoveryAdmission<'a> {
+    retained: &'a mut MemoryLease,
+    scratch: &'a mut MemoryLease,
+}
+
 #[derive(Clone, Copy)]
 struct MarkerCandidate {
     format: EmbeddedFormat,
@@ -170,7 +212,16 @@ struct MarkerScan {
     omissions: EmbeddedDiscoveryOmissions,
 }
 
-struct ZipValidationContext<'a> {
+struct PngValidationContext<'a, 'memory> {
+    limits: PngLimits,
+    maximum_attempts: usize,
+    attempt_count: &'a mut usize,
+    work_remaining: &'a mut usize,
+    validation_input_bytes: &'a mut usize,
+    memory: Option<&'a mut DiscoveryAdmission<'memory>>,
+}
+
+struct ZipValidationContext<'a, 'memory> {
     boundaries: &'a [ZipBoundary],
     last_omitted_boundary_offset: Option<usize>,
     scan_incomplete: bool,
@@ -181,6 +232,7 @@ struct ZipValidationContext<'a> {
     work_remaining: &'a mut usize,
     validation_input_bytes: &'a mut usize,
     expanded_remaining: &'a mut usize,
+    memory: Option<&'a mut DiscoveryAdmission<'memory>>,
 }
 
 enum ZipBoundaryResult {
@@ -224,8 +276,52 @@ pub(super) fn discover_embedded_objects_with_work_and_skip_start(
     max_work_bytes: usize,
     skip_start_format: Option<EmbeddedFormat>,
 ) -> Result<EmbeddedDiscoveryReport, EmbeddedDiscoveryError> {
-    let scan = scan_markers(bytes, limits, skip_start_format)?;
-    validate_markers(bytes, limits, scan, max_work_bytes)
+    match discover_inner(bytes, limits, max_work_bytes, skip_start_format, None) {
+        Ok(report) => Ok(report),
+        Err(EmbeddedDiscoveryMemoryError::Discovery(error)) => Err(error),
+        Err(EmbeddedDiscoveryMemoryError::Memory(_)) => {
+            Err(EmbeddedDiscoveryError::AllocationFailure)
+        }
+    }
+}
+
+/// The caller retains this charge while the report or its moved strings remain live
+pub(super) fn discover_embedded_objects_with_work_and_skip_start_with_memory(
+    bytes: &[u8],
+    limits: EmbeddedDiscoveryLimits,
+    max_work_bytes: usize,
+    skip_start_format: Option<EmbeddedFormat>,
+    memory: &mut MemoryLease,
+) -> Result<EmbeddedDiscoveryReport, EmbeddedDiscoveryMemoryError> {
+    let before = memory.bytes();
+    let mut scratch = memory.try_sibling(0)?;
+    let result = discover_inner(
+        bytes,
+        limits,
+        max_work_bytes,
+        skip_start_format,
+        Some(DiscoveryAdmission {
+            retained: memory,
+            scratch: &mut scratch,
+        }),
+    );
+    // Discovery has dropped its scan vectors before their temporary charge is released
+    drop(scratch);
+    if result.is_err() {
+        memory.try_resize(before)?;
+    }
+    result
+}
+
+fn discover_inner(
+    bytes: &[u8],
+    limits: EmbeddedDiscoveryLimits,
+    max_work_bytes: usize,
+    skip_start_format: Option<EmbeddedFormat>,
+    mut memory: Option<DiscoveryAdmission<'_>>,
+) -> Result<EmbeddedDiscoveryReport, EmbeddedDiscoveryMemoryError> {
+    let scan = scan_markers(bytes, limits, skip_start_format, memory.as_mut())?;
+    validate_markers(bytes, limits, scan, max_work_bytes, memory.as_mut())
 }
 
 fn validate_markers(
@@ -233,7 +329,8 @@ fn validate_markers(
     limits: EmbeddedDiscoveryLimits,
     scan: MarkerScan,
     max_work_bytes: usize,
-) -> Result<EmbeddedDiscoveryReport, EmbeddedDiscoveryError> {
+    mut memory: Option<&mut DiscoveryAdmission<'_>>,
+) -> Result<EmbeddedDiscoveryReport, EmbeddedDiscoveryMemoryError> {
     let MarkerScan {
         markers,
         boundaries,
@@ -242,9 +339,13 @@ fn validate_markers(
         mut omissions,
     } = scan;
     let mut candidates = Vec::new();
-    candidates
-        .try_reserve_exact(markers.len())
-        .map_err(|_| EmbeddedDiscoveryError::AllocationFailure)?;
+    reserve_vec(
+        &mut candidates,
+        markers.len(),
+        memory
+            .as_deref_mut()
+            .map(|admission| &mut *admission.retained),
+    )?;
     let mut validation_attempt_count = 0_usize;
     let mut work_remaining = max_work_bytes;
     let mut validation_input_bytes = 0_usize;
@@ -257,12 +358,15 @@ fn validate_markers(
             EmbeddedFormat::Png => validate_png_candidate(
                 bytes,
                 marker.offset,
-                limits.png_limits,
-                limits.max_validation_attempts,
-                &mut validation_attempt_count,
-                &mut work_remaining,
-                &mut validation_input_bytes,
-            ),
+                &mut PngValidationContext {
+                    limits: limits.png_limits,
+                    maximum_attempts: limits.max_validation_attempts,
+                    attempt_count: &mut validation_attempt_count,
+                    work_remaining: &mut work_remaining,
+                    validation_input_bytes: &mut validation_input_bytes,
+                    memory: memory.as_deref_mut(),
+                },
+            )?,
             EmbeddedFormat::Zip => validate_zip_candidate(
                 bytes,
                 marker.offset,
@@ -277,8 +381,9 @@ fn validate_markers(
                     work_remaining: &mut work_remaining,
                     validation_input_bytes: &mut validation_input_bytes,
                     expanded_remaining: &mut zip_expanded_remaining,
+                    memory: memory.as_deref_mut(),
                 },
-            ),
+            )?,
         };
         if matches!(
             candidate.validation,
@@ -315,21 +420,14 @@ fn scan_markers(
     bytes: &[u8],
     limits: EmbeddedDiscoveryLimits,
     skip_start_format: Option<EmbeddedFormat>,
-) -> Result<MarkerScan, EmbeddedDiscoveryError> {
+    mut memory: Option<&mut DiscoveryAdmission<'_>>,
+) -> Result<MarkerScan, EmbeddedDiscoveryMemoryError> {
     let scan_length = bytes.len().min(limits.max_scan_bytes);
     let mut markers = Vec::new();
-    let marker_capacity = limits.max_candidates.min(scan_length);
-    markers
-        .try_reserve_exact(marker_capacity)
-        .map_err(|_| EmbeddedDiscoveryError::AllocationFailure)?;
-
     let mut boundaries = Vec::new();
-    let boundary_capacity = limits
+    let boundary_limit = limits
         .max_validation_attempts
         .min(scan_length / ZIP_END_SIGNATURE.len());
-    boundaries
-        .try_reserve_exact(boundary_capacity)
-        .map_err(|_| EmbeddedDiscoveryError::AllocationFailure)?;
 
     let mut omissions = EmbeddedDiscoveryOmissions {
         unscanned_range: (scan_length < bytes.len()).then_some(FileRange {
@@ -353,7 +451,8 @@ fn scan_markers(
                     format: EmbeddedFormat::Png,
                     offset,
                 },
-            );
+                memory.as_deref_mut(),
+            )?;
         }
 
         if !(offset == 0 && skip_start_format == Some(EmbeddedFormat::Zip))
@@ -367,7 +466,8 @@ fn scan_markers(
                     format: EmbeddedFormat::Zip,
                     offset,
                 },
-            );
+                memory.as_deref_mut(),
+            )?;
         }
 
         if marker_matches(bytes, offset, ZIP_END_SIGNATURE, scan_length)
@@ -384,9 +484,17 @@ fn scan_markers(
                         format: EmbeddedFormat::Zip,
                         offset,
                     },
-                );
+                    memory.as_deref_mut(),
+                )?;
             }
-            if boundaries.len() < boundary_capacity {
+            if boundaries.len() < boundary_limit {
+                reserve_next(
+                    &mut boundaries,
+                    boundary_limit,
+                    memory
+                        .as_deref_mut()
+                        .map(|admission| &mut *admission.scratch),
+                )?;
                 boundaries.push(ZipBoundary { offset, end });
             } else {
                 last_omitted_boundary_offset = Some(offset);
@@ -416,13 +524,71 @@ fn retain_marker(
     omissions: &mut EmbeddedDiscoveryOmissions,
     maximum: usize,
     candidate: MarkerCandidate,
-) {
+    memory: Option<&mut DiscoveryAdmission<'_>>,
+) -> Result<(), EmbeddedDiscoveryMemoryError> {
     if markers.len() >= maximum {
         omissions.output_candidate_count += 1;
-        return;
+        return Ok(());
     }
     // One recognized marker can occur at each scanned source position
+    reserve_next(
+        markers,
+        maximum,
+        memory.map(|admission| &mut *admission.scratch),
+    )?;
     markers.push(candidate);
+    Ok(())
+}
+
+fn reserve_next<T>(
+    values: &mut Vec<T>,
+    maximum: usize,
+    memory: Option<&mut MemoryLease>,
+) -> Result<(), EmbeddedDiscoveryMemoryError> {
+    if values.len() < values.capacity() {
+        return Ok(());
+    }
+    let next = values.capacity().saturating_mul(2).max(4).min(maximum);
+    reserve_vec(values, next, memory)
+}
+
+fn reserve_vec<T>(
+    values: &mut Vec<T>,
+    required: usize,
+    mut memory: Option<&mut MemoryLease>,
+) -> Result<(), EmbeddedDiscoveryMemoryError> {
+    let old_capacity = values.capacity();
+    if old_capacity >= required {
+        return Ok(());
+    }
+    let before = memory.as_deref().map_or(0, MemoryLease::bytes);
+    if let Some(lease) = memory.as_deref_mut() {
+        lease.try_resize(grown_vec_charge::<T>(before, old_capacity, required)?)?;
+    }
+    values
+        .try_reserve_exact(required - values.len())
+        .map_err(|_| EmbeddedDiscoveryError::AllocationFailure)?;
+    if let Some(lease) = memory {
+        lease.try_resize(grown_vec_charge::<T>(
+            before,
+            old_capacity,
+            values.capacity(),
+        )?)?;
+    }
+    Ok(())
+}
+
+fn grown_vec_charge<T>(
+    before: u64,
+    old_capacity: usize,
+    new_capacity: usize,
+) -> Result<u64, EmbeddedDiscoveryError> {
+    new_capacity
+        .checked_sub(old_capacity)
+        .and_then(|growth| growth.checked_mul(std::mem::size_of::<T>()))
+        .and_then(|bytes| u64::try_from(bytes).ok())
+        .and_then(|bytes| before.checked_add(bytes))
+        .ok_or(EmbeddedDiscoveryError::AllocationFailure)
 }
 
 fn zip_end_boundary(bytes: &[u8], offset: usize, scan_length: usize) -> Option<usize> {
@@ -458,56 +624,69 @@ fn empty_zip_fields(bytes: &[u8], offset: usize, scan_length: usize) -> bool {
 fn validate_png_candidate(
     bytes: &[u8],
     offset: usize,
-    limits: PngLimits,
-    maximum_attempts: usize,
-    attempt_count: &mut usize,
-    work_remaining: &mut usize,
-    validation_input_bytes: &mut usize,
-) -> EmbeddedCandidate {
+    context: &mut PngValidationContext<'_, '_>,
+) -> Result<EmbeddedCandidate, EmbeddedDiscoveryMemoryError> {
     let available_length = bytes.len() - offset;
-    let probe_length = available_length.min(limits.max_input_bytes);
+    let probe_length = available_length.min(context.limits.max_input_bytes);
     let probe_end = offset + probe_length;
     let probe_range = FileRange {
         offset,
         length: probe_length,
     };
-    if *attempt_count >= maximum_attempts {
-        return EmbeddedCandidate {
+    if *context.attempt_count >= context.maximum_attempts {
+        return Ok(EmbeddedCandidate {
             format: EmbeddedFormat::Png,
             offset,
             range: probe_range,
             validation: Err(EmbeddedValidationFailure::ValidationAttemptsExhausted),
-        };
+        });
     }
-    if probe_length > *work_remaining {
-        return EmbeddedCandidate {
+    if probe_length > *context.work_remaining {
+        return Ok(EmbeddedCandidate {
             format: EmbeddedFormat::Png,
             offset,
             range: probe_range,
             validation: Err(EmbeddedValidationFailure::ValidationWorkExhausted),
-        };
+        });
     }
-    *attempt_count += 1;
-    *work_remaining -= probe_length;
-    *validation_input_bytes += probe_length;
+    *context.attempt_count += 1;
+    *context.work_remaining -= probe_length;
+    *context.validation_input_bytes += probe_length;
 
     let Some(candidate_bytes) = bytes.get(offset..probe_end) else {
-        return EmbeddedCandidate {
+        return Ok(EmbeddedCandidate {
             format: EmbeddedFormat::Png,
             offset,
             range: probe_range,
             validation: Err(EmbeddedValidationFailure::Png(PngError::TruncatedChunk)),
-        };
+        });
     };
-    match parse_png(candidate_bytes, limits) {
+    let mut parser_memory = context
+        .memory
+        .as_deref()
+        .map(|admission| admission.scratch.try_sibling(0))
+        .transpose()?;
+    let result = super::png::parse_png_optional_memory(
+        candidate_bytes,
+        context.limits,
+        parser_memory.as_mut(),
+    );
+    Ok(match result {
         Ok(report) => png_candidate(offset, bytes.len(), probe_range, &report),
-        Err(error) => EmbeddedCandidate {
+        Err(PngReadError::Memory(error)) => return Err(error.into()),
+        Err(PngReadError::Io(_)) => EmbeddedCandidate {
+            format: EmbeddedFormat::Png,
+            offset,
+            range: probe_range,
+            validation: Err(EmbeddedValidationFailure::Png(PngError::TruncatedChunk)),
+        },
+        Err(PngReadError::Format(error)) => EmbeddedCandidate {
             format: EmbeddedFormat::Png,
             offset,
             range: probe_range,
             validation: Err(EmbeddedValidationFailure::Png(error)),
         },
-    }
+    })
 }
 
 fn png_candidate(
@@ -567,8 +746,8 @@ const fn png_range_failure(offset: usize, probe_range: FileRange) -> EmbeddedCan
 fn validate_zip_candidate(
     bytes: &[u8],
     offset: usize,
-    context: &mut ZipValidationContext<'_>,
-) -> EmbeddedCandidate {
+    context: &mut ZipValidationContext<'_, '_>,
+) -> Result<EmbeddedCandidate, EmbeddedDiscoveryMemoryError> {
     let mut last_candidate_range = FileRange { offset, length: 0 };
     let mut last_error = None;
 
@@ -584,18 +763,18 @@ fn validate_zip_candidate(
             offset,
             length: boundary.end - offset,
         };
-        match inspect_zip_boundary(bytes, offset, boundary.end, context) {
+        match inspect_zip_boundary(bytes, offset, boundary.end, context)? {
             ZipBoundaryResult::Validated(evidence) => {
-                return EmbeddedCandidate {
+                return Ok(EmbeddedCandidate {
                     format: EmbeddedFormat::Zip,
                     offset,
                     range: last_candidate_range,
                     validation: Ok(evidence),
-                };
+                });
             }
             ZipBoundaryResult::Rejected(error) => last_error = Some(error),
             ZipBoundaryResult::Omitted(reason) => {
-                return zip_failure(offset, last_candidate_range, reason);
+                return Ok(zip_failure(offset, last_candidate_range, reason));
             }
             ZipBoundaryResult::MissingBytes => {
                 last_error = Some(ZipArtifactError::InvalidArchive);
@@ -607,65 +786,85 @@ fn validate_zip_candidate(
         .last_omitted_boundary_offset
         .is_some_and(|boundary_offset| boundary_offset >= offset)
     {
-        return zip_failure(
+        return Ok(zip_failure(
             offset,
             range_through_scan(offset, context.scan_end),
             EmbeddedValidationFailure::ValidationAttemptsExhausted,
-        );
+        ));
     }
     if context.scan_incomplete {
-        return zip_failure(
+        return Ok(zip_failure(
             offset,
             range_through_scan(offset, context.scan_end),
             EmbeddedValidationFailure::ScanBudgetExhausted,
-        );
+        ));
     }
     if let Some(error) = last_error {
-        return zip_failure(
+        return Ok(zip_failure(
             offset,
             last_candidate_range,
             EmbeddedValidationFailure::Zip(error),
-        );
+        ));
     }
 
-    zip_failure(
+    Ok(zip_failure(
         offset,
         range_through_scan(offset, context.scan_end),
         EmbeddedValidationFailure::Zip(ZipArtifactError::InvalidArchive),
-    )
+    ))
 }
 
 fn inspect_zip_boundary(
     bytes: &[u8],
     offset: usize,
     end: usize,
-    context: &mut ZipValidationContext<'_>,
-) -> ZipBoundaryResult {
+    context: &mut ZipValidationContext<'_, '_>,
+) -> Result<ZipBoundaryResult, EmbeddedDiscoveryMemoryError> {
     if *context.attempt_count >= context.maximum_attempts {
-        return ZipBoundaryResult::Omitted(EmbeddedValidationFailure::ValidationAttemptsExhausted);
+        return Ok(ZipBoundaryResult::Omitted(
+            EmbeddedValidationFailure::ValidationAttemptsExhausted,
+        ));
     }
     let Some(candidate_bytes) = bytes.get(offset..end) else {
-        return ZipBoundaryResult::MissingBytes;
+        return Ok(ZipBoundaryResult::MissingBytes);
     };
     if candidate_bytes.len() > *context.work_remaining {
-        return ZipBoundaryResult::Omitted(EmbeddedValidationFailure::ValidationWorkExhausted);
+        return Ok(ZipBoundaryResult::Omitted(
+            EmbeddedValidationFailure::ValidationWorkExhausted,
+        ));
     }
     *context.work_remaining -= candidate_bytes.len();
     *context.validation_input_bytes += candidate_bytes.len();
     *context.attempt_count += 1;
     let operation_budget = (*context.expanded_remaining).min(*context.work_remaining);
     let mut operation_remaining = operation_budget;
-    let result = inspect_zip_at_depth_with_operation_budget(
-        candidate_bytes,
-        context.limits,
-        0,
-        &mut operation_remaining,
-    );
+    let mut parser_memory = context
+        .memory
+        .as_deref()
+        .map(|admission| admission.scratch.try_sibling(0))
+        .transpose()?;
+    let result = if let Some(lease) = parser_memory.as_mut() {
+        inspect_zip_at_depth_with_memory(
+            candidate_bytes,
+            context.limits,
+            0,
+            &mut operation_remaining,
+            lease,
+        )
+    } else {
+        inspect_zip_at_depth_with_operation_budget(
+            candidate_bytes,
+            context.limits,
+            0,
+            &mut operation_remaining,
+        )
+        .map_err(ZipMemoryError::Archive)
+    };
     let consumed = operation_budget - operation_remaining;
     *context.expanded_remaining -= consumed;
     *context.work_remaining -= consumed;
 
-    match result {
+    let outcome = match result {
         Ok(report)
             if report.omissions.iter().any(|omission| {
                 matches!(omission.reason, ZipArtifactOmissionReason::EntryCountLimit)
@@ -676,15 +875,50 @@ fn inspect_zip_boundary(
                 maximum: context.limits.max_entries,
             })
         }
-        Ok(report) => ZipBoundaryResult::Validated(EmbeddedValidationEvidence::Zip {
-            archive_sha256: report.archive_sha256,
-            entry_count: report.entry_count,
-            expanded_byte_count: report.expanded_byte_count,
-            expanded_work_byte_count: report.expanded_work_byte_count,
-            omitted_entry_count: report.omitted_entry_count,
-        }),
-        Err(error) => ZipBoundaryResult::Rejected(error),
-    }
+        Ok(mut report) => {
+            // Keep the copied hash charged while the rest of the ZIP report is dropped
+            let archive_sha256 = if let Some(admission) = context.memory.as_deref_mut() {
+                copy_retained_string(&report.archive_sha256, admission.retained)?
+            } else {
+                std::mem::take(&mut report.archive_sha256)
+            };
+            ZipBoundaryResult::Validated(EmbeddedValidationEvidence::Zip {
+                archive_sha256,
+                entry_count: report.entry_count,
+                expanded_byte_count: report.expanded_byte_count,
+                expanded_work_byte_count: report.expanded_work_byte_count,
+                omitted_entry_count: report.omitted_entry_count,
+            })
+        }
+        Err(ZipMemoryError::Archive(error)) => ZipBoundaryResult::Rejected(error),
+        Err(ZipMemoryError::Memory(error)) => return Err(error.into()),
+    };
+    // Reports are dropped before their parser charge is released
+    drop(parser_memory);
+    Ok(outcome)
+}
+
+fn copy_retained_string(
+    value: &str,
+    memory: &mut MemoryLease,
+) -> Result<String, EmbeddedDiscoveryMemoryError> {
+    let before = memory.bytes();
+    let requested = u64::try_from(value.len())
+        .ok()
+        .and_then(|bytes| before.checked_add(bytes))
+        .ok_or(EmbeddedDiscoveryError::AllocationFailure)?;
+    memory.try_resize(requested)?;
+    let mut copied = String::new();
+    copied
+        .try_reserve_exact(value.len())
+        .map_err(|_| EmbeddedDiscoveryError::AllocationFailure)?;
+    let actual = u64::try_from(copied.capacity())
+        .ok()
+        .and_then(|bytes| before.checked_add(bytes))
+        .ok_or(EmbeddedDiscoveryError::AllocationFailure)?;
+    memory.try_resize(actual)?;
+    copied.push_str(value);
+    Ok(copied)
 }
 
 const fn range_through_scan(offset: usize, scan_end: usize) -> FileRange {
