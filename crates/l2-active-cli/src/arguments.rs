@@ -9,6 +9,11 @@ use clap::{Args, Parser, Subcommand, ValueEnum};
 use l2_active_linux::InterfaceSelector;
 use l2_onpath::MacAddress;
 
+use super::{
+    observer_arguments::{HsrpCommand, MplsCommand, ObserveCommand, VrrpCommand},
+    vlan_arguments::VlanCommand,
+};
+
 /// Standalone parser using the same active-command arguments as `L2Solver`
 #[derive(Clone, Debug, Eq, Parser, PartialEq)]
 #[command(
@@ -84,6 +89,48 @@ pub enum ActiveCommand {
         /// Select a bounded EAPOL operation
         #[command(subcommand)]
         command: Dot1xCommand,
+    },
+    /// Observe IPv4 VRRP version 3 advertisements without transmitting
+    Vrrp {
+        /// Select the bounded receive-only operation
+        #[command(subcommand)]
+        command: VrrpCommand,
+    },
+    /// Observe IPv4 HSRP version 1 messages without transmitting
+    Hsrp {
+        /// Select the bounded receive-only operation
+        #[command(subcommand)]
+        command: HsrpCommand,
+    },
+    /// Observe Cisco Dynamic Trunking Protocol messages without transmitting
+    Dtp {
+        /// Select the bounded receive-only operation
+        #[command(subcommand)]
+        command: ObserveCommand,
+    },
+    /// Observe Cisco VLAN Trunking Protocol messages without transmitting
+    Vtp {
+        /// Select the bounded receive-only operation
+        #[command(subcommand)]
+        command: ObserveCommand,
+    },
+    /// Observe MPLS frames addressed to the selected interface
+    Mpls {
+        /// Select the bounded receive-only operation
+        #[command(subcommand)]
+        command: MplsCommand,
+    },
+    /// Observe Cisco ISL encapsulation without transmitting
+    Isl {
+        /// Select the bounded receive-only operation
+        #[command(subcommand)]
+        command: ObserveCommand,
+    },
+    /// Compare an explicitly selected ARP canary across two interfaces
+    Vlan {
+        /// Select the bounded VLAN assessment
+        #[command(subcommand)]
+        command: VlanCommand,
     },
 }
 
@@ -246,11 +293,11 @@ pub struct ArpProbeArgs {
     pub session: SessionArgs,
 }
 
-fn interface_selector(name: &str) -> Result<InterfaceSelector, String> {
+pub(super) fn interface_selector(name: &str) -> Result<InterfaceSelector, String> {
     InterfaceSelector::new(name).map_err(|error| error.to_string())
 }
 
-fn ipv4_address(value: &str) -> Result<Ipv4Addr, String> {
+pub(super) fn ipv4_address(value: &str) -> Result<Ipv4Addr, String> {
     let address = value
         .parse::<Ipv4Addr>()
         .map_err(|error| error.to_string())?;
@@ -258,7 +305,7 @@ fn ipv4_address(value: &str) -> Result<Ipv4Addr, String> {
     Ok(address)
 }
 
-fn mac_address(value: &str) -> Result<MacAddress, String> {
+pub(super) fn mac_address(value: &str) -> Result<MacAddress, String> {
     let mut parts = value.split(':');
     let mut bytes = [0_u8; 6];
     for byte in &mut bytes {

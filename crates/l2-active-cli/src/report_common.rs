@@ -133,6 +133,22 @@ pub struct QualityView {
 
 impl QualityView {
     pub fn new(summary: &RunSummary, close_error: Option<&io::Error>) -> Self {
+        Self::with_diagnostics(summary, close_error, DiagnosticDetail::Full)
+    }
+
+    pub fn codes_only(summary: &RunSummary, close_error: Option<&io::Error>) -> Self {
+        Self::with_diagnostics(summary, close_error, DiagnosticDetail::CodesOnly)
+    }
+
+    fn with_diagnostics(
+        summary: &RunSummary,
+        close_error: Option<&io::Error>,
+        detail: DiagnosticDetail,
+    ) -> Self {
+        let render: fn(&io::Error) -> Diagnostic = match detail {
+            DiagnosticDetail::Full => diagnostic,
+            DiagnosticDetail::CodesOnly => code_only_diagnostic,
+        };
         Self {
             capture_scope: "inbound_fixed_profile",
             tx: Transmit {
@@ -159,16 +175,25 @@ impl QualityView {
                 final_backlog: summary.capture_backlog(),
             },
             stop_reason: stop_name(summary.stop_reason()),
-            transport_error: summary.transport_error().map(diagnostic),
-            loss_error: summary.loss_error().map(diagnostic),
-            accounting_error: summary.accounting_error().map(diagnostic),
-            backlog_error: summary.backlog_error().map(diagnostic),
+            transport_error: summary.transport_error().map(render),
+            loss_error: summary.loss_error().map(render),
+            accounting_error: summary.accounting_error().map(render),
+            backlog_error: summary.backlog_error().map(render),
             cleanup: Cleanup {
                 confirmed: close_error.is_none(),
-                error: close_error.map(ToString::to_string),
+                error: close_error.map(|error| match detail {
+                    DiagnosticDetail::Full => error.to_string(),
+                    DiagnosticDetail::CodesOnly => io_error_code(error).to_owned(),
+                }),
             },
         }
     }
+}
+
+#[derive(Clone, Copy)]
+enum DiagnosticDetail {
+    Full,
+    CodesOnly,
 }
 
 pub const fn acceptance(summary: &RunSummary) -> &'static str {
@@ -208,6 +233,14 @@ fn diagnostic(error: &io::Error) -> Diagnostic {
     Diagnostic {
         code: io_error_code(error),
         message: error.to_string(),
+    }
+}
+
+fn code_only_diagnostic(error: &io::Error) -> Diagnostic {
+    let code = io_error_code(error);
+    Diagnostic {
+        code,
+        message: code.to_owned(),
     }
 }
 

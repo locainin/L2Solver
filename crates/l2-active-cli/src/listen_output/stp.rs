@@ -9,7 +9,7 @@ use l2_active::{
 use l2_active_linux::{InterfaceSelector, VlanInfo};
 use serde::Serialize;
 
-use super::collection::{Collection, FrameView, Operation};
+use super::collection::{Collection, Diagnostics, FrameView, Operation};
 use crate::{ActiveOutcome, Error, OutputFormat, mac::format_mac, report_common::Evidence};
 
 #[derive(Serialize)]
@@ -123,6 +123,7 @@ pub fn write(
             sender_root_claim_changes: report.has_sender_root_changes(),
         },
         close_error,
+        diagnostics: Diagnostics::Detailed,
     }
     .write(format, output)
 }

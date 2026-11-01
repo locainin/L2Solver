@@ -10,10 +10,16 @@ mod dhcp;
 mod dot1x;
 #[path = "cli/errors.rs"]
 mod errors;
+#[cfg(target_os = "linux")]
+#[path = "first_hop/namespace_cli.rs"]
+mod first_hop;
 #[path = "cli/helper_timeout.rs"]
 mod helper_timeout;
 #[path = "cli/listen.rs"]
 mod listen;
+#[cfg(target_os = "linux")]
+#[path = "cli/mpls.rs"]
+mod mpls;
 #[cfg(target_os = "linux")]
 #[path = "cli/namespace.rs"]
 mod namespace;
@@ -22,5 +28,10 @@ mod ndp;
 #[path = "cli/output.rs"]
 mod output;
 #[cfg(target_os = "linux")]
+#[path = "switching/namespace_cli.rs"]
+mod switching;
+#[cfg(target_os = "linux")]
 #[path = "cli/vlan.rs"]
 mod vlan;
+#[path = "cli/vlan_assessment_args.rs"]
+mod vlan_assessment_args;

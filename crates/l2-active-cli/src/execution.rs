@@ -6,11 +6,12 @@ use std::{
 };
 
 use super::{
-    ActiveArgs, ActiveCommand, ArpCommand, DhcpCommand, Dot1xCommand, Error, ListenCommand,
-    NdpCommand, capabilities, dhcp_probe, dot1x_probe, interface_capabilities, listen_probe,
-    ndp_probe,
+    ActiveArgs, ActiveCommand, ArpCommand, DhcpCommand, Dot1xCommand, Error, HsrpCommand,
+    ListenCommand, MplsCommand, NdpCommand, ObserveCommand, VlanCommand, VrrpCommand, capabilities,
+    dhcp_probe, dot1x_probe, first_hop_probe, interface_capabilities, isl_probe, listen_probe,
+    mpls_probe, ndp_probe,
     preflight::{self, HelperStage, PreflightStop},
-    probe,
+    probe, switching_probe,
 };
 
 /// Process outcome that the main application can map to its own exit policy
@@ -20,7 +21,7 @@ pub enum ActiveOutcome {
     Completed,
     /// The evidence or bounded observation was incomplete
     Incomplete,
-    /// An observed identity differed from the explicitly supplied expectation
+    /// An observed value differed from an explicitly supplied expectation
     Findings,
     /// The operation was cancelled
     Cancelled,
@@ -36,49 +37,7 @@ pub fn execute(
     output: &mut impl Write,
 ) -> Result<ActiveOutcome, Error> {
     match &args.command {
-        ActiveCommand::Capabilities(options) => {
-            if cancelled.load(Ordering::Acquire) {
-                return stopped_capabilities(options, args.format, output);
-            }
-            let Some(info) = preflight::cancelled_discovery(
-                preflight::discover(&options.interface, cancelled),
-                cancelled,
-            )?
-            else {
-                return stopped_capabilities(options, args.format, output);
-            };
-            let Some(ethernet) = preflight::cancelled_discovery(
-                l2_active_linux::ethernet_capabilities::discover(
-                    &options.interface,
-                    info.identity(),
-                    preflight::discovery_deadline()?,
-                    cancelled,
-                )
-                .map_err(Error::Discovery),
-                cancelled,
-            )?
-            else {
-                return stopped_capabilities(options, args.format, output);
-            };
-            let Some(wireless) = preflight::cancelled_discovery(
-                interface_capabilities::discover(
-                    &options.interface,
-                    &info,
-                    preflight::discovery_deadline()?,
-                    cancelled,
-                )
-                .map_err(Error::Discovery),
-                cancelled,
-            )?
-            else {
-                return stopped_capabilities(options, args.format, output);
-            };
-            if cancelled.load(Ordering::Acquire) {
-                return stopped_capabilities(options, args.format, output);
-            }
-            capabilities::write(&info, &wireless, ethernet, args.format, output)?;
-            Ok(ActiveOutcome::Completed)
-        }
+        ActiveCommand::Capabilities(options) => query_capabilities(options, args.format, cancelled, output),
         ActiveCommand::Arp {
             command: ArpCommand::Probe(options),
         } => probe::run(options, args.format, cancelled, output),
@@ -109,7 +68,74 @@ pub fn execute(
         ActiveCommand::Dot1x {
             command: Dot1xCommand::Probe(options),
         } => dot1x_probe::run(options, args.format, cancelled, output),
+        ActiveCommand::Vrrp {
+            command: VrrpCommand::Observe(options),
+        } => first_hop_probe::vrrp(options, args.format, cancelled, output)
+            .map_err(Error::codes_only),
+        ActiveCommand::Hsrp {
+            command: HsrpCommand::Observe(options),
+        } => first_hop_probe::hsrp(options, args.format, cancelled, output)
+            .map_err(Error::codes_only),
+        ActiveCommand::Vlan {
+            command: VlanCommand::Assess(options),
+        } => super::vlan_assessment::run(options, args.format, cancelled, output)
+            .map_err(Error::codes_only),
+        ActiveCommand::Dtp {
+            command: ObserveCommand::Observe(options),
+        } => switching_probe::run(
+            switching_probe::Kind::Dtp,
+            options,
+            args.format,
+            cancelled,
+            output,
+        )
+        .map_err(Error::codes_only),
+        ActiveCommand::Vtp {
+            command: ObserveCommand::Observe(options),
+        } => switching_probe::run(
+            switching_probe::Kind::Vtp,
+            options,
+            args.format,
+            cancelled,
+            output,
+        )
+        .map_err(Error::codes_only),
+        ActiveCommand::Isl {
+            command: ObserveCommand::Observe(options),
+        } => isl_probe::run(options, args.format, cancelled, output).map_err(Error::codes_only),
+        ActiveCommand::Mpls {
+            command: MplsCommand::Observe(options),
+        } => mpls_probe::run(options, args.format, cancelled, output).map_err(Error::codes_only),
     }
+}
+
+fn query_capabilities(
+    options: &super::InterfaceArgs,
+    format: super::OutputFormat,
+    cancelled: &AtomicBool,
+    output: &mut impl Write,
+) -> Result<ActiveOutcome, Error> {
+    if cancelled.load(Ordering::Acquire) {
+        return stopped_capabilities(options, format, output);
+    }
+    let Some(info) = preflight::cancelled_discovery(
+        preflight::discover(&options.interface, cancelled), cancelled,
+    )? else { return stopped_capabilities(options, format, output); };
+    let Some(ethernet) = preflight::cancelled_discovery(
+        l2_active_linux::ethernet_capabilities::discover(
+            &options.interface, info.identity(), preflight::discovery_deadline()?, cancelled,
+        ).map_err(Error::Discovery), cancelled,
+    )? else { return stopped_capabilities(options, format, output); };
+    let Some(wireless) = preflight::cancelled_discovery(
+        interface_capabilities::discover(
+            &options.interface, &info, preflight::discovery_deadline()?, cancelled,
+        ).map_err(Error::Discovery), cancelled,
+    )? else { return stopped_capabilities(options, format, output); };
+    if cancelled.load(Ordering::Acquire) {
+        return stopped_capabilities(options, format, output);
+    }
+    capabilities::write(&info, &wireless, ethernet, format, output)?;
+    Ok(ActiveOutcome::Completed)
 }
 
 fn stopped_capabilities(

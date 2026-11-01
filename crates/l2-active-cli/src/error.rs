@@ -44,6 +44,13 @@ pub enum Error {
     Output(io::Error),
     /// Structured output could not be written
     Json(serde_json::Error),
+    /// An observer failed without exposing untrusted diagnostic text
+    CodesOnly {
+        /// Stable category of the original error
+        code: &'static str,
+        /// Stage that reported the original error
+        stage: &'static str,
+    },
 }
 
 impl Error {
@@ -51,6 +58,7 @@ impl Error {
     #[must_use]
     pub fn code(&self) -> &'static str {
         match self {
+            Self::CodesOnly { code, .. } => code,
             Self::Allocation | Self::DhcpPlan(l2_active::dhcp::DhcpError::Allocation) => {
                 "allocation_failed"
             }
@@ -73,6 +81,7 @@ impl Error {
     #[must_use]
     pub const fn stage(&self) -> &'static str {
         match self {
+            Self::CodesOnly { stage, .. } => stage,
             Self::Discovery(_) => "discovery",
             Self::Scope(_) | Self::Address(_) => "scope",
             Self::Helper(_) | Self::Cleanup { .. } => "helper",
@@ -83,6 +92,13 @@ impl Error {
             | Self::Run(_) => "preparation",
             Self::Signal(_) => "cancellation",
             Self::Allocation | Self::Output(_) | Self::Json(_) => "output",
+        }
+    }
+
+    pub(crate) fn codes_only(self) -> Self {
+        Self::CodesOnly {
+            code: self.code(),
+            stage: self.stage(),
         }
     }
 }
@@ -113,6 +129,7 @@ impl fmt::Display for Error {
             }
             Self::Output(error) => write!(output, "could not write output: {error}"),
             Self::Json(error) => write!(output, "could not write JSON: {error}"),
+            Self::CodesOnly { code, .. } => write!(output, "active operation failed ({code})"),
         }
     }
 }
@@ -120,7 +137,7 @@ impl fmt::Display for Error {
 impl std::error::Error for Error {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
-            Self::Allocation => None,
+            Self::Allocation | Self::CodesOnly { .. } => None,
             Self::Discovery(error)
             | Self::Scope(error)
             | Self::Helper(error)

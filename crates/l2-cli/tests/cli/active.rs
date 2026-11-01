@@ -7,8 +7,79 @@ fn active_help_shows_only_supported_native_operations() -> Result<(), Box<dyn Er
         .output()?;
     assert!(output.status.success());
     let help = String::from_utf8(output.stdout)?;
-    for operation in ["capabilities", "arp", "dhcp", "ndp", "stp", "discovery", "dot1x"] {
+    for operation in [
+        "capabilities",
+        "arp",
+        "dhcp",
+        "ndp",
+        "stp",
+        "discovery",
+        "dot1x",
+        "vrrp",
+        "hsrp",
+        "dtp",
+        "vtp",
+        "mpls",
+        "isl",
+        "vlan",
+    ] {
         assert!(help.contains(operation), "missing {operation}: {help}");
+    }
+    Ok(())
+}
+
+#[test]
+fn active_protocol_observers_require_an_interface_and_explain_raw_disclosure()
+-> Result<(), Box<dyn Error>> {
+    for protocol in ["vrrp", "hsrp", "dtp", "vtp", "mpls", "isl"] {
+        let missing = Command::new(env!("CARGO_BIN_EXE_l2solver"))
+            .args(["active", protocol, "observe"])
+            .output()?;
+        assert_eq!(missing.status.code(), Some(2));
+        assert!(String::from_utf8_lossy(&missing.stderr).contains("interface"));
+        let help = Command::new(env!("CARGO_BIN_EXE_l2solver"))
+            .args(["active", protocol, "observe", "--help"])
+            .output()?;
+        assert!(help.status.success());
+        assert!(String::from_utf8_lossy(&help.stdout).contains("--include-raw"));
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn active_protocol_observer_discovery_errors_preserve_codes_and_omit_details()
+-> Result<(), Box<dyn Error>> {
+    let interface = format!("l2s-{}", std::process::id());
+    assert!(
+        !std::path::Path::new("/sys/class/net")
+            .join(&interface)
+            .exists()
+    );
+    for protocol in ["vrrp", "hsrp", "dtp", "vtp", "mpls", "isl"] {
+        let output = Command::new(env!("CARGO_BIN_EXE_l2solver"))
+            .args([
+                "active",
+                protocol,
+                "observe",
+                "--interface",
+                &interface,
+                "--format",
+                "json",
+            ])
+            .output()?;
+        assert_eq!(output.status.code(), Some(1));
+        let error: serde_json::Value = serde_json::from_slice(&output.stderr)?;
+        assert_eq!(
+            error.get("code").and_then(serde_json::Value::as_str),
+            Some("not_found")
+        );
+        assert_eq!(
+            error.get("stage").and_then(serde_json::Value::as_str),
+            Some("discovery")
+        );
+        assert!(!String::from_utf8_lossy(&output.stderr).contains(&interface));
+        assert!(output.stdout.is_empty());
     }
     Ok(())
 }

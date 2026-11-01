@@ -81,7 +81,23 @@ struct PreflightCleanup {
 pub enum PreflightStop {
     Cancelled,
     #[cfg(target_os = "linux")]
+    DiscoveryTimeout,
+    #[cfg(target_os = "linux")]
     HelperTimeout,
+}
+
+#[cfg(target_os = "linux")]
+pub fn discovery_failure(
+    error: std::io::Error,
+    cancelled: &AtomicBool,
+) -> Result<PreflightStop, Error> {
+    match error.kind() {
+        std::io::ErrorKind::Interrupted if cancelled.load(Ordering::Acquire) => {
+            Ok(PreflightStop::Cancelled)
+        }
+        std::io::ErrorKind::TimedOut => Ok(PreflightStop::DiscoveryTimeout),
+        _ => Err(Error::Discovery(error)),
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -122,6 +138,13 @@ pub fn write_stopped(
             "cancelled",
             "cancelled",
             ActiveOutcome::Cancelled,
+        ),
+        #[cfg(target_os = "linux")]
+        PreflightStop::DiscoveryTimeout => (
+            "inconclusive",
+            "incomplete",
+            "discovery_timeout",
+            ActiveOutcome::Incomplete,
         ),
         #[cfg(target_os = "linux")]
         PreflightStop::HelperTimeout => (

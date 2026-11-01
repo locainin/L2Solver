@@ -9,7 +9,7 @@ use l2_active::{
 use l2_active_linux::{InterfaceSelector, VlanInfo};
 use serde::Serialize;
 
-use super::collection::{Collection, FrameView, Operation};
+use super::collection::{Collection, Diagnostics, FrameView, Operation};
 use crate::{
     ActiveOutcome, Error, OutputFormat,
     mac::format_mac,
@@ -95,5 +95,6 @@ pub fn write(
             limitation: "LLDP/CDP claims and hold times are unauthenticated; withdrawals do not prove absence, and silence does not prove isolation or physical multicast visibility" },
         interface, vlan, limits, summary: report.summary(), observations,
         details: Details { unmatched_packets: report.unmatched_packets() }, close_error,
+        diagnostics: Diagnostics::Detailed,
     }.write(format, output)
 }

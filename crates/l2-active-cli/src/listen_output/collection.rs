@@ -6,32 +6,81 @@ use l2_active::{Limits, RunSummary};
 use l2_active_linux::InterfaceSelector;
 use l2_capture::CapturedFrame;
 use serde::Serialize;
-use serde_json::ser::{CompactFormatter, Formatter, PrettyFormatter};
+use serde_json::ser::{CompactFormatter, PrettyFormatter};
 
 use crate::{
     ActiveOutcome, Error, OutputFormat,
     interface_view::InterfaceView,
     report_common::{self, Evidence, LimitsView, QualityView, SendMode},
+    safe_json::write_json,
 };
 
 #[derive(Serialize)]
-pub(super) struct FrameView {
+pub(crate) struct FrameView {
     captured_bytes: usize,
     original_bytes: u32,
-    frame_hex: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    frame_hex: Option<String>,
 }
 
 impl FrameView {
-    pub(super) fn new(frame: &CapturedFrame) -> Result<Self, Error> {
+    pub(crate) fn new(frame: &CapturedFrame) -> Result<Self, Error> {
+        Self::for_disclosure(frame, Disclosure::IncludeRaw)
+    }
+
+    pub(crate) fn for_disclosure(
+        frame: &CapturedFrame,
+        disclosure: Disclosure,
+    ) -> Result<Self, Error> {
         Ok(Self {
             captured_bytes: frame.captured_len(),
             original_bytes: frame.metadata().original_len(),
-            frame_hex: report_common::frame_hex(frame.bytes())?,
+            frame_hex: match disclosure {
+                Disclosure::OmitRaw => None,
+                Disclosure::IncludeRaw => Some(report_common::frame_hex(frame.bytes())?),
+            },
         })
     }
 }
 
-pub(super) struct Operation {
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum Disclosure {
+    OmitRaw,
+    IncludeRaw,
+}
+
+#[derive(Clone, Copy)]
+pub(crate) enum Diagnostics {
+    Detailed,
+    CodesOnly,
+}
+
+pub(crate) struct Context<'a> {
+    pub interface: &'a InterfaceSelector,
+    pub vlan: Option<l2_active_linux::VlanInfo>,
+    pub limits: Limits,
+    pub close_error: Option<&'a io::Error>,
+    pub disclosure: Disclosure,
+}
+
+impl<'a> Context<'a> {
+    pub fn new(
+        options: &'a crate::ObserveArgs,
+        vlan: Option<l2_active_linux::VlanInfo>,
+        limits: Limits,
+        close_error: Option<&'a io::Error>,
+    ) -> Self {
+        Self {
+            interface: &options.interface,
+            vlan,
+            limits,
+            close_error,
+            disclosure: if options.include_raw { Disclosure::IncludeRaw } else { Disclosure::OmitRaw },
+        }
+    }
+}
+
+pub(crate) struct Operation {
     pub name: &'static str,
     pub status: &'static str,
     pub evidence: Evidence,
@@ -53,7 +102,7 @@ struct Report<'a, T, D> {
     limitation: &'static str,
 }
 
-pub(super) struct Collection<'a, T, D> {
+pub(crate) struct Collection<'a, T, D> {
     pub operation: Operation,
     pub interface: &'a InterfaceSelector,
     pub vlan: Option<l2_active_linux::VlanInfo>,
@@ -62,10 +111,11 @@ pub(super) struct Collection<'a, T, D> {
     pub observations: Vec<T>,
     pub details: D,
     pub close_error: Option<&'a io::Error>,
+    pub diagnostics: Diagnostics,
 }
 
 impl<T: Serialize, D: Serialize> Collection<'_, T, D> {
-    pub(super) fn write(
+    pub(crate) fn write(
         self,
         format: OutputFormat,
         output: &mut impl Write,
@@ -82,7 +132,10 @@ impl<T: Serialize, D: Serialize> Collection<'_, T, D> {
             completion: report_common::completion_name(outcome),
             scope: InterfaceView::new(self.interface.name(), self.summary.interface(), self.vlan),
             limits: LimitsView::new(self.limits),
-            quality: QualityView::new(self.summary, self.close_error),
+            quality: match self.diagnostics {
+                Diagnostics::Detailed => QualityView::new(self.summary, self.close_error),
+                Diagnostics::CodesOnly => QualityView::codes_only(self.summary, self.close_error),
+            },
             authenticated: false,
             details: self.details,
             observations: self.observations,
@@ -108,110 +161,4 @@ impl<T: Serialize, D: Serialize> Collection<'_, T, D> {
         writeln!(output).map_err(Error::Output)?;
         Ok(outcome)
     }
-}
-
-fn write_json<T: Serialize, F: Formatter>(
-    output: &mut impl Write,
-    value: &T,
-    formatter: F,
-) -> serde_json::Result<()> {
-    let mut serializer = serde_json::Serializer::with_formatter(output, SafeFormatter(formatter));
-    value.serialize(&mut serializer)
-}
-
-// JSON escapes preserve the original value when a consumer decodes it
-struct SafeFormatter<F>(F);
-
-impl<F: Formatter> Formatter for SafeFormatter<F> {
-    fn write_string_fragment<W>(&mut self, writer: &mut W, fragment: &str) -> io::Result<()>
-    where
-        W: ?Sized + Write,
-    {
-        for chunk in fragment.split_inclusive(needs_escape) {
-            let mut chars = chunk.chars();
-            if let Some(character) = chars.next_back()
-                && needs_escape(character)
-            {
-                writer.write_all(chars.as_str().as_bytes())?;
-                let mut units = [0_u16; 2];
-                for unit in character.encode_utf16(&mut units) {
-                    write!(writer, "\\u{unit:04x}")?;
-                }
-            } else {
-                writer.write_all(chunk.as_bytes())?;
-            }
-        }
-        Ok(())
-    }
-
-    fn begin_array<W>(&mut self, writer: &mut W) -> io::Result<()>
-    where
-        W: ?Sized + Write,
-    {
-        self.0.begin_array(writer)
-    }
-
-    fn end_array<W>(&mut self, writer: &mut W) -> io::Result<()>
-    where
-        W: ?Sized + Write,
-    {
-        self.0.end_array(writer)
-    }
-
-    fn begin_array_value<W>(&mut self, writer: &mut W, first: bool) -> io::Result<()>
-    where
-        W: ?Sized + Write,
-    {
-        self.0.begin_array_value(writer, first)
-    }
-
-    fn end_array_value<W>(&mut self, writer: &mut W) -> io::Result<()>
-    where
-        W: ?Sized + Write,
-    {
-        self.0.end_array_value(writer)
-    }
-
-    fn begin_object<W>(&mut self, writer: &mut W) -> io::Result<()>
-    where
-        W: ?Sized + Write,
-    {
-        self.0.begin_object(writer)
-    }
-
-    fn end_object<W>(&mut self, writer: &mut W) -> io::Result<()>
-    where
-        W: ?Sized + Write,
-    {
-        self.0.end_object(writer)
-    }
-
-    fn begin_object_key<W>(&mut self, writer: &mut W, first: bool) -> io::Result<()>
-    where
-        W: ?Sized + Write,
-    {
-        self.0.begin_object_key(writer, first)
-    }
-
-    fn begin_object_value<W>(&mut self, writer: &mut W) -> io::Result<()>
-    where
-        W: ?Sized + Write,
-    {
-        self.0.begin_object_value(writer)
-    }
-
-    fn end_object_value<W>(&mut self, writer: &mut W) -> io::Result<()>
-    where
-        W: ?Sized + Write,
-    {
-        self.0.end_object_value(writer)
-    }
-}
-
-fn needs_escape(character: char) -> bool {
-    character.is_control()
-        || matches!(
-            character,
-            '\u{061c}' | '\u{200e}'..='\u{200f}' | '\u{2028}'..='\u{202e}' | '\u{2066}'..='\u{206f}'
-        )
 }
