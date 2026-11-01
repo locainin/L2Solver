@@ -5,7 +5,10 @@ mod compression;
 mod crypto;
 
 use super::memory::{Admission, Buffer, BufferError};
-use super::{CounterByteOrder, CounterWidth, OperandRef, Operation, SeedCounterOrder, StepFailure};
+use super::{
+    AesGcmTagLayout, CounterByteOrder, CounterWidth, OperandRef, Operation, SeedCounterOrder,
+    StepFailure,
+};
 
 pub use bits::select_bit_plane_chunks;
 pub(super) use codec::base64_engine;
@@ -116,35 +119,23 @@ fn dispatch<A: Admission>(
         }
         Operation::Sha256CounterXor {
             seed,
-            initial_counter,
-            counter_width,
-            counter_byte_order,
-            seed_order,
-        } => untracked(admission, || {
-            crypto::sha256_counter_xor(
-                input,
-                literal_operand(seed)?,
-                *initial_counter,
-                *counter_width,
-                *counter_byte_order,
-                *seed_order,
-                budget,
-            )
-        }),
+            initial_counter: initial,
+            counter_width: width,
+            counter_byte_order: byte_order,
+            seed_order: order,
+        } => {
+            let counter = (*initial, *width, *byte_order, *order);
+            untracked(admission, || {
+                counter_xor_with_operand(input, seed, counter, budget)
+            })
+        }
         Operation::AesGcmDecrypt {
             key,
             nonce,
             associated_data,
             tag_layout,
         } => untracked(admission, || {
-            crypto::aes_gcm_decrypt(
-                input,
-                literal_operand(key)?,
-                literal_operand(nonce)?,
-                literal_operand(associated_data)?,
-                *tag_layout,
-                budget,
-            )
+            decrypt_with_operands(input, key, nonce, associated_data, *tag_layout, budget)
         }),
         Operation::ScryptDerive {
             salt,
@@ -153,15 +144,7 @@ fn dispatch<A: Admission>(
             p,
             output_length,
         } => untracked(admission, || {
-            crypto::scrypt_derive(
-                input,
-                literal_operand(salt)?,
-                *log_n,
-                *r,
-                *p,
-                *output_length,
-                budget,
-            )
+            scrypt_with_operand(input, salt, *log_n, *r, *p, *output_length, budget)
         }),
         Operation::ByteAdd { value } => {
             untracked(admission, || bytes::byte_add(input, *value, budget))
@@ -189,13 +172,8 @@ fn dispatch<A: Admission>(
             bits_per_byte,
             remainder,
         } => untracked(admission, || {
-            bits::select_bit_range(
-                input,
-                bits::BitWindow::new(*start_bit, *bit_count, *stride_bits, *phase),
-                *bits_per_byte,
-                *remainder,
-                budget,
-            )
+            let window = bits::BitWindow::new(*start_bit, *bit_count, *stride_bits, *phase);
+            bits::select_bit_range(input, window, *bits_per_byte, *remainder, budget)
         }),
         Operation::Reverse {} => untracked(admission, || bytes::reverse(input, budget)),
         Operation::Permute { indices } => {
@@ -204,6 +182,62 @@ fn dispatch<A: Admission>(
         Operation::GzipDecompress {} => compression::gzip(input, budget, admission),
         Operation::ZlibDecompress {} => compression::zlib(input, budget, admission),
     }
+}
+
+fn counter_xor_with_operand(
+    input: &[u8],
+    seed: &OperandRef,
+    counter: (u64, CounterWidth, CounterByteOrder, SeedCounterOrder),
+    budget: OutputBudget,
+) -> Result<Vec<u8>, StepFailure> {
+    let (initial, width, byte_order, seed_order) = counter;
+    crypto::sha256_counter_xor(
+        input,
+        literal_operand(seed)?,
+        initial,
+        width,
+        byte_order,
+        seed_order,
+        budget,
+    )
+}
+
+fn decrypt_with_operands(
+    input: &[u8],
+    key: &OperandRef,
+    nonce: &OperandRef,
+    associated_data: &OperandRef,
+    tag_layout: AesGcmTagLayout,
+    budget: OutputBudget,
+) -> Result<Vec<u8>, StepFailure> {
+    crypto::aes_gcm_decrypt(
+        input,
+        literal_operand(key)?,
+        literal_operand(nonce)?,
+        literal_operand(associated_data)?,
+        tag_layout,
+        budget,
+    )
+}
+
+fn scrypt_with_operand(
+    input: &[u8],
+    salt: &OperandRef,
+    log_n: u8,
+    r: u32,
+    p: u32,
+    output_length: usize,
+    budget: OutputBudget,
+) -> Result<Vec<u8>, StepFailure> {
+    crypto::scrypt_derive(
+        input,
+        literal_operand(salt)?,
+        log_n,
+        r,
+        p,
+        output_length,
+        budget,
+    )
 }
 
 fn untracked<A: Admission>(

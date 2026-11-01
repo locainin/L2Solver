@@ -135,6 +135,23 @@ impl MemberMerger<'_> {
         {
             return self.append_unanalyzed(bytes, origin);
         }
+        self.append_analyzed(
+            &bytes,
+            origin,
+            entry.metadata.index,
+            remaining_count,
+            remaining_output,
+        )
+    }
+
+    fn append_analyzed(
+        &mut self,
+        bytes: &[u8],
+        origin: ArtifactOrigin,
+        entry_index: usize,
+        remaining_count: usize,
+        remaining_output: usize,
+    ) -> Result<(), Box<dyn Error>> {
         let mut child_options = self.options;
         child_options.limits.max_artifacts = remaining_count;
         child_options.limits.max_total_output_bytes = remaining_output;
@@ -150,8 +167,8 @@ impl MemberMerger<'_> {
         child_options.limits.max_signature_scan_bytes = self.signature_remaining;
         child_options.limits.max_depth = self.options.limits.max_depth.saturating_sub(1);
         let child =
-            analyze_artifacts_with_memory(&bytes, None, child_options, self.omission_memory)?;
-        self.merge_child(child, origin, entry.metadata.index)
+            analyze_artifacts_with_memory(bytes, None, child_options, self.omission_memory)?;
+        self.merge_child(child, origin, entry_index)
     }
 
     fn append_unanalyzed(

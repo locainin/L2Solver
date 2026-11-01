@@ -632,29 +632,7 @@ fn analyze_source_stream(
         .ok_or_else(|| invalid_input("source prefix length is invalid"))?;
     let complete = io::Cursor::new(prefix).chain(reader);
     let mut complete = super::range_transform::ObservingReader::new(complete, observe_transforms);
-    let mut stream_options = options;
-    // Leave work for canonical ZIP validation after observing source markers
-    let total_work = options.limits.max_total_work_bytes;
-    let zip_work = if total_work >= 1024 * 1024 {
-        (total_work / 8).min(16 * 1024 * 1024)
-    } else {
-        0
-    };
-    stream_options.limits.max_total_work_bytes -= zip_work;
-    let remaining = if is_png && length < stream_options.limits.max_total_work_bytes {
-        stream_options.limits.max_total_work_bytes - length
-    } else {
-        stream_options.limits.max_total_work_bytes
-    };
-    let marker_work = if length <= remaining / 2 {
-        length
-    } else {
-        remaining / 16
-    };
-    let limits = l2_workbench::artifact::ZipEndScanLimits {
-        max_scan_bytes: length.min(marker_work),
-        max_candidates: (options.limits.max_input_bytes / 256).min(64),
-    };
+    let (stream_options, limits) = stream_scan_options(length, options, is_png);
     let mut png_metadata = memory.try_reserve(MemoryClass::Executor, 0)?;
     let mut result = l2_workbench::artifact::analyze_artifacts_observing_zip_ends(
         &mut complete,
@@ -693,15 +671,14 @@ fn analyze_source_stream(
         drop(outputs);
         return Err("scanner PNG digest charge is missing".into());
     };
-    let png = match result.png.take() {
-        Some(boundary) => Some(AdmittedPngBoundary {
+    let png = if let Some(boundary) = result.png.take() {
+        Some(AdmittedPngBoundary {
             boundary,
             memory: png_memory,
-        }),
-        None => {
-            drop(png_memory);
-            None
-        }
+        })
+    } else {
+        drop(png_memory);
+        None
     };
     let probe = AdmittedArchiveProbe {
         prefix_sha256: result.prefix_sha256.take(),
@@ -718,6 +695,40 @@ fn analyze_source_stream(
         omission_memory: omissions,
         source_digest_memory,
     })
+}
+
+fn stream_scan_options(
+    length: usize,
+    options: l2_workbench::artifact::ArtifactAnalysisOptions,
+    is_png: bool,
+) -> (
+    l2_workbench::artifact::ArtifactAnalysisOptions,
+    l2_workbench::artifact::ZipEndScanLimits,
+) {
+    let mut stream_options = options;
+    // Leave work for canonical ZIP validation after observing source markers
+    let total_work = options.limits.max_total_work_bytes;
+    let zip_work = if total_work >= 1024 * 1024 {
+        (total_work / 8).min(16 * 1024 * 1024)
+    } else {
+        0
+    };
+    stream_options.limits.max_total_work_bytes -= zip_work;
+    let remaining = if is_png && length < stream_options.limits.max_total_work_bytes {
+        stream_options.limits.max_total_work_bytes - length
+    } else {
+        stream_options.limits.max_total_work_bytes
+    };
+    let marker_work = if length <= remaining / 2 {
+        length
+    } else {
+        remaining / 16
+    };
+    let limits = l2_workbench::artifact::ZipEndScanLimits {
+        max_scan_bytes: length.min(marker_work),
+        max_candidates: (options.limits.max_input_bytes / 256).min(64),
+    };
+    (stream_options, limits)
 }
 
 fn scanner_probe_bytes(
@@ -1357,26 +1368,7 @@ pub(super) fn fingerprint_sources(
     job: &Job,
 ) -> Result<FingerprintedSources, Box<dyn Error>> {
     let count = input_set.sources.len();
-    let labels_bytes = input_set
-        .sources
-        .iter()
-        .try_fold(0_usize, |total, spec| total.checked_add(spec.label.len()))
-        .ok_or("fingerprint label size overflows")?;
-    let scratch_bytes = count
-        .checked_mul(std::mem::size_of::<SampledSource<'_>>() + 128)
-        .and_then(|bytes| bytes.checked_add(64 * 1024 + 512))
-        .ok_or("fingerprint scratch size overflows")?;
-    let retained_bytes = count
-        .checked_mul(std::mem::size_of::<String>())
-        .and_then(|bytes| bytes.checked_add(labels_bytes))
-        .and_then(|bytes| bytes.checked_add(256))
-        .ok_or("fingerprint metadata size overflows")?;
-    let mut scratch = input_set
-        .memory
-        .try_reserve(MemoryClass::Base, u64::try_from(scratch_bytes)?)?;
-    let mut retained = input_set
-        .memory
-        .try_reserve(MemoryClass::Base, u64::try_from(retained_bytes)?)?;
+    let (mut scratch, mut retained) = fingerprint_memory(input_set)?;
     let mut sampled = Vec::new();
     let mut labels = Vec::new();
     sampled.try_reserve_exact(count)?;
@@ -1410,24 +1402,13 @@ pub(super) fn fingerprint_sources(
             .checked_add(u64::try_from(length)?)
             .ok_or_else(|| invalid_input("input source byte total overflows"))?;
         let fingerprint = if plan.omission.is_none() {
-            input_set
-                .budget
-                .reserve(SourceFingerprint::sample_read_bytes(u64::try_from(length)?))?;
-            let fingerprint = SourceFingerprint::fast_open_file_with_expected_length_and_observer(
+            Some(sample_fingerprint(
+                input_set,
                 &mut file,
-                u64::try_from(length)?,
-                |count| record_source_read(job, count),
-            )?;
-            if fingerprint.size_bytes != u64::try_from(length)? {
-                return Err(invalid_input(
-                    "input artifact changed while it was fingerprinted",
-                ));
-            }
-            super::analysis_memory::charge(
+                length,
+                job,
                 &mut scratch,
-                fingerprint.sample_sha256.capacity().saturating_sub(128),
-            )?;
-            Some(fingerprint)
+            )?)
         } else {
             None
         };
@@ -1445,20 +1426,7 @@ pub(super) fn fingerprint_sources(
         labels.push(label);
     }
 
-    // The set hint binds ordering, labels, declarations, metadata, and bounded samples
-    let sample_set_sha256 = super::hash::hash_json(&("l2solver-refine-sample-set-v1", &sampled))?;
-    let identity = if sampled.iter().all(|entry| entry.fingerprint.is_some()) {
-        let mut fingerprint = sampled
-            .first()
-            .and_then(|entry| entry.fingerprint.as_ref())
-            .ok_or_else(|| invalid_input("input has no sources"))?
-            .sample_hint();
-        fingerprint.size_bytes = total;
-        fingerprint.sample_sha256.clone_from(&sample_set_sha256);
-        SourceIdentity::Fast(fingerprint)
-    } else {
-        SourceIdentity::Unavailable
-    };
+    let (identity, sample_set_sha256) = sample_set_identity(&sampled, total)?;
     let digest_bytes = sample_set_sha256
         .capacity()
         .checked_add(match &identity {
@@ -1476,6 +1444,79 @@ pub(super) fn fingerprint_sources(
         sample_set_sha256,
         _memory: retained,
     })
+}
+
+fn fingerprint_memory(input: &InputSet) -> Result<(MemoryLease, MemoryLease), Box<dyn Error>> {
+    let count = input.sources.len();
+    let labels_bytes = input
+        .sources
+        .iter()
+        .try_fold(0_usize, |total, spec| total.checked_add(spec.label.len()))
+        .ok_or("fingerprint label size overflows")?;
+    let scratch_bytes = count
+        .checked_mul(std::mem::size_of::<SampledSource<'_>>() + 128)
+        .and_then(|bytes| bytes.checked_add(64 * 1024 + 512))
+        .ok_or("fingerprint scratch size overflows")?;
+    let retained_bytes = count
+        .checked_mul(std::mem::size_of::<String>())
+        .and_then(|bytes| bytes.checked_add(labels_bytes))
+        .and_then(|bytes| bytes.checked_add(256))
+        .ok_or("fingerprint metadata size overflows")?;
+    let scratch = input
+        .memory
+        .try_reserve(MemoryClass::Base, u64::try_from(scratch_bytes)?)?;
+    let retained = input
+        .memory
+        .try_reserve(MemoryClass::Base, u64::try_from(retained_bytes)?)?;
+    Ok((scratch, retained))
+}
+
+fn sample_fingerprint(
+    input: &InputSet,
+    file: &mut File,
+    length: usize,
+    job: &Job,
+    scratch: &mut MemoryLease,
+) -> Result<SourceFingerprint, Box<dyn Error>> {
+    input
+        .budget
+        .reserve(SourceFingerprint::sample_read_bytes(u64::try_from(length)?))?;
+    let fingerprint = SourceFingerprint::fast_open_file_with_expected_length_and_observer(
+        file,
+        u64::try_from(length)?,
+        |count| record_source_read(job, count),
+    )?;
+    if fingerprint.size_bytes != u64::try_from(length)? {
+        return Err(invalid_input(
+            "input artifact changed while it was fingerprinted",
+        ));
+    }
+    super::analysis_memory::charge(
+        scratch,
+        fingerprint.sample_sha256.capacity().saturating_sub(128),
+    )?;
+    Ok(fingerprint)
+}
+
+fn sample_set_identity(
+    sampled: &[SampledSource<'_>],
+    total: u64,
+) -> Result<(SourceIdentity, String), Box<dyn Error>> {
+    // The set hint binds ordering, labels, declarations, metadata, and bounded samples
+    let digest = super::hash::hash_json(&("l2solver-refine-sample-set-v1", sampled))?;
+    let identity = if sampled.iter().all(|entry| entry.fingerprint.is_some()) {
+        let mut fingerprint = sampled
+            .first()
+            .and_then(|entry| entry.fingerprint.as_ref())
+            .ok_or_else(|| invalid_input("input has no sources"))?
+            .sample_hint();
+        fingerprint.size_bytes = total;
+        fingerprint.sample_sha256.clone_from(&digest);
+        SourceIdentity::Fast(fingerprint)
+    } else {
+        SourceIdentity::Unavailable
+    };
+    Ok((identity, digest))
 }
 
 pub(super) fn strong_source_identity(

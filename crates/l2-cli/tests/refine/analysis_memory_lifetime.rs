@@ -63,7 +63,7 @@ fn failed_source_append_releases_report_memory_after_its_buffers() -> Result<(),
         SourceReport {
             report,
             _source_digest_memory: None,
-            _report_memory: None,
+            report_memory: None,
             omission_memory: Some(lease),
         },
         &memory,
@@ -106,7 +106,7 @@ fn retained_omissions_keep_their_report_charge_until_the_source_record_drops()
         SourceReport {
             report,
             _source_digest_memory: None,
-            _report_memory: None,
+            report_memory: None,
             omission_memory: Some(lease),
         },
         &memory,
@@ -120,7 +120,7 @@ fn retained_omissions_keep_their_report_charge_until_the_source_record_drops()
         + record.label.capacity()
         + record.sha256.as_ref().map_or(0, String::capacity)
         + record.reason.as_ref().map_or(0, String::capacity);
-    assert_eq!(record._omission_memory.bytes(), u64::try_from(retained)?);
+    assert_eq!(record.omission_memory.bytes(), u64::try_from(retained)?);
     drop(sources);
     assert_eq!(memory.snapshot()?.used_bytes, 0);
     Ok(())

@@ -241,22 +241,14 @@ fn propose_region_inner<A: RegionAdmission>(
         nodes: 0,
     };
 
-    let cue_count = explicit_cues.len().min(limits.max_cues);
-    omissions.cues = explicit_cues.len().saturating_sub(cue_count);
-    for cue in explicit_cues.iter().take(cue_count) {
-        if !valid_range(cue.range, input.len()) {
-            omissions.invalid_cues = omissions.invalid_cues.saturating_add(1);
-            continue;
-        }
-        add_candidate(
-            &mut candidates,
-            cue.range,
-            cue.origin.clone(),
-            limits.max_regions,
-            &mut omissions,
-            &admission,
-        )?;
-    }
+    add_explicit_cues(
+        input.len(),
+        explicit_cues,
+        limits,
+        &mut candidates,
+        &mut omissions,
+        &admission,
+    )?;
 
     let scan_length = input.len().min(limits.max_scan_bytes);
     omissions.scan_bytes = input.len().saturating_sub(scan_length);
@@ -325,6 +317,33 @@ fn propose_region_inner<A: RegionAdmission>(
     };
     admission.finish(retained_memory);
     Ok(report)
+}
+
+fn add_explicit_cues<A: RegionAdmission>(
+    input_length: usize,
+    cues: &[RegionCue],
+    limits: TransformRegionLimits,
+    candidates: &mut CandidateSet<A::Lease>,
+    omissions: &mut TransformRegionOmissions,
+    admission: &A,
+) -> Result<(), A::Error> {
+    let count = cues.len().min(limits.max_cues);
+    omissions.cues = cues.len().saturating_sub(count);
+    for cue in cues.iter().take(count) {
+        if !valid_range(cue.range, input_length) {
+            omissions.invalid_cues = omissions.invalid_cues.saturating_add(1);
+            continue;
+        }
+        add_candidate(
+            candidates,
+            cue.range,
+            cue.origin.clone(),
+            limits.max_regions,
+            omissions,
+            admission,
+        )?;
+    }
+    Ok(())
 }
 
 const fn valid_range(range: ByteRange, input_length: usize) -> bool {

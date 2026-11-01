@@ -46,7 +46,7 @@ pub(super) struct SourceRecord {
     pub(super) reason: Option<String>,
     // Hold the report charge until its retained omissions are dropped
     #[serde(skip)]
-    pub(super) _omission_memory: l2_workbench::job::MemoryLease,
+    pub(super) omission_memory: l2_workbench::job::MemoryLease,
 }
 
 pub(super) struct ArtifactRecord {

@@ -487,18 +487,13 @@ fn scan_markers(
                     memory.as_deref_mut(),
                 )?;
             }
-            if boundaries.len() < boundary_limit {
-                reserve_next(
-                    &mut boundaries,
-                    boundary_limit,
-                    memory
-                        .as_deref_mut()
-                        .map(|admission| &mut *admission.scratch),
-                )?;
-                boundaries.push(ZipBoundary { offset, end });
-            } else {
-                last_omitted_boundary_offset = Some(offset);
-            }
+            retain_zip_boundary(
+                &mut boundaries,
+                boundary_limit,
+                ZipBoundary { offset, end },
+                &mut last_omitted_boundary_offset,
+                memory.as_deref_mut(),
+            )?;
         }
     }
 
@@ -509,6 +504,26 @@ fn scan_markers(
         scan_length,
         omissions,
     })
+}
+
+fn retain_zip_boundary(
+    boundaries: &mut Vec<ZipBoundary>,
+    maximum: usize,
+    boundary: ZipBoundary,
+    last_omitted: &mut Option<usize>,
+    memory: Option<&mut DiscoveryAdmission<'_>>,
+) -> Result<(), EmbeddedDiscoveryMemoryError> {
+    if boundaries.len() < maximum {
+        reserve_next(
+            boundaries,
+            maximum,
+            memory.map(|admission| &mut *admission.scratch),
+        )?;
+        boundaries.push(boundary);
+    } else {
+        *last_omitted = Some(boundary.offset);
+    }
+    Ok(())
 }
 
 fn marker_matches(bytes: &[u8], offset: usize, marker: &[u8], scan_length: usize) -> bool {

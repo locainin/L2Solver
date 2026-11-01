@@ -162,7 +162,7 @@ fn analysis_with_record_origins(
             zip_expanded_work_bytes: 0,
         },
         _source_digest_memory: None,
-        _report_memory: Some(lease),
+        report_memory: Some(lease),
         omission_memory: None,
     };
     analysis.append_artifacts(0, &mut report)?;
@@ -348,7 +348,7 @@ fn source_digest_charge_survives_until_a_failed_report_handoff_drops_the_report(
             zip_expanded_work_bytes: 0,
         },
         _source_digest_memory: Some(digest_memory),
-        _report_memory: None,
+        report_memory: None,
         omission_memory: None,
     };
     let used = budget.snapshot()?.used_bytes;

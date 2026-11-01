@@ -87,7 +87,7 @@ fn operation_bytes(operation: &Operation) -> Option<usize> {
     }
 }
 
-fn operand_bytes(operand: &OperandRef) -> usize {
+const fn operand_bytes(operand: &OperandRef) -> usize {
     match operand {
         OperandRef::Literal(bytes) => bytes.capacity(),
         OperandRef::NodeRange { .. } | OperandRef::SelectedInputRange { .. } => 0,

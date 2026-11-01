@@ -419,24 +419,9 @@ fn parse_imports(
     reference_text_bytes: &mut usize,
     admission: &mut Admission,
 ) -> Result<Vec<ArtifactReference>, InspectMemoryError> {
-    let Some(directory) = image.directories.get(IMPORT_DIRECTORY).copied() else {
+    let Some((directory_offset, descriptor_count)) = import_directory(image)? else {
         return Ok(Vec::new());
     };
-    if directory.rva == 0 && directory.size == 0 {
-        return Ok(Vec::new());
-    }
-    let directory_size =
-        usize::try_from(directory.size).map_err(|_| ArtifactError::InvalidHeader {
-            field: "PE import directory size",
-        })?;
-    if directory_size < IMPORT_DESCRIPTOR_BYTES || directory_size % IMPORT_DESCRIPTOR_BYTES != 0 {
-        return Err(ArtifactError::InvalidHeader {
-            field: "PE import directory size",
-        }
-        .into());
-    }
-    let directory_offset = rva_to_offset(image, directory.rva, directory_size)?;
-    let descriptor_count = directory_size / IMPORT_DESCRIPTOR_BYTES;
     let mut references = Vec::new();
     let mut terminated = false;
     for index in 0..descriptor_count {
@@ -500,6 +485,28 @@ fn parse_imports(
         .into());
     }
     Ok(references)
+}
+
+fn import_directory(image: &PeImage) -> Result<Option<(usize, usize)>, InspectMemoryError> {
+    let Some(directory) = image.directories.get(IMPORT_DIRECTORY).copied() else {
+        return Ok(None);
+    };
+    if directory.rva == 0 && directory.size == 0 {
+        return Ok(None);
+    }
+    let directory_size =
+        usize::try_from(directory.size).map_err(|_| ArtifactError::InvalidHeader {
+            field: "PE import directory size",
+        })?;
+    if directory_size < IMPORT_DESCRIPTOR_BYTES || directory_size % IMPORT_DESCRIPTOR_BYTES != 0 {
+        return Err(ArtifactError::InvalidHeader {
+            field: "PE import directory size",
+        }
+        .into());
+    }
+    let directory_offset = rva_to_offset(image, directory.rva, directory_size)?;
+    let descriptor_count = directory_size / IMPORT_DESCRIPTOR_BYTES;
+    Ok(Some((directory_offset, descriptor_count)))
 }
 
 fn parse_thunks(

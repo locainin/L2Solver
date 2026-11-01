@@ -46,7 +46,7 @@ mod retained_tests;
 struct SourceReport {
     report: l2_workbench::artifact::ArtifactAnalysis,
     _source_digest_memory: Option<MemoryLease>,
-    _report_memory: Option<MemoryLease>,
+    report_memory: Option<MemoryLease>,
     omission_memory: Option<MemoryLease>,
 }
 
@@ -95,7 +95,7 @@ pub(super) fn analyze_sources(
             SourceReport {
                 report,
                 _source_digest_memory: None,
-                _report_memory: Some(lease),
+                report_memory: Some(lease),
                 omission_memory: None,
             }
         } else {
@@ -180,12 +180,12 @@ fn analyze_file_source(context: FileAnalysis<'_>) -> Result<SourceReport, Box<dy
     let mut source_report = SourceReport {
         report: retained.report,
         _source_digest_memory: Some(retained.source_digest_memory),
-        _report_memory: Some(retained.report_memory),
+        report_memory: Some(retained.report_memory),
         omission_memory: Some(retained.omission_memory),
     };
     let report = &mut source_report.report;
     let report_memory = source_report
-        ._report_memory
+        .report_memory
         .as_mut()
         .ok_or("report memory is missing")?;
     let omission_memory = source_report
@@ -216,20 +216,28 @@ fn analyze_file_source(context: FileAnalysis<'_>) -> Result<SourceReport, Box<dy
             profile,
         })?;
     } else {
-        super::analysis_memory::reserve_omission(&mut report.omissions, omission_memory)?;
-        let reason = super::analysis_memory::copy_message(
-            "stream observation work budget is exhausted",
-            omission_memory,
-        )?;
-        report.omissions.push(
-            l2_workbench::artifact::AnalysisOmission::SourceStreamTransform {
-                operation: None,
-                reason,
-            },
-        );
+        record_missing_observation(report, omission_memory)?;
     }
     record_analysis_work(job, report)?;
     Ok(source_report)
+}
+
+fn record_missing_observation(
+    report: &mut l2_workbench::artifact::ArtifactAnalysis,
+    memory: &mut MemoryLease,
+) -> Result<(), Box<dyn Error>> {
+    super::analysis_memory::reserve_omission(&mut report.omissions, memory)?;
+    let reason = super::analysis_memory::copy_message(
+        "stream observation work budget is exhausted",
+        memory,
+    )?;
+    report.omissions.push(
+        l2_workbench::artifact::AnalysisOmission::SourceStreamTransform {
+            operation: None,
+            reason,
+        },
+    );
+    Ok(())
 }
 
 struct RetainedSource {
@@ -371,7 +379,7 @@ fn no_case_space(
     Ok(SourceReport {
         report,
         _source_digest_memory: None,
-        _report_memory: Some(lease),
+        report_memory: Some(lease),
         omission_memory: None,
     })
 }
@@ -690,7 +698,7 @@ impl AnalyzedSources {
             work_bytes_charged: None,
             zip_expanded_work_bytes_charged: None,
             reason: Some(reason),
-            _omission_memory: lease,
+            omission_memory: lease,
         });
         Ok(())
     }
@@ -708,7 +716,7 @@ impl AnalyzedSources {
             let bytes = u64::try_from(super::analysis_memory::omissions_owned_bytes(
                 &report.omissions,
             )?)?;
-            let lease = if let Some(report_memory) = &mut source_report._report_memory {
+            let lease = if let Some(report_memory) = &mut source_report.report_memory {
                 report_memory
                     .split_off(bytes)
                     .ok_or("omission charge is missing from the report")?
@@ -751,7 +759,7 @@ impl AnalyzedSources {
             zip_expanded_work_bytes_charged: Some(report.zip_expanded_work_bytes),
             omissions: std::mem::take(&mut source_report.report.omissions),
             reason,
-            _omission_memory: omission_memory,
+            omission_memory,
         });
         // The report's buffers are gone before returning unused child-analysis credit
         drop(source_report);
@@ -759,11 +767,11 @@ impl AnalyzedSources {
             .source_records
             .last_mut()
             .ok_or("source record is missing")?;
-        if record._omission_memory.bytes() < u64::try_from(retained)? {
+        if record.omission_memory.bytes() < u64::try_from(retained)? {
             return Err("source record memory charge is incomplete".into());
         }
         record
-            ._omission_memory
+            .omission_memory
             .try_resize(u64::try_from(retained)?)?;
         Ok(())
     }
@@ -853,7 +861,7 @@ fn transfer_report_memory(
 ) -> Result<(), Box<dyn Error>> {
     let mut remaining = u64::try_from(bytes)?;
     let omissions_separate = report.omission_memory.is_some();
-    if let Some(source) = &mut report._report_memory {
+    if let Some(source) = &mut report.report_memory {
         let keep = if omissions_separate { 0 } else { protected };
         remaining -= transfer_lease(source, target, remaining, keep)?;
     }

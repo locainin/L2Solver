@@ -874,7 +874,16 @@ fn discover_embedded_objects(
             },
         )?;
     }
-    for candidate in discovery.candidates {
+    retain_embedded_objects(context, discovery.candidates, found, memory)
+}
+
+fn retain_embedded_objects(
+    context: &ArtifactContext<'_>,
+    candidates: Vec<super::embedded::EmbeddedCandidate>,
+    found: &mut PendingArtifacts,
+    memory: &memory::Charge,
+) -> Result<(), AnalyzerError> {
+    for candidate in candidates {
         if candidate.validation.is_err() {
             continue;
         }
@@ -1127,27 +1136,12 @@ fn execute_transform_candidates<'a>(
         }
         let derivation_limits = derivation_limits(context.limits, budget.work.remaining);
         let mut result_memory = memory::sibling(memory, 0)?;
-        let result = if let Some(lease) = &mut result_memory {
-            match derivation::run_with_memory(
-                context.input_bytes,
-                &proposal.proposal.recipe,
-                derivation_limits,
-                lease,
-            ) {
-                Ok(result) => Ok(result),
-                Err(derivation::AdmittedDerivationError::Derivation(error)) => Err(error),
-                Err(derivation::AdmittedDerivationError::Memory(error)) => return Err(error.into()),
-                Err(derivation::AdmittedDerivationError::UnsupportedOperation) => {
-                    return Err(AnalyzerError::UnsupportedMemoryOperation);
-                }
-            }
-        } else {
-            derivation::run_with_limits(
-                context.input_bytes,
-                &proposal.proposal.recipe,
-                derivation_limits,
-            )
-        };
+        let result = run_candidate_derivation(
+            context.input_bytes,
+            &proposal.proposal.recipe,
+            derivation_limits,
+            &mut result_memory,
+        )?;
         match result {
             Ok(derivation) => {
                 if !budget.work.charge(derivation.work_bytes) {
@@ -1190,6 +1184,25 @@ fn execute_transform_candidates<'a>(
         }
     }
     Ok(())
+}
+
+fn run_candidate_derivation(
+    input: &[u8],
+    recipe: &derivation::Recipe,
+    limits: derivation::DerivationLimits,
+    memory: &mut memory::Charge,
+) -> Result<Result<derivation::DerivationReport, derivation::DerivationError>, AnalyzerError> {
+    memory.as_mut().map_or_else(
+        || Ok(derivation::run_with_limits(input, recipe, limits)),
+        |lease| match derivation::run_with_memory(input, recipe, limits, lease) {
+            Ok(result) => Ok(Ok(result)),
+            Err(derivation::AdmittedDerivationError::Derivation(error)) => Ok(Err(error)),
+            Err(derivation::AdmittedDerivationError::Memory(error)) => Err(error.into()),
+            Err(derivation::AdmittedDerivationError::UnsupportedOperation) => {
+                Err(AnalyzerError::UnsupportedMemoryOperation)
+            }
+        },
+    )
 }
 
 fn record_transform_result(
