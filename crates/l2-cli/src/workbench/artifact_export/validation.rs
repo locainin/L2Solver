@@ -6,10 +6,11 @@ use l2_workbench::{
         ArtifactBoundaryEvidence, ArtifactStructure, ArtifactValidationFormat,
         ArtifactValidationOutcome, ArtifactValidator, DerReport, FileRange,
     },
-    evidence::{Case, Node},
+    evidence::{Case, EvidenceStatus, Node},
+    job::{MemoryBudget, MemoryClass, MemoryError, MemoryLease},
 };
 use serde::Serialize;
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -167,9 +168,16 @@ pub(super) fn retain_validation_attempt(
 #[derive(Default)]
 pub(super) struct SelectionWorkCache<'a> {
     text_by_blob: HashMap<&'a str, bool>,
-    validation_by_blob_format: HashMap<(&'a str, &'static str), ArtifactValidationOutcome<'a>>,
+    validation_by_blob_format: HashMap<(&'a str, &'static str), CachedValidation<'a>>,
+    memory: Option<MemoryBudget>,
     #[cfg(test)]
     pub(super) counts: SelectionWorkCounts,
+}
+
+struct CachedValidation<'a> {
+    outcome: ArtifactValidationOutcome<'a>,
+    // The parser report drops before its shared charge
+    _memory: Option<MemoryLease>,
 }
 
 #[cfg(test)]
@@ -181,6 +189,13 @@ pub(super) struct SelectionWorkCounts {
 }
 
 impl<'a> SelectionWorkCache<'a> {
+    pub(super) fn new(memory: Option<&MemoryBudget>) -> Self {
+        Self {
+            memory: memory.cloned(),
+            ..Self::default()
+        }
+    }
+
     pub(super) fn is_plain_text(&mut self, blob_id: &'a str, bytes: &'a [u8]) -> bool {
         if let Some(is_text) = self.text_by_blob.get(blob_id) {
             return *is_text;
@@ -201,7 +216,7 @@ impl<'a> SelectionWorkCache<'a> {
         blob_id: &'a str,
         format: ArtifactValidationFormat,
         bytes: &'a [u8],
-    ) -> &ArtifactValidationOutcome<'a> {
+    ) -> Result<&ArtifactValidationOutcome<'a>, MemoryError> {
         let key = (blob_id, validation_cache_label(format));
         match self.validation_by_blob_format.entry(key) {
             std::collections::hash_map::Entry::Occupied(entry) => {
@@ -209,15 +224,29 @@ impl<'a> SelectionWorkCache<'a> {
                 {
                     self.counts.validation_cache_hits += 1;
                 }
-                entry.into_mut()
+                Ok(&entry.into_mut().outcome)
             }
             std::collections::hash_map::Entry::Vacant(entry) => {
-                let outcome = validator.validate_as(format, bytes);
+                let mut memory = self
+                    .memory
+                    .as_ref()
+                    .map(|budget| budget.try_reserve(MemoryClass::Publication, 0))
+                    .transpose()?;
+                let outcome = if let Some(lease) = &mut memory {
+                    validator.validate_as_with_memory(format, bytes, lease)?
+                } else {
+                    validator.validate_as(format, bytes)
+                };
                 #[cfg(test)]
                 {
                     self.counts.validation_calls += 1;
                 }
-                entry.insert(outcome)
+                Ok(&entry
+                    .insert(CachedValidation {
+                        outcome,
+                        _memory: memory,
+                    })
+                    .outcome)
             }
         }
     }
@@ -238,7 +267,7 @@ impl<'case> SelectionValidation<'_, 'case> {
         blob_id: &'case str,
         format: ArtifactValidationFormat,
         bytes: &'case [u8],
-    ) -> &ArtifactValidationOutcome<'case> {
+    ) -> Result<&ArtifactValidationOutcome<'case>, MemoryError> {
         self.work
             .validate_as(self.validator, blob_id, format, bytes)
     }
@@ -255,12 +284,9 @@ const fn validation_cache_label(format: ArtifactValidationFormat) -> &'static st
 }
 pub(super) fn add_validated_inputs<'a>(
     case: &'a Case,
-    nodes_by_id: &HashMap<u64, &'a Node>,
-    bytes_by_id: &HashMap<&'a str, &'a [u8]>,
-    parsed_edges: &HashSet<(u64, u64)>,
     validation: &mut SelectionValidation<'_, 'a>,
     specs: &mut HashMap<u64, ExportSpec>,
-) {
+) -> Result<(), MemoryError> {
     for structure in case
         .nodes()
         .iter()
@@ -273,22 +299,27 @@ pub(super) fn add_validated_inputs<'a>(
         else {
             continue;
         };
-        if !parsed_edges.contains(&(input_id, structure.id)) {
+        if !case.has_edge(
+            input_id,
+            structure.id,
+            "parsed_as",
+            EvidenceStatus::Observed,
+        ) {
             continue;
         }
-        let Some(input) = nodes_by_id.get(&input_id).copied() else {
+        let Some(input) = case.node(input_id) else {
             continue;
         };
         if structure.blob != input.blob {
             continue;
         }
-        let Some(bytes) = node_bytes(input, bytes_by_id) else {
+        let Some(bytes) = node_bytes(case, input) else {
             continue;
         };
         let Some(blob_id) = input.blob.as_deref() else {
             continue;
         };
-        let report = match validated_der_report(validation, blob_id, bytes) {
+        let report = match validated_der_report(validation, blob_id, bytes)? {
             Ok(report) => {
                 retain_validation_attempt(
                     specs,
@@ -314,50 +345,57 @@ pub(super) fn add_validated_inputs<'a>(
         spec.structural_validation =
             StructuralValidation::validated("der_structure", Some(structure.id));
     }
+    Ok(())
 }
 
 fn validated_der_report<'cache, 'case>(
     validation: &'cache mut SelectionValidation<'_, 'case>,
     blob_id: &'case str,
     bytes: &'case [u8],
-) -> Result<&'cache DerReport, StructuralValidation> {
-    match validation.validate_as(blob_id, ArtifactValidationFormat::Der, bytes) {
-        ArtifactValidationOutcome::Validated {
-            format: ArtifactValidationFormat::Der,
-            range,
-            boundary: ArtifactBoundaryEvidence::DerEncodedLength,
-            structure: ArtifactStructure::Der(report),
-        } if *range == complete_range(bytes) => Ok(report),
-        ArtifactValidationOutcome::Validated { .. } => Err(StructuralValidation::outcome(
-            StructuralValidationStatus::Unknown,
-            Some("der_structure"),
-            None,
-        )),
-        ArtifactValidationOutcome::BoundaryUnproven { format, .. } => {
-            Err(StructuralValidation::outcome(
-                StructuralValidationStatus::BoundaryUnproven,
-                Some(validation_format_label(*format, "der_structure")),
+) -> Result<Result<&'cache DerReport, StructuralValidation>, MemoryError> {
+    Ok(
+        match validation.validate_as(blob_id, ArtifactValidationFormat::Der, bytes)? {
+            ArtifactValidationOutcome::Validated {
+                format: ArtifactValidationFormat::Der,
+                range,
+                boundary: ArtifactBoundaryEvidence::DerEncodedLength,
+                structure: ArtifactStructure::Der(report),
+            } if *range == complete_range(bytes) => Ok(report),
+            ArtifactValidationOutcome::Validated { .. } => Err(StructuralValidation::outcome(
+                StructuralValidationStatus::Unknown,
+                Some("der_structure"),
                 None,
-            ))
-        }
-        ArtifactValidationOutcome::Rejected { format, .. } => Err(StructuralValidation::outcome(
-            StructuralValidationStatus::Rejected,
-            Some(validation_format_label(*format, "der_structure")),
-            None,
-        )),
-        ArtifactValidationOutcome::Unsupported { .. } => Err(StructuralValidation::outcome(
-            StructuralValidationStatus::Unsupported,
-            Some("der_structure"),
-            None,
-        )),
-        ArtifactValidationOutcome::Omitted { format, .. } => Err(StructuralValidation::outcome(
-            StructuralValidationStatus::Omitted,
-            Some((*format).map_or("der_structure", |format| {
-                validation_format_label(format, "der_structure")
-            })),
-            None,
-        )),
-    }
+            )),
+            ArtifactValidationOutcome::BoundaryUnproven { format, .. } => {
+                Err(StructuralValidation::outcome(
+                    StructuralValidationStatus::BoundaryUnproven,
+                    Some(validation_format_label(*format, "der_structure")),
+                    None,
+                ))
+            }
+            ArtifactValidationOutcome::Rejected { format, .. } => {
+                Err(StructuralValidation::outcome(
+                    StructuralValidationStatus::Rejected,
+                    Some(validation_format_label(*format, "der_structure")),
+                    None,
+                ))
+            }
+            ArtifactValidationOutcome::Unsupported { .. } => Err(StructuralValidation::outcome(
+                StructuralValidationStatus::Unsupported,
+                Some("der_structure"),
+                None,
+            )),
+            ArtifactValidationOutcome::Omitted { format, .. } => {
+                Err(StructuralValidation::outcome(
+                    StructuralValidationStatus::Omitted,
+                    Some((*format).map_or("der_structure", |format| {
+                        validation_format_label(format, "der_structure")
+                    })),
+                    None,
+                ))
+            }
+        },
+    )
 }
 
 fn has_der_structure_evidence(structure: &Node, report: &DerReport) -> bool {
@@ -395,13 +433,9 @@ fn detail_range_matches(details: &serde_json::Value, field: &str, expected: File
 
 pub(super) fn add_validated_png_structures<'a>(
     case: &'a Case,
-    nodes_by_id: &HashMap<u64, &'a Node>,
-    bytes_by_id: &HashMap<&'a str, &'a [u8]>,
-    parsed_edges: &HashSet<(u64, u64)>,
-    followed_by_edges: &HashSet<(u64, u64)>,
     validation: &mut SelectionValidation<'_, 'a>,
     specs: &mut HashMap<u64, ExportSpec>,
-) {
+) -> Result<(), MemoryError> {
     let trailers_by_structure = png_trailers(case);
     for structure in case
         .nodes()
@@ -415,23 +449,29 @@ pub(super) fn add_validated_png_structures<'a>(
         else {
             continue;
         };
-        if !parsed_edges.contains(&(input_id, structure.id)) || specs.contains_key(&structure.id) {
+        if !case.has_edge(
+            input_id,
+            structure.id,
+            "parsed_as",
+            EvidenceStatus::Observed,
+        ) || specs.contains_key(&structure.id)
+        {
             continue;
         }
-        let Some(input) = nodes_by_id.get(&input_id).copied() else {
+        let Some(input) = case.node(input_id) else {
             continue;
         };
-        let Some(input_bytes) = node_bytes(input, bytes_by_id) else {
+        let Some(input_bytes) = node_bytes(case, input) else {
             continue;
         };
-        let Some(structure_bytes) = node_bytes(structure, bytes_by_id) else {
+        let Some(structure_bytes) = node_bytes(case, structure) else {
             continue;
         };
         let Some(blob_id) = structure.blob.as_deref() else {
             continue;
         };
         let parsed_chunk_count =
-            match validated_png_chunk_count(validation, blob_id, structure_bytes) {
+            match validated_png_chunk_count(validation, blob_id, structure_bytes)? {
                 Ok(chunk_count) => {
                     let validation = if structure_bytes == input_bytes {
                         StructuralValidation::validated("png_structure", None)
@@ -468,17 +508,10 @@ pub(super) fn add_validated_png_structures<'a>(
             },
         );
         if let Some(trailers) = trailers_by_structure.get(&structure.id) {
-            add_validated_png_trailers(
-                structure,
-                input,
-                input_bytes,
-                trailers,
-                bytes_by_id,
-                followed_by_edges,
-                specs,
-            );
+            add_validated_png_trailers(case, structure, input, input_bytes, trailers, specs);
         }
     }
+    Ok(())
 }
 
 fn png_trailers(case: &Case) -> HashMap<u64, Vec<&Node>> {
@@ -503,22 +536,26 @@ fn png_trailers(case: &Case) -> HashMap<u64, Vec<&Node>> {
 }
 
 fn add_validated_png_trailers(
+    case: &Case,
     structure: &Node,
     input: &Node,
     input_bytes: &[u8],
     trailers: &[&Node],
-    bytes_by_id: &HashMap<&str, &[u8]>,
-    followed_by_edges: &HashSet<(u64, u64)>,
     specs: &mut HashMap<u64, ExportSpec>,
 ) {
-    let Some(structure_bytes) = node_bytes(structure, bytes_by_id) else {
+    let Some(structure_bytes) = node_bytes(case, structure) else {
         return;
     };
     for trailer in trailers {
-        if !followed_by_edges.contains(&(structure.id, trailer.id)) {
+        if !case.has_edge(
+            structure.id,
+            trailer.id,
+            "followed_by",
+            EvidenceStatus::Observed,
+        ) {
             continue;
         }
-        let Some(trailer_bytes) = node_bytes(trailer, bytes_by_id) else {
+        let Some(trailer_bytes) = node_bytes(case, trailer) else {
             continue;
         };
         if !has_png_trailing_data_evidence(
@@ -641,44 +678,50 @@ fn validated_png_chunk_count<'a>(
     validation: &mut SelectionValidation<'_, 'a>,
     blob_id: &'a str,
     bytes: &'a [u8],
-) -> Result<usize, StructuralValidation> {
-    match validation.validate_as(blob_id, ArtifactValidationFormat::Png, bytes) {
-        ArtifactValidationOutcome::Validated {
-            format: ArtifactValidationFormat::Png,
-            range,
-            boundary: ArtifactBoundaryEvidence::PngIend,
-            structure: ArtifactStructure::Png(report),
-        } if *range == complete_range(bytes) => Ok(report.chunks.len()),
-        ArtifactValidationOutcome::Validated { .. } => Err(StructuralValidation::outcome(
-            StructuralValidationStatus::Unknown,
-            Some("png_structure"),
-            None,
-        )),
-        ArtifactValidationOutcome::BoundaryUnproven { format, .. } => {
-            Err(StructuralValidation::outcome(
-                StructuralValidationStatus::BoundaryUnproven,
-                Some(validation_format_label(*format, "png_structure")),
+) -> Result<Result<usize, StructuralValidation>, MemoryError> {
+    Ok(
+        match validation.validate_as(blob_id, ArtifactValidationFormat::Png, bytes)? {
+            ArtifactValidationOutcome::Validated {
+                format: ArtifactValidationFormat::Png,
+                range,
+                boundary: ArtifactBoundaryEvidence::PngIend,
+                structure: ArtifactStructure::Png(report),
+            } if *range == complete_range(bytes) => Ok(report.chunks.len()),
+            ArtifactValidationOutcome::Validated { .. } => Err(StructuralValidation::outcome(
+                StructuralValidationStatus::Unknown,
+                Some("png_structure"),
                 None,
-            ))
-        }
-        ArtifactValidationOutcome::Rejected { format, .. } => Err(StructuralValidation::outcome(
-            StructuralValidationStatus::Rejected,
-            Some(validation_format_label(*format, "png_structure")),
-            None,
-        )),
-        ArtifactValidationOutcome::Unsupported { .. } => Err(StructuralValidation::outcome(
-            StructuralValidationStatus::Unsupported,
-            Some("png_structure"),
-            None,
-        )),
-        ArtifactValidationOutcome::Omitted { format, .. } => Err(StructuralValidation::outcome(
-            StructuralValidationStatus::Omitted,
-            Some((*format).map_or("png_structure", |format| {
-                validation_format_label(format, "png_structure")
-            })),
-            None,
-        )),
-    }
+            )),
+            ArtifactValidationOutcome::BoundaryUnproven { format, .. } => {
+                Err(StructuralValidation::outcome(
+                    StructuralValidationStatus::BoundaryUnproven,
+                    Some(validation_format_label(*format, "png_structure")),
+                    None,
+                ))
+            }
+            ArtifactValidationOutcome::Rejected { format, .. } => {
+                Err(StructuralValidation::outcome(
+                    StructuralValidationStatus::Rejected,
+                    Some(validation_format_label(*format, "png_structure")),
+                    None,
+                ))
+            }
+            ArtifactValidationOutcome::Unsupported { .. } => Err(StructuralValidation::outcome(
+                StructuralValidationStatus::Unsupported,
+                Some("png_structure"),
+                None,
+            )),
+            ArtifactValidationOutcome::Omitted { format, .. } => {
+                Err(StructuralValidation::outcome(
+                    StructuralValidationStatus::Omitted,
+                    Some((*format).map_or("png_structure", |format| {
+                        validation_format_label(format, "png_structure")
+                    })),
+                    None,
+                ))
+            }
+        },
+    )
 }
 
 pub(super) const fn complete_range(bytes: &[u8]) -> FileRange {

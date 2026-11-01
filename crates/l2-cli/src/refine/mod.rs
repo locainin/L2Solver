@@ -261,6 +261,7 @@ fn analyze_and_publish<W: Write>(
     let selected = artifact_export::select_artifacts_with_analyzer_receipts(
         &analyzed.case,
         &validation_receipts,
+        Some(memory),
     )?;
     drop(validation_receipts);
     job.start(Phase::Reports, Some(1))?;

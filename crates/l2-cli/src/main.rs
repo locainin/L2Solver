@@ -36,6 +36,7 @@ mod render;
 mod replay_time;
 mod report;
 mod result_directory;
+mod retained_memory;
 mod safe_filename;
 mod source_collection;
 mod stp_render;

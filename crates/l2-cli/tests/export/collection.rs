@@ -67,6 +67,56 @@ fn collection_preserves_typed_memory_failure_with_capture_context() -> Result<()
     Ok(())
 }
 
+#[test]
+fn recovered_artifact_collection_uses_the_shared_selector_budget() -> Result<(), Box<dyn Error>> {
+    let temporary = tempfile::tempdir()?;
+    let mut artifacts = ArtifactCollection::new(temporary.path(), ArtifactLimits::default())?;
+    let mut case = l2_workbench::evidence::Case::new();
+    case.add_bytes_node(
+        "record_object",
+        b"recoverable",
+        Vec::new(),
+        serde_json::json!({}),
+    )?;
+    let budget = MemoryBudget::new(64 * 1024);
+    let blocker = budget.try_reserve(MemoryClass::Cache, budget.snapshot()?.limit_bytes)?;
+    let error = super::collection::collect_case_artifacts_with_context(
+        &mut artifacts,
+        &case,
+        Some(&budget),
+        |_, _| Ok(recovered_test_context()),
+    )
+    .err()
+    .ok_or("recovered collection ignored the shared memory limit")?;
+    assert!(matches!(
+        crate::memory_error::find(error.as_ref()),
+        Some(MemoryError::Limit { .. })
+    ));
+    assert_eq!(artifacts.coverage().references_selected, 0);
+    drop(blocker);
+    assert_eq!(budget.snapshot()?.used_bytes, 0);
+
+    super::collection::collect_case_artifacts_with_context(
+        &mut artifacts,
+        &case,
+        Some(&budget),
+        |_, _| Ok(recovered_test_context()),
+    )?;
+    assert_eq!(artifacts.coverage().references_selected, 1);
+    assert_eq!(budget.snapshot()?.used_bytes, 0);
+    Ok(())
+}
+
+fn recovered_test_context() -> super::provenance::ArtifactSourceContext {
+    super::provenance::ArtifactSourceContext {
+        flow: None,
+        supporting_flows: Vec::new(),
+        cohort_scope: None,
+        case_id: None,
+        case_scope: serde_json::json!({}),
+    }
+}
+
 #[cfg(unix)]
 #[test]
 fn collection_error_escapes_capture_path_terminal_controls() -> Result<(), Box<dyn Error>> {
@@ -392,7 +442,7 @@ fn collect_test_case(
             page.result.case.write_json(&mut encoded)?;
         }
         crate::workbench::full_source::FullSourceItem::Cohort(cohort) => {
-            super::collection::collect_cohort_artifacts(artifacts, &cohort, None, &scope)?;
+            super::collection::collect_cohort_artifacts(artifacts, &cohort, None, &scope, None)?;
             cohort.result.case.write_json(&mut encoded)?;
         }
     }
@@ -416,7 +466,7 @@ fn collect_test_flow_artifacts(
         case_id: None,
         case_scope: scope.clone(),
     };
-    super::collection::collect_case_artifacts_with_context(artifacts, case, |_, _| {
+    super::collection::collect_case_artifacts_with_context(artifacts, case, None, |_, _| {
         Ok(context.clone())
     })
 }

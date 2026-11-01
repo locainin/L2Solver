@@ -182,7 +182,7 @@ fn identical_exportable_nodes_keep_case_qualified_provenance_once_each()
 
     let mut artifacts = ArtifactCollection::new(temporary.path(), ArtifactLimits::default())?;
     for _ in 0..2 {
-        collect_case_artifacts_with_context(&mut artifacts, &case, |_, _| {
+        collect_case_artifacts_with_context(&mut artifacts, &case, None, |_, _| {
             Ok(ArtifactSourceContext {
                 flow: None,
                 supporting_flows: Vec::new(),
@@ -262,7 +262,7 @@ fn omitted_case_evidence_does_not_leave_export_node_references() -> Result<(), B
     assert!(!record.retained);
 
     let mut artifacts = ArtifactCollection::new(temporary.path(), ArtifactLimits::default())?;
-    collect_case_artifacts_with_context(&mut artifacts, &case, |_, _| {
+    collect_case_artifacts_with_context(&mut artifacts, &case, None, |_, _| {
         Ok(ArtifactSourceContext {
             flow: None,
             supporting_flows: Vec::new(),

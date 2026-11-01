@@ -1,8 +1,4 @@
-use std::{
-    collections::{HashMap, HashSet},
-    io,
-    path::Path,
-};
+use std::{collections::HashMap, io, path::Path};
 
 use l2_workbench::{
     artifact::{
@@ -12,6 +8,13 @@ use l2_workbench::{
     evidence::{Case, Edge, EvidenceStatus},
 };
 use serde_json::json;
+
+#[path = "artifact_export/case_indexes.rs"]
+mod case_indexes;
+#[path = "artifact_export/selection_memory.rs"]
+mod selection_memory;
+#[path = "artifact_export/zip_memory.rs"]
+mod zip_memory;
 
 #[test]
 fn rejects_unsafe_file_name_with_invalid_input_error() -> Result<(), Box<dyn std::error::Error>> {
@@ -83,7 +86,7 @@ fn selected_artifact_identity_matches_its_canonical_case_blob_digest()
         .find(|node| node.id == node_id)
         .and_then(|node| node.blob.as_deref())
         .ok_or("selected object blob is missing")?;
-    let selected = super::select_artifacts(&case)?;
+    let selected = super::select_artifacts(&case, None)?;
     let artifact = selected.first().ok_or("selected artifact is missing")?;
 
     assert_eq!(artifact.bytes(), bytes);
@@ -148,7 +151,7 @@ fn ordinary_selection_keeps_compatible_signature_evidence_reference()
         reason: String::from("Signature bytes were observed in the input object"),
     })?;
 
-    let selected = super::select_artifacts(&case)?;
+    let selected = super::select_artifacts(&case, None)?;
     let artifact = selected.first().ok_or("PNG record was not selected")?;
     let provenance = artifact
         .provenance()
@@ -187,7 +190,7 @@ fn arbitrary_record_details_cannot_promote_garbage_to_validated_png()
             "extension": "png"
         }),
     )?;
-    let selected = super::select_artifacts(&case)?;
+    let selected = super::select_artifacts(&case, None)?;
     let artifact = selected.first().ok_or("garbage record was not selected")?;
 
     assert!(
@@ -259,7 +262,7 @@ fn analyzer_receipt_for_another_blob_cannot_promote_garbage_to_validated_png()
                 structure_count: 3,
             },
         );
-        let selected = super::select_artifacts_with_analyzer_receipts(&case, &[receipt])?;
+        let selected = super::select_artifacts_with_analyzer_receipts(&case, &[receipt], None)?;
         let artifact = selected.first().ok_or("garbage record was not selected")?;
 
         assert!(
@@ -302,8 +305,8 @@ fn repeated_validation_is_cached_once_per_blob_and_format() -> Result<(), Box<dy
         ArtifactValidationFormat::Png,
         ArtifactValidationFormat::Zip,
     ] {
-        work.validate_as(&validator, blob_id, format, bytes);
-        work.validate_as(&validator, blob_id, format, bytes);
+        work.validate_as(&validator, blob_id, format, bytes)?;
+        work.validate_as(&validator, blob_id, format, bytes)?;
     }
 
     assert_eq!(work.counts.validation_calls, 3);
@@ -399,24 +402,14 @@ fn final_zip_member_uses_indexed_entry_lookup_with_the_same_export_metadata()
         .filter(|node| member_ids.contains(&node.id))
         .collect();
     let members_by_archive = HashMap::from([(archive_id, members)]);
-    let contains_member_edges: HashSet<_> = member_ids
-        .iter()
-        .map(|member_id| (archive_id, *member_id))
-        .collect();
-    let bytes_by_id: HashMap<&str, &[u8]> = case
-        .blobs()
-        .iter()
-        .map(|blob| (blob.id.as_str(), blob.bytes.as_slice()))
-        .collect();
     let mut specs = HashMap::new();
 
     super::add_validated_archive_members(
+        &case,
         archive_id,
         &[structure],
         &members_by_archive,
-        &contains_member_edges,
         &report,
-        &bytes_by_id,
         &mut specs,
     );
 
@@ -546,7 +539,7 @@ fn case_with_zip_members(
             .ok_or("test ZIP member content is missing")?;
         let raw_name_preview = super::encode_hex(&metadata.raw_name);
         let utf8_name = String::from_utf8(metadata.raw_name.clone())?;
-        member_ids.push(case.add_bytes_node(
+        let member_id = case.add_bytes_node(
             "archive_member",
             member_bytes,
             Vec::new(),
@@ -568,7 +561,15 @@ fn case_with_zip_members(
                 "crc32": metadata.crc32,
                 "local_header_offset": metadata.local_header_offset
             }),
-        )?);
+        )?;
+        case.add_edge(Edge {
+            from: archive_id,
+            to: member_id,
+            relation: "contains_member".to_owned(),
+            status: EvidenceStatus::Observed,
+            reason: "Archive member was validated".to_owned(),
+        })?;
+        member_ids.push(member_id);
     }
     Ok(ZipMemberCase {
         case,

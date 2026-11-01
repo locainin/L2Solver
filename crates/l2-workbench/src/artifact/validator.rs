@@ -374,6 +374,22 @@ impl ArtifactValidator {
         )
     }
 
+    /// Validate one format using a shared lease for supported parser buffers
+    ///
+    /// ZIP, PNG, and executable buffers are admitted; DER inventories are not yet metered
+    /// The caller keeps the lease until the returned report and moved data are dropped
+    ///
+    /// # Errors
+    /// Returns a shared-memory admission failure from a metered parser
+    pub fn validate_as_with_memory<'a>(
+        &self,
+        format: ArtifactValidationFormat,
+        bytes: &'a [u8],
+        memory: &mut MemoryLease,
+    ) -> Result<ArtifactValidationOutcome<'a>, MemoryError> {
+        self.validate_as_with_operation_budget(format, bytes, None, Some(memory))
+    }
+
     /// Validate one explicit format while consuming a shared ZIP expansion budget
     ///
     /// The remaining budget is reduced before each member extraction, including failed

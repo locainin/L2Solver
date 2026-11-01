@@ -75,6 +75,42 @@ fn exact_edge_lookup_checks_text_after_a_hash_collision() -> Result<(), Evidence
 }
 
 #[test]
+fn coarse_edge_lookup_checks_relation_after_a_hash_collision() -> Result<(), EvidenceError> {
+    let mut case = Case::new();
+    let from = case.add_node("from", None, Vec::new(), serde_json::json!({}))?;
+    let to = case.add_node("to", None, Vec::new(), serde_json::json!({}))?;
+    let first = Edge {
+        from,
+        to,
+        relation: "parsed_as".to_owned(),
+        status: EvidenceStatus::Observed,
+        reason: "first relation".to_owned(),
+    };
+    let second = Edge {
+        relation: "contains_member".to_owned(),
+        ..first.clone()
+    };
+    case.add_edge(first.clone())?;
+    case.add_edge(second)?;
+
+    // Put a different relation at the collision-chain head
+    let key = super::edge_index_key(&case.edge_hash, &first, false);
+    case.edge_index.insert(key, 1);
+    case.edge_links
+        .get_mut(1)
+        .ok_or(EvidenceError::InvalidJson)?
+        .coarse = 0;
+    assert!(!case.has_edge(from, to, "parsed_as", EvidenceStatus::Observed));
+    let link = case
+        .edge_links
+        .get_mut(1)
+        .ok_or(EvidenceError::InvalidJson)?;
+    link.coarse = 1;
+    assert!(case.has_edge(from, to, "parsed_as", EvidenceStatus::Observed));
+    Ok(())
+}
+
+#[test]
 fn inconsistent_blob_byte_total_is_fatal_not_a_quota_omission()
 -> Result<(), Box<dyn std::error::Error>> {
     let mut case = Case::new();

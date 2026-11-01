@@ -432,6 +432,7 @@ fn cohort_artifact_lookup_is_built_once_for_multiple_artifacts() -> Result<(), B
         &cohort,
         Some("cohort-case"),
         &json!({"kind": "cohort"}),
+        None,
     )?;
 
     let builds = super::COHORT_ARTIFACT_LOOKUP_BUILDS.with(std::cell::Cell::get);

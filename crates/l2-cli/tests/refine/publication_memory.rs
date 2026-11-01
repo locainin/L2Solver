@@ -20,7 +20,7 @@ fn manifest_admits_retained_origins_and_releases_them_after_drop() -> TestResult
     let budget = MemoryBudget::new(256 * 1024);
     let mut case = Case::new();
     let node = case.add_bytes_node("record_object", b"source bytes", Vec::new(), json!({}))?;
-    let selected = select_artifacts(&case)?;
+    let selected = select_artifacts(&case, None)?;
     let validation = ValidationSummary {
         state: ArtifactValidationState::Unsupported,
         format: None,
@@ -80,7 +80,10 @@ fn manifest_admits_retained_origins_and_releases_them_after_drop() -> TestResult
     drop(partial_blocker);
     assert_eq!(budget.snapshot()?.used_bytes, baseline);
 
-    let blocker = budget.try_reserve(MemoryClass::Cache, budget.snapshot()?.limit_bytes - baseline)?;
+    let blocker = budget.try_reserve(
+        MemoryClass::Cache,
+        budget.snapshot()?.limit_bytes - baseline,
+    )?;
     let error = make_manifest(&selected, &files, &sources, &records, true, &budget)
         .err()
         .ok_or("manifest ignored the shared memory limit")?;
@@ -155,7 +158,14 @@ fn streamed_summary_preserves_escaped_source_details() -> TestResult {
         omission_memory: budget.try_reserve(MemoryClass::Executor, 0)?,
     }];
 
-    write_summary_file(directory.path(), Path::new("result\nname"), &[], &[], &sources, false)?;
+    write_summary_file(
+        directory.path(),
+        Path::new("result\nname"),
+        &[],
+        &[],
+        &sources,
+        false,
+    )?;
     assert_eq!(
         fs::read_to_string(directory.path().join("summary.txt"))?,
         "Refined artifacts\nDirectory: result\\nname\nSources: 1; files: 0; status: incomplete\nSource: input\\nname; SHA-256: not read; bytes: 17; analysis: partial; reason: invalid\\tdata\n"

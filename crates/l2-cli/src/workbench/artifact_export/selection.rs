@@ -13,11 +13,9 @@ use l2_workbench::artifact::ArtifactValidator;
 use l2_workbench::artifact::{
     AnalysisBoundary, AnalysisFormat, ArtifactValidationState, FileRange, ValidationSummary,
 };
-use l2_workbench::evidence::{Case, EvidenceStatus, Node};
-use std::{
-    collections::{HashMap, HashSet},
-    error::Error,
-};
+use l2_workbench::evidence::{Case, Node};
+use l2_workbench::job::{MemoryBudget, MemoryClass, MemoryError, MemoryLease};
+use std::{collections::HashMap, error::Error, ops::Deref};
 
 /// One exact byte object selected for export, with every retained source reference
 pub struct SelectedArtifact<'a> {
@@ -25,6 +23,21 @@ pub struct SelectedArtifact<'a> {
     content_sha256: &'a str,
     file_name: String,
     provenance: Vec<ArtifactProvenance>,
+}
+
+/// Selected artifacts and the charge for their retained names and provenance
+pub struct SelectedArtifacts<'a> {
+    artifacts: Vec<SelectedArtifact<'a>>,
+    // Drop the selected data before releasing its shared charge
+    _memory: Option<MemoryLease>,
+}
+
+impl<'a> Deref for SelectedArtifacts<'a> {
+    type Target = [SelectedArtifact<'a>];
+
+    fn deref(&self) -> &Self::Target {
+        &self.artifacts
+    }
 }
 
 /// Existing analyzer validation bound to the exact case blob it inspected
@@ -58,13 +71,6 @@ struct AnalyzerExportValidation {
     validation: StructuralValidation,
 }
 
-#[derive(Clone, Copy)]
-struct ExportEdges<'a> {
-    parsed: &'a HashSet<(u64, u64)>,
-    contains_member: &'a HashSet<(u64, u64)>,
-    followed_by: &'a HashSet<(u64, u64)>,
-}
-
 impl SelectedArtifact<'_> {
     pub const fn bytes(&self) -> &[u8] {
         self.bytes
@@ -90,61 +96,48 @@ pub(super) struct ExportSpec {
 }
 
 /// Choose complete export objects and group only byte-for-byte duplicates
-pub fn select_artifacts(case: &Case) -> Result<Vec<SelectedArtifact<'_>>, Box<dyn Error>> {
-    let mut work = SelectionWorkCache::default();
-    select_artifacts_with_cache(case, &mut work)
+pub fn select_artifacts<'a>(
+    case: &'a Case,
+    memory: Option<&MemoryBudget>,
+) -> Result<SelectedArtifacts<'a>, Box<dyn Error>> {
+    let mut work = SelectionWorkCache::new(memory);
+    select_artifacts_with_receipts_and_cache(case, &[], &mut work, memory)
 }
 
 /// Reuse trusted analyzer validation when publishing the same case blobs
 pub fn select_artifacts_with_analyzer_receipts<'a>(
     case: &'a Case,
     receipts: &[AnalyzerValidationReceipt<'_>],
-) -> Result<Vec<SelectedArtifact<'a>>, Box<dyn Error>> {
-    let mut work = SelectionWorkCache::default();
-    select_artifacts_with_receipts_and_cache(case, receipts, &mut work)
+    memory: Option<&MemoryBudget>,
+) -> Result<SelectedArtifacts<'a>, Box<dyn Error>> {
+    let mut work = SelectionWorkCache::new(memory);
+    select_artifacts_with_receipts_and_cache(case, receipts, &mut work, memory)
 }
 
+#[cfg(test)]
 pub(super) fn select_artifacts_with_cache<'a>(
     case: &'a Case,
     work: &mut SelectionWorkCache<'a>,
-) -> Result<Vec<SelectedArtifact<'a>>, Box<dyn Error>> {
-    select_artifacts_with_receipts_and_cache(case, &[], work)
+) -> Result<SelectedArtifacts<'a>, Box<dyn Error>> {
+    select_artifacts_with_receipts_and_cache(case, &[], work, None)
 }
 
 fn select_artifacts_with_receipts_and_cache<'a>(
     case: &'a Case,
     receipts: &[AnalyzerValidationReceipt<'_>],
     work: &mut SelectionWorkCache<'a>,
-) -> Result<Vec<SelectedArtifact<'a>>, Box<dyn Error>> {
-    // Indexes resolve node references without rescanning the case for each object
-    let nodes_by_id: HashMap<u64, &Node> =
-        case.nodes().iter().map(|node| (node.id, node)).collect();
-    let bytes_by_id: HashMap<&str, &[u8]> = case
-        .blobs()
-        .iter()
-        .map(|blob| (blob.id.as_str(), blob.bytes.as_slice()))
-        .collect();
+    memory: Option<&MemoryBudget>,
+) -> Result<SelectedArtifacts<'a>, Box<dyn Error>> {
+    let mut retained = memory
+        .map(|budget| budget.try_reserve(MemoryClass::Publication, 0))
+        .transpose()?;
     let validator = ArtifactValidator::default();
     let mut validation = SelectionValidation {
         validator: &validator,
         work,
     };
-    let parsed_edges = observed_parse_edges(case);
-    let contains_member_edges = observed_edges(case, "contains_member");
-    let followed_by_edges = observed_edges(case, "followed_by");
     let receipts_by_node = analyzer_receipts_by_node(receipts)?;
-    let specs = export_specs(
-        case,
-        &nodes_by_id,
-        &bytes_by_id,
-        ExportEdges {
-            parsed: &parsed_edges,
-            contains_member: &contains_member_edges,
-            followed_by: &followed_by_edges,
-        },
-        &receipts_by_node,
-        &mut validation,
-    );
+    let specs = export_specs(case, &receipts_by_node, &mut validation)?;
 
     // Validated blob identifiers provide the content key without hashing every byte per node
     let mut artifact_by_blob: HashMap<&str, usize> = HashMap::new();
@@ -161,19 +154,24 @@ fn select_artifacts_with_receipts_and_cache<'a>(
         let content_sha256 = blob_id
             .strip_prefix("sha256:")
             .ok_or("recovered artifact blob ID is not a SHA-256 identity")?;
-        let bytes = bytes_by_id
-            .get(blob_id)
-            .copied()
+        let bytes = case
+            .blob(blob_id)
+            .map(|blob| blob.bytes.as_slice())
             .ok_or("recovered artifact node bytes are missing")?;
         let provenance = ArtifactProvenance {
             id: node.id,
-            kind: node.kind.clone(),
-            archive_path: spec.archive_path.clone(),
+            kind: copy_text(&node.kind, &mut retained)?,
+            archive_path: spec
+                .archive_path
+                .as_deref()
+                .map(|path| copy_text(path, &mut retained))
+                .transpose()?,
             completion_basis: node
                 .details
                 .get("completion_basis")
                 .and_then(serde_json::Value::as_str)
-                .map(str::to_owned),
+                .map(|basis| copy_text(basis, &mut retained))
+                .transpose()?,
             reconstruction_status: reconstruction_status(node),
             structural_validation: spec.structural_validation.clone(),
             extension_evidence_node: spec.extension_evidence_node,
@@ -181,24 +179,54 @@ fn select_artifacts_with_receipts_and_cache<'a>(
 
         if let Some(index) = artifact_by_blob.get(blob_id).copied() {
             // Keep every source visible while storing identical content once
-            artifacts
+            let origins = &mut artifacts
                 .get_mut(index)
                 .ok_or("artifact index is missing")?
-                .provenance
-                .push(provenance);
+                .provenance;
+            grow(origins, &mut retained)?;
+            origins.push(provenance);
             continue;
         }
 
         let index = artifacts.len();
+        artifact_by_blob.try_reserve(1)?;
+        grow(&mut artifacts, &mut retained)?;
+        let mut origins = Vec::new();
+        grow(&mut origins, &mut retained)?;
+        origins.push(provenance);
+        let file_name = copy_text(&spec.file_name, &mut retained)?;
         artifact_by_blob.insert(blob_id, index);
         artifacts.push(SelectedArtifact {
             bytes,
             content_sha256,
-            file_name: spec.file_name.clone(),
-            provenance: vec![provenance],
+            file_name,
+            provenance: origins,
         });
     }
-    Ok(artifacts)
+    Ok(SelectedArtifacts {
+        artifacts,
+        _memory: retained,
+    })
+}
+
+fn grow<T>(values: &mut Vec<T>, memory: &mut Option<MemoryLease>) -> Result<(), Box<dyn Error>> {
+    if let Some(memory) = memory {
+        crate::retained_memory::grow_vec(values, memory, 1)
+    } else {
+        values.try_reserve(1)?;
+        Ok(())
+    }
+}
+
+fn copy_text(value: &str, memory: &mut Option<MemoryLease>) -> Result<String, Box<dyn Error>> {
+    if let Some(memory) = memory {
+        crate::retained_memory::copy_message(value, memory)
+    } else {
+        let mut copy = String::new();
+        copy.try_reserve_exact(value.len())?;
+        copy.push_str(value);
+        Ok(copy)
+    }
 }
 
 fn analyzer_receipts_by_node<'a, 'digest>(
@@ -214,54 +242,20 @@ fn analyzer_receipts_by_node<'a, 'digest>(
 
 fn export_specs<'a>(
     case: &'a Case,
-    nodes_by_id: &HashMap<u64, &'a Node>,
-    bytes_by_id: &HashMap<&'a str, &'a [u8]>,
-    edges: ExportEdges<'_>,
     analysis_receipts: &HashMap<u64, &AnalyzerValidationReceipt<'_>>,
     validation: &mut SelectionValidation<'_, 'a>,
-) -> HashMap<u64, ExportSpec> {
-    let signature_extensions =
-        record_signature_extensions(case, nodes_by_id, bytes_by_id, validation);
-    let mut specs = direct_export_specs(
-        case,
-        &signature_extensions,
-        bytes_by_id,
-        analysis_receipts,
-        validation,
-    );
-    add_validated_inputs(
-        case,
-        nodes_by_id,
-        bytes_by_id,
-        edges.parsed,
-        validation,
-        &mut specs,
-    );
-    add_validated_archives(
-        case,
-        nodes_by_id,
-        bytes_by_id,
-        edges.parsed,
-        edges.contains_member,
-        validation,
-        &mut specs,
-    );
-    add_validated_png_structures(
-        case,
-        nodes_by_id,
-        bytes_by_id,
-        edges.parsed,
-        edges.followed_by,
-        validation,
-        &mut specs,
-    );
-    specs
+) -> Result<HashMap<u64, ExportSpec>, MemoryError> {
+    let signature_extensions = record_signature_extensions(case, validation)?;
+    let mut specs = direct_export_specs(case, &signature_extensions, analysis_receipts, validation);
+    add_validated_inputs(case, validation, &mut specs)?;
+    add_validated_archives(case, validation, &mut specs)?;
+    add_validated_png_structures(case, validation, &mut specs)?;
+    Ok(specs)
 }
 
 fn direct_export_specs<'a>(
     case: &'a Case,
     signature_extensions: &HashMap<u64, SignatureExtension>,
-    bytes_by_id: &HashMap<&'a str, &'a [u8]>,
     analysis_receipts: &HashMap<u64, &AnalyzerValidationReceipt<'_>>,
     validation: &mut SelectionValidation<'_, 'a>,
 ) -> HashMap<u64, ExportSpec> {
@@ -274,14 +268,14 @@ fn direct_export_specs<'a>(
                 let analyzed = analysis_receipts
                     .get(&node.id)
                     .copied()
-                    .and_then(|receipt| analyzer_export_validation(node, receipt, bytes_by_id));
+                    .and_then(|receipt| analyzer_export_validation(case, node, receipt));
                 let extension = analyzed
                     .as_ref()
                     .map(|matched| matched.extension.clone())
                     .or_else(|| signature.and_then(|matched| matched.extension.clone()))
                     .or_else(|| {
                         let blob_id = node.blob.as_deref()?;
-                        let bytes = node_bytes(node, bytes_by_id)?;
+                        let bytes = node_bytes(case, node)?;
                         validation
                             .is_plain_text(blob_id, bytes)
                             .then(|| String::from("txt"))
@@ -322,15 +316,15 @@ fn direct_export_specs<'a>(
 }
 
 fn analyzer_export_validation(
+    case: &Case,
     node: &Node,
     receipt: &AnalyzerValidationReceipt<'_>,
-    bytes_by_id: &HashMap<&str, &[u8]>,
 ) -> Option<AnalyzerExportValidation> {
     let blob_id = node.blob.as_deref()?;
     if blob_id.strip_prefix("sha256:")? != receipt.sha256 {
         return None;
     }
-    let bytes = node_bytes(node, bytes_by_id)?;
+    let bytes = node_bytes(case, node)?;
     if bytes.len() != receipt.byte_length
         || receipt.summary.state != ArtifactValidationState::Validated
         || receipt.summary.range
@@ -360,23 +354,9 @@ fn analyzer_export_validation(
     })
 }
 
-fn observed_parse_edges(case: &Case) -> HashSet<(u64, u64)> {
-    observed_edges(case, "parsed_as")
-}
-
-pub(super) fn observed_edges(case: &Case, relation: &str) -> HashSet<(u64, u64)> {
-    case.edges()
-        .iter()
-        .filter(|edge| edge.relation == relation && edge.status == EvidenceStatus::Observed)
-        .map(|edge| (edge.from, edge.to))
-        .collect()
-}
-
-pub(super) fn node_bytes<'a>(
-    node: &Node,
-    bytes_by_id: &HashMap<&str, &'a [u8]>,
-) -> Option<&'a [u8]> {
+pub(super) fn node_bytes<'a>(case: &'a Case, node: &Node) -> Option<&'a [u8]> {
     node.blob
         .as_deref()
-        .and_then(|blob_id| bytes_by_id.get(blob_id).copied())
+        .and_then(|blob_id| case.blob(blob_id))
+        .map(|blob| blob.bytes.as_slice())
 }

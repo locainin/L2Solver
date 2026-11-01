@@ -19,7 +19,7 @@ use super::{
 use crate::{arguments::ExportOptions, workbench};
 use l2_workbench::{
     evidence::{Blob, Case, EvidenceStatus, Node},
-    job::Phase,
+    job::{MemoryBudget, Phase},
     reconstruction::Limits,
     tshark::SourceIdentity,
 };
@@ -32,11 +32,12 @@ use std::{
 
 const TSHARK_OBJECT_BUDGET: workbench::ObjectExportBudget = workbench::ObjectExportBudget::DEFAULT;
 
-struct CaseCollection {
+struct CaseCollection<'a> {
     artifacts: ArtifactCollection,
     evidence: EvidenceSidecar,
     limitations: LimitationSpool,
     recovery: RecoveryCoverage,
+    memory: Option<&'a MemoryBudget>,
 }
 
 pub(super) struct CollectedExport {
@@ -74,6 +75,7 @@ fn collect_export_inner(
         evidence: EvidenceSidecar::new(staging, limits.evidence_bytes, context.memory)?,
         limitations: LimitationSpool::new(staging)?,
         recovery: RecoveryCoverage::default(),
+        memory: context.memory,
     };
     let capture_cache = context
         .cache
@@ -119,6 +121,7 @@ fn collect_export_inner(
         evidence,
         limitations,
         recovery,
+        memory: _,
     } = collection;
     Ok(CollectedExport {
         artifacts,
@@ -332,6 +335,7 @@ fn collect_flow_case(
         &analysis.flow,
         case_id.as_deref(),
         scope,
+        collection.memory,
     )?;
     for message in analysis.result.case.limitations() {
         collection
@@ -384,6 +388,7 @@ fn collect_flow_page_case(
         &page.flow,
         case_id.as_deref(),
         scope,
+        collection.memory,
     )?;
     for message in page.result.case.limitations() {
         collection
@@ -419,7 +424,13 @@ fn collect_cohort_case(
         CaseLimitationOrigin::Cohort(&cohort_label),
         &mut collection.limitations,
     )?;
-    collect_cohort_artifacts(&mut collection.artifacts, cohort, case_id.as_deref(), scope)?;
+    collect_cohort_artifacts(
+        &mut collection.artifacts,
+        cohort,
+        case_id.as_deref(),
+        scope,
+        collection.memory,
+    )?;
     for message in cohort.result.case.limitations() {
         collection
             .limitations
@@ -527,6 +538,7 @@ fn collect_case_artifacts(
     flow: &l2_workbench::store::Flow,
     case_id: Option<&str>,
     case_scope: &serde_json::Value,
+    memory: Option<&MemoryBudget>,
 ) -> Result<(), Box<dyn Error>> {
     let flow_context = serde_json::to_value(flow)?;
     let context = ArtifactSourceContext {
@@ -536,7 +548,7 @@ fn collect_case_artifacts(
         case_id: case_id.map(str::to_owned),
         case_scope: case_scope.clone(),
     };
-    collect_case_artifacts_with_context(collection, case, |_, _| Ok(context.clone()))
+    collect_case_artifacts_with_context(collection, case, memory, |_, _| Ok(context.clone()))
 }
 
 pub(super) fn collect_cohort_artifacts(
@@ -544,17 +556,22 @@ pub(super) fn collect_cohort_artifacts(
     cohort: &workbench::full_source::CohortAnalysis,
     case_id: Option<&str>,
     case_scope: &serde_json::Value,
+    memory: Option<&MemoryBudget>,
 ) -> Result<(), Box<dyn Error>> {
     // Native and recovered artifacts share this collection-scoped lookup
     let context_index = CohortArtifactContextIndex::new(cohort)?;
-    collect_case_artifacts_with_context(collection, &cohort.result.case, |node, nodes_by_id| {
-        context_index.for_node(node, nodes_by_id, case_id, case_scope)
-    })
+    collect_case_artifacts_with_context(
+        collection,
+        &cohort.result.case,
+        memory,
+        |node, nodes_by_id| context_index.for_node(node, nodes_by_id, case_id, case_scope),
+    )
 }
 
 pub(super) fn collect_case_artifacts_with_context(
     collection: &mut ArtifactCollection,
     case: &Case,
+    memory: Option<&MemoryBudget>,
     mut context_for_node: impl FnMut(
         &Node,
         &HashMap<u64, &Node>,
@@ -562,7 +579,7 @@ pub(super) fn collect_case_artifacts_with_context(
 ) -> Result<(), Box<dyn Error>> {
     let index = CaseArtifactIndex::new(case)?;
     collect_native_case_artifacts(collection, case, &index, &mut context_for_node)?;
-    collect_selected_case_artifacts(collection, case, &index, &mut context_for_node)
+    collect_selected_case_artifacts(collection, case, &index, memory, &mut context_for_node)
 }
 
 pub(super) struct CaseArtifactIndex<'a> {
@@ -674,12 +691,13 @@ fn collect_selected_case_artifacts(
     collection: &mut ArtifactCollection,
     case: &Case,
     index: &CaseArtifactIndex<'_>,
+    memory: Option<&MemoryBudget>,
     context_for_node: &mut impl FnMut(
         &Node,
         &HashMap<u64, &Node>,
     ) -> Result<ArtifactSourceContext, Box<dyn Error>>,
 ) -> Result<(), Box<dyn Error>> {
-    let selected_artifacts = workbench::artifact_export::select_artifacts(case)?;
+    let selected_artifacts = workbench::artifact_export::select_artifacts(case, memory)?;
     let archive_member_paths = selected_artifacts
         .iter()
         .flat_map(workbench::artifact_export::SelectedArtifact::provenance)
@@ -690,7 +708,7 @@ fn collect_selected_case_artifacts(
                 .map(|path| (provenance.id, path.clone()))
         })
         .collect::<HashMap<_, _>>();
-    for artifact in selected_artifacts {
+    for artifact in selected_artifacts.iter() {
         for selected_origin in artifact.provenance() {
             let node = index
                 .nodes_by_id

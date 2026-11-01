@@ -24,7 +24,7 @@ pub(super) fn run(
     output: &mut impl Write,
 ) -> Result<bool, Box<dyn Error>> {
     let case = load(case_path)?;
-    let artifacts = artifact_export::select_artifacts(&case)?;
+    let artifacts = artifact_export::select_artifacts(&case, None)?;
     let node_count = artifact_export::artifact_node_count(&artifacts);
     let complete = case.collection_complete();
     let summary = format_summary(directory, &artifacts, complete, node_count);

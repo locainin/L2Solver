@@ -1327,13 +1327,11 @@ impl Case {
         self.blob_index.get(id).copied()
     }
 
-    pub(crate) fn has_edge(
-        &self,
-        from: u64,
-        to: u64,
-        relation: &str,
-        status: EvidenceStatus,
-    ) -> bool {
+    /// Check whether a relation with these endpoints and status is retained
+    ///
+    /// The original relation text is checked after the indexed hash lookup
+    #[must_use]
+    pub fn has_edge(&self, from: u64, to: u64, relation: &str, status: EvidenceStatus) -> bool {
         self.find_edge(from, to, relation, status, None)
     }
 

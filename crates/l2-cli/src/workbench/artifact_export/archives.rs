@@ -15,32 +15,29 @@ use l2_workbench::{
         ArtifactValidationOutcome,
         zip::{ZipArtifactEntry, ZipArtifactEntryMetadata, ZipArtifactReport},
     },
-    evidence::{Case, Node},
+    evidence::{Case, EvidenceStatus, Node},
+    job::MemoryError,
 };
 use std::collections::{HashMap, HashSet};
 
 pub(super) fn add_validated_archives<'a>(
     case: &'a Case,
-    nodes_by_id: &HashMap<u64, &'a Node>,
-    bytes_by_id: &HashMap<&'a str, &'a [u8]>,
-    parsed_edges: &HashSet<(u64, u64)>,
-    contains_member_edges: &HashSet<(u64, u64)>,
     validation: &mut SelectionValidation<'_, 'a>,
     specs: &mut HashMap<u64, ExportSpec>,
-) {
-    let structures_by_archive = archive_structures(case, nodes_by_id, parsed_edges);
+) -> Result<(), MemoryError> {
+    let structures_by_archive = archive_structures(case);
     let members_by_archive = archive_members(case);
     for (archive_id, structures) in structures_by_archive {
-        let Some(archive) = nodes_by_id.get(&archive_id).copied() else {
+        let Some(archive) = case.node(archive_id) else {
             continue;
         };
-        let Some(archive_bytes) = node_bytes(archive, bytes_by_id) else {
+        let Some(archive_bytes) = node_bytes(case, archive) else {
             continue;
         };
         let Some(blob_id) = archive.blob.as_deref() else {
             continue;
         };
-        let report = match validated_zip_report(validation, blob_id, archive_bytes) {
+        let report = match validated_zip_report(validation, blob_id, archive_bytes)? {
             Ok(report) => {
                 retain_validation_attempt(
                     specs,
@@ -82,22 +79,18 @@ pub(super) fn add_validated_archives<'a>(
         }
 
         add_validated_archive_members(
+            case,
             archive_id,
             &structures,
             &members_by_archive,
-            contains_member_edges,
             report,
-            bytes_by_id,
             specs,
         );
     }
+    Ok(())
 }
 
-fn archive_structures<'a>(
-    case: &'a Case,
-    nodes_by_id: &HashMap<u64, &Node>,
-    parsed_edges: &HashSet<(u64, u64)>,
-) -> HashMap<u64, Vec<&'a Node>> {
+fn archive_structures(case: &Case) -> HashMap<u64, Vec<&Node>> {
     let mut structures_by_archive: HashMap<u64, Vec<&Node>> = HashMap::new();
     for structure in case
         .nodes()
@@ -111,10 +104,15 @@ fn archive_structures<'a>(
         else {
             continue;
         };
-        if !parsed_edges.contains(&(archive_id, structure.id)) {
+        if !case.has_edge(
+            archive_id,
+            structure.id,
+            "parsed_as",
+            EvidenceStatus::Observed,
+        ) {
             continue;
         }
-        let Some(archive) = nodes_by_id.get(&archive_id).copied() else {
+        let Some(archive) = case.node(archive_id) else {
             continue;
         };
         if structure.blob != archive.blob {
@@ -151,12 +149,11 @@ fn archive_members(case: &Case) -> HashMap<u64, Vec<&Node>> {
 }
 
 pub(super) fn add_validated_archive_members(
+    case: &Case,
     archive_id: u64,
     structures: &[&Node],
     members_by_archive: &HashMap<u64, Vec<&Node>>,
-    contains_member_edges: &HashSet<(u64, u64)>,
     report: &ZipArtifactReport,
-    bytes_by_id: &HashMap<&str, &[u8]>,
     specs: &mut HashMap<u64, ExportSpec>,
 ) {
     let structure_ids: HashSet<u64> = structures.iter().map(|node| node.id).collect();
@@ -169,7 +166,12 @@ pub(super) fn add_validated_archive_members(
         .map(|entry| (entry.metadata.index, entry))
         .collect();
     for member in members {
-        if !contains_member_edges.contains(&(archive_id, member.id)) {
+        if !case.has_edge(
+            archive_id,
+            member.id,
+            "contains_member",
+            EvidenceStatus::Observed,
+        ) {
             continue;
         }
         let Some(structure_id) = member
@@ -193,7 +195,7 @@ pub(super) fn add_validated_archive_members(
         let Some(entry) = entries_by_index.get(&entry_index).copied() else {
             continue;
         };
-        let Some(member_bytes) = node_bytes(member, bytes_by_id) else {
+        let Some(member_bytes) = node_bytes(case, member) else {
             continue;
         };
         if !archive_member_matches(member, entry, member_bytes) {
@@ -346,42 +348,48 @@ fn validated_zip_report<'cache, 'case>(
     validation: &'cache mut SelectionValidation<'_, 'case>,
     blob_id: &'case str,
     bytes: &'case [u8],
-) -> Result<&'cache ZipArtifactReport, StructuralValidation> {
-    match validation.validate_as(blob_id, ArtifactValidationFormat::Zip, bytes) {
-        ArtifactValidationOutcome::Validated {
-            format: ArtifactValidationFormat::Zip,
-            range,
-            boundary: ArtifactBoundaryEvidence::ZipEndRecord,
-            structure: ArtifactStructure::Zip(report),
-        } if *range == complete_range(bytes) => Ok(report),
-        ArtifactValidationOutcome::Validated { .. } => Err(StructuralValidation::outcome(
-            StructuralValidationStatus::Unknown,
-            Some("zip_structure"),
-            None,
-        )),
-        ArtifactValidationOutcome::BoundaryUnproven { format, .. } => {
-            Err(StructuralValidation::outcome(
-                StructuralValidationStatus::BoundaryUnproven,
-                Some(validation_format_label(*format, "zip_structure")),
+) -> Result<Result<&'cache ZipArtifactReport, StructuralValidation>, MemoryError> {
+    Ok(
+        match validation.validate_as(blob_id, ArtifactValidationFormat::Zip, bytes)? {
+            ArtifactValidationOutcome::Validated {
+                format: ArtifactValidationFormat::Zip,
+                range,
+                boundary: ArtifactBoundaryEvidence::ZipEndRecord,
+                structure: ArtifactStructure::Zip(report),
+            } if *range == complete_range(bytes) => Ok(report),
+            ArtifactValidationOutcome::Validated { .. } => Err(StructuralValidation::outcome(
+                StructuralValidationStatus::Unknown,
+                Some("zip_structure"),
                 None,
-            ))
-        }
-        ArtifactValidationOutcome::Rejected { format, .. } => Err(StructuralValidation::outcome(
-            StructuralValidationStatus::Rejected,
-            Some(validation_format_label(*format, "zip_structure")),
-            None,
-        )),
-        ArtifactValidationOutcome::Unsupported { .. } => Err(StructuralValidation::outcome(
-            StructuralValidationStatus::Unsupported,
-            Some("zip_structure"),
-            None,
-        )),
-        ArtifactValidationOutcome::Omitted { format, .. } => Err(StructuralValidation::outcome(
-            StructuralValidationStatus::Omitted,
-            Some((*format).map_or("zip_structure", |format| {
-                validation_format_label(format, "zip_structure")
-            })),
-            None,
-        )),
-    }
+            )),
+            ArtifactValidationOutcome::BoundaryUnproven { format, .. } => {
+                Err(StructuralValidation::outcome(
+                    StructuralValidationStatus::BoundaryUnproven,
+                    Some(validation_format_label(*format, "zip_structure")),
+                    None,
+                ))
+            }
+            ArtifactValidationOutcome::Rejected { format, .. } => {
+                Err(StructuralValidation::outcome(
+                    StructuralValidationStatus::Rejected,
+                    Some(validation_format_label(*format, "zip_structure")),
+                    None,
+                ))
+            }
+            ArtifactValidationOutcome::Unsupported { .. } => Err(StructuralValidation::outcome(
+                StructuralValidationStatus::Unsupported,
+                Some("zip_structure"),
+                None,
+            )),
+            ArtifactValidationOutcome::Omitted { format, .. } => {
+                Err(StructuralValidation::outcome(
+                    StructuralValidationStatus::Omitted,
+                    Some((*format).map_or("zip_structure", |format| {
+                        validation_format_label(format, "zip_structure")
+                    })),
+                    None,
+                ))
+            }
+        },
+    )
 }

@@ -198,7 +198,10 @@ fn validation_receipts_require_and_retain_the_shared_publication_charge() -> Tes
     let budget = MemoryBudget::new(64 * 1024);
     let analysis = analysis_with_one_record(&budget)?;
     let baseline = budget.snapshot()?.used_bytes;
-    let blocker = budget.try_reserve(MemoryClass::Cache, budget.snapshot()?.limit_bytes - baseline)?;
+    let blocker = budget.try_reserve(
+        MemoryClass::Cache,
+        budget.snapshot()?.limit_bytes - baseline,
+    )?;
 
     let error = analysis
         .analyzer_validation_receipts()

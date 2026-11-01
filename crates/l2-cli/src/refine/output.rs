@@ -1,10 +1,10 @@
 //! Refinement identity, provenance manifest, and user-facing summaries
 
 use super::{
-    analysis_memory,
     analysis::{
         CACHE_ANALYSIS_SCHEMA_VERSION, REFINE_ANALYZER_ALGORITHM_VERSION, recovery_profile_name,
     },
+    analysis_memory,
     file_artifact::{FileArtifact, FileOrigin},
     input::LoadedSource,
     invalid_input,

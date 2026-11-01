@@ -2,7 +2,7 @@
 
 use super::{
     naming::safe_extension,
-    selection::{node_bytes, observed_edges},
+    selection::node_bytes,
     validation::{
         SelectionValidation, StructuralValidation, StructuralValidationStatus,
         boundary_matches_format, complete_range, validation_format_label,
@@ -10,7 +10,8 @@ use super::{
 };
 use l2_workbench::{
     artifact::{ArtifactValidationFormat, ArtifactValidationOutcome},
-    evidence::{Case, Node},
+    evidence::{Case, EvidenceStatus, Node},
+    job::MemoryError,
 };
 use std::collections::HashMap;
 
@@ -26,12 +27,9 @@ struct SignatureSourceEvidence {
 }
 pub(super) fn record_signature_extensions<'a>(
     case: &'a Case,
-    nodes_by_id: &HashMap<u64, &'a Node>,
-    bytes_by_id: &HashMap<&'a str, &'a [u8]>,
     validation: &mut SelectionValidation<'_, 'a>,
-) -> HashMap<u64, SignatureExtension> {
+) -> Result<HashMap<u64, SignatureExtension>, MemoryError> {
     let mut extensions_by_node: HashMap<u64, SignatureExtension> = HashMap::new();
-    let contains_signature_edges = observed_edges(case, "contains_signature");
     let mut signature_sources: HashMap<&str, SignatureSourceEvidence> = HashMap::new();
     for evidence in case.nodes().iter().filter(|candidate| {
         candidate.kind == "file_signature_match"
@@ -53,16 +51,21 @@ pub(super) fn record_signature_extensions<'a>(
         else {
             continue;
         };
-        let Some(input) = nodes_by_id.get(&node_id).copied() else {
+        let Some(input) = case.node(node_id) else {
             continue;
         };
-        if !contains_signature_edges.contains(&(input.id, evidence.id)) {
+        if !case.has_edge(
+            input.id,
+            evidence.id,
+            "contains_signature",
+            EvidenceStatus::Observed,
+        ) {
             continue;
         }
         let Some(blob_id) = input.blob.as_deref() else {
             continue;
         };
-        let Some(bytes) = node_bytes(input, bytes_by_id) else {
+        let Some(bytes) = node_bytes(case, input) else {
             continue;
         };
         let source_evidence = signature_sources.entry(blob_id).or_insert_with(|| {
@@ -81,7 +84,7 @@ pub(super) fn record_signature_extensions<'a>(
             continue;
         }
         let (extension, candidate_validation) =
-            signature_extension_validation(evidence, blob_id, bytes, validation);
+            signature_extension_validation(evidence, blob_id, bytes, validation)?;
 
         match extensions_by_node.get_mut(&node_id) {
             Some(existing) if existing.extension.is_none() && extension.is_some() => {
@@ -102,7 +105,7 @@ pub(super) fn record_signature_extensions<'a>(
             }
         }
     }
-    extensions_by_node
+    Ok(extensions_by_node)
 }
 
 fn signature_extension_validation<'a>(
@@ -110,7 +113,7 @@ fn signature_extension_validation<'a>(
     blob_id: &'a str,
     bytes: &'a [u8],
     validation: &mut SelectionValidation<'_, 'a>,
-) -> (Option<String>, StructuralValidation) {
+) -> Result<(Option<String>, StructuralValidation), MemoryError> {
     let mut extension = None;
     let mut validation_result = StructuralValidation::not_checked();
     for candidate in evidence
@@ -123,7 +126,7 @@ fn signature_extension_validation<'a>(
         .filter_map(safe_extension)
     {
         let (validated_extension, candidate_validation) =
-            validate_signature_extension(blob_id, &candidate, bytes, validation);
+            validate_signature_extension(blob_id, &candidate, bytes, validation)?;
         if validated_extension.is_some() {
             extension = validated_extension;
             validation_result = candidate_validation;
@@ -135,7 +138,7 @@ fn signature_extension_validation<'a>(
             validation_result = candidate_validation;
         }
     }
-    (extension, validation_result)
+    Ok((extension, validation_result))
 }
 
 fn signature_evidence_matches_input(
@@ -200,14 +203,14 @@ fn validate_signature_extension<'a>(
     candidate: &str,
     bytes: &'a [u8],
     validation: &mut SelectionValidation<'_, 'a>,
-) -> (Option<String>, StructuralValidation) {
+) -> Result<(Option<String>, StructuralValidation), MemoryError> {
     let (format, format_name) = match candidate {
         "der" => (ArtifactValidationFormat::Der, "der_structure"),
         "png" => (ArtifactValidationFormat::Png, "png_structure"),
         "zip" => (ArtifactValidationFormat::Zip, "zip_structure"),
-        _ => return (None, StructuralValidation::not_checked()),
+        _ => return Ok((None, StructuralValidation::not_checked())),
     };
-    match validation.validate_as(blob_id, format, bytes) {
+    Ok(match validation.validate_as(blob_id, format, bytes)? {
         ArtifactValidationOutcome::Validated {
             format: validated_format,
             range,
@@ -264,5 +267,5 @@ fn validate_signature_extension<'a>(
                 None,
             ),
         ),
-    }
+    })
 }
