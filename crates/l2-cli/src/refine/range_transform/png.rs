@@ -1,7 +1,7 @@
 //! Validate derived PNG spools through the shared streaming parser
 
-use super::super::file_artifact::DerivedFile;
-use super::{JobReader, StreamContext, StreamObject, archive::next_index, omit};
+use super::super::file_artifact::DerivedArtifact;
+use super::{JobReader, StreamContext, StreamObject, archive::next_index, omit, omit_formatted};
 use l2_workbench::{
     artifact::{
         FileRange, PNG_SIGNATURE, PngLimits, PngRangeChunk, PngReadError, StreamPngBoundary,
@@ -26,7 +26,7 @@ mod tests;
 
 pub(super) fn inspect_png(
     context: &mut StreamContext<'_>,
-    mut object: StreamObject,
+    object: StreamObject,
 ) -> Result<Option<StreamObject>, Box<dyn Error>> {
     let prefix = object
         .observation
@@ -36,29 +36,31 @@ pub(super) fn inspect_png(
     if !prefix.starts_with(&PNG_SIGNATURE) {
         return Ok(Some(object));
     }
+    let length = object
+        .derived
+        .steps
+        .last()
+        .ok_or("stream receipt is missing")?
+        .output_length;
     // Admit the parser buffer and chunk records before reading the spool
     let scratch = context
         .memory
         .try_reserve(MemoryClass::Executor, PNG_BUFFER_BYTES)?;
     let mut metadata = context.memory.try_reserve(MemoryClass::Executor, 0)?;
     let limits = PngLimits {
-        max_input_bytes: object.receipt.output_length,
+        max_input_bytes: length,
         max_chunks: PngLimits::default().max_chunks.min(
             (context.options.limits.max_input_bytes / std::mem::size_of::<PngRangeChunk>()).max(1),
         ),
     };
-    object.file.seek(SeekFrom::Start(0))?;
+    let mut file = object.derived.spool.file.try_clone()?;
+    file.seek(SeekFrom::Start(0))?;
     let reader = JobReader {
-        inner: &mut object.file,
+        inner: &mut file,
         job: context.job,
     };
     let mut reader = WorkHashReader::new(reader, &mut context.budget.work);
-    let result = parse_png_from_reader_with_memory(
-        &mut reader,
-        object.receipt.output_length,
-        limits,
-        &mut metadata,
-    );
+    let result = parse_png_from_reader_with_memory(&mut reader, length, limits, &mut metadata);
     let (work, digest) = reader.finish();
     context.report.work_bytes = context
         .report
@@ -73,17 +75,17 @@ pub(super) fn inspect_png(
                 None,
                 "derived PNG inspection exceeded the stream work limit",
             )?;
-            return Ok(None);
+            return Ok(Some(object));
         }
         Err(PngReadError::Io(error)) => return Err(error.into()),
         Err(PngReadError::Memory(error)) => return Err(error.into()),
         Err(PngReadError::Format(error)) => {
-            omit(
+            omit_formatted(
                 context,
                 None,
-                &format!("derived PNG validation failed: {error}"),
+                format_args!("derived PNG validation failed: {error}"),
             )?;
-            return Ok(None);
+            return Ok(Some(object));
         }
     };
     // The parser stops at IEND, so its read digest covers exactly the PNG prefix
@@ -98,13 +100,13 @@ pub(super) fn inspect_png(
     drop(parsed);
     drop(metadata);
     drop(scratch);
-    retain_png(context, object, boundary)?;
-    Ok(None)
+    retain_png(context, &object, boundary)?;
+    Ok(Some(object))
 }
 
 fn retain_png(
     context: &mut StreamContext<'_>,
-    object: StreamObject,
+    object: &StreamObject,
     boundary: StreamPngBoundary,
 ) -> Result<(), Box<dyn Error>> {
     let Some((index, _)) = next_index(context)? else {
@@ -118,11 +120,7 @@ fn retain_png(
         context.source,
         &source_sha256,
         boundary,
-        DerivedFile {
-            file: object.file,
-            steps: object.steps,
-            memory: object.memory,
-        },
+        DerivedArtifact::new(object.derived.clone(), context.memory, 1)?,
     )?;
     context.job.increment(Counter::ValidatedArtifacts, 1)?;
     Ok(())
@@ -140,7 +138,7 @@ impl fmt::Display for WorkLimit {
 impl Error for WorkLimit {}
 
 fn is_work_limit(error: &io::Error) -> bool {
-    error.get_ref().is_some_and(|cause| cause.is::<WorkLimit>())
+    matches!(error.get_ref(), Some(cause) if cause.is::<WorkLimit>())
 }
 
 struct WorkHashReader<'a, R> {

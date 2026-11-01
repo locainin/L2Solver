@@ -254,6 +254,7 @@ fn range_zip_expansion_is_admitted_before_member_reads_and_retries_without_omiss
         crate::refine::input::prepare_input_set_with_limit(&input_path, u64::MAX, &job, &memory)?;
     let mut file = fs::File::open(&input_path)?;
     let mut retained = memory.try_reserve(MemoryClass::Executor, 0)?;
+    let mut omissions = memory.try_reserve(MemoryClass::Executor, 0)?;
     let held = memory.try_reserve(MemoryClass::Cache, 11 * 1024 * 1024)?;
     let before = memory.snapshot()?.used_bytes;
     let error = crate::refine::range_zip::inspect(
@@ -265,6 +266,7 @@ fn range_zip_expansion_is_admitted_before_member_reads_and_retries_without_omiss
         &input,
         &job,
         &mut retained,
+        &mut omissions,
     )
     .err()
     .ok_or("ZIP expansion ignored shared pressure")?;
@@ -296,6 +298,7 @@ fn range_zip_expansion_is_admitted_before_member_reads_and_retries_without_omiss
         &input,
         &job,
         &mut retained,
+        &mut omissions,
     )?
     .ok_or("retry did not inspect the ZIP")?;
     assert_eq!(archive.extracted_entry_count, 2);
@@ -310,6 +313,7 @@ fn range_zip_expansion_is_admitted_before_member_reads_and_retries_without_omiss
     assert!(retained.bytes() >= u64::try_from(large.len())?);
     drop(archive);
     drop(retained);
+    drop(omissions);
     drop(input);
     assert_eq!(memory.snapshot()?.used_bytes, 0);
     Ok(())
@@ -352,6 +356,7 @@ fn failed_zip_read_retains_expansion_work_already_charged() -> Result<(), Box<dy
     report.source_sha256.clone_from(&digest);
     report.source_length = bytes.len();
     let mut retained = memory.try_reserve(MemoryClass::Executor, 0)?;
+    let mut omissions = memory.try_reserve(MemoryClass::Executor, 0)?;
     let result = crate::refine::range_zip::inspect(
         &mut fs::File::open(&path)?,
         bytes.len(),
@@ -361,6 +366,7 @@ fn failed_zip_read_retains_expansion_work_already_charged() -> Result<(), Box<dy
         &input,
         &job,
         &mut retained,
+        &mut omissions,
     )?;
     assert!(
         result.is_none(),

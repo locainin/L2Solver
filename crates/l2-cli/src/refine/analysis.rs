@@ -1,8 +1,8 @@
 //! Bounded artifact analysis, per-input caching, and evidence-case construction
 
 use super::{
-    file_artifact::{DerivedFile, FileArtifact},
-    input::{InputSet, LoadedSource, SourceData},
+    file_artifact::{DerivedArtifact, FileArtifact},
+    input::{InputSet, LoadedSource, ReadOmission, SourceData},
     invalid_input,
     output::{ArtifactRecord, SourceRecord},
     policy::RefinePolicy,
@@ -16,7 +16,7 @@ use l2_workbench::{
     },
     evidence::{Case, MAX_NODES, SourceRange},
     job::{
-        CacheFallbackKind, CacheStage, Counter, Job, MemoryBudget, MemoryLease, Phase,
+        CacheFallbackKind, CacheStage, Counter, Job, MemoryBudget, MemoryClass, MemoryLease, Phase,
         cache::{Cache, CacheEntry, CacheReadPolicy, Lease, SourceIdentity, StageKey, StageStatus},
     },
     recovery::proposals::TRANSFORM_PROPOSAL_FORMAT_VERSION,
@@ -53,20 +53,7 @@ pub(super) fn analyze_sources(
             format!("analyzing {}", source.label.escape_debug()),
         )?;
         if let SourceData::Skipped(omission) = &source.data {
-            analysis.complete = false;
-            analysis.source_records.push(SourceRecord {
-                label: source.label.clone(),
-                sha256: None,
-                byte_length: omission.length,
-                status: AnalysisStatus::Partial,
-                omissions: vec![l2_workbench::artifact::AnalysisOmission::SourceReadLimit {
-                    length: u64::try_from(omission.length)?,
-                    required: omission.required,
-                    remaining: omission.remaining,
-                    maximum: omission.maximum,
-                }],
-                reason: Some(String::from("source read limit prevented analysis")),
-            });
+            analysis.append_skipped_source(source, *omission, memory)?;
             job.advance(Phase::TransformDiscovery, 1)?;
             continue;
         }
@@ -85,30 +72,37 @@ pub(super) fn analyze_sources(
                 .max_total_work_bytes
                 .min(streaming.work_remaining());
         }
-        let (report, _report_memory) = if source.bytes().is_some() && remaining == 0 {
-            (no_case_space(source, policy.case_blob_limit)?, None)
-        } else if source.bytes().is_some() {
-            (
-                analyze_source_cached(source, options, recovery, cache, job)?,
-                None,
-            )
-        } else {
-            let (report, lease) = analyze_file_source(FileAnalysis {
-                analysis: &mut analysis,
-                input: input_set,
-                source_index,
-                source,
-                options,
-                job,
-                memory,
-                streaming: &mut streaming,
-                profile: recovery.profile,
-            })?;
-            (report, Some(lease))
-        };
+        let (mut report, report_memory, omission_memory) =
+            if source.bytes().is_some() && remaining == 0 {
+                (no_case_space(source, policy.case_blob_limit)?, None, None)
+            } else if source.bytes().is_some() {
+                (
+                    analyze_source_cached(source, options, recovery, cache, job)?,
+                    None,
+                    None,
+                )
+            } else {
+                let (report, lease, omissions) = analyze_file_source(FileAnalysis {
+                    analysis: &mut analysis,
+                    input: input_set,
+                    source_index,
+                    source,
+                    options,
+                    job,
+                    memory,
+                    streaming: &mut streaming,
+                    profile: recovery.profile,
+                })?;
+                (report, Some(lease), Some(omissions))
+            };
         if source.bytes().is_some() {
             streaming.charge_range_work(report.work_bytes)?;
             streaming.charge_zip_work(report.zip_expanded_work_bytes)?;
+            // Source identity was reserved before analysis of any input began
+            report.work_bytes = report
+                .work_bytes
+                .checked_add(source.length())
+                .ok_or("source identity work overflows")?;
         }
         let expanded_members = report
             .artifacts
@@ -116,7 +110,8 @@ pub(super) fn analyze_sources(
             .flat_map(|artifact| &artifact.origins)
             .filter(|origin| matches!(origin, ArtifactOrigin::ArchiveMember { .. }))
             .count();
-        analysis.append_source(source_index, source, report)?;
+        analysis.append_source(source_index, source, report, omission_memory, memory)?;
+        drop(report_memory);
         job.advance(Phase::Expansion, u64::try_from(expanded_members)?)?;
         job.advance(Phase::TransformDiscovery, 1)?;
     }
@@ -137,7 +132,14 @@ struct FileAnalysis<'a> {
 
 fn analyze_file_source(
     context: FileAnalysis<'_>,
-) -> Result<(l2_workbench::artifact::ArtifactAnalysis, MemoryLease), Box<dyn Error>> {
+) -> Result<
+    (
+        l2_workbench::artifact::ArtifactAnalysis,
+        MemoryLease,
+        MemoryLease,
+    ),
+    Box<dyn Error>,
+> {
     let FileAnalysis {
         analysis,
         input,
@@ -166,8 +168,12 @@ fn analyze_file_source(
         memory,
         observation_work.is_some(),
     )?;
-    let (mut report, mut report_memory, observation) =
+    let retained =
         retain_source_formats(analysis, source_index, source, range, options, streaming)?;
+    let mut omission_memory = retained.omission_memory;
+    let mut report_memory = retained.report_memory;
+    let mut report = retained.report;
+    let observation = retained.observation;
     // Source hashing is required even when syntax observation is skipped
     report.work_bytes = report
         .work_bytes
@@ -186,19 +192,32 @@ fn analyze_file_source(
             job,
             memory,
             report_memory: &mut report_memory,
+            omission_memory: &mut omission_memory,
             budget: streaming,
+            profile,
         })?;
     } else {
-        report.omissions.try_reserve(1)?;
+        super::analysis_memory::reserve_omission(&mut report.omissions, &mut omission_memory)?;
+        let reason = super::analysis_memory::copy_message(
+            "stream observation work budget is exhausted",
+            &mut omission_memory,
+        )?;
         report.omissions.push(
             l2_workbench::artifact::AnalysisOmission::SourceStreamTransform {
                 operation: None,
-                reason: String::from("stream observation work budget is exhausted"),
+                reason,
             },
         );
     }
     record_analysis_work(job, &report)?;
-    Ok((report, report_memory))
+    Ok((report, report_memory, omission_memory))
+}
+
+struct RetainedSource {
+    report: l2_workbench::artifact::ArtifactAnalysis,
+    observation: Option<super::range_transform::Observation>,
+    report_memory: MemoryLease,
+    omission_memory: MemoryLease,
 }
 
 fn retain_source_formats(
@@ -208,14 +227,8 @@ fn retain_source_formats(
     range: super::input::RangeAnalysis,
     options: ArtifactAnalysisOptions,
     streaming: &mut super::range_transform::StreamingBudget,
-) -> Result<
-    (
-        l2_workbench::artifact::ArtifactAnalysis,
-        MemoryLease,
-        Option<super::range_transform::Observation>,
-    ),
-    Box<dyn Error>,
-> {
+) -> Result<RetainedSource, Box<dyn Error>> {
+    let mut omission_memory = range.omission_memory;
     let mut report = range.report;
     streaming.charge_range_work(report.work_bytes)?;
     let mut next_file_index = report.artifacts.len();
@@ -232,7 +245,13 @@ fn retain_source_formats(
             )?;
         }
         let previous_work = report.work_bytes;
-        super::range_members::append_members(&mut report, archive, parent_index, options)?;
+        super::range_members::append_members(
+            &mut report,
+            archive,
+            parent_index,
+            options,
+            &mut omission_memory,
+        )?;
         streaming.charge_range_work(
             report
                 .work_bytes
@@ -256,7 +275,12 @@ fn retain_source_formats(
         )?;
     }
     streaming.charge_zip_work(report.zip_expanded_work_bytes)?;
-    Ok((report, range.report_memory, range.observation))
+    Ok(RetainedSource {
+        report,
+        observation: range.observation,
+        report_memory: range.report_memory,
+        omission_memory,
+    })
 }
 
 fn no_case_space(
@@ -284,6 +308,7 @@ pub(super) struct AnalyzedSources {
     pub(super) artifact_records: Vec<ArtifactRecord>,
     pub(super) file_artifacts: Vec<FileArtifact>,
     pub(super) complete: bool,
+    pub(super) _source_records_memory: MemoryLease,
 }
 
 impl AnalyzedSources {
@@ -292,16 +317,26 @@ impl AnalyzedSources {
         source_count: usize,
         memory: &MemoryBudget,
     ) -> Result<Self, Box<dyn Error>> {
+        let bytes = source_count
+            .checked_mul(std::mem::size_of::<SourceRecord>())
+            .ok_or("source record memory overflows")?;
+        let mut source_records_memory =
+            memory.try_reserve(MemoryClass::Executor, u64::try_from(bytes)?)?;
         let mut source_records = Vec::new();
         source_records
             .try_reserve_exact(source_count)
             .map_err(|_| io::Error::other("source report allocation failed"))?;
+        super::analysis_memory::charge(
+            &mut source_records_memory,
+            (source_records.capacity() - source_count) * std::mem::size_of::<SourceRecord>(),
+        )?;
         Ok(Self {
             case: Case::with_blob_limit_and_memory_budget(case_blob_limit, memory)?,
             source_records,
             artifact_records: Vec::new(),
             file_artifacts: Vec::new(),
             complete: true,
+            _source_records_memory: source_records_memory,
         })
     }
 
@@ -338,14 +373,14 @@ impl AnalyzedSources {
         source: &LoadedSource,
         source_sha256: &str,
         archive: &l2_workbench::artifact::zip::ZipArtifactReport,
-        derived: DerivedFile,
+        derived: DerivedArtifact,
     ) -> Result<(), Box<dyn Error>> {
         let node_id = self.append_stream_node(
             source_index,
             artifact_index,
             source,
             source_sha256,
-            &derived.steps,
+            &derived.file.steps,
         )?;
         self.file_artifacts.try_reserve(1)?;
         self.file_artifacts.push(FileArtifact::derived_zip(
@@ -366,14 +401,14 @@ impl AnalyzedSources {
         source: &LoadedSource,
         source_sha256: &str,
         boundary: l2_workbench::artifact::StreamPngBoundary,
-        derived: DerivedFile,
+        derived: DerivedArtifact,
     ) -> Result<(), Box<dyn Error>> {
         let node_id = self.append_stream_node(
             source_index,
             artifact_index,
             source,
             source_sha256,
-            &derived.steps,
+            &derived.file.steps,
         )?;
         self.file_artifacts.try_reserve(1)?;
         self.file_artifacts.push(FileArtifact::derived_png(
@@ -384,6 +419,35 @@ impl AnalyzedSources {
             source.length(),
             derived,
         ));
+        Ok(())
+    }
+
+    pub(super) fn append_stream_ranges(
+        &mut self,
+        source_index: usize,
+        artifact_index: usize,
+        source: &LoadedSource,
+        source_sha256: &str,
+        artifact: &l2_workbench::artifact::AnalyzedArtifact,
+        derived: DerivedArtifact,
+    ) -> Result<(), Box<dyn Error>> {
+        let node_id = self.append_stream_node(
+            source_index,
+            artifact_index,
+            source,
+            source_sha256,
+            &derived.file.steps,
+        )?;
+        let file = FileArtifact::derived_ranges(
+            node_id,
+            source_index,
+            artifact_index,
+            source.length(),
+            artifact,
+            derived,
+        )?;
+        self.file_artifacts.try_reserve(1)?;
+        self.file_artifacts.push(file);
         Ok(())
     }
 
@@ -498,22 +562,78 @@ impl AnalyzedSources {
         Ok(receipts)
     }
 
+    fn append_skipped_source(
+        &mut self,
+        source: &LoadedSource,
+        omission: ReadOmission,
+        memory: &MemoryBudget,
+    ) -> Result<(), Box<dyn Error>> {
+        let mut lease = memory.try_reserve(MemoryClass::Executor, 0)?;
+        let mut omissions = Vec::new();
+        super::analysis_memory::reserve_omission(&mut omissions, &mut lease)?;
+        omissions.push(l2_workbench::artifact::AnalysisOmission::SourceReadLimit {
+            length: u64::try_from(omission.length)?,
+            required: omission.required,
+            remaining: omission.remaining,
+            maximum: omission.maximum,
+        });
+        let label = super::analysis_memory::copy_message(&source.label, &mut lease)?;
+        let reason = super::analysis_memory::copy_message(
+            "source read limit prevented analysis",
+            &mut lease,
+        )?;
+        self.complete = false;
+        self.source_records.push(SourceRecord {
+            label,
+            sha256: None,
+            byte_length: omission.length,
+            status: AnalysisStatus::Partial,
+            omissions,
+            work_bytes_charged: None,
+            zip_expanded_work_bytes_charged: None,
+            reason: Some(reason),
+            _omission_memory: lease,
+        });
+        Ok(())
+    }
+
     fn append_source(
         &mut self,
         source_index: usize,
         source: &LoadedSource,
         report: l2_workbench::artifact::ArtifactAnalysis,
+        omission_memory: Option<MemoryLease>,
+        memory: &MemoryBudget,
     ) -> Result<(), Box<dyn Error>> {
         self.append_artifacts(source_index, &report.artifacts)?;
+        let mut omission_memory = if let Some(lease) = omission_memory {
+            lease
+        } else {
+            let mut lease = memory.try_reserve(MemoryClass::Executor, 0)?;
+            super::analysis_memory::charge_existing_omissions(&report.omissions, &mut lease)?;
+            lease
+        };
+        let label = super::analysis_memory::copy_message(&source.label, &mut omission_memory)?;
+        let sha256 =
+            super::analysis_memory::copy_message(&report.source_sha256, &mut omission_memory)?;
+        // The fixed scratch bound covers the short formatted reason during construction
+        let reason_scratch = memory.try_reserve(MemoryClass::Executor, 1024)?;
         let reason = analysis_reason(&report);
+        if let Some(reason) = &reason {
+            super::analysis_memory::charge(&mut omission_memory, reason.capacity())?;
+        }
+        drop(reason_scratch);
         self.complete &= report.status == AnalysisStatus::Complete;
         self.source_records.push(SourceRecord {
-            label: source.label.clone(),
-            sha256: Some(report.source_sha256.clone()),
+            label,
+            sha256: Some(sha256),
             byte_length: report.source_length,
             status: report.status,
+            work_bytes_charged: Some(report.work_bytes),
+            zip_expanded_work_bytes_charged: Some(report.zip_expanded_work_bytes),
             omissions: report.omissions,
             reason,
+            _omission_memory: omission_memory,
         });
         Ok(())
     }

@@ -94,6 +94,12 @@ impl Observation {
         }
         Ok(operations)
     }
+
+    pub(super) fn gzip_header_observation_limited(&self, operations: &[Operation]) -> bool {
+        self.length > self.prefix_length
+            && self.prefix.starts_with(&[0x1f, 0x8b])
+            && !operations.contains(&Operation::GzipDecompress {})
+    }
 }
 
 pub(in crate::refine) struct ObservingReader<R> {

@@ -49,18 +49,126 @@ fn stream_reservation_admits_a_small_output_when_the_maximum_would_not_fit()
 
 #[test]
 fn queued_stream_metadata_requires_and_releases_shared_memory() -> Result<(), Box<dyn Error>> {
-    use super::super::{STREAM_OBJECT_MEMORY_BYTES, reserve_stream_object};
+    use super::super::reserve_stream_object;
+    use crate::refine::file_artifact::STREAM_METADATA_BYTES;
     use l2_workbench::job::{MemoryBudget, MemoryError};
-    let small = MemoryBudget::new(STREAM_OBJECT_MEMORY_BYTES - 1);
+    let small = MemoryBudget::new(STREAM_METADATA_BYTES - 1);
     assert!(matches!(
         reserve_stream_object(&small),
         Err(MemoryError::Limit { .. })
     ));
-    let budget = MemoryBudget::new(STREAM_OBJECT_MEMORY_BYTES);
+    let budget = MemoryBudget::new(STREAM_METADATA_BYTES);
     let lease = reserve_stream_object(&budget)?;
-    assert_eq!(budget.snapshot()?.used_bytes, STREAM_OBJECT_MEMORY_BYTES);
+    assert_eq!(budget.snapshot()?.used_bytes, STREAM_METADATA_BYTES);
     drop(lease);
     assert_eq!(budget.snapshot()?.used_bytes, 0);
+    Ok(())
+}
+
+#[test]
+fn streaming_omissions_require_memory_before_allocation() -> Result<(), Box<dyn Error>> {
+    use super::super::omit;
+    use l2_workbench::job::{MemoryClass, MemoryError};
+
+    let memory = MemoryBudget::new(1024 * 1024);
+    let job = Job::new("stream omission memory");
+    let mut budget = StreamingBudget {
+        work: 100_000,
+        output: 100_000,
+        zip: 0,
+        attempts: 1,
+    };
+    with_stream_source(b"source bytes", &job, &memory, &mut budget, |context| {
+        let available = memory.snapshot()?.limit_bytes - memory.snapshot()?.used_bytes;
+        let competing = memory.try_reserve(MemoryClass::Cache, available)?;
+        let error = omit(context, None, "stream omission needs memory")
+            .err()
+            .ok_or("omission allocation ignored memory pressure")?;
+        assert!(matches!(
+            error.downcast_ref::<MemoryError>(),
+            Some(MemoryError::Limit { .. })
+        ));
+        assert!(context.report.omissions.is_empty());
+        drop(competing);
+
+        for _ in 0..100 {
+            omit(context, None, "stream omission needs memory")?;
+        }
+        let records = context.report.omissions.capacity()
+            * std::mem::size_of::<l2_workbench::artifact::AnalysisOmission>();
+        let messages = context
+            .report
+            .omissions
+            .iter()
+            .map(|omission| match omission {
+                l2_workbench::artifact::AnalysisOmission::SourceStreamTransform {
+                    reason, ..
+                } => reason.capacity(),
+                _ => 0,
+            })
+            .sum::<usize>();
+        assert!(context.omission_memory.bytes() >= u64::try_from(records + messages)?);
+        Ok(())
+    })?;
+    assert_eq!(memory.snapshot()?.used_bytes, 0);
+    Ok(())
+}
+
+#[test]
+fn formatted_omission_requires_memory_before_growing_its_message() -> Result<(), Box<dyn Error>> {
+    use l2_workbench::job::{MemoryClass, MemoryError};
+
+    let memory = MemoryBudget::new(128);
+    let mut lease = memory.try_reserve(MemoryClass::Executor, 0)?;
+    let error = crate::refine::analysis_memory::format_message(
+        format_args!("archive entry {} failed", "x".repeat(256)),
+        &mut lease,
+    )
+    .err()
+    .ok_or("formatted message ignored memory pressure")?;
+    assert!(matches!(
+        error.downcast_ref::<MemoryError>(),
+        Some(MemoryError::Limit { .. })
+    ));
+    drop(lease);
+    assert_eq!(memory.snapshot()?.used_bytes, 0);
+    Ok(())
+}
+
+#[test]
+fn long_optional_gzip_header_reports_bounded_observation() -> Result<(), Box<dyn Error>> {
+    use super::super::ObservingReader;
+    use flate2::{Compression, GzBuilder};
+    use l2_workbench::recovery::proposals::{TransformProposalBudget, propose_transforms};
+    use std::io::{Read, Write};
+
+    let mut encoder = GzBuilder::new()
+        .extra(vec![0xa5; 5000])
+        .write(Vec::new(), Compression::fast());
+    encoder.write_all(b"a valid gzip payload")?;
+    let gzip = encoder.finish()?;
+    let proposals = propose_transforms(
+        &gzip,
+        TransformProposalBudget {
+            max_candidates: 7,
+            max_reports: 0,
+        },
+    );
+    assert!(
+        proposals.proposals.iter().any(|proposal| {
+            proposal.recipe.steps.first() == Some(&Operation::GzipDecompress {})
+        })
+    );
+    let mut observed = ObservingReader::new(gzip.as_slice(), true);
+    std::io::copy(&mut observed, &mut std::io::sink())?;
+    let observation = observed.finish().ok_or("observation missing")?;
+    let operations = observation.operations()?;
+    assert!(!operations.contains(&Operation::GzipDecompress {}));
+    assert!(observation.gzip_header_observation_limited(&operations));
+    let mut inflater = flate2::read::GzDecoder::new(gzip.as_slice());
+    let mut decoded = String::new();
+    inflater.read_to_string(&mut decoded)?;
+    assert_eq!(decoded, "a valid gzip payload");
     Ok(())
 }
 
@@ -181,6 +289,32 @@ fn zip_expansion_from_earlier_sources_reduces_the_shared_budget() -> Result<(), 
     assert_eq!(budget.zip, 3);
     budget.charge_zip_work(3)?;
     assert_eq!(budget.zip, 0);
+    Ok(())
+}
+
+#[test]
+fn derived_ranges_share_the_spools_reserved_publication_work() -> Result<(), Box<dyn Error>> {
+    use super::super::ranges::reserve_publication;
+    let bytes = vec![b'a'; 32];
+    let memory = MemoryBudget::new(1024 * 1024);
+    let job = Job::new("derived range publication work");
+    let mut budget = StreamingBudget {
+        work: 5,
+        output: 100,
+        zip: 0,
+        attempts: 1,
+    };
+    with_stream_source(&bytes, &job, &memory, &mut budget, |context| {
+        let mut reserved = 10;
+        assert!(reserve_publication(context, 12, &mut reserved)?);
+        assert_eq!(reserved, 0);
+        assert_eq!(context.budget.work, 3);
+        assert_eq!(context.report.work_bytes, 2);
+        assert!(!reserve_publication(context, 4, &mut reserved)?);
+        assert_eq!(context.budget.work, 3);
+        assert_eq!(context.report.omissions.len(), 1);
+        Ok(())
+    })?;
     Ok(())
 }
 
@@ -345,12 +479,14 @@ fn with_stream_source(
     let sources = crate::refine::read_sources(&input, 1, 1, job)?;
     let source = sources.first().ok_or("source missing")?;
     let mut report_memory = memory.try_reserve(MemoryClass::Executor, 0)?;
+    let mut omission_memory = memory.try_reserve(MemoryClass::Executor, 0)?;
     let mut analysis = AnalyzedSources {
         case: Case::with_blob_limit_and_memory_budget(4096, memory)?,
         source_records: Vec::new(),
         artifact_records: Vec::new(),
         file_artifacts: Vec::new(),
         complete: true,
+        _source_records_memory: memory.try_reserve(MemoryClass::Executor, 0)?,
     };
     let mut report = ArtifactAnalysis {
         source_sha256: l2_workbench::sha256(bytes),
@@ -375,7 +511,9 @@ fn with_stream_source(
         job,
         memory,
         report_memory: &mut report_memory,
+        omission_memory: &mut omission_memory,
         budget,
+        profile: crate::arguments::RecoveryProfile::Normal,
     };
     action(&mut context)
 }

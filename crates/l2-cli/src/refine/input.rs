@@ -154,8 +154,8 @@ impl InputSet {
                 let mut reader = CancellableReader::new(source_copy, job);
                 copy_verified_range(&mut reader, &mut target, artifact, buffer)?;
             }
-            FileBacking::Spool { file, .. } => {
-                let mut spool = file.try_clone()?;
+            FileBacking::Spool(spool) => {
+                let mut spool = spool.file.try_clone()?;
                 spool.seek(SeekFrom::Start(u64::try_from(artifact.range.offset)?))?;
                 let mut reader = PrivateReader { inner: spool, job };
                 copy_verified_range(&mut reader, &mut target, artifact, buffer)?;
@@ -264,6 +264,7 @@ pub(super) struct RangeAnalysis {
     pub(super) png: Option<l2_workbench::artifact::StreamPngBoundary>,
     pub(super) observation: Option<super::range_transform::Observation>,
     pub(super) report_memory: MemoryLease,
+    pub(super) omission_memory: MemoryLease,
 }
 
 impl LoadedSource {
@@ -331,7 +332,7 @@ impl LoadedSource {
         &self,
         input_set: &InputSet,
         source_index: usize,
-        options: l2_workbench::artifact::ArtifactAnalysisOptions,
+        mut options: l2_workbench::artifact::ArtifactAnalysisOptions,
         job: &Job,
         memory: &MemoryBudget,
         observe_transforms: bool,
@@ -343,16 +344,12 @@ impl LoadedSource {
             .sources
             .get(source_index)
             .ok_or_else(|| invalid_input("range source index is missing"))?;
-        let mut file = open_identity_source(input_set, spec)?;
-        if metadata_fingerprint(&file.metadata()?) != source.metadata {
-            return Err(invalid_input(
-                "input artifact changed before range analysis",
-            ));
-        }
-        let zip_candidate = super::range_zip::probe_tail(
+        let mut file = open_range_source(input_set, spec, source)?;
+        let complete_work_limit = options.limits.max_total_work_bytes;
+        let tail = probe_source_tail(
             &mut file,
             source.length,
-            options.limits.max_input_bytes,
+            &mut options,
             input_set,
             job,
             memory,
@@ -364,10 +361,16 @@ impl LoadedSource {
                 .ok_or_else(|| invalid_input("source read length overflows"))?,
         )?;
         let mut reader = CancellableReader::new(file, job);
-        let checkpoint = zip_candidate
+        let checkpoint = tail
+            .candidate
             .as_ref()
             .and_then(|candidate| (candidate.length < source.length).then_some(candidate.length));
-        let (scanned, mut report_memory, observation) = analyze_source_stream(
+        let ScannedSource {
+            mut report_memory,
+            mut omission_memory,
+            scanned,
+            observation,
+        } = analyze_source_stream(
             &mut reader,
             source.length,
             options,
@@ -376,24 +379,20 @@ impl LoadedSource {
             observe_transforms,
         )?;
         let mut report = scanned.analysis;
+        record_tail_work(
+            &mut report,
+            &mut omission_memory,
+            tail.work_bytes,
+            tail.omission,
+        )?;
         let mut png = scanned.png;
+        options.limits.max_total_work_bytes = complete_work_limit;
         let mut file = reader.into_inner();
-        if metadata_fingerprint(&file.metadata()?) != source.metadata {
-            return Err(invalid_input(
-                "input artifact changed during range analysis",
-            ));
-        }
-        if spec
-            .expected_sha256
-            .as_ref()
-            .is_some_and(|expected| expected != &report.source_sha256)
-        {
-            return Err(invalid_input("artifact hash does not match its manifest"));
-        }
+        confirm_range_content(&file, source, spec, &report.source_sha256)?;
         let (archive, retain_source) = inspect_source_archive(
             &mut file,
             ObservedArchiveEnds {
-                tail: zip_candidate,
+                tail: tail.candidate,
                 prefix_sha256: scanned.prefix_sha256,
                 stream: scanned.zip_observation,
             },
@@ -401,15 +400,10 @@ impl LoadedSource {
             options,
             input_set,
             job,
-            &mut report_memory,
+            (&mut report_memory, &mut omission_memory),
         )?;
-        png = retain_png_range(png, &mut report, input_set)?;
-        if metadata_fingerprint(&file.metadata()?) != source.metadata {
-            return Err(invalid_input(
-                "input artifact changed during range analysis",
-            ));
-        }
-        confirm_range_source_name(input_set, spec, source)?;
+        png = retain_png_range(png, &mut report, input_set, &mut omission_memory)?;
+        confirm_range_source_after_analysis(&file, input_set, spec, source)?;
         Ok(RangeAnalysis {
             report,
             archive,
@@ -417,14 +411,136 @@ impl LoadedSource {
             png,
             observation,
             report_memory,
+            omission_memory,
         })
     }
+}
+
+fn open_range_source(
+    input: &InputSet,
+    spec: &InputSpec,
+    source: &RangeSource,
+) -> Result<File, Box<dyn Error>> {
+    let file = open_identity_source(input, spec)?;
+    if metadata_fingerprint(&file.metadata()?) != source.metadata {
+        return Err(invalid_input(
+            "input artifact changed before range analysis",
+        ));
+    }
+    Ok(file)
+}
+
+fn confirm_range_content(
+    file: &File,
+    source: &RangeSource,
+    spec: &InputSpec,
+    sha256: &str,
+) -> Result<(), Box<dyn Error>> {
+    if metadata_fingerprint(&file.metadata()?) != source.metadata {
+        return Err(invalid_input(
+            "input artifact changed during range analysis",
+        ));
+    }
+    if spec
+        .expected_sha256
+        .as_deref()
+        .is_some_and(|expected| expected != sha256)
+    {
+        return Err(invalid_input("artifact hash does not match its manifest"));
+    }
+    Ok(())
+}
+
+fn confirm_range_source_after_analysis(
+    file: &File,
+    input: &InputSet,
+    spec: &InputSpec,
+    source: &RangeSource,
+) -> Result<(), Box<dyn Error>> {
+    if metadata_fingerprint(&file.metadata()?) != source.metadata {
+        return Err(invalid_input(
+            "input artifact changed during range analysis",
+        ));
+    }
+    confirm_range_source_name(input, spec, source)
+}
+
+struct SourceTail {
+    candidate: Option<super::range_zip::ZipCandidate>,
+    work_bytes: usize,
+    omission: Option<&'static str>,
+}
+
+fn probe_source_tail(
+    file: &mut File,
+    length: usize,
+    options: &mut l2_workbench::artifact::ArtifactAnalysisOptions,
+    input: &InputSet,
+    job: &Job,
+    memory: &MemoryBudget,
+) -> Result<SourceTail, Box<dyn Error>> {
+    let result = super::range_zip::probe_tail(
+        file,
+        length,
+        options.limits.max_input_bytes,
+        input,
+        job,
+        memory,
+        options.limits.max_total_work_bytes.saturating_sub(1),
+    )?;
+    let (candidate, work_bytes, omission) = match result {
+        super::range_zip::TailProbe::Skipped => (None, 0, None),
+        super::range_zip::TailProbe::ReadLimit => {
+            (None, 0, Some("ZIP tail hint exceeds the source read limit"))
+        }
+        super::range_zip::TailProbe::WorkLimit => (
+            None,
+            0,
+            Some("ZIP tail hint exceeds the remaining work limit"),
+        ),
+        super::range_zip::TailProbe::Scanned {
+            candidate,
+            work_bytes,
+        } => {
+            options.limits.max_total_work_bytes -= work_bytes;
+            (candidate, work_bytes, None)
+        }
+    };
+    Ok(SourceTail {
+        candidate,
+        work_bytes,
+        omission,
+    })
+}
+
+fn record_tail_work(
+    report: &mut l2_workbench::artifact::ArtifactAnalysis,
+    memory: &mut MemoryLease,
+    work_bytes: usize,
+    omission: Option<&str>,
+) -> Result<(), Box<dyn Error>> {
+    report.work_bytes = report
+        .work_bytes
+        .checked_add(work_bytes)
+        .ok_or("ZIP tail work overflows")?;
+    if let Some(message) = omission {
+        super::analysis_memory::reserve_omission(&mut report.omissions, memory)?;
+        let reason = super::analysis_memory::copy_message(message, memory)?;
+        report.omissions.push(
+            l2_workbench::artifact::AnalysisOmission::SourceRangeValidationLimit {
+                format: l2_workbench::artifact::AnalysisFormat::Zip,
+                reason,
+            },
+        );
+    }
+    Ok(())
 }
 
 fn retain_png_range(
     png: Option<l2_workbench::artifact::StreamPngBoundary>,
     report: &mut l2_workbench::artifact::ArtifactAnalysis,
     input: &InputSet,
+    omission_memory: &mut MemoryLease,
 ) -> Result<Option<l2_workbench::artifact::StreamPngBoundary>, Box<dyn Error>> {
     let Some(boundary) = png else { return Ok(None) };
     if report.artifacts.iter().any(|artifact| {
@@ -436,6 +552,7 @@ fn retain_png_range(
     if input.reserve_source_output(length)? {
         return Ok(Some(boundary));
     }
+    super::analysis_memory::reserve_omission(&mut report.omissions, omission_memory)?;
     report.omissions.push(
         l2_workbench::artifact::AnalysisOmission::SourceRangeOutputReadLimit {
             length,
@@ -446,6 +563,13 @@ fn retain_png_range(
     Ok(None)
 }
 
+struct ScannedSource {
+    scanned: l2_workbench::artifact::StreamSourceAnalysis,
+    observation: Option<super::range_transform::Observation>,
+    report_memory: MemoryLease,
+    omission_memory: MemoryLease,
+}
+
 fn analyze_source_stream(
     reader: &mut impl Read,
     length: usize,
@@ -453,14 +577,7 @@ fn analyze_source_stream(
     checkpoint: Option<usize>,
     memory: &MemoryBudget,
     observe_transforms: bool,
-) -> Result<
-    (
-        l2_workbench::artifact::StreamSourceAnalysis,
-        MemoryLease,
-        Option<super::range_transform::Observation>,
-    ),
-    Box<dyn Error>,
-> {
+) -> Result<ScannedSource, Box<dyn Error>> {
     let mut signature = [0_u8; l2_workbench::artifact::PNG_SIGNATURE.len()];
     let count = length.min(signature.len());
     let prefix = signature
@@ -470,6 +587,7 @@ fn analyze_source_stream(
     // Feed the already-read prefix to the analyzer without reopening the source
     let is_png = count == signature.len() && signature == l2_workbench::artifact::PNG_SIGNATURE;
     let (scratch, mut retained) = super::analysis_memory::reserve(memory, length, options, is_png)?;
+    let mut omissions = memory.try_reserve(MemoryClass::Executor, 0)?;
     let prefix = signature
         .get(..count)
         .ok_or_else(|| invalid_input("source prefix length is invalid"))?;
@@ -512,11 +630,18 @@ fn analyze_source_stream(
         }),
     )
     .map_err(stream_error)?;
+    // Scanner scratch covers these records until their retained lease is charged
+    super::analysis_memory::charge_existing_omissions(&result.analysis.omissions, &mut omissions)?;
     drop(scratch);
-    Ok((result, retained, complete.finish()))
+    Ok(ScannedSource {
+        scanned: result,
+        observation: complete.finish(),
+        report_memory: retained,
+        omission_memory: omissions,
+    })
 }
 
-fn stream_error(error: io::Error) -> Box<dyn Error> {
+pub(super) fn stream_error(error: io::Error) -> Box<dyn Error> {
     if let Some(memory) = error
         .get_ref()
         .and_then(|source| source.downcast_ref::<MemoryError>())
@@ -559,17 +684,61 @@ fn inspect_source_archive(
     options: l2_workbench::artifact::ArtifactAnalysisOptions,
     input: &InputSet,
     job: &Job,
-    memory: &mut MemoryLease,
+    memory: (&mut MemoryLease, &mut MemoryLease),
 ) -> Result<(Option<l2_workbench::artifact::zip::ZipArtifactReport>, bool), Box<dyn Error>> {
+    let (memory, omission_memory) = memory;
+    let candidates = source_zip_candidates(ends, report, omission_memory)?;
+    for candidate in candidates {
+        let Some(archive) = super::range_zip::inspect(
+            file,
+            candidate.end,
+            &candidate.sha256,
+            report,
+            options,
+            input,
+            job,
+            memory,
+            omission_memory,
+        )?
+        else {
+            continue;
+        };
+        let length = u64::try_from(candidate.end)?;
+        let retain = input.reserve_source_output(length)?;
+        if !retain {
+            super::analysis_memory::reserve_omission(&mut report.omissions, omission_memory)?;
+            report.omissions.push(
+                l2_workbench::artifact::AnalysisOmission::SourceRangeOutputReadLimit {
+                    length,
+                    remaining: input.extra_read_bytes(),
+                    maximum: input.budget.maximum(),
+                },
+            );
+        }
+        return Ok((Some(archive), retain));
+    }
+    Ok((None, false))
+}
+
+fn source_zip_candidates(
+    ends: ObservedArchiveEnds,
+    report: &mut l2_workbench::artifact::ArtifactAnalysis,
+    omission_memory: &mut MemoryLease,
+) -> Result<Vec<l2_workbench::artifact::StreamZipEnd>, Box<dyn Error>> {
     let mut candidates = if let Some(observation) = ends.stream {
         if observation.unscanned_bytes > 0 || observation.omitted_candidates > 0 {
+            super::analysis_memory::reserve_omission(&mut report.omissions, omission_memory)?;
+            let reason = super::analysis_memory::format_message(
+                format_args!(
+                    "ZIP end observation left {} bytes unscanned and omitted {} candidates",
+                    observation.unscanned_bytes, observation.omitted_candidates
+                ),
+                omission_memory,
+            )?;
             report.omissions.push(
                 l2_workbench::artifact::AnalysisOmission::SourceRangeValidationLimit {
                     format: l2_workbench::artifact::AnalysisFormat::Zip,
-                    reason: format!(
-                        "ZIP end observation left {} bytes unscanned and omitted {} candidates",
-                        observation.unscanned_bytes, observation.omitted_candidates
-                    ),
+                    reason,
                 },
             );
         }
@@ -598,44 +767,20 @@ fn inspect_source_archive(
         }
     }
     if multiple || candidates.len() > 1 {
+        super::analysis_memory::reserve_omission(&mut report.omissions, omission_memory)?;
+        let reason = super::analysis_memory::copy_message(
+            "multiple ZIP end boundaries were found; candidates were checked until one validated",
+            omission_memory,
+        )?;
         report.omissions.push(
             l2_workbench::artifact::AnalysisOmission::SourceRangeValidationLimit {
                 format: l2_workbench::artifact::AnalysisFormat::Zip,
-                reason: String::from(
-                    "multiple ZIP end boundaries were found; candidates were checked until one validated",
-                ),
+                reason,
             },
         );
     }
     candidates.sort_unstable_by_key(|candidate| std::cmp::Reverse(candidate.end));
-    for candidate in candidates {
-        let Some(archive) = super::range_zip::inspect(
-            file,
-            candidate.end,
-            &candidate.sha256,
-            report,
-            options,
-            input,
-            job,
-            memory,
-        )?
-        else {
-            continue;
-        };
-        let length = u64::try_from(candidate.end)?;
-        let retain = input.reserve_source_output(length)?;
-        if !retain {
-            report.omissions.push(
-                l2_workbench::artifact::AnalysisOmission::SourceRangeOutputReadLimit {
-                    length,
-                    remaining: input.extra_read_bytes(),
-                    maximum: input.budget.maximum(),
-                },
-            );
-        }
-        return Ok((Some(archive), retain));
-    }
-    Ok((None, false))
+    Ok(candidates)
 }
 
 pub(super) struct CancellableReader<'a, R> {

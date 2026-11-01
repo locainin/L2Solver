@@ -322,6 +322,21 @@ pub enum AnalysisOmission {
         /// Source positions without a complete bounded-object discovery window
         uncovered_range: Option<FileRange>,
     },
+    /// Coverage of bounded object discovery within one transformed stream
+    DerivedStreamRangeCoverage {
+        /// SHA-256 of the complete transformed stream
+        output_sha256: String,
+        /// Largest object guaranteed to fit within overlapping stream windows
+        max_object_bytes: usize,
+        /// Candidate observations omitted by configured budgets
+        omitted_candidates: usize,
+        /// ZIP candidates stopped before directory parsing by the entry-count limit
+        zip_entry_count_limited: usize,
+        /// Retained objects whose signature scan did not fit its budget
+        signature_scans_omitted: usize,
+        /// Stream positions without a complete bounded-object discovery window
+        uncovered_range: Option<FileRange>,
+    },
     /// Source bytes exceeded the selected in-memory analysis ceiling
     InputLimit { length: usize, maximum: usize },
     /// The source could not fit in the retained output byte budget

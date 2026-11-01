@@ -5,6 +5,7 @@ use l2_workbench::artifact::{
     ArtifactOrigin, ArtifactValidationState, ValidationSummary, analyze_artifacts,
     archive_member_origin, zip::ZipArtifactReport,
 };
+use l2_workbench::job::MemoryLease;
 use std::{error::Error, io};
 
 pub(super) fn append_members(
@@ -12,6 +13,7 @@ pub(super) fn append_members(
     archive: ZipArtifactReport,
     parent_index: usize,
     options: ArtifactAnalysisOptions,
+    omission_memory: &mut MemoryLease,
 ) -> Result<(), Box<dyn Error>> {
     let signature_used = report
         .artifacts
@@ -24,6 +26,7 @@ pub(super) fn append_members(
     let zip_used = report.zip_expanded_work_bytes;
     let mut merger = MemberMerger {
         report,
+        omission_memory,
         options,
         parent_index,
         archive_length: archive.archive_size,
@@ -47,6 +50,7 @@ pub(super) fn append_members(
 
 struct MemberMerger<'a> {
     report: &'a mut ArtifactAnalysis,
+    omission_memory: &'a mut MemoryLease,
     options: ArtifactAnalysisOptions,
     parent_index: usize,
     archive_length: usize,
@@ -61,11 +65,11 @@ impl MemberMerger<'_> {
         entry: l2_workbench::artifact::zip::ZipArtifactEntry,
     ) -> Result<(), Box<dyn Error>> {
         if let Some(reason) = entry.omission {
-            self.report.omissions.push(AnalysisOmission::ZipMember {
+            self.push_omission(AnalysisOmission::ZipMember {
                 artifact_index: self.parent_index,
                 entry_index: entry.metadata.index,
                 reason,
-            });
+            })?;
         }
         let Some(bytes) = entry.content else {
             return Ok(());
@@ -89,17 +93,17 @@ impl MemberMerger<'_> {
             .max_artifacts
             .saturating_sub(self.report.artifacts.len().saturating_add(1));
         if remaining_count == 0 {
-            self.report.omissions.push(AnalysisOmission::ArtifactLimit {
+            self.push_omission(AnalysisOmission::ArtifactLimit {
                 maximum: self.options.limits.max_artifacts,
-            });
+            })?;
             return Ok(());
         }
         if bytes.len() > remaining_output {
-            self.report.omissions.push(AnalysisOmission::OutputLimit {
+            self.push_omission(AnalysisOmission::OutputLimit {
                 parent_index: self.parent_index,
                 length: bytes.len(),
                 remaining: remaining_output,
-            });
+            })?;
             return Ok(());
         }
         let origin = archive_member_origin(self.parent_index, self.archive_length, &entry.metadata);
@@ -168,7 +172,7 @@ impl MemberMerger<'_> {
                 remaining: 0,
             }
         };
-        self.report.omissions.push(omission);
+        self.push_omission(omission)?;
         Ok(())
     }
 
@@ -223,9 +227,7 @@ impl MemberMerger<'_> {
             indices.push(self.merge_artifact(artifact)?);
         }
         for omission in child.omissions {
-            self.report
-                .omissions
-                .push(rebase_omission(omission, &indices, entry_index)?);
+            self.push_omission(rebase_omission(omission, &indices, entry_index)?)?;
         }
         for mut region in child.region_transform_reports {
             region.artifact_index = *indices
@@ -245,6 +247,10 @@ impl MemberMerger<'_> {
             for origin in artifact.origins {
                 if !existing.origins.contains(&origin) {
                     if existing.origins.len() >= self.options.limits.max_artifacts {
+                        super::analysis_memory::reserve_omission(
+                            &mut self.report.omissions,
+                            self.omission_memory,
+                        )?;
                         self.report.omissions.push(AnalysisOmission::ArtifactLimit {
                             maximum: self.options.limits.max_artifacts,
                         });
@@ -266,6 +272,13 @@ impl MemberMerger<'_> {
             self.report.artifacts.push(artifact);
             Ok(index)
         }
+    }
+
+    fn push_omission(&mut self, omission: AnalysisOmission) -> Result<(), Box<dyn Error>> {
+        super::analysis_memory::reserve_omission(&mut self.report.omissions, self.omission_memory)?;
+        super::analysis_memory::charge_omission_payload(&omission, self.omission_memory)?;
+        self.report.omissions.push(omission);
+        Ok(())
     }
 }
 

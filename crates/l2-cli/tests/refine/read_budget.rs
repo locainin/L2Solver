@@ -4,6 +4,64 @@ use crate::arguments::{RecoveryOptions, RecoveryProfile, RefineOptions};
 use l2_workbench::job::{Counter, Job};
 
 #[test]
+fn zip_tail_hint_requires_shared_work_before_reading() -> Result<(), Box<dyn Error>> {
+    use crate::refine::range_zip::{TailProbe, probe_tail};
+    use l2_workbench::job::MemoryBudget;
+
+    let directory = tempfile::tempdir()?;
+    let path = directory.path().join("source.bin");
+    let file = fs::File::create(&path)?;
+    file.set_len(128 * 1024)?;
+    let memory = MemoryBudget::new(1024 * 1024);
+    let job = Job::new("ZIP hint work quota");
+    let input = crate::refine::input::prepare_input_set_with_limit(&path, u64::MAX, &job, &memory)?;
+    let mut file = fs::File::open(&path)?;
+    let work = 2 * (65_535 + 22);
+    let before = job
+        .snapshot()?
+        .counters
+        .get(&Counter::SourceReadBytes)
+        .copied()
+        .unwrap_or(0);
+    let limited = probe_tail(
+        &mut file,
+        128 * 1024,
+        128 * 1024,
+        &input,
+        &job,
+        &memory,
+        work - 1,
+    )?;
+    assert!(matches!(limited, TailProbe::WorkLimit));
+    assert_eq!(
+        job.snapshot()?
+            .counters
+            .get(&Counter::SourceReadBytes)
+            .copied()
+            .unwrap_or(0),
+        before
+    );
+    let admitted = probe_tail(
+        &mut file,
+        128 * 1024,
+        128 * 1024,
+        &input,
+        &job,
+        &memory,
+        work,
+    )?;
+    assert!(matches!(admitted, TailProbe::Scanned { work_bytes, .. } if work_bytes == work));
+    let after = job
+        .snapshot()?
+        .counters
+        .get(&Counter::SourceReadBytes)
+        .copied()
+        .unwrap_or(0);
+    assert_eq!(after - before, u64::try_from(work / 2)?);
+    Ok(())
+}
+
+#[test]
 fn aggregate_source_read_limit_skips_large_source_and_retains_later_small_input()
 -> Result<(), Box<dyn Error>> {
     #[cfg(target_os = "linux")]
@@ -174,6 +232,12 @@ fn skipped_source_has_no_digest_and_cannot_be_reused_as_verified() -> Result<(),
         manifest
             .pointer("/sources/0/sha256")
             .is_none_or(serde_json::Value::is_null)
+    );
+    assert!(manifest.pointer("/sources/0/work_bytes_charged").is_none());
+    assert!(
+        manifest
+            .pointer("/sources/0/zip_expanded_work_bytes_charged")
+            .is_none()
     );
     assert!(
         manifest

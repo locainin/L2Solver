@@ -30,7 +30,7 @@ use std::{
     path::{Path, PathBuf},
 };
 
-const REFINE_ALGORITHM_VERSION: u32 = 15;
+const REFINE_ALGORITHM_VERSION: u32 = 16;
 
 #[derive(Serialize)]
 pub(super) struct SourceRecord {
@@ -40,7 +40,14 @@ pub(super) struct SourceRecord {
     pub(super) status: AnalysisStatus,
     pub(super) omissions: Vec<AnalysisOmission>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub(super) work_bytes_charged: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(super) zip_expanded_work_bytes_charged: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub(super) reason: Option<String>,
+    // Hold the report charge until its retained omissions are dropped
+    #[serde(skip)]
+    pub(super) _omission_memory: l2_workbench::job::MemoryLease,
 }
 
 pub(super) struct ArtifactRecord {
@@ -271,18 +278,23 @@ fn append_file_records<'a>(
         let source = sources
             .get(artifact.source_index)
             .ok_or_else(|| invalid_input("artifact source index is missing"))?;
+        let mut origins = Vec::new();
+        origins.try_reserve_exact(artifact.origins.len())?;
+        for origin in &artifact.origins {
+            origins.push(PublishedOriginRecord {
+                source_index: artifact.source_index,
+                source_label: &source.label,
+                artifact_index: artifact.artifact_index,
+                origin: PublishedOrigin::File(origin),
+                validation: artifact.validation,
+                signature_match_count: artifact.signature_match_count,
+            });
+        }
         published.push(PublishedArtifactRecord {
             file: &artifact.file_name,
             byte_length: artifact.range.length,
             sha256: artifact.sha256.clone(),
-            origins: vec![PublishedOriginRecord {
-                source_index: artifact.source_index,
-                source_label: &source.label,
-                artifact_index: artifact.artifact_index,
-                origin: PublishedOrigin::File(&artifact.origin),
-                validation: artifact.validation,
-                signature_match_count: 0,
-            }],
+            origins,
             nodes: &artifact.provenance,
         });
     }

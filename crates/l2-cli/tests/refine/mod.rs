@@ -424,11 +424,8 @@ fn per_input_cache_ignores_previous_algorithm_and_reuses_current() -> Result<(),
 fn cache_receipts_over_work_or_expansion_limits_are_rejected_and_can_fall_back()
 -> Result<(), Box<dyn Error>> {
     use l2_workbench::{
-        artifact::{AnalysisStatus, analyze_artifacts_with_source_sha256},
-        job::{
-            Job,
-            cache::{Cache, SourceIdentity, StageKey, StageStatus},
-        },
+        artifact::analyze_artifacts_with_source_sha256,
+        job::{Job, cache::Cache},
     };
 
     for invalid_work in [true, false] {
@@ -449,58 +446,7 @@ fn cache_receipts_over_work_or_expansion_limits_are_rejected_and_can_fall_back()
         } else {
             report.zip_expanded_work_bytes = options.limits.max_zip_expanded_bytes + 1;
         }
-        let key = StageKey::new(
-            "file_artifact_analysis",
-            1,
-            format!(
-                "l2_artifact_analyzer_v{}",
-                super::analysis::REFINE_ANALYZER_ALGORITHM_VERSION
-            ),
-            &json!({
-                "schema_version": 1,
-                "transform_proposal_format_version":
-                    l2_workbench::recovery::proposals::TRANSFORM_PROPOSAL_FORMAT_VERSION,
-                "analyzer": options,
-                "profile": "normal",
-            }),
-            &SourceIdentity::from_sha256(digest.to_owned())?,
-            &[],
-        )?;
-        let lease = cache.lease(&key)?;
-        let lengths: Vec<_> = report
-            .artifacts
-            .iter()
-            .map(|item| item.bytes.len())
-            .collect();
-        fs::write(
-            lease.directory().join("analysis.json"),
-            serde_json::to_vec(&json!({
-                "schema_version": 1,
-                "artifact_lengths": lengths,
-                "analysis": &report,
-            }))?,
-        )?;
-        for artifact in &report.artifacts {
-            fs::write(
-                lease
-                    .directory()
-                    .join(format!("artifact-{:08}.bin", artifact.index)),
-                &artifact.bytes,
-            )?;
-        }
-        let status = if report.status == AnalysisStatus::Partial {
-            StageStatus::Partial
-        } else {
-            StageStatus::Complete
-        };
-        drop(lease.commit(
-            status,
-            json!({
-                "schema_version": 1,
-                "receipt": "analysis.json",
-                "artifact_count": report.artifacts.len(),
-            }),
-        )?);
+        write_cached_analysis(&cache, digest, options, &report)?;
         recovery.strict_cache = true;
         assert!(
             analyze_source_cached(
@@ -519,6 +465,72 @@ fn cache_receipts_over_work_or_expansion_limits_are_rejected_and_can_fall_back()
         assert!(actual.zip_expanded_work_bytes <= options.limits.max_zip_expanded_bytes);
         assert!(!job.snapshot()?.cache_fallbacks.records().is_empty());
     }
+    Ok(())
+}
+
+fn write_cached_analysis(
+    cache: &l2_workbench::job::cache::Cache,
+    digest: &str,
+    options: l2_workbench::artifact::ArtifactAnalysisOptions,
+    report: &l2_workbench::artifact::ArtifactAnalysis,
+) -> Result<(), Box<dyn Error>> {
+    use l2_workbench::{
+        artifact::AnalysisStatus,
+        job::cache::{SourceIdentity, StageKey, StageStatus},
+    };
+
+    let key = StageKey::new(
+        "file_artifact_analysis",
+        1,
+        format!(
+            "l2_artifact_analyzer_v{}",
+            super::analysis::REFINE_ANALYZER_ALGORITHM_VERSION
+        ),
+        &json!({
+            "schema_version": 1,
+            "transform_proposal_format_version":
+                l2_workbench::recovery::proposals::TRANSFORM_PROPOSAL_FORMAT_VERSION,
+            "analyzer": options,
+            "profile": "normal",
+        }),
+        &SourceIdentity::from_sha256(digest.to_owned())?,
+        &[],
+    )?;
+    let lease = cache.lease(&key)?;
+    let lengths: Vec<_> = report
+        .artifacts
+        .iter()
+        .map(|item| item.bytes.len())
+        .collect();
+    fs::write(
+        lease.directory().join("analysis.json"),
+        serde_json::to_vec(&json!({
+            "schema_version": 1,
+            "artifact_lengths": lengths,
+            "analysis": report,
+        }))?,
+    )?;
+    for artifact in &report.artifacts {
+        fs::write(
+            lease
+                .directory()
+                .join(format!("artifact-{:08}.bin", artifact.index)),
+            &artifact.bytes,
+        )?;
+    }
+    let status = if report.status == AnalysisStatus::Partial {
+        StageStatus::Partial
+    } else {
+        StageStatus::Complete
+    };
+    drop(lease.commit(
+        status,
+        json!({
+            "schema_version": 1,
+            "receipt": "analysis.json",
+            "artifact_count": report.artifacts.len(),
+        }),
+    )?);
     Ok(())
 }
 
@@ -612,10 +624,10 @@ fn result_identity_uses_ordered_content_hashes_and_analysis_settings() -> Result
     let recovery = RecoveryOptions::default();
     let policy = RefinePolicy::new(&recovery, false)?;
     let identity = result_identity(&sources, &recovery, &policy)?;
-    assert_eq!(identity.algorithm_version, 13);
+    assert_eq!(identity.algorithm_version, 16);
     assert_eq!(
         identity.settings.get("analyzer_algorithm_version"),
-        Some(&json!(13))
+        Some(&json!(14))
     );
     assert_eq!(
         identity.settings.get("analysis_receipt_schema_version"),

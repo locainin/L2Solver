@@ -48,6 +48,53 @@ fn options(input: &Path, output: &Path) -> RefineOptions {
     }
 }
 
+fn has_png_extension(name: &str) -> bool {
+    Path::new(name)
+        .extension()
+        .is_some_and(|extension| extension == "png")
+}
+
+#[cfg(target_os = "linux")]
+fn assert_stream_job_stats(
+    input: &Path,
+    settings: &RefineOptions,
+    job: &Job,
+    reads_before: u64,
+) -> Result<(), Box<dyn Error>> {
+    use l2_workbench::job::Counter;
+
+    let observed = super::range_analysis::process_read_bytes()? - reads_before;
+    let snapshot = job.snapshot()?;
+    let source_reads = snapshot
+        .counters
+        .get(&Counter::SourceReadBytes)
+        .copied()
+        .ok_or("source read counter missing")?;
+    assert!(
+        snapshot
+            .counters
+            .get(&Counter::Transforms)
+            .copied()
+            .unwrap_or(0)
+            >= 4
+    );
+    assert!(
+        snapshot
+            .counters
+            .get(&Counter::ValidatedArtifacts)
+            .copied()
+            .unwrap_or(0)
+            >= 2
+    );
+    let source_length = fs::metadata(input)?.len();
+    assert!(source_reads <= settings.recovery.source_read_limit);
+    assert!(observed >= source_reads.saturating_sub(16));
+    eprintln!(
+        "stream fixture: source_bytes={source_length} source_read_bytes={source_reads} process_read_bytes={observed}"
+    );
+    Ok(())
+}
+
 #[test]
 fn refine_streams_large_base64_gzip_zip_and_validates_its_member() -> Result<(), Box<dyn Error>> {
     let directory = tempfile::tempdir()?;
@@ -62,39 +109,7 @@ fn refine_streams_large_base64_gzip_zip_and_validates_its_member() -> Result<(),
     let reads_before = super::range_analysis::process_read_bytes()?;
     assert!(!super::run_with_job(&settings, &mut Vec::new(), &job)?);
     #[cfg(target_os = "linux")]
-    {
-        use l2_workbench::job::Counter;
-        let observed = super::range_analysis::process_read_bytes()? - reads_before;
-        let source_reads = job
-            .snapshot()?
-            .counters
-            .get(&Counter::SourceReadBytes)
-            .copied()
-            .ok_or("source read counter missing")?;
-        let snapshot = job.snapshot()?;
-        assert!(
-            snapshot
-                .counters
-                .get(&Counter::Transforms)
-                .copied()
-                .unwrap_or(0)
-                >= 4
-        );
-        assert!(
-            snapshot
-                .counters
-                .get(&Counter::ValidatedArtifacts)
-                .copied()
-                .unwrap_or(0)
-                >= 2
-        );
-        let source_length = fs::metadata(&input)?.len();
-        assert!(source_reads <= settings.recovery.source_read_limit);
-        assert!(observed >= source_reads.saturating_sub(16));
-        eprintln!(
-            "stream fixture: source_bytes={source_length} source_read_bytes={source_reads} process_read_bytes={observed}"
-        );
-    }
+    assert_stream_job_stats(&input, &settings, &job, reads_before)?;
     assert_eq!(SourceIdentity::sha256_file(&input)?, source_hash);
     let manifest: serde_json::Value =
         serde_json::from_slice(&fs::read(output.join("manifest.json"))?)?;
@@ -136,7 +151,7 @@ fn refine_streams_large_base64_gzip_zip_and_validates_its_member() -> Result<(),
     assert!(artifacts.iter().any(|item| {
         item.get("file")
             .and_then(serde_json::Value::as_str)
-            .filter(|name| name.ends_with(".png"))
+            .filter(|name| has_png_extension(name))
             .and_then(|name| fs::read(output.join(name)).ok())
             .is_some_and(|bytes| bytes == png)
     }));
@@ -203,6 +218,140 @@ fn refine_streams_large_encoded_png_and_publishes_exact_iend_prefix() -> Result<
 }
 
 #[test]
+fn refine_carves_interior_png_and_zip_from_a_large_decoded_stream() -> Result<(), Box<dyn Error>> {
+    let directory = tempfile::tempdir()?;
+    let png = super::structural_png()?;
+    let zip = super::structural_zip()?;
+    let decoded = directory.path().join("decoded.bin");
+    let (png_offset, second_png_offset, zip_offset) = write_interior_objects(&decoded, &png, &zip)?;
+    let decoded_hash = serde_json::to_value(SourceIdentity::sha256_file(&decoded)?)?;
+    let input = directory.path().join("encoded.txt");
+    let encoded = EncoderWriter::new(File::create(&input)?, &STANDARD);
+    let mut gzip = GzEncoder::new(encoded, Compression::none());
+    io::copy(&mut File::open(&decoded)?, &mut gzip)?;
+    gzip.finish()?.finish()?.sync_all()?;
+    assert!(fs::metadata(&input)?.len() > 16 * 1024 * 1024);
+    let source_hash = SourceIdentity::sha256_file(&input)?;
+    let output = directory.path().join("result");
+    assert!(!super::run(&options(&input, &output), &mut Vec::new())?);
+    assert_eq!(SourceIdentity::sha256_file(&input)?, source_hash);
+    let manifest: serde_json::Value =
+        serde_json::from_slice(&fs::read(output.join("manifest.json"))?)?;
+    let artifacts = manifest
+        .get("artifacts")
+        .and_then(serde_json::Value::as_array)
+        .ok_or("artifacts missing")?;
+    assert_interior_objects(
+        artifacts,
+        &output,
+        &decoded_hash,
+        [
+            (png.as_slice(), png_offset, "png"),
+            (zip.as_slice(), zip_offset, "zip"),
+        ],
+        second_png_offset,
+    )?;
+    assert!(artifacts.iter().any(|item| {
+        item.get("sha256").and_then(serde_json::Value::as_str)
+            == Some(l2_workbench::sha256(b"member payload").as_str())
+    }));
+    let omissions = manifest
+        .pointer("/sources/0/omissions")
+        .and_then(serde_json::Value::as_array)
+        .ok_or("source omissions missing")?;
+    assert!(omissions.iter().any(|omission| {
+        omission.get("kind") == Some(&serde_json::json!("derived_stream_range_coverage"))
+            && omission.get("output_sha256") == decoded_hash.get("value")
+            && omission
+                .get("uncovered_range")
+                .is_none_or(serde_json::Value::is_null)
+            && omission
+                .get("max_object_bytes")
+                .and_then(serde_json::Value::as_u64)
+                .is_some_and(|size| size <= 4 * 1024 * 1024)
+    }));
+    assert!(
+        manifest
+            .pointer("/sources/0/work_bytes_charged")
+            .and_then(serde_json::Value::as_u64)
+            .is_some_and(|work| work > 0)
+    );
+    assert!(
+        manifest
+            .pointer("/sources/0/zip_expanded_work_bytes_charged")
+            .and_then(serde_json::Value::as_u64)
+            .is_some_and(|work| work >= 14)
+    );
+    Ok(())
+}
+
+fn assert_interior_objects(
+    artifacts: &[serde_json::Value],
+    output: &Path,
+    decoded_hash: &serde_json::Value,
+    objects: [(&[u8], u64, &str); 2],
+    second_png_offset: u64,
+) -> Result<(), Box<dyn Error>> {
+    for (bytes, offset, format) in objects {
+        let artifact = artifacts
+            .iter()
+            .find(|item| {
+                item.pointer("/origins/0/origin/output_range/offset")
+                    == Some(&serde_json::json!(offset))
+                    && item.pointer("/origins/0/origin/steps/1/output_sha256")
+                        == decoded_hash.get("value")
+                    && item.pointer("/origins/0/validation/format")
+                        == Some(&serde_json::json!(format))
+            })
+            .ok_or("derived interior object missing")?;
+        assert_eq!(
+            artifact.get("sha256"),
+            Some(&serde_json::json!(l2_workbench::sha256(bytes)))
+        );
+        let name = artifact
+            .get("file")
+            .and_then(serde_json::Value::as_str)
+            .ok_or("object filename missing")?;
+        assert_eq!(fs::read(output.join(name))?, bytes);
+        if format == "png" {
+            let origins = artifact
+                .get("origins")
+                .and_then(serde_json::Value::as_array)
+                .ok_or("PNG origins missing")?;
+            assert_eq!(origins.len(), 2);
+            assert!(origins.iter().any(|origin| {
+                origin.pointer("/origin/output_range/offset")
+                    == Some(&serde_json::json!(second_png_offset))
+            }));
+        }
+    }
+    Ok(())
+}
+
+fn write_interior_objects(
+    path: &Path,
+    png: &[u8],
+    zip: &[u8],
+) -> Result<(u64, u64, u64), Box<dyn Error>> {
+    let mut payload = File::create(path)?;
+    payload.write_all(&[0x91; 128])?;
+    for _ in 0..17 * 64 {
+        payload.write_all(&[0x91; 16 * 1024])?;
+    }
+    let png_offset = fs::metadata(path)?.len();
+    payload.write_all(png)?;
+    payload.write_all(&[0x91; 64])?;
+    let second_png_offset = png_offset + u64::try_from(png.len())? + 64;
+    payload.write_all(png)?;
+    payload.write_all(&[0x91; 64])?;
+    let zip_offset = second_png_offset + u64::try_from(png.len())? + 64;
+    payload.write_all(zip)?;
+    payload.write_all(&[0x91; 32])?;
+    payload.sync_all()?;
+    Ok((png_offset, second_png_offset, zip_offset))
+}
+
+#[test]
 fn refine_does_not_publish_a_derived_png_with_a_bad_crc() -> Result<(), Box<dyn Error>> {
     let directory = tempfile::tempdir()?;
     let png = directory.path().join("corrupt.png");
@@ -235,6 +384,121 @@ fn refine_does_not_publish_a_derived_png_with_a_bad_crc() -> Result<(), Box<dyn 
             .and_then(serde_json::Value::as_str)
             .is_some_and(|reason| reason.contains("derived PNG validation failed"))
     }));
+    assert!(omissions.iter().any(|omission| {
+        omission
+            .get("reason")
+            .and_then(serde_json::Value::as_str)
+            .is_some_and(|reason| reason.contains("retained validated format"))
+    }));
+    Ok(())
+}
+
+#[test]
+fn refine_carves_an_interior_png_from_a_valid_derived_png() -> Result<(), Box<dyn Error>> {
+    let directory = tempfile::tempdir()?;
+    let nested = super::structural_png()?;
+    let outer = directory.path().join("outer.png");
+    let mut file = File::create(&outer)?;
+    file.write_all(nested.get(..33).ok_or("PNG header missing")?)?;
+    let payload_length = nested.len() + 150 * 16 * 1024;
+    file.write_all(&u32::try_from(payload_length)?.to_be_bytes())?;
+    file.write_all(b"rUST")?;
+    let mut crc = crc32fast::Hasher::new();
+    crc.update(b"rUST");
+    file.write_all(&nested)?;
+    crc.update(&nested);
+    for _ in 0..150 {
+        let block = [7_u8; 16 * 1024];
+        file.write_all(&block)?;
+        crc.update(&block);
+    }
+    file.write_all(&crc.finalize().to_be_bytes())?;
+    file.write_all(nested.get(33..).ok_or("PNG IEND missing")?)?;
+    file.sync_all()?;
+    let outer_hash = serde_json::to_value(SourceIdentity::sha256_file(&outer)?)?;
+    let input = directory.path().join("encoded.txt");
+    let encoded = EncoderWriter::new(File::create(&input)?, &STANDARD);
+    let mut gzip = GzEncoder::new(encoded, Compression::none());
+    io::copy(&mut File::open(&outer)?, &mut gzip)?;
+    gzip.finish()?.finish()?.sync_all()?;
+    let output = directory.path().join("result");
+    let mut settings = options(&input, &output);
+    settings.recovery.memory_limit = 8 * 1024 * 1024;
+    assert!(!super::run(&settings, &mut Vec::new())?);
+    let manifest: serde_json::Value =
+        serde_json::from_slice(&fs::read(output.join("manifest.json"))?)?;
+    let artifacts = manifest
+        .get("artifacts")
+        .and_then(serde_json::Value::as_array)
+        .ok_or("artifacts missing")?;
+    assert!(
+        artifacts
+            .iter()
+            .any(|item| item.get("sha256") == outer_hash.get("value"))
+    );
+    let inner = artifacts
+        .iter()
+        .find(|item| {
+            item.get("sha256") == Some(&serde_json::json!(l2_workbench::sha256(&nested)))
+                && item.pointer("/origins/0/origin/output_range/offset")
+                    == Some(&serde_json::json!(41))
+                && item.pointer("/origins/0/origin/steps/1/output_sha256")
+                    == outer_hash.get("value")
+        })
+        .ok_or("nested PNG range missing")?;
+    let name = inner
+        .get("file")
+        .and_then(serde_json::Value::as_str)
+        .ok_or("nested PNG file missing")?;
+    assert_eq!(fs::read(output.join(name))?, nested);
+    Ok(())
+}
+
+#[test]
+fn refine_reports_long_gzip_header_observation_limit_for_source_and_derived_stream()
+-> Result<(), Box<dyn Error>> {
+    use flate2::GzBuilder;
+
+    let directory = tempfile::tempdir()?;
+    let gzip_path = directory.path().join("long-header.gz");
+    let mut gzip = GzBuilder::new()
+        .extra(vec![0xa5; 5000])
+        .write(File::create(&gzip_path)?, Compression::none());
+    for _ in 0..150 {
+        gzip.write_all(&[0x91; 16 * 1024])?;
+    }
+    gzip.finish()?.sync_all()?;
+    let encoded_path = directory.path().join("encoded.txt");
+    let mut encoded = EncoderWriter::new(File::create(&encoded_path)?, &STANDARD);
+    io::copy(&mut File::open(&gzip_path)?, &mut encoded)?;
+    encoded.finish()?.sync_all()?;
+
+    for (input, name) in [
+        (&gzip_path, "source-result"),
+        (&encoded_path, "derived-result"),
+    ] {
+        let output = directory.path().join(name);
+        let original = SourceIdentity::sha256_file(input)?;
+        let mut settings = options(input, &output);
+        settings.recovery.memory_limit = 8 * 1024 * 1024;
+        assert!(!super::run(&settings, &mut Vec::new())?);
+        assert_eq!(SourceIdentity::sha256_file(input)?, original);
+        let manifest: serde_json::Value =
+            serde_json::from_slice(&fs::read(output.join("manifest.json"))?)?;
+        let omissions = manifest
+            .pointer("/sources/0/omissions")
+            .and_then(serde_json::Value::as_array)
+            .ok_or("source omissions missing")?;
+        assert!(
+            omissions.iter().any(|omission| omission
+                .get("reason")
+                .and_then(serde_json::Value::as_str)
+                .is_some_and(|reason| reason.contains("gzip")
+                    && reason.contains("4096")
+                    && reason.contains("observation"))),
+            "missing gzip observation limit for {name}"
+        );
+    }
     Ok(())
 }
 
@@ -382,7 +646,7 @@ fn streaming_recursion_limit_prevents_unbounded_nested_expansion() -> Result<(),
     assert!(!artifacts.iter().any(|item| {
         item.get("file")
             .and_then(serde_json::Value::as_str)
-            .filter(|name| name.ends_with(".png"))
+            .filter(|name| has_png_extension(name))
             .and_then(|name| fs::read(output.join(name)).ok())
             .is_some_and(|bytes| bytes == png)
     }));
@@ -473,7 +737,7 @@ fn normal_refinement_finds_a_valid_object_near_the_end_of_a_large_file()
     assert!(artifacts.iter().any(|item| {
         item.get("file")
             .and_then(serde_json::Value::as_str)
-            .filter(|name| name.ends_with(".png"))
+            .filter(|name| has_png_extension(name))
             .and_then(|name| fs::read(output.join(name)).ok())
             .is_some_and(|bytes| bytes == png)
     }));

@@ -569,7 +569,63 @@ fn exhausted_case_marks_a_later_memory_source_partial() -> Result<(), Box<dyn Er
     )?;
     let later = report.source_records.get(1).ok_or("later source missing")?;
     assert!(later.omissions.iter().any(|omission| matches!(omission, AnalysisOmission::CaseBlobLimit { maximum } if *maximum == png.len())));
+    assert_eq!(later.work_bytes_charged, Some(b"later".len()));
     assert!(!report.complete);
+    Ok(())
+}
+
+#[test]
+fn range_source_omission_memory_remains_charged_while_source_record_is_live()
+-> Result<(), Box<dyn Error>> {
+    use crate::refine::{
+        analysis::analyze_sources, input::prepare_input_set, policy::RefinePolicy,
+    };
+    use l2_workbench::{
+        artifact::AnalysisOmission,
+        job::{Job, MemoryBudget, Phase},
+    };
+
+    let directory = tempfile::tempdir()?;
+    let path = directory.path().join("source.bin");
+    fs::write(&path, [0x91; 8192])?;
+    let input = prepare_input_set(&path)?;
+    let job = Job::new("retained range source omissions");
+    job.start(Phase::Expansion, None)?;
+    job.start(Phase::TransformDiscovery, Some(1))?;
+    let sources = super::read_sources(&input, 1, 1, &job)?;
+    let recovery = RecoveryOptions::default();
+    let policy = RefinePolicy::new(&recovery, false)?;
+    let memory = MemoryBudget::new(8 * 1024 * 1024);
+    let mut analyzed = analyze_sources(&sources, &input, &policy, &recovery, None, &job, &memory)?;
+    let record = analyzed
+        .source_records
+        .pop()
+        .ok_or("source record missing")?;
+    assert!(
+        record
+            .omissions
+            .iter()
+            .any(|omission| matches!(omission, AnalysisOmission::SourceStreamTransform { .. }))
+    );
+    let records = record.omissions.capacity() * std::mem::size_of::<AnalysisOmission>();
+    let messages = record
+        .omissions
+        .iter()
+        .map(|omission| match omission {
+            AnalysisOmission::SourceStreamTransform { reason, .. }
+            | AnalysisOmission::SourceRangeValidationLimit { reason, .. } => reason.capacity(),
+            _ => 0,
+        })
+        .sum::<usize>();
+    let metadata = record.label.capacity()
+        + record.sha256.as_ref().map_or(0, String::capacity)
+        + record.reason.as_ref().map_or(0, String::capacity);
+    let minimum = u64::try_from(records + messages + metadata)?;
+    let live = memory.snapshot()?.used_bytes;
+    assert!(live >= minimum);
+    drop(record);
+    assert!(memory.snapshot()?.used_bytes <= live - minimum);
+    drop(analyzed);
     Ok(())
 }
 

@@ -24,6 +24,16 @@ pub(super) struct ZipCandidate {
     pub(super) multiple_boundaries: bool,
 }
 
+pub(super) enum TailProbe {
+    Skipped,
+    ReadLimit,
+    WorkLimit,
+    Scanned {
+        candidate: Option<ZipCandidate>,
+        work_bytes: usize,
+    },
+}
+
 pub(super) fn probe_tail(
     file: &mut File,
     length: usize,
@@ -31,10 +41,19 @@ pub(super) fn probe_tail(
     input: &InputSet,
     job: &Job,
     memory: &MemoryBudget,
-) -> Result<Option<ZipCandidate>, Box<dyn Error>> {
+    remaining_work: usize,
+) -> Result<TailProbe, Box<dyn Error>> {
     let count = length.min(ZIP_END_SCAN_BYTES).min(max_buffer);
-    if count < 22 || !input.reserve_extra_reads(u64::try_from(count)?)? {
-        return Ok(None);
+    if count < 22 {
+        return Ok(TailProbe::Skipped);
+    }
+    // The bounded read and the marker scan each visit the tail once
+    let requested = count.checked_mul(2).ok_or("ZIP tail work overflows")?;
+    if requested > remaining_work {
+        return Ok(TailProbe::WorkLimit);
+    }
+    if !input.reserve_extra_reads(u64::try_from(count)?)? {
+        return Ok(TailProbe::ReadLimit);
     }
     let _scratch = memory.try_reserve(MemoryClass::Executor, u64::try_from(count)?)?;
     let mut tail = Vec::new();
@@ -74,12 +93,15 @@ pub(super) fn probe_tail(
             });
         }
     }
-    Ok(candidate)
+    Ok(TailProbe::Scanned {
+        candidate,
+        work_bytes: requested,
+    })
 }
 
 #[expect(
     clippy::too_many_arguments,
-    reason = "the source checks share one job and report lease"
+    reason = "the source checks share one job and report leases"
 )]
 pub(super) fn inspect(
     file: &mut File,
@@ -90,6 +112,7 @@ pub(super) fn inspect(
     input: &InputSet,
     job: &Job,
     memory: &mut MemoryLease,
+    omission_memory: &mut MemoryLease,
 ) -> Result<Option<ZipArtifactReport>, Box<dyn Error>> {
     let remaining_work = options
         .limits
@@ -161,13 +184,14 @@ pub(super) fn inspect(
         .zip_expanded_work_bytes
         .checked_add(expanded_work)
         .ok_or("ZIP expansion work counter overflow")?;
-    report_inspection_result(result, report, memory, before)
+    report_inspection_result(result, report, memory, omission_memory, before)
 }
 
 fn report_inspection_result(
     result: Result<ZipArtifactReport, ZipReadError>,
     report: &mut ArtifactAnalysis,
     memory: &mut MemoryLease,
+    omission_memory: &mut MemoryLease,
     before: u64,
 ) -> Result<Option<ZipArtifactReport>, Box<dyn Error>> {
     match result {
@@ -182,13 +206,16 @@ fn report_inspection_result(
         {
             drop(archive);
             memory.try_resize(before)?;
+            super::analysis_memory::reserve_omission(&mut report.omissions, omission_memory)?;
+            let reason = super::analysis_memory::copy_message(
+                "ZIP entry or depth limit prevented structural validation",
+                omission_memory,
+            )?;
             report
                 .omissions
                 .push(AnalysisOmission::SourceRangeValidationLimit {
                     format: AnalysisFormat::Zip,
-                    reason: String::from(
-                        "ZIP entry or depth limit prevented structural validation",
-                    ),
+                    reason,
                 });
             Ok(None)
         }
@@ -200,11 +227,14 @@ fn report_inspection_result(
             | l2_workbench::artifact::zip::ZipArtifactError::AmbiguousEndRecords,
         )) => Ok(None),
         Err(error) => {
+            super::analysis_memory::reserve_omission(&mut report.omissions, omission_memory)?;
+            let reason =
+                super::analysis_memory::format_message(format_args!("{error}"), omission_memory)?;
             report
                 .omissions
                 .push(AnalysisOmission::SourceRangeValidationLimit {
                     format: AnalysisFormat::Zip,
-                    reason: error.to_string(),
+                    reason,
                 });
             Ok(None)
         }

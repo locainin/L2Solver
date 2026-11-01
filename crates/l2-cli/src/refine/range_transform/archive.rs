@@ -1,10 +1,10 @@
 //! Validate derived ZIP spools and merge their bounded member reports
 
-use super::super::file_artifact::DerivedFile;
-use super::{JobReader, StreamContext, StreamObject, omit};
+use super::super::file_artifact::DerivedArtifact;
+use super::{JobReader, StreamContext, StreamObject, omit, omit_formatted};
 use l2_workbench::{
     artifact::{
-        AnalysisOmission,
+        AnalysisOmission, AnalyzedArtifact,
         zip::{
             ZipArtifactError, ZipArtifactLimits, ZipArtifactOmissionReason, ZipArtifactReport,
             ZipReadError, ZipReaderBudget, ZipReaderLimits,
@@ -15,12 +15,12 @@ use l2_workbench::{
 };
 use std::{
     error::Error,
-    io::{Seek, SeekFrom},
+    io::{Cursor, Seek, SeekFrom},
 };
 
 pub(super) fn inspect_archive(
     context: &mut StreamContext<'_>,
-    mut object: StreamObject,
+    object: StreamObject,
 ) -> Result<Option<StreamObject>, Box<dyn Error>> {
     let prefix = object
         .observation
@@ -30,12 +30,11 @@ pub(super) fn inspect_archive(
     if !prefix.starts_with(b"PK\x03\x04") && !prefix.starts_with(b"PK\x05\x06") {
         return Ok(Some(object));
     }
-    match parse_archive(context, &mut object)? {
-        Inspection::Unrecognized => Ok(Some(object)),
-        Inspection::Omitted => Ok(None),
+    match parse_archive(context, &object)? {
+        Inspection::Unrecognized | Inspection::Omitted => Ok(Some(object)),
         Inspection::Validated(report) => {
-            retain_archive(context, object, report)?;
-            Ok(None)
+            retain_archive(context, &object, report)?;
+            Ok(Some(object))
         }
     }
 }
@@ -48,22 +47,28 @@ enum Inspection {
 
 fn parse_archive(
     context: &mut StreamContext<'_>,
-    object: &mut StreamObject,
+    object: &StreamObject,
 ) -> Result<Inspection, Box<dyn Error>> {
-    let (limits, mut budget) = parser_limits(context, object.receipt.output_length)?;
+    let receipt = object
+        .derived
+        .steps
+        .last()
+        .ok_or("stream receipt is missing")?;
+    let (limits, mut budget) = parser_limits(context, receipt.output_length)?;
     let initial = budget;
     let memory_before = context.report_memory.bytes();
-    object.file.seek(SeekFrom::Start(0))?;
+    let mut file = object.derived.spool.file.try_clone()?;
+    file.seek(SeekFrom::Start(0))?;
     let mut reader = JobReader {
-        inner: &mut object.file,
+        inner: &mut file,
         job: context.job,
     };
     let result = inspect_zip_from_reader_with_source_sha256_and_memory(
         &mut reader,
-        object.receipt.output_length,
-        &object.receipt.output_sha256,
+        receipt.output_length,
+        &receipt.output_sha256,
         limits,
-        object.depth,
+        object.derived.steps.len(),
         &mut budget,
         context.report_memory,
     );
@@ -98,14 +103,71 @@ fn parse_archive(
         }
         Err(error) => {
             context.report_memory.try_resize(memory_before)?;
-            omit(
+            omit_formatted(
                 context,
                 None,
-                &format!("derived ZIP inspection incomplete: {error}"),
+                format_args!("derived ZIP inspection incomplete: {error}"),
             )?;
             Ok(Inspection::Unrecognized)
         }
     }
+}
+
+pub(super) fn expand_carved_archive(
+    context: &mut StreamContext<'_>,
+    artifact: &AnalyzedArtifact,
+    index: usize,
+    depth: usize,
+    file_count: usize,
+) -> Result<(), Box<dyn Error>> {
+    let (limits, mut budget) = parser_limits(context, artifact.bytes.len())?;
+    let initial = budget;
+    let before = context.report_memory.bytes();
+    let mut reader = JobReader {
+        inner: Cursor::new(artifact.bytes.as_slice()),
+        job: context.job,
+    };
+    let result = inspect_zip_from_reader_with_source_sha256_and_memory(
+        &mut reader,
+        artifact.bytes.len(),
+        &artifact.sha256,
+        limits,
+        depth,
+        &mut budget,
+        context.report_memory,
+    );
+    charge_parser(context, initial, budget)?;
+    match result {
+        Ok(archive)
+            if archive.omissions.iter().any(|omission| {
+                matches!(
+                    omission.reason,
+                    ZipArtifactOmissionReason::EntryCountLimit
+                        | ZipArtifactOmissionReason::DepthLimit
+                )
+            }) =>
+        {
+            drop(archive);
+            context.report_memory.try_resize(before)?;
+            omit(
+                context,
+                None,
+                "carved ZIP expansion reached its entry or depth limit",
+            )?;
+        }
+        Ok(archive) => merge_members(context, archive, index, depth, file_count)?,
+        Err(ZipReadError::Io(error)) => return Err(error.into()),
+        Err(ZipReadError::Memory(error)) => return Err(error.into()),
+        Err(error) => {
+            context.report_memory.try_resize(before)?;
+            omit_formatted(
+                context,
+                None,
+                format_args!("carved ZIP expansion incomplete: {error}"),
+            )?;
+        }
+    }
+    Ok(())
 }
 
 fn parser_limits(
@@ -188,12 +250,13 @@ fn charge_parser(
 
 fn retain_archive(
     context: &mut StreamContext<'_>,
-    object: StreamObject,
+    object: &StreamObject,
     archive: ZipArtifactReport,
 ) -> Result<(), Box<dyn Error>> {
     let Some((index, file_count)) = next_index(context)? else {
         return Ok(());
     };
+    let depth = object.derived.steps.len();
     let source_sha256 = context.report.source_sha256.clone();
     context.analysis.append_stream_archive(
         context.source_index,
@@ -201,13 +264,9 @@ fn retain_archive(
         context.source,
         &source_sha256,
         &archive,
-        DerivedFile {
-            file: object.file,
-            steps: object.steps,
-            memory: object.memory,
-        },
+        DerivedArtifact::new(object.derived.clone(), context.memory, 1)?,
     )?;
-    merge_members(context, archive, index, object.depth, file_count)?;
+    merge_members(context, archive, index, depth, file_count)?;
     context.job.increment(Counter::ValidatedArtifacts, 1)?;
     Ok(())
 }
@@ -224,7 +283,10 @@ pub(super) fn next_index(
     if context.report.artifacts.len().saturating_add(file_count)
         >= context.options.limits.max_artifacts
     {
-        context.report.omissions.try_reserve(1)?;
+        super::super::analysis_memory::reserve_omission(
+            &mut context.report.omissions,
+            context.omission_memory,
+        )?;
         context
             .report
             .omissions
@@ -267,7 +329,13 @@ fn merge_members(
     options.limits.max_depth = options.limits.max_depth.saturating_sub(depth);
     let work_before = context.report.work_bytes;
     let expansion_before = context.report.zip_expanded_work_bytes;
-    super::super::range_members::append_members(context.report, archive, index, options)?;
+    super::super::range_members::append_members(
+        context.report,
+        archive,
+        index,
+        options,
+        context.omission_memory,
+    )?;
     let work = context
         .report
         .work_bytes

@@ -4,10 +4,12 @@ mod archive;
 mod budget;
 mod observation;
 mod png;
+mod ranges;
 mod readers;
 
 use super::{
     analysis::AnalyzedSources,
+    file_artifact::{DerivedFile, STREAM_METADATA_BYTES},
     input::{InputSet, LoadedSource},
     policy::STREAM_EXPANSION_RATIO,
 };
@@ -22,12 +24,10 @@ use l2_workbench::{
     job::{Counter, Job, MemoryBudget, MemoryClass, MemoryError, MemoryLease},
 };
 
-const STREAM_OBJECT_MEMORY_BYTES: u64 = 16 * 1024;
-
 pub(in crate::refine) fn reserve_stream_object(
     memory: &MemoryBudget,
 ) -> Result<MemoryLease, MemoryError> {
-    memory.try_reserve(MemoryClass::Executor, STREAM_OBJECT_MEMORY_BYTES)
+    memory.try_reserve(MemoryClass::Executor, STREAM_METADATA_BYTES)
 }
 use observation::ObservingWriter;
 pub(super) use observation::{Observation, ObservingReader};
@@ -35,17 +35,14 @@ use readers::JobReader;
 use std::{
     collections::VecDeque,
     error::Error,
+    fmt,
     fs::File,
     io::{Seek, SeekFrom},
 };
 
 struct StreamObject {
-    file: File,
-    receipt: StreamReceipt,
-    steps: Vec<StreamReceipt>,
     observation: Observation,
-    depth: usize,
-    memory: MemoryLease,
+    derived: DerivedFile,
 }
 
 pub(super) struct StreamContext<'a> {
@@ -59,18 +56,32 @@ pub(super) struct StreamContext<'a> {
     pub(super) job: &'a Job,
     pub(super) memory: &'a MemoryBudget,
     pub(super) report_memory: &'a mut MemoryLease,
+    pub(super) omission_memory: &'a mut MemoryLease,
     pub(super) budget: &'a mut StreamingBudget,
+    pub(super) profile: crate::arguments::RecoveryProfile,
 }
 
 pub(super) fn append_streams(mut context: StreamContext<'_>) -> Result<(), Box<dyn Error>> {
     let mut queue = VecDeque::new();
     let operations = context.observation.operations()?;
-    if operations.is_empty() {
+    let observation_limited = context
+        .observation
+        .gzip_header_observation_limited(&operations);
+    if observation_limited {
         omit(
             &mut context,
             None,
-            "no supported whole-source streaming transformation was identified",
+            "gzip header may exceed the 4096-byte streaming observation limit",
         )?;
+    }
+    if operations.is_empty() {
+        if !observation_limited {
+            omit(
+                &mut context,
+                None,
+                "no supported whole-source streaming transformation was identified",
+            )?;
+        }
         return Ok(());
     }
     if context.options.limits.max_depth == 0 {
@@ -85,27 +96,42 @@ pub(super) fn append_streams(mut context: StreamContext<'_>) -> Result<(), Box<d
     }
     while let Some(object) = queue.pop_front() {
         context.job.check_cancelled()?;
+        let files_before = context.analysis.file_artifacts.len();
         let Some(object) = png::inspect_png(&mut context, object)? else {
             continue;
         };
-        let Some(mut object) = inspect_archive(&mut context, object)? else {
+        let Some(object) = inspect_archive(&mut context, object)? else {
             continue;
         };
+        let retained_prefix = context.analysis.file_artifacts.len() > files_before;
+        let found_ranges = ranges::inspect_ranges(&mut context, &object)?;
         let operations = object.observation.operations()?;
-        if operations.is_empty() {
+        let observation_limited = object
+            .observation
+            .gzip_header_observation_limited(&operations);
+        if observation_limited {
             omit(
                 &mut context,
                 None,
-                "derived stream has no supported whole-source transformation or validated format",
+                "gzip header may exceed the 4096-byte streaming observation limit",
             )?;
+        }
+        if operations.is_empty() {
+            if !found_ranges && !retained_prefix && !observation_limited {
+                omit(
+                    &mut context,
+                    None,
+                    "derived stream has no supported whole-source transformation or retained validated format",
+                )?;
+            }
             continue;
         }
-        if object.depth >= context.options.limits.max_depth {
+        if object.derived.steps.len() >= context.options.limits.max_depth {
             omit(&mut context, None, "stream recursion depth is exhausted")?;
             continue;
         }
         for operation in operations {
-            if let Some(child) = transform_object(&mut context, &mut object, &operation)? {
+            if let Some(child) = transform_object(&mut context, &object, &operation)? {
                 queue.try_reserve(1)?;
                 queue.push_back(child);
             }
@@ -179,7 +205,6 @@ fn transform_source(
         spool,
         observation,
         Vec::new(),
-        1,
         reservation,
         memory,
     )
@@ -187,10 +212,15 @@ fn transform_source(
 
 fn transform_object(
     context: &mut StreamContext<'_>,
-    object: &mut StreamObject,
+    object: &StreamObject,
     operation: &Operation,
 ) -> Result<Option<StreamObject>, Box<dyn Error>> {
-    let length = object.receipt.output_length;
+    let receipt = object
+        .derived
+        .steps
+        .last()
+        .ok_or("stream receipt is missing")?;
+    let length = receipt.output_length;
     let Some(reservation) = context.budget.reserve(length, operation) else {
         omit(
             context,
@@ -200,9 +230,10 @@ fn transform_object(
         return Ok(None);
     };
     let memory = reserve_stream_object(context.memory)?;
-    object.file.seek(SeekFrom::Start(0))?;
+    let mut file = object.derived.spool.file.try_clone()?;
+    file.seek(SeekFrom::Start(0))?;
     let mut reader = JobReader {
-        inner: &mut object.file,
+        inner: &mut file,
         job: context.job,
     };
     let mut spool = tempfile::tempfile()?;
@@ -213,7 +244,7 @@ fn transform_object(
         operation,
         StreamInput {
             length,
-            sha256: &object.receipt.output_sha256,
+            sha256: &receipt.output_sha256,
         },
         operation_limits(length, reservation),
         context.memory,
@@ -225,8 +256,7 @@ fn transform_object(
         result,
         spool,
         observation,
-        object.steps.clone(),
-        object.depth + 1,
+        object.derived.steps.as_ref().clone(),
         reservation,
         memory,
     )
@@ -252,7 +282,6 @@ fn finish_attempt(
     file: File,
     observation: Observation,
     mut steps: Vec<StreamReceipt>,
-    depth: usize,
     reservation: Reservation,
     memory: MemoryLease,
 ) -> Result<Option<StreamObject>, Box<dyn Error>> {
@@ -267,15 +296,11 @@ fn finish_attempt(
                 .and_then(|work| work.checked_add(receipt.output_length))
                 .ok_or("stream work overflows")?;
             steps.try_reserve(1)?;
-            steps.push(receipt.clone());
+            steps.push(receipt);
             context.job.increment(Counter::Transforms, 1)?;
             Ok(Some(StreamObject {
-                file,
-                receipt,
-                steps,
                 observation,
-                depth,
-                memory,
+                derived: DerivedFile::new(file, memory, steps),
             }))
         }
         Err(error @ (StreamTransformError::InputChanged | StreamTransformError::Io(_))) => {
@@ -289,7 +314,7 @@ fn finish_attempt(
                 .work_bytes
                 .checked_add(reservation.work)
                 .ok_or("stream work overflows")?;
-            omit(context, Some(operation.clone()), &error.to_string())?;
+            omit_formatted(context, Some(operation.clone()), format_args!("{error}"))?;
             Ok(None)
         }
     }
@@ -300,10 +325,19 @@ fn omit(
     operation: Option<Operation>,
     reason: &str,
 ) -> Result<(), Box<dyn Error>> {
-    context.report.omissions.try_reserve(1)?;
-    let mut message = String::new();
-    message.try_reserve_exact(reason.len())?;
-    message.push_str(reason);
+    omit_formatted(context, operation, format_args!("{reason}"))
+}
+
+fn omit_formatted(
+    context: &mut StreamContext<'_>,
+    operation: Option<Operation>,
+    reason: fmt::Arguments<'_>,
+) -> Result<(), Box<dyn Error>> {
+    super::analysis_memory::reserve_omission(
+        &mut context.report.omissions,
+        context.omission_memory,
+    )?;
+    let message = super::analysis_memory::format_message(reason, context.omission_memory)?;
     context
         .report
         .omissions
