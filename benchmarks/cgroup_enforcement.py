@@ -9,9 +9,19 @@ from fractions import Fraction
 from pathlib import Path
 
 if __package__:
-    from .runner.process import DEFAULT_MAX_LOG_BYTES, run_child, validate_timeout
+    from .runner.process import (
+        DEFAULT_MAX_LOG_BYTES,
+        resolve_working_directory,
+        run_child,
+        validate_timeout,
+    )
 else:
-    from runner.process import DEFAULT_MAX_LOG_BYTES, run_child, validate_timeout
+    from runner.process import (
+        DEFAULT_MAX_LOG_BYTES,
+        resolve_working_directory,
+        run_child,
+        validate_timeout,
+    )
 
 
 def delegated_scope():
@@ -171,13 +181,19 @@ class CgroupSamples:
         }
 
 
-def run_in_scope(directory, memory_max, timeout, max_log_bytes, command):
+def run_in_scope(
+    directory, memory_max, timeout, max_log_bytes, command,
+    workload_sample=None, working_directory=None
+):
     """Run a single command with a separate kernel limit and bounded log capture."""
     validate_timeout(timeout)
     if memory_max <= 0 or max_log_bytes <= 0 or not command:
         raise ValueError("positive memory and log caps and a command are required")
     if not directory.is_dir():
         raise ValueError("the output directory must already exist")
+    cwd = resolve_working_directory(
+        directory if working_directory is None else working_directory
+    )
     scope = delegated_scope()
 
     # Keep the observer outside the capped group so an OOM cannot erase its receipt
@@ -199,6 +215,11 @@ def run_in_scope(directory, memory_max, timeout, max_log_bytes, command):
         initial_cpu_limits = cpu_hierarchy_limits(workload)
         samples = CgroupSamples(workload)
 
+        def sample():
+            samples.sample()
+            if workload_sample is not None:
+                workload_sample(workload)
+
         # Move the launcher before exec so the monitor samples the analyzer PID
         launch = (
             "import os,sys; "
@@ -211,7 +232,8 @@ def run_in_scope(directory, memory_max, timeout, max_log_bytes, command):
             directory,
             timeout,
             max_log_bytes=max_log_bytes,
-            sample=samples.sample,
+            sample=sample,
+            working_directory=cwd,
         )
         duration = time.monotonic() - start
         final_events = event_counts(workload)
@@ -241,6 +263,7 @@ def run_in_scope(directory, memory_max, timeout, max_log_bytes, command):
         }
         receipt = {
             "command": command,
+            "working_directory": str(cwd),
             "exit_code": exit_code,
             "status": status,
             "message": message,
@@ -261,6 +284,11 @@ def run_in_scope(directory, memory_max, timeout, max_log_bytes, command):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--directory", type=Path, required=True)
+    parser.add_argument(
+        "--working-directory",
+        type=Path,
+        help="Existing child directory (default: output directory)",
+    )
     parser.add_argument("--memory-max", type=int, required=True)
     parser.add_argument("--timeout", type=float, required=True)
     parser.add_argument("--max-log-bytes", type=int, default=DEFAULT_MAX_LOG_BYTES)
@@ -276,6 +304,7 @@ def main():
             arguments.timeout,
             arguments.max_log_bytes,
             command,
+            working_directory=arguments.working_directory,
         )
     except (OSError, ValueError) as error:
         print(f"cgroup enforcement failed: {error}", file=sys.stderr)

@@ -52,6 +52,16 @@ def validate_timeout(timeout):
         )
 
 
+def resolve_working_directory(directory):
+    try:
+        resolved = Path(directory).resolve(strict=True)
+    except (OSError, RuntimeError) as error:
+        raise ValueError("working directory must be an existing directory") from error
+    if not resolved.is_dir():
+        raise ValueError("working directory must be an existing directory")
+    return resolved
+
+
 def stop_owned_processes(child):
     # Each POSIX analyzer starts a new session, so its group contains only owned work
     if child.returncode is not None:
@@ -327,6 +337,7 @@ def run_child(
     env=None,
     interrupt_when: Callable[[Mapping[str, Path]], bool] | None = None,
     sample: Callable[[], None] | None = None,
+    working_directory=None,
 ):
     validate_timeout(timeout)
     if (
@@ -335,6 +346,11 @@ def run_child(
         or max_log_bytes <= 0
     ):
         raise ValueError("log budget must be a positive byte count")
+    cwd = (
+        directory
+        if working_directory is None
+        else resolve_working_directory(working_directory)
+    )
     deadline = time.monotonic() + timeout
     prefix = f"{log_prefix}." if log_prefix else ""
     cpu_before = _child_cpu_usage()
@@ -344,7 +360,7 @@ def run_child(
     ):
         child = subprocess.Popen(
             command,
-            cwd=directory,
+            cwd=cwd,
             stdin=subprocess.DEVNULL,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,

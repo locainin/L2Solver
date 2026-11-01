@@ -8,8 +8,74 @@ from pathlib import Path
 
 import pytest
 
+from benchmarks import cgroup_enforcement
+
 ROOT = Path(__file__).resolve().parents[2]
 HARNESS = ROOT / "benchmarks" / "cgroup_enforcement.py"
+
+
+def test_invalid_working_directory_is_rejected_before_scope_or_child(tmp_path, monkeypatch):
+    def unexpected_scope():
+        pytest.fail("invalid working directory reached cgroup setup")
+
+    monkeypatch.setattr(cgroup_enforcement, "delegated_scope", unexpected_scope)
+    marker = tmp_path / "child-started"
+    with pytest.raises(ValueError, match="working directory"):
+        cgroup_enforcement.run_in_scope(
+            tmp_path,
+            128 * 1024 * 1024,
+            5,
+            1024,
+            [sys.executable, "-c", f"from pathlib import Path; Path({str(marker)!r}).touch()"],
+            working_directory=tmp_path / "missing",
+        )
+    assert not marker.exists()
+    assert not (tmp_path / "stdout.log").exists()
+    assert not (tmp_path / "cgroup.json").exists()
+
+
+@pytest.mark.skipif(sys.platform != "linux", reason="requires Linux cgroup v2")
+@pytest.mark.parametrize("explicit", [True, False], ids=["explicit", "default"])
+def test_owned_scope_records_resolved_working_directory(tmp_path, monkeypatch, explicit):
+    try:
+        cgroup_enforcement.delegated_scope()
+    except (OSError, ValueError):
+        pytest.skip("requires an exclusive delegated transient scope")
+
+    output = tmp_path / "results"
+    output.mkdir()
+    work = tmp_path / "source" if explicit else output
+    working_directory = []
+    if explicit:
+        work.mkdir()
+        alias = tmp_path / "source-link"
+        alias.symlink_to(work, target_is_directory=True)
+        working_directory = ["--working-directory", str(alias)]
+    (work / "fixture.py").write_text("VALUE = 'relative import'\n")
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "cgroup_enforcement",
+            "--directory", str(output),
+            *working_directory,
+            "--memory-max", "268435456",
+            "--timeout", "5",
+            "--", sys.executable, "-c",
+            "import fixture; from pathlib import Path; "
+            "Path('child.txt').write_text(fixture.VALUE); print(fixture.VALUE)",
+        ],
+    )
+
+    assert cgroup_enforcement.main() == 0
+    receipt = json.loads((output / "cgroup.json").read_text())
+    assert receipt["working_directory"] == str(work.resolve())
+    assert receipt["exit_code"] == 0
+    assert receipt["monitor"]["log_capture_complete"] is True
+    assert (work / "child.txt").read_text() == "relative import"
+    assert (output / "stdout.log").read_text() == "relative import\n"
+    if explicit:
+        assert not (work / "stdout.log").exists()
 
 
 @pytest.fixture

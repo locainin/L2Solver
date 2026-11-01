@@ -41,6 +41,102 @@ def run_with_group_signal_observer(command, directory, timeout):
 
 
 class ProcessTests(unittest.TestCase):
+    def test_default_working_directory_is_the_log_directory(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            result = run_child(
+                [sys.executable, "-c", "from pathlib import Path; Path('legacy').touch()"],
+                root,
+                5,
+            )
+
+            self.assertEqual(result[:3], (0, None, None))
+            self.assertTrue((root / "legacy").is_file())
+
+    def test_child_uses_requested_working_directory_and_separate_logs(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            work = root / "source"
+            logs = root / "results"
+            work.mkdir()
+            logs.mkdir()
+            (work / "fixture.py").write_text("VALUE = 'source fixture'\n")
+            result = run_child(
+                [
+                    sys.executable,
+                    "-c",
+                    "import fixture; from pathlib import Path; "
+                    "Path('child.txt').write_text(fixture.VALUE); print(fixture.VALUE)",
+                ],
+                logs,
+                5,
+                working_directory=work,
+            )
+
+            self.assertEqual(result[:3], (0, None, None))
+            self.assertEqual((work / "child.txt").read_text(), "source fixture")
+            self.assertEqual((logs / "stdout.log").read_text(), "source fixture\n")
+            self.assertTrue((logs / "stderr.log").is_file())
+            self.assertFalse((work / "stdout.log").exists())
+
+    def test_invalid_working_directory_rejects_before_logs_or_child(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            invalid_file = root / "file"
+            invalid_file.write_text("not a directory")
+            for working_directory in (root / "missing", invalid_file):
+                with self.subTest(working_directory=working_directory):
+                    marker = root / "child-started"
+                    with self.assertRaisesRegex(ValueError, "working directory"):
+                        run_child(
+                            [
+                                sys.executable,
+                                "-c",
+                                f"from pathlib import Path; Path({str(marker)!r}).touch()",
+                            ],
+                            root,
+                            5,
+                            working_directory=working_directory,
+                        )
+                    self.assertFalse(marker.exists())
+                    self.assertFalse((root / "stdout.log").exists())
+                    self.assertFalse((root / "stderr.log").exists())
+
+    @unittest.skipUnless(os.name == "posix", "requires process-group signal handling")
+    def test_callbacks_and_interrupt_use_logs_with_separate_working_directory(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            work = root / "source"
+            logs = root / "results"
+            work.mkdir()
+            logs.mkdir()
+            samples = []
+            command = [
+                sys.executable,
+                "-c",
+                "import signal,sys,time; "
+                "signal.signal(signal.SIGINT, lambda *_: sys.exit(130)); "
+                "print('ready', file=sys.stderr, flush=True); time.sleep(10)",
+            ]
+
+            def ready(paths):
+                self.assertEqual(paths["stderr"], logs / "stderr.log")
+                return "ready" in paths["stderr"].read_text()
+
+            result = run_child(
+                command,
+                logs,
+                5,
+                working_directory=work,
+                interrupt_when=ready,
+                sample=lambda: samples.append(True),
+            )
+
+            self.assertEqual(result[:3], (130, None, None))
+            self.assertTrue(result[3]["interrupt_sent"])
+            self.assertTrue(result[3]["log_capture_complete"])
+            self.assertTrue(samples)
+
     def test_sample_callback_runs_while_child_is_monitored(self):
         with tempfile.TemporaryDirectory() as directory:
             samples = []
