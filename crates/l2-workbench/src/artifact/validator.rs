@@ -467,14 +467,15 @@ impl ArtifactValidator {
                 }
             }
             ArtifactValidationFormat::Elf => {
-                validate_executable(format, ArtifactFormat::Elf, bytes, input_range)
+                validate_executable(format, ArtifactFormat::Elf, bytes, input_range, memory)?
             }
             ArtifactValidationFormat::PortableExecutable => validate_executable(
                 format,
                 ArtifactFormat::PortableExecutable,
                 bytes,
                 input_range,
-            ),
+                memory,
+            )?,
         })
     }
 }
@@ -675,6 +676,11 @@ const fn classify_executable_error<'a>(
                 maximum,
             },
         },
+        ArtifactError::AllocationFailure => ArtifactValidationOutcome::Omitted {
+            format: Some(format),
+            input_range,
+            reason: ArtifactResourceOmissionReason::AllocationFailure,
+        },
         ArtifactError::UnsupportedFormat => ArtifactValidationOutcome::Unsupported { input_range },
         error @ (ArtifactError::InvalidRange { .. }
         | ArtifactError::InvalidHeader { .. }
@@ -691,23 +697,36 @@ const fn classify_executable_error<'a>(
     }
 }
 
-fn validate_executable(
+fn validate_executable<'src>(
     format: ArtifactValidationFormat,
     expected: ArtifactFormat,
-    bytes: &[u8],
+    bytes: &'src [u8],
     input_range: FileRange,
-) -> ArtifactValidationOutcome<'_> {
+    memory: Option<&mut MemoryLease>,
+) -> Result<ArtifactValidationOutcome<'src>, MemoryError> {
     if candidate_executable_format(bytes) != Some(expected) {
-        return ArtifactValidationOutcome::Unsupported { input_range };
+        return Ok(ArtifactValidationOutcome::Unsupported { input_range });
     }
-    match super::inspect(bytes) {
+    let report = if let Some(lease) = memory {
+        match super::inspect::inspect_with_memory(bytes, lease) {
+            Ok(report) => Ok(report),
+            Err(super::inspect::InspectMemoryError::Format(error)) => Err(error),
+            Err(super::inspect::InspectMemoryError::Memory(error)) => return Err(error),
+            Err(super::inspect::InspectMemoryError::Allocation) => {
+                Err(ArtifactError::AllocationFailure)
+            }
+        }
+    } else {
+        super::inspect(bytes)
+    };
+    Ok(match report {
         Ok(report) => ArtifactValidationOutcome::BoundaryUnproven {
             format,
             input_range,
             structure: ArtifactStructure::Executable(report),
         },
         Err(error) => classify_executable_error(format, input_range, error),
-    }
+    })
 }
 
 const fn png_result(report: PngReport<'_>) -> ArtifactValidationOutcome<'_> {

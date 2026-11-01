@@ -1,6 +1,7 @@
 mod sections;
 
 use super::bytes::{Endian, range, slice, u16_at, u32_at, u64_at, usize_from_u64};
+use super::inspect::{Admission, InspectMemoryError, array_bytes};
 use super::{
     ArtifactError, ArtifactFormat, ArtifactReport, ArtifactSection, EntryPoint, FileMapping,
     MAX_SECTIONS,
@@ -43,17 +44,25 @@ pub(super) struct Header {
 }
 
 /// Parse ELF headers, sections, load mappings, symbols, and dynamic imports
-pub(super) fn parse(bytes: &[u8]) -> Result<ArtifactReport, ArtifactError> {
+pub(super) fn parse(
+    bytes: &[u8],
+    admission: &mut Admission,
+) -> Result<ArtifactReport, InspectMemoryError> {
     let header = read_header(bytes)?;
-    let section_headers = read_sections(bytes, &header)?;
+    let section_headers = read_sections(bytes, &header, admission)?;
     let (mut sections, references) = sections::parse(
         bytes,
         &section_headers,
         header.section_string_index,
         header.is_64,
         header.endian,
+        admission,
     )?;
-    let mappings = read_programs(bytes, &header, &mut sections)?;
+    let header_bytes = array_bytes::<SectionHeader>(section_headers.capacity())?;
+    // Header records are no longer needed once section metadata is built
+    drop(section_headers);
+    admission.release(header_bytes)?;
+    let mappings = read_programs(bytes, &header, &mut sections, admission)?;
     let entrypoint = if header.entry == 0 {
         None
     } else {
@@ -62,20 +71,22 @@ pub(super) fn parse(bytes: &[u8]) -> Result<ArtifactReport, ArtifactError> {
             file_offset: Some(map_address(&mappings, header.entry, 1)?),
         })
     };
+    let mut limitations = admission.vec(3)?;
+    limitations.extend_from_slice(&[
+        "ELF load mappings include only file-backed PT_LOAD bytes",
+        "ELF symbol names are displayed as lossy UTF-8 while exact name byte ranges are retained",
+    ]);
     Ok(ArtifactReport {
         format: ArtifactFormat::Elf,
         sha256: String::new(),
         machine: header.machine,
-        architecture: super::bytes::machine_name("elf", header.machine),
+        architecture: super::bytes::machine_name(ArtifactFormat::Elf, header.machine, admission)?,
         bitness: if header.is_64 { 64 } else { 32 },
         entrypoint,
         sections,
         mappings,
         references,
-        limitations: vec![
-            "ELF load mappings include only file-backed PT_LOAD bytes",
-            "ELF symbol names are displayed as lossy UTF-8 while exact name byte ranges are retained",
-        ],
+        limitations,
     })
 }
 
@@ -244,7 +255,11 @@ const fn validate_table_headers(header: &Header) -> Result<(), ArtifactError> {
     Ok(())
 }
 
-fn read_sections(bytes: &[u8], header: &Header) -> Result<Vec<SectionHeader>, ArtifactError> {
+fn read_sections(
+    bytes: &[u8],
+    header: &Header,
+    admission: &mut Admission,
+) -> Result<Vec<SectionHeader>, InspectMemoryError> {
     let table_length = header
         .section_entry_size
         .checked_mul(header.section_count)
@@ -252,27 +267,29 @@ fn read_sections(bytes: &[u8], header: &Header) -> Result<Vec<SectionHeader>, Ar
             field: "ELF section table length",
         })?;
     range(header.section_offset, table_length, bytes.len())?;
-    (0..header.section_count)
-        .map(|index| {
-            let displacement = header.section_entry_size.checked_mul(index).ok_or(
-                ArtifactError::InvalidHeader {
+    let mut sections = admission.vec(header.section_count)?;
+    for index in 0..header.section_count {
+        let displacement =
+            header
+                .section_entry_size
+                .checked_mul(index)
+                .ok_or(ArtifactError::InvalidHeader {
                     field: "ELF section table offset",
-                },
-            )?;
-            let offset = header.section_offset.checked_add(displacement).ok_or(
-                ArtifactError::InvalidHeader {
-                    field: "ELF section table offset",
-                },
-            )?;
-            read_section(
-                bytes,
-                offset,
-                header.section_entry_size,
-                header.is_64,
-                header.endian,
-            )
-        })
-        .collect()
+                })?;
+        let offset = header.section_offset.checked_add(displacement).ok_or(
+            ArtifactError::InvalidHeader {
+                field: "ELF section table offset",
+            },
+        )?;
+        sections.push(read_section(
+            bytes,
+            offset,
+            header.section_entry_size,
+            header.is_64,
+            header.endian,
+        )?);
+    }
+    Ok(sections)
 }
 
 fn read_section(
@@ -338,7 +355,8 @@ fn read_programs(
     bytes: &[u8],
     header: &Header,
     sections: &mut Vec<ArtifactSection>,
-) -> Result<Vec<FileMapping>, ArtifactError> {
+    admission: &mut Admission,
+) -> Result<Vec<FileMapping>, InspectMemoryError> {
     let table_length = header
         .program_entry_size
         .checked_mul(header.program_count)
@@ -367,16 +385,24 @@ fn read_programs(
                 offset: file_offset,
                 length: file_size,
                 total: bytes.len(),
-            });
+            }
+            .into());
         }
         if segment_type == PT_LOAD {
             if file_size > memory_size {
                 return Err(ArtifactError::InvalidHeader {
                     field: "ELF load segment size",
-                });
+                }
+                .into());
             }
+            admission.grow_vec(sections, 1)?;
+            let name = admission.number_name(
+                "LOAD[",
+                u64::try_from(index).map_err(|_| InspectMemoryError::Allocation)?,
+                "]",
+            )?;
             sections.push(ArtifactSection {
-                name: format!("LOAD[{index}]"),
+                name,
                 address,
                 file_offset: Some(file_offset),
                 file_size,
@@ -384,6 +410,7 @@ fn read_programs(
                 flags,
             });
             if file_size > 0 {
+                admission.grow_vec(&mut mappings, 1)?;
                 mappings.push(FileMapping {
                     address,
                     file_offset,

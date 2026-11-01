@@ -1,6 +1,7 @@
 use std::collections::BTreeMap;
 
 use super::super::bytes::{Endian, charge_reference_text, slice, u16_at, u32_at, u64_at};
+use super::super::inspect::{Admission, InspectMemoryError};
 use super::super::{
     ArtifactError, ArtifactReference, ArtifactReferenceKind, ArtifactSection, FileRange,
     MAX_REFERENCES,
@@ -31,14 +32,15 @@ pub(super) fn parse(
     string_index: usize,
     is_64: bool,
     endian: Endian,
-) -> Result<(Vec<ArtifactSection>, Vec<ArtifactReference>), ArtifactError> {
+    admission: &mut Admission,
+) -> Result<(Vec<ArtifactSection>, Vec<ArtifactReference>), InspectMemoryError> {
     let section_names = string_section(bytes, headers, string_index)?;
-    let mut sections = Vec::with_capacity(headers.len());
+    let mut sections = admission.vec(headers.len())?;
     for header in headers {
         if header.section_type != SHT_NOBITS {
             slice(bytes, header.offset, header.size)?;
         }
-        let name = section_name(section_names, header.name)?;
+        let name = section_name(section_names, header.name, admission)?;
         sections.push(ArtifactSection {
             name,
             address: header.address,
@@ -52,7 +54,7 @@ pub(super) fn parse(
             flags: header.flags,
         });
     }
-    let references = parse_symbols(bytes, headers, is_64, endian)?;
+    let references = parse_symbols(bytes, headers, is_64, endian, admission)?;
     Ok((sections, references))
 }
 
@@ -80,14 +82,18 @@ fn string_section<'a>(
     )))
 }
 
-fn section_name(table: Option<(&[u8], usize)>, offset: u32) -> Result<String, ArtifactError> {
+fn section_name(
+    table: Option<(&[u8], usize)>,
+    offset: u32,
+    admission: &mut Admission,
+) -> Result<String, InspectMemoryError> {
     if offset == 0 {
         return Ok(String::new());
     }
     let Some((table, base)) = table else {
-        return Err(ArtifactError::InvalidName { offset: 0 });
+        return Err(ArtifactError::InvalidName { offset: 0 }.into());
     };
-    name_from_table(table, base, offset).map(|(name, _, _)| name)
+    name_from_table(table, base, offset, admission).map(|(name, _, _)| name)
 }
 
 fn parse_symbols(
@@ -95,7 +101,8 @@ fn parse_symbols(
     headers: &[SectionHeader],
     is_64: bool,
     endian: Endian,
-) -> Result<Vec<ArtifactReference>, ArtifactError> {
+    admission: &mut Admission,
+) -> Result<Vec<ArtifactReference>, InspectMemoryError> {
     let context = SymbolContext {
         bytes,
         headers,
@@ -112,21 +119,40 @@ fn parse_symbols(
         .iter()
         .filter(|section| matches!(section.section_type, SHT_SYMTAB | SHT_DYNSYM))
     {
-        parse_symbol_table(&context, &mut collection, section)?;
+        parse_symbol_table(&context, &mut collection, section, admission)?;
     }
-    Ok(collection.references.into_values().collect())
+    let map_bytes = symbol_map_bytes(collection.references.len())?;
+    let key_bytes = collection
+        .references
+        .keys()
+        .try_fold(0_usize, |total, key| {
+            total
+                .checked_add(key.1.capacity())
+                .ok_or(InspectMemoryError::Allocation)
+        })?;
+    // The map and the final vector overlap until every record has moved
+    let mut references = admission.vec(collection.references.len())?;
+    references.extend(collection.references.into_values());
+    admission.release(
+        map_bytes
+            .checked_add(key_bytes)
+            .ok_or(InspectMemoryError::Allocation)?,
+    )?;
+    Ok(references)
 }
 
 fn parse_symbol_table(
     context: &SymbolContext<'_>,
     collection: &mut SymbolCollection,
     section: &SectionHeader,
-) -> Result<(), ArtifactError> {
+    admission: &mut Admission,
+) -> Result<(), InspectMemoryError> {
     let minimum = if context.is_64 { 24 } else { 16 };
     if section.entry_size < minimum || !section.size.is_multiple_of(section.entry_size) {
         return Err(ArtifactError::InvalidHeader {
             field: "ELF symbol entry size",
-        });
+        }
+        .into());
     }
     let string_index = usize::try_from(section.link).map_err(|_| ArtifactError::InvalidHeader {
         field: "ELF symbol string table index",
@@ -140,7 +166,8 @@ fn parse_symbol_table(
     if string_header.section_type != SHT_STRTAB {
         return Err(ArtifactError::InvalidHeader {
             field: "ELF symbol string table type",
-        });
+        }
+        .into());
     }
     let strings = slice(context.bytes, string_header.offset, string_header.size)?;
     let count = section.size / section.entry_size;
@@ -156,7 +183,8 @@ fn parse_symbol_table(
         return Err(ArtifactError::LimitExceeded {
             field: "symbol records",
             maximum: MAX_REFERENCES,
-        });
+        }
+        .into());
     }
     for index in 0..count {
         let record_offset = section
@@ -172,8 +200,11 @@ fn parse_symbol_table(
             continue;
         }
         let (name, name_offset, name_length) =
-            name_from_table(strings, string_header.offset, name_index)?;
+            name_from_table(strings, string_header.offset, name_index, admission)?;
         if name.is_empty() {
+            let bytes = name.capacity();
+            drop(name);
+            admission.release(bytes)?;
             continue;
         }
         add_symbol_reference(
@@ -189,6 +220,7 @@ fn parse_symbol_table(
             },
             address,
             section_index == SHN_UNDEF,
+            admission,
         )?;
     }
     Ok(())
@@ -201,18 +233,35 @@ fn add_symbol_reference(
     name_range: FileRange,
     address: u64,
     is_import: bool,
-) -> Result<(), ArtifactError> {
+    admission: &mut Admission,
+) -> Result<(), InspectMemoryError> {
     let kind = if is_import {
         ArtifactReferenceKind::Import
     } else {
         ArtifactReferenceKind::Symbol
     };
     let address = (address != 0).then_some(address);
-    let key = (reference_kind_key(kind), name.clone(), address);
+    let key = (
+        reference_kind_key(kind),
+        admission.copy_str(&name)?,
+        address,
+    );
     if collection.references.contains_key(&key) {
+        let bytes = key
+            .1
+            .capacity()
+            .checked_add(name.capacity())
+            .ok_or(InspectMemoryError::Allocation)?;
+        drop(key);
+        drop(name);
+        admission.release(bytes)?;
         return Ok(());
     }
     charge_reference_text(&mut collection.text_bytes, &name, None)?;
+    let old_map_bytes = symbol_map_bytes(collection.references.len())?;
+    let new_map_bytes = symbol_map_bytes(collection.references.len() + 1)?;
+    // Admit any possible node split before inserting the new symbol
+    admission.reserve(new_map_bytes - old_map_bytes)?;
     collection.references.insert(
         key,
         ArtifactReference {
@@ -253,7 +302,8 @@ fn name_from_table(
     table: &[u8],
     table_offset: usize,
     name_index: u32,
-) -> Result<(String, usize, usize), ArtifactError> {
+    admission: &mut Admission,
+) -> Result<(String, usize, usize), InspectMemoryError> {
     let local_offset = usize::try_from(name_index).map_err(|_| ArtifactError::InvalidName {
         offset: table_offset,
     })?;
@@ -269,20 +319,37 @@ fn name_from_table(
         .ok_or_else(|| ArtifactError::InvalidName {
             offset: table_offset.saturating_add(local_offset),
         })?;
-    let name =
-        String::from_utf8_lossy(
-            rest.get(..length)
-                .ok_or_else(|| ArtifactError::InvalidName {
-                    offset: table_offset.saturating_add(local_offset),
-                })?,
-        )
-        .into_owned();
+    let name = admission.lossy_string(rest.get(..length).ok_or_else(|| {
+        ArtifactError::InvalidName {
+            offset: table_offset.saturating_add(local_offset),
+        }
+    })?)?;
     let offset = table_offset
         .checked_add(local_offset)
         .ok_or(ArtifactError::InvalidName {
             offset: table_offset,
         })?;
     Ok((name, offset, length))
+}
+
+fn symbol_map_bytes(entries: usize) -> Result<usize, InspectMemoryError> {
+    if entries == 0 {
+        return Ok(0);
+    }
+    // The Rust 1.96 B-tree has 11 slots and at least 5 entries per non-root node
+    // Charge every node as an internal node, including child pointers and spare slots
+    // Recheck this logical model when the toolchain changes; allocator overhead is separate
+    let nodes = if entries < 11 {
+        1
+    } else {
+        (entries - 1) / 5 + 1
+    };
+    let node =
+        crate::allocation::btree_node_bytes::<(u8, String, Option<u64>), ArtifactReference>()
+            .ok_or(InspectMemoryError::Allocation)?;
+    nodes
+        .checked_mul(node)
+        .ok_or(InspectMemoryError::Allocation)
 }
 
 const fn reference_kind_key(kind: ArtifactReferenceKind) -> u8 {

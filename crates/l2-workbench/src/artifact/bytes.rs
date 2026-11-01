@@ -1,4 +1,5 @@
-use super::ArtifactError;
+use super::inspect::{Admission, InspectMemoryError};
+use super::{ArtifactError, ArtifactFormat};
 
 #[derive(Clone, Copy)]
 pub(super) enum Endian {
@@ -86,7 +87,8 @@ pub(super) fn c_string(
     bytes: &[u8],
     offset: usize,
     maximum: usize,
-) -> Result<(String, usize), ArtifactError> {
+    admission: &mut Admission,
+) -> Result<(String, usize), InspectMemoryError> {
     let available = bytes.len().saturating_sub(offset).min(maximum);
     let raw = slice(bytes, offset, available)?;
     let end = raw
@@ -96,7 +98,7 @@ pub(super) fn c_string(
     let name_bytes = raw
         .get(..end)
         .ok_or(ArtifactError::InvalidName { offset })?;
-    let name = String::from_utf8_lossy(name_bytes).into_owned();
+    let name = admission.lossy_string(name_bytes)?;
     Ok((name, end))
 }
 
@@ -127,15 +129,25 @@ pub(super) fn charge_reference_text(
     Ok(())
 }
 
-pub(super) fn machine_name(format: &'static str, machine: u16) -> String {
+pub(super) fn machine_name(
+    format: ArtifactFormat,
+    machine: u16,
+    admission: &mut Admission,
+) -> Result<String, InspectMemoryError> {
     let name = match (format, machine) {
-        ("elf", 3) | ("pe", 0x014c) => "x86",
-        ("elf", 62) | ("pe", 0x8664) => "x86_64",
-        ("elf", 40) | ("pe", 0x01c0) => "arm",
-        ("elf", 183) | ("pe", 0xaa64) => "aarch64",
-        ("elf", 20) => "powerpc",
-        ("elf", 21) => "powerpc64",
-        _ => return format!("{format}_machine_{machine}"),
+        (ArtifactFormat::Elf, 3) | (ArtifactFormat::PortableExecutable, 0x014c) => "x86",
+        (ArtifactFormat::Elf, 62) | (ArtifactFormat::PortableExecutable, 0x8664) => "x86_64",
+        (ArtifactFormat::Elf, 40) | (ArtifactFormat::PortableExecutable, 0x01c0) => "arm",
+        (ArtifactFormat::Elf, 183) | (ArtifactFormat::PortableExecutable, 0xaa64) => "aarch64",
+        (ArtifactFormat::Elf, 20) => "powerpc",
+        (ArtifactFormat::Elf, 21) => "powerpc64",
+        _ => {
+            let prefix = match format {
+                ArtifactFormat::Elf => "elf_machine_",
+                ArtifactFormat::PortableExecutable => "pe_machine_",
+            };
+            return admission.number_name(prefix, u64::from(machine), "");
+        }
     };
-    name.to_owned()
+    admission.copy_str(name)
 }

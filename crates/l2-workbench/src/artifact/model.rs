@@ -303,6 +303,8 @@ pub enum ArtifactError {
     },
     /// A table count or record size exceeded a configured bound
     LimitExceeded { field: &'static str, maximum: usize },
+    /// Space for executable metadata could not be allocated
+    AllocationFailure,
     /// A required header field has an unsupported or invalid value
     InvalidHeader { field: &'static str },
     /// A name table entry was not a bounded NUL-terminated string
@@ -340,6 +342,7 @@ impl fmt::Display for ArtifactError {
             Self::LimitExceeded { field, maximum } => {
                 write!(formatter, "artifact {field} exceeds maximum {maximum}")
             }
+            Self::AllocationFailure => formatter.write_str("executable metadata allocation failed"),
             Self::InvalidHeader { field } => write!(formatter, "invalid executable {field}"),
             Self::InvalidName { offset } => {
                 write!(formatter, "invalid bounded name at file offset {offset}")

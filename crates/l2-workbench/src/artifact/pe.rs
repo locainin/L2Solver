@@ -1,4 +1,5 @@
 use super::bytes::{Endian, c_string, charge_reference_text, range, slice, u16_at, u32_at, u64_at};
+use super::inspect::{Admission, InspectMemoryError, array_bytes};
 use super::{
     ArtifactError, ArtifactFormat, ArtifactReference, ArtifactReferenceKind, ArtifactReport,
     ArtifactSection, EntryPoint, FileMapping, FileRange, MAX_REFERENCES, MAX_SECTIONS,
@@ -53,17 +54,34 @@ struct ImportReferences<'a> {
 }
 
 /// Parse PE headers, sections, exports, and imports
-pub(super) fn parse(bytes: &[u8]) -> Result<ArtifactReport, ArtifactError> {
-    let image = read_image(bytes)?;
+pub(super) fn parse(
+    bytes: &[u8],
+    admission: &mut Admission,
+) -> Result<ArtifactReport, InspectMemoryError> {
+    let image = read_image(bytes, admission)?;
     let mut reference_text_bytes = 0_usize;
-    let mut references = parse_exports(bytes, &image, &mut reference_text_bytes)?;
+    let mut references = parse_exports(bytes, &image, &mut reference_text_bytes, admission)?;
     let remaining_references = MAX_REFERENCES.saturating_sub(references.len());
-    references.extend(parse_imports(
+    let mut imports = parse_imports(
         bytes,
         &image,
         remaining_references,
         &mut reference_text_bytes,
-    )?);
+        admission,
+    )?;
+    if references.is_empty() {
+        let empty_bytes = array_bytes::<ArtifactReference>(references.capacity())?;
+        drop(references);
+        admission.release(empty_bytes)?;
+        // A PE without exports can keep the import buffer directly
+        references = imports;
+    } else {
+        admission.grow_vec(&mut references, imports.len())?;
+        references.append(&mut imports);
+        let import_bytes = array_bytes::<ArtifactReference>(imports.capacity())?;
+        drop(imports);
+        admission.release(import_bytes)?;
+    }
     let entrypoint = if image.entry_rva == 0 {
         None
     } else {
@@ -79,32 +97,44 @@ pub(super) fn parse(bytes: &[u8]) -> Result<ArtifactReport, ArtifactError> {
             file_offset: Some(file_offset),
         })
     };
+    let directory_bytes = array_bytes::<DataDirectory>(image.directories.capacity())?;
+    // The report keeps sections and mappings, while directory records can be dropped
+    drop(image.directories);
+    admission.release(directory_bytes)?;
+    let mut limitations = admission.vec(3)?;
+    limitations.extend_from_slice(&[
+        "PE import and export names are static table observations and do not establish executed behavior",
+        "PE section mappings include file-backed raw bytes only",
+    ]);
     Ok(ArtifactReport {
         format: ArtifactFormat::PortableExecutable,
         sha256: String::new(),
         machine: image.machine,
-        architecture: super::bytes::machine_name("pe", image.machine),
+        architecture: super::bytes::machine_name(
+            ArtifactFormat::PortableExecutable,
+            image.machine,
+            admission,
+        )?,
         bitness: if image.is_64 { 64 } else { 32 },
         entrypoint,
         sections: image.sections,
         mappings: image.mappings,
         references,
-        limitations: vec![
-            "PE import and export names are static table observations and do not establish executed behavior",
-            "PE section mappings include file-backed raw bytes only",
-        ],
+        limitations,
     })
 }
 
-fn read_image(bytes: &[u8]) -> Result<PeImage, ArtifactError> {
+fn read_image(bytes: &[u8], admission: &mut Admission) -> Result<PeImage, InspectMemoryError> {
     let coff = read_coff_header(bytes)?;
-    let optional = read_optional_header(bytes, coff.optional_offset, coff.optional_size)?;
+    let optional =
+        read_optional_header(bytes, coff.optional_offset, coff.optional_size, admission)?;
     let (sections, mappings) = read_sections(
         bytes,
         coff.section_table_offset,
         coff.section_count,
         optional.image_base,
         optional.size_of_headers,
+        admission,
     )?;
     Ok(PeImage {
         is_64: optional.is_64,
@@ -168,7 +198,8 @@ fn read_optional_header(
     bytes: &[u8],
     optional_offset: usize,
     optional_size: usize,
-) -> Result<OptionalHeader, ArtifactError> {
+    admission: &mut Admission,
+) -> Result<OptionalHeader, InspectMemoryError> {
     slice(bytes, optional_offset, optional_size)?;
     let magic = u16_at(bytes, optional_offset, Endian::Little)?;
     let (is_64, directory_offset, directory_count_offset, base_optional_size) = match magic {
@@ -177,13 +208,15 @@ fn read_optional_header(
         _ => {
             return Err(ArtifactError::InvalidHeader {
                 field: "PE optional header magic",
-            });
+            }
+            .into());
         }
     };
     if optional_size < base_optional_size {
         return Err(ArtifactError::InvalidHeader {
             field: "PE optional header size",
-        });
+        }
+        .into());
     }
     let entry_rva = u32_at(bytes, optional_offset + 16, Endian::Little)?;
     let image_base = if is_64 {
@@ -198,7 +231,8 @@ fn read_optional_header(
     if size_of_headers == 0 || size_of_headers > bytes.len() {
         return Err(ArtifactError::InvalidHeader {
             field: "PE headers size",
-        });
+        }
+        .into());
     }
     let directories = read_directories(
         bytes,
@@ -206,6 +240,7 @@ fn read_optional_header(
         optional_size,
         directory_offset,
         directory_count_offset,
+        admission,
     )?;
     Ok(OptionalHeader {
         is_64,
@@ -222,7 +257,8 @@ fn read_directories(
     optional_size: usize,
     directory_offset: usize,
     directory_count_offset: usize,
-) -> Result<Vec<DataDirectory>, ArtifactError> {
+    admission: &mut Admission,
+) -> Result<Vec<DataDirectory>, InspectMemoryError> {
     let directory_count = usize::try_from(u32_at(
         bytes,
         optional_offset + directory_count_offset,
@@ -241,10 +277,11 @@ fn read_directories(
     if directory_count > available_directory_count {
         return Err(ArtifactError::InvalidHeader {
             field: "PE directory count",
-        });
+        }
+        .into());
     }
     let retained_count = directory_count.min(RETAINED_DIRECTORY_COUNT);
-    let mut directories = Vec::with_capacity(retained_count);
+    let mut directories = admission.vec(retained_count)?;
     for index in 0..retained_count {
         let offset = optional_offset
             .checked_add(directory_offset)
@@ -266,12 +303,13 @@ fn read_sections(
     count: usize,
     image_base: u64,
     size_of_headers: usize,
-) -> Result<(Vec<ArtifactSection>, Vec<FileMapping>), ArtifactError> {
+    admission: &mut Admission,
+) -> Result<(Vec<ArtifactSection>, Vec<FileMapping>), InspectMemoryError> {
     let table_size = count.checked_mul(40).ok_or(ArtifactError::InvalidHeader {
         field: "PE section table size",
     })?;
     range(table_offset, table_size, bytes.len())?;
-    let mut sections = Vec::with_capacity(count);
+    let mut sections = admission.vec(count)?;
     let mut mappings = Vec::new();
     for index in 0..count {
         let offset = table_offset
@@ -281,13 +319,15 @@ fn read_sections(
             .ok_or(ArtifactError::InvalidHeader {
                 field: "PE section header offset",
             })?;
-        let (section, mapping) = read_section(bytes, offset, image_base)?;
+        let (section, mapping) = read_section(bytes, offset, image_base, admission)?;
         sections.push(section);
         if let Some(mapping) = mapping {
+            admission.grow_vec(&mut mappings, 1)?;
             mappings.push(mapping);
         }
     }
     if size_of_headers > 0 {
+        admission.grow_vec(&mut mappings, 1)?;
         mappings.push(FileMapping {
             address: image_base,
             file_offset: 0,
@@ -303,7 +343,8 @@ fn read_section(
     bytes: &[u8],
     offset: usize,
     image_base: u64,
-) -> Result<(ArtifactSection, Option<FileMapping>), ArtifactError> {
+    admission: &mut Admission,
+) -> Result<(ArtifactSection, Option<FileMapping>), InspectMemoryError> {
     let raw_name = slice(bytes, offset, 8)?;
     let name_length = raw_name
         .iter()
@@ -316,7 +357,7 @@ fn read_section(
             length: name_length,
             total: bytes.len(),
         })?;
-    let name = String::from_utf8_lossy(name_bytes).into_owned();
+    let name = admission.lossy_string(name_bytes)?;
     let memory_size =
         usize::try_from(u32_at(bytes, offset + 8, Endian::Little)?).map_err(|_| {
             ArtifactError::InvalidHeader {
@@ -348,7 +389,8 @@ fn read_section(
             offset: file_offset,
             length: 0,
             total: bytes.len(),
-        });
+        }
+        .into());
     }
     let mapping = (file_size > 0).then_some(FileMapping {
         address,
@@ -375,7 +417,8 @@ fn parse_imports(
     image: &PeImage,
     reference_limit: usize,
     reference_text_bytes: &mut usize,
-) -> Result<Vec<ArtifactReference>, ArtifactError> {
+    admission: &mut Admission,
+) -> Result<Vec<ArtifactReference>, InspectMemoryError> {
     let Some(directory) = image.directories.get(IMPORT_DIRECTORY).copied() else {
         return Ok(Vec::new());
     };
@@ -389,7 +432,8 @@ fn parse_imports(
     if directory_size < IMPORT_DESCRIPTOR_BYTES || directory_size % IMPORT_DESCRIPTOR_BYTES != 0 {
         return Err(ArtifactError::InvalidHeader {
             field: "PE import directory size",
-        });
+        }
+        .into());
     }
     let directory_offset = rva_to_offset(image, directory.rva, directory_size)?;
     let descriptor_count = directory_size / IMPORT_DESCRIPTOR_BYTES;
@@ -416,10 +460,12 @@ fn parse_imports(
         if name_rva == 0 || first_thunk == 0 {
             return Err(ArtifactError::InvalidHeader {
                 field: "PE import descriptor",
-            });
+            }
+            .into());
         }
         let name_offset = rva_to_offset(image, name_rva, 1)?;
-        let (library, library_length) = c_string(bytes, name_offset, MAX_IMPORT_NAME_BYTES)?;
+        let (library, library_length) =
+            c_string(bytes, name_offset, MAX_IMPORT_NAME_BYTES, admission)?;
         let thunk_rva = if original_thunk == 0 {
             first_thunk
         } else {
@@ -441,12 +487,17 @@ fn parse_imports(
                 length: library_length,
             },
             &mut import_references,
+            admission,
         )?;
+        let library_bytes = library.capacity();
+        drop(library);
+        admission.release(library_bytes)?;
     }
     if !terminated {
         return Err(ArtifactError::InvalidHeader {
             field: "PE import terminator",
-        });
+        }
+        .into());
     }
     Ok(references)
 }
@@ -458,7 +509,8 @@ fn parse_thunks(
     library: &str,
     library_range: FileRange,
     output: &mut ImportReferences<'_>,
-) -> Result<(), ArtifactError> {
+    admission: &mut Admission,
+) -> Result<(), InspectMemoryError> {
     let width = if image.is_64 { 8_usize } else { 4_usize };
     let ordinal_mask = if image.is_64 {
         1_u64 << 63
@@ -490,11 +542,12 @@ fn parse_thunks(
             return Err(ArtifactError::LimitExceeded {
                 field: "PE import thunks",
                 maximum: MAX_REFERENCES,
-            });
+            }
+            .into());
         }
         let (name, name_range) = if value & ordinal_mask != 0 {
             let ordinal = value & 0xffff;
-            (format!("#{ordinal}"), None)
+            (admission.number_name("#", ordinal, "")?, None)
         } else {
             let name_rva = u32::try_from(value).map_err(|_| ArtifactError::InvalidHeader {
                 field: "PE import name RVA",
@@ -505,7 +558,8 @@ fn parse_thunks(
                 .ok_or(ArtifactError::InvalidHeader {
                     field: "PE import name offset",
                 })?;
-            let (name, name_length) = c_string(bytes, name_offset, MAX_IMPORT_NAME_BYTES)?;
+            let (name, name_length) =
+                c_string(bytes, name_offset, MAX_IMPORT_NAME_BYTES, admission)?;
             (
                 name,
                 Some(FileRange {
@@ -515,9 +569,11 @@ fn parse_thunks(
             )
         };
         charge_reference_text(output.text_bytes, &name, Some(library))?;
+        let retained_library = admission.copy_str(library)?;
+        admission.grow_vec(output.records, 1)?;
         output.records.push(ArtifactReference {
             name,
-            library: Some(library.to_owned()),
+            library: Some(retained_library),
             library_range: Some(library_range),
             kind: ArtifactReferenceKind::Import,
             record_range: FileRange {
@@ -531,18 +587,20 @@ fn parse_thunks(
     Err(ArtifactError::LimitExceeded {
         field: "PE import thunks",
         maximum: MAX_REFERENCES,
-    })
+    }
+    .into())
 }
 
 fn parse_exports(
     bytes: &[u8],
     image: &PeImage,
     reference_text_bytes: &mut usize,
-) -> Result<Vec<ArtifactReference>, ArtifactError> {
+    admission: &mut Admission,
+) -> Result<Vec<ArtifactReference>, InspectMemoryError> {
     let Some(exports) = export_table(bytes, image)? else {
         return Ok(Vec::new());
     };
-    let mut references = Vec::with_capacity(exports.name_count);
+    let mut references = admission.vec(exports.name_count)?;
     for index in 0..exports.name_count {
         references.push(parse_export(
             bytes,
@@ -550,6 +608,7 @@ fn parse_exports(
             &exports,
             index,
             reference_text_bytes,
+            admission,
         )?);
     }
     Ok(references)
@@ -609,7 +668,8 @@ fn parse_export(
     exports: &ExportTable,
     index: usize,
     reference_text_bytes: &mut usize,
-) -> Result<ArtifactReference, ArtifactError> {
+    admission: &mut Admission,
+) -> Result<ArtifactReference, InspectMemoryError> {
     let index_u32 = u32::try_from(index).map_err(|_| ArtifactError::InvalidHeader {
         field: "PE export name index",
     })?;
@@ -617,7 +677,7 @@ fn parse_export(
     let record_offset = rva_to_offset(image, name_pointer_rva, 4)?;
     let export_name_rva = u32_at(bytes, record_offset, Endian::Little)?;
     let name_offset = rva_to_offset(image, export_name_rva, 1)?;
-    let (name, name_length) = c_string(bytes, name_offset, MAX_IMPORT_NAME_BYTES)?;
+    let (name, name_length) = c_string(bytes, name_offset, MAX_IMPORT_NAME_BYTES, admission)?;
     charge_reference_text(reference_text_bytes, &name, None)?;
     let ordinal_index = indexed_rva(
         exports.ordinals_rva,
@@ -630,7 +690,8 @@ fn parse_export(
     if function_index >= exports.function_count {
         return Err(ArtifactError::InvalidHeader {
             field: "PE export ordinal",
-        });
+        }
+        .into());
     }
     let function_index =
         u32::try_from(function_index).map_err(|_| ArtifactError::InvalidHeader {

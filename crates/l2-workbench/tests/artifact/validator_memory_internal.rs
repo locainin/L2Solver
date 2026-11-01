@@ -11,6 +11,8 @@ use crate::{
 
 #[path = "embedded_memory_internal.rs"]
 mod embedded_memory;
+#[path = "support.rs"]
+mod executable_support;
 #[path = "png_memory_internal.rs"]
 mod png_memory;
 #[path = "signature_detection_internal.rs"]
@@ -31,6 +33,35 @@ mod image_support {
 }
 
 type TestResult = Result<(), Box<dyn Error>>;
+
+#[test]
+fn executable_validation_admits_parser_metadata_and_preserves_results() -> TestResult {
+    for image in [
+        executable_support::minimal_pe()?,
+        executable_support::minimal_elf()?,
+    ] {
+        let validator = ArtifactValidator::new(ArtifactValidationPolicy::default())?;
+        let expected = validator.validate(&image);
+        let budget = MemoryBudget::new(65_536);
+        let blocker = budget.try_reserve(MemoryClass::Cache, 65_536)?;
+        let mut lease = budget.try_reserve(MemoryClass::Executor, 0)?;
+        let mut zip_work = 1024;
+        assert!(matches!(
+            validator.validate_with_zip_budget_and_memory(&image, &mut zip_work, &mut lease),
+            Err(MemoryError::Limit { .. })
+        ));
+        assert_eq!(lease.bytes(), 0);
+        drop(blocker);
+        let result =
+            validator.validate_with_zip_budget_and_memory(&image, &mut zip_work, &mut lease)?;
+        assert_eq!(result, expected);
+        assert!(lease.bytes() > 0);
+        drop(result);
+        drop(lease);
+        assert_eq!(budget.snapshot()?.used_bytes, 0);
+    }
+    Ok(())
+}
 
 fn png_with_chunks(extra_chunks: usize) -> Result<Vec<u8>, Box<dyn Error>> {
     let chunks = vec![(*b"abCd", b"".as_slice()); extra_chunks];
