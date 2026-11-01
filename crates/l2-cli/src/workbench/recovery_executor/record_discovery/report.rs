@@ -154,6 +154,7 @@ struct RecordAnalysis {
     partition: SessionPartition,
     strategies: Option<RecordSchemaMultiStrategyAnalysisReport>,
     family_selection: Option<family::FamilySelection>,
+    family_search: Option<family::FamilySearchSummary>,
 }
 
 struct RecordReportOutput {
@@ -774,13 +775,12 @@ impl Executor<'_> {
                 context.omitted_frames > 0,
                 include_repeated_boundaries,
             )?;
-            let family_reports = if analysis.result == STATUS_NO_CANDIDATES
-                && matches!(&context.key.origin, RecordCohortOrigin::TcpMaterialized)
-            {
-                self.analyze_message_families(&context, &mut analysis, proposal_limits)?
-            } else {
-                Vec::new()
-            };
+            let family_reports =
+                if matches!(&context.key.origin, RecordCohortOrigin::TcpMaterialized) {
+                    self.analyze_message_families(&context, &mut analysis, proposal_limits)?
+                } else {
+                    Vec::new()
+                };
             let full_report = build_report(&context, &analysis, work_bound_bytes)?;
             let bytes = serde_json::to_vec(&full_report).map_err(|source| {
                 operational("record discovery report serialization failed", source)
@@ -1083,6 +1083,7 @@ impl Executor<'_> {
                 partition,
                 strategies: None,
                 family_selection: None,
+                family_search: None,
             });
         }
         let strategies = analyze_strategies(
@@ -1137,6 +1138,7 @@ impl Executor<'_> {
             partition,
             strategies: Some(strategies),
             family_selection: None,
+            family_search: None,
         })
     }
 
@@ -1281,7 +1283,7 @@ fn build_compact_report(
         },
         "work_bound_bytes":requested_work,
     });
-    add_family_selection(&mut report, analysis)?;
+    add_family_details(&mut report, analysis)?;
     Ok(report)
 }
 
@@ -1523,11 +1525,11 @@ fn build_report(
         "repeated_boundary_analysis":repeated_boundary_analysis,
         "work_bound_bytes":requested_work,
     });
-    add_family_selection(&mut report, analysis)?;
+    add_family_details(&mut report, analysis)?;
     Ok(report)
 }
 
-fn add_family_selection(
+fn add_family_details(
     report: &mut Value,
     analysis: &RecordAnalysis,
 ) -> Result<(), RecoveryExecutionError> {
@@ -1538,6 +1540,14 @@ fn add_family_selection(
             .as_object_mut()
             .ok_or(RecoveryError::InvariantFailure)?
             .insert("family_selection".to_owned(), details);
+    }
+    if let Some(summary) = &analysis.family_search {
+        let details = serde_json::to_value(summary)
+            .map_err(|source| operational("family search serialization failed", source))?;
+        report
+            .as_object_mut()
+            .ok_or(RecoveryError::InvariantFailure)?
+            .insert("family_search".to_owned(), details);
     }
     Ok(())
 }

@@ -23,6 +23,8 @@ const MAX_VALUES: usize = 4;
 const MAX_GROUPS: usize = 8;
 const MAX_APPLICATION_FRAMES: usize = 4096;
 const FAMILY_WORK_LIMIT: usize = 1_000_000;
+const MAX_FAMILY_MEMORY_BYTES: usize = 128 * 1024 * 1024;
+const MAX_GROUP_EXAMPLES: usize = 8;
 
 #[derive(serde::Serialize)]
 pub(super) struct FamilySelection {
@@ -37,6 +39,44 @@ pub(super) struct FamilySelection {
     selector_search_complete: bool,
 }
 
+#[derive(Default, serde::Serialize)]
+pub(super) struct FamilySearchSummary {
+    limits: RecordSchemaProposalLimits,
+    selectors_retained: usize,
+    groups_proposed: usize,
+    groups_examined: usize,
+    groups_with_schemas: usize,
+    groups_without_candidate_space: usize,
+    groups_without_surviving_schemas: usize,
+    schema_candidate_evaluations: usize,
+    schema_survivor_group_pairs: usize,
+    complete_within_limits: bool,
+    groups: Vec<FamilyGroupSummary>,
+}
+
+#[derive(serde::Serialize)]
+struct FamilyGroupSummary {
+    selector_range: ByteRange,
+    selector_value: Vec<u8>,
+    training_count: usize,
+    heldout_count: usize,
+    training_examples: Vec<FamilyFrameExample>,
+    heldout_examples: Vec<FamilyFrameExample>,
+    omitted_training_examples: usize,
+    omitted_heldout_examples: usize,
+    application_count: usize,
+    result: &'static str,
+    reason: Option<&'static str>,
+    schema_candidate_evaluations: usize,
+    schema_survivors_retained: usize,
+}
+
+#[derive(serde::Serialize)]
+struct FamilyFrameExample {
+    node_id: u64,
+    blob_id: String,
+}
+
 struct FamilyGroup {
     context: RecordDiscoveryContext,
     partition: SessionPartition,
@@ -46,6 +86,7 @@ struct FamilyGroup {
 struct FamilyGroups {
     groups: Vec<FamilyGroup>,
     incomplete: bool,
+    selectors_retained: usize,
 }
 
 impl Executor<'_> {
@@ -63,6 +104,11 @@ impl Executor<'_> {
             return Ok(Vec::new());
         }
         let memory_bytes = memory_bound(context, limits)?;
+        if memory_bytes > MAX_FAMILY_MEMORY_BYTES {
+            mark_incomplete(uniform, "message_family_memory_limit");
+            return Ok(Vec::new());
+        }
+        // Reserve temporary and queued data before learning any selectors
         let memory = if let Some(budget) = &self.memory {
             let requested =
                 u64::try_from(memory_bytes).map_err(|_| RecoveryError::InvariantFailure)?;
@@ -82,7 +128,19 @@ impl Executor<'_> {
             mark_incomplete(uniform, "message_family_work_limit");
             return Ok(Vec::new());
         }
+        // Keep the uniform report even when a separate family search is incomplete
         let proposal = propose_groups(self.case, context, &uniform.partition, limits)?;
+        let mut summary = FamilySearchSummary {
+            limits,
+            selectors_retained: proposal.selectors_retained,
+            groups_proposed: proposal.groups.len(),
+            complete_within_limits: !proposal.incomplete,
+            ..FamilySearchSummary::default()
+        };
+        summary
+            .groups
+            .try_reserve_exact(proposal.groups.len())
+            .map_err(|source| operational("family group summary allocation failed", source))?;
         if proposal.incomplete {
             mark_incomplete(uniform, "message_family_search_limit");
         }
@@ -96,8 +154,13 @@ impl Executor<'_> {
             }
             let bound = cohort_work_bound(&group.context.key, &group.context.inputs, limits)
                 .ok_or(RecoveryError::InvariantFailure)?;
+            let mut group_summary = group_summary(&group)?;
             if !self.charge_record_case_work(bound)? {
                 mark_incomplete(uniform, "message_family_work_limit");
+                summary.complete_within_limits = false;
+                group_summary.result = "not_examined";
+                group_summary.reason = Some("message_family_work_limit");
+                summary.groups.push(group_summary);
                 break;
             }
             let mut analysis = self.analyze_record_cohort(
@@ -107,9 +170,37 @@ impl Executor<'_> {
                 group.context.omitted_frames > 0,
                 false,
             )?;
+            summary.groups_examined += 1;
+            group_summary.result = analysis.result;
+            group_summary.reason = analysis.no_candidate_reason;
+            summary.complete_within_limits &=
+                analysis.search_exhaustive_within_plan && analysis.report_details_complete;
+            // Count work per selected group without retaining more schema arrays
+            if let Some(strategies) = &analysis.strategies {
+                for strategy in super::strategy_reports(strategies) {
+                    if let Some(discovery) = &strategy.discovery {
+                        summary.schema_candidate_evaluations += discovery.examined_combinations;
+                        summary.schema_survivor_group_pairs += discovery.surviving.len();
+                        group_summary.schema_candidate_evaluations +=
+                            discovery.examined_combinations;
+                        group_summary.schema_survivors_retained += discovery.surviving.len();
+                    }
+                }
+            }
+            summary.groups.push(group_summary);
             if analysis.result != STATUS_HYPOTHESES_FOUND {
+                match analysis.no_candidate_reason {
+                    Some("no_structural_candidate_space") => {
+                        summary.groups_without_candidate_space += 1
+                    }
+                    Some("no_schema_survived_strict_parsing") => {
+                        summary.groups_without_surviving_schemas += 1
+                    }
+                    _ => {}
+                }
                 continue;
             }
+            summary.groups_with_schemas += 1;
             // Compact reports avoid materializing large speculative schema arrays
             analysis.report_details_complete = false;
             analysis.family_selection = Some(group.selection);
@@ -131,8 +222,59 @@ impl Executor<'_> {
                 self.family_memory.push(lease);
             }
         }
+        uniform.family_search = Some(summary);
         Ok(reports)
     }
+}
+
+fn group_summary(group: &FamilyGroup) -> Result<FamilyGroupSummary, RecoveryExecutionError> {
+    let training_count = group.partition.training_count;
+    let heldout_count = group
+        .context
+        .inputs
+        .len()
+        .checked_sub(training_count)
+        .ok_or(RecoveryError::InvariantFailure)?;
+    let training = group
+        .context
+        .inputs
+        .get(..training_count)
+        .ok_or(RecoveryError::InvariantFailure)?;
+    let heldout = group
+        .context
+        .inputs
+        .get(training_count..)
+        .ok_or(RecoveryError::InvariantFailure)?;
+    Ok(FamilyGroupSummary {
+        selector_range: group.selection.selector_range,
+        selector_value: group.selection.selector_value.clone(),
+        training_count,
+        heldout_count,
+        training_examples: frame_examples(training)?,
+        heldout_examples: frame_examples(heldout)?,
+        omitted_training_examples: training_count.saturating_sub(MAX_GROUP_EXAMPLES),
+        omitted_heldout_examples: heldout_count.saturating_sub(MAX_GROUP_EXAMPLES),
+        application_count: group.context.application_inputs.len(),
+        result: "not_examined",
+        reason: None,
+        schema_candidate_evaluations: 0,
+        schema_survivors_retained: 0,
+    })
+}
+
+fn frame_examples(
+    inputs: &[super::RecordFrameInput],
+) -> Result<Vec<FamilyFrameExample>, RecoveryExecutionError> {
+    let count = inputs.len().min(MAX_GROUP_EXAMPLES);
+    let mut examples = Vec::new();
+    examples
+        .try_reserve_exact(count)
+        .map_err(|source| operational("family frame example allocation failed", source))?;
+    examples.extend(inputs.iter().take(count).map(|input| FamilyFrameExample {
+        node_id: input.node_id,
+        blob_id: input.blob_id.clone(),
+    }));
+    Ok(examples)
 }
 
 fn mark_incomplete(analysis: &mut RecordAnalysis, reason: &'static str) {
@@ -180,11 +322,33 @@ fn memory_bound(
         .and_then(|value| value.checked_add(limits.max_length_checks))
         .and_then(|value| value.checked_mul(512))
         .ok_or(RecoveryError::InvariantFailure)?;
-    // Include selected descriptors, bounded schema models, and compact report buffers
+    let survivors = limits
+        .discovery
+        .max_survivors
+        .min(limits.discovery.max_candidates);
+    let session_count = super::application_session_count(&context.application_inputs);
+    let input_ids = context
+        .application_inputs
+        .len()
+        .checked_mul(survivors)
+        .and_then(|value| value.checked_mul(std::mem::size_of::<u64>()))
+        .ok_or(RecoveryError::InvariantFailure)?;
+    let queued_requests = session_count
+        .checked_mul(survivors)
+        .and_then(|value| {
+            value.checked_mul(
+                std::mem::size_of::<(Vec<u64>, l2_workbench::protocol::RecordSchema, u64)>()
+                    + std::mem::size_of::<super::super::super::scheduler::PendingRecordAssembly>(),
+            )
+        })
+        .ok_or(RecoveryError::InvariantFailure)?;
+    // Include selected descriptors, schema models, report buffers, and pending assembly requests
     frame_bytes
-        .checked_mul(2)
+        .checked_mul(4)
         .and_then(|value| value.checked_add(schema_entries))
         .and_then(|value| value.checked_add(proposal_entries))
+        .and_then(|value| value.checked_add(input_ids.checked_mul(2)?))
+        .and_then(|value| value.checked_add(queued_requests.checked_mul(2)?))
         .and_then(|value| value.checked_add(1024 * 1024))
         .and_then(|value| value.checked_mul(MAX_GROUPS))
         .and_then(|value| value.checked_add(2 * 1024 * 1024))
@@ -197,6 +361,7 @@ fn propose_groups(
     partition: &SessionPartition,
     limits: RecordSchemaProposalLimits,
 ) -> Result<FamilyGroups, RecoveryExecutionError> {
+    // Keep the original session split while limiting the learning prefix
     let sample = learning_sample(
         &context.inputs,
         DEFAULT_MAX_FAMILY_SAMPLES,
@@ -247,6 +412,7 @@ fn propose_groups(
         return Ok(FamilyGroups {
             groups: Vec::new(),
             incomplete: true,
+            selectors_retained: 0,
         });
     }
     let family_limits = MessageFamilyLimits {
@@ -274,11 +440,22 @@ fn propose_groups(
     let mut groups = Vec::new();
     let mut incomplete = !report.complete;
     for selector in &report.selectors {
-        if !selector.training_coverage_complete || selector.families.len() < 2 {
+        // One supported value can still separate data from varied control messages
+        let has_other_training_values = selector
+            .unassigned
+            .iter()
+            .any(|observation| training.contains(&observation.sample));
+        if !selector.training_coverage_complete
+            || (selector.families.len() < 2 && !has_other_training_values)
+        {
             continue;
         }
         let unassigned = unassigned_count(case, &context.application_inputs, selector)?;
         for family in &selector.families {
+            if groups.len() == MAX_GROUPS {
+                incomplete = true;
+                break;
+            }
             let Some(group) = make_group(
                 case,
                 context,
@@ -292,6 +469,7 @@ fn propose_groups(
             else {
                 continue;
             };
+            // Identical full input sets do not need another schema search
             if groups.iter().any(|existing: &FamilyGroup| {
                 existing.context.application_inputs.len() == group.context.application_inputs.len()
                     && existing
@@ -303,10 +481,6 @@ fn propose_groups(
             }) {
                 continue;
             }
-            if groups.len() == MAX_GROUPS {
-                incomplete = true;
-                break;
-            }
             groups
                 .try_reserve(1)
                 .map_err(|source| operational("family group allocation failed", source))?;
@@ -317,7 +491,11 @@ fn propose_groups(
             break;
         }
     }
-    Ok(FamilyGroups { groups, incomplete })
+    Ok(FamilyGroups {
+        groups,
+        incomplete,
+        selectors_retained: report.selectors.len(),
+    })
 }
 
 fn frame_bytes<'a>(
@@ -339,6 +517,7 @@ fn unassigned_count(
     let mut unassigned = 0_usize;
     for input in inputs {
         let value = frame_bytes(case, input)?.get(selector.range.start..selector.range.end);
+        // A value absent from training stays outside every supported family
         if !value.is_some_and(|bytes| selector.families.iter().any(|family| family.value == bytes))
         {
             unassigned += 1;
@@ -371,6 +550,7 @@ fn make_group(
             selected.push(input.clone());
         }
     }
+    // Apply the frozen selector to all eligible frames, not just learning samples
     let mut application = Vec::new();
     application
         .try_reserve_exact(context.application_inputs.len())
