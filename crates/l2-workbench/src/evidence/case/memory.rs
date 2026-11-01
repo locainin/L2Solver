@@ -254,7 +254,7 @@ pub(super) fn source_payload(source: &super::Source) -> Result<usize, EvidenceEr
     Ok(bytes)
 }
 
-pub(super) fn node_payload(
+pub(in crate::evidence) fn node_payload(
     kind: &str,
     blob: Option<&str>,
     ranges: &[SourceRange],

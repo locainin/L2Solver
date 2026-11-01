@@ -14,8 +14,8 @@ use super::{
         recovery_worker_count,
     },
     provenance::{
-        ArtifactSelection, ArtifactSourceContext, CohortArtifactContextIndex, artifact_provenance,
-        selected_artifact_source_ranges,
+        ArtifactPublication, ArtifactSelection, ArtifactSourceContext, CohortArtifactContextIndex,
+        artifact_provenance, selected_artifact_source_ranges,
     },
     recovery_cache::{CachedRecovery, RecoveryContext},
     tshark_objects,
@@ -119,6 +119,7 @@ fn collect_export_inner(
         &mut collection.artifacts,
         phases,
         context.job,
+        context.memory,
     )?;
     let CaseCollection {
         artifacts,
@@ -145,6 +146,7 @@ fn collect_tshark_and_finish(
     artifacts: &mut ArtifactCollection,
     phases: CollectionPhases<'_>,
     job: Option<&l2_workbench::job::Job>,
+    memory: Option<&MemoryBudget>,
 ) -> Result<(tshark_objects::Collection, Option<String>), Box<dyn Error>> {
     if let Some(job) = job {
         job.set_current(
@@ -159,6 +161,7 @@ fn collect_tshark_and_finish(
         artifacts,
         TSHARK_OBJECT_BUDGET,
         job,
+        memory,
     );
     let phase_result = phases.finish(match &tshark_result {
         Ok(_) => l2_workbench::job::PhaseOutcome::Completed,
@@ -479,6 +482,7 @@ fn collect_tshark_objects(
     artifacts: &mut ArtifactCollection,
     budget: workbench::ObjectExportBudget,
     job: Option<&l2_workbench::job::Job>,
+    memory: Option<&MemoryBudget>,
 ) -> Result<(tshark_objects::Collection, Option<String>), Box<dyn Error>> {
     if let Some(job) = job {
         job.check_cancelled()?;
@@ -493,7 +497,7 @@ fn collect_tshark_objects(
     }
     match workbench::export_tshark_objects_with_job(capture, staging, budget, job) {
         Ok(objects) => {
-            let result = collect_matching_tshark_snapshot(source, &objects, artifacts)?;
+            let result = collect_matching_tshark_snapshot(source, &objects, artifacts, memory)?;
             if let Some(job) = job {
                 job.check_cancelled()?;
             }
@@ -513,6 +517,7 @@ pub(super) fn collect_matching_tshark_snapshot(
     source: &workbench::full_source::SourceCoverage,
     objects: &workbench::ExportObjectSet,
     artifacts: &mut ArtifactCollection,
+    memory: Option<&MemoryBudget>,
 ) -> Result<(tshark_objects::Collection, Option<String>), Box<dyn Error>> {
     let identity_matches = capture_identity_matches(source, &objects.source_identity);
     let mut collection = if identity_matches {
@@ -520,7 +525,12 @@ pub(super) fn collect_matching_tshark_snapshot(
             workbench::ObjectExportStatus::Complete => &objects.directories,
             workbench::ObjectExportStatus::Partial => &objects.partial_directories,
         };
-        tshark_objects::collect(directories, artifacts, objects.budget.temporary_files)?
+        tshark_objects::collect(
+            directories,
+            artifacts,
+            objects.budget.temporary_files,
+            memory,
+        )?
     } else {
         tshark_objects::Collection::default()
     };
@@ -736,10 +746,10 @@ fn collect_native_case_artifacts(
             Some(description.to_owned()),
             None,
             index.signatures_for(node.id, context.case_id.is_some())?,
-            case,
+            ArtifactPublication { case, memory },
         )?;
         let name = file_name(number, node, &blob.bytes, memory)?;
-        collection.add_bytes(&blob.bytes, &name, &origin)?;
+        collection.add_bytes(&blob.bytes, &name, &origin, memory)?;
     }
     Ok(())
 }
@@ -809,12 +819,13 @@ fn collect_selected_case_artifacts(
                 None,
                 Some(selection),
                 index.signatures_for(node.id, context.case_id.is_some())?,
-                case,
+                ArtifactPublication { case, memory },
             )?;
             collection.add_bytes(
                 artifact.bytes(),
                 &recovered_file_name(number, artifact.file_name()),
                 &origin,
+                memory,
             )?;
         }
     }

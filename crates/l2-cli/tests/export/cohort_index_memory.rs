@@ -101,7 +101,7 @@ fn flow_lookup_rejects_insufficient_publication_memory() -> TestResult {
 #[test]
 fn flow_lookup_releases_its_charge_after_publication() -> TestResult {
     let cohort = cohort_with_many_flows()?;
-    let budget = MemoryBudget::new(2 * 1024 * 1024);
+    let budget = MemoryBudget::new(8 * 1024 * 1024);
     let coverage = collect_cohort(&cohort, &budget)?;
     assert_eq!(coverage.references_selected, 1);
     assert!(budget.snapshot()?.peak_bytes >= u64::try_from(ENTRIES * size_of::<(i64, usize)>())?);

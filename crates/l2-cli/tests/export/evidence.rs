@@ -117,6 +117,7 @@ fn shared_artifact_keeps_resolvable_origins_from_distinct_cases() -> Result<(), 
                 b"shared object bytes",
                 "shared.bin",
                 &artifact_provenance(Some(record.case_id.as_str()), Some(1), Some(2), None),
+                None,
             )?,
             AddOutcome::Stored | AddOutcome::Duplicate
         ));
@@ -662,7 +663,7 @@ fn evidence_budget_omits_a_whole_case_and_leaves_no_artifact_node_reference()
     );
     let mut artifacts = ArtifactCollection::new(temporary.path(), ArtifactLimits::default())?;
     assert_eq!(
-        artifacts.add_bytes(b"retained artifact", "retained.bin", &record)?,
+        artifacts.add_bytes(b"retained artifact", "retained.bin", &record, None)?,
         AddOutcome::Stored
     );
 

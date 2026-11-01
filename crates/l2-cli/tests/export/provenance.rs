@@ -1,4 +1,4 @@
-use super::provenance::ArtifactSelection;
+use super::provenance::{AdmittedArtifactProvenance, ArtifactPublication, ArtifactSelection};
 use super::{
     ArtifactSourceContext, CaseArtifactIndex, CohortArtifactContextIndex, artifact_packet_summary,
     artifact_provenance, collect_cohort_artifacts, selected_artifact_source_ranges,
@@ -17,10 +17,14 @@ use std::error::Error;
 
 #[path = "cohort_index_memory.rs"]
 mod cohort_index_memory;
+#[path = "encoding_memory.rs"]
+mod encoding_memory;
 #[path = "index_memory.rs"]
 mod index_memory;
 #[path = "mapping_memory.rs"]
 mod mapping_memory;
+#[path = "node_copy_memory.rs"]
+mod node_copy_memory;
 
 #[test]
 fn summary_prefers_exact_selected_packet_ranges() -> Result<(), Box<dyn Error>> {
@@ -195,7 +199,7 @@ fn source_provenance(
     node_id: u64,
     case_id: Option<&str>,
     selection: Option<ArtifactSelection>,
-) -> Result<super::ArtifactProvenance, Box<dyn Error>> {
+) -> Result<AdmittedArtifactProvenance, Box<dyn Error>> {
     let node = case.node(node_id).ok_or("artifact node is missing")?;
     let context = ArtifactSourceContext {
         flow: None,
@@ -212,7 +216,7 @@ fn source_provenance(
         None,
         selection,
         std::iter::empty(),
-        case,
+        ArtifactPublication { case, memory: None },
     )
 }
 
@@ -699,7 +703,10 @@ fn cohort_context_follows_plural_frame_node_references() -> Result<(), Box<dyn E
         None,
         None,
         std::iter::empty(),
-        &cohort.result.case,
+        ArtifactPublication {
+            case: &cohort.result.case,
+            memory: None,
+        },
     )?;
     let canonical_inputs = provenance
         .canonical_origin

@@ -17,7 +17,7 @@ mod index_tests;
 #[path = "mapping.rs"]
 mod mapping;
 #[path = "case/memory.rs"]
-mod memory;
+pub(super) mod memory;
 #[path = "case/prefix.rs"]
 mod prefix;
 #[path = "case/snapshot/mod.rs"]

@@ -69,7 +69,8 @@ fn mismatch_omits_tshark_objects() -> Result<(), Box<dyn std::error::Error>> {
         issues: Vec::new(),
     };
 
-    let (objects, issue) = collect_matching_tshark_snapshot(&source, &objects, &mut artifacts)?;
+    let (objects, issue) =
+        collect_matching_tshark_snapshot(&source, &objects, &mut artifacts, None)?;
 
     assert_eq!(objects.objects_exported, 0);
     assert_eq!(artifacts.coverage().references_selected, 0);
@@ -109,7 +110,8 @@ fn partial_tshark_export_does_not_publish_unfinished_objects()
         issues: vec![String::from("temporary object limit reached")],
     };
 
-    let (collection, issue) = collect_matching_tshark_snapshot(&source, &objects, &mut artifacts)?;
+    let (collection, issue) =
+        collect_matching_tshark_snapshot(&source, &objects, &mut artifacts, None)?;
 
     assert_eq!(collection.objects_exported, 0);
     assert_eq!(artifacts.coverage().references_selected, 0);
@@ -162,7 +164,7 @@ fn partial_tshark_export_preserves_verified_objects_and_exact_limit_receipt()
     };
 
     let (collection, mismatch) =
-        collect_matching_tshark_snapshot(&source, &objects, &mut artifacts)?;
+        collect_matching_tshark_snapshot(&source, &objects, &mut artifacts, None)?;
 
     assert_eq!(collection.objects_exported, 1);
     assert_eq!(collection.export_status, Some(ObjectExportStatus::Partial));

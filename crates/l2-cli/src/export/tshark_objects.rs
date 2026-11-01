@@ -2,6 +2,7 @@ use super::artifact_collection::{
     AddOutcome, ArtifactCollection, ArtifactProvenance, OmissionReason,
 };
 use crate::workbench::{ObjectExportBudget, ObjectExportStatus, ObjectExportUsage};
+use l2_workbench::job::MemoryBudget;
 use std::{
     collections::BinaryHeap,
     error::Error,
@@ -30,6 +31,7 @@ pub(super) fn collect(
     directories: &[(String, PathBuf)],
     artifacts: &mut ArtifactCollection,
     scan_entry_budget: u64,
+    memory: Option<&MemoryBudget>,
 ) -> Result<Collection, Box<dyn Error>> {
     let mut collection = Collection::default();
     if !safe_file_checks_available() {
@@ -55,6 +57,7 @@ pub(super) fn collect(
             artifacts,
             &mut collection,
             scan_entry_budget,
+            memory,
         ) {
             Ok(false) => {}
             Ok(true) => {
@@ -87,6 +90,7 @@ fn collect_protocol(
     artifacts: &mut ArtifactCollection,
     collection: &mut Collection,
     scan_entry_budget: u64,
+    memory: Option<&MemoryBudget>,
 ) -> io::Result<bool> {
     let metadata = fs::symlink_metadata(directory)?;
     if !metadata.file_type().is_dir() {
@@ -113,6 +117,7 @@ fn collect_protocol(
             u64::try_from(ordinal).map_err(io::Error::other)?,
             artifacts,
             collection,
+            memory,
         )?;
     }
     if selection.omitted_count != 0 {
@@ -240,6 +245,7 @@ fn collect_entry(
     source_ordinal: u64,
     artifacts: &mut ArtifactCollection,
     collection: &mut Collection,
+    memory: Option<&MemoryBudget>,
 ) -> io::Result<()> {
     let mut source = match open_regular_object(path) {
         Ok(source) if source.metadata()?.len() == expected_length => source,
@@ -294,7 +300,7 @@ fn collect_entry(
         }),
     };
     match artifacts
-        .add_open_file(&mut source, &name, &provenance)
+        .add_open_file(&mut source, &name, &provenance, memory)
         .map_err(|error| as_io_error(error.as_ref()))?
     {
         AddOutcome::Stored => {
@@ -449,7 +455,8 @@ fn note_issue(collection: &mut Collection, issue: String) {
 }
 
 fn as_io_error(error: &(dyn Error + 'static)) -> io::Error {
-    io::Error::other(error.to_string())
+    crate::memory_error::find(error)
+        .map_or_else(|| io::Error::other(error.to_string()), io::Error::other)
 }
 
 fn safe_protocol(protocol: &str) -> bool {

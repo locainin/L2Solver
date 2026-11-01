@@ -52,6 +52,30 @@ pub struct Node {
     pub details: Value,
 }
 
+impl Node {
+    /// Conservative logical heap allowance for a deep owned Node copy
+    ///
+    /// The inline Node value is excluded; this is not a process RSS measurement
+    /// Returns `None` when the modeled size cannot be represented
+    #[must_use]
+    pub fn owned_heap_bytes(&self) -> Option<usize> {
+        let payload = super::case::memory::node_payload(
+            &self.kind,
+            self.blob.as_deref(),
+            &self.ranges,
+            self.ranges.capacity(),
+            &self.details,
+        )
+        .ok()?;
+        let kind_spare = self.kind.capacity() - self.kind.len();
+        let blob_spare = self
+            .blob
+            .as_ref()
+            .map_or(0, |blob| blob.capacity() - blob.len());
+        payload.checked_add(kind_spare)?.checked_add(blob_spare)
+    }
+}
+
 /// An absolute byte range in a source file or capture
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]

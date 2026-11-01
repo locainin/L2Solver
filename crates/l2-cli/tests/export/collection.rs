@@ -544,7 +544,7 @@ fn rejects_unsafe_flat_file_names() -> Result<(), Box<dyn Error>> {
 
     for name in ["", ".", "..", "nested/name", r"nested\name", "bad\nname"] {
         let error = collection
-            .add_bytes(b"object", name, &provenance())
+            .add_bytes(b"object", name, &provenance(), None)
             .err()
             .ok_or("unsafe artifact name should be rejected")?;
         let error = error
@@ -567,11 +567,23 @@ fn digest_collision_keeps_bytes_distinct() -> Result<(), Box<dyn Error>> {
     let forced_digest = "a".repeat(64);
 
     assert_eq!(
-        collection.add_bytes_with_digest(b"one", &forced_digest, "first.bin", &provenance())?,
+        collection.add_bytes_with_digest(
+            b"one",
+            &forced_digest,
+            "first.bin",
+            &provenance(),
+            None
+        )?,
         AddOutcome::Stored
     );
     assert_eq!(
-        collection.add_bytes_with_digest(b"two", &forced_digest, "second.bin", &provenance())?,
+        collection.add_bytes_with_digest(
+            b"two",
+            &forced_digest,
+            "second.bin",
+            &provenance(),
+            None
+        )?,
         AddOutcome::Stored
     );
 
@@ -593,11 +605,11 @@ fn same_origin_is_suppressed() -> Result<(), Box<dyn Error>> {
     let mut collection = ArtifactCollection::new(temporary.path(), ArtifactLimits::default())?;
 
     assert_eq!(
-        collection.add_bytes(b"same bytes", "first.bin", &provenance())?,
+        collection.add_bytes(b"same bytes", "first.bin", &provenance(), None)?,
         AddOutcome::Stored
     );
     assert_eq!(
-        collection.add_bytes(b"same bytes", "second.bin", &provenance())?,
+        collection.add_bytes(b"same bytes", "second.bin", &provenance(), None)?,
         AddOutcome::SameOrigin
     );
 
@@ -639,7 +651,7 @@ fn exact_limit_keeps_source_complete() -> Result<(), Box<dyn Error>> {
                 1 => ("second.bin", b"two".as_slice()),
                 _ => return Err("source visitor received an unexpected flow".into()),
             };
-            let outcome = collection.add_bytes(body, name, &provenance())?;
+            let outcome = collection.add_bytes(body, name, &provenance(), None)?;
             if visited_flows == 0 && outcome != AddOutcome::Stored {
                 return Err("exact-boundary artifact was not retained".into());
             }
@@ -670,8 +682,8 @@ fn exact_limit_keeps_source_complete() -> Result<(), Box<dyn Error>> {
 fn manifest_preserves_artifact_order_and_content_hashes() -> Result<(), Box<dyn Error>> {
     let temporary = tempfile::tempdir()?;
     let mut collection = ArtifactCollection::new(temporary.path(), ArtifactLimits::default())?;
-    collection.add_bytes(b"first", "one.bin", &provenance())?;
-    collection.add_bytes(b"second", "two.bin", &provenance())?;
+    collection.add_bytes(b"first", "one.bin", &provenance(), None)?;
+    collection.add_bytes(b"second", "two.bin", &provenance(), None)?;
     let mut manifest = Vec::new();
     collection.write_manifest_artifacts(&mut manifest)?;
 
@@ -733,7 +745,7 @@ fn archive_omission_collection(
         },
     )?;
     assert_eq!(
-        collection.add_bytes(b"retained", "retained.bin", &provenance())?,
+        collection.add_bytes(b"retained", "retained.bin", &provenance(), None)?,
         AddOutcome::Stored
     );
     let mut archive_member = provenance();
@@ -748,7 +760,7 @@ fn archive_omission_collection(
         "archive_parent": { "node_id": 39 }
     }));
     assert_eq!(
-        collection.add_bytes(b"omitted", "member.bin", &archive_member)?,
+        collection.add_bytes(b"omitted", "member.bin", &archive_member, None)?,
         AddOutcome::Omitted(OmissionReason::ProvenanceCount)
     );
     archive_member.selected_node_id = Some(44);
@@ -757,7 +769,7 @@ fn archive_omission_collection(
         "selected_file_name": "second.bin"
     }));
     assert_eq!(
-        collection.add_bytes(b"also omitted", "second.bin", &archive_member)?,
+        collection.add_bytes(b"also omitted", "second.bin", &archive_member, None)?,
         AddOutcome::Omitted(OmissionReason::ProvenanceCount)
     );
     Ok(collection)
@@ -878,7 +890,7 @@ fn omission_detail_byte_limit_counts_unretained_identity() -> Result<(), Box<dyn
     )?;
 
     assert_eq!(
-        collection.add_bytes(b"payload", "payload.bin", &provenance())?,
+        collection.add_bytes(b"payload", "payload.bin", &provenance(), None)?,
         AddOutcome::Omitted(OmissionReason::ProvenanceBytes)
     );
     let coverage = collection.coverage();
@@ -946,7 +958,7 @@ fn tshark_limit_marks_partial() -> Result<(), Box<dyn Error>> {
     };
     let mut artifacts = ArtifactCollection::new(&staging, limits)?;
     assert_eq!(
-        artifacts.add_bytes(b"one", "native.bin", &provenance())?,
+        artifacts.add_bytes(b"one", "native.bin", &provenance(), None)?,
         AddOutcome::Stored
     );
 
@@ -954,6 +966,7 @@ fn tshark_limit_marks_partial() -> Result<(), Box<dyn Error>> {
         &[(String::from("http"), object_directory)],
         &mut artifacts,
         10,
+        None,
     )?;
 
     assert_eq!(tshark.objects_exported, 0);
@@ -1014,6 +1027,7 @@ fn tshark_scan_budget_accepts_exact_entry_count() -> Result<(), Box<dyn Error>> 
         &[(String::from("http"), object_directory)],
         &mut artifacts,
         1,
+        None,
     )?;
 
     assert_eq!(tshark.scan_entries, 1);
@@ -1048,12 +1062,13 @@ fn tshark_duplicate_summary_shows_protocol_and_shared_artifact() -> Result<(), B
         source_ranges: Vec::new(),
         canonical_origin: serde_json::json!({ "category": "recovered_artifact", "node": 1 }),
     };
-    artifacts.add_bytes(b"same artifact", "recovered.bin", &recovered)?;
+    artifacts.add_bytes(b"same artifact", "recovered.bin", &recovered, None)?;
 
     let tshark = tshark_objects::collect(
         &[(String::from("http"), object_directory)],
         &mut artifacts,
         10,
+        None,
     )?;
 
     assert_eq!(tshark.objects_exported, 0);
@@ -1126,6 +1141,7 @@ fn tshark_scan_budget_stops_after_first_over_budget_entry() -> Result<(), Box<dy
         &[(String::from("http"), object_directory)],
         &mut artifacts,
         1,
+        None,
     )?;
 
     assert_eq!(tshark.scan_entries, 2);

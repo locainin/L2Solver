@@ -1,6 +1,10 @@
 //! Project validated artifact bytes back to their capture evidence
 
 #[cfg(test)]
+#[path = "../../tests/export/provenance/canonical_move.rs"]
+mod canonical_move_tests;
+
+#[cfg(test)]
 use super::COHORT_ARTIFACT_LOOKUP_BUILDS;
 use super::{artifact_collection::ArtifactProvenance, collection::CaseArtifactIndex};
 use crate::workbench;
@@ -14,6 +18,7 @@ use l2_workbench::{
 use std::{
     collections::{BTreeSet, HashSet},
     error::Error,
+    ops::Deref,
 };
 
 pub(super) struct CohortArtifactContextIndex<'a> {
@@ -569,6 +574,26 @@ fn mappings_cover_object(
     Ok(complete && covered_end >= object_length)
 }
 
+#[derive(Clone, Copy)]
+pub(super) struct ArtifactPublication<'a> {
+    pub(super) case: &'a Case,
+    pub(super) memory: Option<&'a MemoryBudget>,
+}
+
+pub(super) struct AdmittedArtifactProvenance {
+    origin: ArtifactProvenance,
+    // Owned Node copies drop before their shared charge
+    _memory: Option<MemoryLease>,
+}
+
+impl Deref for AdmittedArtifactProvenance {
+    type Target = ArtifactProvenance;
+
+    fn deref(&self) -> &Self::Target {
+        &self.origin
+    }
+}
+
 pub(super) fn artifact_provenance<'a>(
     category: &str,
     context: &ArtifactSourceContext,
@@ -576,8 +601,13 @@ pub(super) fn artifact_provenance<'a>(
     description: Option<String>,
     selection: Option<ArtifactSelection>,
     signature_candidates: impl Iterator<Item = &'a Node>,
-    case: &Case,
-) -> Result<ArtifactProvenance, Box<dyn Error>> {
+    publication: ArtifactPublication<'_>,
+) -> Result<AdmittedArtifactProvenance, Box<dyn Error>> {
+    let case = publication.case;
+    let mut memory = publication
+        .memory
+        .map(|budget| budget.try_reserve(MemoryClass::Publication, 0))
+        .transpose()?;
     let graph_retained = context.case_id.is_some();
     let (selection, selected_ranges) = selection_parts(selection, graph_retained);
     let selected_node_id = node.map(|node| node.id);
@@ -589,31 +619,23 @@ pub(super) fn artifact_provenance<'a>(
         .as_ref()
         .and_then(|selection| selection.get("extension_evidence_node"))
         .and_then(serde_json::Value::as_u64);
-    for node_id in [selected_node_id, validation_node_id, extension_node_id]
-        .into_iter()
-        .flatten()
-    {
-        if case.node(node_id).is_none() {
-            return Err("artifact provenance references a missing Case node".into());
-        }
-    }
-    let source_projection =
+    validate_provenance_nodes(
+        case,
+        [selected_node_id, validation_node_id, extension_node_id],
+    )?;
+    let mut source_projection =
         artifact_source_projection(context, node, selected_node_id, selected_ranges);
     // Copy evidence only when the sidecar retains the corresponding Case
-    let node = if graph_retained { node.cloned() } else { None };
+    let (node, retained_candidates) =
+        retained_node_copies(node, signature_candidates, graph_retained, &mut memory)?;
     let selection = graph_retained.then_some(selection).flatten();
     // Keep exact source ranges when their Case graph is omitted from the sidecar
     let source_ranges = if graph_retained {
         Vec::new()
     } else {
-        source_projection.source_ranges
+        std::mem::take(&mut source_projection.source_ranges)
     };
-    let canonical_source_ranges = (!source_ranges.is_empty()).then_some(&source_ranges);
-    let signature_candidates = if graph_retained {
-        signature_candidates.cloned().collect()
-    } else {
-        Vec::new()
-    };
+    let canonical_source_ranges = (!source_ranges.is_empty()).then_some(source_ranges.as_slice());
     let selected_node_id = graph_retained.then_some(selected_node_id).flatten();
     let validation_node_id = graph_retained.then_some(validation_node_id).flatten();
     let extension_node_id = graph_retained.then_some(extension_node_id).flatten();
@@ -625,22 +647,16 @@ pub(super) fn artifact_provenance<'a>(
         .as_ref()
         .map(|selection| canonical_selection(selection, case))
         .transpose()?;
-    let stable_candidates = canonical_nodes(&signature_candidates, case)?;
-    // Flow and cohort Cases can describe the same packet-backed object with different local IDs
-    let canonical_origin = serde_json::json!({
-        "category": category,
-        "local_case_identity": source_projection.local_case_identity,
-        "local_case_scope": source_projection.local_case_scope,
-        "flow": context.flow,
-        "supporting_flows": context.supporting_flows,
-        "cohort_scope": context.cohort_scope,
-        "node": stable_node,
-        "source_ranges": canonical_source_ranges,
-        "description": description,
-        "selection": stable_selection,
-        "signature_candidates": stable_candidates,
-    });
-    Ok(ArtifactProvenance {
+    let stable_candidates = canonical_nodes(&retained_candidates, case)?;
+    let canonical_origin = canonical_origin(
+        category,
+        context,
+        &source_projection,
+        canonical_source_ranges,
+        description.as_deref(),
+        (stable_node, stable_selection, stable_candidates),
+    );
+    let origin = ArtifactProvenance {
         category: category.to_owned(),
         case_id: context.case_id.clone(),
         selected_node_id,
@@ -652,10 +668,116 @@ pub(super) fn artifact_provenance<'a>(
         node,
         description,
         selection,
-        signature_candidates,
+        signature_candidates: retained_candidates,
         source_ranges,
         canonical_origin,
+    };
+    Ok(AdmittedArtifactProvenance {
+        origin,
+        _memory: memory,
     })
+}
+
+fn validate_provenance_nodes(case: &Case, nodes: [Option<u64>; 3]) -> Result<(), Box<dyn Error>> {
+    for node_id in nodes.into_iter().flatten() {
+        if case.node(node_id).is_none() {
+            return Err("artifact provenance references a missing Case node".into());
+        }
+    }
+    Ok(())
+}
+
+fn retained_node_copies<'a>(
+    node: Option<&Node>,
+    signatures: impl Iterator<Item = &'a Node>,
+    graph_retained: bool,
+    memory: &mut Option<MemoryLease>,
+) -> Result<(Option<Node>, Vec<Node>), Box<dyn Error>> {
+    if !graph_retained {
+        return Ok((None, Vec::new()));
+    }
+    let node = node.map(|node| copy_node(node, memory)).transpose()?;
+    let mut candidates = Vec::new();
+    for candidate in signatures {
+        crate::retained_memory::grow_vec_optional(&mut candidates, memory, 1)?;
+        candidates.push(copy_node(candidate, memory)?);
+    }
+    Ok((node, candidates))
+}
+
+fn canonical_origin(
+    category: &str,
+    context: &ArtifactSourceContext,
+    projection: &ArtifactSourceProjection<'_>,
+    source_ranges: Option<&[SourceRange]>,
+    description: Option<&str>,
+    stable: (
+        Option<serde_json::Value>,
+        Option<serde_json::Value>,
+        Vec<serde_json::Value>,
+    ),
+) -> serde_json::Value {
+    let (node, selection, candidates) = stable;
+    // Flow and cohort Cases can describe the same packet-backed object with different local IDs
+    serde_json::Value::Object(serde_json::Map::from_iter([
+        ("category".to_owned(), serde_json::json!(category)),
+        (
+            "local_case_identity".to_owned(),
+            serde_json::json!(projection.local_case_identity),
+        ),
+        (
+            "local_case_scope".to_owned(),
+            serde_json::json!(projection.local_case_scope),
+        ),
+        ("flow".to_owned(), serde_json::json!(context.flow)),
+        (
+            "supporting_flows".to_owned(),
+            serde_json::json!(context.supporting_flows),
+        ),
+        (
+            "cohort_scope".to_owned(),
+            serde_json::json!(context.cohort_scope),
+        ),
+        // Already-owned canonical values move into the final origin
+        ("node".to_owned(), node.unwrap_or(serde_json::Value::Null)),
+        ("source_ranges".to_owned(), serde_json::json!(source_ranges)),
+        ("description".to_owned(), serde_json::json!(description)),
+        (
+            "selection".to_owned(),
+            selection.unwrap_or(serde_json::Value::Null),
+        ),
+        (
+            "signature_candidates".to_owned(),
+            serde_json::Value::Array(candidates),
+        ),
+    ]))
+}
+
+fn copy_node(node: &Node, memory: &mut Option<MemoryLease>) -> Result<Node, Box<dyn Error>> {
+    let Some(memory) = memory else {
+        return Ok(node.clone());
+    };
+    let before = memory.bytes();
+    let expected = node
+        .owned_heap_bytes()
+        .ok_or("Node copy memory overflows")?;
+    crate::retained_memory::charge(memory, expected)?;
+    let copy = node.clone();
+    let admitted = copy
+        .owned_heap_bytes()
+        .and_then(|bytes| u64::try_from(bytes).ok())
+        .and_then(|bytes| before.checked_add(bytes));
+    let Some(admitted) = admitted else {
+        drop(copy);
+        memory.try_resize(before)?;
+        return Err("Node copy memory overflows".into());
+    };
+    if let Err(error) = memory.try_resize(admitted) {
+        drop(copy);
+        memory.try_resize(before)?;
+        return Err(Box::new(error));
+    }
+    Ok(copy)
 }
 
 fn selection_parts(

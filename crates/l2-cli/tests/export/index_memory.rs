@@ -98,7 +98,7 @@ fn signature_reference_index_releases_its_charge_after_collection() -> TestResul
         temporary.path(),
         super::super::ArtifactLimits::default(),
     )?;
-    let budget = MemoryBudget::new(2 * 1024 * 1024);
+    let budget = MemoryBudget::new(8 * 1024 * 1024);
     super::super::collect_case_artifacts_with_context(
         &mut artifacts,
         &case,

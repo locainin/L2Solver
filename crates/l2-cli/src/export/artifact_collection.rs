@@ -2,7 +2,7 @@
 
 use l2_workbench::{
     evidence::{Node, SourceRange},
-    job::RecoveryArtifactSample,
+    job::{MemoryBudget, MemoryClass, MemoryLease, RecoveryArtifactSample},
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -171,6 +171,29 @@ struct OmittedArtifactDetailRef<'a> {
 struct BoundedBuffer {
     bytes: Vec<u8>,
     maximum: usize,
+    failure: Option<Box<dyn Error>>,
+    // The encoded bytes drop before their shared charge
+    memory: Option<MemoryLease>,
+}
+
+impl BoundedBuffer {
+    fn new(maximum: usize, budget: Option<&MemoryBudget>) -> Result<Self, Box<dyn Error>> {
+        Ok(Self {
+            bytes: Vec::new(),
+            maximum,
+            failure: None,
+            memory: budget
+                .map(|budget| budget.try_reserve(MemoryClass::Publication, 0))
+                .transpose()?,
+        })
+    }
+
+    fn encode<T: Serialize + ?Sized>(&mut self, value: &T) -> Result<(), Box<dyn Error>> {
+        if let Err(error) = serde_json::to_writer(&mut *self, value) {
+            return Err(self.failure.take().unwrap_or_else(|| Box::new(error)));
+        }
+        Ok(())
+    }
 }
 
 impl Write for BoundedBuffer {
@@ -180,6 +203,14 @@ impl Write for BoundedBuffer {
         };
         if new_length > self.maximum {
             return Err(io::Error::other("omission detail exceeds its byte limit"));
+        }
+        if let Err(error) = crate::retained_memory::grow_vec_optional(
+            &mut self.bytes,
+            &mut self.memory,
+            bytes.len(),
+        ) {
+            self.failure = Some(error);
+            return Err(io::Error::other("publication buffer admission failed"));
         }
         self.bytes.extend_from_slice(bytes);
         Ok(bytes.len())
@@ -240,9 +271,10 @@ impl ArtifactCollection {
         bytes: &[u8],
         suggested_name: &str,
         provenance: &ArtifactProvenance,
+        memory: Option<&MemoryBudget>,
     ) -> Result<AddOutcome, Box<dyn Error>> {
         let digest = format!("{:x}", Sha256::digest(bytes));
-        self.add_bytes_with_digest(bytes, &digest, suggested_name, provenance)
+        self.add_bytes_with_digest(bytes, &digest, suggested_name, provenance, memory)
     }
 
     pub(super) fn add_bytes_with_digest(
@@ -251,6 +283,7 @@ impl ArtifactCollection {
         digest: &str,
         suggested_name: &str,
         provenance: &ArtifactProvenance,
+        memory: Option<&MemoryBudget>,
     ) -> Result<AddOutcome, Box<dyn Error>> {
         if !valid_sha256(digest) {
             return Err(invalid("artifact digest is malformed").into());
@@ -259,9 +292,9 @@ impl ArtifactCollection {
         let length = u64::try_from(bytes.len())?;
         let bucket = self.bucket_path(length, digest);
         if let Some(record) = self.find_bytes_duplicate(&bucket, bytes)? {
-            return self.record_duplicate(&bucket, &record, provenance);
+            return self.record_duplicate(&bucket, &record, provenance, memory);
         }
-        self.store_bytes(bytes, length, suggested_name, provenance, &bucket)
+        self.store_bytes(bytes, length, suggested_name, provenance, &bucket, memory)
     }
 
     /// Hash and stage one open `TShark` object without buffering it in memory
@@ -270,6 +303,7 @@ impl ArtifactCollection {
         source: &mut File,
         suggested_name: &str,
         provenance: &ArtifactProvenance,
+        memory: Option<&MemoryBudget>,
     ) -> Result<AddOutcome, Box<dyn Error>> {
         self.coverage.references_selected = add_counter(self.coverage.references_selected, 1)?;
         let metadata = source.metadata()?;
@@ -278,6 +312,7 @@ impl ArtifactCollection {
                 OmissionReason::UnreadableObject,
                 metadata.len(),
                 provenance,
+                memory,
             )?;
             return Ok(AddOutcome::Omitted(OmissionReason::UnreadableObject));
         }
@@ -289,6 +324,7 @@ impl ArtifactCollection {
                     OmissionReason::UnreadableObject,
                     metadata.len(),
                     provenance,
+                    memory,
                 )?;
                 return Ok(AddOutcome::Omitted(OmissionReason::UnreadableObject));
             }
@@ -298,6 +334,7 @@ impl ArtifactCollection {
                 OmissionReason::UnreadableObject,
                 metadata.len(),
                 provenance,
+                memory,
             )?;
             return Ok(AddOutcome::Omitted(OmissionReason::UnreadableObject));
         };
@@ -306,20 +343,21 @@ impl ArtifactCollection {
                 OmissionReason::UnreadableObject,
                 metadata.len(),
                 provenance,
+                memory,
             )?;
             return Ok(AddOutcome::Omitted(OmissionReason::UnreadableObject));
         }
         let bucket = self.bucket_path(byte_length, &digest);
         if let Some(record) = self.find_open_file_duplicate(&bucket, source)? {
-            return self.record_duplicate(&bucket, &record, provenance);
+            return self.record_duplicate(&bucket, &record, provenance, memory);
         }
         self.store_open_file(
             source,
-            byte_length,
-            &digest,
+            (byte_length, &digest),
             suggested_name,
             provenance,
             &bucket,
+            memory,
         )
     }
 
@@ -533,10 +571,13 @@ impl ArtifactCollection {
         suggested_name: &str,
         provenance: &ArtifactProvenance,
         bucket: &Path,
+        memory: Option<&MemoryBudget>,
     ) -> Result<AddOutcome, Box<dyn Error>> {
-        let (canonical_origin, encoded) = encode_provenance_record(provenance)?;
-        if let Some(reason) = self.unique_omission_reason(byte_length, encoded.len()) {
-            self.omit_reference_with_provenance(reason, byte_length, provenance)?;
+        let (canonical_origin, encoded) = encode_provenance_record(provenance, memory)?;
+        if let Some(reason) = self.unique_omission_reason(byte_length, encoded.bytes.len()) {
+            drop(canonical_origin);
+            drop(encoded);
+            self.omit_reference_with_provenance(reason, byte_length, provenance, memory)?;
             return Ok(AddOutcome::Omitted(reason));
         }
 
@@ -550,8 +591,8 @@ impl ArtifactCollection {
             file_name,
             byte_length,
             &provenance.category,
-            &canonical_origin,
-            &encoded,
+            &canonical_origin.bytes,
+            &encoded.bytes,
         )?;
         Ok(AddOutcome::Stored)
     }
@@ -559,15 +600,18 @@ impl ArtifactCollection {
     fn store_open_file(
         &mut self,
         source: &mut File,
-        byte_length: u64,
-        digest: &str,
+        identity: (u64, &str),
         suggested_name: &str,
         provenance: &ArtifactProvenance,
         bucket: &Path,
+        memory: Option<&MemoryBudget>,
     ) -> Result<AddOutcome, Box<dyn Error>> {
-        let (canonical_origin, encoded) = encode_provenance_record(provenance)?;
-        if let Some(reason) = self.unique_omission_reason(byte_length, encoded.len()) {
-            self.omit_reference_with_provenance(reason, byte_length, provenance)?;
+        let (byte_length, digest) = identity;
+        let (canonical_origin, encoded) = encode_provenance_record(provenance, memory)?;
+        if let Some(reason) = self.unique_omission_reason(byte_length, encoded.bytes.len()) {
+            drop(canonical_origin);
+            drop(encoded);
+            self.omit_reference_with_provenance(reason, byte_length, provenance, memory)?;
             return Ok(AddOutcome::Omitted(reason));
         }
 
@@ -579,10 +623,13 @@ impl ArtifactCollection {
             Err(OpenFileCopyError::Source) => {
                 drop(destination);
                 fs::remove_file(path)?;
+                drop(canonical_origin);
+                drop(encoded);
                 self.omit_reference_with_provenance(
                     OmissionReason::UnreadableObject,
                     byte_length,
                     provenance,
+                    memory,
                 )?;
                 return Ok(AddOutcome::Omitted(OmissionReason::UnreadableObject));
             }
@@ -595,10 +642,13 @@ impl ArtifactCollection {
         if copied.0 != byte_length || copied.1 != digest {
             drop(destination);
             fs::remove_file(path)?;
+            drop(canonical_origin);
+            drop(encoded);
             self.omit_reference_with_provenance(
                 OmissionReason::UnreadableObject,
                 byte_length,
                 provenance,
+                memory,
             )?;
             return Ok(AddOutcome::Omitted(OmissionReason::UnreadableObject));
         }
@@ -608,8 +658,8 @@ impl ArtifactCollection {
             file_name,
             byte_length,
             &provenance.category,
-            &canonical_origin,
-            &encoded,
+            &canonical_origin.bytes,
+            &encoded.bytes,
         )?;
         Ok(AddOutcome::Stored)
     }
@@ -666,22 +716,31 @@ impl ArtifactCollection {
         bucket: &Path,
         record: &IndexedArtifact,
         provenance: &ArtifactProvenance,
+        memory: Option<&MemoryBudget>,
     ) -> Result<AddOutcome, Box<dyn Error>> {
-        let (canonical_origin, encoded) = encode_provenance_record(provenance)?;
+        let (canonical_origin, encoded) = encode_provenance_record(provenance, memory)?;
         let path = bucket.join(provenance_file_name(record.entry_id));
         let origin_directory = Self::origin_directory(bucket, record.entry_id);
-        let origin_index = Self::origin_index_path(&origin_directory, &canonical_origin);
-        if origin_index_contains(&path, &origin_index, &canonical_origin)? {
+        let origin_index = Self::origin_index_path(&origin_directory, &canonical_origin.bytes);
+        if origin_index_contains(&path, &origin_index, &canonical_origin.bytes)? {
             self.coverage.same_origin_references_suppressed =
                 add_counter(self.coverage.same_origin_references_suppressed, 1)?;
             return Ok(AddOutcome::SameOrigin);
         }
-        if let Some(reason) = self.provenance_omission_reason(encoded.len()) {
-            self.omit_reference_with_provenance(reason, record.byte_length, provenance)?;
+        if let Some(reason) = self.provenance_omission_reason(encoded.bytes.len()) {
+            drop(canonical_origin);
+            drop(encoded);
+            self.omit_reference_with_provenance(reason, record.byte_length, provenance, memory)?;
             return Ok(AddOutcome::Omitted(reason));
         }
-        append_provenance_record(&path, &origin_directory, &canonical_origin, &encoded, false)?;
-        self.retain_provenance(encoded.len(), &provenance.category)?;
+        append_provenance_record(
+            &path,
+            &origin_directory,
+            &canonical_origin.bytes,
+            &encoded.bytes,
+            false,
+        )?;
+        self.retain_provenance(encoded.bytes.len(), &provenance.category)?;
         self.coverage.duplicate_byte_references_grouped =
             add_counter(self.coverage.duplicate_byte_references_grouped, 1)?;
         Ok(AddOutcome::Duplicate)
@@ -740,9 +799,10 @@ impl ArtifactCollection {
         reason: OmissionReason,
         candidate_bytes: u64,
         provenance: &ArtifactProvenance,
+        memory: Option<&MemoryBudget>,
     ) -> Result<(), Box<dyn Error>> {
         self.omit_references(reason, 1, candidate_bytes)?;
-        self.append_omission_detail(reason, candidate_bytes, provenance)
+        self.append_omission_detail(reason, candidate_bytes, provenance, memory)
     }
 
     fn append_omission_detail(
@@ -750,6 +810,7 @@ impl ArtifactCollection {
         reason: OmissionReason,
         candidate_bytes: u64,
         provenance: &ArtifactProvenance,
+        memory: Option<&MemoryBudget>,
     ) -> Result<(), Box<dyn Error>> {
         if self.coverage.omission_details_retained >= self.limits.provenance_entries {
             self.coverage.omission_details_not_retained =
@@ -782,11 +843,11 @@ impl ArtifactCollection {
             archive_path,
             selected_file_name,
         };
-        let mut encoded = BoundedBuffer {
-            bytes: Vec::new(),
-            maximum,
-        };
+        let mut encoded = BoundedBuffer::new(maximum, memory)?;
         if serde_json::to_writer(&mut encoded, &detail).is_err() {
+            if let Some(error) = encoded.failure.take() {
+                return Err(error);
+            }
             self.coverage.omission_details_not_retained =
                 add_counter(self.coverage.omission_details_not_retained, 1)?;
             return Ok(());
@@ -993,10 +1054,13 @@ fn write_json_line(path: &Path, value: &impl Serialize) -> Result<(), Box<dyn Er
 
 fn encode_provenance_record(
     provenance: &ArtifactProvenance,
-) -> Result<(Vec<u8>, Vec<u8>), Box<dyn Error>> {
-    let canonical_origin = serde_json::to_vec(&provenance.canonical_origin)?;
-    let record = serde_json::to_vec(&StoredProvenanceRecordRef {
-        canonical_origin: &canonical_origin,
+    memory: Option<&MemoryBudget>,
+) -> Result<(BoundedBuffer, BoundedBuffer), Box<dyn Error>> {
+    let mut canonical_origin = BoundedBuffer::new(usize::MAX, memory)?;
+    canonical_origin.encode(&provenance.canonical_origin)?;
+    let mut record = BoundedBuffer::new(usize::MAX, memory)?;
+    record.encode(&StoredProvenanceRecordRef {
+        canonical_origin: &canonical_origin.bytes,
         provenance,
     })?;
     Ok((canonical_origin, record))
