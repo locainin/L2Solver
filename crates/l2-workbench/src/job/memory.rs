@@ -4,6 +4,10 @@ mod buffering;
 mod system;
 mod working_set;
 
+#[cfg(test)]
+#[path = "../../tests/job/memory/split.rs"]
+mod split_tests;
+
 pub use buffering::{BufferedCase, BufferedCaseSnapshot};
 pub use system::{CgroupMemoryEvents, CgroupMemorySnapshot, SystemMemorySnapshot};
 pub use working_set::{MemoryWorkingSet, WorkingSetSnapshot};
@@ -380,14 +384,41 @@ impl MemoryLease {
         self.budget.try_reserve(self.class, bytes)
     }
 
-    pub(crate) fn absorb(&mut self, mut other: Self) {
+    /// Move part of this charge to another owner without changing total admission
+    ///
+    /// Returns `None` without changing this lease if the requested part is too large
+    #[must_use]
+    pub fn split_off(&mut self, bytes: u64) -> Option<Self> {
+        self.bytes = self.bytes.checked_sub(bytes)?;
+        // Both owners keep the original budget and working-set credit
+        Some(Self {
+            budget: self.budget.clone(),
+            class: self.class,
+            bytes,
+        })
+    }
+
+    pub(crate) fn absorb(&mut self, other: Self) {
         assert!(
-            self.budget.same_owner(&other.budget) && self.class == other.class,
+            self.try_absorb(other).is_ok(),
             "memory charges must share one budget and class"
         );
+    }
+
+    /// Combine charges from the same budget scope and class without new admission
+    ///
+    /// A mismatched charge is returned intact so its owner can keep or release it
+    ///
+    /// # Errors
+    /// Returns the other lease if its budget scope or allocation class differs
+    pub fn try_absorb(&mut self, mut other: Self) -> Result<(), Self> {
+        if !self.budget.same_owner(&other.budget) || self.class != other.class {
+            return Err(other);
+        }
         // Both charges are already included in the same bounded aggregate
         self.bytes += other.bytes;
         other.bytes = 0;
+        Ok(())
     }
 
     /// Return the bytes currently represented by this lease

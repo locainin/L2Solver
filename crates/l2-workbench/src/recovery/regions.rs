@@ -8,11 +8,21 @@ use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
 
+mod admission;
+
+pub(crate) use admission::RegionMemoryError;
+use admission::{RegionAdmission, Shared, Unlimited};
+
+#[cfg(test)]
+#[path = "../../tests/recovery/regions/admission.rs"]
+mod admission_tests;
+
 use crate::{
     derivation::Operation,
+    job::MemoryLease,
     protocol::ByteRange,
     recovery::proposals::{
-        TransformProposal, TransformProposalBudget, TransformProposalReport, propose_transforms,
+        TransformProposal, TransformProposalBudget, TransformProposalReport,
         transform_proposal_scan_work_bound,
     },
 };
@@ -193,8 +203,43 @@ pub fn propose_region_transforms(
     limits: TransformRegionLimits,
     proposal_budget: TransformProposalBudget,
 ) -> TransformRegionReport {
+    match propose_region_inner(input, explicit_cues, limits, proposal_budget, Unlimited) {
+        Ok(report) => report,
+        Err(never) => match never {},
+    }
+}
+
+/// The caller retains this charge until the region report and moved metadata are dropped
+pub(crate) fn propose_region_transforms_with_memory(
+    input: &[u8],
+    explicit_cues: &[RegionCue],
+    limits: TransformRegionLimits,
+    proposal_budget: TransformProposalBudget,
+    memory: &mut MemoryLease,
+) -> Result<TransformRegionReport, RegionMemoryError> {
+    propose_region_inner(
+        input,
+        explicit_cues,
+        limits,
+        proposal_budget,
+        Shared(memory),
+    )
+}
+
+fn propose_region_inner<A: RegionAdmission>(
+    input: &[u8],
+    explicit_cues: &[RegionCue],
+    limits: TransformRegionLimits,
+    proposal_budget: TransformProposalBudget,
+    admission: A,
+) -> Result<TransformRegionReport, A::Error> {
     let mut omissions = TransformRegionOmissions::default();
-    let mut candidates = BTreeMap::<ByteRange, Vec<RegionCueOrigin>>::new();
+    let mut retained_memory = admission.lease()?;
+    let mut candidates = CandidateSet {
+        entries: BTreeMap::<ByteRange, CandidateOrigins<A::Lease>>::new(),
+        scratch: admission.lease()?,
+        nodes: 0,
+    };
 
     let cue_count = explicit_cues.len().min(limits.max_cues);
     omissions.cues = explicit_cues.len().saturating_sub(cue_count);
@@ -209,7 +254,8 @@ pub fn propose_region_transforms(
             cue.origin.clone(),
             limits.max_regions,
             &mut omissions,
-        );
+            &admission,
+        )?;
     }
 
     let scan_length = input.len().min(limits.max_scan_bytes);
@@ -220,11 +266,16 @@ pub fn propose_region_transforms(
         limits.max_regions,
         &mut candidates,
         &mut omissions,
-    );
+        &admission,
+    )?;
 
     let mut retained_bytes = 0_usize;
     let mut regions = Vec::new();
-    for (range, cue_origins) in candidates {
+    for (range, candidate) in std::mem::take(&mut candidates.entries) {
+        let CandidateOrigins {
+            memory: candidate_memory,
+            origins: cue_origins,
+        } = candidate;
         let length = range.end - range.start;
         if length > limits.max_region_bytes {
             omissions.region_bytes = omissions.region_bytes.saturating_add(length);
@@ -244,57 +295,101 @@ pub fn propose_region_transforms(
             omissions.invalid_cues = omissions.invalid_cues.saturating_add(1);
             continue;
         };
-        let mut proposal_report = propose_transforms(region_bytes, proposal_budget);
-        prefix_slice(&mut proposal_report.proposals, range);
+        let mut proposal_memory = admission.lease()?;
+        let mut proposal_report =
+            admission.propose(region_bytes, proposal_budget, &mut proposal_memory)?;
+        prefix_slice(
+            &mut proposal_report.proposals,
+            range,
+            &admission,
+            &mut proposal_memory,
+        )?;
+        admission.reserve_one(&mut regions, &mut retained_memory)?;
         regions.push(TransformRegion {
             range,
             cue_origins,
             proposal_report,
         });
+        admission.absorb(&mut retained_memory, candidate_memory);
+        admission.absorb(&mut retained_memory, proposal_memory);
     }
 
     let complete = omissions == TransformRegionOmissions::default();
-    TransformRegionReport {
+    let report = TransformRegionReport {
         regions,
         coverage: TransformRegionCoverage {
             examined_bytes: scan_length,
             complete,
             omissions,
         },
-    }
+    };
+    admission.finish(retained_memory);
+    Ok(report)
 }
 
 const fn valid_range(range: ByteRange, input_length: usize) -> bool {
     range.start < range.end && range.end <= input_length
 }
 
-fn add_candidate(
-    candidates: &mut BTreeMap<ByteRange, Vec<RegionCueOrigin>>,
+struct CandidateOrigins<L> {
+    origins: Vec<RegionCueOrigin>,
+    memory: L,
+}
+
+struct CandidateSet<L> {
+    entries: BTreeMap<ByteRange, CandidateOrigins<L>>,
+    scratch: L,
+    nodes: usize,
+}
+
+fn add_candidate<A: RegionAdmission>(
+    candidates: &mut CandidateSet<A::Lease>,
     range: ByteRange,
     origin: RegionCueOrigin,
     maximum: usize,
     omissions: &mut TransformRegionOmissions,
-) {
-    if let Some(origins) = candidates.get_mut(&range) {
-        if !origins.contains(&origin) {
-            origins.push(origin);
+    admission: &A,
+) -> Result<(), A::Error> {
+    if let Some(candidate) = candidates.entries.get_mut(&range) {
+        if !candidate.origins.contains(&origin) {
+            admission.reserve_one(&mut candidate.origins, &mut candidate.memory)?;
+            candidate.origins.push(origin);
         }
-        return;
+        return Ok(());
     }
-    if candidates.len() >= maximum {
+    if candidates.entries.len() >= maximum {
         omissions.regions = omissions.regions.saturating_add(1);
-        return;
+        return Ok(());
     }
-    candidates.insert(range, vec![origin]);
+    let count = candidates.entries.len().saturating_add(1);
+    let nodes = if count <= 11 { 1 } else { 1 + (count - 1) / 5 };
+    let additional = nodes.saturating_sub(candidates.nodes);
+    let node_bytes = crate::allocation::btree_node_bytes::<ByteRange, CandidateOrigins<A::Lease>>()
+        .unwrap_or(usize::MAX);
+    // The bound follows the minimum non-root occupancy of the current B-tree layout
+    admission.charge(
+        &mut candidates.scratch,
+        additional.saturating_mul(node_bytes),
+    )?;
+    candidates.nodes = nodes;
+    let mut memory = admission.lease()?;
+    let mut origins = Vec::new();
+    admission.reserve_one(&mut origins, &mut memory)?;
+    origins.push(origin);
+    candidates
+        .entries
+        .insert(range, CandidateOrigins { origins, memory });
+    Ok(())
 }
 
-fn scan_automatic_cues(
+fn scan_automatic_cues<A: RegionAdmission>(
     input: &[u8],
     scan_length: usize,
     maximum_regions: usize,
-    candidates: &mut BTreeMap<ByteRange, Vec<RegionCueOrigin>>,
+    candidates: &mut CandidateSet<A::Lease>,
     omissions: &mut TransformRegionOmissions,
-) -> usize {
+    admission: &A,
+) -> Result<usize, A::Error> {
     let mut open_encoding_run = None;
     let mut delimiter_offsets: [Option<usize>; DELIMITERS.len()] = [None; DELIMITERS.len()];
     let mut incomplete_regions = 0_usize;
@@ -311,7 +406,8 @@ fn scan_automatic_cues(
                     RegionCueOrigin::EncodingRun,
                     maximum_regions,
                     omissions,
-                );
+                    admission,
+                )?;
             }
         }
 
@@ -333,7 +429,8 @@ fn scan_automatic_cues(
                         },
                         maximum_regions,
                         omissions,
-                    );
+                        admission,
+                    )?;
                 }
             }
             if let Some(previous_offset) = delimiter_offsets.get_mut(delimiter_index) {
@@ -354,7 +451,8 @@ fn scan_automatic_cues(
                     RegionCueOrigin::EncodingRun,
                     maximum_regions,
                     omissions,
-                );
+                    admission,
+                )?;
             }
         } else {
             incomplete_regions = incomplete_regions.saturating_add(1);
@@ -369,11 +467,17 @@ fn scan_automatic_cues(
     {
         incomplete_regions = incomplete_regions.saturating_add(1);
     }
-    incomplete_regions
+    Ok(incomplete_regions)
 }
 
-fn prefix_slice(proposals: &mut [TransformProposal], range: ByteRange) {
+fn prefix_slice<A: RegionAdmission>(
+    proposals: &mut [TransformProposal],
+    range: ByteRange,
+    admission: &A,
+    memory: &mut A::Lease,
+) -> Result<(), A::Error> {
     for proposal in proposals {
+        admission.reserve_one(&mut proposal.recipe.steps, memory)?;
         proposal.recipe.steps.insert(
             0,
             Operation::Slice {
@@ -382,6 +486,7 @@ fn prefix_slice(proposals: &mut [TransformProposal], range: ByteRange) {
             },
         );
     }
+    Ok(())
 }
 
 const fn is_encoding_byte(byte: u8) -> bool {

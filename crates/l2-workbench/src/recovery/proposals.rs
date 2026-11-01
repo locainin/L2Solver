@@ -11,8 +11,17 @@
 //! A valid encoding or compression header supports an attempt; the decoded result still needs
 //! its own integrity and format checks
 
-use crate::derivation::{Base64Alphabet, Base64Padding, Operation, Recipe};
+use crate::{
+    allocation::{Metered, Unrestricted, VectorAdmission, VectorAllocationError},
+    derivation::{Base64Alphabet, Base64Padding, Operation, Recipe},
+    job::{MemoryError, MemoryLease},
+};
 use serde::{Deserialize, Serialize};
+use std::{error::Error, fmt};
+
+#[cfg(test)]
+#[path = "../../tests/recovery/proposals/admission.rs"]
+mod admission_tests;
 
 /// Number of canonical operations checked by one complete proposal pass
 pub const TRANSFORM_PROPOSAL_OPERATION_COUNT: usize = 7;
@@ -169,6 +178,68 @@ pub fn propose_transforms(
     input: &[u8],
     budget: TransformProposalBudget,
 ) -> TransformProposalReport {
+    match propose_inner(input, budget, &mut Unrestricted) {
+        Ok(report) => report,
+        Err(never) => match never {},
+    }
+}
+
+#[derive(Debug)]
+pub(crate) enum ProposalMemoryError {
+    Memory(MemoryError),
+    Allocation,
+}
+
+impl fmt::Display for ProposalMemoryError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Memory(error) => error.fmt(formatter),
+            Self::Allocation => formatter.write_str("transform proposal allocation failed"),
+        }
+    }
+}
+
+impl Error for ProposalMemoryError {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        match self {
+            Self::Memory(error) => Some(error),
+            Self::Allocation => None,
+        }
+    }
+}
+
+impl From<MemoryError> for ProposalMemoryError {
+    fn from(error: MemoryError) -> Self {
+        Self::Memory(error)
+    }
+}
+
+impl From<VectorAllocationError> for ProposalMemoryError {
+    fn from(error: VectorAllocationError) -> Self {
+        match error {
+            VectorAllocationError::Memory(error) => Self::Memory(error),
+            VectorAllocationError::Allocation => Self::Allocation,
+        }
+    }
+}
+
+/// The caller keeps this charge until the report and its moved recipes are dropped
+pub(crate) fn propose_transforms_with_memory(
+    input: &[u8],
+    budget: TransformProposalBudget,
+    memory: &mut MemoryLease,
+) -> Result<TransformProposalReport, ProposalMemoryError> {
+    let mut retained = memory.try_sibling(0)?;
+    let report = propose_inner(input, budget, &mut Metered(&mut retained))?;
+    memory.absorb(retained);
+    Ok(report)
+}
+
+fn propose_inner<A: VectorAdmission>(
+    input: &[u8],
+    budget: TransformProposalBudget,
+    admission: &mut A,
+) -> Result<TransformProposalReport, A::Error> {
     let mut proposals = Vec::new();
     let mut assessments = Vec::new();
     let mut unique_eligible_count = 0_usize;
@@ -185,32 +256,31 @@ pub fn propose_transforms(
                     CandidateKind::Base64 { .. } => base64_representative.clone(),
                     CandidateKind::Hex | CandidateKind::Gzip | CandidateKind::Zlib => None,
                 };
-                let disposition = representative.map_or_else(
-                    || {
-                        if matches!(candidate, CandidateKind::Base64 { .. }) {
-                            base64_representative = Some(operation.clone());
-                        }
-                        unique_eligible_count += 1;
-                        if proposals.len() < budget.max_candidates {
-                            proposals.push(TransformProposal {
-                                recipe: Recipe {
-                                    steps: vec![operation.clone()],
-                                    constraints: Vec::new(),
-                                },
-                                evidence: evidence.clone(),
-                            });
-                            TransformProposalDisposition::Proposed
-                        } else {
-                            TransformProposalDisposition::OmittedByCandidateBudget
-                        }
-                    },
-                    |representative| {
-                        // Different alphabets accept together only when input uses their shared symbols
-                        // Different padding modes accept together only for unpadded full quartets
-                        // Eligibility proves equal decoded bytes without execution or a second pass
-                        TransformProposalDisposition::AliasOf { representative }
-                    },
-                );
+                let disposition = if let Some(representative) = representative {
+                    // Shared alphabet bytes and complete quartets decode equally across aliases
+                    TransformProposalDisposition::AliasOf { representative }
+                } else {
+                    if matches!(candidate, CandidateKind::Base64 { .. }) {
+                        base64_representative = Some(operation.clone());
+                    }
+                    unique_eligible_count += 1;
+                    if proposals.len() < budget.max_candidates {
+                        let mut steps = Vec::new();
+                        admission.reserve_one(&mut steps)?;
+                        steps.push(operation.clone());
+                        admission.reserve_one(&mut proposals)?;
+                        proposals.push(TransformProposal {
+                            recipe: Recipe {
+                                steps,
+                                constraints: Vec::new(),
+                            },
+                            evidence: evidence.clone(),
+                        });
+                        TransformProposalDisposition::Proposed
+                    } else {
+                        TransformProposalDisposition::OmittedByCandidateBudget
+                    }
+                };
                 TransformAssessmentResult::Eligible {
                     evidence,
                     disposition,
@@ -222,18 +292,19 @@ pub fn propose_transforms(
         report_count += 1;
         // Candidate generation continues after the report budget so omitted counts stay exact
         if assessments.len() < budget.max_reports {
+            admission.reserve_one(&mut assessments)?;
             assessments.push(TransformAssessment { operation, result });
         }
     }
 
-    TransformProposalReport {
+    Ok(TransformProposalReport {
         omissions: TransformProposalOmissions {
             candidates: unique_eligible_count - proposals.len(),
             reports: report_count - assessments.len(),
         },
         proposals,
         assessments,
-    }
+    })
 }
 
 #[derive(Clone, Copy)]
