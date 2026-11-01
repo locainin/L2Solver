@@ -14,11 +14,17 @@ use std::error::Error;
 
 type TestResult = Result<(), Box<dyn Error>>;
 
-fn nested_archive() -> Result<(Vec<u8>, Vec<u8>, Vec<u8>), Box<dyn Error>> {
+struct NestedArchive {
+    outer: Vec<u8>,
+    inner: Vec<u8>,
+    png: Vec<u8>,
+}
+
+fn nested_archive() -> Result<NestedArchive, Box<dyn Error>> {
     let png = structural_png(&[])?;
     let inner = build_zip(&[FixtureEntry::stored(b"image.png", &png)])?;
     let outer = build_zip(&[FixtureEntry::stored(b"inner.zip", &inner)])?;
-    Ok((outer, inner, png))
+    Ok(NestedArchive { outer, inner, png })
 }
 
 #[test]
@@ -47,7 +53,7 @@ fn analyzer_admits_source_copy_before_allocation_and_preserves_existing_charge()
 
 #[test]
 fn nested_zip_members_keep_capacity_charged_in_one_near_full_working_set() -> TestResult {
-    let (outer, inner, png) = nested_archive()?;
+    let NestedArchive { outer, inner, png } = nested_archive()?;
     let root = MemoryBudget::new(16 * 1024 * 1024);
     let work = root.try_working_set(8 * 1024 * 1024)?;
     let before = root.snapshot()?;
@@ -97,7 +103,7 @@ fn nested_zip_members_keep_capacity_charged_in_one_near_full_working_set() -> Te
 
 #[test]
 fn analyzer_pressure_rolls_back_pending_and_nested_output_charges() -> TestResult {
-    let (outer, _, _) = nested_archive()?;
+    let outer = nested_archive()?.outer;
     let options = ArtifactAnalysisOptions::default();
     let ample = MemoryBudget::new(16 * 1024 * 1024);
     let mut lease = ample.try_reserve(MemoryClass::Executor, 0)?;

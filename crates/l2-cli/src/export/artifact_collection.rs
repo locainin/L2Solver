@@ -718,7 +718,7 @@ impl ArtifactCollection {
         provenance: &ArtifactProvenance,
         memory: Option<&MemoryBudget>,
     ) -> Result<AddOutcome, Box<dyn Error>> {
-        let (canonical_origin, encoded) = encode_provenance_record(provenance, memory)?;
+        let canonical_origin = encode_canonical_origin(provenance, memory)?;
         let path = bucket.join(provenance_file_name(record.entry_id));
         let origin_directory = Self::origin_directory(bucket, record.entry_id);
         let origin_index = Self::origin_index_path(&origin_directory, &canonical_origin.bytes);
@@ -727,6 +727,7 @@ impl ArtifactCollection {
                 add_counter(self.coverage.same_origin_references_suppressed, 1)?;
             return Ok(AddOutcome::SameOrigin);
         }
+        let encoded = encode_record(provenance, &canonical_origin.bytes, memory)?;
         if let Some(reason) = self.provenance_omission_reason(encoded.bytes.len()) {
             drop(canonical_origin);
             drop(encoded);
@@ -1056,14 +1057,31 @@ fn encode_provenance_record(
     provenance: &ArtifactProvenance,
     memory: Option<&MemoryBudget>,
 ) -> Result<(BoundedBuffer, BoundedBuffer), Box<dyn Error>> {
-    let mut canonical_origin = BoundedBuffer::new(usize::MAX, memory)?;
-    canonical_origin.encode(&provenance.canonical_origin)?;
+    let canonical_origin = encode_canonical_origin(provenance, memory)?;
+    let record = encode_record(provenance, &canonical_origin.bytes, memory)?;
+    Ok((canonical_origin, record))
+}
+
+fn encode_canonical_origin(
+    provenance: &ArtifactProvenance,
+    memory: Option<&MemoryBudget>,
+) -> Result<BoundedBuffer, Box<dyn Error>> {
+    let mut origin = BoundedBuffer::new(usize::MAX, memory)?;
+    origin.encode(&provenance.canonical_origin)?;
+    Ok(origin)
+}
+
+fn encode_record(
+    provenance: &ArtifactProvenance,
+    canonical_origin: &[u8],
+    memory: Option<&MemoryBudget>,
+) -> Result<BoundedBuffer, Box<dyn Error>> {
     let mut record = BoundedBuffer::new(usize::MAX, memory)?;
     record.encode(&StoredProvenanceRecordRef {
-        canonical_origin: &canonical_origin.bytes,
+        canonical_origin,
         provenance,
     })?;
-    Ok((canonical_origin, record))
+    Ok(record)
 }
 
 fn selection_string<'a>(provenance: &'a ArtifactProvenance, key: &str) -> Option<&'a str> {

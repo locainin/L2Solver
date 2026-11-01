@@ -624,6 +624,120 @@ fn same_origin_is_suppressed() -> Result<(), Box<dyn Error>> {
 }
 
 #[test]
+fn same_origin_does_not_encode_a_discarded_provenance_record() -> Result<(), Box<dyn Error>> {
+    let temporary = tempfile::tempdir()?;
+    let mut collection = ArtifactCollection::new(temporary.path(), ArtifactLimits::default())?;
+    let description = "x".repeat(32 * 1024);
+    let mut origin = provenance();
+    origin.description = Some(description.clone());
+    origin.canonical_origin = serde_json::json!({"category": "test", "description": description});
+    let full_budget = MemoryBudget::new(2 * 1024 * 1024);
+    assert_eq!(
+        collection.add_bytes(b"same bytes", "first.bin", &origin, Some(&full_budget))?,
+        AddOutcome::Stored
+    );
+    assert_eq!(full_budget.snapshot()?.used_bytes, 0);
+    let mut before = Vec::new();
+    collection.write_manifest_artifacts(&mut before)?;
+
+    // The identity fits, while its byte-array representation plus the full record does not
+    let identity_budget = MemoryBudget::new(128 * 1024);
+    assert_eq!(
+        collection.add_bytes(b"same bytes", "second.bin", &origin, Some(&identity_budget))?,
+        AddOutcome::SameOrigin
+    );
+    assert_eq!(identity_budget.snapshot()?.used_bytes, 0);
+    assert_eq!(collection.coverage().same_origin_references_suppressed, 1);
+    let mut after = Vec::new();
+    collection.write_manifest_artifacts(&mut after)?;
+    assert_eq!(after, before);
+    Ok(())
+}
+
+#[test]
+fn colliding_origin_index_still_compares_exact_identity() -> Result<(), Box<dyn Error>> {
+    use sha2::{Digest, Sha256};
+
+    let temporary = tempfile::tempdir()?;
+    let mut collection = ArtifactCollection::new(temporary.path(), ArtifactLimits::default())?;
+    let forced_digest = "a".repeat(64);
+    let mut first = provenance();
+    first.description = Some("first".into());
+    first.canonical_origin = serde_json::json!({"description": "first"});
+    let mut second = provenance();
+    second.description = Some("second".into());
+    second.canonical_origin = serde_json::json!({"description": "second"});
+    assert_eq!(
+        collection.add_bytes_with_digest(
+            b"same bytes",
+            &forced_digest,
+            "first.bin",
+            &first,
+            None
+        )?,
+        AddOutcome::Stored
+    );
+
+    // Point the second digest at the first row to exercise the collision comparison
+    let origin_dir = temporary
+        .path()
+        .join(".l2solver-artifact-index")
+        .join(format!("{:020}-{forced_digest}", b"same bytes".len()))
+        .join("entry-00000000000000000000.origins");
+    let first_digest = format!(
+        "{:x}",
+        Sha256::digest(serde_json::to_vec(&first.canonical_origin)?)
+    );
+    let second_digest = format!(
+        "{:x}",
+        Sha256::digest(serde_json::to_vec(&second.canonical_origin)?)
+    );
+    fs::copy(
+        origin_dir.join(first_digest),
+        origin_dir.join(second_digest),
+    )?;
+    assert_eq!(
+        collection.add_bytes_with_digest(
+            b"same bytes",
+            &forced_digest,
+            "second.bin",
+            &second,
+            None
+        )?,
+        AddOutcome::Duplicate
+    );
+    assert_eq!(
+        collection.add_bytes_with_digest(
+            b"same bytes",
+            &forced_digest,
+            "third.bin",
+            &second,
+            None
+        )?,
+        AddOutcome::SameOrigin
+    );
+    let mut serialized = Vec::new();
+    collection.write_manifest_artifacts(&mut serialized)?;
+    let artifacts: Vec<Value> =
+        serde_json::from_slice(&[b"[".as_slice(), &serialized, b"]"].concat())?;
+    let origins = artifacts
+        .first()
+        .and_then(|artifact| artifact.get("provenance"))
+        .and_then(Value::as_array)
+        .ok_or("missing artifact provenance")?;
+    assert_eq!(origins.len(), 2);
+    assert_eq!(
+        origins.first().and_then(|origin| origin.get("description")),
+        Some(&Value::from("first"))
+    );
+    assert_eq!(
+        origins.get(1).and_then(|origin| origin.get("description")),
+        Some(&Value::from("second"))
+    );
+    Ok(())
+}
+
+#[test]
 fn exact_limit_keeps_source_complete() -> Result<(), Box<dyn Error>> {
     let temporary = tempfile::tempdir()?;
     let capture = temporary.path().join("flows.pcap");

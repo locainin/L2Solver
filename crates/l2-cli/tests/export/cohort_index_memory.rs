@@ -113,24 +113,9 @@ fn flow_lookup_releases_its_charge_after_publication() -> TestResult {
 fn unsorted_duplicate_lookups_keep_the_last_witness_and_exact_flow_context() -> TestResult {
     let mut case = Case::new();
     super::add_source(&mut case)?;
-    let packet_seven = case.add_bytes_node(
-        "ftp_data_candidate",
-        b"packet seven",
-        vec![super::source_range(7, 0, 12)],
-        json!({}),
-    )?;
-    let packet_one = case.add_bytes_node(
-        "ftp_data_candidate",
-        b"packet one",
-        vec![super::source_range(1, 0, 10)],
-        json!({}),
-    )?;
-    let missing_packet = case.add_bytes_node(
-        "ftp_data_candidate",
-        b"missing packet",
-        vec![super::source_range(u64::from(u32::MAX) + 1, 0, 14)],
-        json!({}),
-    )?;
+    let packet_seven = packet_artifact(&mut case, b"packet seven", 7)?;
+    let packet_one = packet_artifact(&mut case, b"packet one", 1)?;
+    let missing_packet = packet_artifact(&mut case, b"missing packet", u64::from(u32::MAX) + 1)?;
     let mut old_ten = super::flow(10);
     old_ten.source_id = "earlier-source".to_owned();
     let mut last_ten = super::flow(10);
@@ -164,12 +149,18 @@ fn unsorted_duplicate_lookups_keep_the_last_witness_and_exact_flow_context() -> 
         match origin.selected_node_id {
             Some(id) if id == packet_seven => {
                 assert_eq!(origin.flow.as_ref(), Some(&expected_twenty));
-                assert_eq!(origin.supporting_flows, [expected_twenty.clone()]);
+                assert_eq!(
+                    origin.supporting_flows.as_slice(),
+                    std::slice::from_ref(&expected_twenty)
+                );
                 assert!(origin.cohort_scope.is_none());
             }
             Some(id) if id == packet_one => {
                 assert_eq!(origin.flow.as_ref(), Some(&expected_ten));
-                assert_eq!(origin.supporting_flows, [expected_ten.clone()]);
+                assert_eq!(
+                    origin.supporting_flows.as_slice(),
+                    std::slice::from_ref(&expected_ten)
+                );
                 assert!(origin.cohort_scope.is_none());
             }
             Some(id) if id == missing_packet => {
@@ -195,4 +186,13 @@ fn unsorted_duplicate_lookups_keep_the_last_witness_and_exact_flow_context() -> 
     assert_eq!(found, 3);
     assert_eq!(budget.snapshot()?.used_bytes, 0);
     Ok(())
+}
+
+fn packet_artifact(case: &mut Case, bytes: &[u8], packet: u64) -> Result<u64, Box<dyn Error>> {
+    Ok(case.add_bytes_node(
+        "ftp_data_candidate",
+        bytes,
+        vec![super::source_range(packet, 0, u64::try_from(bytes.len())?)],
+        json!({}),
+    )?)
 }

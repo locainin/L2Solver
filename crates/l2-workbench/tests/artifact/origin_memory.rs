@@ -9,7 +9,7 @@ use l2_workbench::{
     recovery::{proposals::TransformEvidence, regions::RegionCueOrigin},
 };
 
-fn transformed(operation: Operation, cue_origins: Vec<RegionCueOrigin>) -> ArtifactOrigin {
+const fn transformed(operation: Operation, cue_origins: Vec<RegionCueOrigin>) -> ArtifactOrigin {
     ArtifactOrigin::Transformation {
         parent_index: 0,
         input_range: FileRange {
