@@ -1,5 +1,5 @@
 use super::{
-    CHECKPOINT_LIMIT, CheckpointFixture, Infallible, Job, RelationalCursorError,
+    CHECKPOINT_LIMIT, CheckpointFixture, Infallible, Job, OwnedRecord, RelationalCursorError,
     RelationalParserScope, RelationalRestoreBudget, RelationalSearchSession, RelationalSearchStep,
     RelationalTransformEvaluationOptions, SCOPE, TestResult, assert_resume_rejected,
     borrow_samples, decode_assessment, evaluate, rehash, search_plan, synthetic_sessions,
@@ -8,11 +8,12 @@ use base64::{Engine as _, engine::general_purpose::STANDARD};
 use l2_workbench::{
     derivation::CounterWidth,
     job::{MemoryBudget, MemoryClass},
-    protocol::{Direction, RelationalCounterReset},
+    protocol::{Direction, RelationalCounterReset, RelationalTransformPlan},
 };
 use serde::Deserialize;
 use serde_json::{Value, value::RawValue};
 use sha2::{Digest, Sha256};
+use std::fmt::Write as _;
 
 fn output_checkpoint_fixture() -> TestResult<CheckpointFixture> {
     let records = synthetic_sessions(false)?;
@@ -99,14 +100,22 @@ fn checkpoint_output_requires_canonical_padded_base64() -> TestResult<()> {
         .rev()
         .take_while(|&&byte| byte == b'=')
         .count();
-    let final_symbol = encoded.len() - trailing - 1;
+    let final_symbol = encoded
+        .len()
+        .checked_sub(trailing)
+        .and_then(|length| length.checked_sub(1))
+        .ok_or("padded output has no Base64 symbol")?;
+    let symbol = *encoded.get(final_symbol).ok_or("missing Base64 symbol")?;
     let alphabet = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
     let index = alphabet
         .iter()
-        .position(|byte| *byte == encoded[final_symbol])
+        .position(|byte| *byte == symbol)
         .ok_or("invalid Base64 alphabet")?;
     assert_eq!(index & 1, 0);
-    encoded[final_symbol] = alphabet[index + 1];
+    let replacement = *alphabet.get(index + 1).ok_or("missing Base64 symbol")?;
+    *encoded
+        .get_mut(final_symbol)
+        .ok_or("missing Base64 symbol")? = replacement;
     *padded = Value::String(String::from_utf8(encoded)?);
     assert_resume_rejected(&samples, &plan, options, None, &rehash(changed)?)?;
 
@@ -167,10 +176,10 @@ fn escaped_output_string_is_admitted_before_decoding() -> TestResult<()> {
     let encoded = first_output_mut(&mut envelope)?
         .as_str()
         .ok_or("output was not encoded as a string")?;
-    let escaped = encoded
-        .bytes()
-        .map(|byte| format!("\\u{byte:04x}"))
-        .collect::<String>();
+    let mut escaped = String::new();
+    for byte in encoded.bytes() {
+        write!(&mut escaped, "\\u{byte:04x}")?;
+    }
     let payload = raw.payload.get().replacen(
         &format!("\"bytes\":\"{encoded}\""),
         &format!("\"bytes\":\"{escaped}\""),
@@ -213,10 +222,12 @@ fn escaped_output_string_is_admitted_before_decoding() -> TestResult<()> {
     Ok(())
 }
 
-#[test]
-fn multi_megabyte_outputs_restore_with_bounded_memory_and_unchanged_search() -> TestResult<()> {
+fn large_search_fixture() -> (
+    Vec<OwnedRecord>,
+    RelationalTransformPlan,
+    RelationalTransformEvaluationOptions,
+) {
     const PAYLOAD_BYTES: usize = 512 * 1024 + 17;
-    const ENCODED_LIMIT: usize = 6 * 1024 * 1024;
     let mut records = Vec::new();
     for session in 1_u8..=4 {
         records.push((
@@ -234,7 +245,6 @@ fn multi_megabyte_outputs_restore_with_bounded_memory_and_unchanged_search() -> 
         );
         records.push((u32::from(session), Direction::SecondToFirst, payload));
     }
-    let samples = borrow_samples(&records)?;
     let mut plan = search_plan();
     plan.parser_scope = RelationalParserScope::AcrossSessions;
     plan.counter_widths = vec![CounterWidth::EightBytes];
@@ -250,6 +260,44 @@ fn multi_megabyte_outputs_restore_with_bounded_memory_and_unchanged_search() -> 
     let options = RelationalTransformEvaluationOptions {
         max_retained_output_bytes: 3 * 1024 * 1024,
     };
+    (records, plan, options)
+}
+
+fn assert_large_checkpoint_outputs(bytes: &[u8]) -> TestResult<u64> {
+    let envelope: Value = serde_json::from_slice(bytes)?;
+    let retained = envelope
+        .pointer("/payload/search/output_bytes_retained")
+        .and_then(Value::as_u64)
+        .ok_or("missing retained output count")?;
+    assert!(
+        retained >= 2 * 1024 * 1024,
+        "fixture did not retain large outputs"
+    );
+    let candidate = envelope
+        .pointer("/payload/search/candidates")
+        .and_then(Value::as_array)
+        .and_then(|candidates| candidates.first())
+        .ok_or("missing retained candidates")?;
+    for split in ["discovery", "heldout"] {
+        let outputs = candidate
+            .pointer(&format!("/outputs/{split}"))
+            .and_then(Value::as_array)
+            .ok_or("missing output split")?;
+        assert!(!outputs.is_empty(), "{split} has no retained output");
+        assert!(
+            outputs
+                .iter()
+                .all(|output| output.get("bytes").is_some_and(Value::is_string))
+        );
+    }
+    Ok(retained)
+}
+
+#[test]
+fn multi_megabyte_outputs_restore_with_bounded_memory_and_unchanged_search() -> TestResult<()> {
+    const ENCODED_LIMIT: usize = 6 * 1024 * 1024;
+    let (records, plan, options) = large_search_fixture();
+    let samples = borrow_samples(&records)?;
     let job = Job::new("original multi-megabyte search").work_scope(SCOPE)?;
     let mut session = RelationalSearchSession::new(&samples, &plan, Some(&job), options, None)?;
     let RelationalSearchStep::Paused(saved) = session.step(None, 1, |_, candidate, _, _| {
@@ -263,28 +311,7 @@ fn multi_megabyte_outputs_restore_with_bounded_memory_and_unchanged_search() -> 
         session.encode_checkpoint(&saved, ENCODED_LIMIT, &encoded_memory, |value, writer| {
             serde_json::to_writer(writer, value)
         })?;
-    let envelope: Value = serde_json::from_slice(&bytes)?;
-    let retained = envelope
-        .pointer("/payload/search/output_bytes_retained")
-        .and_then(Value::as_u64)
-        .ok_or("missing retained output count")?;
-    assert!(
-        retained >= 2 * 1024 * 1024,
-        "fixture did not retain large outputs"
-    );
-    let candidates = envelope
-        .pointer("/payload/search/candidates")
-        .and_then(Value::as_array)
-        .ok_or("missing retained candidates")?;
-    for split in ["discovery", "heldout"] {
-        let outputs = candidates[0]
-            .pointer(&format!("/outputs/{split}"))
-            .and_then(Value::as_array)
-            .ok_or("missing output split")?;
-        assert!(!outputs.is_empty(), "{split} has no retained output");
-        assert!(outputs.iter().all(|output| output["bytes"].is_string()));
-    }
-    drop(envelope);
+    let retained = assert_large_checkpoint_outputs(&bytes)?;
     let work_at_pause = job.work_snapshot()?;
     let mut original_calls = Vec::new();
     let RelationalSearchStep::Complete(original) =
@@ -332,6 +359,10 @@ fn multi_megabyte_outputs_restore_with_bounded_memory_and_unchanged_search() -> 
         .flat_map(|outputs| outputs.discovery.iter().chain(&outputs.heldout))
         .next()
         .ok_or("final report has no captured output")?;
-    assert!(serde_json::to_value(output)?["bytes"].is_array());
+    assert!(
+        serde_json::to_value(output)?
+            .get("bytes")
+            .is_some_and(Value::is_array)
+    );
     Ok(())
 }

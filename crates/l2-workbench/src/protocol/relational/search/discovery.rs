@@ -12,7 +12,7 @@ use super::{
     anchor::{AnchoredPayloadSearch, anchored_payload_locators},
     history::{RelationalReplayHistory, ReplayDisposition},
     input::{
-        SessionGroup, build_selector_indexes, group_sessions, shared_selectors, validate_plan,
+        SessionGroup, build_selector_indexes, partition_sessions, shared_selectors, validate_plan,
     },
     locator::{
         LocatorCandidate, locator_ranges_overlap, locator_start_rank, payload_locators,
@@ -42,7 +42,8 @@ thread_local! {
 
 pub use cursor::{
     RelationalCursorError, RelationalRestoreBudget, RelationalSearchCursor,
-    RelationalSearchSession, RelationalSearchStep,
+    RelationalSearchSession, RelationalSearchStep, prepare_relational_session_partition,
+    validate_relational_producer_parameters,
 };
 
 #[derive(serde::Deserialize)]
@@ -1214,7 +1215,9 @@ where
         job.check_cancelled()
             .map_err(RelationalTransformError::from)?;
     }
-    validate_plan(plan)?;
+    let mut check_cancelled =
+        || job.map_or(Ok(()), |job| job.check_cancelled().map_err(Into::into));
+    validate_plan(plan, &mut check_cancelled)?;
     if settings.max_retained_output_bytes > plan.limits.max_total_bytes {
         return Err(RelationalEvaluationError::Search(
             RelationalTransformError::InvalidPlan(
@@ -1248,9 +1251,8 @@ fn prepare_search(
 ) -> Result<PreparedSearch, RelationalTransformError> {
     let mut check_cancelled =
         || job.map_or(Ok(()), |job| job.check_cancelled().map_err(Into::into));
-    let mut discovery_groups = group_sessions(samples, plan.limits, &mut check_cancelled)?;
-    let discovery_count = discovery_groups.len().div_ceil(2);
-    let heldout_groups = discovery_groups.split_off(discovery_count);
+    let (discovery_groups, heldout_groups) =
+        partition_sessions(samples, plan.limits, &mut check_cancelled)?;
     let discovery_sessions = discovery_groups
         .iter()
         .map(|group| group.id.clone())

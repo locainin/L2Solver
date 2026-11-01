@@ -9,6 +9,7 @@ use l2_workbench::{
     derivation::{CounterByteOrder, CounterWidth, SeedCounterOrder},
     protocol::{
         Direction, RelationalCounterReset, RelationalOperationTemplate, RelationalTransformRule,
+        validate_relational_producer_parameters,
     },
 };
 use std::convert::Infallible;
@@ -62,9 +63,8 @@ fn history_hits_can_reach_valid_parameters_past_the_ranking_window() -> TestResu
                 Ok::<_, Infallible>(evaluate(candidate))
             })?;
             match step {
-                RelationalSearchStep::Complete(_) => break,
                 RelationalSearchStep::Paused(saved) if retained.is_none() => cursor = Some(saved),
-                RelationalSearchStep::Paused(_) => break,
+                RelationalSearchStep::Complete(_) | RelationalSearchStep::Paused(_) => break,
             }
         }
         drop(session);
@@ -76,17 +76,15 @@ fn history_hits_can_reach_valid_parameters_past_the_ranking_window() -> TestResu
     let RelationalOperationTemplate::Sha256CounterXor(operation) = rule.operation;
     assert_eq!(operation.initial_counter, 0);
     assert!(history.is_complete());
-    let session = RelationalSearchSession::new(&samples, &plan, None, options, None)?;
     let mut work = RelationalRestoreBudget::new(1024, 0);
-    session.validate_producer_parameters(&rule, &mut work)?;
+    validate_relational_producer_parameters(&plan, &rule, None, &mut work)?;
     assert!(work.verification_work_bytes() > 0);
     Ok(())
 }
 
 #[test]
 fn allowed_parameters_beyond_the_ranking_window_are_accepted() -> TestResult<()> {
-    let (records, mut plan, _, bytes, _lease) = checkpoint_fixture()?;
-    let samples = borrow_samples(&records)?;
+    let (_, mut plan, _, bytes, _lease) = checkpoint_fixture()?;
     let mut rule = candidate_rule(&bytes)?;
     plan.limits.max_candidates = 1;
     plan.counter_widths = vec![CounterWidth::EightBytes];
@@ -100,23 +98,15 @@ fn allowed_parameters_beyond_the_ranking_window_are_accepted() -> TestResult<()>
     operation.seed_order = SeedCounterOrder::SeedThenCounter;
     operation.initial_counter = 1;
     rule.counter_reset = RelationalCounterReset::Continuous;
-    let session = RelationalSearchSession::new(
-        &samples,
-        &plan,
-        None,
-        RelationalTransformEvaluationOptions::default(),
-        None,
-    )?;
     let mut work = RelationalRestoreBudget::new(1024, 0);
-    session.validate_producer_parameters(&rule, &mut work)?;
+    validate_relational_producer_parameters(&plan, &rule, None, &mut work)?;
     assert!(work.verification_work_bytes() > 0);
     Ok(())
 }
 
 #[test]
 fn incompatible_parameters_are_rejected_and_consume_verification_work() -> TestResult<()> {
-    let (records, mut plan, _, bytes, _lease) = checkpoint_fixture()?;
-    let samples = borrow_samples(&records)?;
+    let (_, mut plan, _, bytes, _lease) = checkpoint_fixture()?;
     let rule = candidate_rule(&bytes)?;
     plan.counter_widths = vec![CounterWidth::OneByte];
     plan.counter_byte_orders = vec![CounterByteOrder::BigEndian, CounterByteOrder::LittleEndian];
@@ -132,15 +122,8 @@ fn incompatible_parameters_are_rejected_and_consume_verification_work() -> TestR
     operation.initial_counter = 0;
     valid.counter_reset = RelationalCounterReset::Continuous;
     valid.parser_format = ArtifactValidationFormat::Der;
-    let session = RelationalSearchSession::new(
-        &samples,
-        &plan,
-        None,
-        RelationalTransformEvaluationOptions::default(),
-        None,
-    )?;
     let mut work = RelationalRestoreBudget::new(10_000, 0);
-    session.validate_producer_parameters(&valid, &mut work)?;
+    validate_relational_producer_parameters(&plan, &valid, None, &mut work)?;
 
     let mut incompatible = Vec::new();
     let mut wrong = valid.clone();
@@ -175,7 +158,7 @@ fn incompatible_parameters_are_rejected_and_consume_verification_work() -> TestR
     for rule in incompatible {
         let before = work.verification_work_bytes();
         assert!(matches!(
-            session.validate_producer_parameters(&rule, &mut work),
+            validate_relational_producer_parameters(&plan, &rule, None, &mut work),
             Err(RelationalCursorError::InvalidCheckpoint)
         ));
         assert!(work.verification_work_bytes() > before);
@@ -185,23 +168,44 @@ fn incompatible_parameters_are_rejected_and_consume_verification_work() -> TestR
 
 #[test]
 fn parameter_validation_respects_work_and_cancellation_before_scanning() -> TestResult<()> {
-    let (records, plan, options, bytes, _lease) = checkpoint_fixture()?;
-    let samples = borrow_samples(&records)?;
+    let (_, plan, _, bytes, _lease) = checkpoint_fixture()?;
     let rule = candidate_rule(&bytes)?;
     let job = Job::new("parameter validation");
-    let session = RelationalSearchSession::new(&samples, &plan, Some(&job), options, None)?;
     let mut denied = RelationalRestoreBudget::new(0, 0);
     assert!(matches!(
-        session.validate_producer_parameters(&rule, &mut denied),
+        validate_relational_producer_parameters(&plan, &rule, Some(&job), &mut denied),
         Err(RelationalCursorError::RestoreWorkLimit)
     ));
     assert_eq!(denied.verification_work_bytes(), 0);
     job.request_cancel();
     let mut cancelled = RelationalRestoreBudget::new(10_000, 0);
     assert!(matches!(
-        session.validate_producer_parameters(&rule, &mut cancelled),
+        validate_relational_producer_parameters(&plan, &rule, Some(&job), &mut cancelled),
         Err(RelationalCursorError::Search(_))
     ));
     assert_eq!(cancelled.verification_work_bytes(), 0);
+    Ok(())
+}
+
+#[test]
+fn producer_validation_rejects_invalid_plan_and_scope_after_charging() -> TestResult<()> {
+    let (_, mut plan, _, bytes, _lease) = checkpoint_fixture()?;
+    let mut rule = candidate_rule(&bytes)?;
+    let mut work = RelationalRestoreBudget::new(10_000, 0);
+    plan.initial_counters = vec![0, 0];
+    assert!(matches!(
+        validate_relational_producer_parameters(&plan, &rule, None, &mut work),
+        Err(RelationalCursorError::Search(_))
+    ));
+    let charged = work.verification_work_bytes();
+    assert!(charged > 0);
+    plan.initial_counters = vec![0];
+    plan.parser_scope = RelationalParserScope::EachSession;
+    rule.parser_scope = RelationalParserScope::EachSession;
+    assert!(matches!(
+        validate_relational_producer_parameters(&plan, &rule, None, &mut work),
+        Err(RelationalCursorError::Search(_))
+    ));
+    assert!(work.verification_work_bytes() > charged);
     Ok(())
 }

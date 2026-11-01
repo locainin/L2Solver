@@ -48,11 +48,7 @@ impl RelationalSearchSession<'_, '_> {
                 .checked_add(size_of::<Vec<usize>>())?
                 .checked_add(6 * size_of::<usize>())?,
         )?;
-        let sample_entry = 8_usize.checked_mul(
-            size_of::<RelationalSessionId>()
-                .checked_add(size_of::<SessionGroup>())?
-                .checked_add(size_of::<[usize; 8]>())?,
-        )?;
+        let grouping = grouping_memory_bytes(samples.len(), context_bytes)?;
         let locator_entry = 8_usize
             .checked_mul(size_of::<LocatorCandidate>())?
             .checked_add(8_usize.checked_mul(max_marker)?)?;
@@ -70,8 +66,7 @@ impl RelationalSearchSession<'_, '_> {
         let total = proposals
             .checked_mul(selector_entry)?
             .checked_add(marker_bytes.checked_mul(4)?)?
-            .checked_add(samples.len().checked_mul(sample_entry)?)?
-            .checked_add(context_bytes.checked_mul(8)?)?
+            .checked_add(grouping)?
             .checked_add(
                 limits
                     .max_locator_candidates
@@ -91,4 +86,15 @@ impl RelationalSearchSession<'_, '_> {
             )?;
         u64::try_from(total).ok()
     }
+}
+
+pub(super) fn grouping_memory_bytes(samples: usize, context_bytes: usize) -> Option<usize> {
+    let sample_entry = 8_usize.checked_mul(
+        size_of::<RelationalSessionId>()
+            .checked_add(size_of::<SessionGroup>())?
+            .checked_add(size_of::<[usize; 8]>())?,
+    )?;
+    samples
+        .checked_mul(sample_entry)?
+        .checked_add(context_bytes.checked_mul(8)?)
 }

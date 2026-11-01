@@ -30,6 +30,22 @@ pub(super) fn group_sessions(
     grouped_samples.into_groups(limits)
 }
 
+pub(super) fn partition_sessions(
+    samples: &[RelationalRecordSample<'_>],
+    limits: RelationalTransformLimits,
+    check_cancelled: &mut impl FnMut() -> Result<(), RelationalTransformError>,
+) -> Result<(Vec<SessionGroup>, Vec<SessionGroup>), RelationalTransformError> {
+    let mut discovery = group_sessions(samples, limits, check_cancelled)?;
+    let discovery_count = discovery.len().div_ceil(2);
+    let mut heldout = Vec::new();
+    heldout
+        .try_reserve_exact(discovery.len() - discovery_count)
+        .map_err(|_| RelationalTransformError::AllocationFailed)?;
+    heldout.extend(discovery.drain(discovery_count..));
+    check_cancelled()?;
+    Ok((discovery, heldout))
+}
+
 #[derive(Default)]
 struct GroupedSamples {
     sample_ids: BTreeSet<u64>,
@@ -172,6 +188,7 @@ impl GroupedSamples {
 
 pub(super) fn validate_plan(
     plan: &RelationalTransformPlan,
+    check_cancelled: &mut impl FnMut() -> Result<(), RelationalTransformError>,
 ) -> Result<(), RelationalTransformError> {
     let limits = plan.limits;
     if limits.max_cohorts == 0
@@ -201,22 +218,32 @@ pub(super) fn validate_plan(
             "relational transform and parser domains must be nonempty",
         ));
     }
-    if has_duplicates(&plan.parser_formats)
-        || has_duplicates(&plan.counter_widths)
-        || has_duplicates(&plan.counter_byte_orders)
-        || has_duplicates(&plan.seed_orders)
-        || has_duplicates(&plan.initial_counters)
-        || has_duplicates(&plan.counter_resets)
+    if has_duplicates(&plan.parser_formats, check_cancelled)?
+        || has_duplicates(&plan.counter_widths, check_cancelled)?
+        || has_duplicates(&plan.counter_byte_orders, check_cancelled)?
+        || has_duplicates(&plan.seed_orders, check_cancelled)?
+        || has_duplicates(&plan.initial_counters, check_cancelled)?
+        || has_duplicates(&plan.counter_resets, check_cancelled)?
     {
         return Err(RelationalTransformError::InvalidPlan(
             "relational search domains must not contain duplicate values",
         ));
     }
-    if plan.initial_counters.iter().all(|counter| {
-        plan.counter_widths
+    let mut any_counter_fits = false;
+    for (index, counter) in plan.initial_counters.iter().enumerate() {
+        if index.is_multiple_of(256) {
+            check_cancelled()?;
+        }
+        if plan
+            .counter_widths
             .iter()
-            .all(|width| *counter > width.maximum_counter())
-    }) {
+            .any(|width| *counter <= width.maximum_counter())
+        {
+            any_counter_fits = true;
+            break;
+        }
+    }
+    if !any_counter_fits {
         return Err(RelationalTransformError::InvalidPlan(
             "no initial counter fits a selected counter width",
         ));
@@ -224,12 +251,21 @@ pub(super) fn validate_plan(
     Ok(())
 }
 
-fn has_duplicates<T: Eq>(items: &[T]) -> bool {
-    items.iter().enumerate().any(|(index, item)| {
-        items
-            .get(index + 1..)
-            .is_some_and(|tail| tail.contains(item))
-    })
+fn has_duplicates<T: Eq>(
+    items: &[T],
+    check_cancelled: &mut impl FnMut() -> Result<(), RelationalTransformError>,
+) -> Result<bool, RelationalTransformError> {
+    for (index, item) in items.iter().enumerate() {
+        for (offset, candidate) in items.iter().skip(index + 1).enumerate() {
+            if offset.is_multiple_of(256) {
+                check_cancelled()?;
+            }
+            if item == candidate {
+                return Ok(true);
+            }
+        }
+    }
+    Ok(false)
 }
 
 fn session_id(context: &crate::protocol::MessageContext) -> RelationalSessionId {

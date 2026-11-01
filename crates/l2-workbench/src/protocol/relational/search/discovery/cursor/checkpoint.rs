@@ -523,7 +523,10 @@ const fn memory_failure<E>(error: MemoryError) -> RelationalCursorError<E> {
     RelationalCursorError::Memory(JsonMemoryError::Memory(error))
 }
 
-fn reserve<E>(memory: &MemoryBudget, bytes: u64) -> Result<MemoryLease, RelationalCursorError<E>> {
+pub(super) fn reserve<E>(
+    memory: &MemoryBudget,
+    bytes: u64,
+) -> Result<MemoryLease, RelationalCursorError<E>> {
     memory
         .try_reserve(MemoryClass::Executor, bytes)
         .map_err(memory_failure)

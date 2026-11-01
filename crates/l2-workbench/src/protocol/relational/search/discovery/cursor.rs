@@ -34,8 +34,12 @@ const CURSOR_VERSION: u32 = 3;
 
 mod budget;
 mod output;
+mod partition;
 mod preparation;
 pub use budget::RelationalRestoreBudget;
+pub use partition::{
+    prepare_relational_session_partition, validate_relational_producer_parameters,
+};
 
 /// A saved search boundary, including retained candidate evidence and caller assessments
 ///

@@ -21,5 +21,6 @@ pub use search::{
     apply_relational_transform_rule, infer_relational_transform_candidates,
     infer_relational_transform_candidates_with_evaluator,
     infer_relational_transform_candidates_with_evaluator_and_history,
-    infer_relational_transform_candidates_with_job,
+    infer_relational_transform_candidates_with_job, prepare_relational_session_partition,
+    validate_relational_producer_parameters,
 };

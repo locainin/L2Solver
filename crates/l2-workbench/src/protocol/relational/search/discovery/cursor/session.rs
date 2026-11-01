@@ -2,20 +2,15 @@
 
 use super::{
     CandidateParameters, Job, Position, PreparedSearch, RelationalAppliedOutput,
-    RelationalCandidateEvaluation, RelationalCursorError, RelationalEvaluationError,
-    RelationalRecordSample, RelationalReplayHistory, RelationalRestoreBudget,
-    RelationalSearchCursor, RelationalSearchStep,
+    RelationalCandidateEvaluation, RelationalEvaluationError, RelationalRecordSample,
+    RelationalReplayHistory, RelationalSearchCursor, RelationalSearchStep,
     RelationalTransformCandidate, RelationalTransformError, RelationalTransformEvaluationContext,
-    RelationalTransformEvaluationOptions, RelationalTransformPlan, RelationalTransformRule,
-    RetentionMode, SearchContext, SearchSettings, SearchState, StepBounds, attach_history,
-    build_report, candidate_parameters, drive, identity, invalid_cursor, prepare_search,
-    validate_plan,
+    RelationalTransformEvaluationOptions, RelationalTransformPlan, RetentionMode, SearchContext,
+    SearchSettings, SearchState, StepBounds, attach_history, build_report, candidate_parameters,
+    drive, identity, invalid_cursor, prepare_search,
 };
-use crate::protocol::RelationalParserScope;
 use std::{
-    convert::Infallible,
     fmt,
-    mem::size_of_val,
     sync::atomic::{AtomicU64, Ordering},
 };
 
@@ -70,12 +65,7 @@ impl<'input, 'bytes> RelationalSearchSession<'input, 'bytes> {
         if let Some(job) = job {
             job.check_cancelled()?;
         }
-        validate_plan(plan)?;
-        if plan.parser_scope != RelationalParserScope::AcrossSessions {
-            return Err(RelationalTransformError::InvalidPlan(
-                "resumable relational search requires across-session parser scope",
-            ));
-        }
+        super::partition::validate_resumable_plan(plan, job)?;
         if options.max_retained_output_bytes > plan.limits.max_total_bytes {
             return Err(RelationalTransformError::InvalidPlan(
                 "retained evaluator outputs exceed the aggregate byte limit",
@@ -109,39 +99,6 @@ impl<'input, 'bytes> RelationalSearchSession<'input, 'bytes> {
     #[must_use]
     pub fn history(&self) -> Option<&RelationalReplayHistory> {
         self.history.as_deref()
-    }
-
-    /// Validate a saved producer's operation and parser parameters against the search plan
-    ///
-    /// This checks allowed parameters, not historical enumeration or locator provenance. The
-    /// plan-vector scan is charged before validation, including when the rule is rejected
-    ///
-    /// # Errors
-    /// Returns an error for incompatible parameters, insufficient verification work, or cancellation
-    pub fn validate_producer_parameters(
-        &self,
-        rule: &RelationalTransformRule,
-        work: &mut RelationalRestoreBudget,
-    ) -> Result<(), RelationalCursorError<Infallible>> {
-        super::checkpoint::check_job(self.job)?;
-        let scan_bytes = [
-            size_of_val(self.plan.parser_formats.as_slice()),
-            size_of_val(self.plan.counter_widths.as_slice()),
-            size_of_val(self.plan.counter_byte_orders.as_slice()),
-            size_of_val(self.plan.seed_orders.as_slice()),
-            size_of_val(self.plan.initial_counters.as_slice()),
-            size_of_val(self.plan.counter_resets.as_slice()),
-        ]
-        .into_iter()
-        .try_fold(size_of::<RelationalTransformRule>(), usize::checked_add)
-        .ok_or(RelationalCursorError::RestoreWorkLimit)?;
-        // Charge the complete scan before looking at the untrusted rule
-        if !work.try_charge_verification(scan_bytes) {
-            return Err(RelationalCursorError::RestoreWorkLimit);
-        }
-        let result = super::validation::validate_rule_parameters(rule, self.plan);
-        super::checkpoint::check_job(self.job)?;
-        result.map_err(|_| RelationalCursorError::InvalidCheckpoint)
     }
 
     /// Continue for a bounded number of candidate and locator traversal actions

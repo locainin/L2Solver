@@ -34,6 +34,8 @@ mod compact;
 mod corruption;
 #[path = "cursor/parameters.rs"]
 mod parameters;
+#[path = "cursor/partition.rs"]
+mod partition;
 #[path = "cursor/resources.rs"]
 mod resources;
 #[path = "cursor/session.rs"]
