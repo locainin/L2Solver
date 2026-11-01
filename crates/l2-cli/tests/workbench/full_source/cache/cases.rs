@@ -8,7 +8,7 @@ use l2_workbench::{
     evidence::{Case, CaseSnapshotLimits},
     job::{
         Counter, Job, MemoryBudget, MemoryClass,
-        cache::{Cache, SourceIdentity, StageKey, StageStatus},
+        cache::{Cache, CacheReadPolicy, SourceIdentity, StageKey, StageStatus},
     },
     store::{IngestReceipt, Store},
 };
@@ -109,9 +109,40 @@ fn warm_native_case_restores_exact_evidence_with_live_shared_charge() -> TestRes
         ..AcquisitionOptions::default()
     };
     let mut indexed = acquire_indexed_source(&capture, directory.path(), &acquisition)?;
+    let source = SourceIdentity::from_sha256(
+        indexed
+            .receipt
+            .source_id
+            .strip_prefix("sha256:")
+            .ok_or("missing source digest")?,
+    )?;
+    let index_key = StageKey::new(
+        "capture_index",
+        5,
+        "pcap-index-v1",
+        &json!({}),
+        &source,
+        &[],
+    )?;
+    assert!(
+        cache
+            .lookup(&index_key, CacheReadPolicy::CompleteOnly)?
+            .is_some()
+    );
+    let flow_id = indexed
+        .store
+        .packet(&indexed.receipt.source_id, 1)?
+        .flow
+        .ok_or("missing flow")?;
+    let native_key = native_key(&indexed.receipt, flow_id, 2, "l2-native-case-v2")?;
     let expected = analyze_flow(&indexed.store, &indexed.receipt, None, None)?;
     let written = analyze_flow(&indexed.store, &indexed.receipt, Some(&cache), None)?;
     assert_eq!(written, expected);
+    assert!(
+        cache
+            .lookup(&native_key, CacheReadPolicy::CompleteOnly)?
+            .is_some()
+    );
     drop(written);
 
     let budget = MemoryBudget::new(32 * 1024 * 1024);

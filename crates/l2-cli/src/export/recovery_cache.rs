@@ -32,7 +32,7 @@ use std::{
 // Work accounting changes belong here when they alter which searches can finish
 // Terminal-result policy changes must not replay earlier resumable entries
 // Capture indexing and native reconstruction keep their separate upstream versions
-pub(super) const RECOVERY_STAGE_VERSION: u32 = 30;
+pub(super) const RECOVERY_STAGE_VERSION: u32 = 31;
 const RECOVERY_STAGE: &str = "default_case_recovery";
 const RECOVERY_ALGORITHM: &str = "l2-default-case-recovery";
 const CASE_FILE: &str = "case.json";

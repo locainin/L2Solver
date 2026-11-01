@@ -61,6 +61,54 @@ fn older_evidence_compression_policy_does_not_reuse_the_published_result()
 }
 
 #[test]
+fn older_recovery_algorithm_does_not_reuse_a_current_evidence_result() -> Result<(), Box<dyn Error>>
+{
+    let temporary = tempfile::tempdir()?;
+    let root = temporary.path();
+    let capture = root.join("capture.pcap");
+    let destination = root.join("result");
+    fs::write(&capture, capture_with_http_body(BODY)?)?;
+    let first = extraction_command(root, &capture, &destination).output()?;
+    assert!(
+        matches!(first.status.code(), Some(0 | 3)),
+        "extraction failed: {}",
+        String::from_utf8_lossy(&first.stderr)
+    );
+
+    let manifest_path = destination.join("manifest.json");
+    let mut manifest: serde_json::Value = serde_json::from_slice(&fs::read(&manifest_path)?)?;
+    let settings = manifest
+        .pointer("/l2solver_result/identity/settings")
+        .cloned()
+        .ok_or("result settings are missing")?;
+    assert_eq!(
+        settings.get("evidence_encoding_version"),
+        Some(&serde_json::json!(6))
+    );
+    assert_eq!(
+        manifest.pointer("/evidence/coverage/encoding_version"),
+        Some(&serde_json::json!(6))
+    );
+    // Only the recovery algorithm version changes in the published identity
+    *manifest
+        .pointer_mut("/l2solver_result/identity/algorithm_version")
+        .ok_or("recovery algorithm version is missing")? = serde_json::json!(30);
+    assert_eq!(
+        manifest.pointer("/l2solver_result/identity/settings"),
+        Some(&settings)
+    );
+    let stale_manifest = serde_json::to_vec(&manifest)?;
+    fs::write(&manifest_path, &stale_manifest)?;
+
+    let stale = extraction_command(root, &capture, &destination).output()?;
+    assert!(!stale.status.success());
+    assert!(String::from_utf8_lossy(&stale.stderr).contains("policy or algorithm version differs"));
+    assert!(!String::from_utf8_lossy(&stale.stdout).contains("Reused"));
+    assert_eq!(fs::read(manifest_path)?, stale_manifest);
+    Ok(())
+}
+
+#[test]
 fn older_evidence_encoding_remains_owned_and_refreshes_to_current_version()
 -> Result<(), Box<dyn Error>> {
     let temporary = tempfile::tempdir()?;

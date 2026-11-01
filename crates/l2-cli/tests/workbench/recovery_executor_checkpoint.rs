@@ -11,11 +11,11 @@ use std::error::Error;
 mod durable;
 #[path = "recovery_executor_checkpoint/memory.rs"]
 mod memory;
-#[path = "recovery_executor_checkpoint/validation.rs"]
-mod validation;
 #[cfg(target_os = "linux")]
 #[path = "recovery_executor_checkpoint/relational_interrupt.rs"]
 mod relational_interrupt;
+#[path = "recovery_executor_checkpoint/validation.rs"]
+mod validation;
 
 #[test]
 fn checkpoint_rejects_an_unused_secret_recipe_before_writing_any_bytes()
