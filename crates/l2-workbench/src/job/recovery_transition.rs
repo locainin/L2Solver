@@ -557,6 +557,20 @@ impl RecoveryTransitionSummary {
         if checkpoint::encoded_fits(self, maximum) {
             return;
         }
+        self.omit_checkpoint_details();
+    }
+
+    pub(super) fn project_result(&mut self, retain_cohorts: bool) {
+        if retain_cohorts {
+            // Keep stage counts while omitting candidate identities from the receipt
+            self.funnel.compact_checkpoint();
+        } else {
+            // Preserve transition records while reporting the receipt-only omission
+            self.funnel.omit_cohorts(FunnelOmissionReason::ReceiptSize);
+        }
+    }
+
+    fn omit_checkpoint_details(&mut self) {
         let previous_records = self.records.len();
         // Keep the bounded publication examples needed to describe missing correlation
         self.records
@@ -565,7 +579,8 @@ impl RecoveryTransitionSummary {
         self.checkpoint_omitted_transition_records = self
             .checkpoint_omitted_transition_records
             .saturating_add(u64::try_from(omitted_records).unwrap_or(u64::MAX));
-        self.funnel.omit_checkpoint_cohorts();
+        self.funnel
+            .omit_cohorts(FunnelOmissionReason::CheckpointSize);
     }
 
     pub(super) fn freeze_funnel(&mut self, memory: Option<super::MemoryLease>) {

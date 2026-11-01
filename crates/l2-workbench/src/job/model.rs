@@ -949,12 +949,33 @@ impl Job {
     /// # Errors
     /// Returns an error when job state or the live memory observer is unavailable
     pub fn snapshot(&self) -> Result<JobSnapshot, JobError> {
+        self.snapshot_with_result_projection(None)
+    }
+
+    /// Returns live progress with bounded recovery details for a result receipt
+    ///
+    /// Cohort stage counts are retained when `retain_cohorts` is true. Otherwise,
+    /// omitted cohort and transition details are reported in the snapshot
+    ///
+    /// # Errors
+    /// Returns an error when job state or the live memory observer is unavailable
+    pub fn result_snapshot(&self, retain_cohorts: bool) -> Result<JobSnapshot, JobError> {
+        self.snapshot_with_result_projection(Some(retain_cohorts))
+    }
+
+    fn snapshot_with_result_projection(
+        &self,
+        retain_cohorts: Option<bool>,
+    ) -> Result<JobSnapshot, JobError> {
         let state = self.lock_state()?;
         let admission =
             reserve_funnel_snapshot(self.inner.memory.as_ref(), state.funnel_cohort_count());
         let memory_limit = admission.cohort_limit;
         let mut snapshot = timed_snapshot(&state, self.is_cancelled(), memory_limit);
         state.work.apply_to(&mut snapshot, memory_limit)?;
+        if let Some(retain_cohorts) = retain_cohorts {
+            snapshot.recovery_transitions.project_result(retain_cohorts);
+        }
         snapshot
             .recovery_transitions
             .freeze_funnel(admission.memory);

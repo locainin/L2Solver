@@ -1,5 +1,7 @@
-use super::{ResultDirectory, ResultIdentity, ResultKind, manifest, stamp::OutputFileStamp};
-use l2_workbench::job::{Job, Phase, PhaseOutcome, cache::SourceIdentity};
+use super::{
+    ResultDirectory, ResultIdentity, ResultKind, bounded, manifest, stamp::OutputFileStamp,
+};
+use l2_workbench::job::{Job, JobSnapshot, Phase, PhaseOutcome, cache::SourceIdentity};
 use l2_workbench::job::{
     RecoveryArtifactSample, RecoveryPublicationSample, RecoveryPublicationSourceBasis,
     RecoveryTransitionOutcome,
@@ -101,7 +103,7 @@ fn write_result_stage<T>(
     job.check_cancelled()?;
     job.start(Phase::Publication, None)?;
     capture.started.set(true);
-    let snapshot = job.snapshot()?;
+    let snapshot = result_snapshot(job)?;
 
     let parsed = manifest::parse_staged_manifest(staging, kind)?;
     validate_identity(identity, kind, parsed.source_identity_sha256.as_deref())?;
@@ -169,6 +171,22 @@ fn write_result_stage<T>(
     manifest::append_receipt(&staging.join("manifest.json"), &receipt)?;
     manifest::validate_staged_receipt(staging, kind)?;
     Ok(result)
+}
+
+fn result_snapshot(job: &Job) -> Result<JobSnapshot, Box<dyn Error>> {
+    let snapshot = job.snapshot()?;
+    if bounded::job_snapshot_fits(&snapshot, job.memory_budget())? {
+        return Ok(snapshot);
+    }
+    drop(snapshot);
+    for retain_cohorts in [true, false] {
+        // Each projection records details omitted solely from this receipt
+        let snapshot = job.result_snapshot(retain_cohorts)?;
+        if bounded::job_snapshot_fits(&snapshot, job.memory_budget())? {
+            return Ok(snapshot);
+        }
+    }
+    Err(io::Error::other("job snapshot exceeds the result receipt limits").into())
 }
 
 fn validate_identity(

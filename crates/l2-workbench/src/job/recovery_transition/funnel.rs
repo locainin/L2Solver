@@ -133,7 +133,13 @@ pub(super) struct FunnelOmissionReasons {
     unattributed_candidate: u64,
     association_limit: u64,
     checkpoint_size: u64,
+    #[serde(skip_serializing_if = "is_default")]
+    receipt_size: u64,
     unclassified: u64,
+}
+
+fn is_default<T: Default + PartialEq>(value: &T) -> bool {
+    value == &T::default()
 }
 
 #[derive(Clone, Copy)]
@@ -143,6 +149,7 @@ pub(in crate::job) enum FunnelOmissionReason {
     UnattributedCandidate,
     AssociationLimit,
     CheckpointSize,
+    ReceiptSize,
 }
 
 impl FunnelOmissionReasons {
@@ -154,6 +161,7 @@ impl FunnelOmissionReasons {
             memory_admission: 0,
             association_limit: 0,
             checkpoint_size: 0,
+            receipt_size: 0,
         }
     }
     pub(super) const fn total(self) -> u64 {
@@ -162,6 +170,7 @@ impl FunnelOmissionReasons {
             .saturating_add(self.unattributed_candidate)
             .saturating_add(self.association_limit)
             .saturating_add(self.checkpoint_size)
+            .saturating_add(self.receipt_size)
             .saturating_add(self.unclassified)
     }
 
@@ -172,6 +181,7 @@ impl FunnelOmissionReasons {
             FunnelOmissionReason::UnattributedCandidate => &mut self.unattributed_candidate,
             FunnelOmissionReason::AssociationLimit => &mut self.association_limit,
             FunnelOmissionReason::CheckpointSize => &mut self.checkpoint_size,
+            FunnelOmissionReason::ReceiptSize => &mut self.receipt_size,
         };
         *count = count.saturating_add(amount);
     }
@@ -186,6 +196,7 @@ impl FunnelOmissionReasons {
             .association_limit
             .saturating_add(other.association_limit);
         self.checkpoint_size = self.checkpoint_size.saturating_add(other.checkpoint_size);
+        self.receipt_size = self.receipt_size.saturating_add(other.receipt_size);
         self.unclassified = self.unclassified.saturating_add(other.unclassified);
     }
 }
@@ -868,10 +879,10 @@ impl Funnel {
         }
     }
 
-    pub(super) fn omit_checkpoint_cohorts(&mut self) {
+    pub(super) fn omit_cohorts(&mut self, reason: FunnelOmissionReason) {
         let count = u64::try_from(self.cohorts.len()).unwrap_or(u64::MAX);
         self.cohorts = Vec::new();
-        self.omit(FunnelOmissionReason::CheckpointSize, count);
+        self.omit(reason, count);
     }
 
     pub(super) fn cohorts(&self) -> &[Cohort] {

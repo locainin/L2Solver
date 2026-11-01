@@ -1,7 +1,8 @@
-use l2_workbench::job::JobSnapshot;
+use crate::output::BoundedWriter;
 use l2_workbench::job::cache::SourceIdentity;
+use l2_workbench::job::{JobSnapshot, MemoryBudget, MemoryClass};
 use serde::{Deserialize, Deserializer, de};
-use std::{fmt, marker::PhantomData};
+use std::{error::Error, fmt, io, marker::PhantomData};
 
 use serde::de::{DeserializeSeed, IgnoredAny, MapAccess, SeqAccess, Visitor};
 
@@ -20,6 +21,8 @@ const MAX_JOB_SNAPSHOT_ITEMS: usize = 128;
 const MAX_JOB_SNAPSHOT_DEPTH: usize = 8;
 const MAX_JOB_SNAPSHOT_STRING_BYTES: usize = 4 * 1024;
 const MAX_JOB_SNAPSHOT_TOTAL_STRING_BYTES: usize = 128 * 1024;
+const MAX_JOB_SNAPSHOT_ENCODED_BYTES: usize = 1024 * 1024;
+const JSON_VALUE_MEMORY_PER_NODE: usize = 256;
 const MAX_FILE_NAME_BYTES: usize = 255;
 const MAX_SOURCE_ID_BYTES: usize = 7 + 64;
 
@@ -60,6 +63,7 @@ struct ValueBudget {
     limits: ValueLimits,
     nodes: usize,
     string_bytes: usize,
+    limit_reached: bool,
 }
 
 impl ValueBudget {
@@ -68,11 +72,13 @@ impl ValueBudget {
             limits,
             nodes: 0,
             string_bytes: 0,
+            limit_reached: false,
         }
     }
 
     fn record_node<E: de::Error>(&mut self, depth: usize) -> Result<(), E> {
         if depth > self.limits.depth {
+            self.limit_reached = true;
             return Err(E::custom("metadata nesting depth limit exceeded"));
         }
         self.nodes = self
@@ -80,6 +86,7 @@ impl ValueBudget {
             .checked_add(1)
             .ok_or_else(|| E::custom("metadata node count overflow"))?;
         if self.nodes > self.limits.nodes {
+            self.limit_reached = true;
             return Err(E::custom("metadata node limit exceeded"));
         }
         Ok(())
@@ -88,6 +95,7 @@ impl ValueBudget {
     fn record_string<E: de::Error>(&mut self, depth: usize, length: usize) -> Result<(), E> {
         self.record_node(depth)?;
         if length > self.limits.string_bytes {
+            self.limit_reached = true;
             return Err(E::custom("metadata string size limit exceeded"));
         }
         self.string_bytes = self
@@ -95,6 +103,7 @@ impl ValueBudget {
             .checked_add(length)
             .ok_or_else(|| E::custom("metadata string size overflow"))?;
         if self.string_bytes > self.limits.total_string_bytes {
+            self.limit_reached = true;
             return Err(E::custom("metadata string budget exceeded"));
         }
         Ok(())
@@ -220,6 +229,7 @@ impl<'de> Visitor<'de> for BoundedValueVisitor<'_> {
             values.push(value);
         }
         if sequence.next_element::<IgnoredAny>()?.is_some() {
+            self.budget.limit_reached = true;
             return Err(de::Error::custom("metadata sequence item limit exceeded"));
         }
         Ok(serde_json::Value::Array(values))
@@ -249,6 +259,7 @@ impl<'de> Visitor<'de> for BoundedValueVisitor<'_> {
             count += 1;
         }
         if map.next_key::<IgnoredAny>()?.is_some() {
+            self.budget.limit_reached = true;
             return Err(de::Error::custom("metadata map entry limit exceeded"));
         }
         Ok(serde_json::Value::Object(values))
@@ -437,6 +448,59 @@ where
         ));
     }
     Ok(snapshot)
+}
+
+pub(super) fn job_snapshot_fits(
+    snapshot: &JobSnapshot,
+    memory: Option<&MemoryBudget>,
+) -> Result<bool, Box<dyn Error>> {
+    let mut counter =
+        BoundedWriter::named(io::sink(), MAX_JOB_SNAPSHOT_ENCODED_BYTES, "job snapshot");
+    if let Err(error) = serde_json::to_writer(&mut counter, snapshot) {
+        // The sink cannot fail, so an I/O error means the encoding limit was reached
+        return if error.is_io() {
+            Ok(false)
+        } else {
+            Err(error.into())
+        };
+    }
+    let encoded_bytes = counter.written();
+    // JSON needs at least two encoded bytes per node, including its separators
+    let nodes = (encoded_bytes / 2 + 1).min(MAX_JOB_SNAPSHOT_NODES);
+    // Cover map and array slots, string allocations, and the encoded buffer
+    let charge = encoded_bytes
+        + nodes * JSON_VALUE_MEMORY_PER_NODE
+        + encoded_bytes.min(MAX_JOB_SNAPSHOT_TOTAL_STRING_BYTES);
+    let charge_bytes = u64::try_from(charge)?;
+    let mut lease = memory
+        .map(|budget| budget.try_reserve(MemoryClass::Publication, charge_bytes))
+        .transpose()?;
+    let mut bytes = Vec::new();
+    bytes
+        .try_reserve_exact(encoded_bytes)
+        .map_err(io::Error::other)?;
+    if let Some(lease) = &mut lease {
+        lease.try_resize(u64::try_from(charge + bytes.capacity() - encoded_bytes)?)?;
+    }
+    {
+        let mut writer = BoundedWriter::named(&mut bytes, encoded_bytes, "job snapshot");
+        serde_json::to_writer(&mut writer, snapshot)?;
+        if writer.written() != encoded_bytes {
+            return Err(io::Error::other("job snapshot encoding changed during validation").into());
+        }
+    }
+    let mut deserializer = serde_json::Deserializer::from_slice(&bytes);
+    let mut budget = ValueBudget::new(JOB_SNAPSHOT_LIMITS);
+    match (BoundedValueSeed {
+        budget: &mut budget,
+        depth: 0,
+    })
+    .deserialize(&mut deserializer)
+    {
+        Ok(_) => Ok(true),
+        Err(_) if budget.limit_reached => Ok(false),
+        Err(error) => Err(error.into()),
+    }
 }
 
 fn deserialize_bounded_value<'de, D>(
