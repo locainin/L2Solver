@@ -1,5 +1,8 @@
 //! Learn bounded message selectors before reusing strict record discovery
 
+use super::super::super::message_family::{
+    MAX_SELECTORS, MAX_VALUES, MAX_WORK_UNITS as FAMILY_WORK_LIMIT, limits as family_limits,
+};
 use super::super::input::learning_sample;
 use super::{
     Executor, RecordAnalysis, RecordDiscoveryContext, RecordReportOutput, STATUS_HYPOTHESES_FOUND,
@@ -10,19 +13,16 @@ use l2_workbench::{
     evidence::Case,
     job::{MemoryClass, MemoryError},
     protocol::{
-        ByteRange, DEFAULT_MAX_FAMILY_SAMPLES, MAX_MESSAGE_BYTES, MAX_PROTOCOL_BYTES,
-        MessageContext, MessageFamilyLimits, MessageFamilySelector, MessageRole, MessageSample,
-        RecordSchemaProposalLimits, discover_message_families,
+        ByteRange, DEFAULT_MAX_FAMILY_RANGES, DEFAULT_MAX_FAMILY_SAMPLES, MAX_PROTOCOL_BYTES,
+        MessageContext, MessageFamilySelector, MessageRole, MessageSample,
+        RecordSchemaProposalLimits, discover_message_families, observation::ObservationCoverage,
     },
     recovery::RecoveryError,
 };
 use std::sync::Arc;
 
-const MAX_SELECTORS: usize = 8;
-const MAX_VALUES: usize = 4;
 const MAX_GROUPS: usize = 8;
 const MAX_APPLICATION_FRAMES: usize = 4096;
-const FAMILY_WORK_LIMIT: usize = 1_000_000;
 const MAX_FAMILY_MEMORY_BYTES: usize = 128 * 1024 * 1024;
 const MAX_GROUP_EXAMPLES: usize = 8;
 
@@ -42,6 +42,7 @@ pub(super) struct FamilySelection {
 #[derive(Default, serde::Serialize)]
 pub(super) struct FamilySearchSummary {
     limits: RecordSchemaProposalLimits,
+    discovery: FamilyDiscoveryEvidence,
     selectors_retained: usize,
     groups_proposed: usize,
     groups_examined: usize,
@@ -52,6 +53,22 @@ pub(super) struct FamilySearchSummary {
     schema_survivor_group_pairs: usize,
     complete_within_limits: bool,
     groups: Vec<FamilyGroupSummary>,
+}
+
+#[derive(Default, serde::Serialize)]
+struct FamilyDiscoveryEvidence {
+    range_pair_limit: usize,
+    training_count: usize,
+    heldout_count: usize,
+    training_examples: Vec<FamilyFrameExample>,
+    heldout_examples: Vec<FamilyFrameExample>,
+    omitted_training_examples: usize,
+    omitted_heldout_examples: usize,
+    omitted_learning_inputs: usize,
+    omitted_candidate_ranges: usize,
+    omitted_report_budget_ranges: usize,
+    omitted_selectors: usize,
+    observation_coverage: Option<ObservationCoverage>,
 }
 
 #[derive(serde::Serialize)]
@@ -87,6 +104,7 @@ struct FamilyGroups {
     groups: Vec<FamilyGroup>,
     incomplete: bool,
     selectors_retained: usize,
+    discovery: FamilyDiscoveryEvidence,
 }
 
 impl Executor<'_> {
@@ -132,6 +150,7 @@ impl Executor<'_> {
         let proposal = propose_groups(self.case, context, &uniform.partition, limits)?;
         let mut summary = FamilySearchSummary {
             limits,
+            discovery: proposal.discovery,
             selectors_retained: proposal.selectors_retained,
             groups_proposed: proposal.groups.len(),
             complete_within_limits: !proposal.incomplete,
@@ -250,8 +269,8 @@ fn group_summary(group: &FamilyGroup) -> Result<FamilyGroupSummary, RecoveryExec
         selector_value: group.selection.selector_value.clone(),
         training_count,
         heldout_count,
-        training_examples: frame_examples(training)?,
-        heldout_examples: frame_examples(heldout)?,
+        training_examples: frame_examples(training.iter())?,
+        heldout_examples: frame_examples(heldout.iter())?,
         omitted_training_examples: training_count.saturating_sub(MAX_GROUP_EXAMPLES),
         omitted_heldout_examples: heldout_count.saturating_sub(MAX_GROUP_EXAMPLES),
         application_count: group.context.application_inputs.len(),
@@ -262,18 +281,21 @@ fn group_summary(group: &FamilyGroup) -> Result<FamilyGroupSummary, RecoveryExec
     })
 }
 
-fn frame_examples(
-    inputs: &[super::RecordFrameInput],
+fn frame_examples<'a>(
+    inputs: impl Iterator<Item = &'a super::RecordFrameInput>,
 ) -> Result<Vec<FamilyFrameExample>, RecoveryExecutionError> {
-    let count = inputs.len().min(MAX_GROUP_EXAMPLES);
     let mut examples = Vec::new();
     examples
-        .try_reserve_exact(count)
+        .try_reserve_exact(MAX_GROUP_EXAMPLES)
         .map_err(|source| operational("family frame example allocation failed", source))?;
-    examples.extend(inputs.iter().take(count).map(|input| FamilyFrameExample {
-        node_id: input.node_id,
-        blob_id: input.blob_id.clone(),
-    }));
+    examples.extend(
+        inputs
+            .take(MAX_GROUP_EXAMPLES)
+            .map(|input| FamilyFrameExample {
+                node_id: input.node_id,
+                blob_id: input.blob_id.clone(),
+            }),
+    );
     Ok(examples)
 }
 
@@ -398,6 +420,28 @@ fn propose_groups(
             }),
         });
     }
+    let heldout_count = sample.len() - training.len();
+    let mut discovery = FamilyDiscoveryEvidence {
+        range_pair_limit: DEFAULT_MAX_FAMILY_RANGES,
+        training_count: training.len(),
+        heldout_count,
+        training_examples: frame_examples(
+            sample
+                .iter()
+                .copied()
+                .filter(|input| training.contains(&input.node_id)),
+        )?,
+        heldout_examples: frame_examples(
+            sample
+                .iter()
+                .copied()
+                .filter(|input| !training.contains(&input.node_id)),
+        )?,
+        omitted_training_examples: training.len().saturating_sub(MAX_GROUP_EXAMPLES),
+        omitted_heldout_examples: heldout_count.saturating_sub(MAX_GROUP_EXAMPLES),
+        omitted_learning_inputs: context.inputs.len() - sample.len(),
+        ..FamilyDiscoveryEvidence::default()
+    };
     let mut training_sessions = sample
         .iter()
         .filter(|input| {
@@ -413,32 +457,18 @@ fn propose_groups(
             groups: Vec::new(),
             incomplete: true,
             selectors_retained: 0,
+            discovery,
         });
     }
-    let family_limits = MessageFamilyLimits {
-        max_message_bytes: limits
-            .discovery
-            .record_limits
-            .max_input_bytes
-            .min(MAX_MESSAGE_BYTES),
-        max_total_bytes: limits
-            .discovery
-            .record_limits
-            .max_input_bytes
-            .min(MAX_PROTOCOL_BYTES),
-        max_selector_offset: limits.max_field_offset.min(15),
-        max_selector_width: 4,
-        max_candidate_ranges: 64,
-        max_selectors: MAX_SELECTORS,
-        max_families_per_selector: MAX_VALUES,
-        max_work_units: FAMILY_WORK_LIMIT,
-        max_report_bytes: 512 * 1024,
-        ..MessageFamilyLimits::default()
-    };
+    let family_limits = family_limits(limits, FAMILY_WORK_LIMIT);
     let report = discover_message_families(&messages, &training, family_limits)
         .map_err(|source| operational("message-family discovery failed", source))?;
+    discovery.omitted_candidate_ranges = report.omitted_candidate_ranges;
+    discovery.omitted_report_budget_ranges = report.omitted_report_budget_ranges;
+    discovery.omitted_selectors = report.omitted_selectors;
+    discovery.observation_coverage = Some(report.observation_coverage);
     let mut groups = Vec::new();
-    let mut incomplete = !report.complete;
+    let mut incomplete = !report.complete || discovery.omitted_learning_inputs > 0;
     for selector in &report.selectors {
         // One supported value can still separate data from varied control messages
         let has_other_training_values = selector
@@ -464,7 +494,7 @@ fn propose_groups(
                 family,
                 unassigned,
                 sample.len(),
-                report.complete,
+                report.complete && discovery.omitted_learning_inputs == 0,
             )?
             else {
                 continue;
@@ -495,6 +525,7 @@ fn propose_groups(
         groups,
         incomplete,
         selectors_retained: report.selectors.len(),
+        discovery,
     })
 }
 

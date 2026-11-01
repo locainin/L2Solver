@@ -12,6 +12,7 @@ use std::io::{Read, Seek, SeekFrom};
 const PAYLOAD_BYTES: usize = 16;
 const FRAME_BYTES: usize = 26;
 const ALTERNATE_FRAME_BYTES: usize = 22;
+const TWO_BYTE_FRAME_BYTES: usize = 27;
 
 struct MixedRun {
     case: Case,
@@ -150,6 +151,7 @@ enum HeldoutChange {
     VariableControls,
     AlternateLayout,
     StructuredControls,
+    TwoByteSelector,
 }
 
 fn aligned_archive(contents: &[u8]) -> TestResult<Vec<u8>> {
@@ -206,6 +208,29 @@ fn alternate_messages(archive: &[u8], session: u8) -> TestResult<Vec<Vec<u8>>> {
     Ok(messages)
 }
 
+fn two_byte_messages(archive: &[u8], session: u8) -> TestResult<Vec<Vec<u8>>> {
+    let mut messages = Vec::new();
+    for (sequence, payload) in archive.chunks_exact(PAYLOAD_BYTES).enumerate() {
+        let mut data = vec![0x10, 0x20];
+        data.extend(record(
+            &[session + 4, session + 13, session + 29],
+            u16::try_from(sequence)?,
+            payload,
+        ));
+        assert_eq!(data.len(), TWO_BYTE_FRAME_BYTES);
+        messages.push(data);
+        for selector in [[0x10, 0x30], [0x11, 0x20], [0x11, 0x30]] {
+            let mut control = selector.to_vec();
+            for offset in 0..TWO_BYTE_FRAME_BYTES - selector.len() {
+                let byte = usize::from(session) * 37 + sequence * 19 + offset * 23 + 11;
+                control.push(u8::try_from(byte % 251)?);
+            }
+            messages.push(control);
+        }
+    }
+    Ok(messages)
+}
+
 fn mixed_fixture(change: HeldoutChange) -> TestResult<MixedFixture> {
     let mut archives = [
         b"first observed message family".as_slice(),
@@ -231,6 +256,8 @@ fn mixed_fixture(change: HeldoutChange) -> TestResult<MixedFixture> {
             let session = u8::try_from(index)?;
             if matches!(change, HeldoutChange::AlternateLayout) {
                 alternate_messages(archive, session)
+            } else if matches!(change, HeldoutChange::TwoByteSelector) {
+                two_byte_messages(archive, session)
             } else {
                 mixed_messages(archive, session)
             }
@@ -266,7 +293,8 @@ fn mixed_fixture(change: HeldoutChange) -> TestResult<MixedFixture> {
         | HeldoutChange::InvalidArtifacts
         | HeldoutChange::VariableControls
         | HeldoutChange::AlternateLayout
-        | HeldoutChange::StructuredControls => {}
+        | HeldoutChange::StructuredControls
+        | HeldoutChange::TwoByteSelector => {}
         HeldoutChange::UnknownControl => {
             let control = heldout
                 .last_mut()
@@ -290,11 +318,18 @@ fn mixed_fixture(change: HeldoutChange) -> TestResult<MixedFixture> {
     let sessions = add_unframed_sessions(&mut case, &source, vec![("mixed", messages)])?;
     let mut policy = normal_policy(&case)?;
     // Four samples per session include both layouts in both training sessions
-    policy.record_schema_proposal_limits.discovery.max_messages = 16;
+    policy.record_schema_proposal_limits.discovery.max_messages =
+        if matches!(change, HeldoutChange::TwoByteSelector) {
+            32
+        } else {
+            16
+        };
     let plan = RecoveryPlan {
         framings: vec![FramingKind::FixedSize {
             bytes: if matches!(change, HeldoutChange::AlternateLayout) {
                 ALTERNATE_FRAME_BYTES
+            } else if matches!(change, HeldoutChange::TwoByteSelector) {
+                TWO_BYTE_FRAME_BYTES
             } else {
                 FRAME_BYTES
             },
@@ -528,6 +563,12 @@ fn mixed_control_and_data_families_recover_each_independent_full_session() -> Te
         let surviving = report.pointer("/family_search/groups_with_schemas").and_then(Value::as_u64);
         matches!((examined, surviving), (Some(examined), Some(surviving)) if examined >= surviving && surviving > 0)
     }), "the bounded family search must report actual examined groups and survivors");
+    assert!(
+        reports.iter().any(|(_, report)| {
+            report.pointer("/family_search/discovery/omitted_candidate_ranges") == Some(&json!(0))
+        }),
+        "the selector range allowance must cover every configured range for this sample"
+    );
     let expected_first_training = format!(
         "sha256:{}",
         l2_workbench::sha256(&run.sessions[0].messages[0])
@@ -687,7 +728,7 @@ fn alternate_field_widths_and_selector_offset_recover_each_session() -> TestResu
         let summaries = run.case.nodes().iter().filter(|node| node.kind == REPORT_KIND).take(8)
             .map(|node| {
                 let report = decode_report(&run.case, node.id)?;
-                Ok(json!({"result":report.get("result"),"reason":report.get("no_candidate_reason"),"family":report.get("family_selection"),"search":report.get("family_search")}))
+                Ok(json!({"result":report.get("result"),"reason":report.get("no_candidate_reason"),"omission":report.get("strategy_omission"),"partition":report.get("partition"),"family":report.get("family_selection"),"search":report.get("family_search")}))
             }).collect::<TestResult<Vec<_>>>()?;
         let expected_frames = run
             .sessions
@@ -705,9 +746,13 @@ fn alternate_field_widths_and_selector_offset_recover_each_session() -> TestResu
                 )
             })
             .collect::<Vec<_>>();
+        let expected_limits = mixed_fixture(HeldoutChange::AlternateLayout)?
+            .policy
+            .record_schema_proposal_limits;
         return Err(format!(
-            "alternate layout was not recovered; validated={}, expected_learning={expected_frames:?}, reports={summaries:?}",
-            run.outcome.validated_artifact_count
+            "alternate layout was not recovered; validated={}, expected_learning={expected_frames:?}, direct_limits={}, reports={summaries:?}",
+            run.outcome.validated_artifact_count,
+            serde_json::to_string(&expected_limits)?,
         )
         .into());
     }
@@ -747,6 +792,33 @@ fn uniform_schema_survivors_do_not_suppress_mixed_family_search() -> TestResult<
             .get("family_selection")
             .is_some_and(|value| !value.is_null())
     }));
+    Ok(())
+}
+
+#[test]
+fn two_byte_selector_separates_overlapping_single_byte_values() -> TestResult<()> {
+    let run = execute_mixed_sessions(HeldoutChange::TwoByteSelector)?;
+    assert!(
+        run.archives.iter().all(|archive| run
+            .case
+            .blobs()
+            .iter()
+            .any(|blob| blob.bytes == *archive)),
+        "every two-byte-selector archive must match exactly"
+    );
+    assert!(
+        run.case
+            .nodes()
+            .iter()
+            .filter(|node| node.kind == REPORT_KIND)
+            .any(|node| {
+                decode_report(&run.case, node.id).is_ok_and(|report| {
+                    report.pointer("/family_selection/selector_range/start") == Some(&json!(0))
+                        && report.pointer("/family_selection/selector_range/end") == Some(&json!(2))
+                })
+            }),
+        "a two-byte selector must identify the data family"
+    );
     Ok(())
 }
 

@@ -1,4 +1,10 @@
-use super::super::super::super::RecoveryExecutionError;
+use super::super::super::super::{
+    RecoveryExecutionError,
+    message_family::{
+        MAX_SELECTORS as MAX_GATE_FAMILY_SELECTORS, MAX_VALUES as MAX_GATE_FAMILY_VALUES,
+        limits as family_limits,
+    },
+};
 use super::super::super::{DecodedFrameOutput, invalid_policy, operational};
 use super::super::SchemaAlternative;
 use super::super::screen::SchemaObserverOptions;
@@ -8,18 +14,13 @@ use super::{LearningMessages, SchemaOffsetScope, prepare_schema_limits};
 use l2_workbench::{
     job::Job,
     protocol::{
-        DEFAULT_MAX_FAMILY_RANGES, DEFAULT_MAX_FAMILY_REPORT_BYTES, DEFAULT_MAX_FAMILY_SAMPLES,
-        Direction, MAX_MESSAGE_BYTES, MessageFamilyLimits, MessageFamilyReport, MessageRole,
-        MessageSample, RecordInput, RecordSchemaProposalLimits, discover_message_families,
+        Direction, MessageFamilyReport, MessageRole, MessageSample, RecordInput,
+        RecordSchemaProposalLimits, discover_message_families,
     },
 };
 use serde_json::{Value, json};
 use std::collections::BTreeSet;
 use std::sync::Arc;
-
-const MAX_GATE_FAMILY_SELECTORS: usize = 8;
-const MAX_GATE_FAMILY_VALUES: usize = 4;
-const MAX_FAMILY_WIDTH: usize = 4;
 
 pub(super) struct FamilyAnalysis {
     pub(super) alternatives: Vec<SchemaAlternative>,
@@ -167,34 +168,6 @@ fn training_sample_ids(
         })
         .map(|sample| sample.sample)
         .collect()
-}
-
-fn family_limits(
-    base_limits: RecordSchemaProposalLimits,
-    work_limit: usize,
-) -> MessageFamilyLimits {
-    MessageFamilyLimits {
-        max_samples: DEFAULT_MAX_FAMILY_SAMPLES,
-        // The record-input allowance spans messages; this ceiling applies to one message
-        max_message_bytes: base_limits
-            .discovery
-            .record_limits
-            .max_input_bytes
-            .min(MAX_MESSAGE_BYTES),
-        max_total_bytes: base_limits
-            .discovery
-            .record_limits
-            .max_input_bytes
-            .min(l2_workbench::protocol::MAX_PROTOCOL_BYTES),
-        max_selector_offset: base_limits.max_field_offset.min(15),
-        max_selector_width: MAX_FAMILY_WIDTH,
-        min_training_sessions_per_family: 2,
-        max_candidate_ranges: DEFAULT_MAX_FAMILY_RANGES,
-        max_selectors: MAX_GATE_FAMILY_SELECTORS,
-        max_families_per_selector: MAX_GATE_FAMILY_VALUES,
-        max_work_units: work_limit.min(1_000_000),
-        max_report_bytes: DEFAULT_MAX_FAMILY_REPORT_BYTES / 2,
-    }
 }
 
 fn unavailable_family_analysis(error: &str, training_count: usize) -> FamilyAnalysis {
@@ -569,6 +542,7 @@ fn family_report_details(
         "training_samples":report.training_samples,
         "heldout_samples":report.heldout_samples,
         "candidate_ranges_omitted":report.omitted_candidate_ranges,
+        "report_budget_ranges_omitted":report.omitted_report_budget_ranges,
         "observation_complete":report.observation_coverage.complete,
         "family_analysis_complete":report.complete,
         "unassigned_samples":unassigned_samples,
@@ -611,6 +585,7 @@ fn context_details(context: Option<&l2_workbench::protocol::MessageContext>) -> 
 fn groups_has_unassigned(report: &l2_workbench::protocol::MessageFamilyReport) -> bool {
     (report.samples_seen > 0 && report.selectors.is_empty())
         || report.omitted_candidate_ranges > 0
+        || report.omitted_report_budget_ranges > 0
         || report.omitted_selectors > 0
         || report.observation_coverage.omitted_samples > 0
         || report

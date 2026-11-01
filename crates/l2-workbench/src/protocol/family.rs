@@ -2,8 +2,8 @@
 
 use super::observation::{
     ByteObservation, ObservationCohort, ObservationCoverage, ObservationError, ObservationInput,
-    ObservationLimits, ObservationPlan, ObservationProvenance, RegionObservation, SampleRange,
-    observe,
+    ObservationLimits, ObservationOrigin, ObservationPlan, ObservationProvenance,
+    RegionObservation, RegionValue, SampleRange, observe_regions,
 };
 use super::{
     ByteRange, MAX_MESSAGE_BYTES, MAX_PROTOCOL_BYTES, MAX_PROTOCOL_SAMPLES, MessageSample,
@@ -12,6 +12,8 @@ use std::collections::BTreeSet;
 use std::error::Error;
 use std::fmt::{Display, Formatter};
 use std::mem::size_of;
+
+const FAMILY_INPUT_IDENTITY: &str = "message-family-input";
 
 /// Maximum number of message samples admitted to one family pass
 pub const DEFAULT_MAX_FAMILY_SAMPLES: usize = 64;
@@ -152,7 +154,7 @@ pub struct MessageFamilySelector {
 pub struct MessageFamilyReport {
     /// Retained selector alternatives, ordered by byte range and cohort
     pub selectors: Vec<MessageFamilySelector>,
-    /// Raw byte observations and source provenance used by the selectors
+    /// Raw region observations and source provenance used by the selectors
     pub observations: super::observation::ObservationReport,
     /// Input and per-region observation coverage
     pub observation_coverage: ObservationCoverage,
@@ -164,6 +166,8 @@ pub struct MessageFamilyReport {
     pub heldout_samples: usize,
     /// Requested sample/range pairs skipped by the family range cap
     pub omitted_candidate_ranges: usize,
+    /// Sample/range pairs skipped to leave room for complete region facts
+    pub omitted_report_budget_ranges: usize,
     /// Supported selector alternatives omitted by report or selector limits
     pub omitted_selectors: usize,
     /// Logical bytes retained for selector metadata and observations
@@ -265,20 +269,24 @@ pub fn discover_message_families(
     let training_ids = training_id_set(samples, training_samples)?;
     let admitted = admit_samples(samples, &training_ids, limits.max_samples)?;
     let observation_inputs = observation_inputs(admitted.samples.as_slice())?;
-    let (region_ranges, omitted_candidate_ranges) =
-        candidate_ranges(admitted.samples.as_slice(), limits)?;
+    let range_plan = candidate_ranges(admitted.samples.as_slice(), limits)?;
+    let CandidateRangePlan {
+        ranges: region_ranges,
+        omissions,
+    } = range_plan;
     let observation_limits = observation_limits(limits, region_ranges.len());
     let observation_plan = ObservationPlan {
         region_ranges,
         limits: observation_limits,
     };
-    let observations = observe(&observation_inputs, &observation_plan)?;
+    // Family selection needs exact region facts, not unrelated length hypotheses
+    let observations = observe_regions(&observation_inputs, &observation_plan)?;
     finish_family_report(
         samples,
         &training_ids,
         &admitted,
         observations,
-        omitted_candidate_ranges,
+        omissions,
         limits,
     )
 }
@@ -333,7 +341,7 @@ fn finish_family_report(
     training_ids: &BTreeSet<u64>,
     admitted: &AdmittedSamples<'_>,
     observations: super::observation::ObservationReport,
-    omitted_candidate_ranges: usize,
+    omissions: RangeOmissions,
     limits: MessageFamilyLimits,
 ) -> Result<MessageFamilyReport, MessageFamilyError> {
     let admitted_training_count = admitted.training_count;
@@ -357,7 +365,9 @@ fn finish_family_report(
     let metadata_bytes = selectors.iter().try_fold(0_usize, |total, selector| {
         total.checked_add(selector_size(selector))
     });
-    let mut complete = observations.coverage.complete && omitted_candidate_ranges == 0;
+    let mut complete = observations.coverage.complete
+        && omissions.range_limit == 0
+        && omissions.report_budget == 0;
     let mut report_bytes_retained = observations.coverage.report_bytes_retained;
     let mut omitted_selectors = omitted_by_selector_limit;
     let mut retained_selectors = selectors;
@@ -393,7 +403,8 @@ fn finish_family_report(
         samples_seen: samples.len(),
         training_samples: admitted_training_count,
         heldout_samples: admitted_heldout_count,
-        omitted_candidate_ranges,
+        omitted_candidate_ranges: omissions.range_limit,
+        omitted_report_budget_ranges: omissions.report_budget,
         omitted_selectors,
         report_bytes_retained,
         complete: complete && admitted.omitted_training == 0 && admitted.omitted_heldout == 0,
@@ -463,7 +474,7 @@ fn observation_inputs<'a>(
         inputs.push(ObservationInput {
             message: sample.clone(),
             provenance: ObservationProvenance::Derived {
-                identity: "message-family-input",
+                identity: FAMILY_INPUT_IDENTITY,
                 range: ByteRange {
                     start: 0,
                     end: sample.bytes.len(),
@@ -474,10 +485,21 @@ fn observation_inputs<'a>(
     Ok(inputs)
 }
 
+#[derive(Clone, Copy)]
+struct RangeOmissions {
+    range_limit: usize,
+    report_budget: usize,
+}
+
+struct CandidateRangePlan {
+    ranges: Vec<SampleRange>,
+    omissions: RangeOmissions,
+}
+
 fn candidate_ranges(
     samples: &[MessageSample<'_>],
     limits: MessageFamilyLimits,
-) -> Result<(Vec<SampleRange>, usize), MessageFamilyError> {
+) -> Result<CandidateRangePlan, MessageFamilyError> {
     let possible_widths = limits
         .max_selector_offset
         .checked_add(1)
@@ -487,7 +509,12 @@ fn candidate_ranges(
         .checked_mul(samples.len())
         .ok_or(MessageFamilyError::InvalidLimits)?;
     let complete_width_count = limits.max_candidate_ranges / samples.len().max(1);
-    let retained_width_count = possible_widths.min(complete_width_count);
+    let range_limited_widths = possible_widths.min(complete_width_count);
+    let retained_width_count = if range_limited_widths > 1 && !samples.is_empty() {
+        range_limited_widths.min(report_safe_range_count(samples, limits).max(1))
+    } else {
+        range_limited_widths
+    };
     let retained_ranges = retained_width_count
         .checked_mul(samples.len())
         .ok_or(MessageFamilyError::InvalidLimits)?;
@@ -515,8 +542,38 @@ fn candidate_ranges(
             candidate_index = candidate_index.saturating_add(1);
         }
     }
-    let omitted_ranges = possible_ranges.saturating_sub(ranges.len());
-    Ok((ranges, omitted_ranges))
+    let range_limited_pairs = range_limited_widths
+        .checked_mul(samples.len())
+        .ok_or(MessageFamilyError::InvalidLimits)?;
+    Ok(CandidateRangePlan {
+        ranges,
+        omissions: RangeOmissions {
+            range_limit: possible_ranges - range_limited_pairs,
+            report_budget: range_limited_pairs - retained_ranges,
+        },
+    })
+}
+
+fn report_safe_range_count(samples: &[MessageSample<'_>], limits: MessageFamilyLimits) -> usize {
+    // Reserve enough space for complete observations and worst-case distinct values
+    let per_range = samples.iter().try_fold(0_usize, |total, sample| {
+        let context_bytes = sample.context.as_ref().map_or(0, |context| {
+            context.source.len().saturating_add(context.scope.len())
+        });
+        let occurrence = size_of::<ByteObservation>()
+            .checked_add(size_of::<ObservationOrigin>())?
+            .checked_add(FAMILY_INPUT_IDENTITY.len())?
+            .checked_add(limits.max_selector_width)?
+            .checked_add(context_bytes.checked_mul(2)?)?
+            .checked_add(size_of::<RegionObservation>())?
+            .checked_add(size_of::<RegionValue>())?
+            .checked_add(limits.max_selector_width)?
+            .checked_add(size_of::<usize>())?;
+        total.checked_add(occurrence)
+    });
+    per_range
+        .filter(|bytes| *bytes > 0)
+        .map_or(0, |bytes| (limits.max_report_bytes / 2) / bytes)
 }
 
 fn observation_limits(limits: MessageFamilyLimits, range_count: usize) -> ObservationLimits {

@@ -8,6 +8,80 @@ use std::mem::size_of;
 type TestResult = Result<(), Box<dyn Error>>;
 
 #[test]
+fn family_discovery_keeps_region_facts_without_unrelated_length_analysis() -> TestResult {
+    let samples = [
+        sample(1, &[b'A', 1, 2, 3], 10),
+        sample(2, &[b'A', 2, 3, 4], 11),
+        sample(3, &[b'B', 3, 4, 5], 12),
+        sample(4, &[b'B', 4, 5, 6], 13),
+    ];
+    let report = discover_message_families(&samples, &[1, 2, 3, 4], limits())?;
+    assert!(
+        report
+            .selectors
+            .iter()
+            .any(|selector| selector.families.len() == 2)
+    );
+    assert!(!report.observations.byte_observations.is_empty());
+    assert!(report.observations.integer_interpretations.is_empty());
+    assert!(report.observations.partial_constraints.is_empty());
+    Ok(())
+}
+
+#[test]
+fn report_budget_preserves_complete_selector_regions_and_reports_unexamined_ranges() -> TestResult {
+    let mut bytes = Vec::new();
+    for index in 0..16_u8 {
+        let mut message = [0_u8; 22];
+        message[0] = index.wrapping_mul(7);
+        message[1] = index.wrapping_mul(11);
+        message[2] = if index.is_multiple_of(2) { 0x39 } else { 0xc5 };
+        for (offset, byte) in message.iter_mut().enumerate().skip(3) {
+            *byte = index.wrapping_mul(17).wrapping_add(u8::try_from(offset)?);
+        }
+        bytes.push(message);
+    }
+    let samples = bytes
+        .iter()
+        .enumerate()
+        .map(|(index, bytes)| -> Result<_, Box<dyn Error>> {
+            let mut value = sample(
+                u64::try_from(index + 1)?,
+                bytes,
+                u64::try_from(index / 4 + 1)?,
+            );
+            if let Some(context) = &mut value.context {
+                context.source = format!("sha256:{}", "a".repeat(64));
+                context.scope = "shared capture scope".to_owned();
+            }
+            Ok(value)
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let training = (1..=8).collect::<Vec<u64>>();
+    let limits = MessageFamilyLimits {
+        max_selector_offset: 15,
+        max_selector_width: 4,
+        max_selectors: 8,
+        max_families_per_selector: 4,
+        max_report_bytes: 512 * 1024,
+        ..MessageFamilyLimits::default()
+    };
+    let report = discover_message_families(&samples, &training, limits)?;
+    assert!(
+        report
+            .selectors
+            .iter()
+            .any(|selector| selector.range.start == 2
+                && selector.range.end == 3
+                && selector.families.len() == 2)
+    );
+    assert!(report.omitted_report_budget_ranges > 0);
+    assert!(!report.complete);
+    assert!(report.report_bytes_retained <= limits.max_report_bytes);
+    Ok(())
+}
+
+#[test]
 fn families_use_repeated_training_values_and_do_not_learn_from_holdout() -> TestResult {
     let samples = [
         sample(1, &[b'A', 1], 10),

@@ -28,6 +28,7 @@ mod framing_discovery;
 #[path = "../../../tests/workbench/recovery_executor_job.rs"]
 mod job_tests;
 mod lineage;
+mod message_family;
 mod model;
 mod peer_cohort;
 mod policy;
