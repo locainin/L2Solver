@@ -1,7 +1,8 @@
 use super::*;
 use crate::arguments::RecoveryOptions;
 use crate::workbench::recovery_executor::{
-    RecoveryRunSummary, recover_case_with_job, resume::RecoveryResume,
+    RecoveryRunSummary, recover_case_with_job,
+    resume::{RecoveryResume, TestCheckpointPart},
 };
 use l2_workbench::job::{
     Counter, Job, MemoryBudget, MemoryWorkingSet,
@@ -118,6 +119,204 @@ fn sigkill_during_populated_relational_search_resumes_committed_candidates()
 fn sigint_during_populated_relational_search_resumes_committed_candidates()
 -> Result<(), Box<dyn Error>> {
     exercise_interrupted_search(Interruption::Interrupt)
+}
+
+#[test]
+fn oversized_inner_checkpoint_preserves_prior_generation_and_respects_cache_mode()
+-> Result<(), Box<dyn Error>> {
+    let options = options();
+    let key = stage_key()?;
+    let mut fixture = build_session_relative_fixture()?;
+    add_previous_output(&mut fixture.case)?;
+    let mut uninterrupted = fixture.case.try_clone()?;
+    let expected_memory = MemoryBudget::new(AGGREGATE_MEMORY);
+    let expected_worker = admit_case(&mut uninterrupted, &expected_memory)?;
+    let expected_job =
+        Job::with_memory_budget("uninterrupted overflow reference", expected_worker.budget());
+    let expected_scope = expected_job.work_scope(key.as_str())?;
+    let expected = recover_case_with_job(
+        &mut uninterrupted,
+        options.profile,
+        options.memory_limit,
+        Some(&expected_scope),
+        Some(expected_worker.budget()),
+        None,
+    )?;
+    assert!(
+        uninterrupted
+            .blobs()
+            .iter()
+            .any(|blob| blob.bytes == fixture.plaintext)
+    );
+    drop(expected_worker);
+    let reference = OverflowReference {
+        initial: &fixture.case,
+        uninterrupted: &uninterrupted,
+        expected: &expected,
+        work: without_cache_hits(serde_json::to_value(expected_scope.work_snapshot()?)?)?,
+        options: &options,
+        key: &key,
+    };
+    for part in [TestCheckpointPart::Gate, TestCheckpointPart::Cursor] {
+        for strict in [true, false] {
+            reference.exercise(part, strict)?;
+        }
+    }
+    Ok(())
+}
+
+struct OverflowReference<'a> {
+    initial: &'a Case,
+    uninterrupted: &'a Case,
+    expected: &'a RecoveryRunSummary,
+    work: Value,
+    options: &'a RecoveryOptions,
+    key: &'a StageKey,
+}
+
+impl OverflowReference<'_> {
+    fn exercise(&self, part: TestCheckpointPart, strict: bool) -> Result<(), Box<dyn Error>> {
+        let temporary = tempfile::tempdir()?;
+        let mut actual_case = self.initial.try_clone()?;
+        let prefix = actual_case.checkpoint_prefix()?;
+        let memory = MemoryBudget::new(AGGREGATE_MEMORY);
+        let worker = admit_case(&mut actual_case, &memory)?;
+        let cache =
+            cache(temporary.path(), self.options, &memory)?.with_memory_scope(worker.budget())?;
+        let job = Job::with_memory_budget("inner checkpoint overflow", worker.budget());
+        let scope = job.work_scope(self.key.as_str())?;
+        let mut configured = self.options.clone();
+        configured.strict_cache = strict;
+        let mut lease = cache.lease(self.key)?;
+        let mut resume = RecoveryResume::new(&mut lease, &configured, Some(worker.budget()));
+        resume.force_inner_checkpoint_limit(part, 1);
+        let result = recover_case_with_job(
+            &mut actual_case,
+            configured.profile,
+            configured.memory_limit,
+            Some(&scope),
+            Some(worker.budget()),
+            Some(&mut resume),
+        );
+        let prior = resume
+            .forced_boundary_generation()
+            .ok_or("missing prior generation")?;
+        if strict {
+            let error = result
+                .err()
+                .ok_or("strict overflow unexpectedly succeeded")?;
+            if part == TestCheckpointPart::Cursor {
+                assert!(caused_by_cursor_size_limit(&error));
+            } else {
+                assert_eq!(
+                    super::checkpoint::unavailable_reason(&error),
+                    Some(super::checkpoint::CheckpointUnavailable::SizeLimit)
+                );
+            }
+            assert!(prefix.matches(&actual_case)?);
+            actual_case.validate()?;
+        } else {
+            let actual = result?;
+            assert_eq!(actual_case.to_json()?, self.uninterrupted.to_json()?);
+            assert_same_summary(&actual, self.expected);
+            assert_eq!(
+                without_cache_hits(serde_json::to_value(scope.work_snapshot()?)?)?,
+                self.work
+            );
+            assert!(
+                job.snapshot()?
+                    .cache_fallbacks
+                    .records()
+                    .iter()
+                    .any(|record| {
+                        record.kind() == l2_workbench::job::CacheFallbackKind::CommitFailed
+                    })
+            );
+        }
+        drop(resume);
+        let limits = l2_workbench::job::cache::ExecutionCheckpointLimits {
+            max_encoded_bytes: configured.cache_max_bytes,
+            max_executor_bytes: configured.memory_limit / 8,
+            max_metadata_bytes: 4 * 1024 * 1024,
+        };
+        let saved = lease
+            .load_active(limits)?
+            .ok_or("prior generation was lost")?;
+        assert_eq!(saved.generation(), &prior);
+        Ok(())
+    }
+}
+
+#[test]
+fn allocation_failure_during_relational_restore_does_not_restart_optional_cache()
+-> Result<(), Box<dyn Error>> {
+    let temporary = tempfile::tempdir()?;
+    let mut options = options();
+    let key = stage_key()?;
+    let mut fixture = build_session_relative_fixture()?;
+    add_previous_output(&mut fixture.case)?;
+    let native = fixture.case.to_json()?;
+    run_interrupted_child(temporary.path(), Interruption::Kill)?;
+
+    options.strict_cache = false;
+    let memory = MemoryBudget::new(AGGREGATE_MEMORY);
+    let worker = admit_case(&mut fixture.case, &memory)?;
+    let cache = cache(temporary.path(), &options, &memory)?.with_memory_scope(worker.budget())?;
+    let job = Job::with_memory_budget("restore allocation failure", worker.budget());
+    let scope = job.work_scope(key.as_str())?;
+    let mut lease = cache.lease(&key)?;
+    let limits = l2_workbench::job::cache::ExecutionCheckpointLimits {
+        max_encoded_bytes: options.cache_max_bytes,
+        max_executor_bytes: options.memory_limit / 8,
+        max_metadata_bytes: 4 * 1024 * 1024,
+    };
+    let prior = lease
+        .load_active(limits)?
+        .ok_or("missing prior generation")?
+        .generation()
+        .clone();
+    let mut resume = RecoveryResume::new(&mut lease, &options, Some(worker.budget()));
+    resume.fail_allocation_during_relational_load();
+    let error = recover_case_with_job(
+        &mut fixture.case,
+        options.profile,
+        options.memory_limit,
+        Some(&scope),
+        Some(worker.budget()),
+        Some(&mut resume),
+    )
+    .err()
+    .ok_or("allocation failure restarted recovery")?;
+    assert!(matches!(
+        error,
+        super::super::RecoveryExecutionError::Coordinator(
+            l2_workbench::recovery::RecoveryError::AllocationFailed
+        )
+    ));
+    assert_eq!(fixture.case.to_json()?, native);
+    assert!(job.snapshot()?.cache_fallbacks.records().is_empty());
+    drop(resume);
+    let saved = lease
+        .load_active(limits)?
+        .ok_or("prior generation was lost")?;
+    assert_eq!(saved.generation(), &prior);
+    Ok(())
+}
+
+fn caused_by_cursor_size_limit(error: &(dyn std::error::Error + 'static)) -> bool {
+    let mut current = Some(error);
+    while let Some(error) = current {
+        if matches!(
+            error.downcast_ref::<l2_workbench::protocol::RelationalCursorError<
+                super::super::RecoveryExecutionError,
+            >>(),
+            Some(l2_workbench::protocol::RelationalCursorError::CheckpointTooLarge)
+        ) {
+            return true;
+        }
+        current = error.source();
+    }
+    false
 }
 
 #[derive(Clone, Copy)]

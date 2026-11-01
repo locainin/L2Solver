@@ -353,6 +353,8 @@ fn prepare_one(
             },
         )?;
         restored_memory = Some(lease);
+        #[cfg(test)]
+        resume.check_relational_allocation_test_failure()?;
         cursor.restoration_pending = false;
         #[cfg(test)]
         resume.relational_restored(restored.candidates_examined(), job)?;
@@ -406,12 +408,14 @@ fn prepare_one(
                 if resume.due() || forced {
                     save_boundary(executor, cursor, resume, memory, &session, &next, &gate)?;
                     #[cfg(test)]
-                    resume.after_populated_checkpoint(
-                        next.candidates_examined(),
-                        cached_plans,
-                        job,
-                        session.history(),
-                    )?;
+                    if forced {
+                        resume.after_populated_checkpoint(
+                            next.candidates_examined(),
+                            cached_plans,
+                            job,
+                            session.history(),
+                        )?;
+                    }
                 }
                 search_cursor = Some(next);
             }
@@ -452,26 +456,49 @@ fn save_boundary(
     gate: &CandidateGate<'_>,
 ) -> Result<(), RecoveryExecutionError> {
     let limit = resume.executor_limit();
-    let (encoded_cursor, cursor_memory) = session
-        .encode_checkpoint(search_cursor, limit, memory, |assessment, writer| {
-            validate_saved_assessment(None, assessment)
-                .map_err(|_| RecoveryError::InvalidCheckpoint)?;
-            serde_json::to_writer(writer, assessment)
-                .map_err(|error| operational("relational assessment encoding failed", error))
-        })
-        .map_err(|error| operational("relational cursor encoding failed", error))?;
-    let description = gate.schema_plan_cache.checkpoint_description(
-        executor
-            .policy
-            .record_schema_proposal_limits
-            .discovery
-            .record_limits,
-        limit,
-    )?;
-    let (encoded_gate, gate_memory) =
-        executor_checkpoint::encode(&description, limit, Some(memory))?;
+    let Some((encoded_cursor, cursor_memory)) =
+        encode_cursor(executor, resume, memory, session, search_cursor)?
+    else {
+        return Ok(());
+    };
+    #[cfg(test)]
+    let gate_limit =
+        resume.inner_checkpoint_test_limit(super::super::super::resume::TestCheckpointPart::Gate);
+    #[cfg(not(test))]
+    let gate_limit = limit;
+    let Some(description) = checkpoint_or_fallback(
+        gate.schema_plan_cache.checkpoint_description(
+            executor
+                .policy
+                .record_schema_proposal_limits
+                .discovery
+                .record_limits,
+            gate_limit,
+        ),
+        executor,
+        resume,
+    )?
+    else {
+        return Ok(());
+    };
+    let Some((encoded_gate, gate_memory)) = checkpoint_or_fallback(
+        executor_checkpoint::encode(&description, gate_limit, Some(memory)),
+        executor,
+        resume,
+    )?
+    else {
+        return Ok(());
+    };
     let (encoded_history, history_memory) = if let Some(history) = session.history() {
-        executor_checkpoint::encode(history, limit, Some(memory))?
+        let Some(encoded) = checkpoint_or_fallback(
+            executor_checkpoint::encode(history, limit, Some(memory)),
+            executor,
+            resume,
+        )?
+        else {
+            return Ok(());
+        };
+        encoded
     } else {
         (Vec::new(), None)
     };
@@ -496,6 +523,55 @@ fn save_boundary(
         .ok_or(RecoveryError::InvariantFailure)?
         .active = None;
     Ok(())
+}
+
+fn encode_cursor(
+    executor: &Executor<'_>,
+    resume: &mut RecoveryResume<'_>,
+    memory: &MemoryBudget,
+    session: &RelationalSearchSession<'_, '_>,
+    search_cursor: &l2_workbench::protocol::RelationalSearchCursor<GateAssessment>,
+) -> Result<Option<(Vec<u8>, MemoryLease)>, RecoveryExecutionError> {
+    #[cfg(test)]
+    let limit =
+        resume.inner_checkpoint_test_limit(super::super::super::resume::TestCheckpointPart::Cursor);
+    #[cfg(not(test))]
+    let limit = resume.executor_limit();
+    let encoded = session.encode_checkpoint(search_cursor, limit, memory, |assessment, writer| {
+        validate_saved_assessment(None, assessment)
+            .map_err(|_| RecoveryError::InvalidCheckpoint)?;
+        serde_json::to_writer(writer, assessment)
+            .map_err(|error| operational("relational assessment encoding failed", error))
+    });
+    match encoded {
+        Ok(value) => Ok(Some(value)),
+        Err(error @ RelationalCursorError::CheckpointTooLarge) => {
+            resume.unrepresentable_or_error(
+                executor,
+                operational("relational cursor encoding failed", error),
+            )?;
+            Ok(None)
+        }
+        Err(error) => Err(operational("relational cursor encoding failed", error)),
+    }
+}
+
+fn checkpoint_or_fallback<T>(
+    result: Result<T, RecoveryExecutionError>,
+    executor: &Executor<'_>,
+    resume: &mut RecoveryResume<'_>,
+) -> Result<Option<T>, RecoveryExecutionError> {
+    match result {
+        Ok(value) => Ok(Some(value)),
+        Err(error)
+            if executor_checkpoint::unavailable_reason(&error)
+                == Some(executor_checkpoint::CheckpointUnavailable::SizeLimit) =>
+        {
+            resume.unrepresentable_or_error(executor, error)?;
+            Ok(None)
+        }
+        Err(error) => Err(error),
+    }
 }
 
 fn restore_budget(

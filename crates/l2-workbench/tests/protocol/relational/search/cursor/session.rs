@@ -1,9 +1,9 @@
 use super::{
-    CHECKPOINT_LIMIT, Infallible, Job, RelationalParserScope, RelationalReplayHistory,
-    RelationalRestoreBudget, RelationalSearchStep, RelationalTransformEvaluationOptions, SCOPE,
-    TestResult, borrow_samples, decode_assessment, evaluate,
-    infer_relational_transform_candidates_with_evaluator_and_history, rehash, search_plan,
-    synthetic_sessions,
+    CHECKPOINT_LIMIT, Infallible, Job, RelationalCandidateEvaluation, RelationalParserScope,
+    RelationalReplayHistory, RelationalRestoreBudget, RelationalSearchStep,
+    RelationalTransformEvaluationOptions, SCOPE, TestResult, borrow_samples, decode_assessment,
+    evaluate, infer_relational_transform_candidates_with_evaluator_and_history, rehash,
+    search_plan, synthetic_sessions,
 };
 use l2_workbench::{
     artifact::ArtifactValidationFormat,
@@ -47,6 +47,76 @@ fn retained_candidates_plan() -> RelationalTransformPlan {
     plan.limits.max_candidates = 160;
     plan.limits.max_retained_candidates = 6;
     plan
+}
+
+#[derive(Debug, Eq, PartialEq)]
+enum Assessment {
+    PartialGate,
+    Invalid,
+    Equivalent,
+    Other(usize),
+}
+
+#[test]
+fn paused_cursor_borrows_every_retained_assessment_in_candidate_order() -> TestResult<()> {
+    let records = synthetic_sessions(false)?;
+    let samples = borrow_samples(&records)?;
+    let plan = retained_candidates_plan();
+    let mut session = RelationalSearchSession::new(
+        &samples,
+        &plan,
+        None,
+        RelationalTransformEvaluationOptions::default(),
+        None,
+    )?;
+    let mut calls = 0_usize;
+    let mut paused = None;
+    for _ in 0..128 {
+        let step = session.step(paused.take(), 1, |_, _, _, _| {
+            let ordinal = calls;
+            calls += 1;
+            let assessment = match ordinal {
+                0 => Assessment::PartialGate,
+                1 => Assessment::Invalid,
+                2 | 3 => Assessment::Equivalent,
+                _ => Assessment::Other(ordinal),
+            };
+            Ok::<_, Infallible>(RelationalCandidateEvaluation {
+                priority: u8::from(ordinal < 6),
+                work_bytes: 0,
+                assessment,
+            })
+        })?;
+        let RelationalSearchStep::Paused(cursor) = step else {
+            return Err("fixture completed before exercising retained assessments".into());
+        };
+        paused = Some(cursor);
+        if calls >= 9 {
+            break;
+        }
+    }
+    assert!(calls >= 9, "fixture did not exercise the retention limit");
+    let cursor = paused.ok_or("fixture did not produce a paused cursor")?;
+    let retained = cursor.assessments().collect::<Vec<_>>();
+    assert_eq!(
+        retained,
+        [
+            &Assessment::PartialGate,
+            &Assessment::Invalid,
+            &Assessment::Equivalent,
+            &Assessment::Equivalent,
+            &Assessment::Other(4),
+            &Assessment::Other(5),
+        ]
+    );
+    let first_equivalent = retained
+        .get(2)
+        .ok_or("first equivalent assessment missing")?;
+    let second_equivalent = retained
+        .get(3)
+        .ok_or("second equivalent assessment missing")?;
+    assert!(!std::ptr::eq(*first_equivalent, *second_equivalent));
+    Ok(())
 }
 
 #[test]
@@ -185,7 +255,8 @@ fn restored_assessments_receive_the_validated_session_partition_and_remaining_wo
 
     let mut restored = RelationalSearchSession::new(&samples, &plan, None, options, None)?;
     let mut calls = 0;
-    let (_cursor, _lease) = restored.restore_checkpoint(
+    let mut decoded = Vec::new();
+    let (cursor, _lease) = restored.restore_checkpoint(
         &bytes,
         CHECKPOINT_LIMIT,
         &memory,
@@ -216,10 +287,13 @@ fn restored_assessments_receive_the_validated_session_partition_and_remaining_wo
                 context.work_bytes_remaining,
                 plan.limits.max_work_bytes - saved_work
             );
-            decode_assessment(context, candidate, outputs, value, work)
+            let assessment = decode_assessment(context, candidate, outputs, value, work)?;
+            decoded.push(assessment);
+            Ok(assessment)
         },
     )?;
     assert!(calls > 0, "fixture had no retained assessments");
+    assert_eq!(cursor.assessments().copied().collect::<Vec<_>>(), decoded);
     Ok(())
 }
 
@@ -248,6 +322,7 @@ fn restored_empty_cursor_exposes_the_validated_session_partition() -> TestResult
         return Err("empty fixture did not pause".into());
     };
     assert_eq!(evaluated, 0);
+    assert_eq!(cursor.assessments().count(), 0);
     let memory = MemoryBudget::new(64 * 1024 * 1024);
     let (bytes, _encoded_lease) =
         original.encode_checkpoint(&cursor, CHECKPOINT_LIMIT, &memory, |value, writer| {
@@ -277,6 +352,7 @@ fn restored_empty_cursor_exposes_the_validated_session_partition() -> TestResult
         },
     )?;
     assert_eq!(decoded, 0);
+    assert_eq!(cursor.assessments().count(), 0);
     let (discovery, heldout) = cursor.session_partition();
     assert_eq!(
         discovery

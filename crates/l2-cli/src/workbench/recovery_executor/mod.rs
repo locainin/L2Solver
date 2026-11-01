@@ -326,7 +326,8 @@ fn execute_internal(
                                             RecoveryExecutionError::Job(_)
                                             | RecoveryExecutionError::Operational { .. }
                                             | RecoveryExecutionError::Coordinator(
-                                                RecoveryError::InvalidCheckpoint,
+                                                RecoveryError::InvalidCheckpoint
+                                                | RecoveryError::AllocationFailed,
                                             ) => error,
                                             other => RecoveryExecutionError::Operational {
                                                 stage: RecoveryStage::TransformDiscovery,

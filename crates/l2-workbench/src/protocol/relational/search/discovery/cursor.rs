@@ -71,6 +71,16 @@ impl<T> RelationalSearchCursor<T> {
         self.search.candidates_examined
     }
 
+    /// Borrow all currently retained assessments in checkpoint candidate order
+    ///
+    /// Assessments for evicted or never-retained candidates are not included
+    pub fn assessments(&self) -> impl Iterator<Item = &T> {
+        self.search
+            .candidates
+            .iter()
+            .map(|candidate| &candidate.assessment)
+    }
+
     /// Borrow the frozen discovery and held-out complete-session partition
     #[must_use]
     pub fn session_partition(&self) -> (&[RelationalSessionId], &[RelationalSessionId]) {

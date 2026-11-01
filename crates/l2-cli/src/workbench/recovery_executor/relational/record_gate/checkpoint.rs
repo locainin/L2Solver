@@ -38,15 +38,21 @@ use super::{
     operational,
     screen::SchemaAlternativeEvaluation,
 };
-use crate::workbench::recovery_executor::RecoveryExecutionError;
-use l2_workbench::protocol::{RecordLimits, RecordSchemaProposalLimits, RelationalTransformRule};
+use crate::workbench::recovery_executor::{
+    RecoveryExecutionError,
+    checkpoint::{self as executor_checkpoint, CheckpointUnavailable},
+};
+use l2_workbench::protocol::{
+    RecordError, RecordLimits, RecordSchemaProposalLimits, RelationalTransformRule,
+};
 use serde::{
     Deserialize, Serialize, Serializer,
     ser::{SerializeSeq, SerializeStruct},
 };
 use serde_json::Value;
-use std::io;
+use std::cell::Cell;
 
+// Earlier gate snapshots do not carry the structural witness needed for replay
 const VERSION: u32 = 3;
 
 // The small fixed index avoids cloning rules or allocating while preparing the writer
@@ -106,6 +112,7 @@ struct CacheRef<'a> {
     producers: Producers<'a>,
     limits: RecordLimits,
     maximum: usize,
+    nested_limit_exceeded: Cell<bool>,
 }
 
 impl Serialize for CacheRef<'_> {
@@ -128,6 +135,7 @@ impl Serialize for CacheRef<'_> {
                 producers,
                 limits: self.limits,
                 maximum: self.maximum,
+                nested_limit_exceeded: &self.nested_limit_exceeded,
             },
         )?;
         result.end()
@@ -319,6 +327,7 @@ struct HeadersRef<'a> {
     producers: ProducersRef<'a>,
     limits: RecordLimits,
     maximum: usize,
+    nested_limit_exceeded: &'a Cell<bool>,
 }
 
 impl Serialize for HeadersRef<'_> {
@@ -340,7 +349,12 @@ impl Serialize for HeadersRef<'_> {
             let description = plan
                 .assembly_plan
                 .checkpoint_description(self.limits, self.maximum)
-                .map_err(serde::ser::Error::custom)?;
+                .map_err(|error| {
+                    if matches!(error, RecordError::ReportTooLarge { .. }) {
+                        self.nested_limit_exceeded.set(true);
+                    }
+                    serde::ser::Error::custom(error)
+                })?;
             sequence.serialize_element(&HeaderRef {
                 key,
                 producer,
@@ -359,17 +373,21 @@ impl SchemaPlanCache {
         maximum: usize,
     ) -> Result<impl Serialize + '_, RecoveryExecutionError> {
         let producers = Producers::from_cache(self)?;
-        let mut writer =
-            crate::output::BoundedWriter::named(io::sink(), maximum, "relational schema cache");
         // Both passes borrow the same immutable producer index and compiled plans
         let view = CacheRef {
             cache: self,
             producers,
             limits,
             maximum,
+            nested_limit_exceeded: Cell::new(false),
         };
-        serde_json::to_writer(&mut writer, &view)
-            .map_err(|error| operational("record gate checkpoint encoding failed", error))?;
+        let measured = executor_checkpoint::measure(&view, maximum);
+        if view.nested_limit_exceeded.get() {
+            return Err(executor_checkpoint::unavailable(
+                CheckpointUnavailable::SizeLimit,
+            ));
+        }
+        measured.map_err(|error| operational("record gate checkpoint encoding failed", error))?;
         Ok(view)
     }
 }

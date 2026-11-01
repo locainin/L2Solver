@@ -17,11 +17,39 @@ use l2_workbench::{
 use serde::{Deserialize, Serialize};
 use serde_json::value::RawValue;
 use std::{
+    error::Error,
+    fmt,
     io::{self, Write},
     sync::Arc,
 };
 
+// Older snapshots lack the receipts needed to resume an inner search safely
 const VERSION: u32 = 2;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum CheckpointUnavailable {
+    SizeLimit,
+}
+
+impl fmt::Display for CheckpointUnavailable {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::SizeLimit => formatter.write_str("executor checkpoint exceeds its byte limit"),
+        }
+    }
+}
+
+impl Error for CheckpointUnavailable {}
+
+pub(super) fn unavailable(reason: CheckpointUnavailable) -> RecoveryExecutionError {
+    operational(reason)
+}
+
+pub(super) fn unavailable_reason(error: &RecoveryExecutionError) -> Option<CheckpointUnavailable> {
+    crate::memory_error::find_map(error, |cause| {
+        cause.downcast_ref::<CheckpointUnavailable>().copied()
+    })
+}
 
 #[derive(Serialize)]
 struct SavedRef<'a> {
@@ -97,8 +125,13 @@ pub(super) fn write(
     let mut output = LimitedWriter {
         output,
         remaining: max_bytes,
+        exceeded: false,
     };
-    serde_json::to_writer(&mut output, &value).map_err(operational)
+    let result = serde_json::to_writer(&mut output, &value);
+    if output.exceeded {
+        return Err(unavailable(CheckpointUnavailable::SizeLimit));
+    }
+    result.map_err(operational)
 }
 
 pub(super) fn encode<T: Serialize + ?Sized>(
@@ -107,18 +140,40 @@ pub(super) fn encode<T: Serialize + ?Sized>(
     memory: Option<&MemoryBudget>,
 ) -> Result<(Vec<u8>, Option<MemoryLease>), RecoveryExecutionError> {
     let mut buffer = buffer::Buffer::new(max_bytes, memory)?;
-    let result = {
+    let (result, exceeded) = {
         let mut output = LimitedWriter {
             output: &mut buffer,
             remaining: max_bytes,
+            exceeded: false,
         };
-        serde_json::to_writer(&mut output, value)
+        let result = serde_json::to_writer(&mut output, value);
+        (result, output.exceeded)
     };
     if let Some(error) = buffer.failure.take() {
         return Err(error);
     }
+    if exceeded {
+        return Err(unavailable(CheckpointUnavailable::SizeLimit));
+    }
     result.map_err(operational)?;
     Ok((buffer.bytes, buffer.memory))
+}
+
+pub(super) fn measure<T: Serialize + ?Sized>(
+    value: &T,
+    max_bytes: usize,
+) -> Result<(), RecoveryExecutionError> {
+    let mut sink = io::sink();
+    let mut output = LimitedWriter {
+        output: &mut sink,
+        remaining: max_bytes,
+        exceeded: false,
+    };
+    let result = serde_json::to_writer(&mut output, value);
+    if output.exceeded {
+        return Err(unavailable(CheckpointUnavailable::SizeLimit));
+    }
+    result.map_err(operational)
 }
 
 pub(super) fn read<'a>(
@@ -217,10 +272,12 @@ fn operational(error: impl std::error::Error + 'static) -> RecoveryExecutionErro
 struct LimitedWriter<'a, W> {
     output: &'a mut W,
     remaining: usize,
+    exceeded: bool,
 }
 impl<W: Write> Write for LimitedWriter<'_, W> {
     fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
         if bytes.len() > self.remaining {
+            self.exceeded = true;
             return Err(io::Error::other(
                 "executor checkpoint exceeds its byte limit",
             ));

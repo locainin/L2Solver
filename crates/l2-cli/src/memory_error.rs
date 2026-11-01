@@ -5,10 +5,24 @@ use std::{error::Error, io};
 
 /// Find a shared-budget failure without relying on display text
 pub fn find(error: &(dyn Error + 'static)) -> Option<MemoryError> {
+    find_map(error, |cause| cause.downcast_ref::<MemoryError>().copied())
+}
+
+pub fn any_cause(
+    error: &(dyn Error + 'static),
+    mut predicate: impl FnMut(&(dyn Error + 'static)) -> bool,
+) -> bool {
+    find_map(error, |cause| predicate(cause).then_some(())).is_some()
+}
+
+pub fn find_map<T>(
+    error: &(dyn Error + 'static),
+    mut inspect: impl FnMut(&(dyn Error + 'static)) -> Option<T>,
+) -> Option<T> {
     let mut current = Some(error);
     while let Some(cause) = current {
-        if let Some(memory) = cause.downcast_ref::<MemoryError>() {
-            return Some(*memory);
+        if let Some(value) = inspect(cause) {
+            return Some(value);
         }
         // io::Error can hold the typed error without exposing it as its source
         current = cause

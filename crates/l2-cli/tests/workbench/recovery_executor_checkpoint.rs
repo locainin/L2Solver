@@ -9,6 +9,8 @@ use std::error::Error;
 
 #[path = "recovery_executor_checkpoint/durable.rs"]
 mod durable;
+#[path = "recovery_executor_checkpoint/limits.rs"]
+mod limits;
 #[path = "recovery_executor_checkpoint/memory.rs"]
 mod memory;
 #[cfg(target_os = "linux")]

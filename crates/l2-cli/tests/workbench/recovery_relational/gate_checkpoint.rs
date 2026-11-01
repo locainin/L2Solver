@@ -155,6 +155,26 @@ fn gate_checkpoint_rejects_the_prior_format_before_replaying_rules() -> Result<(
 }
 
 #[test]
+fn gate_checkpoint_reports_a_typed_size_limit() -> Result<(), Box<dyn Error>> {
+    let fixture = Fixture::new()?;
+    let samples = fixture.samples();
+    let stored = fixture.stored();
+    let memory = MemoryBudget::new(256 * 1024 * 1024);
+    let (cache, _) = learn_decoy(&fixture, &samples, &stored, &memory)?;
+    let limits = RecordSchemaProposalLimits::default()
+        .discovery
+        .record_limits;
+    let Err(error) = cache.checkpoint_description(limits, 1) else {
+        return Err("gate size limit was ignored".into());
+    };
+    assert_eq!(
+        super::super::checkpoint::unavailable_reason(&error),
+        Some(super::super::checkpoint::CheckpointUnavailable::SizeLimit),
+    );
+    Ok(())
+}
+
+#[test]
 fn restored_gate_reuses_a_verified_decoy_plan_and_validates_the_artifact()
 -> Result<(), Box<dyn Error>> {
     let fixture = Fixture::new()?;
