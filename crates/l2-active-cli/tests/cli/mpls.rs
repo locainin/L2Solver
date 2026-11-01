@@ -246,12 +246,14 @@ fn verify_disclosure(
     fixture_dir: &std::path::Path,
     raw: bool,
 ) -> Result<(), Box<dyn Error>> {
+    use std::fmt::Write as _;
+
     if raw {
         let frame = std::fs::read(fixture_dir.join("valid.bin"))?;
-        let hex = frame
-            .iter()
-            .map(|byte| format!("{byte:02x}"))
-            .collect::<String>();
+        let mut hex = String::new();
+        for byte in &frame {
+            write!(&mut hex, "{byte:02x}")?;
+        }
         assert!(observations.iter().any(|item| {
             item.get("frame_hex").and_then(serde_json::Value::as_str) == Some(hex.as_str())
         }));

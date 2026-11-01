@@ -16,17 +16,17 @@ fn receive_only_observers_require_an_interface_and_explicit_raw_opt_in()
             "--interface",
             "test0",
         ])?;
-        let options = match cli.active.command {
-            ActiveCommand::Dtp {
-                command: ObserveCommand::Observe(options),
-            }
-            | ActiveCommand::Vtp {
-                command: ObserveCommand::Observe(options),
-            }
-            | ActiveCommand::Isl {
-                command: ObserveCommand::Observe(options),
-            } => options,
-            _ => return Err("expected receive-only observation".into()),
+        let (ActiveCommand::Dtp {
+            command: ObserveCommand::Observe(options),
+        }
+        | ActiveCommand::Vtp {
+            command: ObserveCommand::Observe(options),
+        }
+        | ActiveCommand::Isl {
+            command: ObserveCommand::Observe(options),
+        }) = cli.active.command
+        else {
+            return Err("expected receive-only observation".into());
         };
         assert!(!options.include_raw);
         let cli = Cli::try_parse_from([
@@ -37,17 +37,17 @@ fn receive_only_observers_require_an_interface_and_explicit_raw_opt_in()
             "test0",
             "--include-raw",
         ])?;
-        let options = match cli.active.command {
-            ActiveCommand::Dtp {
-                command: ObserveCommand::Observe(options),
-            }
-            | ActiveCommand::Vtp {
-                command: ObserveCommand::Observe(options),
-            }
-            | ActiveCommand::Isl {
-                command: ObserveCommand::Observe(options),
-            } => options,
-            _ => return Err("expected receive-only observation".into()),
+        let (ActiveCommand::Dtp {
+            command: ObserveCommand::Observe(options),
+        }
+        | ActiveCommand::Vtp {
+            command: ObserveCommand::Observe(options),
+        }
+        | ActiveCommand::Isl {
+            command: ObserveCommand::Observe(options),
+        }) = cli.active.command
+        else {
+            return Err("expected receive-only observation".into());
         };
         assert!(options.include_raw);
     }

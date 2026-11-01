@@ -46,75 +46,80 @@ fn mpls_output_shows_label_facts_and_redacts_payload_and_backend_errors()
             assert!(!text.contains(marker));
         }
         if format == OutputFormat::Json {
-            let value: serde_json::Value = serde_json::from_str(&text)?;
-            assert_eq!(
-                value
-                    .pointer("/details/expected_top_label")
-                    .and_then(serde_json::Value::as_u64),
-                Some(101)
-            );
-            assert_eq!(
-                value
-                    .pointer("/details/unexpected_top_label")
-                    .and_then(serde_json::Value::as_bool),
-                Some(true)
-            );
-            assert_eq!(
-                value
-                    .pointer("/observations/0/disposition")
-                    .and_then(serde_json::Value::as_str),
-                Some("stack")
-            );
-            assert_eq!(
-                value
-                    .pointer("/observations/0/labels/0/value")
-                    .and_then(serde_json::Value::as_u64),
-                Some(100)
-            );
-            assert_eq!(
-                value
-                    .pointer("/observations/0/labels/0/traffic_class")
-                    .and_then(serde_json::Value::as_u64),
-                Some(5)
-            );
-            assert_eq!(
-                value
-                    .pointer("/observations/0/labels/0/ttl")
-                    .and_then(serde_json::Value::as_u64),
-                Some(64)
-            );
-            assert_eq!(
-                value
-                    .pointer("/observations/0/labels/0/bottom_of_stack")
-                    .and_then(serde_json::Value::as_bool),
-                Some(false)
-            );
-            assert_eq!(
-                value
-                    .pointer("/observations/1/disposition")
-                    .and_then(serde_json::Value::as_str),
-                Some("unsupported")
-            );
-            assert_eq!(
-                value
-                    .pointer("/observations/1/reason")
-                    .and_then(serde_json::Value::as_str),
-                Some("special_purpose_label")
-            );
-            assert_eq!(
-                value
-                    .pointer("/transport_error/message")
-                    .and_then(serde_json::Value::as_str),
-                Some("io_error")
-            );
-            assert_eq!(
-                value
-                    .pointer("/cleanup/error")
-                    .and_then(serde_json::Value::as_str),
-                Some("io_error")
-            );
+            assert_mpls_json(&text)?;
         }
     }
+    Ok(())
+}
+
+fn assert_mpls_json(text: &str) -> Result<(), Box<dyn Error>> {
+    let value: serde_json::Value = serde_json::from_str(text)?;
+    assert_eq!(
+        value
+            .pointer("/details/expected_top_label")
+            .and_then(serde_json::Value::as_u64),
+        Some(101)
+    );
+    assert_eq!(
+        value
+            .pointer("/details/unexpected_top_label")
+            .and_then(serde_json::Value::as_bool),
+        Some(true)
+    );
+    assert_eq!(
+        value
+            .pointer("/observations/0/disposition")
+            .and_then(serde_json::Value::as_str),
+        Some("stack")
+    );
+    assert_eq!(
+        value
+            .pointer("/observations/0/labels/0/value")
+            .and_then(serde_json::Value::as_u64),
+        Some(100)
+    );
+    assert_eq!(
+        value
+            .pointer("/observations/0/labels/0/traffic_class")
+            .and_then(serde_json::Value::as_u64),
+        Some(5)
+    );
+    assert_eq!(
+        value
+            .pointer("/observations/0/labels/0/ttl")
+            .and_then(serde_json::Value::as_u64),
+        Some(64)
+    );
+    assert_eq!(
+        value
+            .pointer("/observations/0/labels/0/bottom_of_stack")
+            .and_then(serde_json::Value::as_bool),
+        Some(false)
+    );
+    assert_eq!(
+        value
+            .pointer("/observations/1/disposition")
+            .and_then(serde_json::Value::as_str),
+        Some("unsupported")
+    );
+    assert_eq!(
+        value
+            .pointer("/observations/1/reason")
+            .and_then(serde_json::Value::as_str),
+        Some("special_purpose_label")
+    );
+    assert_eq!(
+        value
+            .pointer("/transport_error/message")
+            .and_then(serde_json::Value::as_str),
+        Some("io_error")
+    );
+    assert_eq!(
+        value
+            .pointer("/cleanup/error")
+            .and_then(serde_json::Value::as_str),
+        Some("io_error")
+    );
     Ok(())
 }
 

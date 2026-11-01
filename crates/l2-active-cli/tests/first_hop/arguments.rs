@@ -52,12 +52,13 @@ fn discovery_failures_for_first_hop_commands_expose_only_code_and_stage()
             "json",
         ])?;
         let mut output = Vec::new();
-        let error = crate::execute(
+        let Err(error) = crate::execute(
             &cli.active,
             &std::sync::atomic::AtomicBool::new(false),
             &mut output,
-        )
-        .expect_err("missing interface must fail");
+        ) else {
+            return Err("missing interface must fail".into());
+        };
         assert_eq!(error.code(), "not_found");
         assert_eq!(error.stage(), "discovery");
         assert!(!error.to_string().contains("l2s-no-test"));

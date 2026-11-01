@@ -1,5 +1,5 @@
 mod arguments;
 mod diagnostics;
-pub(crate) mod fixture;
+pub mod fixture;
 mod hsrp;
 mod vrrp;

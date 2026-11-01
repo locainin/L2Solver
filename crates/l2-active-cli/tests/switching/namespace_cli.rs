@@ -228,14 +228,16 @@ fn verify_disclosure(
     expected: &[u8],
     raw: bool,
 ) -> Result<(), Box<dyn Error>> {
+    use std::fmt::Write as _;
+
     let observations = report
         .get("observations")
         .and_then(serde_json::Value::as_array)
         .ok_or("missing observations")?;
-    let hex = expected
-        .iter()
-        .map(|byte| format!("{byte:02x}"))
-        .collect::<String>();
+    let mut hex = String::new();
+    for byte in expected {
+        write!(&mut hex, "{byte:02x}")?;
+    }
     if raw {
         assert!(observations.iter().any(|item| {
             item.get("frame_hex").and_then(serde_json::Value::as_str) == Some(hex.as_str())

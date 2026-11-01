@@ -127,6 +127,22 @@ fn observe(
     assert_no_secrets(&stderr);
     let text = String::from_utf8(output.stdout)?;
     let report: serde_json::Value = serde_json::from_str(&text)?;
+    assert_observer_report(&report);
+    verify_disclosure(
+        &report,
+        &text,
+        &std::fs::read(Path::new(&fixture_dir).join(fixture))?,
+        include_raw,
+    )?;
+    assert_eq!(
+        crate::namespace::memberships(index, group)?,
+        baseline,
+        "multicast membership leaked"
+    );
+    Ok(())
+}
+
+fn assert_observer_report(report: &serde_json::Value) {
     assert_eq!(
         report.get("status").and_then(serde_json::Value::as_str),
         Some("observed")
@@ -145,18 +161,6 @@ fn observe(
             .and_then(serde_json::Value::as_str),
         Some("sampled")
     );
-    verify_disclosure(
-        &report,
-        &text,
-        &std::fs::read(Path::new(&fixture_dir).join(fixture))?,
-        include_raw,
-    )?;
-    assert_eq!(
-        crate::namespace::memberships(index, group)?,
-        baseline,
-        "multicast membership leaked"
-    );
-    Ok(())
 }
 
 fn verify_disclosure(
@@ -165,15 +169,17 @@ fn verify_disclosure(
     expected: &[u8],
     raw: bool,
 ) -> Result<(), Box<dyn Error>> {
+    use std::fmt::Write as _;
+
     let observations = report
         .get("observations")
         .and_then(serde_json::Value::as_array)
         .ok_or("missing observations")?;
     assert!(!observations.is_empty());
-    let hex = expected
-        .iter()
-        .map(|byte| format!("{byte:02x}"))
-        .collect::<String>();
+    let mut hex = String::new();
+    for byte in expected {
+        write!(&mut hex, "{byte:02x}")?;
+    }
     if raw {
         assert!(observations.iter().any(|item| {
             item.get("frame_hex").and_then(serde_json::Value::as_str) == Some(hex.as_str())

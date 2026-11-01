@@ -38,10 +38,10 @@ impl ActiveLink for SensitiveLink {
     }
 
     fn receive(&mut self, _: Instant, _: &AtomicBool, _: usize) -> io::Result<ReceiveEvent> {
-        match self.frames.pop_front() {
-            Some(frame) => Ok(ReceiveEvent::Frame(frame)),
-            None => Err(io::Error::other(SECRET)),
-        }
+        self.frames
+            .pop_front()
+            .map(ReceiveEvent::Frame)
+            .ok_or_else(|| io::Error::other(SECRET))
     }
 
     fn capture_loss(&mut self) -> io::Result<Option<u64>> {

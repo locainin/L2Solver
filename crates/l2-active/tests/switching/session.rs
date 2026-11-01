@@ -115,7 +115,10 @@ fn malformed_envelopes_require_the_selected_destination_length_and_snap()
     assert_eq!(report.unmatched_packets(), 3);
     assert_eq!(report.observations().len(), 1);
     assert!(matches!(
-        report.observations().first().map(|item| item.evidence()),
+        report
+            .observations()
+            .first()
+            .map(l2_active::switching::dtp::DtpObservation::evidence),
         Some(l2_active::switching::dtp::DtpEvidence::Malformed(
             l2_active::switching::dtp::DtpMalformed::Ethernet
         ))
