@@ -6,11 +6,12 @@ use l2_workbench::job::MemorySnapshot;
 use l2_workbench::{
     evidence::{Case, CaseSnapshotLimits, CaseSnapshotUsage},
     job::{
-        MemoryBudget, MemoryClass,
+        Job, JobError, MemoryBudget, MemoryClass, MemoryLease,
         cache::{CacheEntry, Lease},
     },
 };
 use std::{
+    cell::Cell,
     error::Error,
     fs::{File, OpenOptions},
     io::{self, BufWriter, Read, Seek, SeekFrom, Write},
@@ -25,8 +26,106 @@ pub const STORAGE_FORMAT: u32 = 1;
 const CODEC_SCRATCH_BYTES: u64 = 2 * 1024 * 1024;
 const FILE_BUFFER_CAPACITY: usize = 16 * 1024;
 const FILE_BUFFER_BYTES: u64 = 2 * FILE_BUFFER_CAPACITY as u64;
+// Bound each transfer while a job can request cancellation
+const CANCELLABLE_IO_CHUNK_BYTES: usize = 64 * 1024;
 
 type Result<T> = std::result::Result<T, Box<dyn Error>>;
+
+pub struct Cancellation<'a> {
+    job: Option<&'a Job>,
+    observed: Cell<bool>,
+    io_failed: Cell<bool>,
+}
+
+impl Cancellation<'_> {
+    fn check(&self) -> io::Result<()> {
+        if let Some(job) = self.job {
+            job.check_cancelled().map_err(|error| {
+                if !self.io_failed.get() {
+                    self.observed.set(true);
+                }
+                io::Error::other(error)
+            })?;
+        }
+        Ok(())
+    }
+
+    fn record_io<T>(&self, result: io::Result<T>) -> io::Result<T> {
+        if let Err(error) = &result
+            && error.kind() != io::ErrorKind::Interrupted
+        {
+            self.io_failed.set(true);
+        }
+        result
+    }
+
+    pub const fn wrap<T>(&self, inner: T) -> CancellableIo<'_, T> {
+        CancellableIo {
+            inner,
+            cancellation: self,
+        }
+    }
+}
+
+pub struct CancellableIo<'a, T> {
+    inner: T,
+    cancellation: &'a Cancellation<'a>,
+}
+
+impl<T> CancellableIo<'_, T> {
+    fn length(&self, available: usize) -> usize {
+        if self.cancellation.job.is_some() {
+            available.min(CANCELLABLE_IO_CHUNK_BYTES)
+        } else {
+            available
+        }
+    }
+}
+
+impl<T: Read> Read for CancellableIo<'_, T> {
+    fn read(&mut self, bytes: &mut [u8]) -> io::Result<usize> {
+        self.cancellation.check()?;
+        let length = self.length(bytes.len());
+        let (chunk, _) = bytes.split_at_mut(length);
+        self.cancellation.record_io(self.inner.read(chunk))
+    }
+}
+
+impl<T: Write> Write for CancellableIo<'_, T> {
+    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        self.cancellation.check()?;
+        let (chunk, _) = bytes.split_at(self.length(bytes.len()));
+        self.cancellation.record_io(self.inner.write(chunk))
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.cancellation.check()?;
+        self.cancellation.record_io(self.inner.flush())
+    }
+}
+
+pub fn with_cancellation<T>(
+    job: Option<&Job>,
+    operation: impl FnOnce(&Cancellation<'_>) -> Result<T>,
+) -> Result<T> {
+    let cancellation = Cancellation {
+        job,
+        observed: Cell::new(false),
+        io_failed: Cell::new(false),
+    };
+    let result = (|| {
+        cancellation.check()?;
+        let value = operation(&cancellation)?;
+        cancellation.check()?;
+        Ok(value)
+    })();
+    // The codec maps stream failures to its own error types
+    if cancellation.observed.get() {
+        Err(JobError::Cancelled.into())
+    } else {
+        result
+    }
+}
 
 /// A checked file whose size can be read from the same open descriptor
 pub trait SnapshotFile: Read + Seek {
@@ -121,23 +220,42 @@ pub fn read_files<G: SnapshotFile, B: SnapshotFile>(
     limits: CaseSnapshotLimits,
     budget: Option<&MemoryBudget>,
 ) -> Result<Case> {
-    if graph.snapshot_len()? != usage.graph_bytes || blobs.snapshot_len()? != usage.blob_pack_bytes
-    {
-        return Err(invalid(
-            "cached Case snapshot file lengths do not match its metadata",
-        ));
-    }
-    // A previous restore can leave both descriptors at end of file
-    graph.seek(SeekFrom::Start(0))?;
-    blobs.seek(SeekFrom::Start(0))?;
-    let result = read_streams(graph, blobs, usage, limits, budget);
-    #[cfg(target_os = "linux")]
-    if constrained_cgroup(budget) {
-        // Only advise the exact descriptors used by this operation
-        graph.advise_consumed();
-        blobs.advise_consumed();
-    }
-    result
+    read_files_cancellable(graph, blobs, usage, limits, budget, None)
+}
+
+/// Validate and restore open descriptors while checking a running job
+pub fn read_files_cancellable<G: SnapshotFile, B: SnapshotFile>(
+    graph: &mut G,
+    blobs: &mut B,
+    usage: CaseSnapshotUsage,
+    limits: CaseSnapshotLimits,
+    budget: Option<&MemoryBudget>,
+    job: Option<&Job>,
+) -> Result<Case> {
+    with_cancellation(job, |cancellation| {
+        if graph.snapshot_len()? != usage.graph_bytes
+            || blobs.snapshot_len()? != usage.blob_pack_bytes
+        {
+            return Err(invalid(
+                "cached Case snapshot file lengths do not match its metadata",
+            ));
+        }
+        // A previous restore can leave both descriptors at end of file
+        graph.seek(SeekFrom::Start(0))?;
+        blobs.seek(SeekFrom::Start(0))?;
+        let result = {
+            let mut graph_reader = cancellation.wrap(&mut *graph);
+            let mut blob_reader = cancellation.wrap(&mut *blobs);
+            read_streams(&mut graph_reader, &mut blob_reader, usage, limits, budget)
+        };
+        #[cfg(target_os = "linux")]
+        if constrained_cgroup(budget) {
+            // Only advise the exact descriptors used by this operation
+            graph.advise_consumed();
+            blobs.advise_consumed();
+        }
+        result
+    })
 }
 
 /// Restore an already-verified snapshot stream and check its measured usage
@@ -197,39 +315,118 @@ pub fn write_files(
     limits: CaseSnapshotLimits,
     budget: Option<&MemoryBudget>,
 ) -> Result<CaseSnapshotUsage> {
+    write_files_cancellable(graph, blobs, case, limits, budget, None)
+}
+
+/// Write fresh descriptors while checking a running job
+pub fn write_files_cancellable(
+    graph: &mut File,
+    blobs: &mut File,
+    case: &Case,
+    limits: CaseSnapshotLimits,
+    budget: Option<&MemoryBudget>,
+    job: Option<&Job>,
+) -> Result<CaseSnapshotUsage> {
+    with_cancellation(job, |cancellation| {
+        let mut buffers = prepare_snapshot_files(graph, blobs, budget)?;
+        let usage = write_buffered_snapshot(
+            graph,
+            blobs,
+            case,
+            limits,
+            budget,
+            &mut buffers,
+            cancellation,
+        )?;
+        sync_snapshot_files(graph, blobs, budget, cancellation)?;
+        Ok(usage)
+    })
+}
+
+fn prepare_snapshot_files(
+    graph: &mut File,
+    blobs: &mut File,
+    budget: Option<&MemoryBudget>,
+) -> Result<Option<MemoryLease>> {
     if graph.metadata()?.len() != 0 || blobs.metadata()?.len() != 0 {
         return Err(invalid("Case snapshot destination is not empty"));
     }
-    let mut buffers = budget
+    let buffers = budget
         .map(|budget| budget.try_reserve(MemoryClass::Cache, FILE_BUFFER_BYTES))
         .transpose()?;
     // Empty files can still have a nonzero seek position
     graph.seek(SeekFrom::Start(0))?;
     blobs.seek(SeekFrom::Start(0))?;
-    let usage = {
-        let mut graph_writer = BufWriter::with_capacity(FILE_BUFFER_CAPACITY, &mut *graph);
-        let mut blob_writer = BufWriter::with_capacity(FILE_BUFFER_CAPACITY, &mut *blobs);
-        if let Some(buffers) = &mut buffers {
-            let actual = graph_writer
-                .capacity()
-                .checked_add(blob_writer.capacity())
-                .ok_or("snapshot writer buffer size overflow")?;
-            buffers.try_resize(u64::try_from(actual)?)?;
-        }
-        let usage = write_streams(&mut graph_writer, &mut blob_writer, case, limits, budget)?;
-        graph_writer.flush()?;
-        blob_writer.flush()?;
-        usage
-    };
+    Ok(buffers)
+}
+
+fn write_buffered_snapshot(
+    graph: &mut File,
+    blobs: &mut File,
+    case: &Case,
+    limits: CaseSnapshotLimits,
+    budget: Option<&MemoryBudget>,
+    buffers: &mut Option<MemoryLease>,
+    cancellation: &Cancellation<'_>,
+) -> Result<CaseSnapshotUsage> {
+    let mut graph_writer = BufWriter::with_capacity(FILE_BUFFER_CAPACITY, cancellation.wrap(graph));
+    let mut blob_writer = BufWriter::with_capacity(FILE_BUFFER_CAPACITY, cancellation.wrap(blobs));
+    let result = write_snapshot_buffers(
+        &mut graph_writer,
+        &mut blob_writer,
+        case,
+        limits,
+        budget,
+        buffers,
+    );
+    if result.is_err() {
+        // Do not retry buffered writes during cleanup after a failed snapshot
+        let _ = graph_writer.into_parts();
+        let _ = blob_writer.into_parts();
+    }
+    result
+}
+
+fn write_snapshot_buffers(
+    graph: &mut BufWriter<impl Write>,
+    blobs: &mut BufWriter<impl Write>,
+    case: &Case,
+    limits: CaseSnapshotLimits,
+    budget: Option<&MemoryBudget>,
+    buffers: &mut Option<MemoryLease>,
+) -> Result<CaseSnapshotUsage> {
+    if let Some(buffers) = buffers {
+        let actual = graph
+            .capacity()
+            .checked_add(blobs.capacity())
+            .ok_or("snapshot writer buffer size overflow")?;
+        buffers.try_resize(u64::try_from(actual)?)?;
+    }
+    let usage = write_streams(graph, blobs, case, limits, budget)?;
+    graph.flush()?;
+    blobs.flush()?;
+    Ok(usage)
+}
+
+fn sync_snapshot_files(
+    graph: &mut File,
+    blobs: &mut File,
+    budget: Option<&MemoryBudget>,
+    cancellation: &Cancellation<'_>,
+) -> Result<()> {
+    cancellation.check()?;
     graph.sync_all()?;
+    cancellation.check()?;
     blobs.sync_all()?;
+    #[cfg(not(target_os = "linux"))]
+    let _ = budget;
     #[cfg(target_os = "linux")]
     if constrained_cgroup(budget) {
         // Clean pages can be reclaimed without risking unsynced snapshot contents
         graph.advise_consumed();
         blobs.advise_consumed();
     }
-    Ok(usage)
+    Ok(())
 }
 
 /// Write an exact snapshot to caller-owned bounded streams

@@ -269,6 +269,7 @@ pub(super) fn process_case_batch(
                             temporary_parent,
                             snapshot_limits,
                             working_set.memory(),
+                            context.job,
                         )?
                     } else {
                         BufferedResult::Resident(Box::new(result))
@@ -295,7 +296,10 @@ pub(super) fn process_case_batch(
             drop(buffered);
             let item = case
                 .item
-                .try_map_result(|result| result.restore(pool, context.memory))?;
+                .try_map_result(|result| result.restore(pool, context.memory, context.job))?;
+            if let Some(job) = context.job {
+                job.check_cancelled()?;
+            }
             emit(RecoveredCase {
                 item,
                 scope: case.scope,

@@ -104,6 +104,7 @@ fn real_full_tmpfs_spill_preserves_previous_output_and_cleans_private_files() ->
                 staging,
                 limits,
                 Some(&memory),
+                None,
             )?);
             Ok(())
         },

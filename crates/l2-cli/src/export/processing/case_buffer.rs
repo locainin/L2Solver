@@ -7,7 +7,7 @@ mod tests;
 use l2_workbench::{
     evidence::{CaseSnapshotLimits, CaseSnapshotUsage},
     investigation::BuildResult,
-    job::{BufferedCase, MemoryBudget, MemoryError},
+    job::{BufferedCase, Job, MemoryBudget, MemoryError},
 };
 use std::{error::Error, fs::File, path::Path};
 
@@ -40,16 +40,18 @@ impl BufferedResult {
         directory: &Path,
         limits: CaseSnapshotLimits,
         memory: Option<&MemoryBudget>,
+        job: Option<&Job>,
     ) -> Result<Self, Box<dyn Error>> {
         // Keep anonymous descriptors open; no path can be replaced before collection
         let mut graph = tempfile::tempfile_in(directory)?;
         let mut blobs = tempfile::tempfile_in(directory)?;
-        let usage = crate::case_snapshot::write_files(
+        let usage = crate::case_snapshot::write_files_cancellable(
             &mut graph,
             &mut blobs,
             &result.case,
             limits,
             memory,
+            job,
         )?;
         let complete = result.complete;
         // Release the full graph before placing the completion in the ordered queue
@@ -67,7 +69,11 @@ impl BufferedResult {
         self,
         pool: &rayon::ThreadPool,
         memory: Option<&MemoryBudget>,
+        job: Option<&Job>,
     ) -> Result<BuildResult, Box<dyn Error>> {
+        if let Some(job) = job {
+            job.check_cancelled()?;
+        }
         match self {
             Self::Resident(result) => Ok(*result),
             Self::Snapshot {
@@ -79,8 +85,8 @@ impl BufferedResult {
             } => {
                 // Reuse worker allocation arenas instead of building another graph in the collector
                 pool.install(move || {
-                    let case = crate::case_snapshot::read_files(
-                        &mut graph, &mut blobs, usage, limits, memory,
+                    let case = crate::case_snapshot::read_files_cancellable(
+                        &mut graph, &mut blobs, usage, limits, memory, job,
                     )
                     .map_err(|error| super::classify_worker_error(error.as_ref()))?;
                     Ok::<_, super::WorkerFailure>(BuildResult { case, complete })

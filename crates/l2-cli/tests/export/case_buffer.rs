@@ -36,11 +36,11 @@ fn spilling_releases_the_case_charge_and_restores_exact_evidence_and_coverage() 
     assert!(memory.snapshot()?.used(MemoryClass::Case) > 0);
     let limits = CaseSnapshotLimits::new(4 * 1024 * 1024, 4 * 1024 * 1024);
 
-    let buffered = BufferedResult::spill(result, directory.path(), limits, Some(&memory))?;
+    let buffered = BufferedResult::spill(result, directory.path(), limits, Some(&memory), None)?;
     assert_eq!(memory.snapshot()?.used_bytes, 0);
     // Anonymous descriptors cannot be mistaken for a published or reusable completed result
     assert_eq!(directory.path().read_dir()?.count(), 0);
-    let restored = buffered.restore(&pool, Some(&memory))?;
+    let restored = buffered.restore(&pool, Some(&memory), None)?;
     assert!(!restored.complete);
     assert_eq!(restored.case.to_json()?, expected);
     drop(restored);
@@ -54,7 +54,7 @@ fn snapshot_write_limit_failure_releases_the_original_case() -> TestResult {
     let memory = MemoryBudget::new(16 * 1024 * 1024);
     let result = retained_result(&memory)?;
     let limits = CaseSnapshotLimits::new(1, 1);
-    assert!(BufferedResult::spill(result, directory.path(), limits, Some(&memory)).is_err());
+    assert!(BufferedResult::spill(result, directory.path(), limits, Some(&memory), None).is_err());
     assert_eq!(memory.snapshot()?.used_bytes, 0);
     assert_eq!(directory.path().read_dir()?.count(), 0);
     Ok(())
@@ -67,10 +67,11 @@ fn snapshot_restore_admission_failure_is_typed_and_drops_private_files() -> Test
     let writer_memory = MemoryBudget::new(16 * 1024 * 1024);
     let result = retained_result(&writer_memory)?;
     let limits = CaseSnapshotLimits::new(4 * 1024 * 1024, 4 * 1024 * 1024);
-    let buffered = BufferedResult::spill(result, directory.path(), limits, Some(&writer_memory))?;
+    let buffered =
+        BufferedResult::spill(result, directory.path(), limits, Some(&writer_memory), None)?;
     let reader_memory = MemoryBudget::new(1);
     let error = buffered
-        .restore(&pool, Some(&reader_memory))
+        .restore(&pool, Some(&reader_memory), None)
         .err()
         .ok_or("restore should exceed admission")?;
     assert!(crate::memory_error::find(error.as_ref()).is_some());
@@ -91,12 +92,13 @@ fn damaged_handoff_snapshot_is_rejected_before_collection() -> TestResult {
         directory.path(),
         limits,
         Some(&memory),
+        None,
     )?;
     let BufferedResult::Snapshot { graph, .. } = &mut buffered else {
         return Err("result was not spilled".into());
     };
     graph.set_len(0)?;
-    assert!(buffered.restore(&pool, Some(&memory)).is_err());
+    assert!(buffered.restore(&pool, Some(&memory), None).is_err());
     assert_eq!(memory.snapshot()?.used_bytes, 0);
     Ok(())
 }
@@ -115,6 +117,7 @@ fn ordered_restoration_uses_the_pool_without_blocking_a_later_worker_waiting_for
             directory.path(),
             limits,
             Some(&memory),
+            None,
         )?;
         items.push((index, buffered));
     }
@@ -136,7 +139,7 @@ fn ordered_restoration_uses_the_pool_without_blocking_a_later_worker_waiting_for
             Ok::<_, String>((index, buffered))
         },
         |(index, buffered)| {
-            let restored = buffered.restore(&pool, Some(&memory))?;
+            let restored = buffered.restore(&pool, Some(&memory), None)?;
             assert_eq!(
                 restored
                     .case

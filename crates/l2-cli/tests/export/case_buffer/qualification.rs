@@ -31,7 +31,7 @@ fn case_for_index(
     case.add_bytes_node("original", &bytes, Vec::new(), json!({"ordinal": index}))?;
     Ok(BuildResult {
         case,
-        complete: index % 2 == 0,
+        complete: index.is_multiple_of(2),
     })
 }
 
@@ -77,7 +77,7 @@ fn prepare_case(
     let buffered = if index == 0 {
         BufferedResult::Resident(Box::new(result))
     } else {
-        BufferedResult::spill(result, root, limits, Some(memory))?
+        BufferedResult::spill(result, root, limits, Some(memory), None)?
     };
     let observation = buffered.observe(memory)?;
     Ok(QueuedCase {
@@ -102,7 +102,7 @@ fn check_restored_case(
         blob_sha256,
     } = queued;
     drop(observation);
-    let restored = buffered.restore(pool, Some(memory))?;
+    let restored = buffered.restore(pool, Some(memory), None)?;
     assert_eq!(sha256(&restored.case.to_json()?), case_sha256);
     let blob = restored
         .case
@@ -126,7 +126,7 @@ fn check_restored_case(
             .and_then(serde_json::Value::as_u64),
         Some(u64::try_from(index)?)
     );
-    assert_eq!(restored.complete, index % 2 == 0);
+    assert_eq!(restored.complete, index.is_multiple_of(2));
     println!(
         "restored case={index} graph_sha256={case_sha256} blob_sha256={blob_sha256} bytes={}",
         blob.bytes.len()
@@ -209,6 +209,7 @@ fn corrupted_ordered_spill_does_not_replace_previous_output_or_leak_files() -> T
                 staging,
                 limits,
                 Some(&memory),
+                None,
             )?;
             let BufferedResult::Snapshot { graph, .. } = &mut damaged else {
                 return Err("snapshot was not spilled".into());
@@ -219,6 +220,7 @@ fn corrupted_ordered_spill_does_not_replace_previous_output_or_leak_files() -> T
                 staging,
                 limits,
                 Some(&memory),
+                None,
             )?;
             let first_observation = damaged.observe(&memory)?;
             let second_observation = second.observe(&memory)?;
@@ -229,7 +231,7 @@ fn corrupted_ordered_spill_does_not_replace_previous_output_or_leak_files() -> T
                 |item, ()| Ok::<_, String>(item),
                 |(buffered, observation)| {
                     drop(observation);
-                    let restored = buffered.restore(&pool, Some(&memory))?;
+                    let restored = buffered.restore(&pool, Some(&memory), None)?;
                     drop(restored);
                     Ok(())
                 },
