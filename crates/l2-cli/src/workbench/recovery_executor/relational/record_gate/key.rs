@@ -10,7 +10,8 @@ use l2_workbench::{
 };
 use std::hash::{Hash, Hasher};
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
+#[serde(deny_unknown_fields)]
 pub(super) struct SchemaLayoutKey {
     discovery_sessions: Vec<u64>,
     heldout_sessions: Vec<u64>,
@@ -21,7 +22,8 @@ pub(super) struct SchemaLayoutKey {
     work_limit: usize,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
+#[serde(deny_unknown_fields)]
 pub(super) struct SchemaHeaderKey {
     split_basis: u8,
     discovery_sessions: Vec<u64>,
@@ -36,6 +38,60 @@ pub(super) struct SchemaHeaderKey {
 impl SchemaHeaderKey {
     pub(super) const fn retained_bytes(&self) -> usize {
         self.retained_bytes
+    }
+
+    pub(super) fn verify_replay(
+        &self,
+        frames: &[DecodedFrameOutput],
+        report: &RelationalTransformReport,
+        format: ArtifactValidationFormat,
+        policy: ArtifactValidationPolicy,
+        limits: RecordSchemaProposalLimits,
+    ) -> Result<(), RecoveryExecutionError> {
+        if self.schema_limits != limits
+            || self.validation_format != format
+            || self.validation_policy != policy
+            || schema_header_key(
+                frames,
+                report,
+                self.validation_format,
+                self.validation_policy,
+                self.schema_limits,
+                self.retained_bytes,
+            )?
+            .as_ref()
+                != Some(self)
+        {
+            return Err(l2_workbench::recovery::RecoveryError::InvalidCheckpoint.into());
+        }
+        Ok(())
+    }
+}
+
+impl SchemaLayoutKey {
+    pub(super) fn verify_replay(
+        &self,
+        frames: &[DecodedFrameOutput],
+        report: &RelationalTransformReport,
+        format: ArtifactValidationFormat,
+        policy: ArtifactValidationPolicy,
+        limits: RecordSchemaProposalLimits,
+    ) -> Result<(), RecoveryExecutionError> {
+        if self.schema_limits != limits
+            || self.validation_format != format
+            || self.validation_policy != policy
+            || schema_layout_key(
+                frames,
+                report,
+                self.validation_format,
+                self.validation_policy,
+                self.schema_limits,
+                self.work_limit,
+            )? != *self
+        {
+            return Err(l2_workbench::recovery::RecoveryError::InvalidCheckpoint.into());
+        }
+        Ok(())
     }
 }
 
@@ -59,7 +115,8 @@ impl Hash for SchemaLayoutKey {
     }
 }
 
-#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+#[derive(Clone, Debug, Eq, Hash, PartialEq, serde::Deserialize, serde::Serialize)]
+#[serde(deny_unknown_fields)]
 struct FrameLayoutKey {
     input_node_id: u64,
     source: String,
@@ -73,7 +130,8 @@ struct FrameLayoutKey {
     transformed_output_sha256: String,
 }
 
-#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+#[derive(Clone, Debug, Eq, Hash, PartialEq, serde::Deserialize, serde::Serialize)]
+#[serde(deny_unknown_fields)]
 struct FrameHeaderKey {
     input_node_id: u64,
     seed_sample: u64,

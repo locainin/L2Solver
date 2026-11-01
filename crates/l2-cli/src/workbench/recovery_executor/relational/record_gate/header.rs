@@ -1,6 +1,7 @@
 use super::super::super::RecoveryExecutionError;
 use super::super::invalid_policy;
 use l2_workbench::protocol::{HeaderParseTemplate, RecordAssemblyPlan, RecordLimits, RecordSchema};
+use std::sync::Arc;
 
 #[derive(Clone)]
 pub(super) struct HeaderSchemaModel {
@@ -14,6 +15,7 @@ pub(super) struct HeaderSchemaPlan {
     pub(super) assembly_plan: RecordAssemblyPlan,
     pub(super) retained_bytes: usize,
     pub(super) omitted_models: usize,
+    pub(super) producer_rule: Option<Arc<l2_workbench::protocol::RelationalTransformRule>>,
 }
 
 impl HeaderSchemaModel {

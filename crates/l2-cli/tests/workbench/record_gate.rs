@@ -17,6 +17,9 @@ type TestResult = Result<(), Box<dyn Error>>;
 // Corroboration tests need room for parser metadata as well as the tiny input bytes
 const STRUCTURAL_CHECK_WORK_LIMIT: usize = 64 * 1024;
 
+#[path = "record_gate_structural_checkpoint.rs"]
+mod structural_checkpoint;
+
 #[test]
 fn clear_header_frames_without_a_schema_report_remain_pending() -> TestResult {
     let frames = [clear_header_frame()];
@@ -132,6 +135,7 @@ fn varying_record_lengths_support_a_schema_when_sequences_repeat() -> TestResult
         "{:?}",
         result.details
     );
+    assert!(result.structural_evidence.is_none());
     Ok(())
 }
 
@@ -206,7 +210,7 @@ fn family_schema_support_stays_pending_when_any_message_is_unassigned() -> TestR
     let family_alternative = SchemaAlternative {
         label: "family_selector_0_value_0".to_owned(),
         frame_indices: Some(Arc::from([0_usize, 1])),
-        discovery_report: Some(surviving_report(2)),
+        discovery_report: Some(surviving_report(2).into()),
         limits: RecordSchemaProposalLimits::default(),
         discovery_work_bytes: 0,
         learning_message_count: 2,
@@ -226,6 +230,7 @@ fn family_schema_support_stays_pending_when_any_message_is_unassigned() -> TestR
         has_unassigned_family_messages: true,
         family_search_complete: false,
         assessment_scope: super::SchemaOffsetScope::CompleteInput,
+        producer_rule: None,
     };
 
     let result = screen_with_schema_plan(
@@ -268,7 +273,7 @@ fn schema_plan(
         alternatives: vec![SchemaAlternative {
             label: "test".to_owned(),
             frame_indices: None,
-            discovery_report,
+            discovery_report: discovery_report.map(Into::into),
             limits: RecordSchemaProposalLimits::default(),
             discovery_work_bytes: 0,
             learning_message_count: 0,
@@ -285,6 +290,7 @@ fn schema_plan(
         has_unassigned_family_messages: false,
         family_search_complete: true,
         assessment_scope: super::SchemaOffsetScope::CompleteInput,
+        producer_rule: None,
     }
 }
 
@@ -385,7 +391,7 @@ fn uniform_and_pending_family_plan() -> SchemaPlan {
             SchemaAlternative {
                 label: "uniform:repeated_boundaries".to_owned(),
                 frame_indices: None,
-                discovery_report: Some(incomplete_surviving_report(3)),
+                discovery_report: Some(incomplete_surviving_report(3).into()),
                 limits: RecordSchemaProposalLimits::default(),
                 discovery_work_bytes: 0,
                 learning_message_count: 3,
@@ -418,6 +424,7 @@ fn uniform_and_pending_family_plan() -> SchemaPlan {
         has_unassigned_family_messages: true,
         family_search_complete: false,
         assessment_scope: super::SchemaOffsetScope::CompleteInput,
+        producer_rule: None,
     }
 }
 

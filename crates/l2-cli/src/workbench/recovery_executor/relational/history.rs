@@ -10,19 +10,83 @@ use l2_workbench::protocol::RelationalReplayHistory;
 #[path = "../../../../tests/workbench/recovery_relational/history.rs"]
 mod tests;
 
-#[derive(Default, serde::Serialize, serde::Deserialize)]
+#[derive(Default, serde::Serialize)]
 pub(super) struct RelationalReplayHistories {
     slots: Vec<HistorySlot>,
+}
+
+impl<'de> serde::Deserialize<'de> for RelationalReplayHistories {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        #[derive(serde::Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct Saved {
+            slots: Box<[HistorySlot]>,
+        }
+        let saved = Saved::deserialize(deserializer)?;
+        // Restoring JSON must not add spare slots that consume the saved search allowance
+        Ok(Self {
+            slots: saved.slots.into_vec(),
+        })
+    }
 }
 
 #[derive(serde::Serialize, serde::Deserialize)]
 struct HistorySlot {
     key: RelationalCohortKey,
-    signature: Vec<HistorySampleIdentity>,
+    signature: Box<[HistorySampleIdentity]>,
     history: RelationalReplayHistory,
 }
 
 impl RelationalReplayHistories {
+    pub(super) fn take_for_context(
+        &mut self,
+        context: &RelationalDiscoveryContext,
+        maximum_slots: usize,
+        total_bytes: usize,
+    ) -> Option<RelationalReplayHistory> {
+        self.for_context(context, maximum_slots, total_bytes)
+            .map(|history| std::mem::replace(history, RelationalReplayHistory::new(0)))
+    }
+
+    pub(super) fn take_restored_context(
+        &mut self,
+        context: &RelationalDiscoveryContext,
+        total_bytes: usize,
+        history: RelationalReplayHistory,
+    ) -> Result<RelationalReplayHistory, l2_workbench::recovery::RecoveryError> {
+        let slot = self
+            .resume_context(context, total_bytes)
+            .ok_or(l2_workbench::recovery::RecoveryError::InvalidCheckpoint)?;
+        if slot.maximum_bytes() != 0 || slot.storage_bytes() != 0 {
+            return Err(l2_workbench::recovery::RecoveryError::InvalidCheckpoint);
+        }
+        *slot = history;
+        let slot = self
+            .resume_context(context, total_bytes)
+            .ok_or(l2_workbench::recovery::RecoveryError::InvalidCheckpoint)?;
+        Ok(std::mem::replace(slot, RelationalReplayHistory::new(0)))
+    }
+
+    pub(super) fn return_context(
+        &mut self,
+        context: &RelationalDiscoveryContext,
+        history: RelationalReplayHistory,
+    ) -> Result<(), l2_workbench::recovery::RecoveryError> {
+        let slot = self
+            .slots
+            .iter_mut()
+            .find(|slot| {
+                slot.key == context.key
+                    && history_input_matches(&context.key, &context.samples, &slot.signature)
+            })
+            .ok_or(l2_workbench::recovery::RecoveryError::InvalidCheckpoint)?;
+        if slot.history.maximum_bytes() != 0 || slot.history.storage_bytes() != 0 {
+            return Err(l2_workbench::recovery::RecoveryError::InvalidCheckpoint);
+        }
+        slot.history = history;
+        Ok(())
+    }
+
     pub(super) fn for_context(
         &mut self,
         context: &RelationalDiscoveryContext,
@@ -68,7 +132,7 @@ impl RelationalReplayHistories {
         let signature = history_input_signature(&context.key, &context.samples, signature_limit)?;
         let slot = HistorySlot {
             key: context.key.clone(),
-            signature,
+            signature: signature.into_boxed_slice(),
             history: RelationalReplayHistory::new(0),
         };
         let index = self.slots.len();
@@ -91,6 +155,29 @@ impl RelationalReplayHistories {
             return None;
         }
         self.limit_slot(index, total_bytes)
+    }
+
+    pub(super) fn resume_context(
+        &mut self,
+        context: &RelationalDiscoveryContext,
+        total_bytes: usize,
+    ) -> Option<&mut RelationalReplayHistory> {
+        let index = self.slots.iter().position(|slot| slot.key == context.key)?;
+        let slot = self.slots.get(index)?;
+        if !history_input_matches(&context.key, &context.samples, &slot.signature) {
+            return None;
+        }
+        let current = slot.history.storage_bytes();
+        let other = self
+            .retained_bytes()?
+            .checked_sub(current.checked_add(current / 4)?)?;
+        let maximum = slot.history.maximum_bytes();
+        let reserved = maximum.checked_add(maximum / 4)?;
+        if other.checked_add(reserved)? > total_bytes {
+            return None;
+        }
+        // Keep the saved ceiling: changing it changes later replay-history omissions
+        Some(&mut self.slots.get_mut(index)?.history)
     }
 
     pub(super) fn discard_context(&mut self, context: &RelationalDiscoveryContext) {
@@ -135,7 +222,7 @@ impl RelationalReplayHistories {
                 .checked_mul(2)?;
             let signature = slot
                 .signature
-                .capacity()
+                .len()
                 .checked_mul(std::mem::size_of::<HistorySampleIdentity>())?;
             let history = slot.history.storage_bytes();
             total

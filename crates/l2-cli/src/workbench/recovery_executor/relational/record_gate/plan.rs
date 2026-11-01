@@ -17,7 +17,8 @@ use std::collections::BTreeSet;
 
 const MAX_RETAINED_SCHEMA_HYPOTHESES: usize = 128;
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
 pub(in crate::workbench::recovery_executor::relational) enum SchemaOffsetScope {
     PreservedHeader,
     CompleteInput,
@@ -56,6 +57,7 @@ struct PlanAnalysisRequest<'frames, 'messages> {
     parser_format: l2_workbench::artifact::ArtifactValidationFormat,
     artifact_policy: l2_workbench::artifact::ArtifactValidationPolicy,
     job: Option<&'frames Job>,
+    structural_admission: Option<super::StructuralAdmission<'frames>>,
     inputs: &'frames [l2_workbench::protocol::RecordInput<'frames>],
     offset_scope: SchemaOffsetScope,
     assessment_scope: SchemaOffsetScope,
@@ -151,6 +153,8 @@ pub(super) fn build_schema_plan(
             artifact_policy,
             work_limit,
             job,
+            producer_rule: None,
+            structural_admission: None,
         },
         None,
         SchemaOffsetScope::PreservedHeader,
@@ -160,22 +164,12 @@ pub(super) fn build_schema_plan(
 pub(super) fn build_full_schema_plan(
     frames: &[DecodedFrameOutput],
     report: &RelationalTransformReport,
-    schema_limits: RecordSchemaProposalLimits,
-    work_limit: usize,
-    parser_format: l2_workbench::artifact::ArtifactValidationFormat,
-    artifact_policy: l2_workbench::artifact::ArtifactValidationPolicy,
-    job: Option<&Job>,
+    options: SchemaCandidateOptions<'_>,
 ) -> Result<SchemaPlan, RecoveryExecutionError> {
     build_schema_plan_with_scope(
         frames,
         report,
-        SchemaCandidateOptions {
-            parser_format,
-            schema_limits,
-            artifact_policy,
-            work_limit,
-            job,
-        },
+        options,
         None,
         SchemaOffsetScope::CompleteInput,
     )
@@ -209,6 +203,7 @@ fn build_schema_plan_with_scope<'frames>(
         artifact_policy,
         work_limit,
         job,
+        structural_admission,
         ..
     } = options;
     let discovery = session_ids(&report.discovery_sessions);
@@ -267,6 +262,7 @@ fn build_schema_plan_with_scope<'frames>(
         parser_format,
         artifact_policy,
         job,
+        structural_admission: structural_admission.copied(),
         inputs,
         offset_scope,
         assessment_scope,
@@ -284,6 +280,7 @@ fn analyze_plan(
         parser_format: request.parser_format,
         artifact_policy: request.artifact_policy,
         job: request.job,
+        structural_admission: request.structural_admission,
     });
     let uniform_analysis_budget = request.work_limit.checked_div(2).unwrap_or(0);
     let uniform_request = AnalysisRequest {
@@ -333,6 +330,7 @@ fn analyze_plan(
         has_unassigned_family_messages: family.has_unassigned_messages,
         family_search_complete: family.complete,
         assessment_scope: request.assessment_scope,
+        producer_rule: None,
     })
 }
 
@@ -556,6 +554,7 @@ fn pending_plan(
         has_unassigned_family_messages: false,
         family_search_complete: false,
         assessment_scope,
+        producer_rule: None,
     }
 }
 

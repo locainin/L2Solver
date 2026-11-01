@@ -1,6 +1,7 @@
 //! Bounded relational transform discovery over strict per-session record candidates
 
 mod application;
+pub(super) mod checkpoint;
 mod history;
 mod input;
 mod publication;
@@ -15,12 +16,24 @@ pub(super) use application::aggregate_validator;
 mod materialization_tests;
 
 #[cfg(test)]
+#[path = "../../../tests/workbench/recovery_relational/gate_checkpoint.rs"]
+mod gate_checkpoint_tests;
+
+#[cfg(test)]
+#[path = "../../../tests/workbench/recovery_relational/prepared_checkpoint.rs"]
+mod prepared_checkpoint_tests;
+
+#[cfg(test)]
 #[path = "../../../tests/workbench/recovery_relational/application_fallback.rs"]
 mod application_fallback_tests;
 
 #[cfg(test)]
 #[path = "../../../tests/workbench/recovery_relational/search_budget.rs"]
 mod search_budget_tests;
+
+#[cfg(test)]
+#[path = "../../../tests/workbench/recovery_relational/producer_admission.rs"]
+mod producer_admission_tests;
 
 #[cfg(test)]
 #[path = "../../../tests/workbench/recovery_relational/scheduler.rs"]
@@ -60,7 +73,7 @@ struct RelationalCohortKey {
     schema_json: String,
 }
 
-#[derive(Clone, serde::Serialize, serde::Deserialize)]
+#[derive(Clone, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
 struct StoredSample {
     node_id: u64,
     context: MessageContext,
@@ -225,7 +238,7 @@ pub(in crate::workbench::recovery_executor) struct RawRelationalRunInput {
     pub(in crate::workbench::recovery_executor) start_known: bool,
 }
 
-#[derive(Clone, serde::Serialize, serde::Deserialize)]
+#[derive(Clone, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
 pub(super) struct RelationalDiscoveryContext {
     lane: RelationalLane,
     key: RelationalCohortKey,
@@ -238,8 +251,11 @@ pub(super) struct RelationalDiscoveryContext {
     input_coverage_complete: bool,
 }
 
+#[derive(serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 struct AppliedOutput {
     candidate_index: usize,
+    #[serde(with = "l2_workbench::job::checkpoint_relational_output")]
     value: RelationalAppliedOutput,
     sha256: String,
     parser_format: l2_workbench::artifact::ArtifactValidationFormat,
@@ -248,21 +264,33 @@ struct AppliedOutput {
     seed_samples: Vec<u64>,
 }
 
-struct PreparedRelationalCohort {
+#[derive(serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(super) struct PreparedRelationalCohort {
     context: RelationalDiscoveryContext,
+    #[serde(with = "l2_workbench::job::checkpoint_bytes")]
     report_bytes: Vec<u8>,
     outputs: Vec<AppliedOutput>,
     decoded_frames: Vec<DecodedFrameOutput>,
     accepted_schemas: Vec<(usize, AcceptedRecordSchema)>,
+    structural_evidence: Vec<(usize, record_gate::StructuralEvidence)>,
+    // Retained data can be checked against its exact producing rule after restoration
+    producer_rules: Vec<(usize, l2_workbench::protocol::RelationalTransformRule)>,
+    // The cohort admission replaces this temporary charge before the next checkpoint
+    #[serde(skip)]
+    producer_memory: Option<l2_workbench::job::MemoryLease>,
     published_rules: Vec<l2_workbench::protocol::RelationalTransformRule>,
+    history_used: bool,
     report_details_complete: bool,
     search_exhaustive_within_plan: bool,
     candidate_limit_remaining: usize,
     locator_candidate_limit_remaining: usize,
     work_bytes_remaining: usize,
-    reason: Option<&'static str>,
+    reason: Option<std::borrow::Cow<'static, str>>,
 }
 
+#[derive(serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 struct DecodedFrameOutput {
     context: MessageContext,
     input_node_id: u64,
@@ -277,13 +305,18 @@ struct DecodedFrameOutput {
     expected_session_orders: Vec<u64>,
     payload_range: l2_workbench::protocol::ByteRange,
     preserved_header_end: Option<usize>,
+    #[serde(with = "l2_workbench::job::checkpoint_bytes")]
     bytes: Vec<u8>,
 }
 
+#[derive(serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 struct GateAssessment {
     status: GateStatus,
     details: Value,
     accepted_schema: Option<AcceptedRecordSchema>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    structural_evidence: Option<record_gate::StructuralEvidence>,
     assessment_scope: Option<SchemaOffsetScope>,
     work_limited_at: Option<usize>,
 }
@@ -517,12 +550,8 @@ impl Executor<'_> {
         if contexts.is_empty() {
             return Err(RecoveryError::InvariantFailure.into());
         }
-        let origins = contexts
-            .iter()
-            .flat_map(|context| context.sample_node_ids.iter().copied())
-            .collect::<Vec<_>>();
         let mut work_remaining = self.coordinator.remaining_work_bytes();
-        let (task, base_plan) = self.relational_task_plan(candidate_id)?;
+        let (_, base_plan) = self.relational_task_plan(candidate_id)?;
         let mut histories = std::mem::take(&mut self.relational_samples.histories);
         let prepared = {
             let job = self.job.as_ref().map(|progress| &progress.job);
@@ -536,33 +565,50 @@ impl Executor<'_> {
             )
         };
         self.relational_samples.histories = histories;
-        let prepared = prepared?;
+        self.publish_prepared_relational(candidate_id, &prepared?, work_remaining)
+    }
+
+    pub(super) fn publish_prepared_relational(
+        &mut self,
+        candidate_id: RecoveryCandidateId,
+        prepared: &[PreparedRelationalCohort],
+        work_remaining: usize,
+    ) -> Result<(), RecoveryExecutionError> {
+        let contexts = self
+            .relational_discoveries
+            .get(&candidate_id)
+            .ok_or(RecoveryError::InvariantFailure)?;
+        let origins = contexts
+            .iter()
+            .flat_map(|context| context.sample_node_ids.iter().copied())
+            .collect::<Vec<_>>();
+        let (task, _) = self.relational_task_plan(candidate_id)?;
         let total_work = self
             .coordinator
             .remaining_work_bytes()
             .checked_sub(work_remaining)
             .ok_or(RecoveryError::InvariantFailure)?;
         if !self.charge_work(candidate_id, &task, &origins, total_work)? {
-            self.discard_unpublished_histories(&prepared);
+            self.discard_unpublished_histories(prepared);
             return Ok(());
         }
         if !self.check_output(
             candidate_id,
             &task,
             &origins,
-            prepared_output_bytes(&prepared)?,
+            prepared_output_bytes(prepared)?,
         )? {
-            self.discard_unpublished_histories(&prepared);
+            self.discard_unpublished_histories(prepared);
             return Ok(());
         }
         self.omissions
             .try_reserve(prepared.len())
             .map_err(|source| operational("relational omission allocation failed", source))?;
         let committed = self.case_transaction_and_finish(candidate_id, |case| {
-            publication::publish_prepared_cohorts(case, &prepared)
+            publication::publish_prepared_cohorts(case, prepared)
         })?;
-        self.record_committed_cohorts(&prepared);
-        self.record_relational_omissions(&prepared);
+        self.record_committed_cohorts(prepared);
+        self.record_relational_omissions(prepared);
         for output_node in committed.output_node_ids {
             self.enqueue_root(output_node, OUTPUT_KIND)?;
         }
@@ -575,7 +621,7 @@ impl Executor<'_> {
         Ok(())
     }
 
-    fn relational_task_plan(
+    pub(super) fn relational_task_plan(
         &self,
         candidate_id: RecoveryCandidateId,
     ) -> Result<
@@ -639,7 +685,7 @@ impl Executor<'_> {
 
     fn record_relational_omissions(&mut self, prepared: &[PreparedRelationalCohort]) {
         for cohort in prepared {
-            if cohort.reason == Some("insufficient_independent_sessions")
+            if cohort.reason.as_deref() == Some("insufficient_independent_sessions")
                 && cohort.context.input_coverage_complete
                 && cohort.context.omitted_sessions == 0
                 && cohort.context.omitted_samples == 0
@@ -663,7 +709,7 @@ impl Executor<'_> {
                     omitted_sessions: cohort.context.omitted_sessions,
                     omitted_samples: cohort.context.omitted_samples,
                     omitted_rules: usize::from(
-                        cohort.reason == Some("supported_rule_application_limit"),
+                        cohort.reason.as_deref() == Some("supported_rule_application_limit"),
                     ),
                     candidate_limit_remaining: cohort.candidate_limit_remaining,
                     locator_candidate_limit_remaining: cohort.locator_candidate_limit_remaining,
@@ -671,7 +717,7 @@ impl Executor<'_> {
                     input_coverage_complete: cohort.context.input_coverage_complete,
                     search_exhaustive_within_plan: cohort.search_exhaustive_within_plan,
                     report_details_complete: cohort.report_details_complete,
-                    reason: cohort.reason.map(Into::into),
+                    reason: cohort.reason.clone(),
                 });
         }
     }

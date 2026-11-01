@@ -338,6 +338,7 @@ fn cold_candidate_without_a_reusable_header_plan_runs_complete_input_inference()
         has_unassigned_family_messages: false,
         family_search_complete: true,
         assessment_scope: SchemaOffsetScope::CompleteInput,
+        producer_rule: None,
     });
     for work_limit in 0..MAX_CACHED_SCHEMA_PLANS {
         let key = schema_layout_key(
@@ -826,6 +827,7 @@ fn observe_with_one_omitted_frame(
         artifact_policy: ArtifactValidationPolicy::default(),
         work_limit: 1024 * 1024,
         job: None,
+        structural_admission: None,
         full_input_bytes,
     };
     let mut observer_work = 0;
@@ -1218,6 +1220,8 @@ fn candidate_options(
         artifact_policy,
         work_limit,
         job: None,
+        producer_rule: None,
+        structural_admission: None,
     }
 }
 

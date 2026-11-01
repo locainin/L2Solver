@@ -228,7 +228,7 @@ pub(super) fn parsed_record_metadata_bytes(records: &[ParsedRecord]) -> usize {
 }
 
 /// Exact payload mapping into one materialized group candidate
-#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct RecordAssemblyPart {
     /// Zero-based source position in the caller-supplied input order
@@ -244,7 +244,7 @@ pub struct RecordAssemblyPart {
 }
 
 /// Evidence receipt for one identifier group
-#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct RecordGroupReceipt {
     /// Exact opaque identifier bytes

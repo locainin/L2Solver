@@ -196,6 +196,49 @@ fn decode_mapping_case(
     sample_context: &MessageContext,
     mappings: Vec<RelationalOutputMapping>,
 ) -> TestResult<Vec<super::DecodedFrameOutput>> {
+    decode_mapping_case_with_job(session, sample_context, mappings, None)
+}
+
+#[test]
+fn decoded_frame_materialization_stops_for_a_cancelled_job() {
+    let session = session(1);
+    let context = message_context(&session);
+    let job = l2_workbench::job::Job::new("decoded frame cancellation regression");
+    job.request_cancel();
+    let mapping = RelationalOutputMapping {
+        sample: 101,
+        source_range: ByteRange { start: 3, end: 10 },
+        output_range: ByteRange { start: 0, end: 7 },
+    };
+    assert!(decode_mapping_case_with_job(&session, &context, vec![mapping], Some(&job)).is_err());
+    let invalid_mapping = RelationalOutputMapping {
+        sample: 101,
+        source_range: ByteRange { start: 3, end: 10 },
+        output_range: ByteRange { start: 0, end: 8 },
+    };
+    let error = decode_mapping_case_with_job(&session, &context, vec![invalid_mapping], Some(&job))
+        .err()
+        .and_then(|error| {
+            error
+                .downcast::<crate::workbench::recovery_executor::RecoveryExecutionError>()
+                .ok()
+        });
+    assert!(matches!(
+        error.as_deref(),
+        Some(
+            crate::workbench::recovery_executor::RecoveryExecutionError::Job(
+                l2_workbench::job::JobError::Cancelled
+            )
+        )
+    ));
+}
+
+fn decode_mapping_case_with_job(
+    session: &RelationalSessionId,
+    sample_context: &MessageContext,
+    mappings: Vec<RelationalOutputMapping>,
+    job: Option<&l2_workbench::job::Job>,
+) -> TestResult<Vec<super::DecodedFrameOutput>> {
     let mut sample_ids = Vec::new();
     for mapping in &mappings {
         if !sample_ids.contains(&mapping.sample) {
@@ -229,6 +272,7 @@ fn decode_mapping_case(
         candidate_index: 0,
         expected_session_orders: &expected_session_orders,
         raw_directional_run: false,
+        job,
     };
     let applied = RelationalAppliedOutput {
         session: session.clone(),
@@ -398,7 +442,7 @@ fn frozen_session_relative_rule_replays_through_the_existing_record_gate() -> Te
     Ok(())
 }
 
-fn frozen_session_relative_rule() -> RelationalTransformRule {
+pub(super) fn frozen_session_relative_rule() -> RelationalTransformRule {
     RelationalTransformRule {
         seed_locator: RelationalByteRangeLocator {
             coordinate_basis: RelationalCoordinateBasis::MessageStartV1,
@@ -430,7 +474,7 @@ fn frozen_session_relative_rule() -> RelationalTransformRule {
     }
 }
 
-fn replay_frozen_frames(
+pub(super) fn replay_frozen_frames(
     samples: &[RelationalRecordSample<'_>],
     stored_samples: &[StoredSample],
     sessions: &[RelationalSessionId],
@@ -462,6 +506,7 @@ fn replay_frozen_frames(
         candidate_index: 0,
         expected_session_orders: &session_orders,
         raw_directional_run: false,
+        job: None,
     };
     let mut frames = Vec::new();
     for output in &outputs {
@@ -485,7 +530,7 @@ fn replay_frozen_frames(
     Ok(frames)
 }
 
-fn frozen_session_relative_report(
+pub(super) fn frozen_session_relative_report(
     sessions: &[RelationalSessionId],
     work_limit: usize,
 ) -> TestResult<RelationalTransformReport> {
@@ -539,6 +584,8 @@ fn assert_gate_accepts_frozen_schema(
             artifact_policy: ArtifactValidationPolicy::default(),
             work_limit,
             job: None,
+            producer_rule: None,
+            structural_admission: None,
         },
     )?;
     assert!(gate.work_bytes <= work_limit);
@@ -598,7 +645,11 @@ fn assert_accepted_schema_uses_byte_identity(
         frame.candidate_index = 7;
     }
     assert!(
-        validate_accepted_record_schema(7, frames, accepted).is_ok(),
+        validate_accepted_record_schema(7, frames, accepted, |_, frame| Ok(l2_workbench::sha256(
+            &frame.bytes
+        )
+        .into()))
+        .is_ok(),
         "the exact accepted bytes remain valid when the retained candidate index changes"
     );
     let original_bytes = frames
@@ -611,7 +662,11 @@ fn assert_accepted_schema_uses_byte_identity(
         .and_then(|frame| frame.bytes.first_mut())
         .ok_or("accepted schema frame is empty")? ^= 1;
     assert!(
-        validate_accepted_record_schema(7, frames, accepted).is_err(),
+        validate_accepted_record_schema(7, frames, accepted, |_, frame| Ok(l2_workbench::sha256(
+            &frame.bytes
+        )
+        .into()))
+        .is_err(),
         "changed decoded bytes must invalidate the accepted schema identity"
     );
     frames
@@ -638,6 +693,8 @@ fn assert_schema_report_cap_preserves_artifact(
             artifact_policy: ArtifactValidationPolicy::default(),
             work_limit,
             job: None,
+            producer_rule: None,
+            structural_admission: None,
         },
     )?;
     assert_eq!(
@@ -985,17 +1042,17 @@ fn assert_replayed_frames_match_fixture(
     Ok(())
 }
 
-struct ReplayMessage {
-    sample: u64,
-    context: MessageContext,
-    session_order: u64,
-    direction_node_id: u64,
-    episode_node_id: u64,
-    stream_offset: usize,
-    bytes: Vec<u8>,
+pub(super) struct ReplayMessage {
+    pub(super) sample: u64,
+    pub(super) context: MessageContext,
+    pub(super) session_order: u64,
+    pub(super) direction_node_id: u64,
+    pub(super) episode_node_id: u64,
+    pub(super) stream_offset: usize,
+    pub(super) bytes: Vec<u8>,
 }
 
-fn session_relative_messages(
+pub(super) fn session_relative_messages(
     case: &Case,
     episodes: &[u64],
 ) -> Result<Vec<ReplayMessage>, Box<dyn Error>> {
@@ -1077,7 +1134,7 @@ fn run_context_scope(case: &Case, episode_node_id: u64) -> Option<&Value> {
     case.node(episode_node_id)?.details.get("scope")
 }
 
-fn session_ids(samples: &[ReplayMessage]) -> Vec<RelationalSessionId> {
+pub(super) fn session_ids(samples: &[ReplayMessage]) -> Vec<RelationalSessionId> {
     let mut sessions = Vec::new();
     for sample in samples {
         if sessions

@@ -1,8 +1,8 @@
 //! Keep scheduler phase and source position at operation boundaries
 
 use super::{
-    Executor, RecoveryError, RecoveryExecutionError, evidence, record_candidate_progress,
-    relational::RelationalLane,
+    Executor, RecoveryCandidateId, RecoveryError, RecoveryExecutionError, RecoveryTask, evidence,
+    record_candidate_progress, relational::RelationalLane,
 };
 use std::sync::Arc;
 
@@ -13,9 +13,20 @@ pub(super) struct SchedulerCursor {
     record_discovery_barrier_reached: bool,
     evidence_stop: Option<evidence::CaseEvidenceStop>,
     evidence_stop_reported: bool,
+    // A saved inner search has already charged its outer candidate once
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(super) begun_relational: Option<RecoveryCandidateId>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(super) active_relational: Option<super::relational::checkpoint::RelationalProgress>,
     // The charge follows restored cursor data without entering its checkpoint
     #[serde(skip)]
     pub(super) checkpoint_memory: Option<Arc<l2_workbench::job::MemoryLease>>,
+    // A decoded history keeps its own charge after moving back into the executor
+    #[serde(skip)]
+    pub(super) restored_memory: Vec<l2_workbench::job::MemoryLease>,
+    // The native Case remains authoritative until all inner state has been validated
+    #[serde(skip)]
+    pub(super) restoration_pending: bool,
 }
 
 #[derive(Default, serde::Deserialize, serde::Serialize)]
@@ -35,6 +46,28 @@ impl SchedulerCursor {
     pub(super) fn validate(&self, executor: &Executor<'_>) -> Result<(), RecoveryError> {
         if self.evidence_stop_reported && self.evidence_stop.is_none() {
             return Err(RecoveryError::InvalidCheckpoint);
+        }
+        if let Some(id) = self.begun_relational {
+            let queued_relational = executor.coordinator.peek_next_id() == Some(id)
+                && executor.coordinator.candidate(id).is_some_and(|candidate| {
+                    matches!(
+                        candidate.task(),
+                        RecoveryTask::RelationalTransformDiscovery
+                            | RecoveryTask::RelationalTransformDiscoveryIncremental
+                    )
+                });
+            if !matches!(&self.phase, SchedulerPhase::Running)
+                || self.evidence_stop.is_some()
+                || !queued_relational
+            {
+                return Err(RecoveryError::InvalidCheckpoint);
+            }
+        }
+        if let Some(progress) = &self.active_relational {
+            if self.begun_relational != Some(progress.candidate_id) {
+                return Err(RecoveryError::InvalidCheckpoint);
+            }
+            progress.validate(executor)?;
         }
         match &self.phase {
             SchedulerPhase::Start => {
@@ -80,9 +113,18 @@ impl SchedulerCursor {
     }
 }
 
+#[cfg(test)]
 pub(super) fn step(
     executor: &mut Executor<'_>,
     cursor: &mut SchedulerCursor,
+) -> Result<bool, RecoveryExecutionError> {
+    step_with_resume(executor, cursor, None)
+}
+
+pub(super) fn step_with_resume(
+    executor: &mut Executor<'_>,
+    cursor: &mut SchedulerCursor,
+    resume: Option<&mut super::resume::RecoveryResume<'_>>,
 ) -> Result<bool, RecoveryExecutionError> {
     match &mut cursor.phase {
         SchedulerPhase::Start => {
@@ -118,11 +160,7 @@ pub(super) fn step(
         SchedulerPhase::Running => {}
         SchedulerPhase::Finished => return Ok(false),
     }
-    if frontier_step(
-        executor,
-        &mut cursor.evidence_stop,
-        &mut cursor.evidence_stop_reported,
-    )? {
+    if frontier_step_cursor(executor, cursor, resume)? {
         return Ok(true);
     }
     // Deferred cohort work can mutate the Case even when the frontier is empty
@@ -160,14 +198,37 @@ pub(super) fn step(
     Ok(false)
 }
 
+#[cfg(test)]
 pub(super) fn frontier_step(
     executor: &mut Executor<'_>,
     evidence_stop: &mut Option<evidence::CaseEvidenceStop>,
     evidence_stop_reported: &mut bool,
 ) -> Result<bool, RecoveryExecutionError> {
+    let mut cursor = SchedulerCursor {
+        phase: SchedulerPhase::Running,
+        evidence_stop: *evidence_stop,
+        evidence_stop_reported: *evidence_stop_reported,
+        ..SchedulerCursor::default()
+    };
+    let result = frontier_step_cursor(executor, &mut cursor, None);
+    *evidence_stop = cursor.evidence_stop;
+    *evidence_stop_reported = cursor.evidence_stop_reported;
+    result
+}
+
+#[expect(
+    clippy::too_many_lines,
+    reason = "keep one candidate transaction and its progress together"
+)]
+fn frontier_step_cursor(
+    executor: &mut Executor<'_>,
+    cursor: &mut SchedulerCursor,
+    mut resume: Option<&mut super::resume::RecoveryResume<'_>>,
+) -> Result<bool, RecoveryExecutionError> {
     // Check before admitting deferred work or removing the next candidate
     executor.check_cancelled()?;
-    if evidence_stop.is_none()
+    if cursor.begun_relational.is_none()
+        && cursor.evidence_stop.is_none()
         && !executor.pending_record_assemblies.is_empty()
         && !executor.next_candidate_precedes_deferred_assembly()
     {
@@ -176,23 +237,55 @@ pub(super) fn frontier_step(
     let Some(candidate_id) = executor.coordinator.peek_next_id() else {
         return Ok(false);
     };
-    if evidence_stop.is_none() {
+    if cursor.evidence_stop.is_none() {
         let task = executor
             .coordinator
             .candidate(candidate_id)
             .ok_or(RecoveryError::UnknownCandidate { id: candidate_id })?
             .task();
-        *evidence_stop = evidence::saturated_case_evidence(executor.case, task);
+        cursor.evidence_stop = evidence::saturated_case_evidence(executor.case, task);
     }
     // Keep the candidate queued when cancellation arrives during progress setup
-    if evidence_stop.is_none() {
+    let mut prepared = None;
+    if cursor.evidence_stop.is_none() {
         let candidate_task = executor
             .coordinator
             .candidate(candidate_id)
             .ok_or(RecoveryError::UnknownCandidate { id: candidate_id })?
             .task();
-        if let Some(progress) = &executor.job {
-            progress.begin_candidate(candidate_task)?;
+        let relational = matches!(
+            candidate_task,
+            RecoveryTask::RelationalTransformDiscovery
+                | RecoveryTask::RelationalTransformDiscoveryIncremental
+        );
+        let resumable = if relational && resume.is_some() {
+            executor.relational_task_plan(candidate_id)?.1.parser_scope
+                == l2_workbench::protocol::RelationalParserScope::AcrossSessions
+        } else {
+            false
+        };
+        if cursor.begun_relational.is_none() {
+            if let Some(progress) = &executor.job {
+                progress.begin_candidate(candidate_task)?;
+            }
+            if resumable {
+                // Keep the graph and queued candidate at a durable transaction boundary
+                cursor.begun_relational = Some(candidate_id);
+                if let Some(active) = resume.as_deref_mut() {
+                    active.save_or_fallback(executor, cursor)?;
+                }
+            }
+        } else if !resumable || cursor.begun_relational != Some(candidate_id) {
+            return Err(RecoveryError::InvalidCheckpoint.into());
+        }
+        if resumable {
+            let active = resume.ok_or(RecoveryError::InvariantFailure)?;
+            prepared = Some(super::relational::checkpoint::prepare(
+                executor,
+                candidate_id,
+                cursor,
+                active,
+            )?);
         }
     } else {
         executor.check_cancelled()?;
@@ -200,16 +293,27 @@ pub(super) fn frontier_step(
     if executor.coordinator.pop_next()? != Some(candidate_id) {
         return Err(RecoveryError::InvariantFailure.into());
     }
-    if let Some(stop) = *evidence_stop {
-        executor.stop_candidate_for_case_evidence(candidate_id, stop, !*evidence_stop_reported)?;
-        *evidence_stop_reported = true;
+    if let Some(stop) = cursor.evidence_stop {
+        executor.stop_candidate_for_case_evidence(
+            candidate_id,
+            stop,
+            !cursor.evidence_stop_reported,
+        )?;
+        cursor.evidence_stop_reported = true;
         record_candidate_progress(executor, candidate_id, executor.omissions.len())?;
         return Ok(true);
     }
     let omission_start = executor.omissions.len();
-    if let Err(error) = executor.execute_candidate(candidate_id) {
-        *evidence_stop = Some(executor.stop_after_case_evidence_error(candidate_id, error)?);
-        *evidence_stop_reported = true;
+    let result = if let Some((cohorts, remaining, _cohort_memory)) = prepared {
+        cursor.begun_relational = None;
+        cursor.active_relational = None;
+        executor.publish_prepared_relational(candidate_id, &cohorts, remaining)
+    } else {
+        executor.execute_candidate(candidate_id)
+    };
+    if let Err(error) = result {
+        cursor.evidence_stop = Some(executor.stop_after_case_evidence_error(candidate_id, error)?);
+        cursor.evidence_stop_reported = true;
         record_candidate_progress(executor, candidate_id, executor.omissions.len())?;
         return Ok(true);
     }
@@ -220,8 +324,8 @@ pub(super) fn frontier_step(
             .get(omission_start..)
             .ok_or(RecoveryError::InvariantFailure)?,
     ) {
-        *evidence_stop = Some(stop);
-        *evidence_stop_reported = true;
+        cursor.evidence_stop = Some(stop);
+        cursor.evidence_stop_reported = true;
     }
     Ok(true)
 }

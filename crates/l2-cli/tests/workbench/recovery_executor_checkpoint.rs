@@ -13,6 +13,9 @@ mod durable;
 mod memory;
 #[path = "recovery_executor_checkpoint/validation.rs"]
 mod validation;
+#[cfg(target_os = "linux")]
+#[path = "recovery_executor_checkpoint/relational_interrupt.rs"]
+mod relational_interrupt;
 
 #[test]
 fn checkpoint_rejects_an_unused_secret_recipe_before_writing_any_bytes()

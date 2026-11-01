@@ -13,6 +13,9 @@ use std::error::Error;
 type TestResult<T = ()> = Result<T, Box<dyn Error>>;
 const PROBE_WORK_LIMIT: usize = 16 * 1024;
 
+#[path = "record_gate_checkpoint.rs"]
+mod checkpoint;
+
 struct LearnedHeader {
     cache: SchemaPlanCache,
     plaintext: Vec<u8>,
@@ -117,6 +120,35 @@ fn changed_payload_boundary_can_reuse_a_model_that_matches_actual_header_bytes()
     )?;
 
     assert_fresh_cached_artifact_validation(&recovered, &fixture.plaintext, PROBE_WORK_LIMIT)?;
+    Ok(())
+}
+
+#[test]
+fn cached_header_match_without_receipt_work_remains_pending() -> TestResult {
+    let mut fixture = LearnedHeader::new()?;
+    let complete = fixture.cache.screen_candidate(
+        &fixture.frames,
+        &fixture.report,
+        options(PROBE_WORK_LIMIT),
+    )?;
+    assert_eq!(complete.status, GateStatus::ArtifactValidated);
+    assert!(complete.accepted_schema.is_some());
+    let limit = complete
+        .work_bytes
+        .checked_sub(1)
+        .ok_or("fixture did no work")?;
+
+    let limited =
+        fixture
+            .cache
+            .screen_candidate(&fixture.frames, &fixture.report, options(limit))?;
+    assert_eq!(
+        limited.details.get("header_schema_plan_cache_hit"),
+        Some(&Value::Bool(true))
+    );
+    assert_eq!(limited.work_limited_at, Some(limit));
+    assert_eq!(limited.status, GateStatus::Pending);
+    assert!(limited.accepted_schema.is_none());
     Ok(())
 }
 

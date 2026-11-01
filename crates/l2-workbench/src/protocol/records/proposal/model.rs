@@ -206,7 +206,8 @@ pub struct RecordSchemaAnalysisReport {
 }
 
 /// Strategy that produced one strictly validated record schema
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
 pub enum RecordSchemaStrategy {
     /// One record occupies each caller-framed message
     FixedLayout,

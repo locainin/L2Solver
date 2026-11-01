@@ -1,6 +1,8 @@
 use super::{RelationalCohortKey, SampleCohort, StoredSample};
 use crate::workbench::recovery_executor::{
-    Executor, RecoveryPlan, execute_executor, normal_policy, test_support,
+    Executor, RecoveryPlan, checkpoint, execute_executor,
+    execution_state::{SchedulerCursor, SchedulerPhase},
+    normal_policy, test_support,
 };
 use l2_workbench::{
     artifact::ArtifactValidationFormat,
@@ -25,6 +27,112 @@ struct AdversarialFixture {
     key: RelationalCohortKey,
     stored: Vec<StoredSample>,
     expected: Vec<Vec<u8>>,
+}
+
+#[test]
+fn relational_begin_checkpoint_keeps_the_exact_candidate_queued() -> TestResult {
+    let mut case = Case::new();
+    let (key, samples) = simple_cohort(&mut case, 1)?;
+    let plan = RecoveryPlan::default();
+    let policy = normal_policy(&case)?;
+    let mut executor = test_support::build_executor(&mut case, &plan, &policy)?;
+    add_cohort_views(&mut executor, key, &samples, &samples);
+    assert!(executor.flush_relational_cohorts(super::RelationalLane::Normal)?);
+    let candidate = executor
+        .coordinator
+        .peek_next_id()
+        .ok_or("relational candidate was not queued")?;
+    let work_remaining = executor.coordinator.remaining_work_bytes();
+    let mut cursor = SchedulerCursor::default();
+    cursor.phase = SchedulerPhase::Running;
+    cursor.begun_relational = Some(candidate);
+    let mut encoded = Vec::new();
+    checkpoint::write(&executor, &cursor, &mut encoded, 1024 * 1024)?;
+    drop(executor);
+
+    let (restored, cursor) =
+        checkpoint::read(&mut case, &plan, &policy, &encoded, 1024 * 1024, None)?;
+    assert_eq!(cursor.begun_relational, Some(candidate));
+    assert_eq!(restored.coordinator.peek_next_id(), Some(candidate));
+    drop(restored);
+    let mut invalid: Value = serde_json::from_slice(&encoded)?;
+    *invalid
+        .pointer_mut("/cursor/begun_relational")
+        .ok_or("missing begun candidate")? = json!(usize::MAX);
+    let encoded = serde_json::to_vec(&invalid)?;
+    assert!(checkpoint::read(&mut case, &plan, &policy, &encoded, 1024 * 1024, None).is_err());
+
+    let mut missing: Value = serde_json::from_slice(&encoded)?;
+    *missing
+        .pointer_mut("/cursor/begun_relational")
+        .ok_or("missing candidate")? = serde_json::to_value(candidate)?;
+    missing
+        .pointer_mut("/cursor")
+        .and_then(Value::as_object_mut)
+        .ok_or("missing cursor")?
+        .insert(
+            "active_relational".into(),
+            json!({
+                "candidate_id":candidate, "next_context":0, "work_remaining":work_remaining,
+                "prepared":[], "active":null,
+            }),
+        );
+    let encoded = serde_json::to_vec(&missing)?;
+    assert!(checkpoint::read(&mut case, &plan, &policy, &encoded, 1024 * 1024, None).is_err());
+    Ok(())
+}
+
+#[test]
+fn each_session_search_uses_its_existing_path_when_resume_is_enabled() -> TestResult {
+    let temporary = tempfile::tempdir()?;
+    let options = crate::arguments::RecoveryOptions {
+        memory_limit: 64 * 1024 * 1024,
+        cache_max_bytes: 128 * 1024 * 1024,
+        strict_cache: true,
+        ..crate::arguments::RecoveryOptions::default()
+    };
+    let cache = l2_workbench::job::cache::Cache::open_at(
+        temporary.path().join("cache"),
+        temporary.path().join("state"),
+        options.cache_max_bytes,
+    )?;
+    let key = l2_workbench::job::cache::StageKey::new(
+        "each_session_resume",
+        1,
+        "each_session_resume",
+        &json!({}),
+        &l2_workbench::job::cache::SourceIdentity::from_sha256("d".repeat(64))?,
+        &[],
+    )?;
+    let mut lease = cache.lease(&key)?;
+    let mut resume = crate::workbench::recovery_executor::resume::RecoveryResume::new(
+        &mut lease, &options, None,
+    );
+    let mut case = Case::new();
+    let (cohort_key, samples) = simple_cohort(&mut case, 1)?;
+    let plan = RecoveryPlan::default();
+    let mut policy = normal_policy(&case)?;
+    policy.relational_transform_plan.parser_scope = RelationalParserScope::EachSession;
+    let mut executor = test_support::build_executor(&mut case, &plan, &policy)?;
+    add_cohort_views(&mut executor, cohort_key, &samples, &samples);
+    assert!(executor.flush_relational_cohorts(super::RelationalLane::Normal)?);
+    let candidate = executor
+        .coordinator
+        .peek_next_id()
+        .ok_or("candidate was not queued")?;
+    let mut cursor = SchedulerCursor::default();
+    cursor.phase = SchedulerPhase::Running;
+    resume.prepare(executor.case)?;
+    assert!(
+        crate::workbench::recovery_executor::execution_state::step_with_resume(
+            &mut executor,
+            &mut cursor,
+            Some(&mut resume),
+        )?
+    );
+    assert_ne!(executor.coordinator.peek_next_id(), Some(candidate));
+    assert!(cursor.begun_relational.is_none());
+    Ok(())
 }
 
 #[test]
@@ -173,7 +281,7 @@ fn incremental_search_reuses_rules_only_after_their_outputs_are_published() -> T
     Ok(())
 }
 
-fn simple_cohort(case: &mut Case, number: u64) -> TestResult<Cohort> {
+pub(super) fn simple_cohort(case: &mut Case, number: u64) -> TestResult<Cohort> {
     let key = cohort_key(format!("source-{number}"));
     let mut samples = Vec::new();
     for session in 1..=2_u64 {
@@ -184,7 +292,7 @@ fn simple_cohort(case: &mut Case, number: u64) -> TestResult<Cohort> {
     Ok((key, samples))
 }
 
-fn add_cohort_views(
+pub(super) fn add_cohort_views(
     executor: &mut Executor<'_>,
     key: RelationalCohortKey,
     normal: &[StoredSample],

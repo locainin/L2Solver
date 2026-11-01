@@ -2,7 +2,7 @@ use super::super::{Executor, RecoveryExecutionError};
 use super::application::{CandidateApplication, DecodedFrameContext, decoded_payload_frames};
 use super::history::RelationalReplayHistories;
 use super::record_gate::SchemaPlanCache;
-use super::record_gate::{GateResult, SchemaCandidateOptions};
+use super::record_gate::{GateResult, SchemaCandidateOptions, StructuralAdmission};
 use super::report::{budget_report, insufficient_sessions_report, report_json};
 use super::{
     DecodedFrameOutput, GateAssessment, MAX_RETAINED_RELATIONAL_APPLICATIONS,
@@ -24,7 +24,10 @@ use l2_workbench::{
 use serde_json::Value;
 use std::collections::{BTreeMap, BTreeSet};
 
-struct CohortSearchResult {
+mod producers;
+pub(super) use producers::collect_producer_rules;
+
+pub(super) struct CohortSearchResult {
     report_value: Value,
     report_details_complete: bool,
     exhaustive: bool,
@@ -35,19 +38,23 @@ struct CohortSearchResult {
     outputs: Vec<super::AppliedOutput>,
     decoded_frames: Vec<DecodedFrameOutput>,
     accepted_schemas: Vec<(usize, super::record_gate::AcceptedRecordSchema)>,
+    structural_evidence: Vec<(usize, super::record_gate::StructuralEvidence)>,
+    producer_rules: Vec<(usize, RelationalTransformRule)>,
+    producer_memory: Option<l2_workbench::job::MemoryLease>,
     published_rules: Vec<RelationalTransformRule>,
+    history_used: bool,
 }
 
 #[derive(Clone, Copy)]
-struct FinishEvaluationContext<'ctx, 'samples> {
-    context: &'ctx RelationalDiscoveryContext,
-    samples: &'ctx [RelationalRecordSample<'samples>],
-    search_plan: &'ctx l2_workbench::protocol::RelationalTransformPlan,
-    cohort_work_budget: usize,
-    artifact_validation_policy: ArtifactValidationPolicy,
-    job: Option<&'ctx Job>,
-    gate: &'ctx CandidateGate<'samples>,
-    history_complete: Option<bool>,
+pub(super) struct FinishEvaluationContext<'ctx, 'samples> {
+    pub(super) context: &'ctx RelationalDiscoveryContext,
+    pub(super) samples: &'ctx [RelationalRecordSample<'samples>],
+    pub(super) search_plan: &'ctx l2_workbench::protocol::RelationalTransformPlan,
+    pub(super) cohort_work_budget: usize,
+    pub(super) artifact_validation_policy: ArtifactValidationPolicy,
+    pub(super) job: Option<&'ctx Job>,
+    pub(super) gate: &'ctx CandidateGate<'samples>,
+    pub(super) history_complete: Option<bool>,
 }
 
 // Gate checks consume the same frozen outputs used by retained candidates
@@ -55,10 +62,11 @@ pub(super) struct CandidateGate<'a> {
     samples: &'a [RelationalRecordSample<'a>],
     stored_samples: &'a [StoredSample],
     raw_directional_run: bool,
-    schema_plan_cache: SchemaPlanCache,
+    pub(super) schema_plan_cache: SchemaPlanCache,
     schema_limits: l2_workbench::protocol::RecordSchemaProposalLimits,
     artifact_policy: ArtifactValidationPolicy,
     job: Option<&'a Job>,
+    structural_admission: Option<StructuralAdmission<'a>>,
 }
 
 pub(super) fn prepare_contexts(
@@ -111,7 +119,17 @@ impl<'a> CandidateGate<'a> {
             schema_limits,
             artifact_policy,
             job,
+            structural_admission: None,
         }
+    }
+
+    pub(super) const fn with_structural_admission(
+        mut self,
+        memory: &'a l2_workbench::job::MemoryBudget,
+        maximum: usize,
+    ) -> Self {
+        self.structural_admission = Some(StructuralAdmission { memory, maximum });
+        self
     }
 
     pub(super) fn evaluate(
@@ -129,6 +147,7 @@ impl<'a> CandidateGate<'a> {
                     status,
                     details: serde_json::json!({"reason":"candidate_did_not_require_across_session_gate"}),
                     accepted_schema: None,
+                    structural_evidence: None,
                     assessment_scope: None,
                     work_limited_at: None,
                 },
@@ -151,6 +170,8 @@ impl<'a> CandidateGate<'a> {
                 artifact_policy: self.artifact_policy,
                 work_limit: screen_work_limit,
                 job: self.job,
+                producer_rule: Some(&candidate.rule),
+                structural_admission: self.structural_admission.as_ref(),
             },
         )?;
         Ok(RelationalCandidateEvaluation {
@@ -160,6 +181,7 @@ impl<'a> CandidateGate<'a> {
                 status: gate.status,
                 details: gate.details,
                 accepted_schema: gate.accepted_schema,
+                structural_evidence: gate.structural_evidence,
                 assessment_scope: Some(gate.assessment_scope),
                 work_limited_at: gate.work_limited_at,
             },
@@ -182,6 +204,8 @@ impl<'a> CandidateGate<'a> {
                 artifact_policy: self.artifact_policy,
                 work_limit,
                 job: self.job,
+                producer_rule: None,
+                structural_admission: self.structural_admission.as_ref(),
             },
         )
     }
@@ -214,6 +238,7 @@ impl<'a> CandidateGate<'a> {
             candidate_index: 0,
             expected_session_orders: &expected_session_orders,
             raw_directional_run: self.raw_directional_run,
+            job: self.job,
         };
         let mut frames = Vec::new();
         for output in ordered_outputs {
@@ -229,7 +254,7 @@ impl<'a> CandidateGate<'a> {
     }
 }
 
-fn initial_gate_status(
+pub(super) fn initial_gate_status(
     candidate: &l2_workbench::protocol::RelationalTransformCandidate,
 ) -> Option<super::record_gate::GateStatus> {
     use super::record_gate::GateStatus;
@@ -248,7 +273,7 @@ fn initial_gate_status(
     }
 }
 
-fn empty_gate_report(
+pub(super) fn empty_gate_report(
     evaluation_context: &l2_workbench::protocol::RelationalTransformEvaluationContext<'_>,
 ) -> RelationalTransformReport {
     RelationalTransformReport {
@@ -285,24 +310,8 @@ pub(super) fn prepare_cohort(
     history: Option<&mut RelationalReplayHistory>,
 ) -> Result<PreparedRelationalCohort, RecoveryExecutionError> {
     let samples = samples_for_context(executor.case, &context)?;
-    let sample_bytes = samples.iter().try_fold(0_usize, |total, sample| {
-        total.checked_add(sample.bytes.len())
-    });
-    let sample_bytes =
-        sample_bytes.ok_or_else(|| invalid_policy("relational input byte count overflowed"))?;
-    let mut search_plan = base_plan.clone();
-    if context.key.framing_rule_json == super::RAW_RUN_FRAMING_RULE {
-        // Raw runs may place a stable payload marker after the seed prefix
-        search_plan.limits.max_marker_offset = search_plan
-            .limits
-            .max_marker_offset
-            .max(search_plan.limits.max_locator_offset);
-    }
-    // Input scans reserve half of the remaining allowance for validation and replay
-    let shared_work_budget = work_remaining.saturating_sub(sample_bytes) / 2;
-    let cohort_work_budget = search_plan.limits.max_work_bytes.min(shared_work_budget);
-    // Keep half of the existing cohort allowance available for replay and parser checks
-    search_plan.limits.max_work_bytes = cohort_work_budget / 2;
+    let (search_plan, cohort_work_budget, sample_bytes) =
+        configure_cohort(&context, &samples, base_plan, *work_remaining)?;
     let job = executor.job.as_ref().map(|progress| &progress.job);
     let result = if context.sessions_available < 2 {
         preflight_result(
@@ -329,6 +338,49 @@ pub(super) fn prepare_cohort(
             history,
         )?
     };
+    finish_cohort(context, result, sample_bytes, work_remaining)
+}
+
+pub(super) fn configure_cohort(
+    context: &RelationalDiscoveryContext,
+    samples: &[RelationalRecordSample<'_>],
+    base_plan: &l2_workbench::protocol::RelationalTransformPlan,
+    work_remaining: usize,
+) -> Result<
+    (
+        l2_workbench::protocol::RelationalTransformPlan,
+        usize,
+        usize,
+    ),
+    RecoveryExecutionError,
+> {
+    let sample_bytes = samples.iter().try_fold(0_usize, |total, sample| {
+        total.checked_add(sample.bytes.len())
+    });
+    let sample_bytes =
+        sample_bytes.ok_or_else(|| invalid_policy("relational input byte count overflowed"))?;
+    let mut search_plan = base_plan.clone();
+    if context.key.framing_rule_json == super::RAW_RUN_FRAMING_RULE {
+        // Raw runs may place a stable payload marker after the seed prefix
+        search_plan.limits.max_marker_offset = search_plan
+            .limits
+            .max_marker_offset
+            .max(search_plan.limits.max_locator_offset);
+    }
+    // Input scans reserve half of the remaining allowance for validation and replay
+    let shared_work_budget = work_remaining.saturating_sub(sample_bytes) / 2;
+    let cohort_work_budget = search_plan.limits.max_work_bytes.min(shared_work_budget);
+    // Keep half of the existing cohort allowance available for replay and parser checks
+    search_plan.limits.max_work_bytes = cohort_work_budget / 2;
+    Ok((search_plan, cohort_work_budget, sample_bytes))
+}
+
+pub(super) fn finish_cohort(
+    context: RelationalDiscoveryContext,
+    result: CohortSearchResult,
+    sample_bytes: usize,
+    work_remaining: &mut usize,
+) -> Result<PreparedRelationalCohort, RecoveryExecutionError> {
     let report_bytes = serde_json::to_vec(&result.report_value)
         .map_err(|source| operational("relational report serialization failed", source))?;
     // A denied cohort only inspects lengths; it never starts its input scan
@@ -350,13 +402,17 @@ pub(super) fn prepare_cohort(
         outputs: result.outputs,
         decoded_frames: result.decoded_frames,
         accepted_schemas: result.accepted_schemas,
+        structural_evidence: result.structural_evidence,
+        producer_rules: result.producer_rules,
+        producer_memory: result.producer_memory,
         published_rules: result.published_rules,
+        history_used: result.history_used,
         report_details_complete: result.report_details_complete,
         search_exhaustive_within_plan: result.exhaustive,
         candidate_limit_remaining: result.candidate_remaining,
         locator_candidate_limit_remaining: result.locator_remaining,
         work_bytes_remaining: *work_remaining,
-        reason: result.reason,
+        reason: result.reason.map(std::borrow::Cow::Borrowed),
     })
 }
 
@@ -377,7 +433,11 @@ const fn preflight_result(
         outputs: Vec::new(),
         decoded_frames: Vec::new(),
         accepted_schemas: Vec::new(),
+        structural_evidence: Vec::new(),
+        producer_rules: Vec::new(),
+        producer_memory: None,
         published_rules: Vec::new(),
+        history_used: false,
     }
 }
 
@@ -450,7 +510,7 @@ fn evaluate_cohort(
     )
 }
 
-fn finish_evaluation(
+pub(super) fn finish_evaluation(
     context: FinishEvaluationContext<'_, '_>,
     evaluation: RelationalCandidateEvaluationReport<GateAssessment>,
 ) -> Result<CohortSearchResult, RecoveryExecutionError> {
@@ -482,6 +542,8 @@ fn finish_evaluation(
         job,
     )?
     .apply(&report, evaluations, gate)?;
+    let (producer_rules, producer_memory) =
+        collect_producer_rules(&report.candidates, &applications, gate.structural_admission)?;
     let published_rules = if history_complete.is_some() {
         fully_published_rules(&report, &applications.outputs)?
     } else {
@@ -519,7 +581,11 @@ fn finish_evaluation(
         outputs: applications.outputs,
         decoded_frames: applications.decoded_frames,
         accepted_schemas: applications.accepted_schemas,
+        structural_evidence: applications.structural_evidence,
+        producer_rules,
+        producer_memory,
         published_rules,
+        history_used: history_complete.is_some(),
     })
 }
 
@@ -581,7 +647,7 @@ fn fully_published_rules(
     Ok(rules)
 }
 
-fn samples_for_context<'a>(
+pub(super) fn samples_for_context<'a>(
     case: &'a l2_workbench::evidence::Case,
     context: &RelationalDiscoveryContext,
 ) -> Result<Vec<RelationalRecordSample<'a>>, RecoveryExecutionError> {

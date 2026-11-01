@@ -149,6 +149,7 @@ fn observer_context<'a>(
         artifact_policy: options.artifact_policy,
         work_limit: request.observer_work_limit,
         job: options.job,
+        structural_admission: options.structural_admission,
         full_input_bytes: request.messages.eligible_input_bytes,
     })
 }
@@ -387,7 +388,7 @@ fn schema_alternative(
     SchemaAlternative {
         label,
         frame_indices: request.frame_indices.clone(),
-        discovery_report: analysis.discovery,
+        discovery_report: analysis.discovery.map(Into::into),
         limits,
         discovery_work_bytes: total_work_bytes,
         learning_message_count: analysis.proposal.training_message_count,
@@ -465,6 +466,10 @@ fn combine_observed_evaluations(
 ) -> SchemaAlternativeEvaluation {
     let fixed = observed.fixed_layout;
     let repeated = observed.repeated_boundaries;
+    let structural_witness = fixed
+        .structural_witness
+        .clone()
+        .or_else(|| repeated.structural_witness.clone());
     let accepted_schema = fixed
         .accepted_schema
         .clone()
@@ -517,6 +522,7 @@ fn combine_observed_evaluations(
             .saturating_add(repeated.strict_survivors_seen),
         exact_artifact_survivor_ordinal,
         accepted_schema,
+        structural_witness,
         survives: fixed.survives || repeated.survives,
         pending: true,
         header_models: Vec::new(),

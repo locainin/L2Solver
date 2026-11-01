@@ -18,7 +18,10 @@ fn checkpoint_bytes_serialize_canonical_padding_and_restore_exact_bytes()
     ] {
         let value = SavedBytes { bytes };
         let document = serde_json::to_value(&value)?;
-        assert_eq!(document["bytes"], encoded);
+        assert_eq!(
+            document.get("bytes").and_then(serde_json::Value::as_str),
+            Some(encoded)
+        );
         assert_eq!(serde_json::from_value::<SavedBytes>(document)?, value);
     }
     Ok(())

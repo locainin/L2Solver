@@ -21,7 +21,7 @@ use std::{
     sync::Arc,
 };
 
-const VERSION: u32 = 1;
+const VERSION: u32 = 2;
 
 #[derive(Serialize)]
 struct SavedRef<'a> {
@@ -99,6 +99,26 @@ pub(super) fn write(
         remaining: max_bytes,
     };
     serde_json::to_writer(&mut output, &value).map_err(operational)
+}
+
+pub(super) fn encode<T: Serialize + ?Sized>(
+    value: &T,
+    max_bytes: usize,
+    memory: Option<&MemoryBudget>,
+) -> Result<(Vec<u8>, Option<MemoryLease>), RecoveryExecutionError> {
+    let mut buffer = buffer::Buffer::new(max_bytes, memory)?;
+    let result = {
+        let mut output = LimitedWriter {
+            output: &mut buffer,
+            remaining: max_bytes,
+        };
+        serde_json::to_writer(&mut output, value)
+    };
+    if let Some(error) = buffer.failure.take() {
+        return Err(error);
+    }
+    result.map_err(operational)?;
+    Ok((buffer.bytes, buffer.memory))
 }
 
 pub(super) fn read<'a>(

@@ -28,7 +28,11 @@ fn checkpoint_rebuilds_shared_layouts_and_preserves_model_receipts() -> Result<(
     let descriptor = plan.checkpoint_description(limits, CHECKPOINT_LIMIT)?;
     let encoded = serde_json::to_value(&descriptor)?;
     assert_eq!(
-        encoded["inputs"].as_array().ok_or("missing inputs")?.len(),
+        encoded
+            .get("inputs")
+            .and_then(serde_json::Value::as_array)
+            .ok_or("missing inputs")?
+            .len(),
         2
     );
     let bytes = serde_json::to_vec(&descriptor)?;
@@ -59,7 +63,7 @@ fn checkpoint_rejects_incompatible_limits_versions_and_invalid_header_lengths()
     let descriptor = plan.checkpoint_description(limits, CHECKPOINT_LIMIT)?;
     let original = serde_json::to_value(&descriptor)?;
     let mut wrong_version = original.clone();
-    wrong_version["version"] = json!(99);
+    set_field(&mut wrong_version, "/version", json!(99))?;
     let saved: RecordAssemblyPlanDescription = serde_json::from_value(wrong_version)?;
     assert!(
         saved
@@ -77,7 +81,7 @@ fn checkpoint_rejects_incompatible_limits_versions_and_invalid_header_lengths()
     );
 
     let mut invalid_header = original;
-    invalid_header["inputs"][0]["header"][3] = json!(255);
+    set_field(&mut invalid_header, "/inputs/0/header/3", json!(255))?;
     let saved: RecordAssemblyPlanDescription = serde_json::from_value(invalid_header)?;
     assert!(
         saved
@@ -104,27 +108,36 @@ fn checkpoint_reconstructs_a_large_logical_record_without_materializing_its_body
     let mut limits = original_limits;
     limits.max_input_bytes = logical_length;
     limits.max_output_bytes = logical_length;
-    encoded["limits"] = serde_json::to_value(limits)?;
+    set_field(&mut encoded, "/limits", serde_json::to_value(limits)?)?;
     {
-        let models = encoded["models"].as_array_mut().ok_or("missing models")?;
+        let models = encoded
+            .get_mut("models")
+            .and_then(serde_json::Value::as_array_mut)
+            .ok_or("missing models")?;
         models.truncate(1);
         let model = models.first_mut().ok_or("missing model")?;
-        model["limits"] = serde_json::to_value(limits)?;
-        model["schema"]["length"]["offset"] = json!(2);
-        model["schema"]["length"]["width"] = json!(8);
-        model["schema"]["data_offset"] = json!(10);
-        let inputs = model["inputs"].as_array_mut().ok_or("missing inputs")?;
+        set_field(model, "/limits", serde_json::to_value(limits)?)?;
+        set_field(model, "/schema/length/offset", json!(2))?;
+        set_field(model, "/schema/length/width", json!(8))?;
+        set_field(model, "/schema/data_offset", json!(10))?;
+        let inputs = model
+            .get_mut("inputs")
+            .and_then(serde_json::Value::as_array_mut)
+            .ok_or("missing inputs")?;
         inputs.truncate(1);
-        inputs.first_mut().ok_or("missing input")?["header_length"] = json!(10);
+        set_field(model, "/inputs/0/header_length", json!(10))?;
     }
-    let inputs = encoded["inputs"].as_array_mut().ok_or("missing inputs")?;
+    let inputs = encoded
+        .get_mut("inputs")
+        .and_then(serde_json::Value::as_array_mut)
+        .ok_or("missing inputs")?;
     inputs.truncate(1);
     let input = inputs.first_mut().ok_or("missing input")?;
-    input["input_length"] = json!(logical_length);
+    set_field(input, "/input_length", json!(logical_length))?;
     let payload_length = u64::try_from(logical_length - 10)?;
     let mut header = vec![b'A', 0];
     header.extend_from_slice(&payload_length.to_be_bytes());
-    input["header"] = json!(header);
+    set_field(input, "/header", json!(header))?;
 
     let saved: RecordAssemblyPlanDescription = serde_json::from_value(encoded)?;
     let restored = saved.restore(limits, CHECKPOINT_LIMIT, CHECKPOINT_LIMIT)?;
@@ -146,7 +159,11 @@ fn checkpoint_headers_must_match_their_frozen_source_inputs() -> Result<(), Box<
     let changed_header = [frame(7, 0, b'x'), frame(1, 0, b'y')];
     let changed = changed_header.iter().map(Vec::as_slice).collect::<Vec<_>>();
     assert!(descriptor.validate_inputs(&changed).is_err());
-    assert!(descriptor.validate_inputs(&inputs[..1]).is_err());
+    assert!(
+        descriptor
+            .validate_inputs(inputs.get(..1).ok_or("missing first input")?)
+            .is_err()
+    );
     let changed_length = [frame(0, 0, b'x'), vec![b'A']];
     let changed = changed_length.iter().map(Vec::as_slice).collect::<Vec<_>>();
     assert!(descriptor.validate_inputs(&changed).is_err());
@@ -216,8 +233,11 @@ fn checkpoint_restores_each_models_original_limits_and_exact_receipts() -> Resul
     // A saved description should not compile the already validated plan again
     let description = plan.checkpoint_description(policy_limits, CHECKPOINT_LIMIT)?;
     let mut beyond_policy = serde_json::to_value(&description)?;
-    beyond_policy["models"][0]["limits"]["max_issue_examples"] =
-        json!(policy_limits.max_issue_examples + 1);
+    set_field(
+        &mut beyond_policy,
+        "/models/0/limits/max_issue_examples",
+        json!(policy_limits.max_issue_examples + 1),
+    )?;
     let invalid: RecordAssemblyPlanDescription = serde_json::from_value(beyond_policy)?;
     assert!(
         invalid
@@ -252,5 +272,17 @@ fn checkpoint_restores_each_models_original_limits_and_exact_receipts() -> Resul
     assert_eq!(limited_receipt.omitted_duplicate_sequences, 1);
     assert_eq!(full_receipt.duplicate_sequences, vec![0, 2]);
     assert_eq!(full_receipt.omitted_duplicate_sequences, 0);
+    Ok(())
+}
+
+// Change one existing fixture field without silently creating a different description
+fn set_field(
+    value: &mut serde_json::Value,
+    pointer: &str,
+    replacement: serde_json::Value,
+) -> Result<(), Box<dyn Error>> {
+    *value
+        .pointer_mut(pointer)
+        .ok_or_else(|| format!("checkpoint fixture field {pointer} is missing"))? = replacement;
     Ok(())
 }

@@ -20,12 +20,13 @@ use l2_workbench::{
     sha256,
 };
 use serde_json::{Value, json};
-use std::collections::HashSet;
+use std::{borrow::Cow, collections::HashSet};
 
 pub(super) struct AppliedCandidates {
     pub(super) outputs: Vec<AppliedOutput>,
     pub(super) decoded_frames: Vec<DecodedFrameOutput>,
     pub(super) accepted_schemas: Vec<(usize, AcceptedRecordSchema)>,
+    pub(super) structural_evidence: Vec<(usize, super::record_gate::StructuralEvidence)>,
     pub(super) aggregate_parser_checks: Vec<Value>,
     pub(super) application_evidence_checks: Vec<Value>,
     pub(super) supported_rules: usize,
@@ -51,15 +52,16 @@ pub(super) struct DecodedFrameContext<'a> {
     pub(super) candidate_index: usize,
     pub(super) expected_session_orders: &'a [u64],
     pub(super) raw_directional_run: bool,
+    pub(super) job: Option<&'a Job>,
 }
 
-struct AggregateOutput {
-    bytes: Vec<u8>,
-    payload_mappings: Vec<RelationalOutputMapping>,
-    seed_samples: Vec<u64>,
-    session_ids: Vec<u64>,
-    session_orders: Vec<u64>,
-    session_work: usize,
+pub(super) struct AggregateOutput {
+    pub(super) bytes: Vec<u8>,
+    pub(super) payload_mappings: Vec<RelationalOutputMapping>,
+    pub(super) seed_samples: Vec<u64>,
+    pub(super) session_ids: Vec<u64>,
+    pub(super) session_orders: Vec<u64>,
+    pub(super) session_work: usize,
 }
 
 struct DecodedFrameBytes {
@@ -87,6 +89,7 @@ pub(super) struct CandidateApplication<'a> {
     application_evidence_checks: Vec<Value>,
     application_unresolved: bool,
     retained_rules: Vec<RetainedRelationalRule>,
+    structural_evidence: Vec<(usize, super::record_gate::StructuralEvidence)>,
     retained_frame_bytes: usize,
     aliases: HashSet<(Vec<u64>, String)>,
     decoded_aliases: HashSet<DecodedAliasKey>,
@@ -136,6 +139,7 @@ impl<'a> CandidateApplication<'a> {
             application_evidence_checks: Vec::new(),
             application_unresolved: !context.input_coverage_complete,
             retained_rules,
+            structural_evidence: Vec::new(),
             retained_frame_bytes: 0,
             aliases: HashSet::new(),
             decoded_aliases: HashSet::new(),
@@ -196,6 +200,7 @@ impl<'a> CandidateApplication<'a> {
             outputs,
             decoded_frames,
             accepted_schemas,
+            structural_evidence: self.structural_evidence,
             aggregate_parser_checks: self.aggregate_parser_checks,
             application_evidence_checks: self.application_evidence_checks,
             supported_rules: self.supported_rules,
@@ -443,7 +448,12 @@ impl<'a> CandidateApplication<'a> {
             )?;
         }
         if let Some(accepted) = &gate_assessment.accepted_schema {
-            validate_accepted_record_schema(candidate_index, &candidate_frames, accepted)?;
+            validate_accepted_record_schema(
+                candidate_index,
+                &candidate_frames,
+                accepted,
+                |_, frame| Ok(Cow::Owned(sha256(&frame.bytes))),
+            )?;
         }
         let (candidate_status, candidate_priority) =
             self.initial_candidate_status(&gate_assessment)?;
@@ -502,6 +512,7 @@ impl<'a> CandidateApplication<'a> {
         self.replay_work_remaining -= fallback.work_bytes;
         assessment.status = fallback.status;
         assessment.accepted_schema = fallback.accepted_schema;
+        assessment.structural_evidence = fallback.structural_evidence;
         assessment.assessment_scope = Some(SchemaOffsetScope::CompleteInput);
         assessment.work_limited_at = fallback.work_limited_at;
         assessment.details = json!({
@@ -545,6 +556,7 @@ impl<'a> CandidateApplication<'a> {
             candidate_index,
             expected_session_orders,
             raw_directional_run: self.context.key.framing_rule_json == super::RAW_RUN_FRAMING_RULE,
+            job: self.job,
         };
         let mut candidate_frames = Vec::new();
         for applied in candidate_outputs {
@@ -594,7 +606,7 @@ impl<'a> CandidateApplication<'a> {
             );
             return Ok(None);
         }
-        let aggregate = concatenate_outputs(candidate_outputs, aggregate_length)?;
+        let aggregate = concatenate_outputs(candidate_outputs, aggregate_length, self.job)?;
         self.validate_aggregate_bytes(candidate_index, candidate, candidate_outputs, aggregate)
     }
 
@@ -755,6 +767,10 @@ impl<'a> CandidateApplication<'a> {
         }))
     }
 
+    #[expect(
+        clippy::too_many_lines,
+        reason = "preserve the single candidate retention transaction"
+    )]
     fn retain_across_session_candidate(
         &mut self,
         candidate: AcrossSessionCandidate<'_>,
@@ -764,12 +780,20 @@ impl<'a> CandidateApplication<'a> {
             rule,
             outputs,
             frames,
-            assessment,
+            mut assessment,
             status,
             priority,
             exact_aggregate_output,
         } = candidate;
         let accepted_schema = assessment.accepted_schema;
+        if status == GateStatus::StructurallySupported
+            && let Some(evidence) = assessment.structural_evidence.take()
+        {
+            self.structural_evidence
+                .try_reserve(1)
+                .map_err(|error| operational("structural evidence allocation failed", error))?;
+            self.structural_evidence.push((candidate_index, evidence));
+        }
         let keep_decoded_frames = should_retain_rule(status, self.context.input_coverage_complete);
         // Duplicate aliases keep the evidence graph bounded while preserving rank
         let decoded_alias = (
@@ -851,10 +875,14 @@ impl<'a> CandidateApplication<'a> {
     }
 }
 
-fn concatenate_outputs(
+pub(super) fn concatenate_outputs(
     outputs: &[RelationalAppliedOutput],
     aggregate_length: usize,
+    job: Option<&Job>,
 ) -> Result<AggregateOutput, super::RecoveryExecutionError> {
+    if let Some(job) = job {
+        job.check_cancelled()?;
+    }
     let mut bytes = Vec::new();
     bytes
         .try_reserve_exact(aggregate_length)
@@ -872,15 +900,25 @@ fn concatenate_outputs(
     let mut seed_samples = Vec::new();
     let mut session_ids = Vec::new();
     let mut session_orders = Vec::new();
+    seed_samples
+        .try_reserve_exact(outputs.len())
+        .map_err(|source| operational("relational aggregate seed allocation failed", source))?;
+    session_ids
+        .try_reserve_exact(outputs.len())
+        .map_err(|source| operational("relational aggregate session allocation failed", source))?;
+    session_orders
+        .try_reserve_exact(outputs.len())
+        .map_err(|source| operational("relational aggregate order allocation failed", source))?;
     let mut session_work = 0_usize;
     for applied in outputs {
-        validate_output_mappings(&applied.payload_mappings, applied.bytes.len())?;
+        validate_output_mappings(&applied.payload_mappings, applied.bytes.len(), job)?;
         let aggregate_offset = bytes.len();
         bytes.extend_from_slice(&applied.bytes);
         append_aggregate_mappings(
             &mut payload_mappings,
             aggregate_offset,
             &applied.payload_mappings,
+            job,
         )?;
         seed_samples.push(applied.seed_sample);
         session_ids.push(applied.session.session);
@@ -902,10 +940,22 @@ fn concatenate_outputs(
 fn validate_output_mappings(
     mappings: &[RelationalOutputMapping],
     output_length: usize,
+    job: Option<&Job>,
 ) -> Result<(), super::RecoveryExecutionError> {
     let mut next_output_start = 0_usize;
     let mut samples = HashSet::new();
-    for mapping in mappings {
+    if let Some(job) = job {
+        job.check_cancelled()?;
+    }
+    samples
+        .try_reserve(mappings.len())
+        .map_err(|source| operational("relational mapping index allocation failed", source))?;
+    for (index, mapping) in mappings.iter().enumerate() {
+        if index.is_multiple_of(256)
+            && let Some(job) = job
+        {
+            job.check_cancelled()?;
+        }
         let source_length = mapping
             .source_range
             .end
@@ -937,8 +987,14 @@ fn append_aggregate_mappings(
     mappings: &mut Vec<RelationalOutputMapping>,
     aggregate_offset: usize,
     applied_mappings: &[RelationalOutputMapping],
+    job: Option<&Job>,
 ) -> Result<(), super::RecoveryExecutionError> {
-    for mapping in applied_mappings {
+    for (index, mapping) in applied_mappings.iter().enumerate() {
+        if index.is_multiple_of(256)
+            && let Some(job) = job
+        {
+            job.check_cancelled()?;
+        }
         let output_range = mapping.output_range;
         mappings.push(RelationalOutputMapping {
             sample: mapping.sample,
@@ -962,12 +1018,15 @@ pub(super) fn decoded_payload_frames(
     rule: &RelationalTransformRule,
     transformed_output_sha256: &str,
 ) -> Result<Vec<DecodedFrameOutput>, super::RecoveryExecutionError> {
-    validate_output_mappings(&applied.payload_mappings, applied.bytes.len())?;
+    validate_output_mappings(&applied.payload_mappings, applied.bytes.len(), context.job)?;
     let mut frames = Vec::new();
     frames
         .try_reserve_exact(applied.payload_mappings.len())
         .map_err(|source| operational("decoded relational frame allocation failed", source))?;
     for mapping in &applied.payload_mappings {
+        if let Some(job) = context.job {
+            job.check_cancelled()?;
+        }
         let sample = context
             .samples
             .iter()
@@ -1136,10 +1195,14 @@ fn retain_relational_rule(
     Ok(true)
 }
 
-pub(super) fn validate_accepted_record_schema(
+pub(super) fn validate_accepted_record_schema<'digest>(
     candidate_index: usize,
     frames: &[DecodedFrameOutput],
     accepted: &AcceptedRecordSchema,
+    mut frame_digest: impl FnMut(
+        usize,
+        &DecodedFrameOutput,
+    ) -> Result<Cow<'digest, str>, super::RecoveryExecutionError>,
 ) -> Result<(), super::RecoveryExecutionError> {
     if accepted.frame_indices.is_empty()
         || accepted.frame_indices.len() != accepted.frame_identities.len()
@@ -1165,7 +1228,8 @@ pub(super) fn validate_accepted_record_schema(
         let frame = frames
             .get(frame_index)
             .ok_or_else(|| invalid_policy("accepted record schema references a missing frame"))?;
-        let frame_bytes_sha256 = sha256(&frame.bytes);
+        // A fresh record parse can supply the same identity without another byte pass
+        let frame_bytes_sha256 = frame_digest(frame_index, frame)?;
         validate_accepted_frame_identity(
             identity,
             frame,
@@ -1218,7 +1282,7 @@ pub(super) fn validate_accepted_frame_identity(
     Ok(())
 }
 
-fn accepted_record_schema_json(accepted: &AcceptedRecordSchema) -> Value {
+pub(super) fn accepted_record_schema_json(accepted: &AcceptedRecordSchema) -> Value {
     let strategy = match accepted.strategy {
         RecordSchemaStrategy::FixedLayout => "fixed_layout",
         RecordSchemaStrategy::RepeatedBoundaries => "repeated_boundaries",

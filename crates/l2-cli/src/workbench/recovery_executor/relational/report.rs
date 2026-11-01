@@ -258,19 +258,22 @@ fn configured_limits_json(plan: &RelationalTransformPlan) -> Value {
 }
 
 fn candidate_json(candidate: &l2_workbench::protocol::RelationalTransformCandidate) -> Value {
-    let rule = &candidate.rule;
     json!({
-        "rule":{
-            "seed_locator":locator_summary(&rule.seed_locator),
-            "payload_locator":locator_summary(&rule.payload_locator),
-            "operation":rule.operation,
-            "counter_reset":rule.counter_reset,
-            "parser_format":format!("{:?}", rule.parser_format),
-            "parser_scope":rule.parser_scope,
-        },
+        "rule":rule_json(&candidate.rule),
         "status":candidate.status,
         "discovery":fit_json(&candidate.discovery),
         "heldout":fit_json(&candidate.heldout),
+    })
+}
+
+pub(super) fn rule_json(rule: &l2_workbench::protocol::RelationalTransformRule) -> Value {
+    json!({
+        "seed_locator":locator_summary(&rule.seed_locator),
+        "payload_locator":locator_summary(&rule.payload_locator),
+        "operation":rule.operation,
+        "counter_reset":rule.counter_reset,
+        "parser_format":format!("{:?}", rule.parser_format),
+        "parser_scope":rule.parser_scope,
     })
 }
 
@@ -294,7 +297,7 @@ fn locator_summary(locator: &l2_workbench::protocol::RelationalByteRangeLocator)
 #[path = "../../../../tests/workbench/recovery_relational/report.rs"]
 mod tests;
 
-fn fit_json(fit: &l2_workbench::protocol::RelationalFit) -> Value {
+pub(super) fn fit_json(fit: &l2_workbench::protocol::RelationalFit) -> Value {
     json!({
         "status":fit.status,
         "supported_sessions":fit.supported_sessions,

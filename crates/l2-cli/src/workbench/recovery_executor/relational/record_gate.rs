@@ -1,11 +1,16 @@
 //! In-memory record and artifact checks used before relational output retention
 
+pub(super) mod checkpoint;
 mod header;
 mod key;
 mod plan;
 mod screen;
 mod selection;
 
+pub(in crate::workbench::recovery_executor::relational) use checkpoint::structural::StructuralEvidence;
+pub(in crate::workbench::recovery_executor::relational) use checkpoint::{
+    SchemaCacheRestoreContext, verify_assessment, verify_structural_assessment,
+};
 pub(super) use plan::SchemaOffsetScope;
 pub(super) use screen::{AcceptedFrameIdentity, AcceptedRecordSchema};
 
@@ -21,20 +26,23 @@ mod family_tests;
 #[path = "../../../../tests/workbench/record_gate_screening.rs"]
 mod screening_tests;
 
+#[cfg(test)]
+use self::screen::screen_with_schema_plan;
 use self::{
     header::HeaderSchemaPlan,
     key::{SchemaHeaderKey, SchemaLayoutKey, schema_header_key, schema_layout_key},
     plan::{build_full_schema_plan, build_schema_plan_with_inputs},
-    screen::{screen_with_header_plan, screen_with_schema_plan},
+    screen::{screen_with_header_plan, screen_with_schema_plan_with_memory},
 };
 use super::super::RecoveryExecutionError;
 use super::{DecodedFrameOutput, invalid_policy, operational};
 use l2_workbench::{
     artifact::{ArtifactValidationFormat, ArtifactValidationPolicy},
-    job::{Counter, Job, Phase},
+    job::{Counter, Job, MemoryBudget, Phase},
     protocol::{
         RecordAssemblyHeaderModel, RecordAssemblyPlan, RecordInput, RecordSchemaDiscoveryReport,
-        RecordSchemaProposalLimits, RelationalTransformReport,
+        RecordSchemaHypothesis, RecordSchemaProposalLimits, RelationalTransformReport,
+        RelationalTransformRule,
     },
 };
 use serde_json::Value;
@@ -43,7 +51,8 @@ use std::{collections::HashMap, sync::Arc};
 const MAX_CACHED_SCHEMA_PLANS: usize = 32;
 const MAX_CACHED_HEADER_PLAN_BYTES: usize = l2_workbench::protocol::DEFAULT_MAX_RECORD_REPORT_BYTES;
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
 pub(super) enum GateStatus {
     ArtifactValidated,
     StructurallySupported,
@@ -77,6 +86,7 @@ pub(super) struct GateResult {
     pub(super) work_limited_at: Option<usize>,
     pub(super) details: Value,
     pub(super) accepted_schema: Option<screen::AcceptedRecordSchema>,
+    pub(super) structural_evidence: Option<checkpoint::structural::StructuralEvidence>,
     pub(super) assessment_scope: SchemaOffsetScope,
 }
 
@@ -92,6 +102,16 @@ pub(super) struct SchemaPlanCache {
     plans: HashMap<SchemaLayoutKey, Arc<SchemaPlan>>,
     header_plans: HashMap<SchemaHeaderKey, Arc<HeaderSchemaPlan>>,
     header_plan_bytes: usize,
+    // Restored maps and compiled plans retain their charges until their data is dropped
+    checkpoint_memory: Option<l2_workbench::job::MemoryLease>,
+    compiled_memory: Vec<l2_workbench::job::MemoryLease>,
+}
+
+impl SchemaPlanCache {
+    #[cfg(test)]
+    pub(super) fn checkpoint_plan_count(&self) -> usize {
+        self.plans.len() + self.header_plans.len()
+    }
 }
 
 pub(super) struct SchemaPlan {
@@ -103,6 +123,8 @@ pub(super) struct SchemaPlan {
     pub(super) has_unassigned_family_messages: bool,
     pub(super) family_search_complete: bool,
     pub(super) assessment_scope: SchemaOffsetScope,
+    // A checkpoint can reuse a plan only after proving its producing output
+    producer_rule: Option<Arc<RelationalTransformRule>>,
 }
 
 #[derive(Clone, Copy)]
@@ -112,13 +134,21 @@ pub(super) struct SchemaCandidateOptions<'a> {
     pub(super) artifact_policy: ArtifactValidationPolicy,
     pub(super) work_limit: usize,
     pub(super) job: Option<&'a Job>,
+    pub(super) producer_rule: Option<&'a RelationalTransformRule>,
+    pub(super) structural_admission: Option<&'a StructuralAdmission<'a>>,
+}
+
+#[derive(Clone, Copy)]
+pub(super) struct StructuralAdmission<'a> {
+    pub(super) memory: &'a MemoryBudget,
+    pub(super) maximum: usize,
 }
 
 #[derive(Clone)]
 pub(super) struct SchemaAlternative {
     pub(super) label: String,
     pub(super) frame_indices: Option<Arc<[usize]>>,
-    discovery_report: Option<RecordSchemaDiscoveryReport>,
+    discovery_report: Option<SchemaGateReport>,
     pub(super) limits: RecordSchemaProposalLimits,
     pub(super) discovery_work_bytes: usize,
     pub(super) learning_message_count: usize,
@@ -129,6 +159,24 @@ pub(super) struct SchemaAlternative {
     pub(super) status: GateStatus,
     pub(super) observed: Option<screen::SchemaAlternativeEvaluation>,
     pub(super) details: Value,
+}
+
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SchemaGateReport {
+    surviving: Vec<RecordSchemaHypothesis>,
+    omitted_survivors: usize,
+    unexamined_combinations: Option<usize>,
+}
+
+impl From<RecordSchemaDiscoveryReport> for SchemaGateReport {
+    fn from(report: RecordSchemaDiscoveryReport) -> Self {
+        Self {
+            surviving: report.surviving,
+            omitted_survivors: report.omitted_survivors,
+            unexamined_combinations: report.unexamined_combinations,
+        }
+    }
 }
 
 impl SchemaPlanCache {
@@ -190,6 +238,8 @@ impl SchemaPlanCache {
         let header_inputs = header_key.map(|_| record_inputs(frames)).transpose()?;
         let mut built_plan =
             build_schema_plan_with_inputs(frames, report, options, header_inputs.as_deref())?;
+        let producer_rule = options.producer_rule.map(|rule| Arc::new(rule.clone()));
+        built_plan.producer_rule.clone_from(&producer_rule);
         let header_cache_has_slot = header_key.is_some()
             && self.plans.len().saturating_add(self.header_plans.len()) < MAX_CACHED_SCHEMA_PLANS;
         let header_plan_maximum = if header_cache_has_slot {
@@ -206,7 +256,17 @@ impl SchemaPlanCache {
         } else {
             0
         };
-        let header_plan = take_header_plan(&mut built_plan, header_plan_maximum)?;
+        let mut header_plan = take_header_plan(&mut built_plan, header_plan_maximum)?;
+        if let Some(header_plan) = &mut header_plan {
+            header_plan.producer_rule = producer_rule;
+        }
+        for alternative in &mut built_plan.alternatives {
+            if let Some(observed) = &mut alternative.observed {
+                // Templates are only needed while constructing the reusable header plan
+                drop(std::mem::take(&mut observed.header_models));
+                observed.header_model_bytes = 0;
+            }
+        }
         if let Some(header_key) = header_key
             && let Some(header_plan) = header_plan
         {
@@ -297,6 +357,7 @@ impl SchemaPlanCache {
                 "work_limit":options.work_limit,
             }),
             accepted_schema: fallback.accepted_schema,
+            structural_evidence: fallback.structural_evidence,
             assessment_scope: SchemaOffsetScope::CompleteInput,
         })
     }
@@ -337,24 +398,8 @@ impl SchemaPlanCache {
         report: &RelationalTransformReport,
         options: SchemaCandidateOptions<'_>,
     ) -> Result<GateResult, RecoveryExecutionError> {
-        let plan = build_full_schema_plan(
-            frames,
-            report,
-            options.schema_limits,
-            options.work_limit,
-            options.parser_format,
-            options.artifact_policy,
-            options.job,
-        )?;
-        let mut result = screen_with_schema_plan(
-            frames,
-            options.parser_format,
-            options.artifact_policy,
-            options.work_limit,
-            options.job,
-            &plan,
-            false,
-        )?;
+        let plan = build_full_schema_plan(frames, report, options)?;
+        let mut result = screen_with_schema_plan_with_memory(frames, options, &plan, false)?;
         result.assessment_scope = SchemaOffsetScope::CompleteInput;
         if let Some(details) = result.details.as_object_mut() {
             details.insert("full_inference_fallback".to_owned(), Value::Bool(true));
@@ -384,15 +429,7 @@ fn screen_plan(
     plan: &SchemaPlan,
     cache_hit: bool,
 ) -> Result<GateResult, RecoveryExecutionError> {
-    screen_with_schema_plan(
-        frames,
-        options.parser_format,
-        options.artifact_policy,
-        options.work_limit,
-        options.job,
-        plan,
-        cache_hit,
-    )
+    screen_with_schema_plan_with_memory(frames, options, plan, cache_hit)
 }
 
 fn add_header_cache_miss_details(
@@ -552,6 +589,7 @@ fn take_header_plan(
         assembly_plan,
         retained_bytes,
         omitted_models: observed.header_models_omitted,
+        producer_rule: None,
     }))
 }
 
@@ -580,6 +618,7 @@ const fn result(status: GateStatus, work_bytes: usize, details: Value) -> GateRe
         work_limited_at: None,
         details,
         accepted_schema: None,
+        structural_evidence: None,
         assessment_scope: SchemaOffsetScope::CompleteInput,
     }
 }

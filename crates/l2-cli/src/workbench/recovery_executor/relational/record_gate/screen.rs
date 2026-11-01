@@ -2,8 +2,8 @@ use super::super::super::RecoveryExecutionError;
 use super::super::{DecodedFrameOutput, aggregate_validator, invalid_policy, operational};
 use super::header::{HeaderSchemaModel, HeaderSchemaPlan};
 use super::{
-    GateResult, GateStatus, SchemaAlternative, SchemaOffsetScope, SchemaPlan, record_inputs,
-    record_job_work, result,
+    GateResult, GateStatus, SchemaAlternative, SchemaCandidateOptions, SchemaGateReport,
+    SchemaOffsetScope, SchemaPlan, StructuralAdmission, record_inputs, record_job_work, result,
 };
 use l2_workbench::{
     artifact::{
@@ -14,8 +14,8 @@ use l2_workbench::{
     protocol::{
         BoundRecordAssemblyPlan, HeaderParseTemplate, MessageContext, RecordAssemblyInput,
         RecordAssemblyModelStatus, RecordAssemblyOutcome, RecordError, RecordGroupReceipt,
-        RecordInput, RecordParseReport, RecordSchema, RecordSchemaDiscoveryReport,
-        RecordSchemaHypothesis, RecordSchemaProposalLimits, RecordSchemaStrategy, RecordWorkBudget,
+        RecordInput, RecordParseReport, RecordSchema, RecordSchemaHypothesis,
+        RecordSchemaProposalLimits, RecordSchemaStrategy, RecordWorkBudget,
         assemble_record_groups_from_inputs,
     },
 };
@@ -44,6 +44,7 @@ struct SchemaEvaluation {
     uniform_structural_support: bool,
     family_structural_support: bool,
     accepted_schema: Option<AcceptedRecordSchema>,
+    structural_witnesses: Vec<super::checkpoint::structural::StructuralWitness>,
     alternatives: Vec<Value>,
 }
 
@@ -71,6 +72,7 @@ pub(in crate::workbench::recovery_executor::relational) struct SchemaAlternative
     pub(super) strict_survivors_seen: usize,
     pub(super) exact_artifact_survivor_ordinal: Option<usize>,
     pub(super) accepted_schema: Option<AcceptedRecordSchema>,
+    pub(super) structural_witness: Option<super::checkpoint::structural::StructuralWitness>,
     pub(super) work_limited: bool,
     pub(super) survives: bool,
     pub(super) pending: bool,
@@ -85,7 +87,8 @@ pub(super) struct ObservedSchemaEvaluations {
     pub(super) repeated_boundaries: SchemaAlternativeEvaluation,
 }
 
-#[derive(Clone)]
+#[derive(Clone, serde::Deserialize, serde::Serialize)]
+#[serde(deny_unknown_fields)]
 pub(in crate::workbench::recovery_executor::relational) struct AcceptedRecordSchema {
     pub(in crate::workbench::recovery_executor::relational) schema: RecordSchema,
     pub(in crate::workbench::recovery_executor::relational) strategy: RecordSchemaStrategy,
@@ -99,7 +102,8 @@ pub(in crate::workbench::recovery_executor::relational) struct AcceptedRecordSch
         ArtifactValidationFormat,
 }
 
-#[derive(Clone)]
+#[derive(Clone, serde::Deserialize, serde::Serialize)]
+#[serde(deny_unknown_fields)]
 pub(in crate::workbench::recovery_executor::relational) struct AcceptedFrameIdentity {
     pub(in crate::workbench::recovery_executor::relational) frame_index: usize,
     pub(in crate::workbench::recovery_executor::relational) input_node_id: u64,
@@ -116,6 +120,7 @@ pub(super) struct SchemaObserverOptions<'a> {
     pub(super) parser_format: ArtifactValidationFormat,
     pub(super) artifact_policy: ArtifactValidationPolicy,
     pub(super) job: Option<&'a Job>,
+    pub(super) structural_admission: Option<StructuralAdmission<'a>>,
 }
 
 pub(super) struct SurvivingSchemaInputs<'a> {
@@ -185,6 +190,7 @@ struct CandidateInspection {
     pending: bool,
 }
 
+#[cfg(test)]
 pub(super) fn screen_with_schema_plan(
     frames: &[DecodedFrameOutput],
     parser_format: ArtifactValidationFormat,
@@ -194,6 +200,35 @@ pub(super) fn screen_with_schema_plan(
     plan: &SchemaPlan,
     cache_hit: bool,
 ) -> Result<GateResult, RecoveryExecutionError> {
+    screen_with_schema_plan_with_memory(
+        frames,
+        SchemaCandidateOptions {
+            parser_format,
+            artifact_policy,
+            work_limit,
+            job,
+            schema_limits: RecordSchemaProposalLimits::default(),
+            producer_rule: None,
+            structural_admission: None,
+        },
+        plan,
+        cache_hit,
+    )
+}
+
+pub(super) fn screen_with_schema_plan_with_memory(
+    frames: &[DecodedFrameOutput],
+    options: SchemaCandidateOptions<'_>,
+    plan: &SchemaPlan,
+    cache_hit: bool,
+) -> Result<GateResult, RecoveryExecutionError> {
+    let SchemaCandidateOptions {
+        parser_format,
+        work_limit,
+        job,
+        structural_admission,
+        ..
+    } = options;
     let unchanged_schema_only = all_frames_have_preserved_headers(frames);
     if let Some(job) = job {
         job.check_cancelled()?;
@@ -213,21 +248,28 @@ pub(super) fn screen_with_schema_plan(
             plan,
         ));
     }
-    let (evaluation, all_alternatives_contradicted) = evaluate_plan_alternatives(
-        frames,
-        parser_format,
-        artifact_policy,
-        work_limit,
-        job,
-        plan,
-        initial_work,
-    )?;
+    let (evaluation, all_alternatives_contradicted) =
+        evaluate_plan_alternatives(frames, options, plan, initial_work)?;
     let status = classify_status(
         &evaluation,
         unchanged_schema_only,
         all_alternatives_contradicted,
         plan,
     );
+    let structural_evidence = if let (GateStatus::StructurallySupported, Some(admission)) =
+        (status, structural_admission)
+    {
+        super::checkpoint::structural::capture_evidence(
+            frames,
+            plan,
+            &evaluation.structural_witnesses,
+            job,
+            Some(admission.memory),
+            admission.maximum,
+        )?
+    } else {
+        None
+    };
     let mut gate_result = result(
         status,
         evaluation.used_work,
@@ -243,6 +285,7 @@ pub(super) fn screen_with_schema_plan(
     gate_result.work_limited_at =
         (evaluation.work_limited.is_some() || plan.work_limited).then_some(work_limit);
     gate_result.accepted_schema = evaluation.accepted_schema;
+    gate_result.structural_evidence = structural_evidence;
     gate_result.assessment_scope = plan.assessment_scope;
     Ok(gate_result)
 }
@@ -277,6 +320,7 @@ pub(super) fn screen_with_header_plan(
         artifact_policy,
         work_limit,
         job,
+        structural_admission: None,
         full_input_bytes,
     };
     let evaluation = evaluate_header_models(&context, plan)?;
@@ -505,6 +549,8 @@ fn evaluate_header_group(
                 plan.assembly_plan.model_count().saturating_sub(model_index);
             return Ok(Some(CandidateInspection {
                 pending: true,
+                // A match cannot be reused until its complete receipt is retained
+                exact_artifact_match: false,
                 ..inspection
             }));
         }
@@ -599,13 +645,18 @@ fn all_frame_indices(frame_count: usize) -> Result<Vec<usize>, RecoveryExecution
 
 fn evaluate_plan_alternatives(
     frames: &[DecodedFrameOutput],
-    parser_format: ArtifactValidationFormat,
-    artifact_policy: ArtifactValidationPolicy,
-    work_limit: usize,
-    job: Option<&Job>,
+    candidate_options: SchemaCandidateOptions<'_>,
     plan: &SchemaPlan,
     initial_work: usize,
 ) -> Result<(SchemaEvaluation, bool), RecoveryExecutionError> {
+    let SchemaCandidateOptions {
+        parser_format,
+        artifact_policy,
+        work_limit,
+        job,
+        structural_admission,
+        ..
+    } = candidate_options;
     let inputs = record_inputs(frames)?;
     let mut evaluation = SchemaEvaluation {
         used_work: initial_work,
@@ -621,6 +672,7 @@ fn evaluate_plan_alternatives(
         artifact_policy,
         work_limit,
         job,
+        structural_admission: structural_admission.copied(),
     };
     let mut all_alternatives_contradicted = true;
     for alternative in &plan.alternatives {
@@ -640,6 +692,7 @@ struct PlanScreenOptions<'a> {
     artifact_policy: ArtifactValidationPolicy,
     work_limit: usize,
     job: Option<&'a Job>,
+    structural_admission: Option<StructuralAdmission<'a>>,
 }
 
 fn evaluate_alternative(
@@ -653,11 +706,7 @@ fn evaluate_alternative(
     }
     let before = EvaluationSnapshot::capture(evaluation);
     let Some(report) = alternative.discovery_report.as_ref() else {
-        return Ok(evaluate_unreported_alternative(
-            alternative,
-            before,
-            evaluation,
-        ));
+        return evaluate_unreported_alternative(alternative, before, evaluation);
     };
     if alternative.omitted_learning_messages > 0 && alternative.observed.is_none() {
         record_incomplete_application(alternative, evaluation);
@@ -674,6 +723,7 @@ fn evaluate_alternative(
         artifact_policy: options.artifact_policy,
         work_limit: options.work_limit,
         job: options.job,
+        structural_admission: options.structural_admission,
         full_input_bytes,
     };
     let alt_result = if let Some(observed) = alternative.observed.as_ref() {
@@ -691,6 +741,7 @@ fn evaluate_alternative(
             strict_survivors_seen: observed.strict_survivors_seen,
             exact_artifact_survivor_ordinal: observed.exact_artifact_survivor_ordinal,
             accepted_schema: observed.accepted_schema.clone(),
+            structural_witness: observed.structural_witness.clone(),
             work_limited: observed.work_limited,
             survives: observed.survives,
             pending: observed.pending,
@@ -715,7 +766,7 @@ fn evaluate_alternative(
         evaluation.work_limited = Some(WorkLimitHit);
     }
     // One corroborated schema is positive structural evidence even when other schemas remain unexamined
-    record_structural_support(alternative, &alt_result, evaluation);
+    record_structural_support(alternative, &alt_result, evaluation)?;
     let alternative_status = alternative_status(alternative, &alt_result, alternative_pending);
     evaluation.alternatives.push(alternative_details(
         alternative,
@@ -732,10 +783,10 @@ fn evaluate_unreported_alternative(
     alternative: &SchemaAlternative,
     before: EvaluationSnapshot,
     evaluation: &mut SchemaEvaluation,
-) -> bool {
+) -> Result<bool, RecoveryExecutionError> {
     let Some(observed) = alternative.observed.as_ref() else {
         record_missing_report(alternative, evaluation);
-        return false;
+        return Ok(false);
     };
     accumulate_observed_evaluation(evaluation, observed);
     if evaluation.accepted_schema.is_none() {
@@ -744,7 +795,7 @@ fn evaluate_unreported_alternative(
             .clone_from(&observed.accepted_schema);
     }
     evaluation.pending = true;
-    record_structural_support(alternative, observed, evaluation);
+    record_structural_support(alternative, observed, evaluation)?;
     let status = alternative_status(alternative, observed, true);
     evaluation.alternatives.push(json!({
         "label":alternative.label,
@@ -759,7 +810,7 @@ fn evaluate_unreported_alternative(
         "work_bytes":alternative.discovery_work_bytes,
         "analysis":alternative.details,
     }));
-    evaluation.exact_artifact_matches > before.matches
+    Ok(evaluation.exact_artifact_matches > before.matches)
 }
 
 fn record_missing_report(alternative: &SchemaAlternative, evaluation: &mut SchemaEvaluation) {
@@ -819,23 +870,33 @@ impl EvaluationSnapshot {
     }
 }
 
-const fn record_structural_support(
+fn record_structural_support(
     alternative: &SchemaAlternative,
     result: &SchemaAlternativeEvaluation,
     evaluation: &mut SchemaEvaluation,
-) {
+) -> Result<(), RecoveryExecutionError> {
     if result.survives {
+        if let Some(witness) = &result.structural_witness {
+            evaluation
+                .structural_witnesses
+                .try_reserve(1)
+                .map_err(|error| operational("structural witness allocation failed", error))?;
+            let mut witness = witness.clone();
+            witness.family = alternative.frame_indices.is_some();
+            evaluation.structural_witnesses.push(witness);
+        }
         if alternative.frame_indices.is_none() {
             evaluation.uniform_structural_support = true;
         } else {
             evaluation.family_structural_support = true;
         }
     }
+    Ok(())
 }
 
 fn alternative_details(
     alternative: &SchemaAlternative,
-    report: &RecordSchemaDiscoveryReport,
+    report: &SchemaGateReport,
     result: &SchemaAlternativeEvaluation,
     before: EvaluationSnapshot,
     evaluation: &SchemaEvaluation,
@@ -999,12 +1060,13 @@ pub(super) struct SchemaScreenContext<'a> {
     pub(super) artifact_policy: ArtifactValidationPolicy,
     pub(super) work_limit: usize,
     pub(super) job: Option<&'a Job>,
+    pub(super) structural_admission: Option<StructuralAdmission<'a>>,
     pub(super) full_input_bytes: usize,
 }
 
 fn evaluate_surviving_schemas(
     context: &SchemaScreenContext<'_>,
-    report: &RecordSchemaDiscoveryReport,
+    report: &SchemaGateReport,
     evaluation: &mut SchemaEvaluation,
 ) -> Result<SchemaAlternativeEvaluation, RecoveryExecutionError> {
     let mut alternative = SchemaAlternativeEvaluation::default();
@@ -1013,6 +1075,9 @@ fn evaluate_surviving_schemas(
             job.check_cancelled()?;
         }
         let result = evaluate_hypothesis(context, hypothesis, &mut evaluation.used_work)?;
+        if result.evidence.is_supported() && alternative.structural_witness.is_none() {
+            alternative.structural_witness = capture_structural_witness(context, hypothesis)?;
+        }
         evaluation.exact_artifact_matches = evaluation
             .exact_artifact_matches
             .saturating_add(result.exact_artifact_matches);
@@ -1065,6 +1130,21 @@ fn evaluate_surviving_schemas(
         }
     }
     Ok(alternative)
+}
+
+fn capture_structural_witness(
+    context: &SchemaScreenContext<'_>,
+    hypothesis: &RecordSchemaHypothesis,
+) -> Result<Option<super::checkpoint::structural::StructuralWitness>, RecoveryExecutionError> {
+    let Some(admission) = context.structural_admission else {
+        return Ok(None);
+    };
+    super::checkpoint::structural::capture_witness(
+        &hypothesis.schema,
+        context.frame_indices,
+        Some(admission.memory),
+        admission.maximum,
+    )
 }
 
 pub(super) fn observe_surviving_schema(
@@ -1132,6 +1212,9 @@ pub(super) fn observe_surviving_schema(
         .map_err(|source| operational("record gate parse reference allocation failed", source))?;
     report_references.extend(completed_reports.iter().map(Cow::as_ref));
     let result = evaluate_hypothesis_reports(context, &report_references, observer_work)?;
+    if result.evidence.is_supported() && evaluation.structural_witness.is_none() {
+        evaluation.structural_witness = capture_structural_witness(context, hypothesis)?;
+    }
     let artifact_validated = result.exact_artifact_matches > 0;
     finish_observer_work(evaluation, *observer_work, before_work);
     accumulate_hypothesis_result(
@@ -1561,8 +1644,17 @@ fn evaluate_hypothesis(
     hypothesis: &RecordSchemaHypothesis,
     used_work: &mut usize,
 ) -> Result<HypothesisEvaluation, RecoveryExecutionError> {
+    evaluate_hypothesis_with_accounting(context, hypothesis, used_work, true)
+}
+
+fn evaluate_hypothesis_with_accounting(
+    context: &SchemaScreenContext<'_>,
+    hypothesis: &RecordSchemaHypothesis,
+    used_work: &mut usize,
+    count_rejections: bool,
+) -> Result<HypothesisEvaluation, RecoveryExecutionError> {
     let mut parser_work = RecordWorkBudget::new(context.work_limit.saturating_sub(*used_work));
-    let parsed = parse_hypothesis_frames(context, hypothesis, &mut parser_work);
+    let parsed = parse_hypothesis_frames(context, hypothesis, &mut parser_work, count_rejections);
     reserve_schema_work(used_work, parser_work.consumed(), context.work_limit)?;
     let parse_reports = match parsed? {
         HypothesisParseReports::Complete(reports) => reports,
@@ -1640,6 +1732,7 @@ fn parse_hypothesis_frames(
     context: &SchemaScreenContext<'_>,
     hypothesis: &RecordSchemaHypothesis,
     work: &mut RecordWorkBudget,
+    count_rejections: bool,
 ) -> Result<HypothesisParseReports, RecoveryExecutionError> {
     let mut reports = Vec::new();
     reports
@@ -1666,7 +1759,7 @@ fn parse_hypothesis_frames(
                 | RecordError::AllocationFailed,
             ) => return Ok(HypothesisParseReports::Omitted),
             Err(_) => {
-                if let Some(job) = context.job {
+                if let Some(job) = context.job.filter(|_| count_rejections) {
                     job.increment(Counter::CandidatesRejected, 1)?;
                 }
                 return Ok(HypothesisParseReports::Contradicted);
@@ -1675,6 +1768,68 @@ fn parse_hypothesis_frames(
         reports.push(parsed);
     }
     Ok(HypothesisParseReports::Complete(reports))
+}
+
+pub(super) fn verify_checkpoint_schema(
+    witness: &super::checkpoint::structural::StructuralWitness,
+    frames: &[DecodedFrameOutput],
+    context: &mut super::checkpoint::SchemaCacheRestoreContext<'_, '_>,
+) -> Result<(), RecoveryExecutionError> {
+    let _workspace = context
+        .memory
+        .try_reserve(
+            l2_workbench::job::MemoryClass::Executor,
+            u64::try_from(context.maximum_workspace_bytes)
+                .map_err(|_| l2_workbench::recovery::RecoveryError::InvalidCheckpoint)?,
+        )
+        .map_err(|error| operational("structural verification admission failed", error))?;
+    let inputs = record_inputs(frames)?;
+    let mut limits = context.schema_limits;
+    let logical = context.maximum_workspace_bytes / 16;
+    if logical == 0 {
+        return Err(l2_workbench::recovery::RecoveryError::InvalidCheckpoint.into());
+    }
+    limits.discovery.record_limits.max_report_bytes =
+        limits.discovery.record_limits.max_report_bytes.min(logical);
+    limits.discovery.record_limits.max_output_bytes =
+        limits.discovery.record_limits.max_output_bytes.min(logical);
+    let full_input_bytes = total_indexed_bytes(frames, &witness.frame_indices)?;
+    let parser_format = frames
+        .first()
+        .ok_or(l2_workbench::recovery::RecoveryError::InvalidCheckpoint)?
+        .parser_format;
+    let screen_context = SchemaScreenContext {
+        frames,
+        inputs: &inputs,
+        frame_indices: &witness.frame_indices,
+        limits,
+        parser_format,
+        artifact_policy: context.artifact_policy,
+        work_limit: context.work.remaining_verification_work_bytes(),
+        job: context.job,
+        structural_admission: None,
+        full_input_bytes,
+    };
+    let hypothesis = RecordSchemaHypothesis {
+        schema: witness.schema.clone(),
+        training_message_count: 0,
+        held_out_message_count: 0,
+        training_record_count: 0,
+        held_out_record_count: 0,
+    };
+    let mut used = 0;
+    // Verification work is separate from the saved search's diagnostics and counters
+    let result =
+        evaluate_hypothesis_with_accounting(&screen_context, &hypothesis, &mut used, false);
+    if !context.work.try_charge_verification(used) {
+        return Err(operational("structural verification work limit reached",
+            l2_workbench::protocol::RelationalCursorError::<std::convert::Infallible>::RestoreWorkLimit));
+    }
+    let result = result?;
+    if !result.evidence.is_supported() {
+        return Err(l2_workbench::recovery::RecoveryError::InvalidCheckpoint.into());
+    }
+    Ok(())
 }
 
 fn assembly_work_bytes(

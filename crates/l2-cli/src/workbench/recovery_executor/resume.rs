@@ -9,7 +9,7 @@ use l2_workbench::{
     evidence::{CasePrefixBinding, CaseSnapshotLimits, CaseSnapshotUsage},
     job::{
         CacheFallbackKind, CacheStage, Job, MemoryBudget, MemoryClass, MemoryLease, WorkSnapshot,
-        cache::{CacheError, ExecutionCheckpointLimits, Lease},
+        cache::{CacheError, ExecutionCheckpointLimits, ExecutionGeneration, Lease},
     },
 };
 use serde::{Deserialize, Serialize};
@@ -19,12 +19,19 @@ const METADATA_VERSION: u32 = 1;
 const MAX_METADATA_BYTES: u64 = 4 * 1024 * 1024;
 const CHECKPOINT_INTERVAL: Duration = Duration::from_secs(30);
 
-#[derive(Deserialize, Serialize)]
+#[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct Metadata {
     version: u32,
     usage: CaseSnapshotUsage,
     work: Option<WorkSnapshot>,
+}
+
+#[derive(Serialize)]
+struct MetadataRef<'a> {
+    version: u32,
+    usage: CaseSnapshotUsage,
+    work: Option<&'a WorkSnapshot>,
 }
 
 /// One exclusively leased recovery stage and its checkpoint storage policy
@@ -33,12 +40,25 @@ pub struct RecoveryResume<'lease> {
     case_limits: CaseSnapshotLimits,
     store_limits: ExecutionCheckpointLimits,
     executor_limit: usize,
+    session_memory: MemoryBudget,
     refresh: bool,
     strict: bool,
     disabled: bool,
     last_save: Option<Instant>,
     initial: Option<CasePrefixBinding>,
     memory: Option<MemoryBudget>,
+    generation: Option<ExecutionGeneration>,
+    usage: Option<CaseSnapshotUsage>,
+    #[cfg(test)]
+    test_hooks: RelationalTestHooks,
+}
+
+#[cfg(test)]
+#[derive(Default)]
+struct RelationalTestHooks {
+    pause_after_relational: Option<std::path::PathBuf>,
+    cancel_after_relational_load: bool,
+    restored_relational: Option<u64>,
 }
 
 pub(super) struct Loaded {
@@ -65,12 +85,19 @@ impl<'lease> RecoveryResume<'lease> {
                 max_metadata_bytes: MAX_METADATA_BYTES,
             },
             executor_limit: usize::try_from(executor_bytes).unwrap_or(usize::MAX),
+            session_memory: memory
+                .cloned()
+                .unwrap_or_else(|| MemoryBudget::new(options.memory_limit)),
             refresh: options.refresh,
             strict: options.strict_cache,
             disabled: false,
             last_save: None,
             initial: None,
             memory: memory.cloned(),
+            generation: None,
+            usage: None,
+            #[cfg(test)]
+            test_hooks: RelationalTestHooks::default(),
         }
     }
 
@@ -95,6 +122,7 @@ impl<'lease> RecoveryResume<'lease> {
         if metadata.version != METADATA_VERSION {
             return Err(cache_error(CacheError::CorruptCheckpoint));
         }
+        let generation = active.generation().clone();
         let encoded_bytes = active.executor_bytes();
         let count =
             usize::try_from(encoded_bytes).map_err(|_| cache_error(CacheError::SizeOverflow))?;
@@ -132,6 +160,8 @@ impl<'lease> RecoveryResume<'lease> {
         bytes.resize(count, 0);
         state.read_exact(&mut bytes).map_err(operational_error)?;
         drop(active);
+        self.generation = Some(generation);
+        self.usage = Some(metadata.usage);
         self.last_save = Some(Instant::now());
         Ok(Some(Loaded {
             case,
@@ -218,9 +248,10 @@ impl<'lease> RecoveryResume<'lease> {
             (Job::new("recovery checkpoint").checkpoint_snapshot()?, None)
         };
         let mut codec_error = None;
+        let mut saved_usage = None;
         let result = self
             .lease
-            .save_active(&snapshot, self.store_limits, |writer| {
+            .save_active_generation(&snapshot, self.store_limits, |writer| {
                 let (mut graph, mut blobs, mut state) = writer.streams();
                 let usage = match crate::case_snapshot::write_streams(
                     &mut graph,
@@ -235,19 +266,74 @@ impl<'lease> RecoveryResume<'lease> {
                         return Err(CacheError::CorruptCheckpoint);
                     }
                 };
+                saved_usage = Some(usage);
                 if let Err(error) =
                     checkpoint::write(executor, cursor, &mut state, self.executor_limit)
                 {
                     codec_error = Some(error);
                     return Err(CacheError::CorruptCheckpoint);
                 }
-                Ok(serde_json::to_value(Metadata {
+                Ok(MetadataRef {
                     version: METADATA_VERSION,
                     usage,
-                    work,
-                })?)
+                    work: work.as_ref(),
+                })
             });
         // Cache quotas and I/O errors explain the writer failure more precisely than the codec
+        match (result, codec_error) {
+            (Err(CacheError::CorruptCheckpoint), Some(error)) => return Err(error),
+            (Err(error), _) => return Err(cache_error(error)),
+            (Ok(generation), _) => {
+                self.generation = Some(generation);
+                self.usage = saved_usage;
+            }
+        }
+        self.last_save = Some(Instant::now());
+        Ok(())
+    }
+
+    pub(super) fn save_incremental(
+        &mut self,
+        executor: &Executor<'_>,
+        cursor: &SchedulerCursor,
+    ) -> Result<(), RecoveryExecutionError> {
+        if self.disabled {
+            return Ok(());
+        }
+        let usage = self
+            .usage
+            .ok_or_else(|| cache_error(CacheError::CorruptCheckpoint))?;
+        let generation = self
+            .generation
+            .as_mut()
+            .ok_or_else(|| cache_error(CacheError::CorruptCheckpoint))?;
+        let (snapshot, work) = if let Some(progress) = &executor.job {
+            (
+                progress.job.checkpoint_snapshot()?,
+                Some(progress.job.work_snapshot()?),
+            )
+        } else {
+            (Job::new("recovery checkpoint").checkpoint_snapshot()?, None)
+        };
+        let executor_limit = self.executor_limit;
+        let mut codec_error = None;
+        let result = self.lease.update_active_executor(
+            generation,
+            &snapshot,
+            self.store_limits,
+            |mut state| {
+                if let Err(error) = checkpoint::write(executor, cursor, &mut state, executor_limit)
+                {
+                    codec_error = Some(error);
+                    return Err(CacheError::CorruptCheckpoint);
+                }
+                Ok(MetadataRef {
+                    version: METADATA_VERSION,
+                    usage,
+                    work: work.as_ref(),
+                })
+            },
+        );
         match (result, codec_error) {
             (Err(CacheError::CorruptCheckpoint), Some(error)) => return Err(error),
             (Err(error), _) => return Err(cache_error(error)),
@@ -262,7 +348,25 @@ impl<'lease> RecoveryResume<'lease> {
         executor: &Executor<'_>,
         cursor: &SchedulerCursor,
     ) -> Result<(), RecoveryExecutionError> {
-        match self.save(executor, cursor) {
+        let result = self.save(executor, cursor);
+        self.save_result(executor, result)
+    }
+
+    pub(super) fn save_incremental_or_fallback(
+        &mut self,
+        executor: &Executor<'_>,
+        cursor: &SchedulerCursor,
+    ) -> Result<(), RecoveryExecutionError> {
+        let result = self.save_incremental(executor, cursor);
+        self.save_result(executor, result)
+    }
+
+    fn save_result(
+        &mut self,
+        executor: &Executor<'_>,
+        result: Result<(), RecoveryExecutionError>,
+    ) -> Result<(), RecoveryExecutionError> {
+        match result {
             Ok(()) => Ok(()),
             Err(error)
                 if !self.strict
@@ -295,6 +399,99 @@ impl<'lease> RecoveryResume<'lease> {
 
     pub(super) const fn executor_limit(&self) -> usize {
         self.executor_limit
+    }
+
+    pub(super) fn session_memory(&self) -> MemoryBudget {
+        self.session_memory.clone()
+    }
+
+    #[cfg(test)]
+    pub(super) const fn wants_populated_checkpoint(&self) -> bool {
+        self.test_hooks.pause_after_relational.is_some()
+    }
+
+    #[cfg(test)]
+    pub(super) fn relational_restored(
+        &mut self,
+        count: usize,
+        job: Option<&Job>,
+    ) -> Result<(), RecoveryExecutionError> {
+        self.test_hooks.restored_relational = Some(
+            u64::try_from(count)
+                .map_err(|_| l2_workbench::recovery::RecoveryError::InvalidCheckpoint)?,
+        );
+        if self.test_hooks.cancel_after_relational_load {
+            let job = job.ok_or(l2_workbench::recovery::RecoveryError::InvalidCheckpoint)?;
+            job.request_cancel();
+            job.check_cancelled()?;
+        }
+        Ok(())
+    }
+
+    #[cfg(test)]
+    pub(super) fn after_populated_checkpoint(
+        &mut self,
+        count: usize,
+        cached_plans: usize,
+        job: Option<&Job>,
+        history: Option<&l2_workbench::protocol::RelationalReplayHistory>,
+    ) -> Result<(), RecoveryExecutionError> {
+        if count > 0
+            && cached_plans > 0
+            && let Some(path) = self.test_hooks.pause_after_relational.take()
+        {
+            let job = job.ok_or(l2_workbench::recovery::RecoveryError::InvalidCheckpoint)?;
+            let peak = job
+                .memory_budget()
+                .ok_or(l2_workbench::recovery::RecoveryError::InvalidCheckpoint)?
+                .snapshot()
+                .map_err(operational_error)?
+                .peak_bytes;
+            let work = job.work_snapshot()?;
+            let history_entries = history
+                .map(serde_json::to_value)
+                .transpose()
+                .map_err(operational_error)?
+                .and_then(|value| {
+                    value
+                        .get("entries")
+                        .and_then(serde_json::Value::as_array)
+                        .map(Vec::len)
+                })
+                .unwrap_or(0);
+            let marker = serde_json::to_vec(&serde_json::json!({
+                    "candidates_examined": count,
+                    "cached_plans": cached_plans,
+                    "aggregate_peak_bytes": peak,
+                    "work_candidates_examined": work.counter(l2_workbench::job::Counter::CandidatesExamined),
+                    "work_bytes": work.counter(l2_workbench::job::Counter::Bytes),
+                    "history_storage_bytes": history.map_or(0, l2_workbench::protocol::RelationalReplayHistory::storage_bytes),
+                    "history_ceiling_bytes": history.map_or(0, l2_workbench::protocol::RelationalReplayHistory::maximum_bytes),
+                    "history_entries": history_entries,
+                }))
+                .map_err(operational_error)?;
+            std::fs::write(path, marker).map_err(operational_error)?;
+            loop {
+                job.check_cancelled()?;
+                std::thread::sleep(Duration::from_millis(20));
+            }
+        }
+        Ok(())
+    }
+
+    #[cfg(test)]
+    pub(super) fn pause_after_populated_relational_checkpoint(&mut self, path: std::path::PathBuf) {
+        self.test_hooks.pause_after_relational = Some(path);
+    }
+
+    #[cfg(test)]
+    pub(super) const fn cancel_after_loading_relational_checkpoint(&mut self) {
+        self.test_hooks.cancel_after_relational_load = true;
+    }
+
+    #[cfg(test)]
+    pub(super) const fn restored_relational_candidates(&self) -> Option<u64> {
+        self.test_hooks.restored_relational
     }
 
     fn reserve(&self, bytes: u64) -> Result<Option<MemoryLease>, RecoveryExecutionError> {

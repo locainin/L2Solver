@@ -147,7 +147,7 @@ fn insufficient_coordinator_work_reports_an_omission_without_charging_unread_inp
         &mut work_remaining,
         None,
     )?;
-    assert_eq!(result.reason, Some("coordinator_work_limit"));
+    assert_eq!(result.reason.as_deref(), Some("coordinator_work_limit"));
     assert_eq!(work_remaining, 1);
     assert!(result.outputs.is_empty());
     Ok(())

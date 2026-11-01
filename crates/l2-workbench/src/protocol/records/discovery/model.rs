@@ -219,7 +219,8 @@ impl RecordDiscoveryValidationBasis {
 }
 
 /// A schema that parsed every supplied message
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct RecordSchemaHypothesis {
     /// Exact schema retained from the finite caller-defined search space
     pub schema: RecordSchema,

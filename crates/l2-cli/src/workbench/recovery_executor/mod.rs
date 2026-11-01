@@ -297,6 +297,9 @@ fn execute_internal(
                     memory,
                 ) {
                     Ok((mut executor, mut cursor)) => {
+                        let prior_work = job
+                            .map(|progress| progress.job.work_snapshot())
+                            .transpose()?;
                         match RecoveryResume::restore_work(
                             job.map(|progress| &progress.job),
                             loaded.work,
@@ -308,11 +311,36 @@ fn execute_internal(
                                 if let Some(progress) = &executor.job {
                                     progress.job.increment(Counter::CacheHits, 1)?;
                                 }
-                                execute_cursor(&mut executor, &mut cursor, Some(active))?;
-                                let outcome = finish_executor(executor)?;
-                                // Restoration is isolated until all saved state has been accepted
-                                *case = loaded.case;
-                                return Ok(outcome);
+                                cursor.restoration_pending = cursor.active_relational.is_some();
+                                match execute_cursor(&mut executor, &mut cursor, Some(active)) {
+                                    Ok(()) => {
+                                        let outcome = finish_executor(executor)?;
+                                        // Restoration is isolated until all saved state has been accepted
+                                        *case = loaded.case;
+                                        return Ok(outcome);
+                                    }
+                                    Err(error) if cursor.restoration_pending => {
+                                        executor.check_cancelled()?;
+                                        drop(executor);
+                                        let error = match error {
+                                            RecoveryExecutionError::Job(_)
+                                            | RecoveryExecutionError::Operational { .. }
+                                            | RecoveryExecutionError::Coordinator(
+                                                RecoveryError::InvalidCheckpoint,
+                                            ) => error,
+                                            other => RecoveryExecutionError::Operational {
+                                                stage: RecoveryStage::TransformDiscovery,
+                                                source: Box::new(other),
+                                            },
+                                        };
+                                        active.invalid(error, job.map(|progress| &progress.job))?;
+                                        RecoveryResume::restore_work(
+                                            job.map(|progress| &progress.job),
+                                            prior_work,
+                                        )?;
+                                    }
+                                    Err(error) => return Err(error),
+                                }
                             }
                             Err(error) => {
                                 active.invalid(error, job.map(|progress| &progress.job))?;
@@ -392,13 +420,16 @@ fn execute_cursor(
 ) -> Result<(), RecoveryExecutionError> {
     loop {
         if let Err(error) = executor.check_cancelled() {
-            if let Some(active) = resume.as_deref_mut() {
+            if let Some(active) = resume
+                .as_deref_mut()
+                .filter(|_| cursor.begun_relational.is_none())
+            {
                 // No operation has begun, so the prior committed boundary is still safe
                 let _ = active.save(executor, cursor);
             }
             return Err(error);
         }
-        if !execution_state::step(executor, cursor)? {
+        if !execution_state::step_with_resume(executor, cursor, resume.as_deref_mut())? {
             break;
         }
         if let Some(active) = resume.as_deref_mut().filter(|active| active.due()) {

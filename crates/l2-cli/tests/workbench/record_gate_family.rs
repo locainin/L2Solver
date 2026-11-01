@@ -135,6 +135,7 @@ fn distinct_training_families_can_recover_one_exact_png_without_cross_merging_sc
         has_unassigned_family_messages: false,
         family_search_complete: true,
         assessment_scope: super::SchemaOffsetScope::CompleteInput,
+        producer_rule: None,
     };
     let uniform_result = screen_with_schema_plan(
         &frames,
@@ -208,6 +209,8 @@ fn one_megabyte_record_stream_fits_actual_schema_work_budget() -> TestResult {
             artifact_policy: ArtifactValidationPolicy::default(),
             work_limit,
             job: None,
+            producer_rule: None,
+            structural_admission: None,
         },
     )?;
 
@@ -250,6 +253,8 @@ fn exhausted_actual_schema_work_remains_pending_without_a_false_contradiction() 
             artifact_policy: ArtifactValidationPolicy::default(),
             work_limit,
             job: None,
+            producer_rule: None,
+            structural_admission: None,
         },
     )?;
 

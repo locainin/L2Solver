@@ -37,11 +37,16 @@ fn checkpoint_output_compacts_bytes_and_preserves_public_output_json() -> Result
 {
     let saved = output_fixture();
     let document = serde_json::to_value(&saved)?;
-    assert_eq!(document["output"]["bytes"], "AAH/");
+    assert_eq!(
+        document
+            .pointer("/output/bytes")
+            .and_then(serde_json::Value::as_str),
+        Some("AAH/")
+    );
     assert_eq!(serde_json::from_value::<SavedOutput>(document)?, saved);
     assert_eq!(
-        serde_json::to_value(&saved.output)?["bytes"],
-        serde_json::json!([0, 1, 255])
+        serde_json::to_value(&saved.output)?.get("bytes"),
+        Some(&serde_json::json!([0, 1, 255]))
     );
     Ok(())
 }
@@ -50,7 +55,9 @@ fn checkpoint_output_compacts_bytes_and_preserves_public_output_json() -> Result
 fn checkpoint_output_rejects_noncanonical_and_numeric_byte_fields() -> Result<(), Box<dyn Error>> {
     for invalid in [serde_json::json!("AB=="), serde_json::json!([0, 1, 255])] {
         let mut document = serde_json::to_value(output_fixture())?;
-        document["output"]["bytes"] = invalid;
+        *document
+            .pointer_mut("/output/bytes")
+            .ok_or("fixture output bytes are missing")? = invalid;
         assert!(serde_json::from_value::<SavedOutput>(document).is_err());
     }
     Ok(())
