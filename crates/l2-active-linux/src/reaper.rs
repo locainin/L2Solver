@@ -52,6 +52,10 @@ pub fn reserve() -> io::Result<Lease> {
     Lease::acquire(&ACTIVE_HELPERS)
 }
 
+#[expect(
+    clippy::mem_forget,
+    reason = "A failed handoff must retain the helper slot until process exit"
+)]
 pub fn submit(child: Child, lease: Lease) {
     let task = Task { child, lease };
     if let Some(sender) = REAPER.get().and_then(Option::as_ref) {
