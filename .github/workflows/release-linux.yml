@@ -61,7 +61,8 @@ jobs:
 
       - name: Build Linux release candidate
         run: >-
-          cargo build --locked --release --package l2-cli
+          cargo build --locked --release --package l2-cli --package l2-active-linux
+          --bin l2solver --bin l2solver-active-helper
           --target x86_64-unknown-linux-gnu
 
       - name: Install candidate check tools
@@ -69,7 +70,7 @@ jobs:
         run: |
           sudo apt-get update
           sudo DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
-            binutils fish python3-pytest python3-pytest-subtests tshark zsh
+            binutils fish iproute2 python3-pytest python3-pytest-subtests python3-scapy tshark zsh
 
       - name: Run Python benchmark regressions
         run: >-
@@ -110,8 +111,14 @@ jobs:
         run: >-
           /usr/bin/python3 -m benchmarks.package_release
           --binary target/x86_64-unknown-linux-gnu/release/l2solver
+          --helper-binary target/x86_64-unknown-linux-gnu/release/l2solver-active-helper
           --lockfile Cargo.lock
           --output-directory "$RUNNER_TEMP/l2solver-dist"
+
+      - name: Check the extracted active application in isolated networks
+        run: >-
+          bash benchmarks/check_active_release.sh
+          "$RUNNER_TEMP/l2solver-dist/l2solver-x86_64-unknown-linux-gnu.tar.gz"
 
       - name: Check packaged executable and record blocked release work
         run: >-

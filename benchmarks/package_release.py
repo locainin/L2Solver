@@ -20,6 +20,8 @@ TARGET = "x86_64-unknown-linux-gnu"
 ARCHIVE_NAME = f"l2solver-{TARGET}.tar.gz"
 PROVENANCE_NAME = "PROVENANCE.json"
 NOTICE_PATH = Path(__file__).resolve().parents[1] / "NOTICE-JEMALLOC.txt"
+INSTALL_PATH = Path(__file__).resolve().parents[1] / "docs/active/install.md"
+HELPER_NAME = "l2solver-active-helper"
 
 
 def _regular_file(path, description, *, executable=False):
@@ -43,7 +45,7 @@ def _hash_file(path):
     return digest.hexdigest()
 
 
-def _provenance(binary, binary_information, lockfile, metadata):
+def _provenance(binary, binary_information, helper, helper_information, lockfile, metadata):
     # Keep the target fixed to the release workflow's only supported artifact
     source_commit = metadata["source_commit"]
     if (
@@ -59,7 +61,7 @@ def _provenance(binary, binary_information, lockfile, metadata):
 
     # Record only portable identifiers and digests, never local filesystem paths
     return {
-        "schema_version": 1,
+        "schema_version": 2,
         "source_commit": source_commit,
         "toolchain": {
             "rustc": metadata["rustc_version"],
@@ -76,13 +78,21 @@ def _provenance(binary, binary_information, lockfile, metadata):
         },
         "build": {
             "command": (
-                f"cargo build --locked --release --package l2-cli --target {TARGET}"
+                "cargo build --locked --release --package l2-cli "
+                "--package l2-active-linux --bin l2solver "
+                f"--bin {HELPER_NAME} --target {TARGET}"
             )
         },
         "binary": {
             "name": "l2solver",
             "bytes": binary_information.st_size,
             "sha256": _hash_file(binary),
+        },
+        "active_helper": {
+            "name": HELPER_NAME,
+            "bytes": helper_information.st_size,
+            "sha256": _hash_file(helper),
+            "required_capability": "cap_net_raw",
         },
     }
 
@@ -100,16 +110,22 @@ def _tar_entry(name, size, mode):
     return entry
 
 
-def _write_archive(binary, provenance, archive):
+def _bounded_document(path, description):
+    document, _ = _regular_file(path, description)
+    with document.open("rb") as source:
+        contents = source.read(64 * 1024 + 1)
+    if not contents or len(contents) > 64 * 1024:
+        raise ValueError(f"{description} must contain between 1 and 65536 bytes")
+    return contents
+
+
+def _write_archive(binary, helper, provenance, archive):
     provenance_bytes = (json.dumps(provenance, indent=2, sort_keys=True) + "\n").encode(
         "utf-8"
     )
     # Distribute the native allocator and Rust binding notices with the linked executable
-    notice_path, _ = _regular_file(NOTICE_PATH, "allocator notices")
-    with notice_path.open("rb") as source:
-        notices = source.read(64 * 1024 + 1)
-    if not notices or len(notices) > 64 * 1024:
-        raise ValueError("allocator notices must contain between 1 and 65536 bytes")
+    notices = _bounded_document(NOTICE_PATH, "allocator notices")
+    instructions = _bounded_document(INSTALL_PATH, "active helper installation guide")
 
     # Fixed gzip and tar metadata make the package bytes independent of the clock
     with (
@@ -120,9 +136,11 @@ def _write_archive(binary, provenance, archive):
         tarfile.open(
             fileobj=compressed, mode="w", format=tarfile.USTAR_FORMAT
         ) as package,
-        binary.open("rb") as source,
     ):
-        package.addfile(_tar_entry("l2solver", binary.stat().st_size, 0o755), source)
+        # Archive permissions grant no capabilities and restrict helper execution
+        for name, path, mode in (("l2solver", binary, 0o755), (HELPER_NAME, helper, 0o750)):
+            with path.open("rb") as source:
+                package.addfile(_tar_entry(name, path.stat().st_size, mode), source)
         package.addfile(
             _tar_entry(PROVENANCE_NAME, len(provenance_bytes), 0o644),
             io.BytesIO(provenance_bytes),
@@ -131,6 +149,10 @@ def _write_archive(binary, provenance, archive):
             _tar_entry(NOTICE_PATH.name, len(notices), 0o644),
             io.BytesIO(notices),
         )
+        package.addfile(
+            _tar_entry("INSTALL-ACTIVE.md", len(instructions), 0o644),
+            io.BytesIO(instructions),
+        )
 
 
 def package_release(
@@ -138,12 +160,17 @@ def package_release(
     lockfile,
     output_directory,
     *,
+    helper_binary=None,
     source_commit,
     rustc_version,
     cargo_version,
 ):
-    """Package one Linux executable and write its provenance and SHA-256 sidecar."""
+    """Package matching Linux executables with provenance and a SHA-256 sidecar."""
     binary, binary_information = _regular_file(binary, "binary", executable=True)
+    helper, helper_information = _regular_file(
+        binary.with_name(HELPER_NAME) if helper_binary is None else helper_binary,
+        "active helper", executable=True,
+    )
     lockfile, lockfile_information = _regular_file(lockfile, "dependency lockfile")
     output_directory = Path(output_directory)
     if output_directory.exists() or output_directory.is_symlink():
@@ -154,6 +181,8 @@ def package_release(
     provenance = _provenance(
         binary,
         binary_information,
+        helper,
+        helper_information,
         lockfile,
         {
             "source_commit": source_commit,
@@ -167,11 +196,13 @@ def package_release(
         staging = Path(staging_name)
         archive = staging / ARCHIVE_NAME
         checksum = staging / f"{ARCHIVE_NAME}.sha256"
-        _write_archive(binary, provenance, archive)
+        _write_archive(binary, helper, provenance, archive)
 
         if (
             _hash_file(binary) != provenance["binary"]["sha256"]
             or binary.stat().st_size != binary_information.st_size
+            or _hash_file(helper) != provenance["active_helper"]["sha256"]
+            or helper.stat().st_size != helper_information.st_size
             or _hash_file(lockfile) != provenance["dependency_lock"]["sha256"]
             or lockfile.stat().st_size != lockfile_information.st_size
         ):
@@ -241,6 +272,7 @@ def _release_metadata():
 def main(arguments=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--binary", type=Path, required=True)
+    parser.add_argument("--helper-binary", type=Path, required=True)
     parser.add_argument("--lockfile", type=Path, default=Path("Cargo.lock"))
     parser.add_argument("--output-directory", type=Path, required=True)
     options = parser.parse_args(arguments)
@@ -250,6 +282,7 @@ def main(arguments=None):
             options.binary,
             options.lockfile,
             options.output_directory,
+            helper_binary=options.helper_binary,
             **_release_metadata(),
         )
     except (OSError, ValueError, subprocess.CalledProcessError) as error:
