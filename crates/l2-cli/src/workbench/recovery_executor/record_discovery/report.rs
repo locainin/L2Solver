@@ -931,17 +931,7 @@ impl Executor<'_> {
                 });
                 let node_id =
                     case.add_bytes_node(REPORT_KIND, &report.bytes, Vec::new(), details)?;
-                let family_origins = if report.analysis.family_selection.is_some() {
-                    let mut ids = Vec::new();
-                    ids.try_reserve_exact(report.context.inputs.len())
-                        .map_err(|source| {
-                            operational("family report origin allocation failed", source)
-                        })?;
-                    ids.extend(report.context.inputs.iter().map(|input| input.node_id));
-                    Some(ids)
-                } else {
-                    None
-                };
+                let family_origins = family_report_origins(report)?;
                 add_transaction_links(
                     case,
                     node_id,
@@ -1209,6 +1199,19 @@ impl Executor<'_> {
                 omitted_length_checks,
             });
     }
+}
+
+fn family_report_origins(
+    report: &RecordReportOutput,
+) -> Result<Option<Vec<u64>>, RecoveryExecutionError> {
+    if report.analysis.family_selection.is_none() {
+        return Ok(None);
+    }
+    let mut ids = Vec::new();
+    ids.try_reserve_exact(report.context.inputs.len())
+        .map_err(|source| operational("family report origin allocation failed", source))?;
+    ids.extend(report.context.inputs.iter().map(|input| input.node_id));
+    Ok(Some(ids))
 }
 
 fn register_record_funnel(

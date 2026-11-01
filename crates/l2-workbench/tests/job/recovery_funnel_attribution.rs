@@ -6,6 +6,7 @@ use l2_workbench::job::{
 use std::error::Error;
 
 type TestResult = Result<(), Box<dyn Error>>;
+type CohortFixture = (Job, Vec<Job>, Vec<RecoveryCandidateSample>);
 
 #[test]
 fn source_registration_without_an_admission_outcome_stays_unknown() -> TestResult {
@@ -54,8 +55,7 @@ fn source_registration_without_an_admission_outcome_stays_unknown() -> TestResul
     Ok(())
 }
 
-fn independently_validated_cohorts()
--> Result<(Job, Vec<Job>, Vec<RecoveryCandidateSample>), Box<dyn Error>> {
+fn independently_validated_cohorts() -> Result<CohortFixture, Box<dyn Error>> {
     use l2_workbench::job::{
         RecoveryFunnelAttribution, RecoveryFunnelEvent, RecoveryFunnelIdentity,
         RecoveryFunnelInput, RecoveryFunnelRegistration,
@@ -154,7 +154,10 @@ fn one_sample_from_a_published_set_reports_the_unrepresented_artifact() -> TestR
     record_publication(
         &job,
         Some(RecoveryArtifactSample {
-            sha256: candidates[0].input_blob_sha256,
+            sha256: candidates
+                .first()
+                .ok_or("candidate is missing")?
+                .input_blob_sha256,
             byte_length: 5,
         }),
         Some(2),
@@ -259,7 +262,10 @@ fn failed_publication_reports_unrepresented_artifacts_without_claiming_success()
                 source_set_sha256: None,
                 source_basis: RecoveryPublicationSourceBasis::Unavailable,
                 artifact: Some(RecoveryArtifactSample {
-                    sha256: candidates[0].input_blob_sha256,
+                    sha256: candidates
+                        .first()
+                        .ok_or("candidate is missing")?
+                        .input_blob_sha256,
                     byte_length: 5,
                 }),
                 artifact_count: Some(2),
@@ -289,7 +295,10 @@ fn contradictory_empty_set_and_artifact_sample_remain_unknown() -> TestResult {
     record_publication(
         &job,
         Some(RecoveryArtifactSample {
-            sha256: candidates[0].input_blob_sha256,
+            sha256: candidates
+                .first()
+                .ok_or("candidate is missing")?
+                .input_blob_sha256,
             byte_length: 5,
         }),
         Some(0),
@@ -316,7 +325,10 @@ fn an_exact_or_empty_publication_set_has_complete_sample_coverage() -> TestResul
     for has_artifact in [true, false] {
         let (job, _workers, candidates) = independently_validated_cohorts()?;
         let artifact = has_artifact.then_some(RecoveryArtifactSample {
-            sha256: candidates[0].input_blob_sha256,
+            sha256: candidates
+                .first()
+                .ok_or("candidate is missing")?
+                .input_blob_sha256,
             byte_length: 5,
         });
         record_publication(&job, artifact, Some(u64::from(has_artifact)))?;
@@ -349,7 +361,7 @@ fn compacted_validation_identities_leave_publication_correlation_unknown() -> Te
         RecoveryFunnelRegistration, WorkSnapshot,
     };
     let (_job, workers, candidates) = independently_validated_cohorts()?;
-    let worker = &workers[0];
+    let worker = workers.first().ok_or("worker is missing")?;
     let inputs = (1000..1256)
         .map(|node_id| RecoveryFunnelInput {
             node_id,
@@ -378,7 +390,10 @@ fn compacted_validation_identities_leave_publication_correlation_unknown() -> Te
     record_publication(
         &resumed,
         Some(RecoveryArtifactSample {
-            sha256: candidates[0].input_blob_sha256,
+            sha256: candidates
+                .first()
+                .ok_or("candidate is missing")?
+                .input_blob_sha256,
             byte_length: 5,
         }),
         Some(1),
@@ -400,15 +415,19 @@ fn compacted_validation_identities_leave_publication_correlation_unknown() -> Te
 fn minimal_checkpoint_preserves_known_publication_omissions() -> TestResult {
     use l2_workbench::job::{RecoveryArtifactSample, WorkSnapshot};
     let (_job, workers, candidates) = independently_validated_cohorts()?;
+    let worker = workers.first().ok_or("worker is missing")?;
     record_publication(
-        &workers[0],
+        worker,
         Some(RecoveryArtifactSample {
-            sha256: candidates[0].input_blob_sha256,
+            sha256: candidates
+                .first()
+                .ok_or("candidate is missing")?
+                .input_blob_sha256,
             byte_length: 5,
         }),
         Some(2),
     )?;
-    let saved = workers[0].work_snapshot()?;
+    let saved = worker.work_snapshot()?;
     let projected = serde_json::to_value(saved.checkpoint_view(0))?;
     assert_eq!(
         projected.pointer(

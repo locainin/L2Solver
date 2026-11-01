@@ -6,7 +6,7 @@ use std::error::Error;
 
 type TestResult = Result<(), Box<dyn Error>>;
 
-pub(super) const fn sample(candidate_index: u64) -> RecoveryTransitionSample {
+pub const fn sample(candidate_index: u64) -> RecoveryTransitionSample {
     RecoveryTransitionSample::Candidate(RecoveryCandidateSample {
         candidate_index,
         input_node_id: 7,

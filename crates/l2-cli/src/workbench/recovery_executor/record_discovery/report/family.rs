@@ -156,6 +156,25 @@ impl Executor<'_> {
         }
         // Keep the uniform report even when a separate family search is incomplete
         let proposal = propose_groups(self.case, context, &uniform.partition, limits)?;
+        let (reports, summary) = self.analyze_family_groups(uniform, proposal, limits)?;
+        if !reports.is_empty()
+            && let Some(lease) = memory
+        {
+            self.family_memory
+                .try_reserve(1)
+                .map_err(|source| operational("family memory lease allocation failed", source))?;
+            self.family_memory.push(lease);
+        }
+        uniform.family_search = Some(summary);
+        Ok(reports)
+    }
+
+    fn analyze_family_groups(
+        &mut self,
+        uniform: &mut RecordAnalysis,
+        proposal: FamilyGroups,
+        limits: RecordSchemaProposalLimits,
+    ) -> Result<(Vec<RecordReportOutput>, FamilySearchSummary), RecoveryExecutionError> {
         let mut summary = FamilySearchSummary {
             limits,
             discovery: proposal.discovery,
@@ -197,67 +216,72 @@ impl Executor<'_> {
                 summary.groups.push(group_summary);
                 break;
             }
-            let mut analysis = self.analyze_record_cohort(
-                &group.context.inputs,
-                group.partition,
-                limits,
-                group.context.omitted_frames > 0,
-                false,
-            )?;
-            summary.groups_examined += 1;
-            group_summary.result = analysis.result;
-            group_summary.reason = analysis.no_candidate_reason;
-            summary.complete_within_limits &=
-                analysis.search_exhaustive_within_plan && analysis.report_details_complete;
-            // Count work per selected group without retaining more schema arrays
-            if let Some(strategies) = &analysis.strategies {
-                for strategy in super::strategy_reports(strategies) {
-                    if let Some(discovery) = &strategy.discovery {
-                        summary.schema_candidate_evaluations += discovery.examined_combinations;
-                        summary.schema_survivor_group_pairs += discovery.surviving.len();
-                        group_summary.schema_candidate_evaluations +=
-                            discovery.examined_combinations;
-                        group_summary.schema_survivors_retained += discovery.surviving.len();
-                    }
-                }
-            }
-            summary.groups.push(group_summary);
-            if analysis.result != STATUS_HYPOTHESES_FOUND {
-                match analysis.no_candidate_reason {
-                    Some("no_structural_candidate_space") => {
-                        summary.groups_without_candidate_space += 1
-                    }
-                    Some("no_schema_survived_strict_parsing") => {
-                        summary.groups_without_surviving_schemas += 1
-                    }
-                    _ => {}
-                }
-                continue;
-            }
-            summary.groups_with_schemas += 1;
-            // Compact reports avoid materializing large speculative schema arrays
-            analysis.report_details_complete = false;
-            analysis.family_selection = Some(group.selection);
-            let report = build_compact_report(&group.context, &analysis, bound)?;
-            let bytes = serde_json::to_vec(&report)
-                .map_err(|source| operational("family report serialization failed", source))?;
-            reports.push(RecordReportOutput {
-                context: group.context,
-                analysis,
-                bytes,
-                work_bound_bytes: bound,
-            });
-        }
-        if !reports.is_empty() {
-            if let Some(lease) = memory {
-                self.family_memory.try_reserve(1).map_err(|source| {
-                    operational("family memory lease allocation failed", source)
-                })?;
-                self.family_memory.push(lease);
+            if let Some(report) =
+                self.analyze_family_group(group, group_summary, bound, limits, &mut summary)?
+            {
+                reports.push(report);
             }
         }
-        uniform.family_search = Some(summary);
-        Ok(reports)
+        Ok((reports, summary))
+    }
+
+    fn analyze_family_group(
+        &self,
+        group: FamilyGroup,
+        mut group_summary: FamilyGroupSummary,
+        bound: usize,
+        limits: RecordSchemaProposalLimits,
+        summary: &mut FamilySearchSummary,
+    ) -> Result<Option<RecordReportOutput>, RecoveryExecutionError> {
+        let mut analysis = self.analyze_record_cohort(
+            &group.context.inputs,
+            group.partition,
+            limits,
+            group.context.omitted_frames > 0,
+            false,
+        )?;
+        summary.groups_examined += 1;
+        group_summary.result = analysis.result;
+        group_summary.reason = analysis.no_candidate_reason;
+        summary.complete_within_limits &=
+            analysis.search_exhaustive_within_plan && analysis.report_details_complete;
+        // Count work per selected group without retaining more schema arrays
+        if let Some(strategies) = &analysis.strategies {
+            for strategy in super::strategy_reports(strategies) {
+                if let Some(discovery) = &strategy.discovery {
+                    summary.schema_candidate_evaluations += discovery.examined_combinations;
+                    summary.schema_survivor_group_pairs += discovery.surviving.len();
+                    group_summary.schema_candidate_evaluations += discovery.examined_combinations;
+                    group_summary.schema_survivors_retained += discovery.surviving.len();
+                }
+            }
+        }
+        summary.groups.push(group_summary);
+        if analysis.result != STATUS_HYPOTHESES_FOUND {
+            match analysis.no_candidate_reason {
+                Some("no_structural_candidate_space") => {
+                    summary.groups_without_candidate_space += 1;
+                }
+                Some("no_schema_survived_strict_parsing") => {
+                    summary.groups_without_surviving_schemas += 1;
+                }
+                _ => {}
+            }
+            return Ok(None);
+        }
+        summary.groups_with_schemas += 1;
+        // Compact reports avoid materializing large speculative schema arrays
+        analysis.report_details_complete = false;
+        analysis.family_selection = Some(group.selection);
+        let report = build_compact_report(&group.context, &analysis, bound)?;
+        let bytes = serde_json::to_vec(&report)
+            .map_err(|source| operational("family report serialization failed", source))?;
+        Ok(Some(RecordReportOutput {
+            context: group.context,
+            analysis,
+            bytes,
+            work_bound_bytes: bound,
+        }))
     }
 }
 
@@ -314,7 +338,7 @@ fn frame_examples<'a>(
     Ok(examples)
 }
 
-fn mark_incomplete(analysis: &mut RecordAnalysis, reason: &'static str) {
+const fn mark_incomplete(analysis: &mut RecordAnalysis, reason: &'static str) {
     analysis.search_exhaustive_within_plan = false;
     analysis.strategy_omission = Some(reason);
 }
@@ -408,12 +432,28 @@ fn memory_bound(
         .ok_or_else(|| RecoveryError::InvariantFailure.into())
 }
 
-fn propose_groups(
-    case: &Case,
+struct FamilyLearning<'a> {
+    messages: Vec<MessageSample<'a>>,
+    training: Vec<u64>,
+    discovery: FamilyDiscoveryEvidence,
+    multiple_sessions: bool,
+}
+
+#[derive(Clone, Copy)]
+struct GroupSelection<'a> {
+    selector: &'a MessageFamilySelector,
+    family: &'a l2_workbench::protocol::MessageFamily,
+    unassigned: usize,
+    sample_count: usize,
+    selector_search_complete: bool,
+}
+
+fn family_learning<'a>(
+    case: &'a Case,
     context: &RecordDiscoveryContext,
     partition: &SessionPartition,
     limits: RecordSchemaProposalLimits,
-) -> Result<FamilyGroups, RecoveryExecutionError> {
+) -> Result<FamilyLearning<'a>, RecoveryExecutionError> {
     // Keep the original session split while limiting the learning prefix
     let sample = learning_sample(
         &context.inputs,
@@ -452,7 +492,7 @@ fn propose_groups(
         });
     }
     let heldout_count = sample.len() - training.len();
-    let mut discovery = FamilyDiscoveryEvidence {
+    let discovery = FamilyDiscoveryEvidence {
         range_pair_limit: DEFAULT_MAX_FAMILY_RANGES,
         training_count: training.len(),
         heldout_count,
@@ -482,32 +522,75 @@ fn propose_groups(
         })
         .map(|input| input.session_node_id);
     let first_session = training_sessions.next();
-    if first_session.is_none() || !training_sessions.any(|session| Some(session) != first_session) {
+    let multiple_sessions =
+        first_session.is_some() && training_sessions.any(|session| Some(session) != first_session);
+    Ok(FamilyLearning {
+        messages,
+        training,
+        discovery,
+        multiple_sessions,
+    })
+}
+
+fn propose_groups(
+    case: &Case,
+    context: &RecordDiscoveryContext,
+    partition: &SessionPartition,
+    limits: RecordSchemaProposalLimits,
+) -> Result<FamilyGroups, RecoveryExecutionError> {
+    let mut learning = family_learning(case, context, partition, limits)?;
+    if !learning.multiple_sessions {
         // A bounded sample cannot support a multi-session selector without two sessions
         return Ok(FamilyGroups {
             groups: Vec::new(),
             incomplete: true,
             selectors_retained: 0,
-            discovery,
+            discovery: learning.discovery,
             group_limit_reached: false,
         });
     }
     let family_limits = family_limits(limits, FAMILY_WORK_LIMIT);
-    let report = discover_message_families(&messages, &training, family_limits)
+    let report = discover_message_families(&learning.messages, &learning.training, family_limits)
         .map_err(|source| operational("message-family discovery failed", source))?;
-    discovery.omitted_candidate_ranges = report.omitted_candidate_ranges;
-    discovery.omitted_report_budget_ranges = report.omitted_report_budget_ranges;
-    discovery.omitted_selectors = report.omitted_selectors;
-    discovery.observation_coverage = Some(report.observation_coverage);
+    learning.discovery.omitted_candidate_ranges = report.omitted_candidate_ranges;
+    learning.discovery.omitted_report_budget_ranges = report.omitted_report_budget_ranges;
+    learning.discovery.omitted_selectors = report.omitted_selectors;
+    learning.discovery.observation_coverage = Some(report.observation_coverage);
+    let (groups, group_limit_reached) = collect_groups(
+        case,
+        context,
+        partition,
+        &learning,
+        &report.selectors,
+        report.complete,
+    )?;
+    Ok(FamilyGroups {
+        groups,
+        incomplete: !report.complete
+            || learning.discovery.omitted_learning_inputs > 0
+            || group_limit_reached,
+        selectors_retained: report.selectors.len(),
+        discovery: learning.discovery,
+        group_limit_reached,
+    })
+}
+
+fn collect_groups(
+    case: &Case,
+    context: &RecordDiscoveryContext,
+    partition: &SessionPartition,
+    learning: &FamilyLearning<'_>,
+    selectors: &[MessageFamilySelector],
+    report_complete: bool,
+) -> Result<(Vec<FamilyGroup>, bool), RecoveryExecutionError> {
     let mut groups = Vec::new();
-    let mut incomplete = !report.complete || discovery.omitted_learning_inputs > 0;
     let mut group_limit_reached = false;
-    for selector in &report.selectors {
+    for selector in selectors {
         // One supported value can still separate data from varied control messages
         let has_other_training_values = selector
             .unassigned
             .iter()
-            .any(|observation| training.contains(&observation.sample));
+            .any(|observation| learning.training.contains(&observation.sample));
         if !selector.training_coverage_complete
             || (selector.families.len() < 2 && !has_other_training_values)
         {
@@ -519,11 +602,14 @@ fn propose_groups(
                 case,
                 context,
                 partition,
-                selector,
-                family,
-                unassigned,
-                sample.len(),
-                report.complete && discovery.omitted_learning_inputs == 0,
+                GroupSelection {
+                    selector,
+                    family,
+                    unassigned,
+                    sample_count: learning.messages.len(),
+                    selector_search_complete: report_complete
+                        && learning.discovery.omitted_learning_inputs == 0,
+                },
             )?
             else {
                 continue;
@@ -542,7 +628,6 @@ fn propose_groups(
             }
             if groups.len() == MAX_GROUPS {
                 // Only a new cohort can be omitted by the group limit
-                incomplete = true;
                 group_limit_reached = true;
                 break;
             }
@@ -555,13 +640,7 @@ fn propose_groups(
             break;
         }
     }
-    Ok(FamilyGroups {
-        groups,
-        incomplete,
-        selectors_retained: report.selectors.len(),
-        discovery,
-        group_limit_reached,
-    })
+    Ok((groups, group_limit_reached))
 }
 
 fn frame_bytes<'a>(
@@ -596,12 +675,15 @@ fn make_group(
     case: &Case,
     context: &RecordDiscoveryContext,
     partition: &SessionPartition,
-    selector: &MessageFamilySelector,
-    family: &l2_workbench::protocol::MessageFamily,
-    unassigned: usize,
-    sample_count: usize,
-    selector_search_complete: bool,
+    selection: GroupSelection<'_>,
 ) -> Result<Option<FamilyGroup>, RecoveryExecutionError> {
+    let GroupSelection {
+        selector,
+        family,
+        unassigned,
+        sample_count,
+        selector_search_complete,
+    } = selection;
     let select = |input: &super::RecordFrameInput| -> Result<bool, RecoveryExecutionError> {
         Ok(frame_bytes(case, input)?
             .get(selector.range.start..selector.range.end)

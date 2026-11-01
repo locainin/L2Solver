@@ -85,17 +85,15 @@ fn assert_exact_case_equality(actual: &Case, expected: &Case) -> TestResult<()> 
     }
     if let Some(index) = first_difference(actual.nodes(), expected.nodes()) {
         if let (Some(left), Some(right)) = (actual.nodes().get(index), expected.nodes().get(index))
-        {
-            if let Some((path, left, right)) =
+            && let Some((path, left, right)) =
                 value_difference(&left.details, &right.details, "details")
-            {
-                return Err(format!(
-                    "node {index} differs at {path}: actual={}, expected={}",
-                    value_summary(left),
-                    value_summary(right)
-                )
-                .into());
-            }
+        {
+            return Err(format!(
+                "node {index} differs at {path}: actual={}, expected={}",
+                value_summary(left),
+                value_summary(right)
+            )
+            .into());
         }
         let describe = |case: &Case| {
             case.nodes()
@@ -132,9 +130,15 @@ fn assert_exact_case_equality(actual: &Case, expected: &Case) -> TestResult<()> 
     let mut offset = 0_u64;
     while offset < length {
         let count = usize::try_from((length - offset).min(left_buffer.len() as u64))?;
-        left.read_exact(&mut left_buffer[..count])?;
-        right.read_exact(&mut right_buffer[..count])?;
-        if left_buffer[..count] != right_buffer[..count] {
+        let left_chunk = left_buffer
+            .get_mut(..count)
+            .ok_or("left chunk is missing")?;
+        let right_chunk = right_buffer
+            .get_mut(..count)
+            .ok_or("right chunk is missing")?;
+        left.read_exact(left_chunk)?;
+        right.read_exact(right_chunk)?;
+        if left_chunk != right_chunk {
             return Err(format!("serialized cases differ at or after byte {offset}").into());
         }
         offset += u64::try_from(count)?;
@@ -270,9 +274,39 @@ fn mixed_fixture(change: HeldoutChange) -> TestResult<MixedFixture> {
             }
         })
         .collect::<TestResult<Vec<_>>>()?;
+    apply_fixture_changes(change, &mut messages)?;
+    let mut case = Case::new();
+    let source = capture(&mut case, "independent mixed message families")?;
+    let sessions = add_unframed_sessions(&mut case, &source, vec![("mixed", messages)])?;
+    let mut policy = normal_policy(&case)?;
+    // The learning sample includes each layout in both training sessions
+    policy.record_schema_proposal_limits.discovery.max_messages = if two_byte { 32 } else { 16 };
+    let plan = RecoveryPlan {
+        framings: vec![FramingKind::FixedSize {
+            bytes: if matches!(change, HeldoutChange::AlternateLayout) {
+                ALTERNATE_FRAME_BYTES
+            } else if two_byte {
+                TWO_BYTE_FRAME_BYTES
+            } else {
+                FRAME_BYTES
+            },
+        }],
+        discover_records: true,
+        ..RecoveryPlan::default()
+    };
+    Ok(MixedFixture {
+        case,
+        sessions,
+        archives,
+        plan,
+        policy,
+    })
+}
+
+fn apply_fixture_changes(change: HeldoutChange, messages: &mut [Vec<Vec<u8>>]) -> TestResult<()> {
     if matches!(change, HeldoutChange::VariableControls) {
         // Control selectors vary while every data frame keeps the same message type
-        for session in &mut messages {
+        for session in messages.iter_mut() {
             for control in session.iter_mut().skip(1).step_by(2) {
                 let value = *control.get(1).ok_or("control value is missing")? | 0x80;
                 *control.first_mut().ok_or("control selector is missing")? = value;
@@ -321,32 +355,7 @@ fn mixed_fixture(change: HeldoutChange) -> TestResult<MixedFixture> {
             *data.get_mut(9).ok_or("data length is missing")? = 15;
         }
     }
-    let mut case = Case::new();
-    let source = capture(&mut case, "independent mixed message families")?;
-    let sessions = add_unframed_sessions(&mut case, &source, vec![("mixed", messages)])?;
-    let mut policy = normal_policy(&case)?;
-    // The learning sample includes each layout in both training sessions
-    policy.record_schema_proposal_limits.discovery.max_messages = if two_byte { 32 } else { 16 };
-    let plan = RecoveryPlan {
-        framings: vec![FramingKind::FixedSize {
-            bytes: if matches!(change, HeldoutChange::AlternateLayout) {
-                ALTERNATE_FRAME_BYTES
-            } else if two_byte {
-                TWO_BYTE_FRAME_BYTES
-            } else {
-                FRAME_BYTES
-            },
-        }],
-        discover_records: true,
-        ..RecoveryPlan::default()
-    };
-    Ok(MixedFixture {
-        case,
-        sessions,
-        archives,
-        plan,
-        policy,
-    })
+    Ok(())
 }
 
 fn execute_mixed_sessions(change: HeldoutChange) -> TestResult<MixedRun> {
@@ -374,16 +383,18 @@ fn sampled_data_messages(sessions: &[UnframedSession]) -> Vec<&[u8]> {
         .collect()
 }
 
-fn assert_data_family_has_strict_schema(change: HeldoutChange) -> TestResult<()> {
+fn assert_training_family_separation(fixture: &MixedFixture) -> TestResult<()> {
     use l2_workbench::protocol::{
         Direction, MessageContext, MessageFamilyLimits, MessageRole, MessageSample,
-        RecordAssemblyInput, analyze_record_schemas, assemble_record_groups_from_inputs,
-        discover_message_families, parse_records_with_limits,
+        discover_message_families,
     };
 
-    let fixture = mixed_fixture(change)?;
     let mut family_samples = Vec::new();
-    for (session_index, session) in fixture.sessions[..2].iter().enumerate() {
+    let sessions = fixture
+        .sessions
+        .get(..2)
+        .ok_or("training sessions are missing")?;
+    for (session_index, session) in sessions.iter().enumerate() {
         for (index, bytes) in session.messages.iter().take(4).enumerate() {
             family_samples.push(MessageSample {
                 sample: u64::try_from(session_index * 4 + index + 1)?,
@@ -426,8 +437,29 @@ fn assert_data_family_has_strict_schema(change: HeldoutChange) -> TestResult<()>
         family_report.selectors,
         family_report.observation_coverage
     );
-    let training = sampled_data_messages(&fixture.sessions[..2]);
-    let heldout = sampled_data_messages(&fixture.sessions[2..]);
+    Ok(())
+}
+
+fn assert_data_family_has_strict_schema(change: HeldoutChange) -> TestResult<()> {
+    use l2_workbench::protocol::{
+        RecordAssemblyInput, analyze_record_schemas, assemble_record_groups_from_inputs,
+        parse_records_with_limits,
+    };
+
+    let fixture = mixed_fixture(change)?;
+    assert_training_family_separation(&fixture)?;
+    let training = sampled_data_messages(
+        fixture
+            .sessions
+            .get(..2)
+            .ok_or("training sessions are missing")?,
+    );
+    let heldout = sampled_data_messages(
+        fixture
+            .sessions
+            .get(2..)
+            .ok_or("held-out sessions are missing")?,
+    );
     let limits = fixture.policy.record_schema_proposal_limits;
     let report = analyze_record_schemas(&training, &heldout, limits)?;
     let Some(discovery) = report.discovery.as_ref() else {
@@ -490,6 +522,21 @@ fn alternate_training_data_has_a_strict_schema_that_assembles_every_full_session
 #[test]
 fn mixed_control_and_data_families_recover_each_independent_full_session() -> TestResult<()> {
     let run = execute_mixed_sessions(HeldoutChange::None)?;
+    assert_exact_archives(&run)?;
+    let (all_frames, data_frames) = materialized_family_frames(&run)?;
+    let reports = run
+        .case
+        .nodes()
+        .iter()
+        .filter(|node| node.kind == REPORT_KIND)
+        .map(|node| Ok((node.id, decode_report(&run.case, node.id)?)))
+        .collect::<TestResult<Vec<_>>>()?;
+    assert_family_search_reports(&run, &reports)?;
+    let report_node = selected_family_report(&run, &reports, &all_frames, &data_frames)?;
+    assert_selected_family_receipts(&run, report_node, &data_frames)
+}
+
+fn assert_exact_archives(run: &MixedRun) -> TestResult<()> {
     let report_results = run
         .case
         .nodes()
@@ -518,7 +565,10 @@ fn mixed_control_and_data_families_recover_each_independent_full_session() -> Te
         );
     }
     assert!(run.outcome.validated_artifact_count >= run.archives.len());
+    Ok(())
+}
 
+fn materialized_family_frames(run: &MixedRun) -> TestResult<(Vec<u64>, Vec<Vec<u64>>)> {
     let mut all_frames = Vec::new();
     let mut data_frames = Vec::new();
     for session in &run.sessions {
@@ -553,14 +603,10 @@ fn mixed_control_and_data_families_recover_each_independent_full_session() -> Te
         );
         all_frames.extend(frames.into_iter().map(|(_, id)| id));
     }
+    Ok((all_frames, data_frames))
+}
 
-    let reports = run
-        .case
-        .nodes()
-        .iter()
-        .filter(|node| node.kind == REPORT_KIND)
-        .map(|node| Ok((node.id, decode_report(&run.case, node.id)?)))
-        .collect::<TestResult<Vec<_>>>()?;
+fn assert_family_search_reports(run: &MixedRun, reports: &[(u64, Value)]) -> TestResult<()> {
     assert!(reports.iter().any(|(_, report)| {
         let examined = report.pointer("/family_search/groups_examined").and_then(Value::as_u64);
         let surviving = report.pointer("/family_search/groups_with_schemas").and_then(Value::as_u64);
@@ -572,10 +618,12 @@ fn mixed_control_and_data_families_recover_each_independent_full_session() -> Te
         }),
         "the selector range allowance must cover every configured range for this sample"
     );
-    let expected_first_training = format!(
-        "sha256:{}",
-        l2_workbench::sha256(&run.sessions[0].messages[0])
-    );
+    let first_frame = run
+        .sessions
+        .first()
+        .and_then(|session| session.messages.first())
+        .ok_or("first training frame is missing")?;
+    let expected_first_training = format!("sha256:{}", l2_workbench::sha256(first_frame));
     assert!(
         reports.iter().any(|(_, report)| {
             report
@@ -597,6 +645,15 @@ fn mixed_control_and_data_families_recover_each_independent_full_session() -> Te
         }),
         "the family search must identify the selected training frames"
     );
+    Ok(())
+}
+
+fn selected_family_report(
+    run: &MixedRun,
+    reports: &[(u64, Value)],
+    all_frames: &[u64],
+    data_frames: &[Vec<u64>],
+) -> TestResult<u64> {
     let expected_data_count = data_frames.iter().map(Vec::len).sum::<usize>();
     let (report_node, report) = reports
         .iter()
@@ -607,11 +664,17 @@ fn mixed_control_and_data_families_recover_each_independent_full_session() -> Te
                     == Some(&json!(all_frames.len() - expected_data_count))
         })
         .ok_or("the family selection must report all selected and excluded frames")?;
-    let training = run.sessions[..2]
+    let training = run
+        .sessions
+        .get(..2)
+        .ok_or("training sessions are missing")?
         .iter()
         .map(|session| session.episode_node)
         .collect::<Vec<_>>();
-    let heldout = run.sessions[2..]
+    let heldout = run
+        .sessions
+        .get(2..)
+        .ok_or("held-out sessions are missing")?
         .iter()
         .map(|session| session.episode_node)
         .collect::<Vec<_>>();
@@ -627,8 +690,15 @@ fn mixed_control_and_data_families_recover_each_independent_full_session() -> Te
         report.pointer("/family_selection/unassigned_frame_count"),
         Some(&json!(0))
     );
+    Ok(*report_node)
+}
 
-    let receipts = selected_record_receipt_ids(&run.case, *report_node)
+fn assert_selected_family_receipts(
+    run: &MixedRun,
+    report_node: u64,
+    data_frames: &[Vec<u64>],
+) -> TestResult<()> {
+    let receipts = selected_record_receipt_ids(&run.case, report_node)
         .into_iter()
         .map(|id| {
             let node = run.case.node(id).ok_or("record receipt is missing")?;
@@ -1076,32 +1146,7 @@ fn checkpoint_restores_pending_family_assemblies_with_the_same_provenance() -> T
     let mut executor = test_support::build_executor(&mut running, &plan, &policy)?;
     executor.case_index = CaseIndex::with_ledger(CaseIndexScanLedger::new()?);
     let mut cursor = SchedulerCursor::default();
-    let mut family_pending = false;
-    let mut inspected_reports = std::collections::BTreeSet::new();
-    let mut has_family_report = false;
-    for _ in 0..20_000 {
-        assert!(
-            step(&mut executor, &mut cursor)?,
-            "no family assembly was queued"
-        );
-        for node in executor
-            .case
-            .nodes()
-            .iter()
-            .filter(|node| node.kind == REPORT_KIND)
-        {
-            if inspected_reports.insert(node.id) {
-                has_family_report |= decode_report(executor.case, node.id)?
-                    .get("family_selection")
-                    .is_some_and(|value| !value.is_null());
-            }
-        }
-        if has_family_report && executor.pending_record_assembly_count > 0 {
-            family_pending = true;
-            break;
-        }
-    }
-    assert!(family_pending, "no pending family assembly was found");
+    advance_to_pending_family_assembly(&mut executor, &mut cursor)?;
     // The queued schemas and their ordered selected input IDs must survive unchanged
     let pending_before = serde_json::to_vec(&executor.pending_record_assemblies)?;
     let snapshot_limits = CaseSnapshotLimits::new(64 * 1024 * 1024, 64 * 1024 * 1024);
@@ -1154,5 +1199,37 @@ fn checkpoint_restores_pending_family_assemblies_with_the_same_provenance() -> T
             .iter()
             .any(|blob| blob.bytes == *archive)
     }));
+    Ok(())
+}
+
+fn advance_to_pending_family_assembly(
+    executor: &mut super::super::Executor<'_>,
+    cursor: &mut super::super::execution_state::SchedulerCursor,
+) -> TestResult<()> {
+    use super::super::execution_state::step;
+
+    let mut inspected_reports = std::collections::BTreeSet::new();
+    let mut has_family_report = false;
+    let mut family_pending = false;
+    for _ in 0..20_000 {
+        assert!(step(executor, cursor)?, "no family assembly was queued");
+        for node in executor
+            .case
+            .nodes()
+            .iter()
+            .filter(|node| node.kind == REPORT_KIND)
+        {
+            if inspected_reports.insert(node.id) {
+                has_family_report |= decode_report(executor.case, node.id)?
+                    .get("family_selection")
+                    .is_some_and(|value| !value.is_null());
+            }
+        }
+        if has_family_report && executor.pending_record_assembly_count > 0 {
+            family_pending = true;
+            break;
+        }
+    }
+    assert!(family_pending, "no pending family assembly was found");
     Ok(())
 }

@@ -182,7 +182,7 @@ fn coordinator_denial_does_not_claim_cohort_admission_after_checkpoint()
     use super::super::{JobProgress, RecoveryPlan, normal_policy, test_support};
     use super::{FunnelCohortKey, register_funnel_cohort};
     use l2_workbench::{
-        job::{Job, RecoveryFunnelInput, WorkSnapshot},
+        job::{Job, RecoveryFunnelInput},
         protocol::Direction,
         recovery::{EnqueueOutcome, RecoveryResource, RecoveryTask},
     };
@@ -246,6 +246,12 @@ fn coordinator_denial_does_not_claim_cohort_admission_after_checkpoint()
 
     let saved = worker.work_snapshot()?;
     let projected = serde_json::to_value(saved.checkpoint_view(8 * 1024))?;
+    assert_denied_checkpoint_projection(projected)
+}
+
+fn assert_denied_checkpoint_projection(projected: serde_json::Value) -> Result<(), Box<dyn Error>> {
+    use l2_workbench::job::{Job, WorkSnapshot};
+
     assert_eq!(
         projected.pointer("/counts/recovery_transitions/checkpoint_projection_version"),
         Some(&json!(1)),

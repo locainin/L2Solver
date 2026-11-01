@@ -161,7 +161,8 @@ fn a_corrupt_late_frame_is_rejected_after_bounded_schema_learning() -> TestResul
 fn rejected_frame_does_not_claim_a_complete_session_in_the_funnel() -> TestResult<()> {
     let job = Job::new("partial record assembly");
     let run = execute_bounded_learning_archive_fixture(true, Some(&job))?;
-    let frame = materialized_frames_for_run(&run.case, run.sessions[1].run_node)?
+    let session = run.sessions.get(1).ok_or("held-out session is missing")?;
+    let frame = materialized_frames_for_run(&run.case, session.run_node)?
         .last()
         .copied()
         .ok_or("corrupt held-out frame is missing")?;
