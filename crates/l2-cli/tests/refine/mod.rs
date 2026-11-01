@@ -19,6 +19,8 @@ mod early_reuse;
 mod large_formats;
 mod memory;
 mod range_analysis;
+mod range_archive_provenance;
+mod range_members;
 mod read_budget;
 mod streaming;
 
@@ -624,7 +626,7 @@ fn result_identity_uses_ordered_content_hashes_and_analysis_settings() -> Result
     let recovery = RecoveryOptions::default();
     let policy = RefinePolicy::new(&recovery, false)?;
     let identity = result_identity(&sources, &recovery, &policy)?;
-    assert_eq!(identity.algorithm_version, 16);
+    assert_eq!(identity.algorithm_version, 17);
     assert_eq!(
         identity.settings.get("analyzer_algorithm_version"),
         Some(&json!(14))

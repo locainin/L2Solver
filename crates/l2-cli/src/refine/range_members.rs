@@ -1,9 +1,9 @@
 //! Merge bounded ZIP member analysis into the source's existing artifact report
 
 use l2_workbench::artifact::{
-    AnalysisFormat, AnalysisOmission, AnalyzedArtifact, ArtifactAnalysis, ArtifactAnalysisOptions,
-    ArtifactOrigin, ArtifactValidationState, ValidationSummary, analyze_artifacts,
-    archive_member_origin, zip::ZipArtifactReport,
+    AnalysisFormat, AnalysisOmission, AnalysisStage, AnalyzedArtifact, ArtifactAnalysis,
+    ArtifactAnalysisOptions, ArtifactOrigin, ArtifactValidationState, ValidationSummary,
+    analyze_artifacts, archive_member_origin, zip::ZipArtifactReport,
 };
 use l2_workbench::job::MemoryLease;
 use std::{error::Error, io};
@@ -133,6 +133,21 @@ impl MemberMerger<'_> {
         bytes: Vec<u8>,
         origin: ArtifactOrigin,
     ) -> Result<(), Box<dyn Error>> {
+        let remaining = self
+            .options
+            .limits
+            .max_total_work_bytes
+            .saturating_sub(self.report.work_bytes);
+        if bytes.len() > remaining {
+            return self.push_omission(AnalysisOmission::WorkLimit {
+                artifact_index: self.parent_index,
+                stage: AnalysisStage::ArtifactIdentity,
+                requested: bytes.len(),
+                remaining,
+            });
+        }
+        // Member identity needs a complete byte pass even when inspection is skipped
+        self.report.work_bytes += bytes.len();
         let index = self.next_index;
         self.next_index = self
             .next_index

@@ -139,6 +139,8 @@ pub enum AnalysisBoundary {
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case", deny_unknown_fields)]
 pub enum AnalysisStage {
+    /// Hashing exact artifact bytes to establish their identity
+    ArtifactIdentity,
     /// File-signature catalogue scan
     SignatureScan,
     /// Structural format validation
@@ -296,6 +298,22 @@ pub enum AnalysisOmission {
         format: AnalysisFormat,
         /// Reader or metadata limit that stopped validation
         reason: String,
+    },
+    /// Expanded ZIP members were not retained because their source archive was omitted
+    SourceArchiveMembersOmitted {
+        /// Exact archive range in the immutable source
+        range: FileRange,
+        /// Number of expanded members omitted with their parent
+        count: usize,
+    },
+    /// An archive member was already omitted by the ZIP parser
+    SourceArchiveMemberOmission {
+        /// Exact archive range in the immutable source
+        range: FileRange,
+        /// Zero-based central-directory entry index
+        entry_index: usize,
+        /// Parser reason the entry could not be expanded
+        reason: ZipArtifactOmissionReason,
     },
     /// A whole-source streaming transformation was incomplete or rejected
     SourceStreamTransform {

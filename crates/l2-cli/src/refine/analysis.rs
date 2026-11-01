@@ -233,9 +233,9 @@ fn retain_source_formats(
     streaming.charge_range_work(report.work_bytes)?;
     let mut next_file_index = report.artifacts.len();
     if let Some(archive) = range.archive {
-        let parent_index = next_file_index;
-        next_file_index += 1;
         if range.retain_source {
+            let parent_index = next_file_index;
+            next_file_index += 1;
             analysis.append_file_archive(
                 source_index,
                 parent_index,
@@ -243,21 +243,23 @@ fn retain_source_formats(
                 &report.source_sha256,
                 &archive,
             )?;
+            let previous_work = report.work_bytes;
+            super::range_members::append_members(
+                &mut report,
+                archive,
+                parent_index,
+                options,
+                &mut omission_memory,
+            )?;
+            streaming.charge_range_work(
+                report
+                    .work_bytes
+                    .checked_sub(previous_work)
+                    .ok_or("range member work decreased")?,
+            )?;
+        } else {
+            record_unpublished_archive_members(&archive, &mut report, &mut omission_memory)?;
         }
-        let previous_work = report.work_bytes;
-        super::range_members::append_members(
-            &mut report,
-            archive,
-            parent_index,
-            options,
-            &mut omission_memory,
-        )?;
-        streaming.charge_range_work(
-            report
-                .work_bytes
-                .checked_sub(previous_work)
-                .ok_or("range member work decreased")?,
-        )?;
     }
     if let Some(png) = range.png {
         let artifact_index = report
@@ -281,6 +283,43 @@ fn retain_source_formats(
         report_memory: range.report_memory,
         omission_memory,
     })
+}
+
+fn record_unpublished_archive_members(
+    archive: &l2_workbench::artifact::zip::ZipArtifactReport,
+    report: &mut l2_workbench::artifact::ArtifactAnalysis,
+    memory: &mut MemoryLease,
+) -> Result<(), Box<dyn Error>> {
+    use l2_workbench::artifact::{AnalysisOmission, FileRange};
+
+    let range = FileRange {
+        offset: 0,
+        length: archive.archive_size,
+    };
+    let count = archive
+        .entries
+        .iter()
+        .filter(|entry| entry.content.is_some())
+        .count();
+    if count > 0 {
+        super::analysis_memory::reserve_omission(&mut report.omissions, memory)?;
+        report
+            .omissions
+            .push(AnalysisOmission::SourceArchiveMembersOmitted { range, count });
+    }
+    for entry in &archive.entries {
+        if let Some(reason) = entry.omission {
+            super::analysis_memory::reserve_omission(&mut report.omissions, memory)?;
+            report
+                .omissions
+                .push(AnalysisOmission::SourceArchiveMemberOmission {
+                    range,
+                    entry_index: entry.metadata.index,
+                    reason,
+                });
+        }
+    }
+    Ok(())
 }
 
 fn no_case_space(
