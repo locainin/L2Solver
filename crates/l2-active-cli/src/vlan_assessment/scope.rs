@@ -5,7 +5,7 @@ use std::io;
 use l2_capture::LinuxInterfaceIdentity;
 use l2_onpath::MacAddress;
 
-pub(super) fn validate_pair(
+pub fn validate_pair(
     control: LinuxInterfaceIdentity,
     test: LinuxInterfaceIdentity,
     control_mac: MacAddress,

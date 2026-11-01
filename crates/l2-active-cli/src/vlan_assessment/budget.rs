@@ -4,7 +4,7 @@ use std::time::{Duration, Instant};
 
 use l2_active::Limits;
 
-pub(super) fn phase_deadline(now: Instant, overall: Instant, phases_left: u32) -> Option<Instant> {
+pub fn phase_deadline(now: Instant, overall: Instant, phases_left: u32) -> Option<Instant> {
     // Leave time for every remaining phase, including helper startup
     let window = overall
         .checked_duration_since(now)?
@@ -15,7 +15,7 @@ pub(super) fn phase_deadline(now: Instant, overall: Instant, phases_left: u32) -
     now.checked_add(window)
 }
 
-pub(super) fn remaining_limits(
+pub fn remaining_limits(
     budget: Limits,
     used_packets: Option<u64>,
     used_bytes: Option<u64>,

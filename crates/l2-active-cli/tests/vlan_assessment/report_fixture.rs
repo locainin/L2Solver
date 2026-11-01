@@ -4,7 +4,7 @@ use l2_active::{ArpReport, PreSendUsage, ReceiveEvent};
 
 use super::arp_fixture;
 
-pub(super) fn report(
+pub fn report(
     senders: &[[u8; 6]],
     drained: Option<PreSendUsage>,
 ) -> Result<ArpReport, Box<dyn Error>> {

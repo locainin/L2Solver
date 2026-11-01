@@ -32,17 +32,17 @@ fn runs_control_test_control_with_separate_budgets_and_one_deadline() -> Result<
         &AtomicBool::new(false),
         |phase, limits, end| {
             calls.push((phase, limits, end));
-            match reports.pop_front() {
-                Some(report) => Attempt::Report {
-                    report,
-                    close_error: None,
-                },
-                None => Attempt::Failure {
+            reports.pop_front().map_or_else(
+                || Attempt::Failure {
                     stage: FailureStage::Open,
                     error: io::Error::other("unexpected extra attempt"),
                     close_error: None,
                 },
-            }
+                |report| Attempt::Report {
+                    report,
+                    close_error: None,
+                },
+            )
         },
     );
     let phases: Vec<_> = calls.iter().map(|(phase, _, _)| *phase).collect();
@@ -91,17 +91,17 @@ fn unknown_control_accounting_still_allows_the_separately_bounded_test_but_not_c
         &AtomicBool::new(false),
         |phase, _, _| {
             phases.push(phase);
-            match reports.pop_front() {
-                Some(report) => Attempt::Report {
-                    report,
-                    close_error: None,
-                },
-                None => Attempt::Failure {
+            reports.pop_front().map_or_else(
+                || Attempt::Failure {
                     stage: FailureStage::Open,
                     error: io::Error::other("unexpected extra attempt"),
                     close_error: None,
                 },
-            }
+                |report| Attempt::Report {
+                    report,
+                    close_error: None,
+                },
+            )
         },
     );
     assert_eq!(phases, [Phase::ControlBefore, Phase::Test]);
@@ -125,17 +125,17 @@ fn cancellation_after_control_prevents_both_later_transmissions() -> Result<(), 
         |_, _, _| {
             calls += 1;
             cancelled.store(true, Ordering::Release);
-            match first.take() {
-                Some(report) => Attempt::Report {
-                    report,
-                    close_error: None,
-                },
-                None => Attempt::Failure {
+            first.take().map_or_else(
+                || Attempt::Failure {
                     stage: FailureStage::Open,
                     error: io::Error::other("unexpected extra attempt"),
                     close_error: None,
                 },
-            }
+                |report| Attempt::Report {
+                    report,
+                    close_error: None,
+                },
+            )
         },
     );
     assert_eq!(calls, 1);
@@ -193,17 +193,17 @@ fn send_timeout_before_acceptance_stops_the_remaining_phases() -> Result<(), Box
         &AtomicBool::new(false),
         |_, _, _| {
             calls += 1;
-            match report.take() {
-                Some(report) => Attempt::Report {
-                    report,
-                    close_error: None,
-                },
-                None => Attempt::Failure {
+            report.take().map_or_else(
+                || Attempt::Failure {
                     stage: FailureStage::Open,
                     error: io::Error::other("unexpected extra attempt"),
                     close_error: None,
                 },
-            }
+                |report| Attempt::Report {
+                    report,
+                    close_error: None,
+                },
+            )
         },
     );
     assert_eq!(calls, 1);
@@ -234,17 +234,17 @@ fn silent_control_with_an_accepted_send_does_not_stop_the_other_phases()
         &AtomicBool::new(false),
         |_, _, _| {
             calls += 1;
-            match reports.pop_front() {
-                Some(report) => Attempt::Report {
-                    report,
-                    close_error: None,
-                },
-                None => Attempt::Failure {
+            reports.pop_front().map_or_else(
+                || Attempt::Failure {
                     stage: FailureStage::Open,
                     error: io::Error::other("unexpected extra attempt"),
                     close_error: None,
                 },
-            }
+                |report| Attempt::Report {
+                    report,
+                    close_error: None,
+                },
+            )
         },
     );
     assert_eq!(calls, 3);
@@ -311,17 +311,17 @@ fn final_scope_sample_failure_stops_the_other_phases() -> Result<(), Box<dyn Err
         &AtomicBool::new(false),
         |_, _, _| {
             calls += 1;
-            match report.take() {
-                Some(report) => Attempt::Report {
-                    report,
-                    close_error: None,
-                },
-                None => Attempt::Failure {
+            report.take().map_or_else(
+                || Attempt::Failure {
                     stage: FailureStage::Open,
                     error: io::Error::other("unexpected extra attempt"),
                     close_error: None,
                 },
-            }
+                |report| Attempt::Report {
+                    report,
+                    close_error: None,
+                },
+            )
         },
     );
     assert_eq!(calls, 1);

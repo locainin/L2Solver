@@ -3,12 +3,12 @@
 use super::engine::{Assessment, Attempt, Step};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(super) enum Claim {
+pub enum Claim {
     ExpectedObserved,
     Inconclusive,
 }
 
-pub(super) fn test_claim(result: &Assessment) -> Claim {
+pub fn test_claim(result: &Assessment) -> Claim {
     if expected_claim(&result.test) {
         Claim::ExpectedObserved
     } else {
@@ -16,11 +16,11 @@ pub(super) fn test_claim(result: &Assessment) -> Claim {
     }
 }
 
-pub(super) fn controls_observed(result: &Assessment) -> bool {
+pub fn controls_observed(result: &Assessment) -> bool {
     expected_claim(&result.before) && expected_claim(&result.after)
 }
 
-pub(super) fn expected_claim(step: &Step) -> bool {
+pub fn expected_claim(step: &Step) -> bool {
     let Step::Attempted {
         outcome: Attempt::Report { report, .. },
         ..

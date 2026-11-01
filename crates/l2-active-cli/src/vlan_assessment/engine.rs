@@ -11,14 +11,14 @@ use l2_active::{ArpReport, Limits, StopReason};
 use super::budget::{phase_deadline, remaining_limits};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(super) enum Phase {
+pub enum Phase {
     ControlBefore,
     Test,
     ControlAfter,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(super) enum SkipReason {
+pub enum SkipReason {
     Cancelled,
     Deadline,
     Budget,
@@ -26,14 +26,14 @@ pub(super) enum SkipReason {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(super) enum FailureStage {
+pub enum FailureStage {
     Prepare,
     Open,
     Run,
 }
 
 #[derive(Debug)]
-pub(super) enum Attempt {
+pub enum Attempt {
     Report {
         report: ArpReport,
         close_error: Option<io::Error>,
@@ -50,19 +50,19 @@ pub(super) enum Attempt {
     clippy::large_enum_variant,
     reason = "three bounded phase results avoid extra heap allocations"
 )]
-pub(super) enum Step {
+pub enum Step {
     Attempted { limits: Limits, outcome: Attempt },
     Skipped(SkipReason),
 }
 
 #[derive(Debug)]
-pub(super) struct Assessment {
+pub struct Assessment {
     pub(super) before: Step,
     pub(super) test: Step,
     pub(super) after: Step,
 }
 
-pub(super) fn run(
+pub fn run(
     budget: Limits,
     deadline: Instant,
     cancelled: &AtomicBool,

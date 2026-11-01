@@ -4,6 +4,8 @@ use std::{
     process::{Command, Output},
 };
 
+/// Build the command selected by the test environment
+#[must_use]
 pub fn command() -> Command {
     let main = std::env::var_os("L2_TEST_MAIN_BINARY");
     let binary = main
@@ -17,6 +19,13 @@ pub fn command() -> Command {
     command
 }
 
+/// Check that the network namespace differs from the parent
+///
+/// # Errors
+/// Returns an error when either namespace identity cannot be read or parsed
+///
+/// # Panics
+/// Panics when the current namespace matches the parent namespace
 pub fn assert_owned() -> Result<(), Box<dyn Error>> {
     let parent = (
         std::env::var("L2_TEST_PARENT_NET_DEVICE")?.parse::<u64>()?,
@@ -27,6 +36,13 @@ pub fn assert_owned() -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
+/// Check the command output and return its report
+///
+/// # Errors
+/// Returns an error when the report is not valid JSON
+///
+/// # Panics
+/// Panics when the command or report does not show a completed observation
 pub fn completed(output: &Output, operation: &str) -> Result<serde_json::Value, Box<dyn Error>> {
     assert_eq!(
         output.status.code(),
@@ -62,6 +78,10 @@ pub fn completed(output: &Output, operation: &str) -> Result<serde_json::Value, 
     Ok(report)
 }
 
+/// Check that one packet with the expected size was accepted
+///
+/// # Panics
+/// Panics when the packet or byte totals differ
 pub fn accepted(report: &serde_json::Value, bytes: u64) {
     assert_eq!(
         report
@@ -77,6 +97,10 @@ pub fn accepted(report: &serde_json::Value, bytes: u64) {
     );
 }
 
+/// Wait for the selected multicast membership to appear
+///
+/// # Errors
+/// Returns an error if the child stops, the wait expires, or status or table lookup fails
 pub fn await_membership(
     child: &mut std::process::Child,
     index: u32,
@@ -95,6 +119,10 @@ pub fn await_membership(
     Ok(())
 }
 
+/// Read the multicast membership count for an interface and group
+///
+/// # Errors
+/// Returns an error when the kernel table cannot be read or parsed
 pub fn memberships(index: u32, group: &str) -> Result<u32, Box<dyn Error>> {
     for line in std::fs::read_to_string("/proc/net/dev_mcast")?.lines() {
         let mut fields = line.split_whitespace();
