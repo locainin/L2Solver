@@ -2,18 +2,17 @@
 
 use super::{
     CandidateId, CandidateParameters, INITIAL_RANK_ORDERED_PAIR_WINDOW, LocatorCandidate,
-    LocatorPair, LocatorPairSchedule, PAIR_STREAM_ROTATION, PairDomain, PairStreamRow,
-    PayloadFamilyIndex, PayloadHeaderGroup, PayloadRankGroup, PreparedSearch, RankedLocatorFamily,
-    RankedPairEntry, RankedPairStream, RankedPayloadLocator, RelationalAppliedOutput,
-    RelationalCandidateEvaluation, RelationalCandidateEvaluationReport, RelationalCandidateOutputs,
-    RelationalEvaluationError, RelationalFit, RelationalFitStatus, RelationalOperationTemplate,
-    RelationalRecordSample, RelationalReplayHistory, RelationalSessionId,
-    RelationalSha256CounterXor, RelationalTransformCandidate, RelationalTransformError,
-    RelationalTransformEvaluationContext, RelationalTransformEvaluationOptions,
-    RelationalTransformPlan, RelationalTransformRule, RelationalTransformStatus, RetainedCandidate,
-    RetentionMode, SearchContext, SearchSettings, SearchState, SeedHeaderGroup, SeedRankGroup,
-    SessionGroup, build_report, candidate_parameters, candidate_status, locator_pair_overlaps,
-    pair_stream_cue_rank, prepare_search, validate_plan,
+    LocatorPair, LocatorPairSchedule, PairStreamRow, PayloadFamilyIndex, PayloadHeaderGroup,
+    PayloadRankGroup, PreparedSearch, RankedLocatorFamily, RankedPairEntry, RankedPayloadLocator,
+    RelationalAppliedOutput, RelationalCandidateEvaluation, RelationalCandidateEvaluationReport,
+    RelationalCandidateOutputs, RelationalEvaluationError, RelationalFit, RelationalFitStatus,
+    RelationalOperationTemplate, RelationalRecordSample, RelationalReplayHistory,
+    RelationalSessionId, RelationalSha256CounterXor, RelationalTransformCandidate,
+    RelationalTransformError, RelationalTransformEvaluationContext,
+    RelationalTransformEvaluationOptions, RelationalTransformPlan, RelationalTransformRule,
+    RelationalTransformStatus, RetainedCandidate, RetentionMode, SearchContext, SearchSettings,
+    SearchState, SeedHeaderGroup, SeedRankGroup, SessionGroup, build_report, candidate_parameters,
+    candidate_status, locator_pair_overlaps, prepare_search, validate_plan,
 };
 use crate::{derivation::CounterWidth, job::Job};
 use serde::{Deserialize, Serialize};
@@ -26,8 +25,17 @@ use std::{
     io::{self, Write},
 };
 
+#[cfg(test)]
+#[path = "../../../../../tests/protocol/relational/search/cursor/scheduler.rs"]
+mod scheduler_tests;
+
 // Change this version when saved search order or continuation semantics change
-const CURSOR_VERSION: u32 = 1;
+const CURSOR_VERSION: u32 = 2;
+
+mod budget;
+mod output;
+mod preparation;
+pub use budget::RelationalRestoreBudget;
 
 /// A saved search boundary, including retained candidate evidence and caller assessments
 ///
@@ -38,6 +46,7 @@ pub struct RelationalSearchCursor<T> {
     session_id: u64,
     search: SearchState<'static, T>,
     prepared: PreparedSearch,
+    schedule: Option<LocatorPairSchedule>,
     initial_pairs: Vec<(usize, usize)>,
     pre_evaluated: BTreeSet<CandidateId>,
     position: Position,
@@ -79,6 +88,8 @@ pub enum RelationalCursorError<E> {
     InvalidCheckpoint,
     /// The encoded checkpoint exceeds the caller's byte ceiling
     CheckpointTooLarge,
+    /// The caller's separate checkpoint validation work allowance was exhausted
+    RestoreWorkLimit,
     /// Aggregate metadata admission rejected the decoded checkpoint
     Memory(crate::job::JsonMemoryError),
     /// Preparing the restored search failed or was cancelled
@@ -95,6 +106,9 @@ impl<E: fmt::Display> fmt::Display for RelationalCursorError<E> {
             Self::InvalidCheckpoint => f.write_str("invalid relational search checkpoint"),
             Self::CheckpointTooLarge => {
                 f.write_str("relational search checkpoint exceeds its byte limit")
+            }
+            Self::RestoreWorkLimit => {
+                f.write_str("relational checkpoint validation work limit exceeded")
             }
             Self::Memory(error) => write!(f, "relational checkpoint memory: {error}"),
             Self::Search(error) => write!(f, "relational checkpoint search: {error}"),
@@ -114,14 +128,14 @@ impl<E: Error + 'static> Error for RelationalCursorError<E> {
     }
 }
 
-#[derive(Serialize, Deserialize)]
+#[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct Position {
     stage: PairStage,
     current: Option<PairPosition>,
 }
 
-#[derive(Serialize, Deserialize)]
+#[derive(Deserialize)]
 #[serde(tag = "stage", rename_all = "snake_case", deny_unknown_fields)]
 enum PairStage {
     Initial { next: usize },
@@ -323,118 +337,93 @@ impl ParameterPosition {
     }
 }
 
-#[derive(Serialize, Deserialize)]
+#[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct SavedSchedule {
     initial_pair_cursor: usize,
     stream_cursor: usize,
+    pairs_returned: usize,
     header: Vec<Reverse<RankedPairEntry>>,
     aligned: Vec<Reverse<RankedPairEntry>>,
     fallback: Vec<Reverse<RankedPairEntry>>,
 }
 
 impl SavedSchedule {
-    fn save(schedule: LocatorPairSchedule<'_>) -> Self {
-        Self {
-            initial_pair_cursor: schedule.initial_pair_cursor,
-            stream_cursor: schedule.stream_cursor,
-            header: schedule.header_aligned.pending.into_vec(),
-            aligned: schedule.aligned.pending.into_vec(),
-            fallback: schedule.fallback.pending.into_vec(),
-        }
-    }
-
-    fn restore<'a>(
-        self,
-        seeds: &'a [LocatorCandidate],
-        payloads: &'a [LocatorCandidate],
-    ) -> Result<LocatorPairSchedule<'a>, RelationalTransformError> {
-        let mut schedule = LocatorPairSchedule::new(seeds, payloads)?;
-        if self.initial_pair_cursor > schedule.initial_pair_count
-            || self.stream_cursor >= PAIR_STREAM_ROTATION.len()
-        {
-            return Err(invalid_cursor());
-        }
-        restore_stream(&schedule.domain, &mut schedule.header_aligned, self.header)?;
-        restore_stream(&schedule.domain, &mut schedule.aligned, self.aligned)?;
-        restore_stream(&schedule.domain, &mut schedule.fallback, self.fallback)?;
-        schedule.initial_pair_cursor = self.initial_pair_cursor;
-        schedule.stream_cursor = self.stream_cursor;
-        Ok(schedule)
-    }
-
-    fn validate(
-        &self,
+    fn restore<E>(
+        mut self,
         seeds: &[LocatorCandidate],
         payloads: &[LocatorCandidate],
-    ) -> Result<(), RelationalTransformError> {
-        let schedule = LocatorPairSchedule::new(seeds, payloads)?;
-        if self.initial_pair_cursor > schedule.initial_pair_count
-            || self.stream_cursor >= PAIR_STREAM_ROTATION.len()
-        {
-            return Err(invalid_cursor());
+        current: Option<&PairPosition>,
+        job: Option<&Job>,
+        work: &mut RelationalRestoreBudget,
+    ) -> Result<LocatorPairSchedule, RelationalCursorError<E>> {
+        let absolute_payloads = payloads
+            .iter()
+            .filter(|payload| payload.anchor_seed_index.is_none())
+            .count();
+        let maximum = seeds
+            .len()
+            .checked_mul(absolute_payloads)
+            .ok_or(RelationalCursorError::InvalidCheckpoint)?;
+        if self.pairs_returned > maximum {
+            return Err(RelationalCursorError::InvalidCheckpoint);
         }
-        validate_stream(&schedule.domain, &schedule.header_aligned, &self.header)?;
-        validate_stream(&schedule.domain, &schedule.aligned, &self.aligned)?;
-        validate_stream(&schedule.domain, &schedule.fallback, &self.fallback)
+        if !work.can_schedule(self.pairs_returned) {
+            return Err(RelationalCursorError::RestoreWorkLimit);
+        }
+        if let Some(job) = job {
+            job.check_cancelled()
+                .map_err(|error| RelationalCursorError::Search(error.into()))?;
+        }
+        let mut schedule =
+            LocatorPairSchedule::new(seeds, payloads).map_err(RelationalCursorError::Search)?;
+        let mut last = None;
+        // A missing heap row is valid only after the canonical traversal exhausts it
+        for index in 0..self.pairs_returned {
+            if index % 256 == 0
+                && let Some(job) = job
+            {
+                job.check_cancelled()
+                    .map_err(|error| RelationalCursorError::Search(error.into()))?;
+            }
+            if !work.charge_schedule() {
+                return Err(RelationalCursorError::RestoreWorkLimit);
+            }
+            last = Some(
+                schedule
+                    .next()
+                    .ok_or(RelationalCursorError::InvalidCheckpoint)?,
+            );
+        }
+        if self.initial_pair_cursor != schedule.initial_pair_cursor
+            || self.stream_cursor != schedule.stream_cursor
+            || current.is_some_and(|pair| last != Some((pair.seed, pair.payload)))
+            || !same_heap(&schedule.header_aligned.pending, &mut self.header)?
+            || !same_heap(&schedule.aligned.pending, &mut self.aligned)?
+            || !same_heap(&schedule.fallback.pending, &mut self.fallback)?
+        {
+            return Err(RelationalCursorError::InvalidCheckpoint);
+        }
+        // Reuse this checked scheduler for every later live slice
+        Ok(schedule)
     }
 }
 
-fn restore_stream(
-    domain: &PairDomain<'_>,
-    stream: &mut RankedPairStream,
-    entries: Vec<Reverse<RankedPairEntry>>,
-) -> Result<(), RelationalTransformError> {
-    validate_stream(domain, stream, &entries)?;
-    stream.pending = BinaryHeap::from(entries);
-    Ok(())
-}
-
-fn validate_stream(
-    domain: &PairDomain<'_>,
-    stream: &RankedPairStream,
-    entries: &[Reverse<RankedPairEntry>],
-) -> Result<(), RelationalTransformError> {
-    if entries.len() > stream.rows.len() {
-        return Err(invalid_cursor());
+fn same_heap<E>(
+    expected: &BinaryHeap<Reverse<RankedPairEntry>>,
+    saved: &mut [Reverse<RankedPairEntry>],
+) -> Result<bool, RelationalCursorError<E>> {
+    if expected.len() != saved.len() {
+        return Ok(false);
     }
-    let mut seeds = Vec::new();
-    seeds
-        .try_reserve_exact(stream.rows.len())
-        .map_err(|_| RelationalTransformError::AllocationFailed)?;
-    seeds.resize(stream.rows.len(), None);
-    for Reverse(item) in &stream.pending {
-        let slot = seeds.get_mut(item.row_index).ok_or(invalid_cursor())?;
-        *slot = Some(item.seed_index);
-    }
-    let mut seen = Vec::new();
-    seen.try_reserve_exact(stream.rows.len())
-        .map_err(|_| RelationalTransformError::AllocationFailed)?;
-    seen.resize(stream.rows.len(), false);
-    for Reverse(entry) in entries {
-        let row = *stream.rows.get(entry.row_index).ok_or(invalid_cursor())?;
-        let payload = domain
-            .payloads
-            .get(entry.payload_order_index)
-            .ok_or(invalid_cursor())?;
-        let observed = seen.get_mut(entry.row_index).ok_or(invalid_cursor())?;
-        if *observed
-            || domain.next_payload_order(row, stream.kind, entry.payload_order_index)
-                != Some(entry.payload_order_index)
-            || payload.candidate_index != entry.payload_index
-            || entry.seed_index >= domain.seeds.len()
-            || entry.cue_rank != pair_stream_cue_rank(domain, stream.kind, entry.seed_index)
-            || entry.pair_rank != entry.seed_index.saturating_add(entry.payload_index)
-        {
-            return Err(invalid_cursor());
-        }
-        // A row is assigned to one seed when its stream is built
-        if seeds.get(entry.row_index).copied().flatten() != Some(entry.seed_index) {
-            return Err(invalid_cursor());
-        }
-        *observed = true;
-    }
-    Ok(())
+    let mut ordered = Vec::new();
+    ordered
+        .try_reserve_exact(expected.len())
+        .map_err(|_| RelationalCursorError::AllocationFailed)?;
+    ordered.extend(expected.iter().copied());
+    ordered.sort_unstable();
+    saved.sort_unstable();
+    Ok(ordered.as_slice() == &*saved)
 }
 
 const fn invalid_cursor() -> RelationalTransformError {
@@ -534,9 +523,10 @@ fn attach_history<'h, T>(
 
 fn history_identity(
     history: Option<&RelationalReplayHistory>,
+    job: Option<&Job>,
 ) -> Result<Option<[u8; 32]>, RelationalTransformError> {
     history
-        .map(RelationalReplayHistory::checkpoint_identity)
+        .map(|history| history.checkpoint_identity(job))
         .transpose()
 }
 
@@ -556,12 +546,17 @@ struct StepBounds {
     clippy::too_many_lines,
     reason = "keep the candidate boundary and phase transitions together"
 )]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "advance the scheduler and search under one candidate boundary"
+)]
 fn drive<T, E, F>(
     context: &SearchContext<'_, '_>,
     search: &mut SearchState<'_, T>,
     initial: &[(usize, usize)],
     pre_evaluated: &BTreeSet<CandidateId>,
     position: &mut Position,
+    schedule: &mut Option<LocatorPairSchedule>,
     bounds: StepBounds,
     evaluator: &mut F,
 ) -> Result<bool, RelationalEvaluationError<E>>
@@ -573,27 +568,16 @@ where
         &[RelationalAppliedOutput],
     ) -> Result<RelationalCandidateEvaluation<T>, E>,
 {
-    let mut schedule = match &mut position.stage {
-        PairStage::Absolute { schedule } => match schedule.take() {
-            Some(saved) => Some(saved.restore(
-                &context.prepared.seed_locators,
-                &context.prepared.payload_locators,
-            )?),
-            None => Some(LocatorPairSchedule::new(
-                &context.prepared.seed_locators,
-                &context.prepared.payload_locators,
-            )?),
-        },
-        _ => None,
-    };
+    match (&position.stage, schedule.as_ref()) {
+        (PairStage::Absolute { schedule: None }, Some(_))
+        | (PairStage::Initial { .. } | PairStage::Anchored { .. }, None) => {}
+        _ => return Err(invalid_cursor().into()),
+    }
     let mut traversed = 0_usize;
     loop {
         check_traversal_cancellation(context.job, traversed)?;
         // Cached rejections and skipped pairs still consume bounded traversal time
         if search.candidates_examined >= bounds.candidate_end || traversed >= bounds.traversal {
-            if let PairStage::Absolute { schedule: saved } = &mut position.stage {
-                *saved = schedule.take().map(SavedSchedule::save);
-            }
             return Ok(false);
         }
         if position.current.is_none() {
@@ -605,18 +589,17 @@ where
                         Some(pair)
                     } else {
                         position.stage = PairStage::Absolute { schedule: None };
-                        schedule = Some(LocatorPairSchedule::new(
+                        *schedule = Some(LocatorPairSchedule::new(
                             &context.prepared.seed_locators,
                             &context.prepared.payload_locators,
                         )?);
                         continue;
                     }
                 }
-                PairStage::Absolute { schedule: saved } => {
+                PairStage::Absolute { .. } => {
                     let next = loop {
                         check_traversal_cancellation(context.job, traversed)?;
                         if traversed >= bounds.traversal {
-                            *saved = schedule.take().map(SavedSchedule::save);
                             return Ok(false);
                         }
                         let Some(pair) = schedule.as_mut().ok_or(invalid_cursor())?.next() else {
@@ -639,7 +622,7 @@ where
                     };
                     if next.is_none() {
                         position.stage = PairStage::Anchored { next: 0 };
-                        schedule = None;
+                        *schedule = None;
                         continue;
                     }
                     next
@@ -675,9 +658,6 @@ where
         }
         let current = position.current.as_mut().ok_or(invalid_cursor())?;
         if traversed >= bounds.traversal {
-            if let PairStage::Absolute { schedule: saved } = &mut position.stage {
-                *saved = schedule.take().map(SavedSchedule::save);
-            }
             return Ok(false);
         }
         let action = current.parameters.next(context.plan)?;

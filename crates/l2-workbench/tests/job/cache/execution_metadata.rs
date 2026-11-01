@@ -283,15 +283,15 @@ fn quota_rejection_keeps_the_previous_metadata_and_usage() -> Result<(), Box<dyn
     let mut generation = active.generation().clone();
     drop(active);
     let old_usage = cache.stats()?.entry_bytes;
-    let error = lease
-        .update_active_metadata(
+    assert!(matches!(
+        lease.update_active_metadata(
             &mut generation,
             &snapshot,
             limits(),
             &json!({"cursor": "x".repeat(5_000)}),
-        )
-        .expect_err("metadata must fit the cache quota");
-    assert!(matches!(error, CacheError::QuotaExceeded { .. }));
+        ),
+        Err(CacheError::QuotaExceeded { .. })
+    ));
     assert_eq!(cache.stats()?.entry_bytes, old_usage);
     assert_eq!(
         lease
@@ -404,7 +404,9 @@ fn legacy_envelope_is_upgraded_and_rejects_an_inconsistent_revision() -> Result<
         |row| row.get(0),
     )?;
     let mut legacy: serde_json::Value = serde_json::from_str(&encoded)?;
-    legacy["version"] = json!(1);
+    *legacy
+        .get_mut("version")
+        .ok_or("missing envelope version")? = json!(1);
     legacy
         .as_object_mut()
         .ok_or("envelope must be an object")?
@@ -423,9 +425,11 @@ fn legacy_envelope_is_upgraded_and_rejects_an_inconsistent_revision() -> Result<
         |row| row.get(0),
     )?;
     let mut upgraded: serde_json::Value = serde_json::from_str(&encoded)?;
-    assert_eq!(upgraded["version"], 2);
-    assert_eq!(upgraded["revision"], 1);
-    upgraded["version"] = json!(1);
+    assert_eq!(upgraded.get("version"), Some(&json!(2)));
+    assert_eq!(upgraded.get("revision"), Some(&json!(1)));
+    *upgraded
+        .get_mut("version")
+        .ok_or("missing upgraded envelope version")? = json!(1);
     replace_envelope(&database, key.as_str(), &upgraded)?;
     assert!(lease.load_active(limits()).is_err());
     Ok(())

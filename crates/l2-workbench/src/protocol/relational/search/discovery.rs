@@ -32,8 +32,17 @@ use std::{
 };
 
 mod cursor;
+#[cfg(test)]
+#[path = "../../../../tests/protocol/relational/search/preparation.rs"]
+mod preparation_tests;
+#[cfg(test)]
+thread_local! {
+    static SCHEDULE_CONSTRUCTIONS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 pub use cursor::{
-    RelationalCursorError, RelationalSearchCursor, RelationalSearchSession, RelationalSearchStep,
+    RelationalCursorError, RelationalRestoreBudget, RelationalSearchCursor,
+    RelationalSearchSession, RelationalSearchStep,
 };
 
 #[derive(serde::Deserialize)]
@@ -172,15 +181,14 @@ type RelativeStartRank = (u8, usize);
 type HeaderStartRank = (usize, usize, usize);
 
 #[derive(Clone, Copy)]
-struct RankedLocatorFamily<'a> {
-    selector: &'a Selector,
+struct RankedLocatorFamily {
     relative_start: RelativeStartRank,
     header_start: HeaderStartRank,
+    same_family_payload: Option<usize>,
 }
 
 #[derive(Clone, Copy)]
-struct RankedPayloadLocator<'a> {
-    selector: &'a Selector,
+struct RankedPayloadLocator {
     relative_start: RelativeStartRank,
     header_start: HeaderStartRank,
     candidate_index: usize,
@@ -224,14 +232,13 @@ struct PayloadFamilyIndex<'a> {
     ordered_index: usize,
 }
 
-struct PairDomain<'a> {
-    seeds: Vec<RankedLocatorFamily<'a>>,
+struct PairDomain {
+    seeds: Vec<RankedLocatorFamily>,
     seed_groups: Vec<SeedRankGroup>,
     seed_header_groups: Vec<SeedHeaderGroup>,
-    payloads: Vec<RankedPayloadLocator<'a>>,
+    payloads: Vec<RankedPayloadLocator>,
     payload_groups: Vec<PayloadRankGroup>,
     payload_header_groups: Vec<PayloadHeaderGroup>,
-    payload_families: Vec<PayloadFamilyIndex<'a>>,
 }
 
 #[derive(Clone, Copy)]
@@ -264,14 +271,15 @@ struct RankedPairEntry {
     payload_order_index: usize,
 }
 
-struct LocatorPairSchedule<'a> {
-    domain: PairDomain<'a>,
+struct LocatorPairSchedule {
+    domain: PairDomain,
     header_aligned: RankedPairStream,
     aligned: RankedPairStream,
     fallback: RankedPairStream,
     initial_pair_count: usize,
     initial_pair_cursor: usize,
     stream_cursor: usize,
+    pairs_returned: usize,
 }
 
 // Keep the established best-ranked pair choices ahead of cue promotion
@@ -287,23 +295,22 @@ const PAIR_STREAM_ROTATION: [PairStreamKind; 7] = [
     PairStreamKind::Fallback,
 ];
 
-impl<'a> PairDomain<'a> {
+impl PairDomain {
     fn new(
-        seed_candidates: &'a [LocatorCandidate],
-        payload_candidates: &'a [LocatorCandidate],
+        seed_candidates: &[LocatorCandidate],
+        payload_candidates: &[LocatorCandidate],
     ) -> Result<Self, RelationalTransformError> {
-        let seeds = ranked_seed_families(seed_candidates)?;
         let payloads = ranked_payload_locators(payload_candidates)?;
         let payload_groups = payload_rank_groups(&payloads)?;
         let payload_header_groups = payload_header_groups(&payloads)?;
-        let payload_families = payload_family_index(&payloads)?;
-        let seed_header_groups = seed_header_groups(&seeds, &payload_families)?;
+        let payload_families = payload_family_index(&payloads, payload_candidates)?;
+        let seeds = ranked_seed_families(seed_candidates, &payload_families)?;
+        let seed_header_groups = seed_header_groups(&seeds)?;
         let seed_groups = seed_rank_groups(
             &seeds,
             &seed_header_groups,
             &payload_groups,
             &payload_header_groups,
-            &payload_families,
         )?;
 
         Ok(Self {
@@ -313,7 +320,6 @@ impl<'a> PairDomain<'a> {
             payloads,
             payload_groups,
             payload_header_groups,
-            payload_families,
         })
     }
 
@@ -321,17 +327,6 @@ impl<'a> PairDomain<'a> {
         self.payload_groups
             .binary_search_by_key(&rank, |group| group.relative_start)
             .ok()
-    }
-
-    fn same_family_payload(&self, rank: RelativeStartRank, selector: &Selector) -> Option<usize> {
-        let ordered_index = self.payload_families.partition_point(|family| {
-            family.relative_start < rank
-                || (family.relative_start == rank && family.selector < selector)
-        });
-        self.payload_families.get(ordered_index).and_then(|family| {
-            (family.relative_start == rank && family.selector == selector)
-                .then_some(family.ordered_index)
-        })
     }
 
     fn header_group(
@@ -492,16 +487,26 @@ impl<'a> PairDomain<'a> {
 
 fn ranked_seed_families(
     candidates: &[LocatorCandidate],
-) -> Result<Vec<RankedLocatorFamily<'_>>, RelationalTransformError> {
+    families: &[PayloadFamilyIndex<'_>],
+) -> Result<Vec<RankedLocatorFamily>, RelationalTransformError> {
     let mut seeds = Vec::new();
     seeds
         .try_reserve_exact(candidates.len())
         .map_err(|_| RelationalTransformError::AllocationFailed)?;
     for candidate in candidates {
+        let rank = locator_start_rank(candidate);
+        let index = families.partition_point(|family| {
+            family.relative_start < rank
+                || (family.relative_start == rank && family.selector < &candidate.selector)
+        });
+        let same_family_payload = families.get(index).and_then(|family| {
+            (family.relative_start == rank && family.selector == &candidate.selector)
+                .then_some(family.ordered_index)
+        });
         seeds.push(RankedLocatorFamily {
-            selector: &candidate.selector,
-            relative_start: locator_start_rank(candidate),
+            relative_start: rank,
             header_start: header_start_rank(candidate),
+            same_family_payload,
         });
     }
     Ok(seeds)
@@ -509,7 +514,7 @@ fn ranked_seed_families(
 
 fn ranked_payload_locators(
     candidates: &[LocatorCandidate],
-) -> Result<Vec<RankedPayloadLocator<'_>>, RelationalTransformError> {
+) -> Result<Vec<RankedPayloadLocator>, RelationalTransformError> {
     let mut payloads = Vec::new();
     payloads
         .try_reserve_exact(
@@ -524,7 +529,6 @@ fn ranked_payload_locators(
             continue;
         }
         payloads.push(RankedPayloadLocator {
-            selector: &candidate.selector,
             relative_start: locator_start_rank(candidate),
             header_start: header_start_rank(candidate),
             candidate_index,
@@ -550,7 +554,7 @@ const fn header_start_rank(candidate: &LocatorCandidate) -> HeaderStartRank {
 }
 
 fn payload_rank_groups(
-    payloads: &[RankedPayloadLocator<'_>],
+    payloads: &[RankedPayloadLocator],
 ) -> Result<Vec<PayloadRankGroup>, RelationalTransformError> {
     let mut groups = Vec::new();
     let Some(first) = payloads.first() else {
@@ -581,7 +585,7 @@ fn payload_rank_groups(
 }
 
 fn payload_header_groups(
-    payloads: &[RankedPayloadLocator<'_>],
+    payloads: &[RankedPayloadLocator],
 ) -> Result<Vec<PayloadHeaderGroup>, RelationalTransformError> {
     let mut groups = Vec::new();
     let Some(first) = payloads.first() else {
@@ -616,7 +620,8 @@ fn payload_header_groups(
 }
 
 fn payload_family_index<'a>(
-    payloads: &[RankedPayloadLocator<'a>],
+    payloads: &[RankedPayloadLocator],
+    candidates: &'a [LocatorCandidate],
 ) -> Result<Vec<PayloadFamilyIndex<'a>>, RelationalTransformError> {
     let mut families = Vec::new();
     families
@@ -624,7 +629,12 @@ fn payload_family_index<'a>(
         .map_err(|_| RelationalTransformError::AllocationFailed)?;
     for (ordered_index, candidate) in payloads.iter().enumerate() {
         families.push(PayloadFamilyIndex {
-            selector: candidate.selector,
+            selector: &candidates
+                .get(candidate.candidate_index)
+                .ok_or(RelationalTransformError::InvalidInput(
+                    "invalid payload locator index",
+                ))?
+                .selector,
             relative_start: candidate.relative_start,
             ordered_index,
         });
@@ -639,13 +649,12 @@ fn payload_family_index<'a>(
 }
 
 fn seed_rank_groups(
-    seeds: &[RankedLocatorFamily<'_>],
+    seeds: &[RankedLocatorFamily],
     seed_header_groups: &[SeedHeaderGroup],
     payload_groups: &[PayloadRankGroup],
     payload_header_groups: &[PayloadHeaderGroup],
-    payload_families: &[PayloadFamilyIndex<'_>],
 ) -> Result<Vec<SeedRankGroup>, RelationalTransformError> {
-    let mut groups = relative_seed_groups(seeds, payload_families)?;
+    let mut groups = relative_seed_groups(seeds)?;
     count_specific_header_pairs(
         &mut groups,
         seed_header_groups,
@@ -656,19 +665,14 @@ fn seed_rank_groups(
 }
 
 fn relative_seed_groups(
-    seeds: &[RankedLocatorFamily<'_>],
-    payload_families: &[PayloadFamilyIndex<'_>],
+    seeds: &[RankedLocatorFamily],
 ) -> Result<Vec<SeedRankGroup>, RelationalTransformError> {
     let mut ordered_seeds = Vec::new();
     ordered_seeds
         .try_reserve_exact(seeds.len())
         .map_err(|_| RelationalTransformError::AllocationFailed)?;
     ordered_seeds.extend_from_slice(seeds);
-    ordered_seeds.sort_unstable_by(|left, right| {
-        left.relative_start
-            .cmp(&right.relative_start)
-            .then_with(|| left.selector.cmp(right.selector))
-    });
+    ordered_seeds.sort_unstable_by_key(|seed| seed.relative_start);
 
     let mut groups = Vec::new();
     groups
@@ -692,16 +696,7 @@ fn relative_seed_groups(
         }
         current_rank = Some(seed.relative_start);
         count = count.saturating_add(1);
-        let same_family_payload = payload_families
-            .binary_search_by(|family| {
-                family
-                    .relative_start
-                    .cmp(&seed.relative_start)
-                    .then_with(|| family.selector.cmp(seed.selector))
-            })
-            .ok()
-            .and_then(|index| payload_families.get(index));
-        if same_family_payload.is_some() {
+        if seed.same_family_payload.is_some() {
             same_family_count = same_family_count.saturating_add(1);
         }
     }
@@ -772,8 +767,7 @@ fn count_specific_header_pairs(
 }
 
 fn seed_header_groups(
-    seeds: &[RankedLocatorFamily<'_>],
-    payload_families: &[PayloadFamilyIndex<'_>],
+    seeds: &[RankedLocatorFamily],
 ) -> Result<Vec<SeedHeaderGroup>, RelationalTransformError> {
     let mut ordered_seeds = Vec::new();
     ordered_seeds
@@ -805,15 +799,7 @@ fn seed_header_groups(
         }
         current_key = Some(key);
         count = count.saturating_add(1);
-        if payload_families
-            .binary_search_by(|family| {
-                family
-                    .relative_start
-                    .cmp(&seed.relative_start)
-                    .then_with(|| family.selector.cmp(seed.selector))
-            })
-            .is_ok()
-        {
+        if seed.same_family_payload.is_some() {
             same_family_count = same_family_count.saturating_add(1);
         }
     }
@@ -829,10 +815,7 @@ fn seed_header_groups(
 }
 
 impl RankedPairStream {
-    fn new(
-        domain: &PairDomain<'_>,
-        kind: PairStreamKind,
-    ) -> Result<Self, RelationalTransformError> {
+    fn new(domain: &PairDomain, kind: PairStreamKind) -> Result<Self, RelationalTransformError> {
         let mut rows = Vec::new();
         rows.try_reserve_exact(domain.seeds.len())
             .map_err(|_| RelationalTransformError::AllocationFailed)?;
@@ -845,7 +828,7 @@ impl RankedPairStream {
             let row = PairStreamRow {
                 payload_group: domain.payload_group(seed.relative_start),
                 header_group: domain.specific_header_group(seed.relative_start, seed.header_start),
-                same_family_payload: domain.same_family_payload(seed.relative_start, seed.selector),
+                same_family_payload: seed.same_family_payload,
             };
             let Some(payload_order_index) = domain.next_payload_order(row, kind, 0) else {
                 continue;
@@ -872,7 +855,7 @@ impl RankedPairStream {
         })
     }
 
-    fn next(&mut self, domain: &PairDomain<'_>) -> Option<(usize, usize)> {
+    fn next(&mut self, domain: &PairDomain) -> Option<(usize, usize)> {
         let Reverse(entry) = self.pending.pop()?;
         let row = *self.rows.get(entry.row_index)?;
         let next_cursor = entry.payload_order_index.saturating_add(1);
@@ -894,7 +877,7 @@ impl RankedPairStream {
     }
 }
 
-fn pair_stream_cue_rank(domain: &PairDomain<'_>, kind: PairStreamKind, seed_index: usize) -> usize {
+fn pair_stream_cue_rank(domain: &PairDomain, kind: PairStreamKind, seed_index: usize) -> usize {
     match kind {
         PairStreamKind::HeaderAligned => domain.seeds.get(seed_index).map_or(usize::MAX, |seed| {
             domain.header_aligned_pair_count(seed.relative_start, seed.header_start)
@@ -906,21 +889,26 @@ fn pair_stream_cue_rank(domain: &PairDomain<'_>, kind: PairStreamKind, seed_inde
     }
 }
 
-impl<'a> LocatorPairSchedule<'a> {
+impl LocatorPairSchedule {
     fn new(
-        seed_candidates: &'a [LocatorCandidate],
-        payload_candidates: &'a [LocatorCandidate],
+        seed_candidates: &[LocatorCandidate],
+        payload_candidates: &[LocatorCandidate],
     ) -> Result<Self, RelationalTransformError> {
+        #[cfg(test)]
+        SCHEDULE_CONSTRUCTIONS.with(|count| count.set(count.get().saturating_add(1)));
         let domain = PairDomain::new(seed_candidates, payload_candidates)?;
-        let header_aligned = RankedPairStream::new(&domain, PairStreamKind::HeaderAligned)?;
-        let aligned = RankedPairStream::new(&domain, PairStreamKind::Aligned)?;
-        let fallback = RankedPairStream::new(&domain, PairStreamKind::Fallback)?;
         // Only absolute payloads participate in this pair schedule
         let initial_pair_count = domain
             .seeds
             .len()
-            .saturating_mul(domain.payloads.len())
+            .checked_mul(domain.payloads.len())
+            .ok_or(RelationalTransformError::InvalidPlan(
+                "relational pair domain is too large",
+            ))?
             .min(INITIAL_RANK_ORDERED_PAIR_WINDOW);
+        let header_aligned = RankedPairStream::new(&domain, PairStreamKind::HeaderAligned)?;
+        let aligned = RankedPairStream::new(&domain, PairStreamKind::Aligned)?;
+        let fallback = RankedPairStream::new(&domain, PairStreamKind::Fallback)?;
         Ok(Self {
             domain,
             header_aligned,
@@ -929,23 +917,27 @@ impl<'a> LocatorPairSchedule<'a> {
             initial_pair_count,
             initial_pair_cursor: 0,
             stream_cursor: 0,
+            pairs_returned: 0,
         })
     }
 
     fn next(&mut self) -> Option<(usize, usize)> {
-        if self.initial_pair_cursor < self.initial_pair_count {
+        let pair = if self.initial_pair_cursor < self.initial_pair_count {
             let payload_count = self.domain.payloads.len();
             let seed_index = self.initial_pair_cursor / payload_count;
             let payload_index = self.initial_pair_cursor % payload_count;
             self.initial_pair_cursor += 1;
-            return Some((seed_index, payload_index));
-        }
-        loop {
-            let pair = self.next_stream_pair()?;
-            if !self.is_in_initial_window(pair) {
-                return Some(pair);
+            (seed_index, payload_index)
+        } else {
+            loop {
+                let pair = self.next_stream_pair()?;
+                if !self.is_in_initial_window(pair) {
+                    break pair;
+                }
             }
-        }
+        };
+        self.pairs_returned += 1;
+        Some(pair)
     }
 
     fn next_stream_pair(&mut self) -> Option<(usize, usize)> {
@@ -1229,7 +1221,7 @@ where
             ),
         ));
     }
-    let mut prepared = prepare_search(samples, plan)?;
+    let mut prepared = prepare_search(samples, plan, job)?;
     if let Some(history) = history.as_deref_mut() {
         history.prepare(plan.limits);
     }
@@ -1251,8 +1243,11 @@ where
 fn prepare_search(
     samples: &[RelationalRecordSample<'_>],
     plan: &RelationalTransformPlan,
+    job: Option<&Job>,
 ) -> Result<PreparedSearch, RelationalTransformError> {
-    let mut discovery_groups = group_sessions(samples, plan.limits)?;
+    let mut check_cancelled =
+        || job.map_or(Ok(()), |job| job.check_cancelled().map_err(Into::into));
+    let mut discovery_groups = group_sessions(samples, plan.limits, &mut check_cancelled)?;
     let discovery_count = discovery_groups.len().div_ceil(2);
     let heldout_groups = discovery_groups.split_off(discovery_count);
     let discovery_sessions = discovery_groups
@@ -1263,14 +1258,20 @@ fn prepare_search(
         .iter()
         .map(|group| group.id.clone())
         .collect();
-    let discovery_indexes = build_selector_indexes(samples, &discovery_groups, plan.limits)?;
-    let common_selectors = shared_selectors(&discovery_indexes)?;
+    let discovery_indexes = build_selector_indexes(
+        samples,
+        &discovery_groups,
+        plan.limits,
+        &mut check_cancelled,
+    )?;
+    let common_selectors = shared_selectors(&discovery_indexes, &mut check_cancelled)?;
     let (seed_locators, seed_locators_complete) = seed_locators(
         samples,
         &discovery_groups,
         &discovery_indexes,
         &common_selectors,
         plan.limits,
+        &mut check_cancelled,
     )?;
     // Keep the initial absolute domain small enough that anchor discovery can later use
     // its existing share of the locator ceiling
@@ -1285,6 +1286,7 @@ fn prepare_search(
         &common_selectors,
         plan.limits,
         initial_absolute_limit,
+        &mut check_cancelled,
     )?;
     Ok(PreparedSearch {
         discovery_sessions,
@@ -1440,6 +1442,9 @@ impl SearchContext<'_, '_> {
             .limits
             .max_locator_candidates
             .saturating_sub(anchored.candidates.len());
+        let job = self.job;
+        let mut check_cancelled =
+            || job.map_or(Ok(()), |job| job.check_cancelled().map_err(Into::into));
         let (expanded_absolute_payloads, absolute_payloads_complete) = payload_locators(
             self.samples,
             &self.prepared.discovery_groups,
@@ -1447,6 +1452,7 @@ impl SearchContext<'_, '_> {
             &self.prepared.common_selectors,
             self.plan.limits,
             absolute_limit,
+            &mut check_cancelled,
         )?;
         let mut absolute_payloads = std::mem::take(&mut self.prepared.payload_locators);
         absolute_payloads

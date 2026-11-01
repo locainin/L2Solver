@@ -10,8 +10,9 @@ mod probe;
 mod replay;
 
 pub use discovery::{
-    RelationalCursorError, RelationalSearchCursor, RelationalSearchSession, RelationalSearchStep,
-    infer_relational_transform_candidates, infer_relational_transform_candidates_with_evaluator,
+    RelationalCursorError, RelationalRestoreBudget, RelationalSearchCursor,
+    RelationalSearchSession, RelationalSearchStep, infer_relational_transform_candidates,
+    infer_relational_transform_candidates_with_evaluator,
     infer_relational_transform_candidates_with_evaluator_and_history,
     infer_relational_transform_candidates_with_job,
 };

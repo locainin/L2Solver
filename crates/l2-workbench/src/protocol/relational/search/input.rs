@@ -15,6 +15,7 @@ pub(super) type SelectorIndex = BTreeMap<Selector, Vec<usize>>;
 pub(super) fn group_sessions(
     samples: &[RelationalRecordSample<'_>],
     limits: RelationalTransformLimits,
+    check_cancelled: &mut impl FnMut() -> Result<(), RelationalTransformError>,
 ) -> Result<Vec<SessionGroup>, RelationalTransformError> {
     if samples.is_empty() {
         return Err(RelationalTransformError::InvalidInput(
@@ -23,6 +24,7 @@ pub(super) fn group_sessions(
     }
     let mut grouped_samples = GroupedSamples::default();
     for (index, sample) in samples.iter().enumerate() {
+        check_cancelled()?;
         grouped_samples.add(index, sample, limits)?;
     }
     grouped_samples.into_groups(limits)
@@ -242,6 +244,7 @@ pub(super) fn build_selector_indexes(
     samples: &[RelationalRecordSample<'_>],
     groups: &[SessionGroup],
     limits: RelationalTransformLimits,
+    check_cancelled: &mut impl FnMut() -> Result<(), RelationalTransformError>,
 ) -> Result<Vec<SelectorIndex>, RelationalTransformError> {
     let mut indexes = Vec::new();
     indexes
@@ -259,6 +262,8 @@ pub(super) fn build_selector_indexes(
             let last_offset = limits.max_marker_offset.min(sample.bytes.len() - 1);
             for marker_offset in 0..=last_offset {
                 for marker_length in 1..=limits.max_marker_bytes {
+                    // Marker enumeration can dominate preparation before the first candidate
+                    check_cancelled()?;
                     let Some(marker_end) = marker_offset.checked_add(marker_length) else {
                         break;
                     };
@@ -285,19 +290,20 @@ pub(super) fn build_selector_indexes(
 
 pub(super) fn shared_selectors(
     indexes: &[SelectorIndex],
+    check_cancelled: &mut impl FnMut() -> Result<(), RelationalTransformError>,
 ) -> Result<Vec<Selector>, RelationalTransformError> {
     let Some(first) = indexes.first() else {
         return Ok(Vec::new());
     };
     let mut selectors = Vec::new();
-    for selector in first
-        .keys()
-        .filter(|selector| indexes.iter().all(|index| index.contains_key(*selector)))
-    {
-        selectors
-            .try_reserve(1)
-            .map_err(|_| RelationalTransformError::AllocationFailed)?;
-        selectors.push(selector.clone());
+    for selector in first.keys() {
+        check_cancelled()?;
+        if indexes.iter().all(|index| index.contains_key(selector)) {
+            selectors
+                .try_reserve(1)
+                .map_err(|_| RelationalTransformError::AllocationFailed)?;
+            selectors.push(selector.clone());
+        }
     }
     Ok(selectors)
 }

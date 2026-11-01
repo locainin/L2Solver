@@ -26,11 +26,11 @@ type SessionCheckResult<T> = Result<Result<T, RelationalSessionCheck>, Relationa
 #[path = "../../../../tests/protocol/relational/search/replay.rs"]
 mod prefix_work_tests;
 
-struct LocatedPayload<'a> {
+pub(super) struct LocatedPayload<'a> {
     sample: u64,
     sample_index: usize,
     source_range: crate::protocol::ByteRange,
-    bytes: &'a [u8],
+    pub(super) bytes: &'a [u8],
 }
 
 // Include the matching index, payload vector, and failure receipts with collection slack
@@ -38,11 +38,11 @@ pub(super) const fn saved_output_validation_record_bytes() -> usize {
     2 * size_of::<LocatedPayload<'static>>() + 4 * size_of::<usize>() + 2 * size_of::<u64>()
 }
 
-struct LocatedSeed<'a> {
+pub(super) struct LocatedSeed<'a> {
     sample: u64,
     sample_index: usize,
     range: crate::protocol::ByteRange,
-    bytes: &'a [u8],
+    pub(super) bytes: &'a [u8],
 }
 
 pub(super) struct PrefixProbeMessage<'a> {
@@ -201,7 +201,7 @@ fn one_session_group(
     samples: &[RelationalRecordSample<'_>],
     limits: RelationalTransformLimits,
 ) -> Result<SessionGroup, RelationalTransformError> {
-    let mut groups = group_sessions(samples, limits)?;
+    let mut groups = group_sessions(samples, limits, &mut || Ok(()))?;
     if groups.len() != 1 {
         return Err(RelationalTransformError::InvalidInput(
             "relational rule replay requires exactly one complete session",
@@ -981,9 +981,9 @@ fn check_session(
     check_transformed_session(group, inputs, context.rule, transformed, output_mappings)
 }
 
-struct SessionTransformInputs<'a> {
-    seed: LocatedSeed<'a>,
-    payloads: Vec<LocatedPayload<'a>>,
+pub(super) struct SessionTransformInputs<'a> {
+    pub(super) seed: LocatedSeed<'a>,
+    pub(super) payloads: Vec<LocatedPayload<'a>>,
 }
 
 fn prepare_session_inputs<'a>(
@@ -1004,18 +1004,18 @@ fn prepare_session_inputs<'a>(
     Ok(Ok(SessionTransformInputs { seed, payloads }))
 }
 
-// Re-resolve the frozen locators without repeating the saved transform
-pub(super) fn saved_output_matches_locators(
-    samples: &[RelationalRecordSample<'_>],
+// Re-resolve the frozen locators before checking the saved transform
+pub(super) fn saved_output_inputs<'a>(
+    samples: &[RelationalRecordSample<'a>],
     group: &SessionGroup,
     rule: &RelationalTransformRule,
     limits: RelationalTransformLimits,
     output: &RelationalAppliedOutput,
-) -> Result<bool, RelationalTransformError> {
+) -> Result<Option<SessionTransformInputs<'a>>, RelationalTransformError> {
     let Ok(inputs) = prepare_session_inputs(samples, group, None, rule, limits)? else {
-        return Ok(false);
+        return Ok(None);
     };
-    Ok(inputs.seed.sample == output.seed_sample
+    let matches = inputs.seed.sample == output.seed_sample
         && inputs.payloads.len() == output.payload_mappings.len()
         && inputs
             .payloads
@@ -1023,7 +1023,8 @@ pub(super) fn saved_output_matches_locators(
             .zip(&output.payload_mappings)
             .all(|(payload, mapping)| {
                 payload.sample == mapping.sample && payload.source_range == mapping.source_range
-            }))
+            });
+    Ok(matches.then_some(inputs))
 }
 
 fn locate_session_seed<'a>(
@@ -1533,7 +1534,7 @@ fn run_transform_ranges<'a>(
     })
 }
 
-fn transform_work_estimate(
+pub(super) fn transform_work_estimate(
     payloads: &[LocatedPayload<'_>],
     seed_length: usize,
     counter_width: CounterWidth,

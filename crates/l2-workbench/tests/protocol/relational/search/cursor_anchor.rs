@@ -6,8 +6,8 @@ use super::{
 use l2_workbench::{
     job::MemoryBudget,
     protocol::{
-        RelationalSearchSession, RelationalSearchStep,
-        infer_relational_transform_candidates_with_evaluator_and_history,
+        RelationalCursorError, RelationalRestoreBudget, RelationalSearchSession,
+        RelationalSearchStep, infer_relational_transform_candidates_with_evaluator_and_history,
     },
 };
 use std::convert::Infallible;
@@ -75,7 +75,11 @@ fn resuming_preserves_anchor_ranking_prefix_work_and_candidate_order() -> TestRe
                         &bytes,
                         4 * 1024 * 1024,
                         &memory,
-                        |_, _, value| serde_json::from_value::<u8>(value),
+                        &mut RelationalRestoreBudget::new(usize::MAX, usize::MAX),
+                        |_, _, value, _| {
+                            serde_json::from_value::<u8>(value)
+                                .map_err(RelationalCursorError::Assessment)
+                        },
                     )?;
                     restored_memory = Some(lease);
                     cursor = Some(restored);

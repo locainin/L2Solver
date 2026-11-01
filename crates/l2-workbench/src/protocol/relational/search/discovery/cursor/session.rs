@@ -47,8 +47,12 @@ impl fmt::Debug for RelationalSearchSession<'_, '_> {
 impl<'input, 'bytes> RelationalSearchSession<'input, 'bytes> {
     /// Prepare a search over an immutable cohort and an optional dedicated replay history
     ///
-    /// A cancelled job is checked while hashing each bounded chunk of input. The same history
-    /// is borrowed for all live slices and can be read using [`Self::history`] at a checkpoint.
+    /// Cancellation is checked while grouping messages, enumerating selectors and locators,
+    /// and hashing bounded chunks of input. The same history is borrowed for all live slices
+    /// and can be read using [`Self::history`] at a checkpoint
+    ///
+    /// Reserve [`Self::preparation_memory_bytes`] before constructing the session and keep that
+    /// allowance until its cursor and any report state moved from preparation have been consumed
     ///
     /// # Errors
     /// Returns an error for cancellation, invalid inputs or plans, or allocation failure
@@ -73,7 +77,7 @@ impl<'input, 'bytes> RelationalSearchSession<'input, 'bytes> {
                 "retained evaluator outputs exceed the aggregate byte limit",
             ));
         }
-        let prepared = prepare_search(samples, plan)?;
+        let prepared = prepare_search(samples, plan, job)?;
         let digest = identity(samples, plan, options, job)?;
         let parameters = candidate_parameters(plan)?;
         let id = NEXT_SESSION
@@ -147,7 +151,7 @@ impl<'input, 'bytes> RelationalSearchSession<'input, 'bytes> {
             capture_outputs_for_evaluator: true,
         };
         let first_step = cursor.is_none();
-        let (mut search, initial_pairs, pre_evaluated, mut position, mut prepared) =
+        let (mut search, initial_pairs, pre_evaluated, mut position, mut prepared, mut schedule) =
             if let Some(cursor) = cursor {
                 if cursor.session_id != self.session_id
                     || cursor.identity != self.identity
@@ -161,6 +165,7 @@ impl<'input, 'bytes> RelationalSearchSession<'input, 'bytes> {
                     cursor.pre_evaluated,
                     cursor.position,
                     cursor.prepared,
+                    cursor.schedule,
                 )
             } else {
                 let mut prepared = self.prepared.take().ok_or(invalid_cursor())?;
@@ -221,6 +226,7 @@ impl<'input, 'bytes> RelationalSearchSession<'input, 'bytes> {
                         current: None,
                     },
                     prepared,
+                    None,
                 )
             };
         // Startup work belongs to the first slice even when ranking exceeds its requested budget
@@ -247,6 +253,7 @@ impl<'input, 'bytes> RelationalSearchSession<'input, 'bytes> {
             &initial_pairs,
             &pre_evaluated,
             &mut position,
+            &mut schedule,
             StepBounds {
                 candidate_end: pause_at,
                 traversal: candidate_budget,
@@ -270,6 +277,7 @@ impl<'input, 'bytes> RelationalSearchSession<'input, 'bytes> {
             session_id: self.session_id,
             search,
             prepared,
+            schedule,
             initial_pairs,
             pre_evaluated,
             position,

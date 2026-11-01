@@ -146,6 +146,7 @@ impl RelationalReplayHistory {
 
     pub(super) fn checkpoint_identity(
         &self,
+        job: Option<&crate::job::Job>,
     ) -> Result<[u8; 32], super::super::model::RelationalTransformError> {
         use super::super::model::RelationalTransformError;
         use std::io::{self, Write};
@@ -165,6 +166,11 @@ impl RelationalReplayHistory {
             .try_reserve_exact(self.entries.len())
             .map_err(|_| RelationalTransformError::AllocationFailed)?;
         for (index, entry) in self.entries.iter().enumerate() {
+            if index.is_multiple_of(256)
+                && let Some(job) = job
+            {
+                job.check_cancelled()?;
+            }
             let mut writer = DigestWriter(Sha256::new());
             serde_json::to_writer(&mut writer, &entry.rule).map_err(|_| {
                 RelationalTransformError::InvalidPlan("history identity encoding failed")

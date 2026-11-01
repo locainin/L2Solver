@@ -1,20 +1,17 @@
 //! Validate restored relational state and exact source provenance before assessment decoding
 
-use super::super::super::replay::{
-    saved_output_matches_locators, saved_output_validation_record_bytes,
-};
+use super::super::super::replay::saved_output_validation_record_bytes;
 use super::{
-    CandidateId, CounterWidth, INITIAL_RANK_ORDERED_PAIR_WINDOW, LocatorCandidate, LocatorPair,
-    PairStage, PairStreamRow, PayloadFamilyIndex, PayloadHeaderGroup, PayloadRankGroup, Position,
-    PreparedSearch, RankedLocatorFamily, RankedPairEntry, RankedPayloadLocator,
-    RelationalAppliedOutput, RelationalFit, RelationalFitStatus, RelationalOperationTemplate,
-    RelationalRecordSample, RelationalTransformError, RelationalTransformEvaluationOptions,
-    RelationalTransformPlan, RelationalTransformRule, SearchState, SeedHeaderGroup, SeedRankGroup,
-    SessionGroup, candidate_status, invalid_cursor, locator_pair_overlaps,
+    CandidateId, CounterWidth, INITIAL_RANK_ORDERED_PAIR_WINDOW, Job, LocatorCandidate,
+    LocatorPair, PairStage, PairStreamRow, PayloadFamilyIndex, PayloadHeaderGroup,
+    PayloadRankGroup, Position, PreparedSearch, RankedLocatorFamily, RankedPairEntry,
+    RankedPayloadLocator, RelationalAppliedOutput, RelationalFit, RelationalFitStatus,
+    RelationalOperationTemplate, RelationalRecordSample, RelationalTransformError,
+    RelationalTransformEvaluationOptions, RelationalTransformPlan, RelationalTransformRule,
+    SearchState, SeedHeaderGroup, SeedRankGroup, SessionGroup, candidate_status, invalid_cursor,
+    locator_pair_overlaps,
 };
-use crate::protocol::{
-    RelationalCoordinateBasis, RelationalSessionCheck, RelationalTransformLimits,
-};
+use crate::protocol::{RelationalCoordinateBasis, RelationalSessionCheck};
 use std::collections::BTreeSet;
 
 // Account for the scheduler's sized vectors and per-session locator resolution scratch
@@ -75,6 +72,7 @@ pub(super) fn restoration_scratch_bytes<T>(
         })
         .and_then(|bytes| bytes.checked_add(schedule))
         .and_then(|bytes| bytes.checked_add(set_bytes))
+        .and_then(|bytes| bytes.checked_add(2 * super::output::CHUNK_BYTES))
         .and_then(|bytes| {
             context_bytes
                 .checked_mul(2)
@@ -89,32 +87,27 @@ fn schedule_scratch_bytes(
     payloads: &[LocatorCandidate],
     position: &Position,
 ) -> Result<usize, RelationalTransformError> {
-    const SEED_BYTES: usize = 4 * size_of::<RankedLocatorFamily<'static>>()
-        + 2 * size_of::<SeedRankGroup>()
-        + 2 * size_of::<SeedHeaderGroup>()
-        + 6 * size_of::<PairStreamRow>()
-        + 6 * size_of::<RankedPairEntry>()
-        + 2 * size_of::<Option<usize>>()
-        + 2 * size_of::<bool>();
-    const PAYLOAD_BYTES: usize = 2 * size_of::<RankedPayloadLocator<'static>>()
-        + 2 * size_of::<PayloadRankGroup>()
-        + 2 * size_of::<PayloadHeaderGroup>()
-        + 2 * size_of::<PayloadFamilyIndex<'static>>();
     if matches!(position.stage, PairStage::Absolute { .. }) {
-        prepared
-            .seed_locators
-            .len()
-            .checked_mul(SEED_BYTES)
-            .and_then(|bytes| {
-                payloads
-                    .len()
-                    .checked_mul(PAYLOAD_BYTES)
-                    .and_then(|payload| bytes.checked_add(payload))
-            })
+        schedule_memory_bytes(prepared.seed_locators.len(), payloads.len())
             .ok_or_else(invalid_cursor)
     } else {
         Ok(0)
     }
+}
+
+pub(super) fn schedule_memory_bytes(seeds: usize, payloads: usize) -> Option<usize> {
+    const SEED_BYTES: usize = 4 * size_of::<RankedLocatorFamily>()
+        + 2 * size_of::<SeedRankGroup>()
+        + 2 * size_of::<SeedHeaderGroup>()
+        + 6 * size_of::<PairStreamRow>()
+        + 6 * size_of::<RankedPairEntry>();
+    const PAYLOAD_BYTES: usize = 2 * size_of::<RankedPayloadLocator>()
+        + 2 * size_of::<PayloadRankGroup>()
+        + 2 * size_of::<PayloadHeaderGroup>()
+        + 2 * size_of::<PayloadFamilyIndex<'static>>();
+    seeds
+        .checked_mul(SEED_BYTES)?
+        .checked_add(payloads.checked_mul(PAYLOAD_BYTES)?)
 }
 
 #[expect(
@@ -134,6 +127,7 @@ pub(super) fn validate_cursor<T>(
     position: &Position,
     plan: &RelationalTransformPlan,
     options: RelationalTransformEvaluationOptions,
+    job: Option<&Job>,
 ) -> Result<(), RelationalTransformError> {
     let limits = plan.limits;
     if search.candidates_examined > limits.max_candidates
@@ -167,7 +161,12 @@ pub(super) fn validate_cursor<T>(
     {
         return Err(invalid_cursor());
     }
-    for locator in &prepared.payload_locators {
+    for (index, locator) in prepared.payload_locators.iter().enumerate() {
+        if index.is_multiple_of(256)
+            && let Some(job) = job
+        {
+            job.check_cancelled()?;
+        }
         if locator.locator.marker.len() > limits.max_marker_bytes
             || locator.locator.marker.is_empty()
             || locator.selector.marker.len() > limits.max_marker_bytes
@@ -280,16 +279,16 @@ pub(super) fn validate_cursor<T>(
         }
         (PairStage::Absolute { .. }, None) => {}
     }
-    if let PairStage::Absolute { schedule } = &position.stage {
-        let Some(schedule) = schedule else {
-            return Err(invalid_cursor());
-        };
-        schedule.validate(&prepared.seed_locators, &prepared.payload_locators)?;
+    if matches!(&position.stage, PairStage::Absolute { schedule: None }) {
+        return Err(invalid_cursor());
     }
     let mut bytes = 0_usize;
     let mut omissions = 0_usize;
     let mut orders = BTreeSet::new();
     for retained in &search.candidates {
+        if let Some(job) = job {
+            job.check_cancelled()?;
+        }
         if retained.search_order == 0
             || retained.search_order > search.candidates_examined
             || !orders.insert(retained.search_order)
@@ -321,16 +320,12 @@ pub(super) fn validate_cursor<T>(
                 &prepared.discovery_groups,
                 &retained.candidate.discovery,
                 &outputs.discovery,
-                &retained.candidate.rule,
-                limits,
             )?;
             validate_outputs(
                 samples,
                 &prepared.heldout_groups,
                 &retained.candidate.heldout,
                 &outputs.heldout,
-                &retained.candidate.rule,
-                limits,
             )?;
         }
         let actual = retained
@@ -383,17 +378,18 @@ fn validate_rule(
     {
         return Err(invalid_cursor());
     }
-    let in_domain = prepared
+    let has_seed = prepared
         .seed_locators
         .iter()
-        .enumerate()
-        .any(|(seed_index, seed)| {
-            seed.locator == rule.seed_locator
-                && prepared.payload_locators.iter().any(|payload| {
-                    payload.locator == rule.payload_locator
-                        && payload
-                            .anchor_seed_index
-                            .is_none_or(|anchor| anchor == seed_index)
+        .any(|seed| seed.locator == rule.seed_locator);
+    let in_domain = has_seed
+        && prepared.payload_locators.iter().any(|payload| {
+            payload.locator == rule.payload_locator
+                && payload.anchor_seed_index.is_none_or(|anchor| {
+                    prepared
+                        .seed_locators
+                        .get(anchor)
+                        .is_some_and(|seed| seed.locator == rule.seed_locator)
                 })
         });
     if in_domain {
@@ -509,8 +505,6 @@ fn validate_outputs(
     groups: &[SessionGroup],
     fit: &RelationalFit,
     outputs: &[RelationalAppliedOutput],
-    rule: &RelationalTransformRule,
-    limits: RelationalTransformLimits,
 ) -> Result<(), RelationalTransformError> {
     if outputs.len() != fit.supported_sessions.len() {
         return Err(invalid_cursor());
@@ -525,16 +519,11 @@ fn validate_outputs(
             .iter()
             .find(|check| check.session == *session)
             .ok_or(invalid_cursor())?;
-        if !saved_output_matches_locators(samples, group, rule, limits, output)? {
-            return Err(invalid_cursor());
-        }
-        let digest = check.output_sha256.as_deref().ok_or(invalid_cursor())?;
         if output.session != *session
             || output.session_order != group.session_order
             || check.seed_sample != Some(output.seed_sample)
             || check.output_length != Some(output.bytes.len())
             || !output.parser_validation_deferred
-            || !crate::hashing::sha256_matches(&output.bytes, digest)
             || output.payload_mappings.len() != check.payload_samples.len()
             || !group.sample_indices.iter().any(|&index| {
                 samples

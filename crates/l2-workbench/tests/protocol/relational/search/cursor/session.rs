@@ -1,8 +1,9 @@
 use super::{
     CHECKPOINT_LIMIT, Infallible, Job, RelationalParserScope, RelationalReplayHistory,
-    RelationalSearchStep, RelationalTransformEvaluationOptions, SCOPE, TestResult, borrow_samples,
-    decode_assessment, evaluate, infer_relational_transform_candidates_with_evaluator_and_history,
-    search_plan, synthetic_sessions,
+    RelationalRestoreBudget, RelationalSearchStep, RelationalTransformEvaluationOptions, SCOPE,
+    TestResult, borrow_samples, decode_assessment, evaluate,
+    infer_relational_transform_candidates_with_evaluator_and_history, search_plan,
+    synthetic_sessions,
 };
 use l2_workbench::{
     artifact::ArtifactValidationFormat,
@@ -114,6 +115,7 @@ fn live_slices_reuse_preparation_and_restart_preserves_the_same_search() -> Test
                         &bytes,
                         CHECKPOINT_LIMIT,
                         &memory,
+                        &mut RelationalRestoreBudget::new(usize::MAX, usize::MAX),
                         decode_assessment,
                     )?;
                     // Keep the restored-state allowance until all returned evidence is consumed
@@ -126,8 +128,7 @@ fn live_slices_reuse_preparation_and_restart_preserves_the_same_search() -> Test
             }
         }
     };
-    assert!(pauses > 2);
-    assert!(previous_count > 16);
+    assert!(pauses > 2 && previous_count > 16);
     assert!(!baseline.evaluations.is_empty());
     assert_eq!(actual, baseline);
     assert_eq!(calls, baseline_calls);
@@ -163,10 +164,16 @@ fn decoded_metadata_is_admitted_before_assessment_conversion() -> TestResult<()>
         .ok_or("limit overflow")?;
     let memory = MemoryBudget::new(limit);
     let mut decoded = 0;
-    let result = session.restore_checkpoint(&bytes, CHECKPOINT_LIMIT, &memory, |_, _, value| {
-        decoded += 1;
-        serde_json::from_value::<usize>(value)
-    });
+    let result = session.restore_checkpoint(
+        &bytes,
+        CHECKPOINT_LIMIT,
+        &memory,
+        &mut RelationalRestoreBudget::new(usize::MAX, usize::MAX),
+        |_, _, value, _| {
+            decoded += 1;
+            serde_json::from_value::<usize>(value).map_err(RelationalCursorError::Assessment)
+        },
+    );
     assert!(matches!(result, Err(RelationalCursorError::Memory(_))));
     assert_eq!(decoded, 0);
     assert_eq!(memory.snapshot()?.used(MemoryClass::Executor), 0);
@@ -208,9 +215,10 @@ fn restored_dimensions_need_separate_admission_before_assessment_conversion() ->
         &bytes,
         CHECKPOINT_LIMIT,
         &memory,
-        |candidate, outputs, value| {
+        &mut RelationalRestoreBudget::new(usize::MAX, usize::MAX),
+        |candidate, outputs, value, work| {
             decoded += 1;
-            decode_assessment(candidate, outputs, value)
+            decode_assessment(candidate, outputs, value, work)
         },
     );
     assert!(matches!(result, Err(RelationalCursorError::Memory(_))));
@@ -242,7 +250,13 @@ fn a_live_session_cannot_restore_a_second_cursor() -> TestResult<()> {
         |value, writer| serde_json::to_writer(writer, value),
     )?;
     let memory = MemoryBudget::new(64 * 1024 * 1024);
-    let restored = session.restore_checkpoint(&bytes, CHECKPOINT_LIMIT, &memory, decode_assessment);
+    let restored = session.restore_checkpoint(
+        &bytes,
+        CHECKPOINT_LIMIT,
+        &memory,
+        &mut RelationalRestoreBudget::new(usize::MAX, usize::MAX),
+        decode_assessment,
+    );
     assert!(matches!(
         restored,
         Err(RelationalCursorError::InvalidCheckpoint)

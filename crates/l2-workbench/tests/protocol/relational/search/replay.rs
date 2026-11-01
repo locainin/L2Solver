@@ -29,7 +29,7 @@ fn positive_insufficient_work_never_starts_a_prefix_transform() -> Result<(), Bo
         bytes: &bytes,
     }];
     let limits = RelationalTransformLimits::default();
-    let groups = group_sessions(&samples, limits)?;
+    let groups = group_sessions(&samples, limits, &mut || Ok(()))?;
     let rule = rule();
     let PrefixPreparation::Ready(prepared) =
         prepare_candidate_prefix(&samples, &groups, &rule, limits, 32)?
@@ -62,7 +62,7 @@ fn prefix_preparation_distinguishes_contradictions_from_unusable_probes()
     let contradiction_bytes = [0xc2, 2, 0x11, 0x22, 0x57, 0x33];
     let samples = [sample(1, &contradiction_bytes)];
     let limits = RelationalTransformLimits::default();
-    let groups = group_sessions(&samples, limits)?;
+    let groups = group_sessions(&samples, limits, &mut || Ok(()))?;
     assert!(matches!(
         prepare_candidate_prefix(&samples, &groups, &rule(), limits, 32)?,
         PrefixPreparation::Contradicted
@@ -76,7 +76,7 @@ fn prefix_preparation_distinguishes_contradictions_from_unusable_probes()
         sample(2, &payload_a),
         sample(3, &payload_b),
     ];
-    let groups = group_sessions(&samples, limits)?;
+    let groups = group_sessions(&samples, limits, &mut || Ok(()))?;
     let mut multi_payload_rule = rule();
     multi_payload_rule.payload_locator.coordinate_basis = RelationalCoordinateBasis::MessageStartV1;
     assert!(matches!(
@@ -87,7 +87,7 @@ fn prefix_preparation_distinguishes_contradictions_from_unusable_probes()
     let mut exhausted = vec![0xd2, 2, 0x11, 0x22, 0x57];
     exhausted.extend(vec![0x33; 32 * 255 + 1]);
     let samples = [sample(1, &exhausted)];
-    let groups = group_sessions(&samples, limits)?;
+    let groups = group_sessions(&samples, limits, &mut || Ok(()))?;
     assert!(matches!(
         prepare_candidate_prefix(&samples, &groups, &rule(), limits, 32)?,
         PrefixPreparation::Contradicted
@@ -102,7 +102,7 @@ fn unfinished_prefix_observation_reports_the_transform_work_already_spent()
     bytes.extend([0x33; 64]);
     let samples = [sample(1, &bytes)];
     let limits = RelationalTransformLimits::default();
-    let groups = group_sessions(&samples, limits)?;
+    let groups = group_sessions(&samples, limits, &mut || Ok(()))?;
     let PrefixPreparation::Ready(prepared) =
         prepare_candidate_prefix(&samples, &groups, &rule(), limits, 32)?
     else {

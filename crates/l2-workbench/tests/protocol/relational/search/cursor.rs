@@ -7,7 +7,8 @@ use l2_workbench::{
     job::{Job, MemoryBudget, MemoryLease},
     protocol::{
         RelationalCandidateOutputs, RelationalCursorError, RelationalReplayHistory,
-        RelationalSearchSession, RelationalSearchStep, RelationalTransformCandidate,
+        RelationalRestoreBudget, RelationalSearchSession, RelationalSearchStep,
+        RelationalTransformCandidate,
         infer_relational_transform_candidates_with_evaluator_and_history,
     },
 };
@@ -25,6 +26,12 @@ type CheckpointFixture = (
     MemoryLease,
 );
 
+#[path = "cursor/absolute_resume.rs"]
+mod absolute_resume;
+#[path = "cursor/corruption.rs"]
+mod corruption;
+#[path = "cursor/resources.rs"]
+mod resources;
 #[path = "cursor/session.rs"]
 mod session;
 
@@ -40,8 +47,9 @@ fn decode_assessment(
     _: &RelationalTransformCandidate,
     _: Option<&RelationalCandidateOutputs>,
     value: serde_json::Value,
-) -> Result<usize, serde_json::Error> {
-    serde_json::from_value(value)
+    _: &mut RelationalRestoreBudget,
+) -> Result<usize, RelationalCursorError<serde_json::Error>> {
+    serde_json::from_value(value).map_err(RelationalCursorError::Assessment)
 }
 
 fn rehash(mut envelope: serde_json::Value) -> TestResult<Vec<u8>> {
@@ -94,9 +102,10 @@ fn assert_resume_rejected(
         bytes,
         CHECKPOINT_LIMIT,
         &memory,
-        |candidate, outputs, value| {
+        &mut RelationalRestoreBudget::new(usize::MAX, usize::MAX),
+        |candidate, outputs, value, work| {
             calls += 1;
-            decode_assessment(candidate, outputs, value)
+            decode_assessment(candidate, outputs, value, work)
         },
     );
     assert!(matches!(
@@ -115,7 +124,13 @@ fn rejects_corrupt_and_oversized_checkpoints() -> TestResult<()> {
     let mut session = RelationalSearchSession::new(&samples, &plan, None, options, None)?;
     assert!(
         session
-            .restore_checkpoint(&bytes, 8, &memory, decode_assessment)
+            .restore_checkpoint(
+                &bytes,
+                8,
+                &memory,
+                &mut RelationalRestoreBudget::new(usize::MAX, usize::MAX),
+                decode_assessment
+            )
             .is_err()
     );
     let mut damaged = bytes.clone();
@@ -123,7 +138,13 @@ fn rejects_corrupt_and_oversized_checkpoints() -> TestResult<()> {
     *damaged.get_mut(index).ok_or("empty checkpoint")? ^= 1;
     assert!(
         session
-            .restore_checkpoint(&damaged, CHECKPOINT_LIMIT, &memory, decode_assessment)
+            .restore_checkpoint(
+                &damaged,
+                CHECKPOINT_LIMIT,
+                &memory,
+                &mut RelationalRestoreBudget::new(usize::MAX, usize::MAX),
+                decode_assessment
+            )
             .is_err()
     );
     let mut incompatible: serde_json::Value = serde_json::from_slice(&bytes)?;
@@ -131,7 +152,13 @@ fn rejects_corrupt_and_oversized_checkpoints() -> TestResult<()> {
     let incompatible = serde_json::to_vec(&incompatible)?;
     assert!(
         session
-            .restore_checkpoint(&incompatible, CHECKPOINT_LIMIT, &memory, decode_assessment)
+            .restore_checkpoint(
+                &incompatible,
+                CHECKPOINT_LIMIT,
+                &memory,
+                &mut RelationalRestoreBudget::new(usize::MAX, usize::MAX),
+                decode_assessment
+            )
             .is_err()
     );
     Ok(())

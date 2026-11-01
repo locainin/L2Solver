@@ -316,6 +316,7 @@ pub(super) fn seed_locators(
     indexes: &[SelectorIndex],
     selectors: &[Selector],
     limits: RelationalTransformLimits,
+    check_cancelled: &mut impl FnMut() -> Result<(), RelationalTransformError>,
 ) -> Result<(Vec<LocatorCandidate>, bool), RelationalTransformError> {
     let mut candidates =
         BoundedLocatorCandidates::new(LocatorRanking::Seed, limits.max_locator_candidates);
@@ -333,6 +334,7 @@ pub(super) fn seed_locators(
                 .max_seed_bytes
                 .min(minimum_length.saturating_sub(value_offset));
             for value_length in 1..=maximum_seed_length {
+                check_cancelled()?;
                 add_seed_locator_candidates(
                     samples,
                     groups,
@@ -450,6 +452,7 @@ pub(super) fn payload_locators(
     selectors: &[Selector],
     limits: RelationalTransformLimits,
     maximum_candidates: usize,
+    check_cancelled: &mut impl FnMut() -> Result<(), RelationalTransformError>,
 ) -> Result<(Vec<LocatorCandidate>, bool), RelationalTransformError> {
     let mut candidates = BoundedLocatorCandidates::new(LocatorRanking::Payload, maximum_candidates);
     for selector in selectors {
@@ -462,6 +465,8 @@ pub(super) fn payload_locators(
             .saturating_sub(1)
             .min(limits.max_locator_offset);
         for value_offset in 0..=last_payload_offset {
+            // Poll inside each selector so a large offset domain remains interruptible
+            check_cancelled()?;
             let locator = RelationalByteRangeLocator {
                 coordinate_basis: RelationalCoordinateBasis::MessageStartV1,
                 direction: selector.direction,
