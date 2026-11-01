@@ -36,6 +36,9 @@ impl VrrpMonitor {
 
     /// Collect scoped advertisements without sending a packet
     ///
+    /// A fixed receive filter must admit this monitor's selected scope; use the
+    /// same monitor for helper admission and collection
+    ///
     /// # Errors
     /// Returns an allocation or deadline error before collection begins
     pub fn run(
@@ -50,6 +53,9 @@ impl VrrpMonitor {
     }
 
     /// Collect under an absolute deadline shared with backend setup
+    ///
+    /// A fixed receive filter must admit this monitor's selected scope; use the
+    /// same monitor for helper admission and collection
     ///
     /// # Errors
     /// Returns an allocation or deadline error before collection begins

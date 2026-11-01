@@ -8,7 +8,8 @@ pub(super) const SUFFIX_BYTES: u16 = 12;
 pub(super) const LLC: [u8; 3] = [0xaa, 0xaa, 3];
 pub(super) const HSA: [u8; 3] = [0, 0, 0x0c];
 const INNER_FCS_BYTES: usize = 4;
-const ETHERNET_HEADER_BYTES: usize = 14;
+// Cisco specifies a 64-byte minimum encapsulated Ethernet frame including FCS
+const MIN_INNER_BYTES: usize = 64;
 // Cisco documents a maximum of 24,575 bytes for the encapsulated frame
 const MAX_INNER_BYTES: usize = 24_575;
 
@@ -59,7 +60,7 @@ fn decode(frame: &[u8]) -> IslEvidence {
     if inner_len > MAX_INNER_BYTES {
         return IslEvidence::LimitExceeded;
     }
-    if inner_len < ETHERNET_HEADER_BYTES + INNER_FCS_BYTES {
+    if inner_len < MIN_INNER_BYTES {
         return IslEvidence::Malformed(IslMalformed::Length);
     }
     // The declared boundary excludes any possible outer FCS or padding

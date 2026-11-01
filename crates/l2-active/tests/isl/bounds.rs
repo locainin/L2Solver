@@ -194,3 +194,68 @@ fn isl_fcs_metadata_alone_does_not_change_crc_or_header_claims() -> Result<(), B
     assert_eq!(first.frame().metadata().fcs(), FcsStatus::Unknown);
     Ok(())
 }
+
+#[test]
+fn isl_ethernet_inner_size_rejects_63_and_accepts_64_bytes() -> Result<(), Box<dyn Error>> {
+    fn sized(inner_len: usize) -> Result<Vec<u8>, Box<dyn Error>> {
+        let mut frame = fixture::VALID
+            .get(..26 + inner_len)
+            .ok_or("fixture too short")?
+            .to_vec();
+        let declared = u16::try_from(inner_len + 12)?.to_be_bytes();
+        frame
+            .get_mut(12..14)
+            .ok_or("missing length")?
+            .copy_from_slice(&declared);
+        Ok(frame)
+    }
+    let mut link = Link::new(
+        vec![fixture::event(&sized(63)?)?, fixture::event(&sized(64)?)?],
+        Some(0),
+    )?;
+    let report =
+        IslMonitor::new(fixture::limits(8, 4096)?).run(&mut link, &AtomicBool::new(false))?;
+    assert!(matches!(
+        report.observations().first().map(IslObservation::evidence),
+        Some(IslEvidence::Malformed(l2_active::isl::IslMalformed::Length))
+    ));
+    let Some(IslEvidence::Frame(header)) =
+        report.observations().get(1).map(IslObservation::evidence)
+    else {
+        return Err("64-byte inner Ethernet frame rejected".into());
+    };
+    assert_eq!(header.inner_frame_length(), 64);
+    Ok(())
+}
+
+#[test]
+fn isl_validates_the_full_inner_8023_payload_before_its_fcs() -> Result<(), Box<dyn Error>> {
+    // The independent fixture contains 66 inner bytes including the four-byte FCS
+    let mut exact = fixture::VALID.to_vec();
+    exact
+        .get_mut(38..40)
+        .ok_or("missing inner length field")?
+        .copy_from_slice(&48_u16.to_be_bytes());
+    let mut overdeclared = exact.clone();
+    overdeclared
+        .get_mut(38..40)
+        .ok_or("missing inner length field")?
+        .copy_from_slice(&49_u16.to_be_bytes());
+    let mut link = Link::new(
+        vec![fixture::event(&exact)?, fixture::event(&overdeclared)?],
+        Some(0),
+    )?;
+    let report =
+        IslMonitor::new(fixture::limits(8, 4096)?).run(&mut link, &AtomicBool::new(false))?;
+    assert!(matches!(
+        report.observations().first().map(IslObservation::evidence),
+        Some(IslEvidence::Frame(_))
+    ));
+    assert!(matches!(
+        report.observations().get(1).map(IslObservation::evidence),
+        Some(IslEvidence::Malformed(
+            l2_active::isl::IslMalformed::InnerEthernet
+        ))
+    ));
+    Ok(())
+}

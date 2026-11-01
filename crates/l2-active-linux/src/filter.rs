@@ -1,5 +1,11 @@
 //! Fixed packet admission filters for narrowly scoped helper operations
 
+mod hsrp;
+mod isl;
+mod mpls;
+mod switching;
+mod vrrp;
+
 use std::io;
 
 use rscap::{
@@ -12,6 +18,10 @@ use crate::intent::{Intent, IntentKind, ListenKind};
 #[cfg(test)]
 #[path = "../tests/filter/mod.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "../tests/filter/fixed_scopes.rs"]
+mod scope_tests;
 
 // Classic BPF instructions load network-order values from the Ethernet frame
 const LOAD_WORD: u16 = 0x20;
@@ -178,12 +188,7 @@ pub fn attach(socket: &L2Socket, intent: &Intent) -> io::Result<()> {
 
 fn instructions(intent: &Intent) -> io::Result<Vec<BpfInstruction>> {
     let mut program = Program::new()?;
-    // Reject offloaded VLAN frames before reading the visible Ethernet bytes
-    program.emit(LOAD_WORD, VLAN_TAG_PRESENT);
-    program.require(EQUAL, 0);
-    // Sending is accounted separately; no outgoing frame enters capture
-    program.emit(LOAD_WORD, PACKET_TYPE);
-    program.branch(EQUAL, PACKET_OUTGOING, Some(Label::Reject), None);
+    preamble(&mut program);
     match intent.kind() {
         IntentKind::Arp { source, target } => arp(
             &mut program,
@@ -203,8 +208,29 @@ fn instructions(intent: &Intent) -> io::Result<Vec<BpfInstruction>> {
         IntentKind::Dot1x => dot1x(&mut program, intent.source_mac().bytes()),
         IntentKind::Listen(ListenKind::Discovery) => discovery(&mut program),
         IntentKind::Listen(ListenKind::Stp) => stp(&mut program),
+        IntentKind::Listen(ListenKind::Vrrp { vrid }) => vrrp::vrrp(&mut program, *vrid),
+        IntentKind::Listen(ListenKind::Hsrp { group }) => hsrp::hsrp(&mut program, *group),
+        IntentKind::Listen(ListenKind::Dtp) => switching::dtp(&mut program),
+        IntentKind::Listen(ListenKind::Vtp) => switching::vtp(&mut program),
+        IntentKind::Listen(ListenKind::Mpls) => {
+            mpls::mpls(&mut program, intent.source_mac().bytes());
+        }
+        IntentKind::Listen(ListenKind::Isl) => isl::isl(&mut program),
     }
     program.finish()
+}
+
+fn preamble(program: &mut Program) {
+    // Reject offloaded VLAN frames before reading the visible Ethernet bytes
+    program.emit(LOAD_WORD, VLAN_TAG_PRESENT);
+    program.require(EQUAL, 0);
+    // A raw tag remains outside the selected logical socket's frame scope
+    program.emit(LOAD_HALF, 12);
+    program.branch(EQUAL, 0x8100, Some(Label::Reject), None);
+    program.branch(EQUAL, 0x88a8, Some(Label::Reject), None);
+    // Sending is accounted separately; no outgoing frame enters capture
+    program.emit(LOAD_WORD, PACKET_TYPE);
+    program.branch(EQUAL, PACKET_OUTGOING, Some(Label::Reject), None);
 }
 
 fn ethernet_type(program: &mut Program, value: u32) {

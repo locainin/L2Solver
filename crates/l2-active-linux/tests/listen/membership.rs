@@ -5,7 +5,7 @@ use super::{DISCOVERY_GROUPS, MembershipError, checked_ifindex, join_groups};
 #[test]
 fn joins_exactly_the_four_required_multicast_groups_in_order() -> Result<(), Box<dyn Error>> {
     let mut joined = Vec::new();
-    join_groups(&DISCOVERY_GROUPS, |address| {
+    join_groups(DISCOVERY_GROUPS, |address| {
         joined.push(address);
         Ok(())
     })?;
@@ -26,7 +26,7 @@ fn joins_exactly_the_four_required_multicast_groups_in_order() -> Result<(), Box
 fn partial_membership_failure_names_the_group_and_stops_further_joins() -> Result<(), Box<dyn Error>>
 {
     let mut attempts = 0_usize;
-    let result = join_groups(&DISCOVERY_GROUPS, |_| {
+    let result = join_groups(DISCOVERY_GROUPS, |_| {
         attempts += 1;
         if attempts == 3 {
             Err(io::Error::from(io::ErrorKind::PermissionDenied))

@@ -27,6 +27,10 @@ const DRAIN_BYTE_LIMIT: u64 = 1_048_576;
 const POLL_INTERVAL: Duration = Duration::from_millis(20);
 const FINAL_SCOPE_TIMEOUT: Duration = Duration::from_millis(500);
 
+#[cfg(test)]
+#[path = "../tests/receive/post_read.rs"]
+mod post_read_tests;
+
 // This type is reachable only from the fixed-operation worker
 pub struct DirectLink {
     selector: InterfaceSelector,
@@ -50,6 +54,10 @@ impl DirectLink {
 
     pub const fn request_tag(&self) -> u8 {
         self.intent.tag()
+    }
+
+    pub fn request_profile(&self) -> u16 {
+        self.intent.profile()
     }
 
     pub fn deadline_elapsed(&self) -> bool {
@@ -325,9 +333,10 @@ impl ActiveLink for DirectLink {
                 Ok(frame) => {
                     // A consumed frame must be checked against the operation deadline,
                     // not the shorter idle polling slice
-                    self.revalidate(self.deadline, cancelled)?;
-                    // A delayed read cannot be attributed to an elapsed window
-                    crate::deadline::ensure_before(self.deadline)?;
+                    let validation = self.revalidate(self.deadline, cancelled);
+                    if let Some(status) = post_read_result(validation, self.deadline)? {
+                        return Ok(status);
+                    }
                     return Ok(ReceiveEvent::Frame(frame));
                 }
                 Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
@@ -374,6 +383,20 @@ impl ActiveLink for DirectLink {
             ));
         }
         Ok(Some(events.contains(PollFlags::POLLIN)))
+    }
+}
+
+fn post_read_result(
+    validation: io::Result<()>,
+    deadline: Instant,
+) -> io::Result<Option<ReceiveEvent>> {
+    match validation {
+        Err(error) if error.kind() == io::ErrorKind::TimedOut && Instant::now() >= deadline => {
+            Ok(Some(ReceiveEvent::BackendTimedOut))
+        }
+        Err(error) => Err(error),
+        Ok(()) if Instant::now() >= deadline => Ok(Some(ReceiveEvent::BackendTimedOut)),
+        Ok(()) => Ok(None),
     }
 }
 

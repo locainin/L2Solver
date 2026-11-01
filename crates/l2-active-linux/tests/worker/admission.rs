@@ -5,7 +5,7 @@ use crate::{
 };
 use std::io;
 
-fn prefix(kind: u8) -> io::Result<Writer> {
+fn prefix(kind: u8, profile: u16) -> io::Result<Writer> {
     let selector = InterfaceSelector::new("lo")?;
     let info = discover(&selector)?;
     let mut writer = Writer::new(wire::OPEN);
@@ -16,6 +16,7 @@ fn prefix(kind: u8) -> io::Result<Writer> {
     wire::write_identity(&mut writer, info.identity());
     wire::write_vlan(&mut writer, None);
     writer.bytes(&[2, 0, 0, 0, 0, 1]);
+    writer.u16(profile);
     Ok(writer)
 }
 
@@ -51,6 +52,7 @@ fn open_rejects_a_vlan_snapshot_that_differs_from_the_selected_interface() -> io
         }),
     );
     writer.bytes(&[2, 0, 0, 0, 0, 1]);
+    writer.u16(0);
     writer.u32(1000);
     writer.u32(10);
     writer.u64(4096);
@@ -70,7 +72,7 @@ fn open_rejects_a_vlan_snapshot_that_differs_from_the_selected_interface() -> io
 
 #[test]
 fn zero_dhcp_transaction_is_rejected_before_opening_a_socket() -> io::Result<()> {
-    let mut writer = prefix(2)?;
+    let mut writer = prefix(2, 0)?;
     writer.u32(0);
     assert_eq!(
         open_request(&writer.finish())
@@ -83,7 +85,7 @@ fn zero_dhcp_transaction_is_rejected_before_opening_a_socket() -> io::Result<()>
 
 #[test]
 fn unknown_open_intent_is_rejected_before_opening_a_socket() -> io::Result<()> {
-    let writer = prefix(255)?;
+    let writer = prefix(255, 0)?;
     assert_eq!(
         open_request(&writer.finish())
             .err()
@@ -94,9 +96,9 @@ fn unknown_open_intent_is_rejected_before_opening_a_socket() -> io::Result<()> {
 }
 
 #[test]
-fn worker_rejects_version_eight_before_socket_admission() {
+fn worker_rejects_version_nine_before_socket_admission() {
     let mut writer = Writer::new(wire::OPEN);
-    writer.u8(8);
+    writer.u8(9);
     assert_eq!(
         open_request(&writer.finish())
             .err()
@@ -107,7 +109,7 @@ fn worker_rejects_version_eight_before_socket_admission() {
 
 #[test]
 fn dot1x_worker_rejects_missing_dedicated_interface_acknowledgement() -> io::Result<()> {
-    let mut writer = prefix(6)?;
+    let mut writer = prefix(6, 0)?;
     writer.u8(0);
     assert_eq!(
         open_request(&writer.finish())
@@ -115,5 +117,53 @@ fn dot1x_worker_rejects_missing_dedicated_interface_acknowledgement() -> io::Res
             .map(|error| error.kind()),
         Some(io::ErrorKind::PermissionDenied)
     );
+    Ok(())
+}
+
+#[test]
+fn worker_rejects_invalid_profile_selections_before_opening_a_socket() -> io::Result<()> {
+    for (kind, profile) in [(1, 1), (7, 256), (8, 257)] {
+        let mut writer = prefix(kind, profile)?;
+        if kind == 1 {
+            writer.bytes(&[192, 0, 2, 1, 192, 0, 2, 2]);
+        }
+        writer.u32(1000);
+        writer.u32(10);
+        writer.u64(4096);
+        writer.u64(crate::deadline::encode_deadline(
+            std::time::Instant::now() + std::time::Duration::from_secs(1),
+            std::time::Duration::from_secs(1),
+        )?);
+        assert_eq!(
+            open_request(&writer.finish())
+                .err()
+                .map(|error| error.kind()),
+            Some(io::ErrorKind::InvalidData),
+            "kind {kind} profile {profile}"
+        );
+    }
+    Ok(())
+}
+
+#[test]
+fn worker_parses_the_full_valid_first_hop_selector_range() -> io::Result<()> {
+    for (kind, profile) in [(7, 0), (7, 255), (8, 0), (8, 1), (8, 256)] {
+        let mut writer = prefix(kind, profile)?;
+        writer.u32(1000);
+        writer.u32(10);
+        writer.u64(4096);
+        writer.u64(crate::deadline::encode_deadline(
+            std::time::Instant::now() + std::time::Duration::from_secs(1),
+            std::time::Duration::from_secs(1),
+        )?);
+        // A valid record reaches Ethernet admission, where loopback is rejected
+        assert_eq!(
+            open_request(&writer.finish())
+                .err()
+                .map(|error| error.kind()),
+            Some(io::ErrorKind::Unsupported),
+            "kind {kind} profile {profile}"
+        );
+    }
     Ok(())
 }

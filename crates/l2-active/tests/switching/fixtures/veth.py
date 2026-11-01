@@ -86,6 +86,7 @@ def exercise_command(peer, witness, watch, net_fd, indices, command, parent_net)
         environment["L2_TEST_SWITCHING_INTERFACE"] = ns.SOURCE
         environment["L2_TEST_SWITCHING_FIXTURES"] = str(HERE)
         environment["L2_TEST_SWITCHING_READY"] = str(ready)
+        environment["L2_TEST_SWITCHING_SYNC_DIR"] = sync_dir
         process = subprocess.Popen(
             command, stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=environment
         )

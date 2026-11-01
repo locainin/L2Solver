@@ -102,3 +102,38 @@ with socket.socket(socket.AF_PACKET, socket.SOCK_RAW, socket.htons(3)) as link:
     assert!(String::from_utf8_lossy(&output.stderr).contains("unexpected client transmission"));
     Ok(())
 }
+
+#[test]
+#[ignore = "uses a proved private network namespace and an owned veth pair"]
+fn owned_veth_does_not_echo_untrusted_client_output_on_failure() -> Result<(), Box<dyn Error>> {
+    let client = r"
+import os
+import socket
+import sys
+from pathlib import Path
+fixture = Path(os.environ['L2_TEST_VRRP_FIXTURE'])
+ready = Path(os.environ['L2_TEST_VRRP_SYNC_DIR']) / 'ready'
+expected = (fixture / 'valid.bin').read_bytes()
+with socket.socket(socket.AF_PACKET, socket.SOCK_RAW, socket.htons(3)) as link:
+    link.bind((os.environ['L2_TEST_VRRP_INTERFACE'], 0))
+    link.settimeout(3)
+    ready.write_text('ready')
+    for _ in range(32):
+        if link.recv(65535) == expected:
+            break
+    else:
+        raise RuntimeError('valid advertisement was not received')
+sys.stderr.write('UNTRUSTED-CLIENT-CONTENT')
+sys.exit(1)
+";
+    let fixture =
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/first_hop/vrrp/fixtures/veth.py");
+    let output = Command::new("python3")
+        .arg(fixture)
+        .args(["--", "python3", "-c", client])
+        .output()?;
+    assert!(!output.status.success());
+    assert!(!String::from_utf8_lossy(&output.stderr).contains("UNTRUSTED-CLIENT-CONTENT"));
+    assert!(!String::from_utf8_lossy(&output.stdout).contains("UNTRUSTED-CLIENT-CONTENT"));
+    Ok(())
+}

@@ -90,7 +90,8 @@ impl RunSummary {
 
     /// Return delivered frame count, including unrelated traffic
     ///
-    /// This is a lower bound when a receive call fails after consuming data
+    /// This is a lower bound when a receive fails or a backend deadline
+    /// follows frame consumption without delivery
     #[must_use]
     pub const fn received_packets(&self) -> u32 {
         self.received_packets
@@ -98,7 +99,8 @@ impl RunSummary {
 
     /// Return delivered retained bytes, including unrelated traffic
     ///
-    /// This is a lower bound when a receive call fails after consuming data
+    /// This is a lower bound when a receive fails or a backend deadline
+    /// follows frame consumption without delivery
     #[must_use]
     pub const fn received_bytes(&self) -> u64 {
         self.received_bytes
@@ -111,9 +113,13 @@ impl RunSummary {
     }
 
     /// Return all drained and collected packets, if accounting is complete
+    ///
+    /// Backend deadlines can occur after a consumed frame without delivering it
     #[must_use]
     pub const fn total_received_packets(&self) -> Option<u64> {
-        if matches!(self.transport_error, Some(TransportFailure::Receive(_))) {
+        if matches!(self.stop_reason, StopReason::BackendDeadline)
+            || matches!(self.transport_error, Some(TransportFailure::Receive(_)))
+        {
             return None;
         }
         match self.pre_send_usage {
@@ -125,9 +131,13 @@ impl RunSummary {
     }
 
     /// Return all retained drained and collected bytes, if accounting is complete
+    ///
+    /// Backend deadlines can occur after a consumed frame without delivering it
     #[must_use]
     pub const fn total_received_bytes(&self) -> Option<u64> {
-        if matches!(self.transport_error, Some(TransportFailure::Receive(_))) {
+        if matches!(self.stop_reason, StopReason::BackendDeadline)
+            || matches!(self.transport_error, Some(TransportFailure::Receive(_)))
+        {
             return None;
         }
         match self.pre_send_usage {

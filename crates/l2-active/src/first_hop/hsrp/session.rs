@@ -37,6 +37,9 @@ impl HsrpMonitor {
 
     /// Collect scoped messages without sending a packet
     ///
+    /// A link with a fixed capture filter must admit this monitor's selected
+    /// group. Reuse the same monitor supplied when opening such a link
+    ///
     /// # Errors
     /// Returns an allocation or deadline error before collection begins
     pub fn run(
@@ -51,6 +54,9 @@ impl HsrpMonitor {
     }
 
     /// Collect under an absolute deadline shared with backend setup
+    ///
+    /// A link with a fixed capture filter must admit this monitor's selected
+    /// group. Reuse the same monitor supplied when opening such a link
     ///
     /// # Errors
     /// Returns an allocation or deadline error before collection begins

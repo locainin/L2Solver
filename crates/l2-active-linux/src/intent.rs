@@ -16,7 +16,7 @@ use l2_onpath::MacAddress;
 use std::{
     io,
     net::{Ipv4Addr, Ipv6Addr},
-    num::NonZeroU32,
+    num::{NonZeroU8, NonZeroU32},
 };
 
 /// The fixed groups admitted for each receive-only operation
@@ -24,6 +24,12 @@ use std::{
 pub enum ListenKind {
     Discovery,
     Stp,
+    Vrrp { vrid: Option<NonZeroU8> },
+    Hsrp { group: Option<u8> },
+    Dtp,
+    Vtp,
+    Mpls,
+    Isl,
 }
 
 /// Only these typed operations can be reconstructed by the worker
@@ -131,6 +137,24 @@ impl Intent {
             IntentKind::Listen(ListenKind::Discovery) => 4,
             IntentKind::Listen(ListenKind::Stp) => 5,
             IntentKind::Dot1x => 6,
+            IntentKind::Listen(ListenKind::Vrrp { .. }) => 7,
+            IntentKind::Listen(ListenKind::Hsrp { .. }) => 8,
+            IntentKind::Listen(ListenKind::Dtp) => 9,
+            IntentKind::Listen(ListenKind::Vtp) => 10,
+            IntentKind::Listen(ListenKind::Mpls) => 11,
+            IntentKind::Listen(ListenKind::Isl) => 12,
+        }
+    }
+
+    pub fn profile(&self) -> u16 {
+        match self.kind {
+            IntentKind::Listen(ListenKind::Vrrp { vrid }) => {
+                vrid.map_or(0, |value| u16::from(value.get()))
+            }
+            IntentKind::Listen(ListenKind::Hsrp { group }) => {
+                group.map_or(0, |value| u16::from(value) + 1)
+            }
+            _ => 0,
         }
     }
     pub const fn limits(&self) -> Limits {
@@ -147,8 +171,10 @@ impl Intent {
             validate_ethernet(info, self.source_mac, &self.frame)?;
         }
         // Listening and EAPOL group replies both require multicast reception
-        let needs_multicast =
-            self.listen_kind().is_some() || matches!(self.kind, IntentKind::Dot1x);
+        let needs_multicast = self
+            .listen_kind()
+            .is_some_and(|kind| kind != ListenKind::Mpls)
+            || matches!(self.kind, IntentKind::Dot1x);
         if needs_multicast && info.flags() & 0x1000 == 0 {
             return Err(io::Error::new(
                 io::ErrorKind::Unsupported,

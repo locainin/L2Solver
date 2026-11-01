@@ -86,6 +86,44 @@ fn tagged_and_non_cisco_snap_frames_are_outside_the_selected_profile() -> Result
 }
 
 #[test]
+fn malformed_envelopes_require_the_selected_destination_length_and_snap()
+-> Result<(), Box<dyn Error>> {
+    let mut malformed = fixture::DTP.to_vec();
+    malformed
+        .get_mut(12..14)
+        .ok_or("missing declared length")?
+        .copy_from_slice(&1500_u16.to_be_bytes());
+    let wrong_destination = fixture::change(&malformed, 5, 0xcd)?;
+    let mut reserved_length = malformed.clone();
+    reserved_length
+        .get_mut(12..14)
+        .ok_or("missing declared length")?
+        .copy_from_slice(&1501_u16.to_be_bytes());
+    let wrong_protocol = fixture::change(&malformed, 21, 5)?;
+    let events = [
+        &malformed,
+        &wrong_destination,
+        &reserved_length,
+        &wrong_protocol,
+    ]
+    .into_iter()
+    .map(|frame| fixture::event(frame))
+    .collect::<Result<Vec<_>, _>>()?;
+    let mut link = Link::new(events, Some(0))?;
+    let report =
+        DtpMonitor::new(fixture::limits(8, 4096)?).run(&mut link, &AtomicBool::new(false))?;
+    assert_eq!(report.unmatched_packets(), 3);
+    assert_eq!(report.observations().len(), 1);
+    assert!(matches!(
+        report.observations().first().map(|item| item.evidence()),
+        Some(l2_active::switching::dtp::DtpEvidence::Malformed(
+            l2_active::switching::dtp::DtpMalformed::Ethernet
+        ))
+    ));
+    Ok(())
+}
+
+#[test]
 fn observation_limit_stops_before_retaining_unbounded_evidence() -> Result<(), Box<dyn Error>> {
     let events = (0..65)
         .map(|_| fixture::event(fixture::SUMMARY))

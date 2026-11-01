@@ -19,7 +19,7 @@ use nix::{
 use std::{
     io,
     net::{Ipv4Addr, Ipv6Addr},
-    num::NonZeroU32,
+    num::{NonZeroU8, NonZeroU32},
     os::fd::{AsFd, OwnedFd},
     sync::{
         Arc,
@@ -102,8 +102,9 @@ pub fn run_helper() -> io::Result<()> {
         return Err(error);
     }
     let frame = link.request_frame();
-    let mut opened = Writer::with_capacity(wire::OK, frame.len() + 4)?;
+    let mut opened = Writer::with_capacity(wire::OK, frame.len() + 6)?;
     opened.u8(link.request_tag());
+    opened.u16(link.request_profile());
     opened.u16(u16::try_from(frame.len()).map_err(io::Error::other)?);
     opened.bytes(frame);
     channel.send(&opened.finish(), startup_deadline)?;
@@ -145,7 +146,39 @@ fn open_request(bytes: &[u8]) -> io::Result<(DirectLink, Instant)> {
             .map_err(|_| wire::invalid_record())?,
     )
     .map_err(invalid_input)?;
-    let kind = match kind {
+    let profile = reader.u16()?;
+    let kind = read_open_kind(&mut reader, kind, profile)?;
+    let limits = Limits::new(
+        Duration::from_millis(u64::from(reader.u32()?)),
+        reader.u32()?,
+        reader.u64()?,
+    )
+    .map_err(invalid_input)?;
+    let requested = crate::deadline::decode_deadline(reader.u64()?)?;
+    reader.finish()?;
+    let intent = match kind {
+        OpenKind::Arp(source, target) => {
+            Intent::arp(&ArpProbe::new(mac, source, target, None, limits).map_err(invalid_input)?)?
+        }
+        OpenKind::Dhcp(transaction) => {
+            Intent::dhcp(&DhcpProbe::new(mac, transaction, None, limits).map_err(invalid_input)?)?
+        }
+        OpenKind::Ndp(source, prefix_len, target) => Intent::ndp(
+            &NdpProbe::new(mac, source, prefix_len, target, None, limits).map_err(invalid_input)?,
+        )?,
+        OpenKind::Listen(kind) => Intent::listen(mac, limits, kind),
+        OpenKind::Dot1x => Intent::dot1x(&Dot1xProbe::new(mac, limits).map_err(invalid_input)?)?,
+    };
+    let deadline = requested.min(Instant::now() + limits.timeout());
+    let link = DirectLink::open(&selector, identity, vlan, intent, deadline)?;
+    Ok((link, deadline))
+}
+
+fn read_open_kind(reader: &mut Reader<'_>, kind: u8, profile: u16) -> io::Result<OpenKind> {
+    if !matches!(kind, 7 | 8) && profile != 0 {
+        return Err(wire::invalid_record());
+    }
+    Ok(match kind {
         1 => {
             let source = Ipv4Addr::from(
                 <[u8; 4]>::try_from(reader.take(4)?).map_err(|_| wire::invalid_record())?,
@@ -178,32 +211,22 @@ fn open_request(bytes: &[u8]) -> io::Result<(DirectLink, Instant)> {
             }
             _ => return Err(wire::invalid_record()),
         },
+        7 => OpenKind::Listen(ListenKind::Vrrp {
+            vrid: NonZeroU8::new(u8::try_from(profile).map_err(|_| wire::invalid_record())?),
+        }),
+        8 => OpenKind::Listen(ListenKind::Hsrp {
+            group: if profile == 0 {
+                None
+            } else {
+                Some(u8::try_from(profile - 1).map_err(|_| wire::invalid_record())?)
+            },
+        }),
+        9 => OpenKind::Listen(ListenKind::Dtp),
+        10 => OpenKind::Listen(ListenKind::Vtp),
+        11 => OpenKind::Listen(ListenKind::Mpls),
+        12 => OpenKind::Listen(ListenKind::Isl),
         _ => return Err(wire::invalid_record()),
-    };
-    let limits = Limits::new(
-        Duration::from_millis(u64::from(reader.u32()?)),
-        reader.u32()?,
-        reader.u64()?,
-    )
-    .map_err(invalid_input)?;
-    let requested = crate::deadline::decode_deadline(reader.u64()?)?;
-    reader.finish()?;
-    let intent = match kind {
-        OpenKind::Arp(source, target) => {
-            Intent::arp(&ArpProbe::new(mac, source, target, None, limits).map_err(invalid_input)?)?
-        }
-        OpenKind::Dhcp(transaction) => {
-            Intent::dhcp(&DhcpProbe::new(mac, transaction, None, limits).map_err(invalid_input)?)?
-        }
-        OpenKind::Ndp(source, prefix_len, target) => Intent::ndp(
-            &NdpProbe::new(mac, source, prefix_len, target, None, limits).map_err(invalid_input)?,
-        )?,
-        OpenKind::Listen(kind) => Intent::listen(mac, limits, kind),
-        OpenKind::Dot1x => Intent::dot1x(&Dot1xProbe::new(mac, limits).map_err(invalid_input)?)?,
-    };
-    let deadline = requested.min(Instant::now() + limits.timeout());
-    let link = DirectLink::open(&selector, identity, vlan, intent, deadline)?;
-    Ok((link, deadline))
+    })
 }
 
 fn operation(

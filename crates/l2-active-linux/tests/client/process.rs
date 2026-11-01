@@ -44,12 +44,13 @@ fn deadline_expiring_while_preparing_receive_is_a_timeout_event() -> io::Result<
 fn helper_open_requires_exact_reconstructed_frame_bytes() -> io::Result<()> {
     let mut writer = wire::Writer::new(wire::OK);
     writer.u8(1);
+    writer.u16(0);
     writer.u16(3);
     writer.bytes(&[1, 2, 3]);
     let record = writer.finish();
-    expect_open(&record, 1, &[1, 2, 3])?;
+    expect_open(&record, 1, 0, &[1, 2, 3])?;
     assert_eq!(
-        expect_open(&record, 1, &[1, 2, 4])
+        expect_open(&record, 1, 0, &[1, 2, 4])
             .err()
             .map(|error| error.kind()),
         Some(io::ErrorKind::InvalidData)
@@ -62,12 +63,53 @@ fn helper_open_rejects_a_different_empty_frame_listen_profile() -> io::Result<()
     let mut writer = wire::Writer::new(wire::OK);
     writer.u8(4);
     writer.u16(0);
+    writer.u16(0);
     let record = writer.finish();
-    expect_open(&record, 4, &[])?;
+    expect_open(&record, 4, 0, &[])?;
     assert_eq!(
-        expect_open(&record, 5, &[]).err().map(|error| error.kind()),
+        expect_open(&record, 5, 0, &[])
+            .err()
+            .map(|error| error.kind()),
         Some(io::ErrorKind::InvalidData)
     );
+    Ok(())
+}
+
+#[test]
+fn helper_open_rejects_a_different_listener_selection() -> io::Result<()> {
+    for (kind, profile, different) in [(7, 42, 43), (8, 0, 1), (8, 1, 0), (8, 256, 0)] {
+        let mut writer = wire::Writer::new(wire::OK);
+        writer.u8(kind);
+        writer.u16(profile);
+        writer.u16(0);
+        let record = writer.finish();
+        expect_open(&record, kind, profile, &[])?;
+        assert_eq!(
+            expect_open(&record, kind, different, &[])
+                .err()
+                .map(|error| error.kind()),
+            Some(io::ErrorKind::InvalidData)
+        );
+        assert_eq!(
+            expect_open(&record, if kind == 7 { 8 } else { 7 }, profile, &[])
+                .err()
+                .map(|error| error.kind()),
+            Some(io::ErrorKind::InvalidData)
+        );
+    }
+    Ok(())
+}
+
+#[test]
+fn hsrp_open_distinguishes_all_groups_from_group_zero_and_group_255()
+-> Result<(), Box<dyn std::error::Error>> {
+    let mac = MacAddress::new([2, 0, 0, 0, 0, 1])?;
+    let limits = Limits::new(Duration::from_secs(1), 1, 60)?;
+    for (group, expected) in [(None, 0), (Some(0), 1), (Some(255), 256)] {
+        let intent =
+            crate::intent::Intent::listen(mac, limits, crate::intent::ListenKind::Hsrp { group });
+        assert_eq!(intent.profile(), expected);
+    }
     Ok(())
 }
 

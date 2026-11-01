@@ -12,12 +12,15 @@ mod tests;
 
 const STP_GROUP: [u8; 6] = [1, 0x80, 0xc2, 0, 0, 0];
 const PAE_GROUP: [u8; 6] = [1, 0x80, 0xc2, 0, 0, 3];
-const DISCOVERY_GROUPS: [[u8; 6]; 4] = [
-    [1, 0x80, 0xc2, 0, 0, 14],
-    PAE_GROUP,
-    STP_GROUP,
-    [1, 0, 0x0c, 0xcc, 0xcc, 0xcc],
-];
+const VRRP_GROUP: [u8; 6] = [1, 0, 0x5e, 0, 0, 0x12];
+const HSRP_GROUP: [u8; 6] = [1, 0, 0x5e, 0, 0, 2];
+const CISCO_GROUP: [u8; 6] = [1, 0, 0x0c, 0xcc, 0xcc, 0xcc];
+const DISCOVERY_GROUPS: [[u8; 6]; 4] =
+    [[1, 0x80, 0xc2, 0, 0, 14], PAE_GROUP, STP_GROUP, CISCO_GROUP];
+
+fn isl_groups() -> impl Iterator<Item = [u8; 6]> {
+    (0_u8..16).flat_map(|user| [[1, 0, 0x0c, 0, 0, user], [3, 0, 0x0c, 0, 0, user]])
+}
 
 // The nix wrapper passes a fully initialized packet_mreq to Linux setsockopt
 nix::sockopt_impl!(
@@ -67,23 +70,43 @@ impl std::error::Error for MembershipError {
 
 /// Join the fixed groups on the verified socket, closing it on any failure
 pub(super) fn join_discovery(socket: L2Socket, ifindex: u32) -> Result<L2Socket, MembershipError> {
-    join_fixed(socket, ifindex, &DISCOVERY_GROUPS)
+    join_fixed(socket, ifindex, DISCOVERY_GROUPS)
 }
 
 /// Join only the fixed STP group, closing the socket on any failure
 pub(super) fn join_stp(socket: L2Socket, ifindex: u32) -> Result<L2Socket, MembershipError> {
-    join_fixed(socket, ifindex, std::slice::from_ref(&STP_GROUP))
+    join_fixed(socket, ifindex, [STP_GROUP])
 }
 
 /// Join only the fixed PAE group, closing the socket on any failure
 pub(super) fn join_pae(socket: L2Socket, ifindex: u32) -> Result<L2Socket, MembershipError> {
-    join_fixed(socket, ifindex, std::slice::from_ref(&PAE_GROUP))
+    join_fixed(socket, ifindex, [PAE_GROUP])
+}
+
+/// Join only the VRRP multicast group
+pub(super) fn join_vrrp(socket: L2Socket, ifindex: u32) -> Result<L2Socket, MembershipError> {
+    join_fixed(socket, ifindex, [VRRP_GROUP])
+}
+
+/// Join only the `HSRPv1` multicast group
+pub(super) fn join_hsrp(socket: L2Socket, ifindex: u32) -> Result<L2Socket, MembershipError> {
+    join_fixed(socket, ifindex, [HSRP_GROUP])
+}
+
+/// Join only the Cisco DTP and VTP multicast group
+pub(super) fn join_cisco(socket: L2Socket, ifindex: u32) -> Result<L2Socket, MembershipError> {
+    join_fixed(socket, ifindex, [CISCO_GROUP])
+}
+
+/// Join the fixed Ethernet ISL multicast destinations
+pub(super) fn join_isl(socket: L2Socket, ifindex: u32) -> Result<L2Socket, MembershipError> {
+    join_fixed(socket, ifindex, isl_groups())
 }
 
 fn join_fixed(
     socket: L2Socket,
     ifindex: u32,
-    groups: &[[u8; 6]],
+    groups: impl IntoIterator<Item = [u8; 6]>,
 ) -> Result<L2Socket, MembershipError> {
     let index = verify_binding(&socket, ifindex).map_err(MembershipError::Binding)?;
     let multicast = u16::try_from(libc::PACKET_MR_MULTICAST)
@@ -126,10 +149,10 @@ fn checked_ifindex(ifindex: u32) -> io::Result<i32> {
 }
 
 fn join_groups(
-    groups: &[[u8; 6]],
+    groups: impl IntoIterator<Item = [u8; 6]>,
     mut join: impl FnMut([u8; 6]) -> io::Result<()>,
 ) -> Result<(), MembershipError> {
-    for (joined, address) in groups.iter().copied().enumerate() {
+    for (joined, address) in groups.into_iter().enumerate() {
         if let Err(source) = join(address) {
             return Err(MembershipError::Join {
                 joined,

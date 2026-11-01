@@ -82,11 +82,10 @@ def exercise_command(
             wait_for_ready(process, Path(sync_dir) / "ready", deadline)
             inject(peer, witness, net_fd, indices, deadline, fixture_dir, names)
             verify_no_client_send(watch, process, deadline)
-            stdout, stderr = process.communicate(timeout=2)
+            process.communicate(timeout=2)
             if process.returncode != 0:
-                raise RuntimeError(
-                    f"receive-only command failed: exit={process.returncode}, stdout={stdout.decode(errors='replace')}, stderr={stderr.decode(errors='replace')}"
-                )
+                # Client output can contain captured packet data
+                raise RuntimeError(f"receive-only command failed: exit={process.returncode}")
         finally:
             if process.poll() is None:
                 # Failed clients are reaped before the owned pair is removed
@@ -94,7 +93,7 @@ def exercise_command(
                 process.communicate(timeout=2)
 
 
-def exercise(net_fd, indices, command, parent_net, fixture_dir, prefix, names):
+def exercise(net_fd, indices, command, parent_net, fixture_dir, prefix, names, self_test_name):
     owned.require_owned_scope(net_fd, indices)
     with (
         socket.socket(socket.AF_PACKET, socket.SOCK_RAW, socket.htons(3)) as peer,
@@ -108,7 +107,7 @@ def exercise(net_fd, indices, command, parent_net, fixture_dir, prefix, names):
         watch.settimeout(0.05)
         if not command:
             inject(
-                peer, witness, net_fd, indices, time.monotonic() + 3, fixture_dir, ("valid.bin",)
+                peer, witness, net_fd, indices, time.monotonic() + 3, fixture_dir, (self_test_name,)
             )
             for _ in range(64):
                 if not read_peer_watch(watch):
@@ -119,11 +118,13 @@ def exercise(net_fd, indices, command, parent_net, fixture_dir, prefix, names):
         )
 
 
-def main(entry, fixture_dir, prefix, names, success):
+def main(entry, fixture_dir, prefix, names, success, self_test_name="valid.bin"):
     if len(sys.argv) >= 6 and sys.argv[1] == "--child":
 
         def run_child(net_fd, indices, command, parent_net):
-            exercise(net_fd, indices, command, parent_net, fixture_dir, prefix, names)
+            exercise(
+                net_fd, indices, command, parent_net, fixture_dir, prefix, names, self_test_name
+            )
 
         owned.child(
             [int(value) for value in sys.argv[2:5]],

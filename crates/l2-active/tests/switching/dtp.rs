@@ -64,6 +64,50 @@ fn dtp_rejects_short_duplicate_and_overlong_known_tlvs() -> Result<(), Box<dyn E
 }
 
 #[test]
+fn dtp_domain_boundaries_and_duplicate_domain_or_trunk_fields_are_checked()
+-> Result<(), Box<dyn Error>> {
+    fn domain(length: usize) -> Result<Vec<u8>, Box<dyn Error>> {
+        let mut payload = vec![1, 0, 1];
+        payload.extend_from_slice(&u16::try_from(length + 4)?.to_be_bytes());
+        payload.resize(payload.len() + length, b'A');
+        fixture::frame(0x2004, &payload)
+    }
+    let duplicate_domain = fixture::frame(0x2004, &[1, 0, 1, 0, 5, b'A', 0, 1, 0, 5, b'B'])?;
+    let duplicate_trunk = fixture::frame(0x2004, &[1, 0, 3, 0, 5, 1, 0, 3, 0, 5, 2])?;
+    let frames = [
+        domain(1)?,
+        domain(33)?,
+        domain(0)?,
+        domain(34)?,
+        duplicate_domain,
+        duplicate_trunk,
+    ];
+    let events = frames
+        .iter()
+        .map(|frame| fixture::event(frame))
+        .collect::<Result<Vec<_>, _>>()?;
+    let mut link = Link::new(events, Some(0))?;
+    let report =
+        DtpMonitor::new(fixture::limits(8, 4096)?).run(&mut link, &AtomicBool::new(false))?;
+    assert_eq!(report.observations().len(), frames.len());
+    for (index, expected_length) in [(0, 1), (1, 33)] {
+        let Some(DtpEvidence::Advertisement(claim)) = report
+            .observations()
+            .get(index)
+            .map(DtpObservation::evidence)
+        else {
+            return Err("valid DTP domain was rejected".into());
+        };
+        assert_eq!(claim.domain().map(<[u8]>::len), Some(expected_length));
+    }
+    assert!(report.observations().iter().skip(2).all(|item| matches!(
+        item.evidence(),
+        DtpEvidence::Malformed(l2_active::switching::dtp::DtpMalformed::Protocol)
+    )));
+    Ok(())
+}
+
+#[test]
 fn dtp_unsupported_versions_and_tlv_limits_are_not_valid_claims() -> Result<(), Box<dyn Error>> {
     let unsupported = fixture::frame(0x2004, &[2, 0, 2, 0, 5, 3])?;
     let mut payload = vec![1];

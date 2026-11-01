@@ -16,6 +16,10 @@ use crate::{
 #[path = "../tests/session/listen.rs"]
 mod listen_tests;
 
+#[cfg(test)]
+#[path = "../tests/session/post_read.rs"]
+mod post_read_tests;
+
 pub fn run_single_until(
     link: &mut impl ActiveLink,
     frame: &[u8],
@@ -210,7 +214,17 @@ fn collect(
                 break;
             }
             Err(error) => {
-                summary.stop_reason = StopReason::TransportError;
+                summary.stop_reason = if error.kind() == std::io::ErrorKind::Interrupted
+                    && cancelled.load(Ordering::Acquire)
+                {
+                    StopReason::Cancelled
+                } else if error.kind() == std::io::ErrorKind::TimedOut && Instant::now() >= deadline
+                {
+                    StopReason::Deadline
+                } else {
+                    StopReason::TransportError
+                };
+                // A consumed frame may not have reached the caller before the error
                 summary.transport_error = Some(TransportFailure::Receive(error));
                 break;
             }

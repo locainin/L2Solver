@@ -11,6 +11,11 @@ pub fn join(socket: L2Socket, ifindex: u32, kind: ListenKind) -> io::Result<L2So
     let joined = match kind {
         ListenKind::Discovery => membership::join_discovery(socket, ifindex),
         ListenKind::Stp => membership::join_stp(socket, ifindex),
+        ListenKind::Vrrp { .. } => membership::join_vrrp(socket, ifindex),
+        ListenKind::Hsrp { .. } => membership::join_hsrp(socket, ifindex),
+        ListenKind::Dtp | ListenKind::Vtp => membership::join_cisco(socket, ifindex),
+        ListenKind::Isl => membership::join_isl(socket, ifindex),
+        ListenKind::Mpls => Ok(socket),
     };
     joined.map_err(membership_error)
 }

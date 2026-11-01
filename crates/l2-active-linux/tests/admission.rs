@@ -12,6 +12,28 @@ use std::{
 };
 
 #[test]
+fn mpls_rejects_a_nonlocal_destination_before_launching_the_helper()
+-> Result<(), Box<dyn std::error::Error>> {
+    let selector = InterfaceSelector::new("lo")?;
+    let info = discover(&selector)?;
+    let limits = Limits::new(Duration::from_secs(1), 1, 60)?;
+    let monitor = l2_active::mpls::MplsMonitor::new([2, 0, 0, 0, 0, 1], None, limits)?;
+    let result = HelperLink::open_mpls(
+        Path::new("/proc/self/fd/no-such-active-helper"),
+        &selector,
+        &info,
+        &monitor,
+        Instant::now() + limits.timeout(),
+        &AtomicBool::new(false),
+    );
+    assert_eq!(
+        result.err().map(|error| error.kind()),
+        Some(io::ErrorKind::InvalidInput)
+    );
+    Ok(())
+}
+
+#[test]
 fn loopback_cannot_be_admitted_for_an_ethernet_arp_probe() -> io::Result<()> {
     let info = discover(&InterfaceSelector::new("lo")?)?;
     let result = select_arp_source(

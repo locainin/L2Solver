@@ -6,8 +6,13 @@ use crate::{
     wire::{self, Reader, Writer},
 };
 use l2_active::{
-    ActiveLink, ArpProbe, Limits, NdpProbe, PreSendUsage, ReceiveEvent, dhcp::DhcpProbe,
+    ActiveLink, ArpProbe, Limits, NdpProbe, PreSendUsage, ReceiveEvent,
+    dhcp::DhcpProbe,
     dot1x::Dot1xProbe,
+    first_hop::{hsrp::HsrpMonitor, vrrp::VrrpMonitor},
+    isl::IslMonitor,
+    mpls::MplsMonitor,
+    switching::{dtp::DtpMonitor, vtp::VtpMonitor},
 };
 use l2_capture::{
     CaptureMetadata, CapturedFrame, Direction, FcsStatus, InterfaceId, LinuxInterfaceIdentity,
@@ -214,6 +219,166 @@ impl HelperLink {
         )
     }
 
+    /// Launch a receive-only helper for IPv4 `VRRPv3` advertisements
+    ///
+    /// Use the same monitor selection when collecting through this link
+    ///
+    /// # Errors
+    /// Returns launch, admission, multicast membership, or capability errors
+    pub fn open_vrrp(
+        executable: &Path,
+        selector: &InterfaceSelector,
+        expected: &InterfaceInfo,
+        monitor: &VrrpMonitor,
+        requested_deadline: Instant,
+        cancelled: &AtomicBool,
+    ) -> io::Result<Self> {
+        Self::open_listen(
+            executable,
+            selector,
+            expected,
+            monitor.limits(),
+            requested_deadline,
+            cancelled,
+            ListenKind::Vrrp {
+                vrid: monitor.vrid(),
+            },
+        )
+    }
+
+    /// Launch a receive-only helper for IPv4 `HSRPv1` messages
+    ///
+    /// Use the same monitor selection when collecting through this link
+    ///
+    /// # Errors
+    /// Returns launch, admission, multicast membership, or capability errors
+    pub fn open_hsrp(
+        executable: &Path,
+        selector: &InterfaceSelector,
+        expected: &InterfaceInfo,
+        monitor: &HsrpMonitor,
+        requested_deadline: Instant,
+        cancelled: &AtomicBool,
+    ) -> io::Result<Self> {
+        Self::open_listen(
+            executable,
+            selector,
+            expected,
+            monitor.limits(),
+            requested_deadline,
+            cancelled,
+            ListenKind::Hsrp {
+                group: monitor.group(),
+            },
+        )
+    }
+
+    /// Launch a receive-only helper for the Cisco DTP multicast profile
+    ///
+    /// Use the same monitor for collection through this link
+    ///
+    /// # Errors
+    /// Returns launch, admission, multicast membership, or capability errors
+    pub fn open_dtp(
+        executable: &Path,
+        selector: &InterfaceSelector,
+        expected: &InterfaceInfo,
+        monitor: &DtpMonitor,
+        requested_deadline: Instant,
+        cancelled: &AtomicBool,
+    ) -> io::Result<Self> {
+        Self::open_listen(
+            executable,
+            selector,
+            expected,
+            monitor.limits(),
+            requested_deadline,
+            cancelled,
+            ListenKind::Dtp,
+        )
+    }
+
+    /// Launch a receive-only helper for the Cisco VTP multicast profile
+    ///
+    /// Use the same monitor for collection through this link
+    ///
+    /// # Errors
+    /// Returns launch, admission, multicast membership, or capability errors
+    pub fn open_vtp(
+        executable: &Path,
+        selector: &InterfaceSelector,
+        expected: &InterfaceInfo,
+        monitor: &VtpMonitor,
+        requested_deadline: Instant,
+        cancelled: &AtomicBool,
+    ) -> io::Result<Self> {
+        Self::open_listen(
+            executable,
+            selector,
+            expected,
+            monitor.limits(),
+            requested_deadline,
+            cancelled,
+            ListenKind::Vtp,
+        )
+    }
+
+    /// Launch a receive-only helper for MPLS frames addressed to the local MAC
+    ///
+    /// Use the same monitor selection when collecting through this link
+    ///
+    /// # Errors
+    /// Returns an error for a nonlocal destination, or on launch or admission
+    pub fn open_mpls(
+        executable: &Path,
+        selector: &InterfaceSelector,
+        expected: &InterfaceInfo,
+        monitor: &MplsMonitor,
+        requested_deadline: Instant,
+        cancelled: &AtomicBool,
+    ) -> io::Result<Self> {
+        if monitor.destination().bytes() != expected.mac() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "MPLS destination does not match the selected interface",
+            ));
+        }
+        Self::open_intent(
+            executable,
+            selector,
+            expected,
+            Intent::listen(monitor.destination(), monitor.limits(), ListenKind::Mpls),
+            requested_deadline,
+            cancelled,
+        )
+    }
+
+    /// Launch a receive-only helper for Ethernet-media Cisco ISL frames
+    ///
+    /// Only the fixed Ethernet media multicast addresses are joined
+    /// Use the same monitor for collection through this link
+    ///
+    /// # Errors
+    /// Returns launch, admission, multicast membership, or capability errors
+    pub fn open_isl(
+        executable: &Path,
+        selector: &InterfaceSelector,
+        expected: &InterfaceInfo,
+        monitor: &IslMonitor,
+        requested_deadline: Instant,
+        cancelled: &AtomicBool,
+    ) -> io::Result<Self> {
+        Self::open_listen(
+            executable,
+            selector,
+            expected,
+            monitor.limits(),
+            requested_deadline,
+            cancelled,
+            ListenKind::Isl,
+        )
+    }
+
     fn open_listen(
         executable: &Path,
         selector: &InterfaceSelector,
@@ -286,7 +451,12 @@ impl HelperLink {
         let request = open_record(selector, expected, &link.intent, encoded_deadline)?;
         let startup_deadline = admitted_deadline.min(Instant::now() + STARTUP_TIMEOUT);
         let response = link.exchange(&request, startup_deadline, Some(cancelled))?;
-        expect_open(&response, link.intent.tag(), link.intent.frame())?;
+        expect_open(
+            &response,
+            link.intent.tag(),
+            link.intent.profile(),
+            link.intent.frame(),
+        )?;
         if cancelled.load(Ordering::Acquire) {
             link.cancel();
             return Err(io::Error::new(
@@ -595,6 +765,7 @@ fn open_record(
     wire::write_identity(&mut writer, expected.identity());
     wire::write_vlan(&mut writer, expected.vlan());
     writer.bytes(&intent.source_mac().bytes());
+    writer.u16(intent.profile());
     match intent.kind() {
         IntentKind::Arp { source, target } => {
             writer.bytes(&source.octets());
@@ -629,7 +800,12 @@ fn expect_ok(record: &[u8]) -> io::Result<()> {
     }
 }
 
-fn expect_open(record: &[u8], expected_tag: u8, expected: &[u8]) -> io::Result<()> {
+fn expect_open(
+    record: &[u8],
+    expected_tag: u8,
+    expected_profile: u16,
+    expected: &[u8],
+) -> io::Result<()> {
     let mut reader = Reader::new(record);
     match reader.u8()? {
         wire::OK => {
@@ -637,6 +813,12 @@ fn expect_open(record: &[u8], expected_tag: u8, expected: &[u8]) -> io::Result<(
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidData,
                     "helper admitted a different operation",
+                ));
+            }
+            if reader.u16()? != expected_profile {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "helper admitted a different listener selection",
                 ));
             }
             let length = usize::from(reader.u16()?);
