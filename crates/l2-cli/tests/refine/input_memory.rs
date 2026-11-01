@@ -9,6 +9,95 @@ use l2_workbench::{
 };
 
 #[test]
+fn loaded_source_records_and_digests_remain_admitted_until_dropped() -> Result<(), Box<dyn Error>> {
+    let file = tempfile::NamedTempFile::new()?;
+    let original = b"source identity";
+    std::fs::write(file.path(), original)?;
+    let input = crate::refine::prepare_input_set(file.path())?;
+    let memory = MemoryBudget::new(1024 * 1024);
+    let sources = super::read_sources(
+        &input,
+        1024,
+        1024,
+        &l2_workbench::job::Job::new("source"),
+        &memory,
+    )?;
+    let source = sources.first().ok_or("source missing")?;
+    assert_eq!(source.bytes(), Some(original.as_slice()));
+    assert_eq!(
+        source.digest(),
+        Some(l2_workbench::sha256(original).as_str())
+    );
+    assert!(
+        memory.snapshot()?.used(MemoryClass::Base)
+            >= u64::try_from(
+                original.len()
+                    + 64
+                    + source.label.capacity()
+                    + std::mem::size_of::<super::LoadedSource>(),
+            )?
+    );
+    drop(sources);
+    assert_eq!(memory.snapshot()?.used_bytes, 0);
+    Ok(())
+}
+
+#[test]
+fn loaded_source_metadata_is_admitted_before_creating_records() -> Result<(), Box<dyn Error>> {
+    let file = tempfile::NamedTempFile::new()?;
+    std::fs::write(file.path(), b"source")?;
+    let input = crate::refine::prepare_input_set(file.path())?;
+    let memory = MemoryBudget::new(1);
+    let error = super::read_sources(
+        &input,
+        1024,
+        1024,
+        &l2_workbench::job::Job::new("source"),
+        &memory,
+    )
+    .err()
+    .ok_or("source metadata bypassed admission")?;
+    assert!(matches!(
+        crate::memory_error::find(error.as_ref()),
+        Some(MemoryError::Limit { .. })
+    ));
+    assert_eq!(memory.snapshot()?.used_bytes, 0);
+    assert_eq!(std::fs::read(file.path())?, b"source");
+    Ok(())
+}
+
+#[test]
+fn source_fingerprint_metadata_is_admitted_and_released_with_its_owner()
+-> Result<(), Box<dyn Error>> {
+    let file = tempfile::NamedTempFile::new()?;
+    std::fs::write(file.path(), b"fingerprint source")?;
+    let memory = MemoryBudget::new(1024 * 1024);
+    let job = l2_workbench::job::Job::new("fingerprint");
+    let input = super::prepare_input_set_with_limit(file.path(), u64::MAX, &job, &memory)?;
+    let baseline = memory.snapshot()?.used_bytes;
+    let blocker = memory.try_reserve(
+        MemoryClass::Cache,
+        memory.snapshot()?.limit_bytes - baseline,
+    )?;
+    let error = super::fingerprint_sources(&input, 1024, 1024, &job)
+        .err()
+        .ok_or("fingerprint bypassed shared admission")?;
+    assert!(matches!(
+        crate::memory_error::find(error.as_ref()),
+        Some(MemoryError::Limit { .. })
+    ));
+    assert_eq!(memory.snapshot()?.used_bytes, baseline + blocker.bytes());
+    drop(blocker);
+    let sampled = super::fingerprint_sources(&input, 1024, 1024, &job)?;
+    assert!(memory.snapshot()?.used_bytes > baseline);
+    drop(sampled);
+    assert_eq!(memory.snapshot()?.used_bytes, baseline);
+    drop(input);
+    assert_eq!(memory.snapshot()?.used_bytes, 0);
+    Ok(())
+}
+
+#[test]
 fn cache_snapshot_is_admitted_before_its_bytes_are_read() -> Result<(), Box<dyn Error>> {
     let path = tempfile::NamedTempFile::new()?;
     let original = b"source cache payload";

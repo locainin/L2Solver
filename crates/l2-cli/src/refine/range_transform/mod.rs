@@ -4,6 +4,7 @@ mod archive;
 mod budget;
 mod observation;
 mod png;
+mod queue;
 mod ranges;
 mod readers;
 
@@ -31,9 +32,9 @@ pub(in crate::refine) fn reserve_stream_object(
 }
 use observation::ObservingWriter;
 pub(super) use observation::{Observation, ObservingReader};
+use queue::StreamQueue;
 use readers::JobReader;
 use std::{
-    collections::VecDeque,
     error::Error,
     fmt,
     fs::File,
@@ -62,7 +63,7 @@ pub(super) struct StreamContext<'a> {
 }
 
 pub(super) fn append_streams(mut context: StreamContext<'_>) -> Result<(), Box<dyn Error>> {
-    let mut queue = VecDeque::new();
+    let mut queue = StreamQueue::new(context.memory)?;
     let operations = context.observation.operations()?;
     let observation_limited = context
         .observation
@@ -90,8 +91,7 @@ pub(super) fn append_streams(mut context: StreamContext<'_>) -> Result<(), Box<d
     }
     for operation in operations {
         if let Some(object) = transform_source(&mut context, &operation)? {
-            queue.try_reserve(1)?;
-            queue.push_back(object);
+            queue.push(object)?;
         }
     }
     while let Some(object) = queue.pop_front() {
@@ -132,8 +132,7 @@ pub(super) fn append_streams(mut context: StreamContext<'_>) -> Result<(), Box<d
         }
         for operation in operations {
             if let Some(child) = transform_object(&mut context, &object, &operation)? {
-                queue.try_reserve(1)?;
-                queue.push_back(child);
+                queue.push(child)?;
             }
         }
     }

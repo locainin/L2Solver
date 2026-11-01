@@ -3,6 +3,7 @@
 mod analysis;
 mod analysis_memory;
 mod file_artifact;
+mod hash;
 mod input;
 mod output;
 mod policy;
@@ -29,7 +30,7 @@ use crate::{
     workbench::artifact_export,
 };
 use l2_workbench::job::{
-    CacheStage, Counter, Job, MemoryBudget, MemoryClass, Phase, PhaseOutcome, cache::Cache,
+    CacheStage, Counter, Job, MemoryBudget, Phase, PhaseOutcome, cache::Cache,
 };
 use policy::RefinePolicy;
 use std::{
@@ -59,8 +60,6 @@ fn run_with_memory_budget(
 ) -> Result<bool, Box<dyn Error>> {
     job.check_cancelled()?;
     let mut publication_buffer = publication_memory::PublicationBuffer::try_new(memory)?;
-    // Fingerprints and strict source digests use one fixed reusable-sized buffer at a time
-    let _identity_scratch = memory.try_reserve(MemoryClass::Base, 64 * 1024)?;
     let destination = options
         .output
         .clone()

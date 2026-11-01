@@ -106,6 +106,25 @@ impl MemberMerger<'_> {
             })?;
             return Ok(());
         }
+        let identity_work = bytes
+            .len()
+            .checked_add(entry.metadata.raw_name.len())
+            .ok_or("member identity work overflows")?;
+        let remaining_work = self
+            .options
+            .limits
+            .max_total_work_bytes
+            .saturating_sub(self.report.work_bytes);
+        if identity_work > remaining_work {
+            return self.push_omission(AnalysisOmission::WorkLimit {
+                artifact_index: self.parent_index,
+                stage: AnalysisStage::ArtifactIdentity,
+                requested: identity_work,
+                remaining: remaining_work,
+            });
+        }
+        // Both the member and its original name receive exact identities
+        self.report.work_bytes += entry.metadata.raw_name.len();
         let preview_bytes = entry.metadata.raw_name.len().min(32) * 2;
         // Admit the name digest and preview before constructing member provenance
         super::analysis_memory::charge(self.omission_memory, 128 + preview_bytes)?;
@@ -124,14 +143,6 @@ impl MemberMerger<'_> {
             .limits
             .max_total_work_bytes
             .saturating_sub(self.report.work_bytes);
-        if bytes.len() > remaining_work {
-            return self.push_omission(AnalysisOmission::WorkLimit {
-                artifact_index: self.parent_index,
-                stage: AnalysisStage::ArtifactIdentity,
-                requested: bytes.len(),
-                remaining: remaining_work,
-            });
-        }
         // The analyzer hashes the exact member once before inspecting it
         self.report.work_bytes += bytes.len();
         child_options.limits.max_total_work_bytes = remaining_work - bytes.len();

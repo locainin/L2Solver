@@ -257,12 +257,11 @@ fn retain_archive(
         return Ok(());
     };
     let depth = object.derived.steps.len();
-    let source_sha256 = context.report.source_sha256.clone();
     context.analysis.append_stream_archive(
         context.source_index,
         index,
         context.source,
-        &source_sha256,
+        &context.report.source_sha256,
         &archive,
         DerivedArtifact::new(object.derived.clone(), context.memory, 1)?,
     )?;

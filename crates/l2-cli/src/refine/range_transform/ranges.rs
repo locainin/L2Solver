@@ -79,12 +79,11 @@ pub(super) fn inspect_ranges(
             context.memory,
             artifact.origins.len(),
         )?;
-        let source_sha256 = context.report.source_sha256.clone();
         context.analysis.append_stream_ranges(
             context.source_index,
             index,
             context.source,
-            &source_sha256,
+            &context.report.source_sha256,
             artifact,
             derived,
         )?;
@@ -184,7 +183,7 @@ fn run_scanner(
     length: usize,
     options: ArtifactAnalysisOptions,
 ) -> Result<RangeReport, Box<dyn Error>> {
-    let (scratch, mut retained_memory) =
+    let (mut scratch, mut retained_memory) =
         super::super::analysis_memory::reserve(context.memory, length, options, false)?;
     let mut png_memory = context.memory.try_reserve(MemoryClass::Executor, 0)?;
     let mut file = object.derived.spool.file.try_clone()?;
@@ -213,9 +212,27 @@ fn run_scanner(
         &scanned.analysis.omissions,
         &mut retained_memory,
     )?;
+    let digest_bytes = u64::try_from(scanned.analysis.source_sha256.capacity())?;
+    let digest_memory = scratch
+        .split_off(digest_bytes)
+        .ok_or("stream digest charge is missing")?;
+    if let Err(digest_memory) = retained_memory.try_absorb(digest_memory) {
+        drop(scanned);
+        drop(digest_memory);
+        return Err("stream digest memory scope differs from its report".into());
+    }
+    let l2_workbench::artifact::StreamSourceAnalysis {
+        analysis,
+        png,
+        prefix_sha256,
+        zip_observation,
+    } = scanned;
+    drop(png);
+    drop(prefix_sha256);
+    drop(zip_observation);
     drop(scratch);
     Ok(RangeReport {
-        report: scanned.analysis,
+        report: analysis,
         _memory: retained_memory,
     })
 }

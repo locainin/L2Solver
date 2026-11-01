@@ -47,11 +47,12 @@ pub(super) struct InputSet {
     publication_recheck_held: Cell<bool>,
     manifest_read_bytes: u64,
     manifest_sha256: Option<String>,
-    _metadata_memory: MemoryLease,
+    memory: MemoryBudget,
     #[cfg(target_os = "linux")]
     directory: Option<DirectoryAnchor>,
     #[cfg(not(target_os = "linux"))]
     directory: Option<PathBuf>,
+    _metadata_memory: MemoryLease,
 }
 
 struct SourcePlan {
@@ -244,6 +245,19 @@ enum InputPath {
 pub(super) struct LoadedSource {
     pub(super) label: String,
     pub(super) data: SourceData,
+}
+
+pub(super) struct LoadedSources {
+    values: Vec<LoadedSource>,
+    _metadata_memory: MemoryLease,
+}
+
+impl std::ops::Deref for LoadedSources {
+    type Target = [LoadedSource];
+
+    fn deref(&self) -> &Self::Target {
+        &self.values
+    }
 }
 
 pub(super) enum SourceData {
@@ -927,6 +941,7 @@ pub(super) struct FingerprintedSources {
     pub(super) labels: Vec<String>,
     pub(super) total_bytes: u64,
     pub(super) sample_set_sha256: String,
+    _memory: MemoryLease,
 }
 
 #[derive(Serialize)]
@@ -1031,6 +1046,7 @@ pub(super) fn prepare_input_set_with_limit(
             expected_sha256: None,
         }],
         manifest_sha256: None,
+        memory: memory.clone(),
         _metadata_memory: metadata_memory,
         plans: Vec::new(),
         budget,
@@ -1104,6 +1120,7 @@ fn prepare_export_directory(
     Ok(InputSet {
         sources,
         manifest_sha256: Some(manifest_sha256),
+        memory: memory.clone(),
         _metadata_memory: metadata_memory,
         plans: Vec::new(),
         budget,
@@ -1204,17 +1221,40 @@ pub(super) fn read_sources(
     per_file_limit: usize,
     job: &Job,
     memory: &MemoryBudget,
-) -> Result<Vec<LoadedSource>, Box<dyn Error>> {
+) -> Result<LoadedSources, Box<dyn Error>> {
+    let count = input_set.sources.len();
+    let labels = input_set
+        .sources
+        .iter()
+        .try_fold(0_usize, |total, source| {
+            total.checked_add(source.label.len())
+        })
+        .ok_or("source label size overflows")?;
+    let requested = count
+        .checked_mul(std::mem::size_of::<LoadedSource>())
+        .and_then(|bytes| bytes.checked_add(labels))
+        .ok_or("loaded source metadata overflows")?;
+    let mut metadata_memory = memory.try_reserve(MemoryClass::Base, u64::try_from(requested)?)?;
     let mut sources = Vec::new();
     sources
-        .try_reserve_exact(input_set.sources.len())
+        .try_reserve_exact(count)
         .map_err(|_| io::Error::other("input source allocation failed"))?;
+    super::analysis_memory::charge(
+        &mut metadata_memory,
+        (sources.capacity() - count)
+            .checked_mul(std::mem::size_of::<LoadedSource>())
+            .ok_or("loaded source metadata overflows")?,
+    )?;
     let mut total_bytes = 0_usize;
     for (spec, plan) in input_set.sources.iter().zip(&input_set.plans) {
         job.check_cancelled()?;
+        let mut label = String::new();
+        label.try_reserve_exact(spec.label.len())?;
+        super::analysis_memory::charge(&mut metadata_memory, label.capacity() - spec.label.len())?;
+        label.push_str(&spec.label);
         if let Some(omission) = plan.omission {
             sources.push(LoadedSource {
-                label: spec.label.clone(),
+                label,
                 data: SourceData::Skipped(omission),
             });
             continue;
@@ -1232,7 +1272,7 @@ pub(super) fn read_sources(
                 return Err(invalid_input("input artifact changed during admission"));
             }
             sources.push(LoadedSource {
-                label: spec.label.clone(),
+                label,
                 data: SourceData::File(RangeSource {
                     length,
                     metadata: fingerprint,
@@ -1240,15 +1280,16 @@ pub(super) fn read_sources(
             });
         } else {
             let next_total = checked_total(total_bytes, length, total_limit)?;
-            let loaded =
+            let data =
                 read_memory_source(input_set, spec, file, length, per_file_limit, job, memory)?;
-            if loaded.bytes().is_some() {
-                total_bytes = next_total;
-            }
-            sources.push(loaded);
+            total_bytes = next_total;
+            sources.push(LoadedSource { label, data });
         }
     }
-    Ok(sources)
+    Ok(LoadedSources {
+        values: sources,
+        _metadata_memory: metadata_memory,
+    })
 }
 
 fn read_memory_source(
@@ -1259,8 +1300,9 @@ fn read_memory_source(
     per_file_limit: usize,
     job: &Job,
     memory: &MemoryBudget,
-) -> Result<LoadedSource, Box<dyn Error>> {
-    let mut lease = memory.try_reserve(MemoryClass::Base, u64::try_from(length)?)?;
+) -> Result<SourceData, Box<dyn Error>> {
+    let requested = length.checked_add(128).ok_or("source memory overflows")?;
+    let mut lease = memory.try_reserve(MemoryClass::Base, u64::try_from(requested)?)?;
     input.budget.reserve(
         u64::try_from(length)?
             .checked_add(1)
@@ -1272,14 +1314,15 @@ fn read_memory_source(
         Some(length),
         spec.expected_sha256.as_deref(),
     )?;
-    lease.try_resize(u64::try_from(bytes.capacity())?)?;
-    Ok(LoadedSource {
-        label: spec.label.clone(),
-        data: SourceData::Memory {
-            bytes,
-            sha256,
-            _memory: Some(lease),
-        },
+    let retained = bytes
+        .capacity()
+        .checked_add(sha256.capacity())
+        .ok_or("source memory overflows")?;
+    lease.try_resize(u64::try_from(retained)?)?;
+    Ok(SourceData::Memory {
+        bytes,
+        sha256,
+        _memory: Some(lease),
     })
 }
 
@@ -1289,7 +1332,7 @@ pub(super) fn read_sources_with_test_budget(
     total_limit: usize,
     per_file_limit: usize,
     job: &Job,
-) -> Result<Vec<LoadedSource>, Box<dyn Error>> {
+) -> Result<LoadedSources, Box<dyn Error>> {
     read_sources(
         input_set,
         total_limit,
@@ -1305,10 +1348,43 @@ pub(super) fn fingerprint_sources(
     per_file_limit: usize,
     job: &Job,
 ) -> Result<FingerprintedSources, Box<dyn Error>> {
+    let count = input_set.sources.len();
+    let labels_bytes = input_set
+        .sources
+        .iter()
+        .try_fold(0_usize, |total, spec| total.checked_add(spec.label.len()))
+        .ok_or("fingerprint label size overflows")?;
+    let scratch_bytes = count
+        .checked_mul(std::mem::size_of::<SampledSource<'_>>() + 128)
+        .and_then(|bytes| bytes.checked_add(64 * 1024 + 512))
+        .ok_or("fingerprint scratch size overflows")?;
+    let retained_bytes = count
+        .checked_mul(std::mem::size_of::<String>())
+        .and_then(|bytes| bytes.checked_add(labels_bytes))
+        .and_then(|bytes| bytes.checked_add(256))
+        .ok_or("fingerprint metadata size overflows")?;
+    let mut scratch = input_set
+        .memory
+        .try_reserve(MemoryClass::Base, u64::try_from(scratch_bytes)?)?;
+    let mut retained = input_set
+        .memory
+        .try_reserve(MemoryClass::Base, u64::try_from(retained_bytes)?)?;
     let mut sampled = Vec::new();
     let mut labels = Vec::new();
-    sampled.try_reserve_exact(input_set.sources.len())?;
-    labels.try_reserve_exact(input_set.sources.len())?;
+    sampled.try_reserve_exact(count)?;
+    labels.try_reserve_exact(count)?;
+    super::analysis_memory::charge(
+        &mut scratch,
+        (sampled.capacity() - count)
+            .checked_mul(std::mem::size_of::<SampledSource<'_>>())
+            .ok_or("fingerprint scratch size overflows")?,
+    )?;
+    super::analysis_memory::charge(
+        &mut retained,
+        (labels.capacity() - count)
+            .checked_mul(std::mem::size_of::<String>())
+            .ok_or("fingerprint metadata size overflows")?,
+    )?;
     let mut total = 0_u64;
     let mut memory_bytes = 0_usize;
     for (spec, plan) in input_set.sources.iter().zip(&input_set.plans) {
@@ -1339,6 +1415,10 @@ pub(super) fn fingerprint_sources(
                     "input artifact changed while it was fingerprinted",
                 ));
             }
+            super::analysis_memory::charge(
+                &mut scratch,
+                fingerprint.sample_sha256.capacity().saturating_sub(128),
+            )?;
             Some(fingerprint)
         } else {
             None
@@ -1350,14 +1430,15 @@ pub(super) fn fingerprint_sources(
             fingerprint,
             skipped_metadata: plan.omission.map(|_| metadata),
         });
-        labels.push(spec.label.clone());
+        let mut label = String::new();
+        label.try_reserve_exact(spec.label.len())?;
+        super::analysis_memory::charge(&mut retained, label.capacity() - spec.label.len())?;
+        label.push_str(&spec.label);
+        labels.push(label);
     }
 
     // The set hint binds ordering, labels, declarations, metadata, and bounded samples
-    let sample_set_sha256 = sha256(&serde_json::to_vec(&(
-        "l2solver-refine-sample-set-v1",
-        &sampled,
-    ))?);
+    let sample_set_sha256 = super::hash::hash_json(&("l2solver-refine-sample-set-v1", &sampled))?;
     let identity = if sampled.iter().all(|entry| entry.fingerprint.is_some()) {
         let mut fingerprint = sampled
             .first()
@@ -1370,11 +1451,22 @@ pub(super) fn fingerprint_sources(
     } else {
         SourceIdentity::Unavailable
     };
+    let digest_bytes = sample_set_sha256
+        .capacity()
+        .checked_add(match &identity {
+            SourceIdentity::Fast(fingerprint) => fingerprint.sample_sha256.capacity(),
+            _ => 0,
+        })
+        .ok_or("fingerprint digest size overflows")?;
+    super::analysis_memory::charge(&mut retained, digest_bytes.saturating_sub(256))?;
+    drop(sampled);
+    drop(scratch);
     Ok(FingerprintedSources {
         identity,
         labels,
         total_bytes: total,
         sample_set_sha256,
+        _memory: retained,
     })
 }
 
@@ -1384,8 +1476,11 @@ pub(super) fn strong_source_identity(
     per_file_limit: usize,
     job: &Job,
 ) -> Result<SourceIdentity, Box<dyn Error>> {
-    let mut digests = Vec::new();
-    digests.try_reserve_exact(input_set.sources.len())?;
+    // One reusable read buffer and digest workspace cover each strong identity pass
+    let _scratch = input_set
+        .memory
+        .try_reserve(MemoryClass::Base, 64 * 1024 + 512)?;
+    let mut writer = super::output::SourceIdentityWriter::new()?;
     let mut total = 0_usize;
     for (spec, plan) in input_set.sources.iter().zip(&input_set.plans) {
         job.check_cancelled()?;
@@ -1427,13 +1522,9 @@ pub(super) fn strong_source_identity(
         if checked_source_length(&file, spec, usize::MAX)? != length {
             return Err(invalid_input("input artifact changed while it was hashed"));
         }
-        digests.push((u64::try_from(length)?, digest));
+        writer.push(u64::try_from(length)?, &digest)?;
     }
-    let digest = super::output::refine_source_identity_sha256(
-        digests
-            .iter()
-            .map(|(length, digest)| (*length, digest.as_str())),
-    )?;
+    let digest = writer.finish()?;
     Ok(SourceIdentity::from_sha256(digest)?)
 }
 

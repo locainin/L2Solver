@@ -112,13 +112,12 @@ fn retain_png(
     let Some((index, _)) = next_index(context)? else {
         return Ok(());
     };
-    let source_sha256 = context.report.source_sha256.clone();
     // Keep the private spool open while its validated range awaits publication
     context.analysis.append_stream_png(
         context.source_index,
         index,
         context.source,
-        &source_sha256,
+        &context.report.source_sha256,
         boundary,
         DerivedArtifact::new(object.derived.clone(), context.memory, 1)?,
     )?;

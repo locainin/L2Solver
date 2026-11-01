@@ -38,7 +38,7 @@ fn unanalysed_member_is_omitted_when_hash_work_cannot_be_admitted() -> Result<()
         omission,
         AnalysisOmission::WorkLimit {
             artifact_index: 0,
-            requested: 14,
+            requested: 24,
             remaining: 0,
             ..
         }
@@ -50,8 +50,8 @@ fn unanalysed_member_is_omitted_when_hash_work_cannot_be_admitted() -> Result<()
 
 #[test]
 fn unanalysed_member_hash_is_debited_before_the_member_is_retained() -> Result<(), Box<dyn Error>> {
-    let (report, omissions) = merge_unanalyzed_member(14)?;
-    assert_eq!(report.work_bytes, 14);
+    let (report, omissions) = merge_unanalyzed_member(24)?;
+    assert_eq!(report.work_bytes, 24);
     let artifact = report.artifacts.first().ok_or("member missing")?;
     assert_eq!(artifact.bytes, b"member payload");
     assert_eq!(artifact.sha256, l2_workbench::sha256(b"member payload"));

@@ -18,7 +18,6 @@ use l2_workbench::{
     artifact::{AnalysisOmission, AnalysisStatus, ArtifactOrigin},
     job::cache::SourceIdentity,
     recovery::proposals::TRANSFORM_PROPOSAL_FORMAT_VERSION,
-    sha256,
 };
 use serde::Serialize;
 use serde_json::json;
@@ -100,18 +99,14 @@ pub(super) fn result_identity(
     recovery: &RecoveryOptions,
     policy: &RefinePolicy,
 ) -> Result<ResultIdentity, Box<dyn Error>> {
-    let input_identities = sources
-        .iter()
-        .map(|source| {
-            Ok((
-                u64::try_from(source.length())?,
-                source.digest().ok_or_else(|| {
-                    invalid_input("source digest is not available before analysis")
-                })?,
-            ))
-        })
-        .collect::<Result<Vec<_>, Box<dyn Error>>>()?;
-    let source = SourceIdentity::from_sha256(refine_source_identity_sha256(input_identities)?)?;
+    let mut writer = SourceIdentityWriter::new()?;
+    for source in sources {
+        let digest = source
+            .digest()
+            .ok_or_else(|| invalid_input("source digest is not available before analysis"))?;
+        writer.push(u64::try_from(source.length())?, digest)?;
+    }
+    let source = SourceIdentity::from_sha256(writer.finish()?)?;
     result_identity_with_source(source, recovery, policy)
 }
 
@@ -144,24 +139,53 @@ pub(super) fn result_identity_with_source(
 pub fn refine_source_identity_sha256<'a>(
     sources: impl IntoIterator<Item = (u64, &'a str)>,
 ) -> Result<String, Box<dyn Error>> {
-    #[derive(Serialize)]
-    struct SourceIdentityPart<'a> {
-        byte_length: u64,
-        sha256: &'a str,
+    let mut writer = SourceIdentityWriter::new()?;
+    for (byte_length, digest) in sources {
+        writer.push(byte_length, digest)?;
+    }
+    writer.finish()
+}
+
+#[derive(Serialize)]
+struct SourceIdentityPart<'a> {
+    byte_length: u64,
+    sha256: &'a str,
+}
+
+pub(super) struct SourceIdentityWriter {
+    writer: super::hash::DigestWriter,
+    first: bool,
+}
+
+impl SourceIdentityWriter {
+    pub(super) fn new() -> io::Result<Self> {
+        let mut writer = super::hash::DigestWriter::new();
+        writer.write_all(b"[\"l2solver-refine-input-set-v1\",[")?;
+        Ok(Self {
+            writer,
+            first: true,
+        })
     }
 
-    let mut inputs = Vec::new();
-    for (byte_length, digest) in sources {
-        inputs
-            .try_reserve(1)
-            .map_err(|_| io::Error::other("source identity allocation failed"))?;
-        inputs.push(SourceIdentityPart {
-            byte_length,
-            sha256: digest,
-        });
+    pub(super) fn push(&mut self, byte_length: u64, digest: &str) -> Result<(), Box<dyn Error>> {
+        if !self.first {
+            self.writer.write_all(b",")?;
+        }
+        self.first = false;
+        serde_json::to_writer(
+            &mut self.writer,
+            &SourceIdentityPart {
+                byte_length,
+                sha256: digest,
+            },
+        )?;
+        Ok(())
     }
-    let source_set = serde_json::to_vec(&("l2solver-refine-input-set-v1", inputs))?;
-    Ok(sha256(&source_set))
+
+    pub(super) fn finish(mut self) -> Result<String, Box<dyn Error>> {
+        self.writer.write_all(b"]]")?;
+        Ok(self.writer.finish())
+    }
 }
 
 pub(super) fn write_reused_summary(

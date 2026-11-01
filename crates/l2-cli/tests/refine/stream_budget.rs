@@ -7,6 +7,56 @@ use l2_workbench::{
 use std::error::Error;
 
 #[test]
+fn stream_queue_admits_replacement_while_the_old_buffer_is_live() -> Result<(), Box<dyn Error>> {
+    use super::super::{ObservingReader, StreamObject, StreamQueue};
+    use crate::refine::file_artifact::DerivedFile;
+    use l2_workbench::job::MemoryClass;
+
+    let size = std::mem::size_of::<StreamObject>();
+    let memory = MemoryBudget::new(u64::try_from(12 * size - 1)?);
+    let mut queue = StreamQueue::new(&memory)?;
+    for _ in 0..4 {
+        let observation = ObservingReader::new(b"".as_slice(), true)
+            .finish()
+            .ok_or("observation missing")?;
+        let derived = DerivedFile::new(
+            tempfile::tempfile()?,
+            memory.try_reserve(MemoryClass::Executor, 0)?,
+            Vec::new(),
+        );
+        queue.push(StreamObject {
+            observation,
+            derived,
+        })?;
+    }
+    let before = memory.snapshot()?.used_bytes;
+    let observation = ObservingReader::new(b"".as_slice(), true)
+        .finish()
+        .ok_or("observation missing")?;
+    let derived = DerivedFile::new(
+        tempfile::tempfile()?,
+        memory.try_reserve(MemoryClass::Executor, 0)?,
+        Vec::new(),
+    );
+    let error = queue
+        .push(StreamObject {
+            observation,
+            derived,
+        })
+        .err()
+        .ok_or("queue replacement bypassed admission")?;
+    assert!(matches!(
+        crate::memory_error::find(error.as_ref()),
+        Some(l2_workbench::job::MemoryError::Limit { .. })
+    ));
+    assert_eq!(queue.values.len(), 4);
+    assert_eq!(memory.snapshot()?.used_bytes, before);
+    drop(queue);
+    assert_eq!(memory.snapshot()?.used_bytes, 0);
+    Ok(())
+}
+
+#[test]
 fn stream_reservation_covers_syntax_proposal_and_output_observation_work()
 -> Result<(), Box<dyn Error>> {
     let mut budget = StreamingBudget {
