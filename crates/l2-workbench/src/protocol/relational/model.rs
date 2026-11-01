@@ -237,7 +237,7 @@ pub struct RelationalTransformRule {
 }
 
 /// Exact output from replaying one frozen rule against one complete session
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, serde::Deserialize)]
 pub struct RelationalAppliedOutput {
     /// Session checked by the rule
     pub session: RelationalSessionId,
@@ -256,7 +256,7 @@ pub struct RelationalAppliedOutput {
 }
 
 /// Maps one selected sample range to its exact interval in transformed output
-#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, serde::Deserialize)]
 pub struct RelationalOutputMapping {
     /// Stable identity of the sample containing the source range
     pub sample: u64,
@@ -299,7 +299,7 @@ pub struct RelationalCandidateEvaluation<T> {
 }
 
 /// Decoded outputs captured for one retained candidate
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, serde::Deserialize)]
 pub struct RelationalCandidateOutputs {
     /// Successful same-pass outputs from discovery sessions
     pub discovery: Vec<RelationalAppliedOutput>,
@@ -406,7 +406,7 @@ impl RelationalOperationTemplate {
 }
 
 /// Source identity for one complete context group
-#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize)]
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize, serde::Deserialize)]
 pub struct RelationalSessionId {
     /// Capture source identity
     pub source: String,
@@ -417,7 +417,7 @@ pub struct RelationalSessionId {
 }
 
 /// Whether all selected sessions supported or falsified a frozen rule
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum RelationalFitStatus {
     /// Every complete session in this split passed the selected parser and exact-range check
@@ -516,7 +516,7 @@ pub struct RelationalFit {
 }
 
 /// Why bounded rule discovery stopped before all configured hypotheses were tested
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum RelationalSearchLimit {
     /// The maximum number of transform configurations was reached
@@ -543,7 +543,7 @@ pub struct RelationalTransformCandidate {
 }
 
 /// Overall result state for a relational transform candidate
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum RelationalTransformStatus {
     /// Discovery constraints passed but no independent session was available for corroboration

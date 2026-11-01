@@ -75,18 +75,20 @@ pub use records::{
 pub use relational::{
     RelationalAppliedOutput, RelationalByteRangeLocator, RelationalCandidateEvaluation,
     RelationalCandidateEvaluationReport, RelationalCandidateOutputs, RelationalCoordinateBasis,
-    RelationalCounterReset, RelationalEvaluationError, RelationalFalsification, RelationalFit,
-    RelationalFitStatus, RelationalLengthField, RelationalOperationTemplate,
-    RelationalOutputMapping, RelationalParserScope, RelationalRecordSample,
-    RelationalReplayHistory, RelationalRetainedEvaluation, RelationalSearchLimit,
-    RelationalSessionCheck, RelationalSessionId, RelationalSha256CounterXor,
-    RelationalTransformCandidate, RelationalTransformError, RelationalTransformEvaluationContext,
+    RelationalCounterReset, RelationalCursorError, RelationalEvaluationError,
+    RelationalFalsification, RelationalFit, RelationalFitStatus, RelationalLengthField,
+    RelationalOperationTemplate, RelationalOutputMapping, RelationalParserScope,
+    RelationalRecordSample, RelationalReplayHistory, RelationalRetainedEvaluation,
+    RelationalSearchCursor, RelationalSearchLimit, RelationalSearchStep, RelationalSessionCheck,
+    RelationalSessionId, RelationalSha256CounterXor, RelationalTransformCandidate,
+    RelationalTransformError, RelationalTransformEvaluationContext,
     RelationalTransformEvaluationOptions, RelationalTransformLimits, RelationalTransformPlan,
     RelationalTransformReport, RelationalTransformRule, RelationalTransformStatus,
     apply_relational_transform_rule, infer_relational_transform_candidates,
     infer_relational_transform_candidates_with_evaluator,
     infer_relational_transform_candidates_with_evaluator_and_history,
     infer_relational_transform_candidates_with_job,
+    step_relational_transform_candidates_with_evaluator_and_history,
 };
 pub(crate) use stream::validate_stream_framings;
 pub use stream::{

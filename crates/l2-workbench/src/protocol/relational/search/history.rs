@@ -4,6 +4,7 @@ use super::super::model::{
     RelationalByteRangeLocator, RelationalLengthField, RelationalOperationTemplate,
     RelationalSha256CounterXor, RelationalTransformLimits, RelationalTransformRule,
 };
+use sha2::{Digest, Sha256};
 use std::{
     collections::hash_map::RandomState,
     hash::{BuildHasher, Hash, Hasher},
@@ -127,6 +128,59 @@ impl RelationalReplayHistory {
     pub(super) fn finish(&mut self) {
         self.entries.sort_unstable_by_key(|entry| entry.hash);
         self.sorted_len = self.entries.len();
+    }
+
+    // Ignore randomized hash buckets while binding the lookup prefix and capacity
+    pub(super) fn checkpoint_identity(
+        &self,
+    ) -> Result<[u8; 32], super::super::model::RelationalTransformError> {
+        use super::super::model::RelationalTransformError;
+        use std::io::{self, Write};
+
+        struct DigestWriter(Sha256);
+        impl Write for DigestWriter {
+            fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+                self.0.update(bytes);
+                Ok(bytes.len())
+            }
+            fn flush(&mut self) -> io::Result<()> {
+                Ok(())
+            }
+        }
+        let mut entries = Vec::new();
+        entries
+            .try_reserve_exact(self.entries.len())
+            .map_err(|_| RelationalTransformError::AllocationFailed)?;
+        for (index, entry) in self.entries.iter().enumerate() {
+            let mut writer = DigestWriter(Sha256::new());
+            serde_json::to_writer(&mut writer, &entry.rule).map_err(|_| {
+                RelationalTransformError::InvalidPlan("history identity encoding failed")
+            })?;
+            writer.0.update([u8::from(index < self.sorted_len)]);
+            writer.0.update([match entry.disposition {
+                ReplayDisposition::Rejected => 0,
+                ReplayDisposition::Published => 1,
+            }]);
+            entries.push(<[u8; 32]>::from(writer.0.finalize()));
+        }
+        entries.sort_unstable();
+        let mut digest = Sha256::new();
+        digest.update(b"l2-relational-history-v1");
+        for value in [self.max_bytes, self.entries.capacity(), self.sorted_len] {
+            digest.update(value.to_le_bytes());
+        }
+        digest.update([u8::from(self.complete)]);
+        if let Some((seed, total)) = self.limits {
+            digest.update([1]);
+            digest.update(seed.to_le_bytes());
+            digest.update(total.to_le_bytes());
+        } else {
+            digest.update([0]);
+        }
+        for entry in entries {
+            digest.update(entry);
+        }
+        Ok(digest.finalize().into())
     }
 
     fn sorted_index(&self, hash: u64, rule: &RelationalTransformRule) -> Option<usize> {

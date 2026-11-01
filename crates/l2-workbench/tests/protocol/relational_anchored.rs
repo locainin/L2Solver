@@ -19,6 +19,9 @@ use std::error::Error;
 
 type TestResult<T> = Result<T, Box<dyn Error>>;
 
+#[path = "relational/search/cursor_anchor.rs"]
+mod cursor_anchor;
+
 #[test]
 fn anchored_payload_replay_uses_the_same_samples_seed_end_and_keeps_absolute_source_ranges()
 -> TestResult<()> {

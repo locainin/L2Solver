@@ -8,7 +8,8 @@ use super::{
 use crate::{derivation::CounterWidth, integer::decode_unsigned, protocol::ByteOrder};
 use std::{cmp::Ordering, collections::BinaryHeap};
 
-#[derive(Clone)]
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub(super) struct LocatorCandidate {
     pub(super) selector: Selector,
     varying_bytes: usize,

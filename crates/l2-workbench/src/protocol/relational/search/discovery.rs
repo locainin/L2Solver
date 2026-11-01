@@ -22,7 +22,6 @@ use super::{
     replay::{EvaluatedSplit, candidate_status, empty_fit, evaluate_split},
 };
 use crate::{
-    derivation::CounterWidth,
     job::{Counter, Job, Phase},
     protocol::{HoldoutBasis, RelationalSessionId},
 };
@@ -32,9 +31,18 @@ use std::{
     convert::Infallible,
 };
 
+mod cursor;
+pub use cursor::{
+    RelationalCursorError, RelationalSearchCursor, RelationalSearchStep,
+    step_relational_transform_candidates_with_evaluator_and_history,
+};
+
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 struct SearchState<'history, T> {
     candidates: Vec<RetainedCandidate<T>>,
     candidates_examined: usize,
+    #[serde(skip)]
     history: Option<&'history mut RelationalReplayHistory>,
     history_reused_rejections: usize,
     history_reused_published: usize,
@@ -57,7 +65,10 @@ struct SearchState<'history, T> {
     output_capture_omissions: usize,
 }
 
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 struct RetainedCandidate<T> {
+    #[serde(deserialize_with = "cursor::deserialize_candidate")]
     candidate: RelationalTransformCandidate,
     priority: u8,
     assessment: T,
@@ -99,39 +110,17 @@ fn candidate_parameters(
     plan: &RelationalTransformPlan,
 ) -> Result<Vec<CandidateParameters>, RelationalTransformError> {
     let mut parameters = Vec::new();
-    'widths: for counter_width in &plan.counter_widths {
-        for initial_counter in &plan.initial_counters {
-            if *initial_counter > counter_width.maximum_counter() {
-                continue;
+    let mut position = cursor::ParameterPosition::default();
+    while parameters.len() < plan.limits.max_candidates {
+        match position.next(plan)? {
+            Some(cursor::ParameterAction::Candidate(_, parameter)) => {
+                parameters
+                    .try_reserve(1)
+                    .map_err(|_| RelationalTransformError::AllocationFailed)?;
+                parameters.push(parameter);
             }
-            for (order_index, counter_byte_order) in plan.counter_byte_orders.iter().enumerate() {
-                // A one-byte counter has no byte order; keep only its first spelling
-                if *counter_width == crate::derivation::CounterWidth::OneByte && order_index > 0 {
-                    continue;
-                }
-                for seed_order in &plan.seed_orders {
-                    for counter_reset in &plan.counter_resets {
-                        for parser_format in &plan.parser_formats {
-                            if parameters.len() == plan.limits.max_candidates {
-                                break 'widths;
-                            }
-                            parameters
-                                .try_reserve(1)
-                                .map_err(|_| RelationalTransformError::AllocationFailed)?;
-                            parameters.push(CandidateParameters {
-                                operation: RelationalSha256CounterXor {
-                                    initial_counter: *initial_counter,
-                                    counter_width: *counter_width,
-                                    counter_byte_order: *counter_byte_order,
-                                    seed_order: *seed_order,
-                                },
-                                counter_reset: *counter_reset,
-                                parser_format: *parser_format,
-                            });
-                        }
-                    }
-                }
-            }
+            Some(cursor::ParameterAction::Alias) => {}
+            None => break,
         }
     }
     if parameters.is_empty() {
@@ -142,7 +131,9 @@ fn candidate_parameters(
     Ok(parameters)
 }
 
-#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+#[derive(
+    Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd, serde::Serialize, serde::Deserialize,
+)]
 struct CandidateId {
     seed: usize,
     payload: usize,
@@ -171,12 +162,6 @@ struct LocatorPair<'a> {
     payload_index: usize,
     seed_locator: &'a LocatorCandidate,
     payload_locator: &'a LocatorCandidate,
-}
-
-#[derive(Clone, Copy)]
-struct CounterOptions {
-    width: CounterWidth,
-    initial_counter: u64,
 }
 
 struct InitialPairSearch {
@@ -270,7 +255,7 @@ struct RankedPairStream {
     pending: BinaryHeap<Reverse<RankedPairEntry>>,
 }
 
-#[derive(Clone, Copy, Eq, Ord, PartialEq, PartialOrd)]
+#[derive(Clone, Copy, Eq, Ord, PartialEq, PartialOrd, serde::Serialize, serde::Deserialize)]
 struct RankedPairEntry {
     cue_rank: usize,
     pair_rank: usize,
@@ -1979,91 +1964,30 @@ impl SearchContext<'_, '_> {
             &[RelationalAppliedOutput],
         ) -> Result<RelationalCandidateEvaluation<T>, E>,
     {
-        let mut parameter_index = 0_usize;
-        for counter_width in &self.plan.counter_widths {
-            for initial_counter in &self.plan.initial_counters {
-                if *initial_counter > counter_width.maximum_counter() {
+        let mut position = cursor::ParameterPosition::default();
+        while let Some(action) = position.next(self.plan)? {
+            let (index, parameters) = match action {
+                cursor::ParameterAction::Alias => {
+                    self.count_equivalent_candidate_aliases(search)?;
                     continue;
                 }
-                let options = CounterOptions {
-                    width: *counter_width,
-                    initial_counter: *initial_counter,
-                };
-                if !self.search_counter_options(
+                cursor::ParameterAction::Candidate(index, parameters) => (index, parameters),
+            };
+            let id = CandidateId {
+                seed: pair.seed_index,
+                payload: pair.payload_index,
+                parameter: index,
+            };
+            if !pre_evaluated.contains(&id)
+                && !self.try_candidate(
                     search,
-                    pair,
-                    options,
-                    &mut parameter_index,
-                    pre_evaluated,
+                    pair.seed_locator,
+                    pair.payload_locator,
+                    parameters,
                     evaluator,
-                )? {
-                    return Ok(false);
-                }
-            }
-        }
-        Ok(true)
-    }
-
-    fn search_counter_options<T, E, F>(
-        &self,
-        search: &mut SearchState<'_, T>,
-        pair: LocatorPair<'_>,
-        options: CounterOptions,
-        parameter_index: &mut usize,
-        pre_evaluated: &BTreeSet<CandidateId>,
-        evaluator: &mut F,
-    ) -> Result<bool, RelationalEvaluationError<E>>
-    where
-        F: FnMut(
-            &RelationalTransformEvaluationContext<'_>,
-            &RelationalTransformCandidate,
-            &[RelationalAppliedOutput],
-            &[RelationalAppliedOutput],
-        ) -> Result<RelationalCandidateEvaluation<T>, E>,
-    {
-        let mut first_byte_order = true;
-        for counter_byte_order in &self.plan.counter_byte_orders {
-            if options.width == CounterWidth::OneByte && !first_byte_order {
-                self.count_equivalent_candidate_aliases(search)?;
-                continue;
-            }
-            first_byte_order = false;
-            for seed_order in &self.plan.seed_orders {
-                for counter_reset in &self.plan.counter_resets {
-                    for parser_format in &self.plan.parser_formats {
-                        let id = CandidateId {
-                            seed: pair.seed_index,
-                            payload: pair.payload_index,
-                            parameter: *parameter_index,
-                        };
-                        *parameter_index = parameter_index.checked_add(1).ok_or(
-                            RelationalTransformError::InvalidPlan(
-                                "relational parameter index overflowed",
-                            ),
-                        )?;
-                        if pre_evaluated.contains(&id) {
-                            continue;
-                        }
-                        if !self.try_candidate(
-                            search,
-                            pair.seed_locator,
-                            pair.payload_locator,
-                            CandidateParameters {
-                                operation: RelationalSha256CounterXor {
-                                    initial_counter: options.initial_counter,
-                                    counter_width: options.width,
-                                    counter_byte_order: *counter_byte_order,
-                                    seed_order: *seed_order,
-                                },
-                                counter_reset: *counter_reset,
-                                parser_format: *parser_format,
-                            },
-                            evaluator,
-                        )? {
-                            return Ok(false);
-                        }
-                    }
-                }
+                )?
+            {
+                return Ok(false);
             }
         }
         Ok(true)

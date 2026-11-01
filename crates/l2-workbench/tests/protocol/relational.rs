@@ -15,6 +15,8 @@ use l2_workbench::{
 };
 use std::error::Error;
 
+#[path = "relational/search/cursor.rs"]
+mod cursor;
 #[path = "relational/search/history.rs"]
 mod history;
 

@@ -5,13 +5,14 @@ use crate::protocol::RelationalTransformRule;
 use serde::{Deserialize, Deserializer, Serialize, Serializer, ser::SerializeSeq};
 use std::mem;
 
-const VERSION: u32 = 1;
+const VERSION: u32 = 2;
 
 #[derive(Serialize)]
 struct SnapshotRef<'a> {
     version: u32,
     max_bytes: usize,
     entry_capacity: usize,
+    sorted_len: usize,
     entries: Entries<'a>,
     complete: bool,
     limits: Option<(usize, usize)>,
@@ -34,6 +35,8 @@ struct Snapshot {
     version: u32,
     max_bytes: usize,
     entry_capacity: usize,
+    #[serde(default)]
+    sorted_len: Option<usize>,
     entries: Vec<(RelationalTransformRule, ReplayDisposition)>,
     complete: bool,
     limits: Option<(usize, usize)>,
@@ -45,6 +48,7 @@ impl Serialize for RelationalReplayHistory {
             version: VERSION,
             max_bytes: self.max_bytes,
             entry_capacity: self.entries.capacity(),
+            sorted_len: self.sorted_len,
             entries: Entries(&self.entries),
             complete: self.complete,
             limits: self.limits,
@@ -57,7 +61,16 @@ impl<'de> Deserialize<'de> for RelationalReplayHistory {
     fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
         let saved = Snapshot::deserialize(deserializer)?;
         // Published rules may be registered before a search, but rejections need replay limits
-        if saved.version != VERSION
+        let sorted_len = match (saved.version, saved.sorted_len) {
+            (1, None) => saved.entries.len(),
+            (VERSION, Some(length)) => length,
+            _ => {
+                return Err(serde::de::Error::custom(
+                    "unsupported replay history checkpoint",
+                ));
+            }
+        };
+        if sorted_len > saved.entries.len()
             || saved.entry_capacity < saved.entries.len()
             || saved
                 .limits
@@ -103,12 +116,20 @@ impl<'de> Deserialize<'de> for RelationalReplayHistory {
                 ));
             }
         }
-        // Hash seeds belong to the new process, so stored bucket values are never reused
-        history.finish();
-        for group in history
+        // Preserve which entries were visible to lookup when the search began
+        history
             .entries
-            .chunk_by(|left, right| left.hash == right.hash)
-        {
+            .get_mut(..sorted_len)
+            .ok_or_else(|| serde::de::Error::custom("invalid replay history prefix"))?
+            .sort_unstable_by_key(|entry| entry.hash);
+        history.sorted_len = sorted_len;
+        let mut ordered = Vec::new();
+        ordered
+            .try_reserve_exact(history.entries.len())
+            .map_err(serde::de::Error::custom)?;
+        ordered.extend(history.entries.iter());
+        ordered.sort_unstable_by_key(|entry| entry.hash);
+        for group in ordered.chunk_by(|left, right| left.hash == right.hash) {
             for (index, entry) in group.iter().enumerate() {
                 if group
                     .iter()

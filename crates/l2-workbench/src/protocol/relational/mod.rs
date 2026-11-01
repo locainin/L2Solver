@@ -16,8 +16,10 @@ pub use model::{
     RelationalTransformReport, RelationalTransformRule, RelationalTransformStatus,
 };
 pub use search::{
-    RelationalReplayHistory, apply_relational_transform_rule,
-    infer_relational_transform_candidates, infer_relational_transform_candidates_with_evaluator,
+    RelationalCursorError, RelationalReplayHistory, RelationalSearchCursor, RelationalSearchStep,
+    apply_relational_transform_rule, infer_relational_transform_candidates,
+    infer_relational_transform_candidates_with_evaluator,
     infer_relational_transform_candidates_with_evaluator_and_history,
     infer_relational_transform_candidates_with_job,
+    step_relational_transform_candidates_with_evaluator_and_history,
 };
