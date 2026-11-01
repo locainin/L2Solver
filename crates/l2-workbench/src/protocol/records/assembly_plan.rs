@@ -12,6 +12,9 @@ use std::{
     hash::{DefaultHasher, Hash, Hasher},
 };
 
+mod checkpoint;
+pub use checkpoint::RecordAssemblyPlanDescription;
+
 /// Header-derived parse templates for one semantic record interpretation
 pub struct RecordAssemblyHeaderModel {
     schema: RecordSchema,
@@ -118,14 +121,14 @@ impl fmt::Debug for RecordAssemblyPlan {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Eq, PartialEq)]
 struct SharedInputExpectation {
     global_input_index: usize,
     length: usize,
     preserved_prefix: Vec<u8>,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Eq, PartialEq)]
 struct CompiledInput {
     global_input_index: usize,
     shared_input_index: usize,
@@ -138,20 +141,21 @@ enum SharedInputMismatch {
     Prefix { offset: usize },
 }
 
-#[derive(Debug)]
+#[derive(Debug, Eq, PartialEq)]
 struct CompiledModel {
     schema: RecordSchema,
+    limits: RecordLimits,
     inputs: Vec<CompiledInput>,
     groups: Vec<CompiledGroup>,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Eq, PartialEq)]
 struct CompiledGroup {
     receipt: RecordGroupReceipt,
     layout_id: usize,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Eq, PartialEq)]
 struct PhysicalLayout {
     parts: Vec<PhysicalPart>,
     output_length: usize,
@@ -457,6 +461,7 @@ impl PlanCompiler {
             .map_err(|_| RecordError::AllocationFailed)?;
         self.compiled_models.push(CompiledModel {
             schema,
+            limits,
             inputs: compiled_inputs,
             groups: compiled_groups,
         });

@@ -14,7 +14,7 @@ pub use assemble::{assemble_record_groups, assemble_record_groups_from_inputs};
 pub use assembly_plan::{
     BoundRecordAssemblyPlan, RecordAssemblyBindStats, RecordAssemblyHeaderModel,
     RecordAssemblyMaterializedLayout, RecordAssemblyModelStatus, RecordAssemblyPlan,
-    RecordAssemblyPlanStats,
+    RecordAssemblyPlanDescription, RecordAssemblyPlanStats,
 };
 pub use discovery::{
     RecordDiscoveryError, RecordDiscoveryLimits, RecordDiscoveryPartition,

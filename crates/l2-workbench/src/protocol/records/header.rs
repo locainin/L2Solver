@@ -90,6 +90,52 @@ pub struct HeaderParseTemplate {
 }
 
 impl HeaderParseTemplate {
+    pub(super) fn from_header_checkpoint(
+        schema: RecordSchema,
+        limits: RecordLimits,
+        input_length: usize,
+        preserved_header: Vec<u8>,
+    ) -> Result<Self, RecordError> {
+        super::parse::validate_limits(limits)?;
+        super::parse::validate_schema(&schema, limits)?;
+        if input_length > limits.max_input_bytes
+            || preserved_header.len() > input_length
+            || preserved_header.len() > limits.max_report_bytes
+        {
+            return Err(RecordError::InvalidReport);
+        }
+        // Decode the original header against its complete logical length without allocating a body
+        let mut work = None;
+        let declared_count = super::parse::declared_count(&preserved_header, &schema, &mut work)?;
+        let record = super::parse::parse_one_with_length(
+            &preserved_header,
+            input_length,
+            &schema,
+            0,
+            schema.records_offset,
+            &mut work,
+        )?;
+        let records = vec![record];
+        if !single_record_fills_input(
+            &schema,
+            declared_count,
+            &records,
+            input_length,
+            preserved_header.len(),
+        ) || parsed_record_metadata_bytes(&records) > limits.max_report_bytes
+        {
+            return Err(RecordError::InvalidReport);
+        }
+        Ok(Self {
+            schema,
+            input_length,
+            preserved_header,
+            limits,
+            declared_count,
+            records,
+        })
+    }
+
     /// Bind cached record metadata to a new full-byte input with the same preserved header
     ///
     /// The full-byte identity is always computed from the current immutable input bytes

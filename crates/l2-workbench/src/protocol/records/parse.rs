@@ -253,7 +253,7 @@ fn validate_integer_field(
     )
 }
 
-fn declared_count(
+pub(super) fn declared_count(
     bytes: &[u8],
     schema: &RecordSchema,
     work: &mut Option<&mut RecordWorkBudget>,
@@ -298,6 +298,17 @@ fn parse_one(
     start: usize,
     work: &mut Option<&mut RecordWorkBudget>,
 ) -> Result<ParsedRecord, RecordError> {
+    parse_one_with_length(bytes, bytes.len(), schema, record_index, start, work)
+}
+
+pub(super) fn parse_one_with_length(
+    bytes: &[u8],
+    input_length: usize,
+    schema: &RecordSchema,
+    record_index: usize,
+    start: usize,
+    work: &mut Option<&mut RecordWorkBudget>,
+) -> Result<ParsedRecord, RecordError> {
     let header_end = start
         .checked_add(schema.data_offset)
         .ok_or(RecordError::LengthOverflow {
@@ -321,12 +332,12 @@ fn parse_one(
         .ok_or(RecordError::LengthOverflow {
             record: record_index,
         })?;
-    if end > bytes.len() {
+    if end > input_length {
         return Err(RecordError::TruncatedRecord {
             record: record_index,
             offset: start,
             needed: end,
-            available: bytes.len(),
+            available: input_length,
         });
     }
 

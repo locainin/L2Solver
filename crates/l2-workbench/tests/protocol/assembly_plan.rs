@@ -8,6 +8,9 @@ use std::error::Error;
 #[path = "assembly_plan_fuzz.rs"]
 mod bounded_fuzz;
 
+#[path = "assembly_plan/checkpoint.rs"]
+mod checkpoint;
+
 const fn schema(identifier_offset: usize, sequence_offset: usize) -> RecordSchema {
     RecordSchema {
         records_offset: 0,
