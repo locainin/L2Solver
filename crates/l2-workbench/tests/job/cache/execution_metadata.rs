@@ -4,6 +4,107 @@ use serde_json::json;
 use std::error::Error;
 
 #[test]
+fn typed_borrowed_metadata_is_written_and_updated_without_a_json_value()
+-> Result<(), Box<dyn Error>> {
+    #[derive(serde::Serialize)]
+    struct Cursor<'a> {
+        candidates: usize,
+        cohort: &'a str,
+    }
+
+    let temporary = tempfile::tempdir()?;
+    let cache = cache_at(temporary.path(), 64 * 1024)?;
+    let key = stage_key("typed-metadata")?;
+    let snapshot = Job::new("typed metadata").snapshot()?;
+    let mut lease = cache.lease(&key)?;
+    let first = Cursor {
+        candidates: 3,
+        cohort: "frozen cohort",
+    };
+    let mut generation = lease.save_active_generation(&snapshot, limits(), |_| Ok(&first))?;
+    lease.update_active_metadata(
+        &mut generation,
+        &snapshot,
+        limits(),
+        &Cursor {
+            candidates: 7,
+            cohort: "frozen cohort",
+        },
+    )?;
+    let active = lease.load_active(limits())?.ok_or("missing generation")?;
+    assert_eq!(active.generation(), &generation);
+    assert_eq!(
+        active.metadata(),
+        &json!({"candidates": 7, "cohort": "frozen cohort"})
+    );
+    Ok(())
+}
+
+#[test]
+fn changing_serialized_metadata_cannot_break_the_admitted_size() -> Result<(), Box<dyn Error>> {
+    struct Changing<'a> {
+        calls: std::cell::Cell<usize>,
+        larger: &'a str,
+        large_first: bool,
+    }
+
+    impl serde::Serialize for Changing<'_> {
+        fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+            let calls = self.calls.get();
+            self.calls.set(calls + 1);
+            serializer.serialize_str(if (calls == 0) == self.large_first {
+                self.larger
+            } else {
+                "small"
+            })
+        }
+    }
+
+    let temporary = tempfile::tempdir()?;
+    let cache = cache_at(temporary.path(), 64 * 1024)?;
+    cache.attach_memory_budget(MemoryBudget::new(64 * 1024 * 1024))?;
+    let key = stage_key("changing-typed-metadata")?;
+    let snapshot = Job::new("changing typed metadata").snapshot()?;
+    let mut lease = cache.lease(&key)?;
+    let mut generation =
+        lease.save_active_generation(&snapshot, limits(), |_| Ok(json!({"cursor": 1})))?;
+    let larger = "x".repeat(4_096);
+    for large_first in [false, true] {
+        let changing = Changing {
+            calls: std::cell::Cell::new(0),
+            larger: &larger,
+            large_first,
+        };
+        assert!(
+            lease
+                .update_active_metadata(&mut generation, &snapshot, limits(), &changing)
+                .is_err()
+        );
+        let active = lease
+            .load_active(limits())?
+            .ok_or("prior generation was lost")?;
+        assert_eq!(active.metadata(), &json!({"cursor": 1}));
+        drop(active);
+
+        let changing = Changing {
+            calls: std::cell::Cell::new(0),
+            larger: &larger,
+            large_first,
+        };
+        assert!(
+            lease
+                .save_active_generation(&snapshot, limits(), |_| Ok(changing))
+                .is_err()
+        );
+        let active = lease
+            .load_active(limits())?
+            .ok_or("prior generation was lost")?;
+        assert_eq!(active.metadata(), &json!({"cursor": 1}));
+    }
+    Ok(())
+}
+
+#[test]
 fn saving_a_generation_returns_the_same_identity_as_a_verified_load() -> Result<(), Box<dyn Error>>
 {
     let temporary = tempfile::tempdir()?;

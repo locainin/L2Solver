@@ -58,12 +58,12 @@ struct Component {
 }
 
 #[derive(Serialize)]
-struct EnvelopeRef<'a> {
+struct EnvelopeRef<'a, T: ?Sized> {
     version: u32,
     revision: u64,
     snapshot_version: u32,
     snapshot: &'a JobSnapshot,
-    metadata: &'a Value,
+    metadata: &'a T,
     components: &'a [Component; 3],
 }
 
@@ -338,17 +338,19 @@ impl Lease {
     ///
     /// The identity can be used to update metadata while the same lease remains held.
     /// The same recipe, memory, and metadata requirements as [`Self::save_active`] apply.
+    /// The metadata serializer is called twice and must produce a stable representation
     ///
     /// # Errors
     /// Returns an error for memory, quota, I/O, integrity, serialization, or database failures
-    pub fn save_active_generation<F>(
+    pub fn save_active_generation<F, T>(
         &mut self,
         snapshot: &JobSnapshot,
         limits: ExecutionCheckpointLimits,
         write: F,
     ) -> Result<ExecutionGeneration>
     where
-        F: FnOnce(&mut ExecutionWriter) -> Result<Value>,
+        F: FnOnce(&mut ExecutionWriter) -> Result<T>,
+        T: Serialize,
     {
         if !snapshot.is_valid_checkpoint() {
             return Err(CacheError::CorruptCheckpoint);
@@ -554,7 +556,7 @@ struct PreparedGeneration {
     _memory: Option<MemoryLease>,
 }
 
-fn write_generation<F>(
+fn write_generation<F, T>(
     directory: &HeldDirectory,
     budget: &Rc<RefCell<Budget>>,
     snapshot: &JobSnapshot,
@@ -563,7 +565,8 @@ fn write_generation<F>(
     write: F,
 ) -> Result<PreparedGeneration>
 where
-    F: FnOnce(&mut ExecutionWriter) -> Result<Value>,
+    F: FnOnce(&mut ExecutionWriter) -> Result<T>,
+    T: Serialize,
 {
     let component = |name: &str, executor| -> Result<ComponentWriter> {
         Ok(ComponentWriter {
@@ -602,19 +605,15 @@ where
         metadata: &metadata,
         components: &components,
     };
-    let envelope_memory = if memory_budget.is_some() {
-        let encoded = memory::json_size(&envelope)?;
-        if encoded > limits.max_metadata_bytes {
-            return Err(CacheError::MetadataTooLarge {
-                limit_bytes: usize::try_from(limits.max_metadata_bytes).unwrap_or(usize::MAX),
-                actual_bytes: usize::try_from(encoded).unwrap_or(usize::MAX),
-            });
-        }
-        memory::reserve(memory_budget, memory::checkpoint_charge(encoded)?)?
-    } else {
-        None
-    };
-    let envelope_json = encode_envelope(&envelope, limits.max_metadata_bytes)?;
+    let encoded = memory::json_size(&envelope)?;
+    if encoded > limits.max_metadata_bytes {
+        return Err(CacheError::MetadataTooLarge {
+            limit_bytes: usize::try_from(limits.max_metadata_bytes).unwrap_or(usize::MAX),
+            actual_bytes: usize::try_from(encoded).unwrap_or(usize::MAX),
+        });
+    }
+    let envelope_memory = memory::reserve(memory_budget, memory::checkpoint_charge(encoded)?)?;
+    let envelope_json = encode_sized_envelope(&envelope, encoded)?;
     let envelope_bytes =
         u64::try_from(envelope_json.len()).map_err(|_| CacheError::SizeOverflow)?;
     {
@@ -689,6 +688,9 @@ impl Write for BoundedBytes {
             self.exceeded = true;
             return Err(io::Error::other("checkpoint metadata limit exceeded"));
         }
+        self.bytes
+            .try_reserve(bytes.len())
+            .map_err(|_| io::Error::other("checkpoint metadata allocation failed"))?;
         self.bytes.extend_from_slice(bytes);
         Ok(bytes.len())
     }
@@ -697,7 +699,10 @@ impl Write for BoundedBytes {
     }
 }
 
-fn encode_envelope(envelope: &EnvelopeRef<'_>, limit: u64) -> Result<String> {
+fn encode_envelope<T: Serialize + ?Sized>(
+    envelope: &EnvelopeRef<'_, T>,
+    limit: u64,
+) -> Result<String> {
     let limit = usize::try_from(limit).unwrap_or(usize::MAX);
     let mut output = BoundedBytes {
         bytes: Vec::new(),
@@ -714,6 +719,27 @@ fn encode_envelope(envelope: &EnvelopeRef<'_>, limit: u64) -> Result<String> {
     result?;
     String::from_utf8(output.bytes)
         .map_err(|_| CacheError::InvalidInput("checkpoint JSON is not UTF-8"))
+}
+
+fn encode_sized_envelope<T: Serialize + ?Sized>(
+    envelope: &EnvelopeRef<'_, T>,
+    expected_bytes: u64,
+) -> Result<String> {
+    // A caller-provided serializer must not grow after memory has been admitted
+    let encoded = match encode_envelope(envelope, expected_bytes) {
+        Err(CacheError::MetadataTooLarge { .. }) => {
+            return Err(CacheError::InvalidInput(
+                "checkpoint metadata changed while serializing",
+            ));
+        }
+        result => result?,
+    };
+    if u64::try_from(encoded.len()).map_err(|_| CacheError::SizeOverflow)? != expected_bytes {
+        return Err(CacheError::InvalidInput(
+            "checkpoint metadata changed while serializing",
+        ));
+    }
+    Ok(encoded)
 }
 
 fn publish(

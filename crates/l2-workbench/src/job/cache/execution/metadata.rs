@@ -4,9 +4,10 @@ use super::{
     CacheError, CheckpointStatus, Component, Durability, ENVELOPE_VERSION, Envelope, EnvelopeRef,
     ExecutionCheckpointLimits, JOB_SNAPSHOT_VERSION, JobSnapshot, Lease, MAX_RELATIVE_PATH_BYTES,
     MemoryLease, OptionalExtension, Result, TransactionBehavior, column_length, database,
-    encode_envelope, envelope_revision, memory, now_ns, params, supports_job_snapshot_version,
+    encode_sized_envelope, envelope_revision, memory, now_ns, params,
+    supports_job_snapshot_version,
 };
-use serde_json::Value;
+use serde::Serialize;
 use sha2::{Digest, Sha256};
 
 /// Identity of one verified active execution revision and its immutable streams
@@ -34,16 +35,18 @@ impl Lease {
     /// consistent with those files and must use a generation returned by `load_active` while
     /// holding this lease. A newer stream or metadata revision invalidates the supplied identity.
     /// A successful update advances the supplied identity to the newly committed revision.
+    /// The metadata serializer is called twice and must produce a stable representation
+    /// The caller accounts for any owned metadata built before this method is invoked
     ///
     /// # Errors
     /// Returns an error for a stale or corrupt generation, invalid snapshot, quota, memory,
     /// serialization, or database failure. The previous generation remains authoritative.
-    pub fn update_active_metadata(
+    pub fn update_active_metadata<T: Serialize + ?Sized>(
         &mut self,
         generation: &mut ExecutionGeneration,
         snapshot: &JobSnapshot,
         limits: ExecutionCheckpointLimits,
-        metadata: &Value,
+        metadata: &T,
     ) -> Result<()> {
         if !snapshot.is_valid_checkpoint() {
             return Err(CacheError::CorruptCheckpoint);
@@ -71,7 +74,7 @@ impl Lease {
             });
         }
         let _new_memory = memory::reserve(budget, memory::checkpoint_charge(next_size)?)?;
-        let next_json = encode_envelope(&next, limits.max_metadata_bytes)?;
+        let next_json = encode_sized_envelope(&next, next_size)?;
         let snapshot_json = serde_json::to_string(snapshot)?;
         let new_total = previous
             .streams
