@@ -1303,18 +1303,17 @@ fn read_memory_source(
     job: &Job,
     memory: &MemoryBudget,
 ) -> Result<SourceData, Box<dyn Error>> {
-    let requested = length.checked_add(128).ok_or("source memory overflows")?;
-    let mut lease = memory.try_reserve(MemoryClass::Base, u64::try_from(requested)?)?;
-    input.budget.reserve(
-        u64::try_from(length)?
-            .checked_add(1)
-            .ok_or_else(|| invalid_input("source read length overflows"))?,
-    )?;
-    let (bytes, sha256) = read_snapshot(
+    let mut lease = memory.try_reserve(MemoryClass::Base, 0)?;
+    let read_bytes = u64::try_from(length)?
+        .checked_add(1)
+        .ok_or_else(|| invalid_input("source read length overflows"))?;
+    let (bytes, sha256) = read_snapshot_inner(
         CancellableReader::new(file, job),
         per_file_limit,
         Some(length),
         spec.expected_sha256.as_deref(),
+        Some(&mut lease),
+        || input.budget.reserve(read_bytes),
     )?;
     let retained = bytes
         .capacity()
@@ -1592,7 +1591,14 @@ pub(super) fn read_snapshot(
     expected_length: Option<usize>,
     expected_sha256: Option<&str>,
 ) -> Result<(Vec<u8>, String), Box<dyn Error>> {
-    read_snapshot_inner(file, maximum, expected_length, expected_sha256, None)
+    read_snapshot_inner(
+        file,
+        maximum,
+        expected_length,
+        expected_sha256,
+        None,
+        || Ok(()),
+    )
 }
 
 // The caller retains this charge with the returned buffers and rolls it back after errors
@@ -1609,6 +1615,7 @@ pub(super) fn read_snapshot_with_memory(
         expected_length,
         expected_sha256,
         Some(memory),
+        || Ok(()),
     )
 }
 
@@ -1618,6 +1625,7 @@ fn read_snapshot_inner(
     expected_length: Option<usize>,
     expected_sha256: Option<&str>,
     mut memory: Option<&mut MemoryLease>,
+    before_read: impl FnOnce() -> Result<(), Box<dyn Error>>,
 ) -> Result<(Vec<u8>, String), Box<dyn Error>> {
     let before = file.file_metadata()?;
     let length = checked_length(&before, expected_length, maximum)?;
@@ -1636,6 +1644,8 @@ fn read_snapshot_inner(
     if let Some(lease) = memory {
         super::analysis_memory::charge(lease, bytes.capacity() - length)?;
     }
+    // Allocation refusal must not consume source-read capacity
+    before_read()?;
     bytes.resize(length, 0);
     if let Err(error) = file.read_exact(&mut bytes) {
         if error.kind() != io::ErrorKind::UnexpectedEof {

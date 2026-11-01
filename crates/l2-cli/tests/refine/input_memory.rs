@@ -67,6 +67,43 @@ fn loaded_source_metadata_is_admitted_before_creating_records() -> Result<(), Bo
 }
 
 #[test]
+fn memory_source_refusal_precedes_its_read_budget_and_file_reads() -> Result<(), Box<dyn Error>> {
+    let file = tempfile::NamedTempFile::new()?;
+    let original = b"source memory admission";
+    std::fs::write(file.path(), original)?;
+    let job = l2_workbench::job::Job::new("source admission");
+    let input_memory = MemoryBudget::new(4096);
+    let input = super::prepare_input_set_with_limit(file.path(), u64::MAX, &job, &input_memory)?;
+    let before = input.budget.remaining();
+    let memory = MemoryBudget::new(u64::try_from(original.len() + 127)?);
+    let error = super::read_memory_source(
+        &input,
+        input.sources.first().ok_or("source missing")?,
+        std::fs::File::open(file.path())?,
+        original.len(),
+        original.len(),
+        &job,
+        &memory,
+    )
+    .err()
+    .ok_or("source bytes bypassed memory admission")?;
+    assert!(matches!(
+        crate::memory_error::find(error.as_ref()),
+        Some(MemoryError::Limit { .. })
+    ));
+    assert_eq!(input.budget.remaining(), before);
+    assert_eq!(
+        job.snapshot()?
+            .counters
+            .get(&l2_workbench::job::Counter::SourceReadBytes),
+        Some(&0)
+    );
+    assert_eq!(memory.snapshot()?.used_bytes, 0);
+    assert_eq!(std::fs::read(file.path())?, original);
+    Ok(())
+}
+
+#[test]
 fn source_fingerprint_metadata_is_admitted_and_released_with_its_owner()
 -> Result<(), Box<dyn Error>> {
     let file = tempfile::NamedTempFile::new()?;
