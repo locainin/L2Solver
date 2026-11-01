@@ -23,6 +23,15 @@ impl ArtifactOrigin {
             } => raw_name_sha256
                 .capacity()
                 .checked_add(raw_name_hex_preview.capacity()),
+            Self::SourceArchiveMember {
+                archive_sha256,
+                raw_name_sha256,
+                raw_name_hex_preview,
+                ..
+            } => archive_sha256
+                .capacity()
+                .checked_add(raw_name_sha256.capacity())?
+                .checked_add(raw_name_hex_preview.capacity()),
             Self::Transformation {
                 operation,
                 cue_origins,

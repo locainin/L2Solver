@@ -640,7 +640,7 @@ fn result_identity_uses_ordered_content_hashes_and_analysis_settings() -> Result
     assert_eq!(identity.algorithm_version, 17);
     assert_eq!(
         identity.settings.get("analyzer_algorithm_version"),
-        Some(&json!(14))
+        Some(&json!(15))
     );
     assert_eq!(
         identity.settings.get("analysis_receipt_schema_version"),
@@ -725,7 +725,7 @@ fn matching_result_directory_is_reused_before_artifact_analysis() -> Result<(), 
 }
 
 #[test]
-fn version_11_analyzer_result_is_not_reused() -> Result<(), Box<dyn Error>> {
+fn version_14_analyzer_result_is_not_reused() -> Result<(), Box<dyn Error>> {
     rejects_prior_result_version(StaleResultVersion::Analyzer)
 }
 
@@ -778,14 +778,14 @@ fn rejects_prior_result_version(version: StaleResultVersion) -> Result<(), Box<d
                 .get_mut("settings")
                 .and_then(serde_json::Value::as_object_mut)
                 .ok_or("result settings are missing")?;
-            settings.insert("analyzer_algorithm_version".to_owned(), json!(11));
+            settings.insert("analyzer_algorithm_version".to_owned(), json!(14));
         }
     }
     fs::write(&manifest_path, serde_json::to_vec(&manifest)?)?;
 
     let error = run(&options, &mut Vec::new())
         .err()
-        .ok_or("version 11 result was reused under version 12")?;
+        .ok_or("a previous result version was reused")?;
     assert!(
         error
             .to_string()

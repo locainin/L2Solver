@@ -1,3 +1,4 @@
+use super::provenance::ArtifactSelection;
 use super::{
     ArtifactSourceContext, CaseArtifactIndex, CohortArtifactContextIndex, artifact_packet_summary,
     artifact_provenance, collect_cohort_artifacts, selected_artifact_source_ranges,
@@ -68,6 +69,12 @@ fn retained_case_keeps_direct_ranges_with_its_node() -> Result<(), Box<dyn Error
         Some([range].as_slice())
     );
     assert!(provenance.source_ranges.is_empty());
+    assert!(
+        provenance
+            .canonical_origin
+            .get("local_case_identity")
+            .is_none_or(Value::is_null)
+    );
     Ok(())
 }
 
@@ -82,7 +89,10 @@ fn omitted_case_prefers_verified_selection_ranges_over_node_ranges() -> Result<(
         &case,
         node_id,
         None,
-        Some(json!({"source_ranges": [selected_range]})),
+        Some(ArtifactSelection {
+            details: json!({}),
+            source_ranges: vec![selected_range.clone()],
+        }),
     )?;
 
     assert_eq!(
@@ -138,7 +148,10 @@ fn selected_artifact_without_verified_ranges_does_not_infer_node_ranges()
         &case,
         node_id,
         None,
-        Some(json!({"transform": "nonlinear"})),
+        Some(ArtifactSelection {
+            details: json!({"transform": "nonlinear"}),
+            source_ranges: Vec::new(),
+        }),
     )?;
 
     assert!(provenance.source_ranges.is_empty());
@@ -177,7 +190,7 @@ fn source_provenance(
     case: &Case,
     node_id: u64,
     case_id: Option<&str>,
-    selection: Option<Value>,
+    selection: Option<ArtifactSelection>,
 ) -> Result<super::ArtifactProvenance, Box<dyn Error>> {
     let node = case.node(node_id).ok_or("artifact node is missing")?;
     let context = ArtifactSourceContext {

@@ -14,7 +14,7 @@ use super::{
         recovery_worker_count,
     },
     provenance::{
-        ArtifactSourceContext, CohortArtifactContextIndex, artifact_provenance,
+        ArtifactSelection, ArtifactSourceContext, CohortArtifactContextIndex, artifact_provenance,
         selected_artifact_source_ranges,
     },
     recovery_cache::{CachedRecovery, RecoveryContext},
@@ -688,7 +688,8 @@ fn collect_selected_case_artifacts(
                 .ok_or("recovered artifact provenance references a missing node")?;
             let number = collection.next_file_number()?;
             let mut selection = serde_json::to_value(selected_origin)?;
-            let source_ranges = selected_artifact_source_ranges(selected_origin, index, memory)?;
+            let mut source_ranges =
+                selected_artifact_source_ranges(selected_origin, index, memory)?;
             if let Some(fields) = selection.as_object_mut() {
                 fields.insert(
                     "selected_file_name".to_owned(),
@@ -714,14 +715,12 @@ fn collect_selected_case_artifacts(
                         }),
                     );
                 }
-                if !source_ranges.ranges.is_empty() {
-                    fields.insert(
-                        "source_ranges".to_owned(),
-                        serde_json::json!(&source_ranges.ranges),
-                    );
-                }
             }
             let context = context_for_node(node, case)?;
+            let selection = ArtifactSelection {
+                details: selection,
+                source_ranges: std::mem::take(&mut source_ranges.ranges),
+            };
             let origin = artifact_provenance(
                 "recovered_artifact",
                 &context,

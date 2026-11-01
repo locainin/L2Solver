@@ -278,10 +278,14 @@ fn archive_above_sixty_four_mib_keeps_its_exact_boundary_and_small_member()
         SourceIdentity::sha256_file(output.join(file))?,
         SourceIdentity::sha256_file(input)?
     );
-    assert!(artifacts.iter().any(
-        |item| item.get("sha256").and_then(serde_json::Value::as_str)
-            == Some(l2_workbench::sha256(&png).as_str())
-    ));
+    assert!(
+        artifacts.iter().any(
+            |item| item.get("sha256").and_then(serde_json::Value::as_str)
+                == Some(l2_workbench::sha256(&png).as_str())
+        ),
+        "validated small member missing; source omissions: {:?}",
+        manifest.pointer("/sources/0/omissions")
+    );
     Ok(())
 }
 

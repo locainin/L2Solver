@@ -31,7 +31,7 @@ use std::{
     ops::Deref,
 };
 
-pub(super) const REFINE_ANALYZER_ALGORITHM_VERSION: u32 = 14;
+pub(super) const REFINE_ANALYZER_ALGORITHM_VERSION: u32 = 15;
 pub(super) const CACHE_ANALYSIS_SCHEMA_VERSION: u32 = 1;
 const MAX_CACHE_RECEIPT_BYTES: usize = 8 * 1024 * 1024;
 
@@ -125,7 +125,13 @@ pub(super) fn analyze_sources(
             .artifacts
             .iter()
             .flat_map(|artifact| &artifact.origins)
-            .filter(|origin| matches!(origin, ArtifactOrigin::ArchiveMember { .. }))
+            .filter(|origin| {
+                matches!(
+                    origin,
+                    ArtifactOrigin::ArchiveMember { .. }
+                        | ArtifactOrigin::SourceArchiveMember { .. }
+                )
+            })
             .count();
         analysis.append_source(source_index, source, source_report, memory)?;
         job.advance(Phase::Expansion, u64::try_from(expanded_members)?)?;
@@ -261,6 +267,7 @@ fn retain_source_formats(
     streaming.charge_range_work(report.work_bytes)?;
     let mut next_file_index = report.artifacts.len();
     if let Some(archive) = range.archive {
+        let previous_work = report.work_bytes;
         if range.retain_source {
             let parent_index = next_file_index;
             next_file_index += 1;
@@ -271,7 +278,6 @@ fn retain_source_formats(
                 &report.source_sha256,
                 &archive,
             )?;
-            let previous_work = report.work_bytes;
             super::range_members::append_members(
                 &mut report,
                 archive,
@@ -279,15 +285,20 @@ fn retain_source_formats(
                 options,
                 &mut omission_memory,
             )?;
-            streaming.charge_range_work(
-                report
-                    .work_bytes
-                    .checked_sub(previous_work)
-                    .ok_or("range member work decreased")?,
-            )?;
         } else {
-            record_unpublished_archive_members(&archive, &mut report, &mut omission_memory)?;
+            super::range_members::append_source_members(
+                &mut report,
+                archive,
+                options,
+                &mut omission_memory,
+            )?;
         }
+        streaming.charge_range_work(
+            report
+                .work_bytes
+                .checked_sub(previous_work)
+                .ok_or("range member work decreased")?,
+        )?;
     }
     if let Some(png) = range.png {
         let artifact_index = report
@@ -312,43 +323,6 @@ fn retain_source_formats(
         omission_memory,
         source_digest_memory: range.source_digest_memory,
     })
-}
-
-fn record_unpublished_archive_members(
-    archive: &l2_workbench::artifact::zip::ZipArtifactReport,
-    report: &mut l2_workbench::artifact::ArtifactAnalysis,
-    memory: &mut MemoryLease,
-) -> Result<(), Box<dyn Error>> {
-    use l2_workbench::artifact::{AnalysisOmission, FileRange};
-
-    let range = FileRange {
-        offset: 0,
-        length: archive.archive_size,
-    };
-    let count = archive
-        .entries
-        .iter()
-        .filter(|entry| entry.content.is_some())
-        .count();
-    if count > 0 {
-        super::analysis_memory::reserve_omission(&mut report.omissions, memory)?;
-        report
-            .omissions
-            .push(AnalysisOmission::SourceArchiveMembersOmitted { range, count });
-    }
-    for entry in &archive.entries {
-        if let Some(reason) = entry.omission {
-            super::analysis_memory::reserve_omission(&mut report.omissions, memory)?;
-            report
-                .omissions
-                .push(AnalysisOmission::SourceArchiveMemberOmission {
-                    range,
-                    entry_index: entry.metadata.index,
-                    reason,
-                });
-        }
-    }
-    Ok(())
 }
 
 fn no_case_space(
@@ -990,7 +964,12 @@ fn record_analysis_work(
         .artifacts
         .iter()
         .flat_map(|artifact| &artifact.origins)
-        .filter(|origin| matches!(origin, ArtifactOrigin::ArchiveMember { .. }))
+        .filter(|origin| {
+            matches!(
+                origin,
+                ArtifactOrigin::ArchiveMember { .. } | ArtifactOrigin::SourceArchiveMember { .. }
+            )
+        })
         .count();
     let validated = report
         .artifacts
@@ -1381,7 +1360,7 @@ fn validate_cached_lineage(
         for origin in &artifact.origins {
             let (parent_index, range) = match origin {
                 ArtifactOrigin::Source => continue,
-                ArtifactOrigin::SourceRange { .. } => {
+                ArtifactOrigin::SourceRange { .. } | ArtifactOrigin::SourceArchiveMember { .. } => {
                     return Err(invalid_cache_entry(
                         "cached source-range reports are unsupported",
                     ));

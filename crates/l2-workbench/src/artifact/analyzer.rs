@@ -213,6 +213,29 @@ pub enum ArtifactOrigin {
         /// Expanded size checked by the ZIP parser
         expanded_size: u64,
     },
+    /// Expanded member bytes validated against a ZIP range in the source
+    SourceArchiveMember {
+        /// Exact archive range in the source identified by the containing analysis
+        archive_range: FileRange,
+        /// SHA-256 of the complete validated archive range
+        archive_sha256: String,
+        /// Zero-based central-directory entry index
+        entry_index: usize,
+        /// SHA-256 of the raw archive member name
+        raw_name_sha256: String,
+        /// Bounded hexadecimal preview of the raw member name
+        raw_name_hex_preview: String,
+        /// ZIP compression method recorded by the validated directory
+        compression_method: u16,
+        /// Compressed size declared by the validated directory
+        compressed_size: u64,
+        /// Expanded size checked by the ZIP parser
+        expanded_size: u64,
+        /// CRC-32 checked against the expanded member bytes
+        crc32: u32,
+        /// Member local-header offset within the archive range
+        local_header_offset: u64,
+    },
     /// Bytes produced by one syntax-gated canonical operation
     Transformation {
         /// Parent artifact index containing the complete transform input
@@ -318,6 +341,30 @@ pub enum AnalysisOmission {
         entry_index: usize,
         /// Parser reason the entry could not be expanded
         reason: ZipArtifactOmissionReason,
+    },
+    /// An expanded source archive member exceeded the remaining output budget
+    SourceArchiveMemberOutputLimit {
+        /// Exact archive range in the immutable source
+        range: FileRange,
+        /// Zero-based central-directory entry index
+        entry_index: usize,
+        /// Expanded member length
+        length: usize,
+        /// Output bytes available before this member
+        remaining: usize,
+    },
+    /// Work required to retain a source archive member exceeded the remaining budget
+    SourceArchiveMemberWorkLimit {
+        /// Exact archive range in the immutable source
+        range: FileRange,
+        /// Zero-based central-directory entry index
+        entry_index: usize,
+        /// Work stage stopped by the limit
+        stage: AnalysisStage,
+        /// Work bytes required by the stage
+        requested: usize,
+        /// Work bytes available before this stage
+        remaining: usize,
     },
     /// A whole-source streaming transformation was incomplete or rejected
     SourceStreamTransform {
@@ -1693,15 +1740,45 @@ pub fn archive_member_origin(
     archive_length: usize,
     metadata: &super::zip::ZipArtifactEntryMetadata,
 ) -> ArtifactOrigin {
+    let (raw_name_sha256, raw_name_hex_preview) = archive_member_name(metadata);
     ArtifactOrigin::ArchiveMember {
         parent_index,
         archive_range: complete_range(archive_length),
         entry_index: metadata.index,
-        raw_name_sha256: sha256(&metadata.raw_name),
-        raw_name_hex_preview: bytes_hex_preview(&metadata.raw_name, 32),
+        raw_name_sha256,
+        raw_name_hex_preview,
         compressed_size: metadata.compressed_size,
         expanded_size: metadata.expanded_size,
     }
+}
+
+/// Construct a member origin anchored to a validated source archive range
+#[must_use]
+pub fn source_archive_member_origin(
+    archive_sha256: &str,
+    archive_length: usize,
+    metadata: &super::zip::ZipArtifactEntryMetadata,
+) -> ArtifactOrigin {
+    let (raw_name_sha256, raw_name_hex_preview) = archive_member_name(metadata);
+    ArtifactOrigin::SourceArchiveMember {
+        archive_range: complete_range(archive_length),
+        archive_sha256: archive_sha256.to_owned(),
+        entry_index: metadata.index,
+        raw_name_sha256,
+        raw_name_hex_preview,
+        compression_method: metadata.compression_method,
+        compressed_size: metadata.compressed_size,
+        expanded_size: metadata.expanded_size,
+        crc32: metadata.crc32,
+        local_header_offset: metadata.local_header_offset,
+    }
+}
+
+fn archive_member_name(metadata: &super::zip::ZipArtifactEntryMetadata) -> (String, String) {
+    (
+        sha256(&metadata.raw_name),
+        bytes_hex_preview(&metadata.raw_name, 32),
+    )
 }
 
 fn bytes_hex_preview(bytes: &[u8], maximum: usize) -> String {
@@ -1823,6 +1900,16 @@ fn origin_owned_bytes(origin: &ArtifactOrigin) -> Result<usize, AnalyzerError> {
             .capacity()
             .checked_add(raw_name_hex_preview.capacity())
             .ok_or(AnalyzerError::AllocationFailure),
+        ArtifactOrigin::SourceArchiveMember {
+            archive_sha256,
+            raw_name_sha256,
+            raw_name_hex_preview,
+            ..
+        } => archive_sha256
+            .capacity()
+            .checked_add(raw_name_sha256.capacity())
+            .and_then(|bytes| bytes.checked_add(raw_name_hex_preview.capacity()))
+            .ok_or(AnalyzerError::AllocationFailure),
         ArtifactOrigin::Transformation { cue_origins, .. } => cue_origins
             .capacity()
             .checked_mul(std::mem::size_of::<RegionCueOrigin>())
@@ -1888,7 +1975,9 @@ const fn candidate_output_size(
 
 const fn origin_parent(origin: &ArtifactOrigin) -> Option<usize> {
     match origin {
-        ArtifactOrigin::Source | ArtifactOrigin::SourceRange { .. } => None,
+        ArtifactOrigin::Source
+        | ArtifactOrigin::SourceRange { .. }
+        | ArtifactOrigin::SourceArchiveMember { .. } => None,
         ArtifactOrigin::EmbeddedObject { parent_index, .. }
         | ArtifactOrigin::ArchiveMember { parent_index, .. }
         | ArtifactOrigin::Transformation { parent_index, .. } => Some(*parent_index),

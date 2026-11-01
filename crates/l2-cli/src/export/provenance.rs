@@ -233,6 +233,11 @@ pub(super) struct SelectedSourceRanges {
     _memory: Option<MemoryLease>,
 }
 
+pub(super) struct ArtifactSelection {
+    pub(super) details: serde_json::Value,
+    pub(super) source_ranges: Vec<SourceRange>,
+}
+
 pub(super) fn selected_artifact_source_ranges(
     selected_origin: &workbench::artifact_export::ArtifactProvenance,
     index: &CaseArtifactIndex<'_>,
@@ -531,10 +536,12 @@ pub(super) fn artifact_provenance(
     context: &ArtifactSourceContext,
     node: Option<&Node>,
     description: Option<String>,
-    selection: Option<serde_json::Value>,
+    selection: Option<ArtifactSelection>,
     signature_candidates: &[&Node],
     case: &Case,
 ) -> Result<ArtifactProvenance, Box<dyn Error>> {
+    let graph_retained = context.case_id.is_some();
+    let (selection, selected_ranges) = selection_parts(selection, graph_retained);
     let selected_node_id = node.map(|node| node.id);
     let validation_node_id = selection
         .as_ref()
@@ -553,8 +560,7 @@ pub(super) fn artifact_provenance(
         }
     }
     let source_projection =
-        artifact_source_projection(context, node, selected_node_id, selection.as_ref())?;
-    let graph_retained = context.case_id.is_some();
+        artifact_source_projection(context, node, selected_node_id, selected_ranges);
     // Copy evidence only when the sidecar retains the corresponding Case
     let node = if graph_retained { node.cloned() } else { None };
     let selection = graph_retained.then_some(selection).flatten();
@@ -617,6 +623,26 @@ pub(super) fn artifact_provenance(
     })
 }
 
+fn selection_parts(
+    selection: Option<ArtifactSelection>,
+    graph_retained: bool,
+) -> (Option<serde_json::Value>, Option<Vec<SourceRange>>) {
+    let Some(mut selection) = selection else {
+        return (None, None);
+    };
+    // An omitted Case stores the ranges directly on its artifact origin
+    if graph_retained
+        && !selection.source_ranges.is_empty()
+        && let Some(fields) = selection.details.as_object_mut()
+    {
+        fields.insert(
+            "source_ranges".to_owned(),
+            serde_json::json!(&selection.source_ranges),
+        );
+    }
+    (Some(selection.details), Some(selection.source_ranges))
+}
+
 struct ArtifactSourceProjection<'a> {
     source_ranges: Vec<SourceRange>,
     local_case_identity: Option<serde_json::Value>,
@@ -627,23 +653,20 @@ fn artifact_source_projection<'a>(
     context: &'a ArtifactSourceContext,
     node: Option<&Node>,
     selected_node_id: Option<u64>,
-    selection: Option<&serde_json::Value>,
-) -> Result<ArtifactSourceProjection<'a>, Box<dyn Error>> {
-    let source_ranges = if let Some(selection) = selection {
-        selection
-            .get("source_ranges")
-            .and_then(serde_json::Value::as_array)
-            .filter(|ranges| !ranges.is_empty())
-            .map(|ranges| serde_json::from_value(serde_json::Value::Array(ranges.clone())))
-            .transpose()?
-            .unwrap_or_default()
-    } else {
-        node.map_or_else(Vec::new, |node| node.ranges.clone())
-    };
-    let source_backed = !source_ranges.is_empty();
+    selected_ranges: Option<Vec<SourceRange>>,
+) -> ArtifactSourceProjection<'a> {
     let graph_retained = context.case_id.is_some();
+    let source_backed = selected_ranges.as_ref().map_or_else(
+        || node.is_some_and(|node| !node.ranges.is_empty()),
+        |ranges| !ranges.is_empty(),
+    );
+    let source_ranges = match selected_ranges {
+        Some(ranges) => ranges,
+        None if graph_retained => Vec::new(),
+        None => node.map_or_else(Vec::new, |node| node.ranges.clone()),
+    };
 
-    Ok(ArtifactSourceProjection {
+    ArtifactSourceProjection {
         source_ranges,
         local_case_identity: (graph_retained && !source_backed).then(|| {
             serde_json::json!({
@@ -652,7 +675,7 @@ fn artifact_source_projection<'a>(
             })
         }),
         local_case_scope: (graph_retained && !source_backed).then_some(&context.case_scope),
-    })
+    }
 }
 
 fn canonical_node(node: &Node, case: &Case) -> Result<serde_json::Value, Box<dyn Error>> {

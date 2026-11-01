@@ -63,6 +63,26 @@ fn archive_origin_charges_exact_owned_string_capacity() {
 }
 
 #[test]
+fn source_archive_origin_charges_all_owned_string_capacity() {
+    let origin = ArtifactOrigin::SourceArchiveMember {
+        archive_range: FileRange {
+            offset: 0,
+            length: 3,
+        },
+        archive_sha256: "archive".to_owned(),
+        entry_index: 0,
+        raw_name_sha256: "hash".to_owned(),
+        raw_name_hex_preview: "70617468".to_owned(),
+        compression_method: 0,
+        compressed_size: 3,
+        expanded_size: 3,
+        crc32: 0,
+        local_header_offset: 0,
+    };
+    assert_eq!(origin.owned_heap_bytes(), Some(19));
+}
+
+#[test]
 fn transformation_origin_charges_keys_indices_and_cue_capacity() {
     let cues = vec![
         RegionCueOrigin::EncodingRun,

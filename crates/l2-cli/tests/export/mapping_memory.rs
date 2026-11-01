@@ -131,6 +131,51 @@ fn mapping_receipt_keeps_exact_ranges_and_releases_its_charge() -> TestResult {
 }
 
 #[test]
+fn retained_case_keeps_the_exact_selected_mapping_ranges_in_its_selection() -> TestResult {
+    let case = mapped_der_case()?;
+    let temporary = tempfile::tempdir()?;
+    let mut artifacts = super::super::ArtifactCollection::new(
+        temporary.path(),
+        super::super::ArtifactLimits::default(),
+    )?;
+    let budget = MemoryBudget::new(8 * 1024 * 1024);
+    super::super::collect_case_artifacts_with_context(
+        &mut artifacts,
+        &case,
+        Some(&budget),
+        |_, _| {
+            let mut source = context();
+            source.case_id = Some("retained-case".to_owned());
+            Ok(source)
+        },
+    )?;
+    let mut found = false;
+    artifacts.visit_artifact_origins(|_, _, origin| {
+        found = true;
+        assert!(origin.source_ranges.is_empty());
+        let ranges = origin
+            .selection
+            .as_ref()
+            .and_then(|selection| selection.get("source_ranges"))
+            .and_then(serde_json::Value::as_array)
+            .ok_or("selection source ranges are missing")?;
+        assert_eq!(ranges.len(), (CHILDREN * 2 + 4) / 2);
+        assert_eq!(
+            ranges.first().and_then(|range| range.get("offset")),
+            Some(&json!(0))
+        );
+        assert_eq!(
+            ranges.last().and_then(|range| range.get("offset")),
+            Some(&json!(1026))
+        );
+        Ok(())
+    })?;
+    assert!(found);
+    assert_eq!(budget.snapshot()?.used_bytes, 0);
+    Ok(())
+}
+
+#[test]
 fn selected_source_ranges_remain_charged_until_the_ranges_drop() -> TestResult {
     let case = mapped_der_case()?;
     let selected = crate::workbench::artifact_export::select_artifacts(&case, None)?;

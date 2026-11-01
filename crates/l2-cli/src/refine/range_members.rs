@@ -2,8 +2,11 @@
 
 use l2_workbench::artifact::{
     AnalysisFormat, AnalysisOmission, AnalysisStage, AnalyzedArtifact, ArtifactAnalysis,
-    ArtifactAnalysisOptions, ArtifactOrigin, ArtifactValidationState, ValidationSummary,
-    analyze_artifacts_with_memory, archive_member_origin, zip::ZipArtifactReport,
+    ArtifactAnalysisOptions, ArtifactOrigin, ArtifactValidationState, FileRange, ValidationSummary,
+    analyze_artifacts_with_memory, archive_member_origin, source_archive_member_origin,
+    zip::{
+        ZipArtifactEntry, ZipArtifactEntryMetadata, ZipArtifactOmissionReason, ZipArtifactReport,
+    },
 };
 use l2_workbench::job::MemoryLease;
 use std::{error::Error, io};
@@ -12,6 +15,52 @@ pub(super) fn append_members(
     report: &mut ArtifactAnalysis,
     archive: ZipArtifactReport,
     parent_index: usize,
+    options: ArtifactAnalysisOptions,
+    omission_memory: &mut MemoryLease,
+) -> Result<(), Box<dyn Error>> {
+    append_archive_entries(
+        report,
+        archive.entries,
+        archive.archive_size,
+        ArchiveParent::Artifact(parent_index),
+        options,
+        omission_memory,
+    )
+}
+
+pub(super) fn append_source_members(
+    report: &mut ArtifactAnalysis,
+    archive: ZipArtifactReport,
+    options: ArtifactAnalysisOptions,
+    omission_memory: &mut MemoryLease,
+) -> Result<(), Box<dyn Error>> {
+    let ZipArtifactReport {
+        archive_sha256,
+        archive_size,
+        entries,
+        ..
+    } = archive;
+    append_archive_entries(
+        report,
+        entries,
+        archive_size,
+        ArchiveParent::Source(&archive_sha256),
+        options,
+        omission_memory,
+    )
+}
+
+#[derive(Clone, Copy)]
+enum ArchiveParent<'a> {
+    Artifact(usize),
+    Source(&'a str),
+}
+
+fn append_archive_entries(
+    report: &mut ArtifactAnalysis,
+    entries: Vec<ZipArtifactEntry>,
+    archive_length: usize,
+    parent: ArchiveParent<'_>,
     options: ArtifactAnalysisOptions,
     omission_memory: &mut MemoryLease,
 ) -> Result<(), Box<dyn Error>> {
@@ -24,15 +73,23 @@ pub(super) fn append_members(
         })
         .ok_or("signature work overflows")?;
     let zip_used = report.zip_expanded_work_bytes;
+    let next_index = match parent {
+        ArchiveParent::Artifact(index) => index.checked_add(1).ok_or("artifact index overflows")?,
+        ArchiveParent::Source(_) => report
+            .artifacts
+            .iter()
+            .map(|artifact| artifact.index)
+            .max()
+            .map_or(Some(0), |index| index.checked_add(1))
+            .ok_or("artifact index overflows")?,
+    };
     let mut merger = MemberMerger {
         report,
         omission_memory,
         options,
-        parent_index,
-        archive_length: archive.archive_size,
-        next_index: parent_index
-            .checked_add(1)
-            .ok_or("artifact index overflows")?,
+        parent,
+        archive_length,
+        next_index,
         zip_remaining: options
             .limits
             .max_zip_expanded_bytes
@@ -42,7 +99,7 @@ pub(super) fn append_members(
             .max_signature_scan_bytes
             .saturating_sub(signature_used),
     };
-    for entry in archive.entries {
+    for entry in entries {
         merger.append(entry)?;
     }
     Ok(())
@@ -52,7 +109,7 @@ struct MemberMerger<'a> {
     report: &'a mut ArtifactAnalysis,
     omission_memory: &'a mut MemoryLease,
     options: ArtifactAnalysisOptions,
-    parent_index: usize,
+    parent: ArchiveParent<'a>,
     archive_length: usize,
     next_index: usize,
     zip_remaining: usize,
@@ -60,16 +117,9 @@ struct MemberMerger<'a> {
 }
 
 impl MemberMerger<'_> {
-    fn append(
-        &mut self,
-        entry: l2_workbench::artifact::zip::ZipArtifactEntry,
-    ) -> Result<(), Box<dyn Error>> {
+    fn append(&mut self, entry: ZipArtifactEntry) -> Result<(), Box<dyn Error>> {
         if let Some(reason) = entry.omission {
-            self.push_omission(AnalysisOmission::ZipMember {
-                artifact_index: self.parent_index,
-                entry_index: entry.metadata.index,
-                reason,
-            })?;
+            self.push_omission(self.parser_omission(entry.metadata.index, reason))?;
         }
         let Some(bytes) = entry.content else {
             return Ok(());
@@ -87,11 +137,12 @@ impl MemberMerger<'_> {
             .limits
             .max_total_output_bytes
             .saturating_sub(used_output);
+        let parent_count = usize::from(matches!(self.parent, ArchiveParent::Artifact(_)));
         let remaining_count = self
             .options
             .limits
             .max_artifacts
-            .saturating_sub(self.report.artifacts.len().saturating_add(1));
+            .saturating_sub(self.report.artifacts.len().saturating_add(parent_count));
         if remaining_count == 0 {
             self.push_omission(AnalysisOmission::ArtifactLimit {
                 maximum: self.options.limits.max_artifacts,
@@ -99,11 +150,11 @@ impl MemberMerger<'_> {
             return Ok(());
         }
         if bytes.len() > remaining_output {
-            self.push_omission(AnalysisOmission::OutputLimit {
-                parent_index: self.parent_index,
-                length: bytes.len(),
-                remaining: remaining_output,
-            })?;
+            self.push_omission(self.output_omission(
+                entry.metadata.index,
+                bytes.len(),
+                remaining_output,
+            ))?;
             return Ok(());
         }
         let identity_work = bytes
@@ -116,24 +167,20 @@ impl MemberMerger<'_> {
             .max_total_work_bytes
             .saturating_sub(self.report.work_bytes);
         if identity_work > remaining_work {
-            return self.push_omission(AnalysisOmission::WorkLimit {
-                artifact_index: self.parent_index,
-                stage: AnalysisStage::ArtifactIdentity,
-                requested: identity_work,
-                remaining: remaining_work,
-            });
+            return self.push_omission(self.work_omission(
+                entry.metadata.index,
+                identity_work,
+                remaining_work,
+            ));
         }
         // Both the member and its original name receive exact identities
         self.report.work_bytes += entry.metadata.raw_name.len();
-        let preview_bytes = entry.metadata.raw_name.len().min(32) * 2;
-        // Admit the name digest and preview before constructing member provenance
-        super::analysis_memory::charge(self.omission_memory, 128 + preview_bytes)?;
-        let origin = archive_member_origin(self.parent_index, self.archive_length, &entry.metadata);
+        let origin = self.member_origin(&entry.metadata)?;
         if self.options.limits.max_depth == 0
             || bytes.len() > self.options.limits.max_input_bytes
             || self.signature_remaining == 0
         {
-            return self.append_unanalyzed(bytes, origin);
+            return self.append_unanalyzed(bytes, origin, entry.metadata.index);
         }
         self.append_analyzed(
             &bytes,
@@ -175,6 +222,7 @@ impl MemberMerger<'_> {
         &mut self,
         bytes: Vec<u8>,
         origin: ArtifactOrigin,
+        entry_index: usize,
     ) -> Result<(), Box<dyn Error>> {
         let remaining = self
             .options
@@ -182,12 +230,7 @@ impl MemberMerger<'_> {
             .max_total_work_bytes
             .saturating_sub(self.report.work_bytes);
         if bytes.len() > remaining {
-            return self.push_omission(AnalysisOmission::WorkLimit {
-                artifact_index: self.parent_index,
-                stage: AnalysisStage::ArtifactIdentity,
-                requested: bytes.len(),
-                remaining,
-            });
+            return self.push_omission(self.work_omission(entry_index, bytes.len(), remaining));
         }
         // Member identity needs a complete byte pass even when inspection is skipped
         self.report.work_bytes += bytes.len();
@@ -290,7 +333,8 @@ impl MemberMerger<'_> {
                             .get(*parent_index)
                             .ok_or("member origin index missing")?;
                     }
-                    ArtifactOrigin::SourceRange { .. } => {}
+                    ArtifactOrigin::SourceRange { .. }
+                    | ArtifactOrigin::SourceArchiveMember { .. } => {}
                 }
             }
             indices.push(self.merge_artifact(artifact)?);
@@ -363,6 +407,100 @@ impl MemberMerger<'_> {
         super::analysis_memory::charge_omission_payload(&omission, self.omission_memory)?;
         self.report.omissions.push(omission);
         Ok(())
+    }
+
+    fn member_origin(
+        &mut self,
+        metadata: &ZipArtifactEntryMetadata,
+    ) -> Result<ArtifactOrigin, Box<dyn Error>> {
+        let preview_bytes = metadata.raw_name.len().min(32) * 2;
+        let source_digest_bytes = match self.parent {
+            ArchiveParent::Artifact(_) => 0,
+            ArchiveParent::Source(digest) => digest.len(),
+        };
+        // Admit the name digest and preview before constructing member provenance
+        super::analysis_memory::charge(
+            self.omission_memory,
+            128 + preview_bytes + source_digest_bytes,
+        )?;
+        Ok(match self.parent {
+            ArchiveParent::Artifact(index) => {
+                archive_member_origin(index, self.archive_length, metadata)
+            }
+            ArchiveParent::Source(digest) => {
+                source_archive_member_origin(digest, self.archive_length, metadata)
+            }
+        })
+    }
+
+    const fn archive_range(&self) -> FileRange {
+        FileRange {
+            offset: 0,
+            length: self.archive_length,
+        }
+    }
+
+    const fn parser_omission(
+        &self,
+        entry_index: usize,
+        reason: ZipArtifactOmissionReason,
+    ) -> AnalysisOmission {
+        match self.parent {
+            ArchiveParent::Artifact(artifact_index) => AnalysisOmission::ZipMember {
+                artifact_index,
+                entry_index,
+                reason,
+            },
+            ArchiveParent::Source(_) => AnalysisOmission::SourceArchiveMemberOmission {
+                range: self.archive_range(),
+                entry_index,
+                reason,
+            },
+        }
+    }
+
+    const fn output_omission(
+        &self,
+        entry_index: usize,
+        length: usize,
+        remaining: usize,
+    ) -> AnalysisOmission {
+        match self.parent {
+            ArchiveParent::Artifact(parent_index) => AnalysisOmission::OutputLimit {
+                parent_index,
+                length,
+                remaining,
+            },
+            ArchiveParent::Source(_) => AnalysisOmission::SourceArchiveMemberOutputLimit {
+                range: self.archive_range(),
+                entry_index,
+                length,
+                remaining,
+            },
+        }
+    }
+
+    const fn work_omission(
+        &self,
+        entry_index: usize,
+        requested: usize,
+        remaining: usize,
+    ) -> AnalysisOmission {
+        match self.parent {
+            ArchiveParent::Artifact(artifact_index) => AnalysisOmission::WorkLimit {
+                artifact_index,
+                stage: AnalysisStage::ArtifactIdentity,
+                requested,
+                remaining,
+            },
+            ArchiveParent::Source(_) => AnalysisOmission::SourceArchiveMemberWorkLimit {
+                range: self.archive_range(),
+                entry_index,
+                stage: AnalysisStage::ArtifactIdentity,
+                requested,
+                remaining,
+            },
+        }
     }
 }
 

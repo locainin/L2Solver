@@ -29,7 +29,7 @@ pub use analyzer::{
     AnalyzedArtifact, AnalyzerError, AnalyzerLimits, ArtifactAnalysis, ArtifactAnalysisOptions,
     ArtifactOrigin, ArtifactRegionTransformReport, ArtifactValidationState, RecoveryMode,
     ValidationSummary, analyze_artifacts, analyze_artifacts_with_memory,
-    analyze_artifacts_with_source_sha256, archive_member_origin,
+    analyze_artifacts_with_source_sha256, archive_member_origin, source_archive_member_origin,
 };
 pub use code_links::{
     CodeLink, CodeLinkError, CodeLinkLimits, CodeLinkReport, CodeLinkSourceChecks,

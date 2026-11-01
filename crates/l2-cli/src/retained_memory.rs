@@ -3,7 +3,7 @@
 use l2_workbench::job::MemoryLease;
 use std::error::Error;
 
-pub(crate) fn grow_vec_optional<T>(
+pub fn grow_vec_optional<T>(
     values: &mut Vec<T>,
     memory: &mut Option<MemoryLease>,
     additional: usize,
@@ -16,7 +16,7 @@ pub(crate) fn grow_vec_optional<T>(
     }
 }
 
-pub(crate) fn copy_optional(
+pub fn copy_optional(
     value: &str,
     memory: &mut Option<MemoryLease>,
 ) -> Result<String, Box<dyn Error>> {
@@ -30,7 +30,7 @@ pub(crate) fn copy_optional(
     }
 }
 
-pub(crate) fn grow_vec_exact_optional<T>(
+pub fn grow_vec_exact_optional<T>(
     values: &mut Vec<T>,
     memory: &mut Option<MemoryLease>,
     additional: usize,
@@ -43,7 +43,7 @@ pub(crate) fn grow_vec_exact_optional<T>(
     }
 }
 
-pub(crate) fn charge(memory: &mut MemoryLease, bytes: usize) -> Result<(), Box<dyn Error>> {
+pub fn charge(memory: &mut MemoryLease, bytes: usize) -> Result<(), Box<dyn Error>> {
     let total = memory
         .bytes()
         .checked_add(u64::try_from(bytes)?)
@@ -52,7 +52,7 @@ pub(crate) fn charge(memory: &mut MemoryLease, bytes: usize) -> Result<(), Box<d
     Ok(())
 }
 
-pub(crate) fn grow_vec<T>(
+pub fn grow_vec<T>(
     values: &mut Vec<T>,
     memory: &mut MemoryLease,
     additional: usize,
@@ -68,7 +68,7 @@ pub(crate) fn grow_vec<T>(
     grow_vec_to(values, memory, wanted)
 }
 
-pub(crate) fn grow_vec_exact<T>(
+pub fn grow_vec_exact<T>(
     values: &mut Vec<T>,
     memory: &mut MemoryLease,
     additional: usize,
@@ -128,7 +128,7 @@ fn grow_vec_to<T>(
     Ok(())
 }
 
-pub(crate) fn copy_message(
+pub fn copy_message(
     value: &str,
     memory: &mut MemoryLease,
 ) -> Result<String, Box<dyn Error>> {
