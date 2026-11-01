@@ -1,4 +1,4 @@
-"""Validate and unpack exactly one candidate executable for qualification."""
+"""Validate and unpack the matching candidate executable pair for qualification."""
 
 import json
 import shutil
@@ -8,6 +8,8 @@ from pathlib import Path
 
 from benchmarks.package_release import (
     ARCHIVE_NAME,
+    HELPER_NAME,
+    INSTALL_NAME,
     NOTICE_PATH,
     PROVENANCE_NAME,
     TARGET,
@@ -44,12 +46,12 @@ def unpack_package(
     rustc_version,
     cargo_version,
 ):
-    """Check provenance and unpack the executable without extracting archive paths."""
+    """Check provenance and unpack executables without extracting archive paths."""
     archive = _regular(archive)
     if archive.name != ARCHIVE_NAME:
         raise ValueError("unexpected package name")
     archive_size = archive.stat().st_size
-    if not 0 < archive_size <= MAX_BINARY_BYTES + 4 * 1024 * 1024:
+    if not 0 < archive_size <= 2 * MAX_BINARY_BYTES + 4 * 1024 * 1024:
         raise ValueError("package archive exceeds its size limit")
     # A growing file cannot extend the approved hash read
     digest = hash_file(archive, expected_bytes=archive_size)
@@ -58,8 +60,10 @@ def unpack_package(
     destination = Path(destination)
     destination.mkdir(parents=True, exist_ok=False)
     binary = destination / "l2solver"
+    helper = destination / HELPER_NAME
+    executables = {"l2solver": binary, HELPER_NAME: helper}
     with tarfile.open(archive, "r:gz") as package:
-        expected = {"l2solver", PROVENANCE_NAME, NOTICE_PATH.name}
+        expected = {*executables, PROVENANCE_NAME, NOTICE_PATH.name, INSTALL_NAME}
         entries = []
         # Stop as soon as the archive has more entries than the package format
         for item in package:
@@ -73,36 +77,38 @@ def unpack_package(
         ):
             raise ValueError("package has unexpected archive members")
         items = {item.name: item for item in entries}
-        if (
-            not 0 < items["l2solver"].size <= MAX_BINARY_BYTES
-            or items["l2solver"].mode & 0o111 == 0
-        ):
-            raise ValueError(
-                "package binary is not executable or exceeds its size limit"
-            )
+        for name in executables:
+            if not 0 < items[name].size <= MAX_BINARY_BYTES or items[name].mode & 0o111 == 0:
+                raise ValueError(
+                    "package binary or helper is not executable or exceeds its size limit"
+                )
         if any(
             not 0 < items[name].size <= MAX_METADATA_BYTES
-            for name in expected - {"l2solver"}
+            for name in expected - executables.keys()
         ):
             raise ValueError("package metadata exceeds its size limit")
         metadata = package.extractfile(items[PROVENANCE_NAME])
-        source = package.extractfile(items["l2solver"])
-        if metadata is None or source is None:
+        if metadata is None:
             raise ValueError("package members cannot be read")
-        with metadata, source:
+        with metadata:
             provenance = json.load(metadata)
-            # Copy the named member only; archive paths never select a destination
-            with binary.open("xb") as output:
+        for name, executable in executables.items():
+            source = package.extractfile(items[name])
+            if source is None:
+                raise ValueError("package executable cannot be read")
+            # Copy the named members only; archive paths never select a destination
+            with source, executable.open("xb") as output:
                 shutil.copyfileobj(source, output, length=1024 * 1024)
-        binary.chmod(0o700)
+            executable.chmod(0o700)
 
     expected_fields = (
         isinstance(provenance, dict)
         and isinstance(provenance.get("dependency_lock"), dict)
         and isinstance(provenance.get("toolchain"), dict)
         and isinstance(provenance.get("binary"), dict)
+        and isinstance(provenance.get("active_helper"), dict)
         and type(provenance.get("schema_version")) is int
-        and provenance.get("schema_version") == 1
+        and provenance.get("schema_version") == 2
         and provenance.get("target") == TARGET
         and provenance.get("source_commit") == source_commit
         and provenance.get("dependency_lock", {}).get("sha256") == lock_sha256
@@ -113,20 +119,25 @@ def unpack_package(
         raise ValueError(
             "package provenance differs from the current source or toolchain"
         )
-    metadata = provenance.get("binary", {})
-    if (
-        metadata.get("name") != "l2solver"
-        or type(metadata.get("bytes")) is not int
-        or metadata["bytes"] != binary.stat().st_size
-        or metadata.get("sha256") != hash_file(binary, expected_bytes=metadata["bytes"])
-    ):
-        raise ValueError("package binary differs from its provenance")
+    for name, key in (("l2solver", "binary"), (HELPER_NAME, "active_helper")):
+        executable = executables[name]
+        metadata = provenance[key]
+        if (
+            metadata.get("name") != name
+            or type(metadata.get("bytes")) is not int
+            or metadata["bytes"] != executable.stat().st_size
+            or metadata.get("sha256") != hash_file(executable, expected_bytes=metadata["bytes"])
+        ):
+            raise ValueError(f"package {key} differs from its provenance")
+    if provenance["active_helper"].get("required_capability") != "cap_net_raw":
+        raise ValueError("package helper capability differs from its provenance")
     # Detect changes while the archive was being read
     if hash_file(archive, expected_bytes=archive_size) != digest:
         raise ValueError("package checksum changed during inspection")
     check_checksum(checksum, archive.name, digest)
     return {
         "binary": binary,
+        "active_helper": helper,
         "archive_sha256": digest,
         "archive_bytes": archive_size,
         "provenance": provenance,

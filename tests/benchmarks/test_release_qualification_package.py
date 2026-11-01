@@ -22,6 +22,9 @@ def candidate(tmp_path):
     binary = tmp_path / "l2solver"
     binary.write_bytes(b"sample executable")
     binary.chmod(0o755)
+    helper = tmp_path / "l2solver-active-helper"
+    helper.write_bytes(b"matching active helper")
+    helper.chmod(0o750)
     lock = tmp_path / "Cargo.lock"
     lock.write_bytes(b"version = 4\n")
     archive, checksum = package_release(
@@ -52,6 +55,9 @@ def test_unpack_checks_the_archive_and_the_actual_executable(candidate, tmp_path
     result = unpack(candidate, tmp_path)
     assert result["binary"].read_bytes() == binary.read_bytes()
     assert result["binary"].stat().st_mode & 0o111
+    helper = binary.with_name("l2solver-active-helper")
+    assert result["active_helper"].read_bytes() == helper.read_bytes()
+    assert result["active_helper"].stat().st_mode & 0o777 == 0o700
     assert result["archive_sha256"] == hashlib.sha256(archive.read_bytes()).hexdigest()
     assert (
         result["provenance"]["binary"]["sha256"]
@@ -117,19 +123,20 @@ def test_unpack_rejects_archive_with_unexpected_member(candidate, tmp_path):
     assert not (tmp_path / "outside").exists()
 
 
-def test_unpack_rejects_an_executable_that_differs_from_provenance(candidate, tmp_path):
+@pytest.mark.parametrize("name", ["l2solver", "l2solver-active-helper"])
+def test_unpack_rejects_an_executable_that_differs_from_provenance(candidate, tmp_path, name):
     archive, checksum, _, _ = candidate
     with tarfile.open(archive, "r:gz") as package:
         members = [(item, package.extractfile(item).read()) for item in package]
     with tarfile.open(archive, "w:gz") as package:
         for info, data in members:
-            if info.name == "l2solver":
+            if info.name == name:
                 data = b"changed executable"
                 info.size = len(data)
             package.addfile(info, io.BytesIO(data))
     digest = hashlib.sha256(archive.read_bytes()).hexdigest()
     checksum.write_text(f"{digest}  {archive.name}\n")
-    with pytest.raises(ValueError, match="binary"):
+    with pytest.raises(ValueError, match="binary|helper"):
         unpack(candidate, tmp_path)
 
 

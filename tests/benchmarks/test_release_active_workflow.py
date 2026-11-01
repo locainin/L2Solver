@@ -22,7 +22,7 @@ def test_release_runs_the_extracted_application_before_upload():
     command = "bash benchmarks/check_active_release.sh"
     assert command in workflow
     assert workflow.index("Package build provenance") < workflow.index(command)
-    assert workflow.index(command) < workflow.index("Upload review artifact")
+    assert workflow.index(command) < workflow.index("Upload unqualified review candidate")
 
 
 def test_release_packet_gate_uses_the_main_executable_and_explicit_parent_tests():

@@ -22,6 +22,7 @@ PROVENANCE_NAME = "PROVENANCE.json"
 NOTICE_PATH = Path(__file__).resolve().parents[1] / "NOTICE-JEMALLOC.txt"
 INSTALL_PATH = Path(__file__).resolve().parents[1] / "docs/active/install.md"
 HELPER_NAME = "l2solver-active-helper"
+INSTALL_NAME = "INSTALL-ACTIVE.md"
 
 
 def _regular_file(path, description, *, executable=False):
@@ -150,7 +151,7 @@ def _write_archive(binary, helper, provenance, archive):
             io.BytesIO(notices),
         )
         package.addfile(
-            _tar_entry("INSTALL-ACTIVE.md", len(instructions), 0o644),
+            _tar_entry(INSTALL_NAME, len(instructions), 0o644),
             io.BytesIO(instructions),
         )
 
