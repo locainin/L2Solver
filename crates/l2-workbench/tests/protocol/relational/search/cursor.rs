@@ -32,6 +32,8 @@ mod absolute_resume;
 mod compact;
 #[path = "cursor/corruption.rs"]
 mod corruption;
+#[path = "cursor/parameters.rs"]
+mod parameters;
 #[path = "cursor/resources.rs"]
 mod resources;
 #[path = "cursor/session.rs"]

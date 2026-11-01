@@ -24,7 +24,7 @@ impl RelationalRestoreBudget {
         }
     }
 
-    /// Return locator, transform, and output-hashing work charged while checking retained outputs
+    /// Return verification work charged while checking checkpoints and caller-owned evidence
     #[must_use]
     pub const fn verification_work_bytes(&self) -> usize {
         self.verification_work_bytes

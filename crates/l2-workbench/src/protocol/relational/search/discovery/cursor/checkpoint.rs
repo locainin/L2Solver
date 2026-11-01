@@ -529,7 +529,7 @@ fn reserve<E>(memory: &MemoryBudget, bytes: u64) -> Result<MemoryLease, Relation
         .map_err(memory_failure)
 }
 
-fn check_job<E>(job: Option<&Job>) -> Result<(), RelationalCursorError<E>> {
+pub(super) fn check_job<E>(job: Option<&Job>) -> Result<(), RelationalCursorError<E>> {
     if let Some(job) = job {
         job.check_cancelled()
             .map_err(|error| RelationalCursorError::Search(error.into()))?;

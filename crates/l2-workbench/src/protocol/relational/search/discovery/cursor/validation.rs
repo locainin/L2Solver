@@ -293,7 +293,6 @@ pub(super) fn validate_cursor<T>(
             || retained.search_order > search.candidates_examined
             || !orders.insert(retained.search_order)
             || retained.candidate.discovery.supported_sessions.is_empty()
-            || retained.candidate.rule.parser_scope != plan.parser_scope
             || retained.candidate.status
                 != candidate_status(
                     &retained.candidate.discovery,
@@ -363,21 +362,7 @@ fn validate_rule(
     prepared: &PreparedSearch,
     plan: &RelationalTransformPlan,
 ) -> Result<(), RelationalTransformError> {
-    let RelationalOperationTemplate::Sha256CounterXor(operation) = rule.operation;
-    if !plan.parser_formats.contains(&rule.parser_format)
-        || !plan.counter_widths.contains(&operation.counter_width)
-        || !plan
-            .counter_byte_orders
-            .contains(&operation.counter_byte_order)
-        || !plan.seed_orders.contains(&operation.seed_order)
-        || !plan.initial_counters.contains(&operation.initial_counter)
-        || operation.initial_counter > operation.counter_width.maximum_counter()
-        || !plan.counter_resets.contains(&rule.counter_reset)
-        || (operation.counter_width == CounterWidth::OneByte
-            && plan.counter_byte_orders.first() != Some(&operation.counter_byte_order))
-    {
-        return Err(invalid_cursor());
-    }
+    validate_rule_parameters(rule, plan)?;
     let has_seed = prepared
         .seed_locators
         .iter()
@@ -397,6 +382,29 @@ fn validate_rule(
     } else {
         Err(invalid_cursor())
     }
+}
+
+pub(super) fn validate_rule_parameters(
+    rule: &RelationalTransformRule,
+    plan: &RelationalTransformPlan,
+) -> Result<(), RelationalTransformError> {
+    let RelationalOperationTemplate::Sha256CounterXor(operation) = rule.operation;
+    if rule.parser_scope != plan.parser_scope
+        || !plan.parser_formats.contains(&rule.parser_format)
+        || !plan.counter_widths.contains(&operation.counter_width)
+        || !plan
+            .counter_byte_orders
+            .contains(&operation.counter_byte_order)
+        || !plan.seed_orders.contains(&operation.seed_order)
+        || !plan.initial_counters.contains(&operation.initial_counter)
+        || operation.initial_counter > operation.counter_width.maximum_counter()
+        || !plan.counter_resets.contains(&rule.counter_reset)
+        || (operation.counter_width == CounterWidth::OneByte
+            && plan.counter_byte_orders.first() != Some(&operation.counter_byte_order))
+    {
+        return Err(invalid_cursor());
+    }
+    Ok(())
 }
 
 fn validate_fit(
