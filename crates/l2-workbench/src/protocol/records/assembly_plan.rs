@@ -178,12 +178,24 @@ impl RecordAssemblyPlan {
         models: Vec<RecordAssemblyHeaderModel>,
         maximum_retained_bytes: usize,
     ) -> Result<Self, RecordError> {
-        let input_count = cohort_input_count(&models)?;
+        Self::compile_header_models_controlled(models, maximum_retained_bytes, None)
+    }
+
+    fn compile_header_models_controlled(
+        models: Vec<RecordAssemblyHeaderModel>,
+        maximum_retained_bytes: usize,
+        mut control: Option<&mut dyn FnMut(usize) -> Result<(), RecordError>>,
+    ) -> Result<Self, RecordError> {
+        let input_count = cohort_input_count(&models, &mut control)?;
         let mut compiler = PlanCompiler::new(models.len(), maximum_retained_bytes);
         for model in models {
-            compiler.add_model(model)?;
+            if let Some(control) = &mut control {
+                compiler.add_model(model, Some(&mut **control))?;
+            } else {
+                compiler.add_model(model, None)?;
+            }
         }
-        Ok(compiler.finish(input_count))
+        compiler.finish(input_count, &mut control)
     }
 
     /// Return the number of semantic interpretations in the plan
@@ -279,11 +291,20 @@ impl RecordAssemblyPlan {
     }
 }
 
-fn cohort_input_count(models: &[RecordAssemblyHeaderModel]) -> Result<usize, RecordError> {
-    models
-        .iter()
-        .flat_map(|model| model.templates.iter().map(|(index, _)| *index))
-        .max()
+fn cohort_input_count(
+    models: &[RecordAssemblyHeaderModel],
+    control: &mut Option<&mut dyn FnMut(usize) -> Result<(), RecordError>>,
+) -> Result<usize, RecordError> {
+    let mut maximum = None;
+    for model in models {
+        for (index, _) in &model.templates {
+            if let Some(control) = control.as_deref_mut() {
+                control(std::mem::size_of::<usize>())?;
+            }
+            maximum = Some(maximum.map_or(*index, |prior: usize| prior.max(*index)));
+        }
+    }
+    maximum
         .and_then(|index| index.checked_add(1))
         .ok_or(RecordError::InvalidReport)
 }
@@ -425,7 +446,11 @@ impl PlanCompiler {
         }
     }
 
-    fn add_model(&mut self, model: RecordAssemblyHeaderModel) -> Result<(), RecordError> {
+    fn add_model(
+        &mut self,
+        model: RecordAssemblyHeaderModel,
+        mut control: Option<&mut dyn FnMut(usize) -> Result<(), RecordError>>,
+    ) -> Result<(), RecordError> {
         let RecordAssemblyHeaderModel {
             schema,
             limits,
@@ -434,10 +459,10 @@ impl PlanCompiler {
         validate_assembly_limits(limits)?;
         validate_schema(&schema, limits)?;
         let base_bytes = self
-            .current_retained_bytes()
+            .current_retained_bytes(&mut control)?
             .saturating_add(self.compiler_workspace_bytes)
             .saturating_add(minimum_model_bytes(templates.len()));
-        let mut budget = AssemblyPlanBudget::new(base_bytes, self.maximum_retained_bytes)?;
+        let mut budget = AssemblyPlanBudget::new(base_bytes, self.maximum_retained_bytes, control)?;
         let frames = indexed_templates(&schema, limits, templates, &mut budget)?;
         update_shared_expectations(
             &mut self.shared_inputs,
@@ -454,7 +479,7 @@ impl PlanCompiler {
             limits,
             &mut budget,
         )?;
-        let compiled_inputs = compile_inputs(&frames, &self.shared_input_lookup)?;
+        let compiled_inputs = compile_inputs(&frames, &self.shared_input_lookup, &mut budget)?;
         let compiled_groups = self.compile_groups(prepared.groups, &frames, &mut budget)?;
         self.compiled_models
             .try_reserve(1)
@@ -483,12 +508,13 @@ impl PlanCompiler {
             .try_reserve_exact(groups.len())
             .map_err(|_| RecordError::AllocationFailed)?;
         for group in groups {
+            budget.checkpoint(std::mem::size_of::<PreparedGroup>())?;
             let PreparedGroup {
                 receipt,
                 layout,
                 output_length,
             } = group;
-            let layout = globalize_layout(layout, frames)?;
+            let layout = globalize_layout(layout, frames, budget)?;
             let layout_id = intern_layout(
                 layout,
                 output_length,
@@ -504,32 +530,46 @@ impl PlanCompiler {
         Ok(compiled)
     }
 
-    fn current_retained_bytes(&self) -> usize {
-        retained_plan_bytes(&self.shared_inputs, &self.compiled_models, &self.layouts)
+    fn current_retained_bytes(
+        &self,
+        control: &mut Option<&mut dyn FnMut(usize) -> Result<(), RecordError>>,
+    ) -> Result<usize, RecordError> {
+        retained_plan_bytes(
+            &self.shared_inputs,
+            &self.compiled_models,
+            &self.layouts,
+            control,
+        )
     }
 
-    fn finish(mut self, input_count: usize) -> RecordAssemblyPlan {
+    fn finish(
+        mut self,
+        input_count: usize,
+        control: &mut Option<&mut dyn FnMut(usize) -> Result<(), RecordError>>,
+    ) -> Result<RecordAssemblyPlan, RecordError> {
         self.stats.layouts = self.layouts.len();
-        self.stats.retained_bytes = self.current_retained_bytes();
-        RecordAssemblyPlan {
+        self.stats.retained_bytes = self.current_retained_bytes(control)?;
+        Ok(RecordAssemblyPlan {
             input_count,
             inputs: self.shared_inputs,
             models: self.compiled_models,
             layouts: self.layouts,
             stats: self.stats,
-        }
+        })
     }
 }
 
 fn compile_inputs(
     frames: &[IndexedTemplate],
     shared_input_lookup: &HashMap<usize, usize>,
+    budget: &mut AssemblyPlanBudget<'_>,
 ) -> Result<Vec<CompiledInput>, RecordError> {
     let mut inputs = Vec::new();
     inputs
         .try_reserve_exact(frames.len())
         .map_err(|_| RecordError::AllocationFailed)?;
     for frame in frames {
+        budget.checkpoint(std::mem::size_of::<CompiledInput>())?;
         let shared_input_index = shared_input_lookup
             .get(&frame.global_input_index)
             .copied()
@@ -565,13 +605,14 @@ fn prepare_model_groups(
     metadata_inputs
         .try_reserve_exact(frames.len())
         .map_err(|_| RecordError::AllocationFailed)?;
-    metadata_inputs.extend(frames.iter().enumerate().map(|(input_index, frame)| {
-        RecordMetadataInput {
+    for (input_index, frame) in frames.iter().enumerate() {
+        budget.checkpoint(std::mem::size_of::<RecordMetadataInput<'_>>())?;
+        metadata_inputs.push(RecordMetadataInput {
             input_index,
             input_length: frame.input_length,
             records: &frame.records,
-        }
-    }));
+        });
+    }
     let prepared = prepare_record_groups(
         &metadata_inputs,
         sequence_base,
@@ -613,6 +654,7 @@ fn indexed_templates(
         .try_reserve_exact(templates.len())
         .map_err(|_| RecordError::AllocationFailed)?;
     for (input_index, template) in templates {
+        budget.checkpoint(std::mem::size_of::<IndexedTemplate>())?;
         if !seen_inputs.insert(input_index) {
             return Err(RecordError::InvalidReport);
         }
@@ -639,6 +681,7 @@ fn update_shared_expectations(
     compiler_workspace_bytes: &mut usize,
 ) -> Result<(), RecordError> {
     for frame in frames {
+        budget.checkpoint(frame.preserved_header.len())?;
         let global_index = frame.global_input_index;
         if let Some(shared_index) = shared_lookup.get(&global_index).copied() {
             let expected = shared
@@ -651,10 +694,19 @@ fn update_shared_expectations(
                 .preserved_prefix
                 .len()
                 .min(frame.preserved_header.len());
-            if expected.preserved_prefix.get(..common_length)
-                != frame.preserved_header.get(..common_length)
-            {
-                return Err(RecordError::InvalidReport);
+            let left = expected
+                .preserved_prefix
+                .get(..common_length)
+                .ok_or(RecordError::InvalidReport)?;
+            let right = frame
+                .preserved_header
+                .get(..common_length)
+                .ok_or(RecordError::InvalidReport)?;
+            for (first, second) in left.chunks(64 * 1024).zip(right.chunks(64 * 1024)) {
+                budget.checkpoint(0)?;
+                if first != second {
+                    return Err(RecordError::InvalidReport);
+                }
             }
             if frame.preserved_header.len() > expected.preserved_prefix.len() {
                 let additional = frame
@@ -662,7 +714,7 @@ fn update_shared_expectations(
                     .len()
                     .saturating_sub(expected.preserved_prefix.len());
                 budget.charge_workspace(frame.preserved_header.len())?;
-                expected.preserved_prefix = try_clone_bytes(&frame.preserved_header)?;
+                expected.preserved_prefix = try_clone_bytes(&frame.preserved_header, budget)?;
                 budget.release_workspace(frame.preserved_header.len());
                 budget.retain(additional)?;
             }
@@ -686,7 +738,7 @@ fn update_shared_expectations(
             shared.push(SharedInputExpectation {
                 global_input_index: global_index,
                 length: frame.input_length,
-                preserved_prefix: try_clone_bytes(&frame.preserved_header)?,
+                preserved_prefix: try_clone_bytes(&frame.preserved_header, budget)?,
             });
             if shared_lookup.insert(global_index, shared_index).is_some() {
                 return Err(RecordError::InvalidReport);
@@ -699,8 +751,10 @@ fn update_shared_expectations(
 fn globalize_layout(
     mut layout: Vec<PhysicalPart>,
     frames: &[IndexedTemplate],
+    budget: &mut AssemblyPlanBudget<'_>,
 ) -> Result<Vec<PhysicalPart>, RecordError> {
     for part in &mut layout {
+        budget.checkpoint(std::mem::size_of::<PhysicalPart>())?;
         part.input_index = frames
             .get(part.input_index)
             .ok_or(RecordError::InvalidReport)?
@@ -718,6 +772,11 @@ fn intern_layout(
     budget: &mut AssemblyPlanBudget,
     compiler_workspace_bytes: &mut usize,
 ) -> Result<usize, RecordError> {
+    budget.checkpoint(
+        parts
+            .len()
+            .saturating_mul(std::mem::size_of::<PhysicalPart>()),
+    )?;
     let hash = layout_hash(&parts);
     if let Some(layout_ids) = buckets.get(&hash)
         && let Some(layout_id) = layout_ids.iter().copied().find(|layout_id| {
@@ -767,11 +826,17 @@ fn layout_hash(layout: &[PhysicalPart]) -> u64 {
     hasher.finish()
 }
 
-fn try_clone_bytes(bytes: &[u8]) -> Result<Vec<u8>, RecordError> {
+fn try_clone_bytes(
+    bytes: &[u8],
+    budget: &mut AssemblyPlanBudget<'_>,
+) -> Result<Vec<u8>, RecordError> {
     let mut copy = Vec::new();
     copy.try_reserve_exact(bytes.len())
         .map_err(|_| RecordError::AllocationFailed)?;
-    copy.extend_from_slice(bytes);
+    for chunk in bytes.chunks(64 * 1024) {
+        budget.checkpoint(chunk.len())?;
+        copy.extend_from_slice(chunk);
+    }
     Ok(copy)
 }
 
@@ -818,19 +883,33 @@ fn retained_plan_bytes(
     inputs: &[SharedInputExpectation],
     models: &[CompiledModel],
     layouts: &[PhysicalLayout],
-) -> usize {
-    let input_bytes = inputs.iter().fold(0_usize, |total, input| {
-        total
+    control: &mut Option<&mut dyn FnMut(usize) -> Result<(), RecordError>>,
+) -> Result<usize, RecordError> {
+    // The size scan reads metadata and lengths without reading stored header contents
+    let mut input_bytes = 0_usize;
+    for input in inputs {
+        if let Some(control) = control.as_deref_mut() {
+            control(std::mem::size_of::<SharedInputExpectation>())?;
+        }
+        input_bytes = input_bytes
             .saturating_add(std::mem::size_of::<SharedInputExpectation>())
-            .saturating_add(input.preserved_prefix.len())
-    });
-    let model_bytes = models.iter().fold(0_usize, |total, model| {
-        let groups = model.groups.iter().fold(0_usize, |groups, group| {
-            groups
+            .saturating_add(input.preserved_prefix.len());
+    }
+    let mut model_bytes = 0_usize;
+    for model in models {
+        if let Some(control) = control.as_deref_mut() {
+            control(std::mem::size_of::<CompiledModel>())?;
+        }
+        let mut groups = 0_usize;
+        for group in &model.groups {
+            if let Some(control) = control.as_deref_mut() {
+                control(std::mem::size_of::<CompiledGroup>())?;
+            }
+            groups = groups
                 .saturating_add(std::mem::size_of::<CompiledGroup>())
-                .saturating_add(receipt_retained_bytes(&group.receipt))
-        });
-        total
+                .saturating_add(receipt_retained_bytes(&group.receipt));
+        }
+        model_bytes = model_bytes
             .saturating_add(std::mem::size_of::<CompiledModel>())
             .saturating_add(
                 model
@@ -838,22 +917,26 @@ fn retained_plan_bytes(
                     .len()
                     .saturating_mul(std::mem::size_of::<CompiledInput>()),
             )
-            .saturating_add(groups)
-    });
-    let layout_bytes = layouts.iter().fold(0_usize, |total, layout| {
-        total
+            .saturating_add(groups);
+    }
+    let mut layout_bytes = 0_usize;
+    for layout in layouts {
+        if let Some(control) = control.as_deref_mut() {
+            control(std::mem::size_of::<PhysicalLayout>())?;
+        }
+        layout_bytes = layout_bytes
             .saturating_add(std::mem::size_of::<PhysicalLayout>())
             .saturating_add(
                 layout
                     .parts
                     .len()
                     .saturating_mul(std::mem::size_of::<PhysicalPart>()),
-            )
-    });
-    std::mem::size_of::<RecordAssemblyPlan>()
+            );
+    }
+    Ok(std::mem::size_of::<RecordAssemblyPlan>()
         .saturating_add(input_bytes)
         .saturating_add(model_bytes)
-        .saturating_add(layout_bytes)
+        .saturating_add(layout_bytes))
 }
 
 const fn receipt_retained_bytes(receipt: &RecordGroupReceipt) -> usize {

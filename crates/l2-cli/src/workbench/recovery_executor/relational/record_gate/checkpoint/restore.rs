@@ -15,11 +15,11 @@ use crate::workbench::recovery_executor::{
 };
 use l2_workbench::{
     artifact::ArtifactValidationPolicy,
-    job::{Job, MemoryBudget, MemoryClass, admit_json},
+    job::{Job, MemoryBudget, MemoryClass, MemoryLease, admit_json},
     protocol::{
-        RecordAssemblyPlanDescription, RecordLimits, RecordSchemaProposalLimits,
-        RelationalRecordSample, RelationalRestoreBudget, RelationalTransformLimits,
-        RelationalTransformReport, RelationalTransformRule,
+        RecordAssemblyPlan, RecordAssemblyPlanDescription, RecordLimits,
+        RecordSchemaProposalLimits, RelationalRecordSample, RelationalRestoreBudget,
+        RelationalTransformLimits, RelationalTransformReport, RelationalTransformRule,
     },
     recovery::RecoveryError,
 };
@@ -172,7 +172,7 @@ impl SchemaPlanCache {
                 index,
                 &frames.frames,
                 &producer,
-                &context,
+                &mut context,
             )?;
             if plans.len() + headers.len() == before {
                 return Err(RecoveryError::InvalidCheckpoint.into());
@@ -225,7 +225,7 @@ impl SchemaPlanCache {
         index: usize,
         frames: &[DecodedFrameOutput],
         producer: &Arc<RelationalTransformRule>,
-        context: &SchemaCacheRestoreContext<'_, '_>,
+        context: &mut SchemaCacheRestoreContext<'_, '_>,
     ) -> Result<Vec<HeaderDescription>, RecoveryExecutionError> {
         let mut remaining = Vec::new();
         remaining
@@ -246,59 +246,23 @@ impl SchemaPlanCache {
         saved: HeaderDescription,
         frames: &[DecodedFrameOutput],
         producer: Arc<RelationalTransformRule>,
-        context: &SchemaCacheRestoreContext<'_, '_>,
+        context: &mut SchemaCacheRestoreContext<'_, '_>,
     ) -> Result<(), RecoveryExecutionError> {
+        charge_header_key_replay(frames, context)?;
         saved.key.verify_replay(
             frames,
             context.report,
             producer.parser_format,
             context.artifact_policy,
             context.schema_limits,
+            context.job,
         )?;
         if self.header_plans.contains_key(&saved.key) {
             return Err(RecoveryError::InvalidCheckpoint.into());
         }
-        let mut inputs = Vec::new();
-        inputs
-            .try_reserve_exact(frames.len())
-            .map_err(|error| operational("schema checkpoint header allocation failed", error))?;
-        inputs.extend(frames.iter().map(|frame| frame.bytes.as_slice()));
-        saved
-            .description
-            .validate_inputs(&inputs)
-            .map_err(|_| RecoveryError::InvalidCheckpoint)?;
-        // Cover compiler capacity and allocator slack within the admitted workspace
-        let mut memory = context
-            .memory
-            .try_reserve(
-                MemoryClass::Executor,
-                u64::try_from(context.maximum_workspace_bytes)
-                    .map_err(|_| RecoveryError::InvalidCheckpoint)?,
-            )
-            .map_err(|error| {
-                operational("schema checkpoint compilation admission failed", error)
-            })?;
-        let logical_workspace = (context.maximum_workspace_bytes / 4)
-            .checked_sub(size_of::<HeaderSchemaPlan>())
-            .ok_or(RecoveryError::InvalidCheckpoint)?;
-        let plan = saved
-            .description
-            .restore(
-                context.schema_limits.discovery.record_limits,
-                context.maximum_checkpoint_bytes,
-                logical_workspace,
-            )
-            .map_err(|_| RecoveryError::InvalidCheckpoint)?;
-        let retained_bytes = size_of::<HeaderSchemaPlan>()
-            .checked_add(plan.retained_bytes())
-            .ok_or(RecoveryError::InvalidCheckpoint)?;
-        let admitted_bytes = retained_bytes
-            .checked_mul(4)
-            .and_then(|bytes| u64::try_from(bytes).ok())
-            .ok_or(RecoveryError::InvalidCheckpoint)?;
-        memory
-            .try_resize(admitted_bytes)
-            .map_err(|error| operational("schema checkpoint plan admission failed", error))?;
+        let (plan, retained_bytes, memory) =
+            rebuild_header_plan(&saved.description, frames, context)?;
+        let previous_count = self.header_plans.len();
         self.cache_header_plan(
             saved.key,
             HeaderSchemaPlan {
@@ -314,8 +278,131 @@ impl SchemaPlanCache {
                 .max_report_bytes
                 .min(MAX_CACHED_HEADER_PLAN_BYTES),
         )?;
+        // A saved entry must survive the same admission rule that originally retained it
+        if self.header_plans.len() == previous_count {
+            return Err(RecoveryError::InvalidCheckpoint.into());
+        }
         self.compiled_memory.push(memory);
         Ok(())
+    }
+}
+
+fn rebuild_header_plan(
+    description: &RecordAssemblyPlanDescription,
+    frames: &[DecodedFrameOutput],
+    context: &mut SchemaCacheRestoreContext<'_, '_>,
+) -> Result<(RecordAssemblyPlan, usize, MemoryLease), RecoveryExecutionError> {
+    let job = context.job;
+    let work = &mut *context.work;
+    // Verification consumes its own allowance without changing frozen search work
+    let limit = work.remaining_verification_work_bytes();
+    let mut control = |bytes| {
+        if job.is_some_and(Job::is_cancelled) {
+            return Err(l2_workbench::protocol::RecordError::Cancelled);
+        }
+        if !work.try_charge_verification(bytes) {
+            return Err(l2_workbench::protocol::RecordError::WorkLimitExceeded {
+                limit,
+                consumed: limit - work.remaining_verification_work_bytes(),
+                requested: bytes,
+            });
+        }
+        Ok(())
+    };
+    let input_work = frames
+        .len()
+        .checked_mul(size_of::<&[u8]>())
+        .ok_or(RecoveryError::InvalidCheckpoint)?;
+    control(input_work).map_err(|error| checkpoint_record_error(&error))?;
+    let mut inputs = Vec::new();
+    inputs
+        .try_reserve_exact(frames.len())
+        .map_err(|error| operational("schema checkpoint header allocation failed", error))?;
+    for frame in frames {
+        control(0).map_err(|error| checkpoint_record_error(&error))?;
+        inputs.push(frame.bytes.as_slice());
+    }
+    description
+        .validate_inputs(&inputs, &mut control)
+        .map_err(|error| checkpoint_record_error(&error))?;
+    // Cover compiler capacity and allocator slack within the admitted workspace
+    let mut memory = context
+        .memory
+        .try_reserve(
+            MemoryClass::Executor,
+            u64::try_from(context.maximum_workspace_bytes)
+                .map_err(|_| RecoveryError::InvalidCheckpoint)?,
+        )
+        .map_err(|error| operational("schema checkpoint compilation admission failed", error))?;
+    let logical_workspace = (context.maximum_workspace_bytes / 4)
+        .checked_sub(size_of::<HeaderSchemaPlan>())
+        .ok_or(RecoveryError::InvalidCheckpoint)?;
+    let plan = description
+        .restore(
+            context.schema_limits.discovery.record_limits,
+            context.maximum_checkpoint_bytes,
+            logical_workspace,
+            &mut control,
+        )
+        .map_err(|error| checkpoint_record_error(&error))?;
+    let retained_bytes = size_of::<HeaderSchemaPlan>()
+        .checked_add(plan.retained_bytes())
+        .ok_or(RecoveryError::InvalidCheckpoint)?;
+    let admitted_bytes = retained_bytes
+        .checked_mul(4)
+        .and_then(|bytes| u64::try_from(bytes).ok())
+        .ok_or(RecoveryError::InvalidCheckpoint)?;
+    memory
+        .try_resize(admitted_bytes)
+        .map_err(|error| operational("schema checkpoint plan admission failed", error))?;
+    Ok((plan, retained_bytes, memory))
+}
+
+fn charge_header_key_replay(
+    frames: &[DecodedFrameOutput],
+    context: &mut SchemaCacheRestoreContext<'_, '_>,
+) -> Result<(), RecoveryExecutionError> {
+    let sessions = context
+        .report
+        .discovery_sessions
+        .len()
+        .checked_add(context.report.heldout_sessions.len())
+        .and_then(|count| count.checked_mul(4 * size_of::<u64>()))
+        .ok_or(RecoveryError::InvalidCheckpoint)?;
+    replay::charge(context, sessions)?;
+    for frame in frames {
+        if let Some(job) = context.job {
+            job.check_cancelled()?;
+        }
+        let bytes = frame
+            .context
+            .source
+            .len()
+            .checked_add(frame.context.scope.len())
+            .and_then(|total| {
+                frame
+                    .expected_session_orders
+                    .len()
+                    .checked_mul(size_of::<u64>())
+                    .and_then(|orders| total.checked_add(orders))
+            })
+            .and_then(|total| total.checked_add(size_of::<DecodedFrameOutput>()))
+            .and_then(|total| total.checked_mul(4))
+            .ok_or(RecoveryError::InvalidCheckpoint)?;
+        replay::charge(context, bytes)?;
+    }
+    Ok(())
+}
+
+fn checkpoint_record_error(error: &l2_workbench::protocol::RecordError) -> RecoveryExecutionError {
+    match error {
+        l2_workbench::protocol::RecordError::Cancelled => l2_workbench::job::JobError::Cancelled.into(),
+        l2_workbench::protocol::RecordError::WorkLimitExceeded { .. } => operational(
+            "schema checkpoint verification work limit reached",
+            l2_workbench::protocol::RelationalCursorError::<std::convert::Infallible>::RestoreWorkLimit,
+        ),
+        l2_workbench::protocol::RecordError::AllocationFailed => RecoveryError::AllocationFailed.into(),
+        _ => RecoveryError::InvalidCheckpoint.into(),
     }
 }
 

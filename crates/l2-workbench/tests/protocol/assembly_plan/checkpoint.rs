@@ -22,6 +22,65 @@ fn compiled_plan() -> Result<RecordAssemblyPlan, Box<dyn Error>> {
 }
 
 #[test]
+fn checkpoint_header_validation_stops_when_work_is_exhausted() -> Result<(), Box<dyn Error>> {
+    let plan = compiled_plan()?;
+    let descriptor = plan.checkpoint_description(RecordLimits::default(), CHECKPOINT_LIMIT)?;
+    let saved: RecordAssemblyPlanDescription =
+        serde_json::from_value(serde_json::to_value(descriptor)?)?;
+    let frames = [frame(0, 0, b'x'), frame(1, 0, b'y')];
+    let inputs = frames.iter().map(Vec::as_slice).collect::<Vec<_>>();
+    let mut work = 0_usize;
+    let mut control = |bytes| {
+        if bytes > 0 {
+            return Err(RecordError::WorkLimitExceeded {
+                limit: 0,
+                consumed: work,
+                requested: bytes,
+            });
+        }
+        work += bytes;
+        Ok(())
+    };
+    assert!(matches!(
+        saved.validate_inputs(&inputs, &mut control),
+        Err(RecordError::WorkLimitExceeded { .. })
+    ));
+    Ok(())
+}
+
+#[test]
+fn checkpoint_reconstruction_propagates_cancellation_between_inputs() -> Result<(), Box<dyn Error>>
+{
+    let plan = compiled_plan()?;
+    let limits = RecordLimits::default();
+    let descriptor = plan.checkpoint_description(limits, CHECKPOINT_LIMIT)?;
+    let saved: RecordAssemblyPlanDescription =
+        serde_json::from_value(serde_json::to_value(descriptor)?)?;
+    let job = l2_workbench::job::Job::new("cancel header reconstruction");
+    let mut checks = 0_usize;
+    let mut charged = 0_usize;
+    let mut control = |bytes: usize| {
+        checks += 1;
+        if checks == 4 {
+            job.request_cancel();
+        }
+        if job.is_cancelled() {
+            return Err(RecordError::Cancelled);
+        }
+        charged += bytes;
+        Ok(())
+    };
+    assert!(matches!(
+        saved.restore(limits, CHECKPOINT_LIMIT, CHECKPOINT_LIMIT, &mut control),
+        Err(RecordError::Cancelled)
+    ));
+    assert!(job.is_cancelled());
+    assert!(checks >= 4);
+    assert!(charged > 0);
+    Ok(())
+}
+
+#[test]
 fn checkpoint_rebuilds_shared_layouts_and_preserves_model_receipts() -> Result<(), Box<dyn Error>> {
     let plan = compiled_plan()?;
     let limits = RecordLimits::default();
@@ -37,7 +96,12 @@ fn checkpoint_rebuilds_shared_layouts_and_preserves_model_receipts() -> Result<(
     );
     let bytes = serde_json::to_vec(&descriptor)?;
     let saved: RecordAssemblyPlanDescription = serde_json::from_slice(&bytes)?;
-    let restored = saved.restore(limits, CHECKPOINT_LIMIT, CHECKPOINT_LIMIT)?;
+    let mut verification_bytes = 0_usize;
+    let restored = saved.restore(limits, CHECKPOINT_LIMIT, CHECKPOINT_LIMIT, &mut |bytes| {
+        verification_bytes += bytes;
+        Ok(())
+    })?;
+    assert!(verification_bytes > 0);
 
     assert_compiled_layout_plan(&restored);
     assert_eq!(restored.stats(), plan.stats());
@@ -67,7 +131,7 @@ fn checkpoint_rejects_incompatible_limits_versions_and_invalid_header_lengths()
     let saved: RecordAssemblyPlanDescription = serde_json::from_value(wrong_version)?;
     assert!(
         saved
-            .restore(limits, CHECKPOINT_LIMIT, CHECKPOINT_LIMIT)
+            .restore(limits, CHECKPOINT_LIMIT, CHECKPOINT_LIMIT, &mut |_| Ok(()))
             .is_err()
     );
 
@@ -76,7 +140,12 @@ fn checkpoint_rejects_incompatible_limits_versions_and_invalid_header_lengths()
     changed_limits.max_records -= 1;
     assert!(
         saved
-            .restore(changed_limits, CHECKPOINT_LIMIT, CHECKPOINT_LIMIT)
+            .restore(
+                changed_limits,
+                CHECKPOINT_LIMIT,
+                CHECKPOINT_LIMIT,
+                &mut |_| Ok(())
+            )
             .is_err()
     );
 
@@ -85,15 +154,23 @@ fn checkpoint_rejects_incompatible_limits_versions_and_invalid_header_lengths()
     let saved: RecordAssemblyPlanDescription = serde_json::from_value(invalid_header)?;
     assert!(
         saved
-            .restore(limits, CHECKPOINT_LIMIT, CHECKPOINT_LIMIT)
+            .restore(limits, CHECKPOINT_LIMIT, CHECKPOINT_LIMIT, &mut |_| Ok(()))
             .is_err()
     );
     assert!(plan.checkpoint_description(limits, 0).is_err());
     let descriptor = plan.checkpoint_description(limits, CHECKPOINT_LIMIT)?;
     let bytes = serde_json::to_vec(&descriptor)?;
     let descriptor: RecordAssemblyPlanDescription = serde_json::from_slice(&bytes)?;
-    assert!(descriptor.restore(limits, 1, CHECKPOINT_LIMIT).is_err());
-    assert!(descriptor.restore(limits, CHECKPOINT_LIMIT, 1).is_err());
+    assert!(
+        descriptor
+            .restore(limits, 1, CHECKPOINT_LIMIT, &mut |_| Ok(()))
+            .is_err()
+    );
+    assert!(
+        descriptor
+            .restore(limits, CHECKPOINT_LIMIT, 1, &mut |_| Ok(()))
+            .is_err()
+    );
     Ok(())
 }
 
@@ -140,7 +217,7 @@ fn checkpoint_reconstructs_a_large_logical_record_without_materializing_its_body
     set_field(input, "/header", json!(header))?;
 
     let saved: RecordAssemblyPlanDescription = serde_json::from_value(encoded)?;
-    let restored = saved.restore(limits, CHECKPOINT_LIMIT, CHECKPOINT_LIMIT)?;
+    let restored = saved.restore(limits, CHECKPOINT_LIMIT, CHECKPOINT_LIMIT, &mut |_| Ok(()))?;
     assert_eq!(restored.model_count(), 1);
     assert_eq!(restored.layout_count(), 1);
     assert!(restored.retained_bytes() < 64 * 1024);
@@ -155,18 +232,28 @@ fn checkpoint_headers_must_match_their_frozen_source_inputs() -> Result<(), Box<
     let descriptor: RecordAssemblyPlanDescription = serde_json::from_slice(&bytes)?;
     let frames = [frame(0, 0, b'x'), frame(1, 0, b'y')];
     let inputs = frames.iter().map(Vec::as_slice).collect::<Vec<_>>();
-    descriptor.validate_inputs(&inputs)?;
+    descriptor.validate_inputs(&inputs, &mut |_| Ok(()))?;
     let changed_header = [frame(7, 0, b'x'), frame(1, 0, b'y')];
     let changed = changed_header.iter().map(Vec::as_slice).collect::<Vec<_>>();
-    assert!(descriptor.validate_inputs(&changed).is_err());
     assert!(
         descriptor
-            .validate_inputs(inputs.get(..1).ok_or("missing first input")?)
+            .validate_inputs(&changed, &mut |_| Ok(()))
+            .is_err()
+    );
+    assert!(
+        descriptor
+            .validate_inputs(inputs.get(..1).ok_or("missing first input")?, &mut |_| Ok(
+                ()
+            ))
             .is_err()
     );
     let changed_length = [frame(0, 0, b'x'), vec![b'A']];
     let changed = changed_length.iter().map(Vec::as_slice).collect::<Vec<_>>();
-    assert!(descriptor.validate_inputs(&changed).is_err());
+    assert!(
+        descriptor
+            .validate_inputs(&changed, &mut |_| Ok(()))
+            .is_err()
+    );
     Ok(())
 }
 
@@ -193,7 +280,7 @@ fn checkpoint_compilation_and_reconstruction_share_one_workspace_limit()
             lower = middle;
         }
     }
-    match descriptor.restore(limits, CHECKPOINT_LIMIT, upper) {
+    match descriptor.restore(limits, CHECKPOINT_LIMIT, upper, &mut |_| Ok(())) {
         Err(RecordError::PlanTooLarge { bytes, maximum }) => {
             assert_eq!(maximum, upper);
             assert!(bytes > maximum);
@@ -241,12 +328,22 @@ fn checkpoint_restores_each_models_original_limits_and_exact_receipts() -> Resul
     let invalid: RecordAssemblyPlanDescription = serde_json::from_value(beyond_policy)?;
     assert!(
         invalid
-            .restore(policy_limits, CHECKPOINT_LIMIT, CHECKPOINT_LIMIT)
+            .restore(
+                policy_limits,
+                CHECKPOINT_LIMIT,
+                CHECKPOINT_LIMIT,
+                &mut |_| Ok(())
+            )
             .is_err()
     );
     let saved = serde_json::to_vec(&description)?;
     let saved: RecordAssemblyPlanDescription = serde_json::from_slice(&saved)?;
-    let restored = saved.restore(policy_limits, CHECKPOINT_LIMIT, CHECKPOINT_LIMIT)?;
+    let restored = saved.restore(
+        policy_limits,
+        CHECKPOINT_LIMIT,
+        CHECKPOINT_LIMIT,
+        &mut |_| Ok(()),
+    )?;
     assert_eq!(plan.stats(), restored.stats());
     let inputs = frames
         .iter()

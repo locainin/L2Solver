@@ -3,6 +3,7 @@ use super::super::DecodedFrameOutput;
 use super::super::{invalid_policy, operational};
 use l2_workbench::{
     artifact::{ArtifactValidationFormat, ArtifactValidationPolicy},
+    job::Job,
     protocol::{
         Direction, HoldoutBasis, RecordSchemaProposalLimits, RelationalSessionId,
         RelationalTransformReport,
@@ -47,6 +48,7 @@ impl SchemaHeaderKey {
         format: ArtifactValidationFormat,
         policy: ArtifactValidationPolicy,
         limits: RecordSchemaProposalLimits,
+        job: Option<&Job>,
     ) -> Result<(), RecoveryExecutionError> {
         if self.schema_limits != limits
             || self.validation_format != format
@@ -58,6 +60,7 @@ impl SchemaHeaderKey {
                 self.validation_policy,
                 self.schema_limits,
                 self.retained_bytes,
+                job,
             )?
             .as_ref()
                 != Some(self)
@@ -216,12 +219,13 @@ pub(super) fn schema_header_key(
     artifact_policy: ArtifactValidationPolicy,
     schema_limits: RecordSchemaProposalLimits,
     maximum_retained_bytes: usize,
+    job: Option<&Job>,
 ) -> Result<Option<SchemaHeaderKey>, RecoveryExecutionError> {
     if frames.is_empty() {
         return Ok(None);
     }
     // A cache hit selects partial models; binding still checks the current bytes and lengths
-    let Some(retained_bytes) = header_key_size(frames, report, maximum_retained_bytes) else {
+    let Some(retained_bytes) = header_key_size(frames, report, maximum_retained_bytes, job)? else {
         return Ok(None);
     };
 
@@ -230,6 +234,9 @@ pub(super) fn schema_header_key(
         .try_reserve_exact(frames.len())
         .map_err(|source| operational("record gate header key allocation failed", source))?;
     for frame in frames {
+        if let Some(job) = job {
+            job.check_cancelled()?;
+        }
         frame_keys.push(frame_header_key(frame)?);
     }
     Ok(Some(SchemaHeaderKey {
@@ -237,8 +244,8 @@ pub(super) fn schema_header_key(
             HoldoutBasis::SampleOrder => 0,
             HoldoutBasis::CompleteSessions => 1,
         },
-        discovery_sessions: try_session_ids(&report.discovery_sessions)?,
-        heldout_sessions: try_session_ids(&report.heldout_sessions)?,
+        discovery_sessions: try_session_ids(&report.discovery_sessions, job)?,
+        heldout_sessions: try_session_ids(&report.heldout_sessions, job)?,
         frames: frame_keys,
         validation_format: parser_format,
         validation_policy: artifact_policy,
@@ -251,7 +258,8 @@ fn header_key_size(
     frames: &[DecodedFrameOutput],
     report: &RelationalTransformReport,
     maximum_retained_bytes: usize,
-) -> Option<usize> {
+    job: Option<&Job>,
+) -> Result<Option<usize>, RecoveryExecutionError> {
     let session_bytes = report
         .discovery_sessions
         .len()
@@ -265,6 +273,9 @@ fn header_key_size(
         )
         .saturating_add(session_bytes);
     for frame in frames {
+        if let Some(job) = job {
+            job.check_cancelled()?;
+        }
         retained_bytes = retained_bytes
             .saturating_add(frame.context.source.len())
             .saturating_add(frame.context.scope.len())
@@ -275,13 +286,13 @@ fn header_key_size(
                     .saturating_mul(std::mem::size_of::<u64>()),
             );
         if retained_bytes > maximum_retained_bytes {
-            return None;
+            return Ok(None);
         }
     }
     if retained_bytes > maximum_retained_bytes {
-        return None;
+        return Ok(None);
     }
-    Some(retained_bytes)
+    Ok(Some(retained_bytes))
 }
 
 fn frame_header_key(frame: &DecodedFrameOutput) -> Result<FrameHeaderKey, RecoveryExecutionError> {
@@ -319,11 +330,19 @@ fn try_copy_slice<T: Copy>(values: &[T]) -> Result<Vec<T>, RecoveryExecutionErro
     Ok(copy)
 }
 
-fn try_session_ids(sessions: &[RelationalSessionId]) -> Result<Vec<u64>, RecoveryExecutionError> {
+fn try_session_ids(
+    sessions: &[RelationalSessionId],
+    job: Option<&Job>,
+) -> Result<Vec<u64>, RecoveryExecutionError> {
     let mut ids = Vec::new();
     ids.try_reserve_exact(sessions.len())
         .map_err(|source| operational("record gate session key allocation failed", source))?;
-    ids.extend(sessions.iter().map(|session| session.session));
+    for session in sessions {
+        if let Some(job) = job {
+            job.check_cancelled()?;
+        }
+        ids.push(session.session);
+    }
     Ok(ids)
 }
 

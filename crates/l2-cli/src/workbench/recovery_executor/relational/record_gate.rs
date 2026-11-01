@@ -199,6 +199,7 @@ impl SchemaPlanCache {
                 .record_limits
                 .max_report_bytes
                 .min(MAX_CACHED_HEADER_PLAN_BYTES),
+            options.job,
         )?;
         let key = schema_layout_key(
             frames,

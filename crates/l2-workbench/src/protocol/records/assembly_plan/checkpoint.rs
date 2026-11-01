@@ -169,18 +169,25 @@ impl RecordAssemblyPlanDescription {
     ///
     /// Input order uses the global indices supplied to the original assembly models.
     /// Payload bytes after each saved header are not compared.
+    /// The control checks cancellation and reserves work before each bounded operation
     ///
     /// # Errors
-    /// Returns an error when a referenced input is missing or its length or header changed.
-    pub fn validate_inputs(&self, inputs: &[&[u8]]) -> Result<(), RecordError> {
+    /// Returns an error when a referenced input changed or the control rejects further work
+    pub fn validate_inputs(
+        &self,
+        inputs: &[&[u8]],
+        control: &mut dyn FnMut(usize) -> Result<(), RecordError>,
+    ) -> Result<(), RecordError> {
         if self.version != VERSION {
             return Err(RecordError::InvalidReport);
         }
         for saved in &self.inputs {
+            control(mem::size_of::<InputDescription>())?;
             let bytes = inputs.get(saved.index).ok_or(RecordError::InvalidReport)?;
-            if bytes.len() != saved.input_length || !bytes.starts_with(&saved.header) {
+            if bytes.len() != saved.input_length {
                 return Err(RecordError::InvalidReport);
             }
+            compare_header(bytes, &saved.header, control)?;
         }
         Ok(())
     }
@@ -191,6 +198,7 @@ impl RecordAssemblyPlanDescription {
     /// `maximum_plan_bytes` bounds reconstruction and compilation workspace.
     /// The workspace uses the compiler's logical accounting, which excludes allocator metadata
     /// and allocation capacity beyond requested entries.
+    /// The control checks cancellation and reserves work before each bounded operation
     ///
     /// # Errors
     /// Returns an error for an incompatible description, invalid header, or exceeded bound.
@@ -199,36 +207,73 @@ impl RecordAssemblyPlanDescription {
         expected_limits: RecordLimits,
         maximum_description_bytes: usize,
         maximum_plan_bytes: usize,
+        control: &mut dyn FnMut(usize) -> Result<(), RecordError>,
     ) -> Result<RecordAssemblyPlan, RecordError> {
         if self.version != VERSION || self.limits != expected_limits {
             return Err(RecordError::InvalidReport);
         }
         super::validate_assembly_limits(expected_limits)?;
-        self.check_size(maximum_description_bytes)?;
-        if self
-            .models
-            .iter()
-            .any(|model| !within_ceiling(model.limits, expected_limits))
-        {
-            return Err(RecordError::InvalidReport);
+        self.check_size(maximum_description_bytes, control)?;
+        for model in &self.models {
+            control(mem::size_of::<ModelDescription>())?;
+            if !within_ceiling(model.limits, expected_limits) {
+                return Err(RecordError::InvalidReport);
+            }
         }
-        let reconstruction_bytes = self.reconstruction_size()?;
+        let reconstruction_bytes = self.reconstruction_size(control)?;
         if reconstruction_bytes > maximum_plan_bytes {
             return Err(RecordError::PlanTooLarge {
                 bytes: reconstruction_bytes,
                 maximum: maximum_plan_bytes,
             });
         }
+        let models = self.rebuild_models(control)?;
+        // The remaining models stay live while the compiler builds shared layouts
+        let compilation_budget = maximum_plan_bytes - reconstruction_bytes;
+        let plan = RecordAssemblyPlan::compile_header_models_controlled(
+            models,
+            compilation_budget,
+            Some(control),
+        )
+        .map_err(|error| match error {
+            RecordError::PlanTooLarge { bytes, .. } => RecordError::PlanTooLarge {
+                bytes: bytes.saturating_add(reconstruction_bytes),
+                maximum: maximum_plan_bytes,
+            },
+            other => other,
+        })?;
+        if plan.inputs.len() != self.inputs.len() {
+            return Err(RecordError::InvalidReport);
+        }
+        for (actual, saved) in plan.inputs.iter().zip(&self.inputs) {
+            control(mem::size_of::<InputDescription>())?;
+            if actual.global_input_index != saved.index || actual.length != saved.input_length {
+                return Err(RecordError::InvalidReport);
+            }
+            if actual.preserved_prefix.len() != saved.header.len() {
+                return Err(RecordError::InvalidReport);
+            }
+            compare_header(&actual.preserved_prefix, &saved.header, control)?;
+        }
+        Ok(plan)
+    }
+
+    fn rebuild_models(
+        &self,
+        control: &mut dyn FnMut(usize) -> Result<(), RecordError>,
+    ) -> Result<Vec<RecordAssemblyHeaderModel>, RecordError> {
         let mut models = Vec::new();
         models
             .try_reserve_exact(self.models.len())
             .map_err(|_| RecordError::AllocationFailed)?;
         for model in &self.models {
+            control(mem::size_of::<ModelDescription>())?;
             let mut templates = Vec::new();
             templates
                 .try_reserve_exact(model.inputs.len())
                 .map_err(|_| RecordError::AllocationFailed)?;
             for input in &model.inputs {
+                control(mem::size_of::<ModelInputDescription>())?;
                 let saved = self
                     .inputs
                     .get(input.shared_index)
@@ -241,7 +286,10 @@ impl RecordAssemblyPlanDescription {
                 header
                     .try_reserve_exact(prefix.len())
                     .map_err(|_| RecordError::AllocationFailed)?;
-                header.extend_from_slice(prefix);
+                for chunk in prefix.chunks(64 * 1024) {
+                    control(chunk.len())?;
+                    header.extend_from_slice(chunk);
+                }
                 let template = HeaderParseTemplate::from_header_checkpoint(
                     model.schema.clone(),
                     model.limits,
@@ -256,34 +304,21 @@ impl RecordAssemblyPlanDescription {
                 templates,
             ));
         }
-        // The remaining models stay live while the compiler builds shared layouts
-        let compilation_budget = maximum_plan_bytes - reconstruction_bytes;
-        let plan = RecordAssemblyPlan::compile_header_models(models, compilation_budget).map_err(
-            |error| match error {
-                RecordError::PlanTooLarge { bytes, .. } => RecordError::PlanTooLarge {
-                    bytes: bytes.saturating_add(reconstruction_bytes),
-                    maximum: maximum_plan_bytes,
-                },
-                other => other,
-            },
-        )?;
-        if plan.inputs.len() != self.inputs.len()
-            || plan.inputs.iter().zip(&self.inputs).any(|(actual, saved)| {
-                actual.global_input_index != saved.index
-                    || actual.length != saved.input_length
-                    || actual.preserved_prefix != saved.header
-            })
-        {
-            return Err(RecordError::InvalidReport);
-        }
-        Ok(plan)
+        Ok(models)
     }
 
-    fn check_size(&self, maximum: usize) -> Result<(), RecordError> {
-        check_size(self.logical_size()?, maximum)
+    fn check_size(
+        &self,
+        maximum: usize,
+        control: &mut dyn FnMut(usize) -> Result<(), RecordError>,
+    ) -> Result<(), RecordError> {
+        check_size(self.logical_size(control)?, maximum)
     }
 
-    fn logical_size(&self) -> Result<usize, RecordError> {
+    fn logical_size(
+        &self,
+        control: &mut dyn FnMut(usize) -> Result<(), RecordError>,
+    ) -> Result<usize, RecordError> {
         let mut total = mem::size_of::<Self>();
         total = add_array(
             total,
@@ -296,11 +331,13 @@ impl RecordAssemblyPlanDescription {
             mem::size_of::<ModelDescription>(),
         )?;
         for input in &self.inputs {
+            control(mem::size_of::<InputDescription>())?;
             total = total
                 .checked_add(input.header.capacity())
                 .ok_or(RecordError::InvalidReport)?;
         }
         for model in &self.models {
+            control(mem::size_of::<ModelDescription>())?;
             total = add_array(
                 total,
                 model.inputs.capacity(),
@@ -310,19 +347,24 @@ impl RecordAssemblyPlanDescription {
         Ok(total)
     }
 
-    fn reconstruction_size(&self) -> Result<usize, RecordError> {
+    fn reconstruction_size(
+        &self,
+        control: &mut dyn FnMut(usize) -> Result<(), RecordError>,
+    ) -> Result<usize, RecordError> {
         let mut total = add_array(
             0,
             self.models.len(),
             mem::size_of::<RecordAssemblyHeaderModel>(),
         )?;
         for model in &self.models {
+            control(mem::size_of::<ModelDescription>())?;
             let per_input = mem::size_of::<(usize, HeaderParseTemplate)>()
                 .checked_add(mem::size_of::<ParsedRecord>())
                 .and_then(|bytes| bytes.checked_add(model.schema.identifier.width))
                 .ok_or(RecordError::InvalidReport)?;
             total = add_array(total, model.inputs.len(), per_input)?;
             for input in &model.inputs {
+                control(mem::size_of::<ModelInputDescription>())?;
                 let shared = self
                     .inputs
                     .get(input.shared_index)
@@ -337,6 +379,23 @@ impl RecordAssemblyPlanDescription {
         }
         Ok(total)
     }
+}
+
+fn compare_header(
+    input: &[u8],
+    header: &[u8],
+    control: &mut dyn FnMut(usize) -> Result<(), RecordError>,
+) -> Result<(), RecordError> {
+    let prefix = input
+        .get(..header.len())
+        .ok_or(RecordError::InvalidReport)?;
+    for (actual, expected) in prefix.chunks(64 * 1024).zip(header.chunks(64 * 1024)) {
+        control(expected.len())?;
+        if actual != expected {
+            return Err(RecordError::InvalidReport);
+        }
+    }
+    Ok(())
 }
 
 const fn within_ceiling(limits: RecordLimits, ceiling: RecordLimits) -> bool {

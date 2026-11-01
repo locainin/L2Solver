@@ -128,10 +128,7 @@ fn grow_vec_to<T>(
     Ok(())
 }
 
-pub fn copy_message(
-    value: &str,
-    memory: &mut MemoryLease,
-) -> Result<String, Box<dyn Error>> {
+pub fn copy_message(value: &str, memory: &mut MemoryLease) -> Result<String, Box<dyn Error>> {
     let before = memory.bytes();
     charge(memory, value.len())?;
     let mut copy = String::new();

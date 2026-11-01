@@ -109,18 +109,24 @@ pub(super) struct PreparedRecordGroups {
 }
 
 /// Bounds plan-specific workspaces while reusing canonical record preparation
-pub(super) struct AssemblyPlanBudget {
+pub(super) struct AssemblyPlanBudget<'a> {
     retained: usize,
     workspace: usize,
     maximum: usize,
+    control: Option<&'a mut dyn FnMut(usize) -> Result<(), RecordError>>,
 }
 
-impl AssemblyPlanBudget {
-    pub(super) fn new(retained_bytes: usize, maximum_bytes: usize) -> Result<Self, RecordError> {
+impl<'a> AssemblyPlanBudget<'a> {
+    pub(super) fn new(
+        retained_bytes: usize,
+        maximum_bytes: usize,
+        control: Option<&'a mut dyn FnMut(usize) -> Result<(), RecordError>>,
+    ) -> Result<Self, RecordError> {
         let budget = Self {
             retained: retained_bytes,
             workspace: 0,
             maximum: maximum_bytes,
+            control,
         };
         budget.check_additional(0)?;
         Ok(budget)
@@ -128,18 +134,31 @@ impl AssemblyPlanBudget {
 
     pub(super) fn charge_workspace(&mut self, bytes: usize) -> Result<(), RecordError> {
         self.check_additional(bytes)?;
+        self.checkpoint(bytes)?;
         self.workspace = self.workspace.saturating_add(bytes);
         Ok(())
     }
 
     pub(super) fn retain(&mut self, bytes: usize) -> Result<(), RecordError> {
         self.check_additional(bytes)?;
+        self.checkpoint(bytes)?;
         self.retained = self.retained.saturating_add(bytes);
         Ok(())
     }
 
     pub(super) const fn release_workspace(&mut self, bytes: usize) {
         self.workspace = self.workspace.saturating_sub(bytes);
+    }
+
+    pub(super) fn checkpoint(&mut self, bytes: usize) -> Result<(), RecordError> {
+        if let Some(control) = &mut self.control {
+            control(bytes)?;
+        }
+        Ok(())
+    }
+
+    pub(super) const fn is_controlled(&self) -> bool {
+        self.control.is_some()
     }
 
     pub(super) const fn overflow_error(&self) -> RecordError {
@@ -293,6 +312,9 @@ fn validate_metadata_inputs(
     let mut record_count = 0_usize;
     let mut report_bytes = 0_usize;
     for (expected_input_index, input) in inputs.iter().enumerate() {
+        if let Some(budget) = plan_budget.as_deref_mut() {
+            budget.checkpoint(std::mem::size_of::<RecordMetadataInput<'_>>())?;
+        }
         if input.input_index != expected_input_index {
             return Err(RecordError::InvalidReport);
         }
@@ -345,7 +367,7 @@ fn validate_metadata_inputs(
                 maximum: limits.max_report_bytes,
             });
         }
-        validate_record_ranges(input.input_length, input.records, limits)?;
+        validate_record_ranges(input.input_length, input.records, limits, &mut plan_budget)?;
     }
     Ok((input_length, report_bytes))
 }
@@ -354,8 +376,10 @@ fn validate_record_ranges(
     input_length: usize,
     records: &[ParsedRecord],
     limits: RecordLimits,
+    plan_budget: &mut Option<&mut AssemblyPlanBudget<'_>>,
 ) -> Result<(), RecordError> {
     for (expected_index, record) in records.iter().enumerate() {
+        checkpoint_plan_budget(plan_budget, std::mem::size_of::<ParsedRecord>())?;
         let record_valid = record.index == expected_index
             && record.record.start <= record.payload.start
             && record.payload.start <= record.payload.end
@@ -385,6 +409,7 @@ fn group_metadata_inputs<'a>(
     let mut workspace_bytes = 0_usize;
     for input in inputs {
         for record in input.records {
+            checkpoint_plan_budget(plan_budget, record.identifier.len())?;
             let identifier = record.identifier.as_slice();
             let group_count = grouped.len();
             let reference_bytes = std::mem::size_of::<RecordReference<'_>>();
@@ -476,6 +501,20 @@ fn prepare_groups(
         terminal_sequence,
     };
     for (identifier, mut records) in grouped {
+        if plan_budget
+            .as_ref()
+            .is_some_and(|budget| budget.is_controlled())
+        {
+            let passes = usize::try_from(records.len().max(1).ilog2())
+                .unwrap_or(usize::MAX)
+                .saturating_add(1);
+            let sort_work = records
+                .len()
+                .saturating_mul(passes)
+                .saturating_mul(std::mem::size_of::<RecordReference<'_>>());
+            checkpoint_plan_budget(plan_budget, sort_work)?;
+        }
+        // The standard sort finishes within the admitted record and workspace bounds
         // Explicit source order makes equal sequence handling reproducible
         records.sort_unstable_by_key(|record| {
             (
@@ -484,6 +523,7 @@ fn prepare_groups(
                 record.record.index,
             )
         });
+        checkpoint_plan_budget(plan_budget, 0)?;
         let group = prepare_group(
             identifier,
             &records,
@@ -587,6 +627,16 @@ fn charge_report_bytes(
         budget.charge_workspace(additional)?;
     }
     *used = total;
+    Ok(())
+}
+
+fn checkpoint_plan_budget(
+    budget: &mut Option<&mut AssemblyPlanBudget<'_>>,
+    bytes: usize,
+) -> Result<(), RecordError> {
+    if let Some(budget) = budget.as_deref_mut() {
+        budget.checkpoint(bytes)?;
+    }
     Ok(())
 }
 
@@ -760,6 +810,7 @@ fn sequence_issues(
     let mut previous = None;
     let mut last_duplicate = None;
     for record in records {
+        checkpoint_plan_budget(plan_budget, std::mem::size_of::<RecordReference<'_>>())?;
         let sequence = record.record.sequence;
         let repeated = previous == Some(sequence);
         if repeated {
@@ -858,6 +909,7 @@ fn missing_sequences(
     let mut next_expected = Some(completion.sequence_base);
     let mut previous_observed = None;
     for record in records {
+        checkpoint_plan_budget(plan_budget, std::mem::size_of::<RecordReference<'_>>())?;
         let sequence = record.record.sequence;
         if sequence < completion.sequence_base
             || sequence > expected_terminal
@@ -867,7 +919,14 @@ fn missing_sequences(
             continue;
         }
         if let Some(expected) = next_expected {
-            append_gap_examples(&mut examples, expected, sequence, false, maximum_examples);
+            append_gap_examples(
+                &mut examples,
+                expected,
+                sequence,
+                false,
+                maximum_examples,
+                plan_budget,
+            )?;
         }
         next_expected = sequence.checked_add(1);
         previous_observed = Some(sequence);
@@ -884,7 +943,8 @@ fn missing_sequences(
             expected_terminal,
             true,
             maximum_examples,
-        );
+            plan_budget,
+        )?;
     }
     Ok((missing_count, examples))
 }
@@ -918,19 +978,24 @@ fn append_gap_examples(
     end: u64,
     include_end: bool,
     maximum: usize,
-) {
+    plan_budget: &mut Option<&mut AssemblyPlanBudget<'_>>,
+) -> Result<(), RecordError> {
     let available = maximum.saturating_sub(examples.len());
     let gap = u128::from(end)
         .saturating_sub(u128::from(start))
         .saturating_add(u128::from(include_end));
     let retain = gap.min(available as u128);
     for delta in 0..retain {
+        if delta.is_multiple_of(256) {
+            checkpoint_plan_budget(plan_budget, 0)?;
+        }
         if let Ok(delta) = u64::try_from(delta)
             && let Some(value) = start.checked_add(delta)
         {
             examples.push(value);
         }
     }
+    Ok(())
 }
 
 fn prepare_layout(
@@ -941,6 +1006,7 @@ fn prepare_layout(
 ) -> Result<(Vec<PhysicalPart>, Vec<RecordAssemblyPart>, usize), RecordError> {
     let mut length = 0_usize;
     for record in records {
+        checkpoint_plan_budget(plan_budget, std::mem::size_of::<RecordReference<'_>>())?;
         let payload_length = record
             .record
             .payload
@@ -986,6 +1052,7 @@ fn prepare_layout(
         .map_err(|_| RecordError::AllocationFailed)?;
     let mut output_offset = 0_usize;
     for record in records {
+        checkpoint_plan_budget(plan_budget, std::mem::size_of::<RecordReference<'_>>())?;
         let payload_length = record.record.payload.end - record.record.payload.start;
         let output_end =
             output_offset

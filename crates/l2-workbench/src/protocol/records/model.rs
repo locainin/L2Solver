@@ -455,6 +455,8 @@ pub enum RecordError {
         /// Logical work bytes needed for the next operation
         requested: usize,
     },
+    /// Checkpoint verification stopped after cancellation was requested
+    Cancelled,
     /// A bounded allocation failed
     AllocationFailed,
 }

@@ -74,6 +74,7 @@ impl fmt::Display for RecordError {
                 formatter,
                 "record work needs {requested} bytes after {consumed} of {limit} were used"
             ),
+            Self::Cancelled => formatter.write_str("record checkpoint verification was cancelled"),
             Self::AllocationFailed => formatter.write_str("record operation allocation failed"),
         }
     }

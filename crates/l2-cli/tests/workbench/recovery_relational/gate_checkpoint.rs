@@ -20,6 +20,7 @@ use std::error::Error;
 const CHECKPOINT_LIMIT: usize = 4 * 1024 * 1024;
 const PLAN_WORKSPACE_LIMIT: usize = 64 * 1024 * 1024;
 const LEARNING_WORK: usize = 64 * 1024 * 1024;
+const RESTORE_WORK: usize = 128 * 1024 * 1024;
 const PROBE_WORK: usize = 16 * 1024;
 
 pub(super) struct Fixture {
@@ -198,7 +199,7 @@ fn restored_gate_reuses_a_verified_decoy_plan_and_validates_the_artifact()
         serde_json::to_vec(&description)?
     };
     assert!(encoded.len() <= CHECKPOINT_LIMIT);
-    let mut work = RelationalRestoreBudget::new(LEARNING_WORK, 100_000);
+    let mut work = RelationalRestoreBudget::new(RESTORE_WORK, 100_000);
     let mut restored = SchemaPlanCache::restore_checkpoint(
         &encoded,
         SchemaCacheRestoreContext {
@@ -590,4 +591,206 @@ fn gate_replay_charges_frame_lookup_and_order_vector_work() -> Result<(), Box<dy
     super::record_gate::checkpoint::replay::replay(&fixture.correct, &mut context)?;
     assert!(work.verification_work_bytes() >= baseline + required_frame_scans + required_orders);
     Ok(())
+}
+
+#[test]
+fn restoring_header_plan_requires_work_after_producer_replay() -> Result<(), Box<dyn Error>> {
+    let fixture = Fixture::new()?;
+    let samples = fixture.samples();
+    let stored = fixture.stored();
+    let memory = MemoryBudget::new(256 * 1024 * 1024);
+    let (cache, _) = learn_decoy(&fixture, &samples, &stored, &memory)?;
+    let limits = RecordSchemaProposalLimits::default()
+        .discovery
+        .record_limits;
+    let mut description =
+        serde_json::to_value(cache.checkpoint_description(limits, CHECKPOINT_LIMIT)?)?;
+    let headers = description
+        .get("headers")
+        .and_then(serde_json::Value::as_array)
+        .ok_or("missing headers")?;
+    assert_eq!(
+        headers.len(),
+        1,
+        "fixture must contain one cached header plan"
+    );
+    assert_eq!(
+        description
+            .get("producers")
+            .and_then(serde_json::Value::as_array)
+            .ok_or("missing producers")?
+            .len(),
+        1
+    );
+    // Isolate header verification from the separately metered full schema plans
+    *description.get_mut("plans").ok_or("missing plans")? = serde_json::json!([]);
+    let bytes = serde_json::to_vec(&description)?;
+    let mut replay_work = RelationalRestoreBudget::new(LEARNING_WORK, 100_000);
+    let mut replay_context = SchemaCacheRestoreContext {
+        raw_directional_run: false,
+        samples: &samples,
+        stored_samples: &stored,
+        report: &fixture.report,
+        relational_limits: RelationalTransformLimits::default(),
+        schema_limits: RecordSchemaProposalLimits::default(),
+        artifact_policy: ArtifactValidationPolicy::default(),
+        maximum_checkpoint_bytes: CHECKPOINT_LIMIT,
+        maximum_workspace_bytes: PLAN_WORKSPACE_LIMIT,
+        memory: &memory,
+        work: &mut replay_work,
+        job: None,
+    };
+    super::record_gate::checkpoint::replay::replay(&fixture.decoy, &mut replay_context)?;
+    let allowance = bytes.len() * 2 + replay_work.verification_work_bytes();
+    let mut work = RelationalRestoreBudget::new(allowance, 100_000);
+    let result = SchemaPlanCache::restore_checkpoint(
+        &bytes,
+        SchemaCacheRestoreContext {
+            raw_directional_run: false,
+            samples: &samples,
+            stored_samples: &stored,
+            report: &fixture.report,
+            relational_limits: RelationalTransformLimits::default(),
+            schema_limits: RecordSchemaProposalLimits::default(),
+            artifact_policy: ArtifactValidationPolicy::default(),
+            maximum_checkpoint_bytes: CHECKPOINT_LIMIT,
+            maximum_workspace_bytes: PLAN_WORKSPACE_LIMIT,
+            memory: &memory,
+            work: &mut work,
+            job: None,
+        },
+    );
+    assert_restore_work_limited(result)?;
+    assert_eq!(work.remaining_verification_work_bytes(), 0);
+    Ok(())
+}
+
+fn assert_restore_work_limited(
+    result: Result<SchemaPlanCache, crate::workbench::recovery_executor::RecoveryExecutionError>,
+) -> Result<(), Box<dyn Error>> {
+    let error = result
+        .err()
+        .ok_or("header reconstruction ignored exhausted work")?;
+    let mut source: Option<&(dyn Error + 'static)> = Some(&error);
+    let mut work_limited = false;
+    while let Some(error) = source {
+        work_limited |= matches!(
+            error.downcast_ref::<l2_workbench::protocol::RelationalCursorError<std::convert::Infallible>>(),
+            Some(l2_workbench::protocol::RelationalCursorError::RestoreWorkLimit)
+        );
+        source = error.source();
+    }
+    assert!(
+        work_limited,
+        "header reconstruction must report the exhausted verification allowance"
+    );
+    Ok(())
+}
+
+#[test]
+fn restored_header_rejects_duplicate_or_unadmitted_saved_entries() -> Result<(), Box<dyn Error>> {
+    let fixture = Fixture::new()?;
+    let samples = fixture.samples();
+    let stored = fixture.stored();
+    let memory = MemoryBudget::new(256 * 1024 * 1024);
+    let (cache, _) = learn_decoy(&fixture, &samples, &stored, &memory)?;
+    let mut limits = RecordSchemaProposalLimits::default();
+    let mut description = serde_json::to_value(
+        cache.checkpoint_description(limits.discovery.record_limits, CHECKPOINT_LIMIT)?,
+    )?;
+    *description.get_mut("plans").ok_or("missing plans")? = serde_json::json!([]);
+    let original_header = description
+        .get("headers")
+        .and_then(serde_json::Value::as_array)
+        .and_then(|headers| headers.first())
+        .ok_or("missing header")?
+        .clone();
+
+    let mut duplicate = description.clone();
+    duplicate
+        .get_mut("headers")
+        .and_then(serde_json::Value::as_array_mut)
+        .ok_or("missing header list")?
+        .push(original_header.clone());
+    assert_invalid_header_restore(&fixture, &samples, &stored, &memory, limits, &duplicate)?;
+
+    let key_bytes = original_header
+        .pointer("/key/retained_bytes")
+        .and_then(serde_json::Value::as_u64)
+        .and_then(|value| usize::try_from(value).ok())
+        .ok_or("missing header key size")?;
+    let saved: l2_workbench::protocol::RecordAssemblyPlanDescription = serde_json::from_value(
+        original_header
+            .get("description")
+            .ok_or("missing plan")?
+            .clone(),
+    )?;
+    let plan = saved.restore(
+        limits.discovery.record_limits,
+        CHECKPOINT_LIMIT,
+        PLAN_WORKSPACE_LIMIT,
+        &mut |_| Ok(()),
+    )?;
+    let ceiling = key_bytes
+        .checked_add(plan.retained_bytes())
+        .and_then(|bytes| bytes.checked_sub(1))
+        .ok_or("invalid fixture size")?;
+    limits.discovery.record_limits.max_report_bytes = ceiling;
+    let header = description
+        .get_mut("headers")
+        .and_then(serde_json::Value::as_array_mut)
+        .and_then(|headers| headers.first_mut())
+        .ok_or("missing header")?;
+    *header
+        .pointer_mut("/key/schema_limits/discovery/record_limits/max_report_bytes")
+        .ok_or("missing key report limit")? = serde_json::json!(ceiling);
+    *header
+        .pointer_mut("/description/limits/max_report_bytes")
+        .ok_or("missing plan report limit")? = serde_json::json!(ceiling);
+    for model in header
+        .pointer_mut("/description/models")
+        .and_then(serde_json::Value::as_array_mut)
+        .ok_or("missing plan models")?
+    {
+        *model
+            .pointer_mut("/limits/max_report_bytes")
+            .ok_or("missing model report limit")? = serde_json::json!(ceiling);
+    }
+    assert_invalid_header_restore(&fixture, &samples, &stored, &memory, limits, &description)
+}
+
+fn assert_invalid_header_restore(
+    fixture: &Fixture,
+    samples: &[RelationalRecordSample<'_>],
+    stored: &[StoredSample],
+    memory: &MemoryBudget,
+    limits: RecordSchemaProposalLimits,
+    description: &serde_json::Value,
+) -> Result<(), Box<dyn Error>> {
+    let bytes = serde_json::to_vec(description)?;
+    let mut work = RelationalRestoreBudget::new(RESTORE_WORK, 100_000);
+    let result = SchemaPlanCache::restore_checkpoint(
+        &bytes,
+        SchemaCacheRestoreContext {
+            raw_directional_run: false,
+            samples,
+            stored_samples: stored,
+            report: &fixture.report,
+            relational_limits: RelationalTransformLimits::default(),
+            schema_limits: limits,
+            artifact_policy: ArtifactValidationPolicy::default(),
+            maximum_checkpoint_bytes: CHECKPOINT_LIMIT,
+            maximum_workspace_bytes: PLAN_WORKSPACE_LIMIT,
+            memory,
+            work: &mut work,
+            job: None,
+        },
+    );
+    match result {
+        Err(crate::workbench::recovery_executor::RecoveryExecutionError::Coordinator(
+            l2_workbench::recovery::RecoveryError::InvalidCheckpoint,
+        )) => Ok(()),
+        Ok(_) => Err("restored header cache silently discarded a saved entry".into()),
+        Err(error) => Err(format!("unexpected header restore failure: {error:?}").into()),
+    }
 }
