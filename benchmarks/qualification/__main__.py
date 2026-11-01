@@ -92,6 +92,7 @@ def execute(package_directory, output_directory):
             "status": "passed",
             "archive_sha256": package["archive_sha256"],
             "binary_sha256": package["provenance"]["binary"]["sha256"],
+            "active_helper_sha256": package["provenance"]["active_helper"]["sha256"],
         }
     except FileNotFoundError as error:
         checks["package"] = {"status": "blocked", "reason": str(error)}
@@ -146,6 +147,11 @@ def execute(package_directory, output_directory):
                     expected_bytes=package["provenance"]["binary"]["bytes"],
                 )
                 == package["provenance"]["binary"]["sha256"]
+                and hash_file(
+                    package["active_helper"],
+                    expected_bytes=package["provenance"]["active_helper"]["bytes"],
+                )
+                == package["provenance"]["active_helper"]["sha256"]
                 and _identity() == identity
             )
         except (OSError, ValueError, subprocess.SubprocessError):
