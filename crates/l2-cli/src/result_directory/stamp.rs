@@ -1,4 +1,5 @@
 use crate::publish::PreparedDirectoryReplacement;
+use l2_workbench::job::{Counter, Job, MemoryClass, MemoryLease, Phase};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::{
@@ -16,7 +17,7 @@ pub struct OutputFileStamp {
     pub file: String,
     /// File size in bytes
     pub byte_length: u64,
-    /// SHA-256 available from the manifest or calculated once for strict verification
+    /// SHA-256 from the manifest or publication; absent only for legacy receipts
     #[serde(
         default,
         deserialize_with = "super::bounded::deserialize_optional_sha256"
@@ -42,19 +43,20 @@ impl OutputFileStamp {
         directory: &std::path::Path,
         file_name: &str,
         manifest_sha256: Option<&str>,
-        artifact: bool,
+        hasher: &mut OutputHasher<'_>,
     ) -> io::Result<Self> {
+        hasher.job.check_cancelled().map_err(io::Error::other)?;
         let path = directory.join(file_name);
         let mut file = open_regular_path(&path)?;
         let before = file.metadata()?;
         let before_stamp = metadata_stamp(file_name.to_owned(), None, &before);
-        let sha256 = match (manifest_sha256, artifact) {
-            (Some(digest), _) => Some(digest.to_owned()),
-            (None, true) => Some(hash_file(&mut file)?),
-            (None, false) => None,
+        // Reuse the artifact's existing identity when the manifest provides one
+        let sha256 = match manifest_sha256 {
+            Some(digest) => digest.to_owned(),
+            None => hasher.hash_file(&mut file, before.len())?,
         };
         let after = file.metadata()?;
-        let after_stamp = metadata_stamp(file_name.to_owned(), sha256, &after);
+        let after_stamp = metadata_stamp(file_name.to_owned(), Some(sha256), &after);
         let named_after = std::fs::symlink_metadata(&path)?;
         if !same_fast_metadata(&before_stamp, &after_stamp)
             || !single_link(&after)
@@ -73,7 +75,9 @@ impl OutputFileStamp {
         &self,
         prepared: &PreparedDirectoryReplacement,
         strict: bool,
+        hasher: &mut OutputHasher<'_>,
     ) -> io::Result<()> {
+        hasher.job.check_cancelled().map_err(io::Error::other)?;
         let mut file = prepared.open_file(&self.file)?;
         let before = file.metadata()?;
         let current = metadata_stamp(self.file.clone(), self.sha256.clone(), &before);
@@ -83,16 +87,24 @@ impl OutputFileStamp {
         if !strict && !same_fast_metadata(self, &current) {
             return Err(changed_output(&self.file));
         }
-        if strict && let Some(expected_sha256) = &self.sha256 {
-            let digest = hash_file(&mut file)?;
+        if strict {
+            let expected_sha256 = self.sha256.as_ref().ok_or_else(|| {
+                super::manifest::actionable_conflict(&format!(
+                    "result output has no stored digest: {}",
+                    self.file
+                ))
+            })?;
+            let digest = hasher.hash_file(&mut file, before.len())?;
             let after = file.metadata()?;
-            let after_stamp = metadata_stamp(self.file.clone(), Some(digest.clone()), &after);
+            let after_stamp = metadata_stamp(self.file.clone(), None, &after);
             if &digest != expected_sha256
                 || !single_link(&after)
                 || !same_fast_metadata(&current, &after_stamp)
             {
                 return Err(changed_output(&self.file));
             }
+            // The name must still refer to the file that was just verified
+            verify_named_file(prepared, &self.file, &after)?;
         }
         prepared.check_location()?;
         Ok(())
@@ -128,21 +140,98 @@ pub(super) fn open_regular_path(path: &std::path::Path) -> io::Result<std::fs::F
     Ok(file)
 }
 
-fn hash_file(file: &mut std::fs::File) -> io::Result<String> {
-    file.seek(SeekFrom::Start(0))?;
-    let mut hasher = Sha256::new();
-    let mut buffer = vec![0_u8; HASH_BUFFER_BYTES].into_boxed_slice();
-    loop {
-        let read = file.read(&mut buffer)?;
-        if read == 0 {
-            break;
+pub(super) struct OutputHasher<'a> {
+    job: &'a Job,
+    // Drop the allocation before releasing its shared memory charge
+    buffer: Vec<u8>,
+    memory: Option<MemoryLease>,
+}
+
+impl<'a> OutputHasher<'a> {
+    pub(super) const fn new(job: &'a Job) -> Self {
+        Self {
+            job,
+            buffer: Vec::new(),
+            memory: None,
         }
-        let chunk = buffer
-            .get(..read)
-            .ok_or_else(|| io::Error::other("file reader returned an oversized chunk"))?;
-        hasher.update(chunk);
     }
-    Ok(format!("{:x}", hasher.finalize()))
+
+    fn hash_file(&mut self, file: &mut std::fs::File, length: u64) -> io::Result<String> {
+        self.job.check_cancelled().map_err(io::Error::other)?;
+        file.seek(SeekFrom::Start(0))?;
+        let mut hasher = Sha256::new();
+        if length > 0 {
+            self.prepare_buffer()?;
+            // Bound the read even if the named file grows while it is being checked
+            let mut limited = file.take(length);
+            while limited.limit() > 0 {
+                self.job.check_cancelled().map_err(io::Error::other)?;
+                let read = limited.read(&mut self.buffer)?;
+                if read == 0 {
+                    return Err(io::Error::new(
+                        io::ErrorKind::UnexpectedEof,
+                        "result output became shorter while hashing",
+                    ));
+                }
+                let bytes = u64::try_from(read).map_err(io::Error::other)?;
+                self.job
+                    .record_work(Phase::Publication, Counter::Bytes, bytes)
+                    .map_err(io::Error::other)?;
+                let chunk = self
+                    .buffer
+                    .get(..read)
+                    .ok_or_else(|| io::Error::other("file reader returned an oversized chunk"))?;
+                hasher.update(chunk);
+            }
+        }
+        self.job.check_cancelled().map_err(io::Error::other)?;
+        Ok(format!("{:x}", hasher.finalize()))
+    }
+
+    fn prepare_buffer(&mut self) -> io::Result<()> {
+        if !self.buffer.is_empty() {
+            return Ok(());
+        }
+        // Admit the allocation before reading any output bytes
+        let requested = u64::try_from(HASH_BUFFER_BYTES).map_err(io::Error::other)?;
+        let mut memory = self
+            .job
+            .memory_budget()
+            .map(|budget| budget.try_reserve(MemoryClass::Publication, requested))
+            .transpose()
+            .map_err(io::Error::other)?;
+        let mut buffer = Vec::new();
+        buffer
+            .try_reserve_exact(HASH_BUFFER_BYTES)
+            .map_err(io::Error::other)?;
+        if let Some(lease) = &mut memory {
+            lease
+                .try_resize(u64::try_from(buffer.capacity()).map_err(io::Error::other)?)
+                .map_err(io::Error::other)?;
+        }
+        buffer.resize(HASH_BUFFER_BYTES, 0);
+        self.buffer = buffer;
+        self.memory = memory;
+        Ok(())
+    }
+}
+
+pub(super) fn verify_named_file(
+    prepared: &PreparedDirectoryReplacement,
+    name: &str,
+    held: &Metadata,
+) -> io::Result<()> {
+    let named = prepared.open_file(name)?.metadata()?;
+    let held_stamp = metadata_stamp(name.to_owned(), None, held);
+    let named_stamp = metadata_stamp(name.to_owned(), None, &named);
+    if !single_link(held)
+        || !single_link(&named)
+        || !same_file_identity(held, &named)
+        || !same_fast_metadata(&held_stamp, &named_stamp)
+    {
+        return Err(changed_output(name));
+    }
+    Ok(())
 }
 
 fn metadata_stamp(file: String, sha256: Option<String>, metadata: &Metadata) -> OutputFileStamp {
@@ -245,3 +334,7 @@ fn changed_output(file: &str) -> io::Error {
         format!("result output changed after publication: {file}"),
     )
 }
+
+#[cfg(test)]
+#[path = "../../tests/result_directory/stamp.rs"]
+mod tests;

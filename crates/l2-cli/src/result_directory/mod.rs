@@ -6,7 +6,7 @@ mod publish;
 mod reuse;
 mod stamp;
 
-use l2_workbench::job::cache::SourceIdentity;
+use l2_workbench::job::{Job, cache::SourceIdentity};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::{error::Error, path::Path};
@@ -80,8 +80,9 @@ impl ResultDirectory {
         identity: &ResultIdentity,
         current_input: Option<&Path>,
         strict: bool,
+        job: &Job,
     ) -> Result<Option<ReusedResult>, Box<dyn Error>> {
-        reuse::reuse(self, identity, current_input, strict)
+        reuse::reuse(self, identity, current_input, strict, job)
     }
 
     pub(crate) fn reuse_refinement(
@@ -89,9 +90,10 @@ impl ResultDirectory {
         identity: &ResultIdentity,
         labels: &[String],
         strict: bool,
+        job: &Job,
         strong_source: impl FnOnce() -> Result<SourceIdentity, Box<dyn Error>>,
     ) -> Result<Option<ReusedResult>, Box<dyn Error>> {
-        reuse::reuse_refinement(self, identity, labels, strict, strong_source)
+        reuse::reuse_refinement(self, identity, labels, strict, job, strong_source)
     }
 
     /// Write a result into a private staging directory and atomically publish it

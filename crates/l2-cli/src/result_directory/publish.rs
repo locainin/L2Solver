@@ -1,5 +1,6 @@
 use super::{
-    ResultDirectory, ResultIdentity, ResultKind, bounded, manifest, stamp::OutputFileStamp,
+    ResultDirectory, ResultIdentity, ResultKind, bounded, manifest,
+    stamp::{OutputFileStamp, OutputHasher},
 };
 use l2_workbench::job::{Job, JobSnapshot, Phase, PhaseOutcome, cache::SourceIdentity};
 use l2_workbench::job::{
@@ -103,26 +104,29 @@ fn write_result_stage<T>(
     job.check_cancelled()?;
     job.start(Phase::Publication, None)?;
     capture.started.set(true);
-    let snapshot = result_snapshot(job)?;
-
     let parsed = manifest::parse_staged_manifest(staging, kind)?;
     validate_identity(identity, kind, parsed.source_identity_sha256.as_deref())?;
     let file_names = manifest::staged_output_files(staging, kind, &parsed)?;
-    let output_files = file_names
-        .iter()
-        .map(|file| {
-            let artifact = parsed
-                .artifacts
-                .iter()
-                .find(|artifact| artifact.file == *file);
-            OutputFileStamp::capture_path(
-                staging,
-                file,
-                artifact.and_then(|artifact| artifact.sha256.as_deref()),
-                artifact.is_some(),
-            )
-        })
-        .collect::<io::Result<Vec<_>>>()?;
+    let output_files = {
+        let mut hasher = OutputHasher::new(job);
+        file_names
+            .iter()
+            .map(|file| {
+                let artifact = parsed
+                    .artifacts
+                    .iter()
+                    .find(|artifact| artifact.file == *file);
+                OutputFileStamp::capture_path(
+                    staging,
+                    file,
+                    artifact.and_then(|artifact| artifact.sha256.as_deref()),
+                    &mut hasher,
+                )
+            })
+            .collect::<io::Result<Vec<_>>>()?
+    };
+    // Capture the completed digest reads after releasing their scratch buffer
+    let snapshot = result_snapshot(job)?;
     let artifact = parsed.artifacts.first().and_then(|artifact| {
         output_files
             .iter()

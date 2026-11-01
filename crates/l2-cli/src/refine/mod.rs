@@ -175,6 +175,7 @@ fn try_reuse<W: Write>(context: ReuseContext<'_, W>) -> Result<Option<bool>, Box
         identity,
         &sampled.labels,
         options.recovery.strict_cache,
+        job,
         || {
             input::strong_source_identity(
                 input_set,

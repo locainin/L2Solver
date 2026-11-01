@@ -10,6 +10,7 @@ type TestResult<T = ()> = Result<T, Box<dyn Error>>;
 mod publication_transition;
 mod publish;
 mod snapshot;
+mod strict_reuse;
 
 struct Fixture {
     _root: TempDir,
@@ -152,7 +153,12 @@ fn newly_published_complete_result_is_reused_with_declared_artifacts() -> TestRe
     let new_result = ResultDirectory::inspect(&fixture.output, ResultKind::Extract)?;
     assert!(
         new_result
-            .reuse(&fixture.identity, Some(&fixture.input), false)?
+            .reuse(
+                &fixture.identity,
+                Some(&fixture.input),
+                false,
+                &Job::new("reuse")
+            )?
             .is_none()
     );
 
@@ -160,7 +166,12 @@ fn newly_published_complete_result_is_reused_with_declared_artifacts() -> TestRe
 
     let existing = ResultDirectory::inspect(&fixture.output, ResultKind::Extract)?;
     let reused = existing
-        .reuse(&fixture.identity, Some(&fixture.input), false)?
+        .reuse(
+            &fixture.identity,
+            Some(&fixture.input),
+            false,
+            &Job::new("reuse"),
+        )?
         .ok_or("an owned result should be available")?;
     assert!(reused.complete);
     assert_eq!(reused.artifacts.len(), 1);
@@ -200,7 +211,12 @@ fn partial_result_is_reused_as_partial_not_a_complete_negative() -> TestResult {
 
     let existing = ResultDirectory::inspect(&fixture.output, ResultKind::Extract)?;
     let reused = existing
-        .reuse(&fixture.identity, Some(&fixture.input), false)?
+        .reuse(
+            &fixture.identity,
+            Some(&fixture.input),
+            false,
+            &Job::new("reuse"),
+        )?
         .ok_or("an owned partial result should be reported")?;
     assert!(!reused.complete);
     Ok(())
@@ -214,7 +230,8 @@ fn changed_policy_returns_actionable_conflict() -> TestResult {
     changed.settings = json!({"flows": false, "limit": 7});
 
     let existing = ResultDirectory::inspect(&fixture.output, ResultKind::Extract)?;
-    let Err(error) = existing.reuse(&changed, Some(&fixture.input), false) else {
+    let Err(error) = existing.reuse(&changed, Some(&fixture.input), false, &Job::new("reuse"))
+    else {
         return Err("different policy must not reuse an old result".into());
     };
     let message = error.to_string();
@@ -248,7 +265,12 @@ fn mutated_artifact_is_not_reused() -> TestResult {
     let existing = ResultDirectory::inspect(&fixture.output, ResultKind::Extract)?;
     assert!(
         existing
-            .reuse(&fixture.identity, Some(&fixture.input), false)
+            .reuse(
+                &fixture.identity,
+                Some(&fixture.input),
+                false,
+                &Job::new("reuse")
+            )
             .is_err()
     );
     Ok(())
@@ -273,7 +295,12 @@ fn strict_reuse_detects_same_length_changed_input() -> TestResult {
     let existing = ResultDirectory::inspect(&fixture.output, ResultKind::Extract)?;
     assert!(
         existing
-            .reuse(&fixture.identity, Some(&fixture.input), true)
+            .reuse(
+                &fixture.identity,
+                Some(&fixture.input),
+                true,
+                &Job::new("reuse")
+            )
             .is_err()
     );
     Ok(())
@@ -743,7 +770,12 @@ fn legacy_extract_requires_explicit_refresh() -> TestResult {
     fs::write(fixture.output.join("evidence.jsonl"), b"")?;
 
     let existing = ResultDirectory::inspect(&fixture.output, ResultKind::Extract)?;
-    let Err(error) = existing.reuse(&fixture.identity, Some(&fixture.input), false) else {
+    let Err(error) = existing.reuse(
+        &fixture.identity,
+        Some(&fixture.input),
+        false,
+        &Job::new("reuse"),
+    ) else {
         return Err("legacy extraction must not be treated as a cache hit".into());
     };
     assert!(error.to_string().contains("--refresh"));
@@ -757,7 +789,12 @@ fn gzip_evidence_sidecar_is_owned_and_reused_from_its_manifest_name() -> TestRes
 
     let existing = ResultDirectory::inspect(&fixture.output, ResultKind::Extract)?;
     let reused = existing
-        .reuse(&fixture.identity, Some(&fixture.input), true)?
+        .reuse(
+            &fixture.identity,
+            Some(&fixture.input),
+            true,
+            &Job::new("reuse"),
+        )?
         .ok_or("a result with its declared gzip sidecar should be reusable")?;
 
     assert!(reused.complete);
@@ -781,7 +818,12 @@ fn legacy_evidence_sidecar_can_be_refreshed_to_the_declared_gzip_sidecar() -> Te
     let legacy = ResultDirectory::inspect(&fixture.output, ResultKind::Extract)?;
     assert!(
         legacy
-            .reuse(&fixture.identity, Some(&fixture.input), false)
+            .reuse(
+                &fixture.identity,
+                Some(&fixture.input),
+                false,
+                &Job::new("reuse")
+            )
             .is_err()
     );
 
@@ -796,7 +838,12 @@ fn legacy_evidence_sidecar_can_be_refreshed_to_the_declared_gzip_sidecar() -> Te
 
     let refreshed = ResultDirectory::inspect(&fixture.output, ResultKind::Extract)?;
     let reused = refreshed
-        .reuse(&fixture.identity, Some(&fixture.input), true)?
+        .reuse(
+            &fixture.identity,
+            Some(&fixture.input),
+            true,
+            &Job::new("reuse"),
+        )?
         .ok_or("the refreshed gzip-sidecar result should be reusable")?;
     assert!(reused.complete);
     assert!(fixture.output.join("evidence.jsonl.gz").is_file());
@@ -838,7 +885,7 @@ fn refine_result_identity_uses_the_ordered_manifest_source_set() -> TestResult {
 
     let existing = ResultDirectory::inspect(&output, ResultKind::Refine)?;
     let reused = existing
-        .reuse(&identity, None, true)?
+        .reuse(&identity, None, true, &Job::new("reuse"))?
         .ok_or("an owned refine result should be available")?;
     assert!(reused.complete);
     assert!(reused.artifacts.is_empty());
@@ -883,7 +930,12 @@ fn destination_replacement_after_inspection_is_detected() -> TestResult {
 
     assert!(
         existing
-            .reuse(&fixture.identity, Some(&fixture.input), false)
+            .reuse(
+                &fixture.identity,
+                Some(&fixture.input),
+                false,
+                &Job::new("reuse")
+            )
             .is_err()
     );
     Ok(())

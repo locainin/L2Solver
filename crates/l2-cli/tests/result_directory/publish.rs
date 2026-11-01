@@ -16,7 +16,12 @@ fn explicit_refresh_atomically_replaces_an_owned_result_from_another_source() ->
     // Ordinary reuse cannot reinterpret the old collection as a result of the new input
     assert!(
         destination
-            .reuse(&fixture.identity, Some(&fixture.input), false)
+            .reuse(
+                &fixture.identity,
+                Some(&fixture.input),
+                false,
+                &Job::new("reuse")
+            )
             .is_err()
     );
     destination.publish(
@@ -28,7 +33,12 @@ fn explicit_refresh_atomically_replaces_an_owned_result_from_another_source() ->
     let replacement = ResultDirectory::inspect(&fixture.output, ResultKind::Extract)?;
     assert!(
         replacement
-            .reuse(&fixture.identity, Some(&fixture.input), true)?
+            .reuse(
+                &fixture.identity,
+                Some(&fixture.input),
+                true,
+                &Job::new("reuse")
+            )?
             .is_some_and(|result| result.complete)
     );
     assert_eq!(
@@ -70,7 +80,7 @@ fn failed_refresh_from_another_source_preserves_the_previous_collection() -> Tes
     let previous = ResultDirectory::inspect(&fixture.output, ResultKind::Extract)?;
     assert!(
         previous
-            .reuse(&previous_identity, None, true)?
+            .reuse(&previous_identity, None, true, &Job::new("reuse"))?
             .is_some_and(|result| result.complete)
     );
     Ok(())

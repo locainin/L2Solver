@@ -50,10 +50,16 @@ fn warm_sample_match_reuses_without_calling_full_source_verification() -> TestRe
         output::result_identity_with_source(sampled.identity.clone(), &options.recovery, &policy)?;
     let inspected = ResultDirectory::inspect(&destination, ResultKind::Refine)?;
     let called = Cell::new(false);
-    let reused = inspected.reuse_refinement(&identity, &sampled.labels, false, || {
-        called.set(true);
-        Err(io::Error::other("unexpected full source verification").into())
-    })?;
+    let reused = inspected.reuse_refinement(
+        &identity,
+        &sampled.labels,
+        false,
+        &Job::new("reuse"),
+        || {
+            called.set(true);
+            Err(io::Error::other("unexpected full source verification").into())
+        },
+    )?;
 
     assert!(
         reused.is_some(),

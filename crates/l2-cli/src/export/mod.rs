@@ -110,6 +110,7 @@ pub fn run_with_job(
             &identity,
             Some(&options.capture),
             options.recovery.strict_cache,
+            job,
         )?
     {
         job.increment(Counter::CacheHits, 1)?;

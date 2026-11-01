@@ -2,7 +2,10 @@ use super::{
     ResultDirectory, ResultIdentity, ReusedResult,
     manifest::{DirectoryState, actionable_conflict},
 };
-use l2_workbench::job::cache::{SourceFingerprint, SourceIdentity};
+use l2_workbench::job::{
+    Job,
+    cache::{SourceFingerprint, SourceIdentity},
+};
 use std::{error::Error, io, path::Path};
 
 pub(super) fn reuse(
@@ -10,7 +13,9 @@ pub(super) fn reuse(
     identity: &ResultIdentity,
     current_input: Option<&Path>,
     strict: bool,
+    job: &Job,
 ) -> Result<Option<ReusedResult>, Box<dyn Error>> {
+    job.check_cancelled()?;
     let (prepared, manifest, receipt) = match &directory.state {
         DirectoryState::Missing => return Ok(None),
         DirectoryState::Legacy { .. } => {
@@ -35,7 +40,7 @@ pub(super) fn reuse(
     }
     verify_source(identity, receipt, current_input, strict)?;
 
-    verified_result(prepared, manifest, receipt, strict).map(Some)
+    verified_result(prepared, manifest, receipt, strict, job).map(Some)
 }
 
 pub(super) fn reuse_refinement(
@@ -43,8 +48,10 @@ pub(super) fn reuse_refinement(
     identity: &ResultIdentity,
     labels: &[String],
     strict: bool,
+    job: &Job,
     strong_source: impl FnOnce() -> Result<SourceIdentity, Box<dyn Error>>,
 ) -> Result<Option<ReusedResult>, Box<dyn Error>> {
+    job.check_cancelled()?;
     let (prepared, manifest, receipt) = match &directory.state {
         DirectoryState::Missing => return Ok(None),
         DirectoryState::Legacy { .. } => {
@@ -89,7 +96,7 @@ pub(super) fn reuse_refinement(
         strong_identity.source = strong_source()?;
         verify_source(&strong_identity, receipt, None, true)?;
     }
-    verified_result(prepared, manifest, receipt, strict).map(Some)
+    verified_result(prepared, manifest, receipt, strict, job).map(Some)
 }
 
 fn verified_result(
@@ -97,9 +104,11 @@ fn verified_result(
     manifest: &super::manifest::OwnedManifest,
     receipt: &super::manifest::ResultReceipt,
     strict: bool,
+    job: &Job,
 ) -> Result<ReusedResult, Box<dyn Error>> {
+    let mut hasher = super::stamp::OutputHasher::new(job);
     for output in &receipt.output_files {
-        output.verify(prepared, strict)?;
+        output.verify(prepared, strict, &mut hasher)?;
     }
     prepared.check_location()?;
     Ok(ReusedResult {
