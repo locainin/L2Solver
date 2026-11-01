@@ -1,25 +1,29 @@
 //! Analyze one byte object through the existing bounded artifact and derivation engines
 
+mod memory;
+
 use super::{
     ArtifactBoundaryEvidence, ArtifactStructure, ArtifactValidationFormat,
     ArtifactValidationOutcome, ArtifactValidationPolicy, ArtifactValidator, DerLimits,
-    EmbeddedDiscoveryLimits, EmbeddedFormat, FileRange, PngLimits, scan_file_signatures,
+    EmbeddedDiscoveryLimits, EmbeddedFormat, FileRange, PngLimits,
     zip::{ZipArtifactLimits, ZipArtifactOmissionReason},
 };
+use crate::job::{MemoryError, MemoryLease};
 use crate::{
     derivation::{self, DerivationLimits, DerivationStatus, Operation},
     recovery::proposals::{
-        TransformEvidence, TransformProposal, TransformProposalBudget, propose_transforms,
-        transform_proposal_scan_work_bound,
+        ProposalMemoryError, TransformEvidence, TransformProposal, TransformProposalBudget,
+        propose_transforms, propose_transforms_with_memory, transform_proposal_scan_work_bound,
     },
     recovery::regions::{
-        RegionCueOrigin, TransformRegionLimits, TransformRegionReport, propose_region_transforms,
+        RegionCueOrigin, RegionMemoryError, TransformRegionLimits, TransformRegionReport,
+        propose_region_transforms, propose_region_transforms_with_memory,
         transform_region_scan_work_bound,
     },
     sha256,
 };
 use serde::{Deserialize, Serialize};
-use std::{collections::VecDeque, error::Error, fmt};
+use std::{error::Error, fmt};
 
 /// Hard limits for one standalone artifact analysis
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -477,6 +481,10 @@ pub enum AnalyzerError {
     InvalidSourceHash,
     /// A bounded analysis metadata allocation could not be reserved
     AllocationFailure,
+    /// The shared live-memory budget could not admit an analysis allocation
+    Memory(MemoryError),
+    /// A proposed operation has no shared-memory admission model
+    UnsupportedMemoryOperation,
 }
 
 impl fmt::Display for AnalyzerError {
@@ -489,16 +497,57 @@ impl fmt::Display for AnalyzerError {
                 formatter.write_str("artifact analysis source SHA-256 is invalid")
             }
             Self::AllocationFailure => formatter.write_str("artifact analysis allocation failed"),
+            Self::Memory(error) => write!(
+                formatter,
+                "artifact analysis memory admission failed: {error}"
+            ),
+            Self::UnsupportedMemoryOperation => {
+                formatter.write_str("artifact analysis operation lacks memory admission")
+            }
         }
     }
 }
 
-impl Error for AnalyzerError {}
+impl Error for AnalyzerError {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        match self {
+            Self::Memory(error) => Some(error),
+            _ => None,
+        }
+    }
+}
+
+impl From<MemoryError> for AnalyzerError {
+    fn from(error: MemoryError) -> Self {
+        Self::Memory(error)
+    }
+}
 
 struct PendingArtifact {
     bytes: Vec<u8>,
     origin: ArtifactOrigin,
     depth: usize,
+    memory: memory::Charge,
+}
+
+struct PendingArtifacts {
+    values: Vec<PendingArtifact>,
+    memory: memory::Charge,
+}
+
+impl PendingArtifacts {
+    fn new(template: &memory::Charge) -> Result<Self, AnalyzerError> {
+        Ok(Self {
+            values: Vec::new(),
+            memory: memory::sibling(template, 0)?,
+        })
+    }
+
+    fn push(&mut self, candidate: PendingArtifact) -> Result<(), AnalyzerError> {
+        memory::reserve_one(&mut self.values, &mut self.memory)?;
+        self.values.push(candidate);
+        Ok(())
+    }
 }
 
 struct WorkBudget {
@@ -554,24 +603,30 @@ struct ArtifactContext<'a> {
     limits: AnalyzerLimits,
 }
 
-struct TransformExecutionCandidate {
-    recipe: crate::derivation::Recipe,
-    evidence: TransformEvidence,
-    operation: Operation,
+struct TransformExecutionCandidate<'a> {
+    proposal: &'a TransformProposal,
     input_range: FileRange,
-    cue_origins: Vec<RegionCueOrigin>,
+    cue_origins: &'a [RegionCueOrigin],
+}
+
+// The derivation report drops before the charge that covers its buffers
+struct AdmittedDerivation {
+    report: derivation::DerivationReport,
+    memory: memory::Charge,
 }
 
 fn inspect_artifact(
     context: &ArtifactContext<'_>,
     budget: &mut AnalysisBudget,
     report: &mut ArtifactAnalysis,
-    found: &mut Vec<PendingArtifact>,
+    found: &mut PendingArtifacts,
+    memory: &mut memory::Charge,
 ) -> Result<ArtifactInspection, AnalyzerError> {
-    let (signature_match_count, signatures_scanned) = scan_signatures(context, budget, report);
-    let validation = validate_and_expand_zip(context, budget, report, found)?;
-    discover_embedded_objects(context, validation, budget, report, found)?;
-    derive_candidates(context, budget, report, found)?;
+    let (signature_match_count, signatures_scanned) =
+        scan_signatures(context, budget, report, memory)?;
+    let validation = validate_and_expand_zip(context, budget, report, found, memory)?;
+    discover_embedded_objects(context, validation, budget, report, found, memory)?;
+    derive_candidates(context, budget, report, found, memory)?;
     Ok(ArtifactInspection {
         signature_match_count,
         signatures_scanned,
@@ -583,27 +638,36 @@ fn scan_signatures(
     context: &ArtifactContext<'_>,
     budget: &mut AnalysisBudget,
     report: &mut ArtifactAnalysis,
-) -> (usize, bool) {
+    memory: &mut memory::Charge,
+) -> Result<(usize, bool), AnalyzerError> {
     let scan_charge = context.input_bytes.len();
     if scan_charge <= budget.signature_scan_remaining && budget.work.charge(scan_charge) {
-        let signatures = scan_file_signatures(context.input_bytes);
+        let matches = super::signatures::count_file_signature_matches(context.input_bytes);
         budget.signature_scan_remaining -= scan_charge;
-        (signatures.matches.len(), true)
+        Ok((matches, true))
     } else if scan_charge > budget.signature_scan_remaining {
-        report.omissions.push(AnalysisOmission::SignatureScanLimit {
-            artifact_index: context.index,
-            requested: scan_charge,
-            remaining: budget.signature_scan_remaining,
-        });
-        (0, false)
+        push_omission(
+            report,
+            memory,
+            AnalysisOmission::SignatureScanLimit {
+                artifact_index: context.index,
+                requested: scan_charge,
+                remaining: budget.signature_scan_remaining,
+            },
+        )?;
+        Ok((0, false))
     } else {
-        report.omissions.push(AnalysisOmission::WorkLimit {
-            artifact_index: context.index,
-            stage: AnalysisStage::SignatureScan,
-            requested: scan_charge,
-            remaining: budget.work.remaining,
-        });
-        (0, false)
+        push_omission(
+            report,
+            memory,
+            AnalysisOmission::WorkLimit {
+                artifact_index: context.index,
+                stage: AnalysisStage::SignatureScan,
+                requested: scan_charge,
+                remaining: budget.work.remaining,
+            },
+        )?;
+        Ok((0, false))
     }
 }
 
@@ -611,28 +675,42 @@ fn validate_and_expand_zip(
     context: &ArtifactContext<'_>,
     budget: &mut AnalysisBudget,
     report: &mut ArtifactAnalysis,
-    found: &mut Vec<PendingArtifact>,
+    found: &mut PendingArtifacts,
+    memory: &mut memory::Charge,
 ) -> Result<ValidationSummary, AnalyzerError> {
     let validation_charge = context.input_bytes.len();
     if !budget.work.charge(validation_charge) {
-        report.omissions.push(AnalysisOmission::WorkLimit {
-            artifact_index: context.index,
-            stage: AnalysisStage::ArtifactValidation,
-            requested: validation_charge,
-            remaining: budget.work.remaining,
-        });
+        push_omission(
+            report,
+            memory,
+            AnalysisOmission::WorkLimit {
+                artifact_index: context.index,
+                stage: AnalysisStage::ArtifactValidation,
+                requested: validation_charge,
+                remaining: budget.work.remaining,
+            },
+        )?;
         return Ok(unsupported_validation());
     }
 
     let validator = validator_for(context.limits)?;
     let mut parser_zip_remaining = budget.zip_remaining.min(budget.work.remaining);
     let parser_zip_start = parser_zip_remaining;
-    let validation =
-        validator.validate_with_zip_budget(context.input_bytes, &mut parser_zip_remaining);
+    let mut validation_memory = memory::sibling(memory, 0)?;
+    let validation = if let Some(lease) = &mut validation_memory {
+        validator.validate_with_zip_budget_and_memory(
+            context.input_bytes,
+            &mut parser_zip_remaining,
+            lease,
+        )
+    } else {
+        Ok(validator.validate_with_zip_budget(context.input_bytes, &mut parser_zip_remaining))
+    };
     let zip_work = parser_zip_start - parser_zip_remaining;
     budget.zip_remaining -= zip_work;
     let charged_zip_work = budget.work.charge(zip_work);
     debug_assert!(charged_zip_work);
+    let validation = validation?;
 
     let summary = summarize_validation(&validation);
     match validation {
@@ -641,30 +719,29 @@ fn validate_and_expand_zip(
             structure: ArtifactStructure::Zip(mut zip_report),
             ..
         } => {
-            append_zip_omissions(context.index, &zip_report, report);
+            append_zip_omissions(context.index, &zip_report, report, memory)?;
             for entry in std::mem::take(&mut zip_report.entries) {
                 if let Some(member_bytes) = entry.content {
-                    push_pending(
-                        found,
-                        PendingArtifact {
-                            bytes: member_bytes,
-                            origin: archive_member_origin(
-                                context.index,
-                                context.input_bytes.len(),
-                                &entry.metadata,
-                            ),
-                            depth: context.depth.saturating_add(1),
-                        },
-                    )?;
+                    found.push(zip_member_candidate(
+                        context,
+                        member_bytes,
+                        &entry.metadata,
+                        &mut validation_memory,
+                    )?)?;
                 }
             }
         }
         ArtifactValidationOutcome::Omitted { format, reason, .. } => {
-            report.omissions.push(AnalysisOmission::ValidationLimit {
-                artifact_index: context.index,
-                format: format.map(format_label),
-                reason: format!("{reason:?}"),
-            });
+            let reason = memory::format_message(format_args!("{reason:?}"), memory)?;
+            push_omission(
+                report,
+                memory,
+                AnalysisOmission::ValidationLimit {
+                    artifact_index: context.index,
+                    format: format.map(format_label),
+                    reason,
+                },
+            )?;
         }
         _ => {}
     }
@@ -675,19 +752,53 @@ fn append_zip_omissions(
     artifact_index: usize,
     zip_report: &super::zip::ZipArtifactReport,
     report: &mut ArtifactAnalysis,
-) {
+    memory: &mut memory::Charge,
+) -> Result<(), AnalyzerError> {
     if zip_report.omitted_entry_count == 0 {
-        return;
+        return Ok(());
     }
     for entry in &zip_report.entries {
         if let Some(reason) = entry.omission {
-            report.omissions.push(AnalysisOmission::ZipMember {
-                artifact_index,
-                entry_index: entry.metadata.index,
-                reason,
-            });
+            push_omission(
+                report,
+                memory,
+                AnalysisOmission::ZipMember {
+                    artifact_index,
+                    entry_index: entry.metadata.index,
+                    reason,
+                },
+            )?;
         }
     }
+    Ok(())
+}
+
+fn zip_member_candidate(
+    context: &ArtifactContext<'_>,
+    bytes: Vec<u8>,
+    metadata: &super::zip::ZipArtifactEntryMetadata,
+    parser_memory: &mut memory::Charge,
+) -> Result<PendingArtifact, AnalyzerError> {
+    let mut owned = memory::Bytes {
+        memory: memory::split(parser_memory, bytes.capacity())?,
+        bytes,
+    };
+    let preview = metadata.raw_name.len().min(32) * 2;
+    // Digest formatting and the bounded name preview can coexist during construction
+    memory::grow(&mut owned.memory, 128 + preview)?;
+    let origin = archive_member_origin(context.index, context.input_bytes.len(), metadata);
+    let retained = owned
+        .bytes
+        .capacity()
+        .checked_add(origin_owned_bytes(&origin)?)
+        .ok_or(AnalyzerError::AllocationFailure)?;
+    memory::resize(&mut owned.memory, retained)?;
+    Ok(PendingArtifact {
+        bytes: owned.bytes,
+        origin,
+        depth: context.depth.saturating_add(1),
+        memory: owned.memory,
+    })
 }
 
 fn discover_embedded_objects(
@@ -695,16 +806,21 @@ fn discover_embedded_objects(
     validation: ValidationSummary,
     budget: &mut AnalysisBudget,
     report: &mut ArtifactAnalysis,
-    found: &mut Vec<PendingArtifact>,
+    found: &mut PendingArtifacts,
+    memory: &mut memory::Charge,
 ) -> Result<(), AnalyzerError> {
     let discovery_charge = context.input_bytes.len();
     if !budget.work.charge(discovery_charge) {
-        report.omissions.push(AnalysisOmission::WorkLimit {
-            artifact_index: context.index,
-            stage: AnalysisStage::EmbeddedDiscovery,
-            requested: discovery_charge,
-            remaining: budget.work.remaining,
-        });
+        push_omission(
+            report,
+            memory,
+            AnalysisOmission::WorkLimit {
+                artifact_index: context.index,
+                stage: AnalysisStage::EmbeddedDiscovery,
+                requested: discovery_charge,
+                remaining: budget.work.remaining,
+            },
+        )?;
         return Ok(());
     }
 
@@ -713,26 +829,49 @@ fn discover_embedded_objects(
     discovery_limits.max_zip_operation_expanded_bytes = 0;
     let skip_start_format =
         embedded_format_for_validated_full_range(validation, context.input_bytes.len());
-    let discovery = super::embedded::discover_embedded_objects_with_work_and_skip_start(
-        context.input_bytes,
-        discovery_limits,
-        budget.work.remaining,
-        skip_start_format,
-    )
-    .map_err(|_| AnalyzerError::AllocationFailure)?;
+    let mut discovery_memory = memory::sibling(memory, 0)?;
+    let discovery = if let Some(lease) = &mut discovery_memory {
+        super::embedded::discover_embedded_objects_with_work_and_skip_start_with_memory(
+            context.input_bytes,
+            discovery_limits,
+            budget.work.remaining,
+            skip_start_format,
+            lease,
+        )
+        .map_err(|error| match error {
+            super::embedded::EmbeddedDiscoveryMemoryError::Discovery(_) => {
+                AnalyzerError::AllocationFailure
+            }
+            super::embedded::EmbeddedDiscoveryMemoryError::Memory(error) => {
+                AnalyzerError::Memory(error)
+            }
+        })?
+    } else {
+        super::embedded::discover_embedded_objects_with_work_and_skip_start(
+            context.input_bytes,
+            discovery_limits,
+            budget.work.remaining,
+            skip_start_format,
+        )
+        .map_err(|_| AnalyzerError::AllocationFailure)?
+    };
     let charged_discovery_work = budget.work.charge(discovery.validation_input_bytes);
     debug_assert!(charged_discovery_work);
     if discovery.omissions.output_candidate_count > 0
         || discovery.omissions.unvalidated_candidate_count > 0
         || discovery.omissions.unscanned_range.is_some()
     {
-        report.omissions.push(AnalysisOmission::EmbeddedDiscovery {
-            artifact_index: context.index,
-            output_candidates: discovery.omissions.output_candidate_count,
-            unvalidated_candidates: discovery.omissions.unvalidated_candidate_count,
-            zip_entry_count_limited: discovery.omissions.zip_entry_count_limited,
-            unscanned_range: discovery.omissions.unscanned_range,
-        });
+        push_omission(
+            report,
+            memory,
+            AnalysisOmission::EmbeddedDiscovery {
+                artifact_index: context.index,
+                output_candidates: discovery.omissions.output_candidate_count,
+                unvalidated_candidates: discovery.omissions.unvalidated_candidate_count,
+                zip_entry_count_limited: discovery.omissions.zip_entry_count_limited,
+                unscanned_range: discovery.omissions.unscanned_range,
+            },
+        )?;
     }
     for candidate in discovery.candidates {
         if candidate.validation.is_err() {
@@ -748,18 +887,20 @@ fn discover_embedded_objects(
         let Some(candidate_bytes) = context.input_bytes.get(candidate.range.offset..end) else {
             continue;
         };
-        push_pending(
-            found,
-            PendingArtifact {
-                bytes: try_copy_bytes(candidate_bytes)?,
-                origin: ArtifactOrigin::EmbeddedObject {
-                    parent_index: context.index,
-                    range: candidate.range,
-                    format: candidate.format,
-                },
-                depth: context.depth.saturating_add(1),
+        let memory::Bytes {
+            memory: candidate_memory,
+            bytes,
+        } = memory::copy_bytes(candidate_bytes, memory)?;
+        found.push(PendingArtifact {
+            bytes,
+            origin: ArtifactOrigin::EmbeddedObject {
+                parent_index: context.index,
+                range: candidate.range,
+                format: candidate.format,
             },
-        )?;
+            depth: context.depth.saturating_add(1),
+            memory: candidate_memory,
+        })?;
     }
     Ok(())
 }
@@ -794,176 +935,257 @@ fn derive_candidates(
     context: &ArtifactContext<'_>,
     budget: &mut AnalysisBudget,
     report: &mut ArtifactAnalysis,
-    found: &mut Vec<PendingArtifact>,
+    found: &mut PendingArtifacts,
+    memory: &mut memory::Charge,
 ) -> Result<(), AnalyzerError> {
     if context.input_bytes.len() > context.limits.max_transform_input_bytes {
-        report
-            .omissions
-            .push(AnalysisOmission::TransformInputLimit {
+        push_omission(
+            report,
+            memory,
+            AnalysisOmission::TransformInputLimit {
                 artifact_index: context.index,
                 length: context.input_bytes.len(),
                 maximum: context.limits.max_transform_input_bytes,
-            });
+            },
+        )?;
         return Ok(());
     }
     let Some(proposal_charge) = transform_proposal_scan_work_bound(context.input_bytes.len())
     else {
-        report.omissions.push(AnalysisOmission::WorkLimit {
-            artifact_index: context.index,
-            stage: AnalysisStage::TransformProposal,
-            requested: usize::MAX,
-            remaining: budget.work.remaining,
-        });
+        push_omission(
+            report,
+            memory,
+            AnalysisOmission::WorkLimit {
+                artifact_index: context.index,
+                stage: AnalysisStage::TransformProposal,
+                requested: usize::MAX,
+                remaining: budget.work.remaining,
+            },
+        )?;
         return Ok(());
     };
     if !budget.work.charge(proposal_charge) {
-        report.omissions.push(AnalysisOmission::WorkLimit {
-            artifact_index: context.index,
-            stage: AnalysisStage::TransformProposal,
-            requested: proposal_charge,
-            remaining: budget.work.remaining,
-        });
+        push_omission(
+            report,
+            memory,
+            AnalysisOmission::WorkLimit {
+                artifact_index: context.index,
+                stage: AnalysisStage::TransformProposal,
+                requested: proposal_charge,
+                remaining: budget.work.remaining,
+            },
+        )?;
         return Ok(());
     }
 
-    let proposals = propose_transforms(
-        context.input_bytes,
-        TransformProposalBudget {
-            max_candidates: 7,
-            max_reports: 7,
-        },
-    );
-    let complete_range = complete_range(context.input_bytes.len());
-    let whole_input_candidates = proposals
+    let proposal_budget = TransformProposalBudget {
+        max_candidates: 7,
+        max_reports: 7,
+    };
+    let mut proposal_memory = memory::sibling(memory, 0)?;
+    let proposals = if let Some(lease) = &mut proposal_memory {
+        propose_transforms_with_memory(context.input_bytes, proposal_budget, lease)
+            .map_err(proposal_memory_error)?
+    } else {
+        propose_transforms(context.input_bytes, proposal_budget)
+    };
+    let candidates = proposals
         .proposals
-        .into_iter()
-        .map(|proposal| execution_candidate(proposal, complete_range, Vec::new()))
-        .collect::<Result<Vec<_>, _>>()?;
-    execute_transform_candidates(context, budget, report, found, whole_input_candidates)?;
-    derive_region_candidates(context, budget, report, found)
+        .iter()
+        .map(|proposal| TransformExecutionCandidate {
+            proposal,
+            input_range: complete_range(context.input_bytes.len()),
+            cue_origins: &[],
+        });
+    execute_transform_candidates(context, budget, report, found, candidates, memory)?;
+    drop(proposals);
+    drop(proposal_memory);
+    derive_region_candidates(context, budget, report, found, memory)
 }
 
 fn derive_region_candidates(
     context: &ArtifactContext<'_>,
     budget: &mut AnalysisBudget,
     report: &mut ArtifactAnalysis,
-    found: &mut Vec<PendingArtifact>,
+    found: &mut PendingArtifacts,
+    memory: &mut memory::Charge,
 ) -> Result<(), AnalyzerError> {
     let input_length = context.input_bytes.len();
     let region_limits = TransformRegionLimits::for_input(input_length);
     let Some(proposal_charge) = transform_region_scan_work_bound(region_limits) else {
-        report.omissions.push(AnalysisOmission::WorkLimit {
-            artifact_index: context.index,
-            stage: AnalysisStage::TransformProposal,
-            requested: usize::MAX,
-            remaining: budget.work.remaining,
-        });
+        push_omission(
+            report,
+            memory,
+            AnalysisOmission::WorkLimit {
+                artifact_index: context.index,
+                stage: AnalysisStage::TransformProposal,
+                requested: usize::MAX,
+                remaining: budget.work.remaining,
+            },
+        )?;
         return Ok(());
     };
     if !budget.work.charge(proposal_charge) {
-        report.omissions.push(AnalysisOmission::WorkLimit {
-            artifact_index: context.index,
-            stage: AnalysisStage::TransformProposal,
-            requested: proposal_charge,
-            remaining: budget.work.remaining,
-        });
+        push_omission(
+            report,
+            memory,
+            AnalysisOmission::WorkLimit {
+                artifact_index: context.index,
+                stage: AnalysisStage::TransformProposal,
+                requested: proposal_charge,
+                remaining: budget.work.remaining,
+            },
+        )?;
         return Ok(());
     }
 
-    let region_report = propose_region_transforms(
-        context.input_bytes,
-        &[],
-        region_limits,
-        TransformProposalBudget {
-            max_candidates: 7,
-            max_reports: 7,
-        },
-    );
-    let mut candidates = Vec::new();
-    for region in &region_report.regions {
-        let input_range = FileRange {
-            offset: region.range.start,
-            length: region.range.end - region.range.start,
-        };
-        for proposal in region.proposal_report.proposals.iter().cloned() {
-            candidates.push(execution_candidate(
+    let proposal_budget = TransformProposalBudget {
+        max_candidates: 7,
+        max_reports: 7,
+    };
+    let mut region_memory = memory::sibling(memory, 0)?;
+    let region_report = if let Some(lease) = &mut region_memory {
+        propose_region_transforms_with_memory(
+            context.input_bytes,
+            &[],
+            region_limits,
+            proposal_budget,
+            lease,
+        )
+        .map_err(region_memory_error)?
+    } else {
+        propose_region_transforms(context.input_bytes, &[], region_limits, proposal_budget)
+    };
+    let candidates = region_report.regions.iter().flat_map(|region| {
+        region
+            .proposal_report
+            .proposals
+            .iter()
+            .map(move |proposal| TransformExecutionCandidate {
                 proposal,
-                input_range,
-                region.cue_origins.clone(),
-            )?);
-        }
-    }
-    report
-        .region_transform_reports
-        .try_reserve(1)
-        .map_err(|_| AnalyzerError::AllocationFailure)?;
+                input_range: FileRange {
+                    offset: region.range.start,
+                    length: region.range.end - region.range.start,
+                },
+                cue_origins: &region.cue_origins,
+            })
+    });
+    execute_transform_candidates(context, budget, report, found, candidates, memory)?;
+    memory::reserve_one(&mut report.region_transform_reports, memory)?;
     report
         .region_transform_reports
         .push(ArtifactRegionTransformReport {
             artifact_index: context.index,
             report: region_report,
         });
-    execute_transform_candidates(context, budget, report, found, candidates)
+    memory::absorb(memory, region_memory);
+    Ok(())
 }
 
-fn execution_candidate(
-    proposal: TransformProposal,
-    input_range: FileRange,
-    cue_origins: Vec<RegionCueOrigin>,
-) -> Result<TransformExecutionCandidate, AnalyzerError> {
-    let operation = proposal
-        .recipe
-        .steps
-        .last()
-        .cloned()
-        .ok_or(AnalyzerError::AllocationFailure)?;
-    Ok(TransformExecutionCandidate {
-        recipe: proposal.recipe,
-        evidence: proposal.evidence,
-        operation,
-        input_range,
-        cue_origins,
-    })
+fn proposal_memory_error(error: ProposalMemoryError) -> AnalyzerError {
+    match error {
+        ProposalMemoryError::Memory(error) => AnalyzerError::Memory(error),
+        ProposalMemoryError::Allocation => AnalyzerError::AllocationFailure,
+    }
 }
 
-fn execute_transform_candidates(
+fn region_memory_error(error: RegionMemoryError) -> AnalyzerError {
+    match error {
+        RegionMemoryError::Memory(error) => AnalyzerError::Memory(error),
+        RegionMemoryError::Allocation => AnalyzerError::AllocationFailure,
+    }
+}
+
+fn execute_transform_candidates<'a>(
     context: &ArtifactContext<'_>,
     budget: &mut AnalysisBudget,
     report: &mut ArtifactAnalysis,
-    found: &mut Vec<PendingArtifact>,
-    proposals: Vec<TransformExecutionCandidate>,
+    found: &mut PendingArtifacts,
+    proposals: impl IntoIterator<Item = TransformExecutionCandidate<'a>>,
+    memory: &mut memory::Charge,
 ) -> Result<(), AnalyzerError> {
     for proposal in proposals {
+        let operation = proposal
+            .proposal
+            .recipe
+            .steps
+            .last()
+            .ok_or(AnalyzerError::AllocationFailure)?;
         if budget.work.remaining == 0 {
-            report.omissions.push(AnalysisOmission::WorkLimit {
-                artifact_index: context.index,
-                stage: AnalysisStage::TransformExecution,
-                requested: 1,
-                remaining: 0,
-            });
+            push_omission(
+                report,
+                memory,
+                AnalysisOmission::WorkLimit {
+                    artifact_index: context.index,
+                    stage: AnalysisStage::TransformExecution,
+                    requested: 1,
+                    remaining: 0,
+                },
+            )?;
             break;
         }
         let derivation_limits = derivation_limits(context.limits, budget.work.remaining);
-        let result =
-            derivation::run_with_limits(context.input_bytes, &proposal.recipe, derivation_limits);
+        let mut result_memory = memory::sibling(memory, 0)?;
+        let result = if let Some(lease) = &mut result_memory {
+            match derivation::run_with_memory(
+                context.input_bytes,
+                &proposal.proposal.recipe,
+                derivation_limits,
+                lease,
+            ) {
+                Ok(result) => Ok(result),
+                Err(derivation::AdmittedDerivationError::Derivation(error)) => Err(error),
+                Err(derivation::AdmittedDerivationError::Memory(error)) => return Err(error.into()),
+                Err(derivation::AdmittedDerivationError::UnsupportedOperation) => {
+                    return Err(AnalyzerError::UnsupportedMemoryOperation);
+                }
+            }
+        } else {
+            derivation::run_with_limits(
+                context.input_bytes,
+                &proposal.proposal.recipe,
+                derivation_limits,
+            )
+        };
         match result {
             Ok(derivation) => {
                 if !budget.work.charge(derivation.work_bytes) {
-                    report.omissions.push(AnalysisOmission::WorkLimit {
-                        artifact_index: context.index,
-                        stage: AnalysisStage::TransformExecution,
-                        requested: derivation.work_bytes,
-                        remaining: budget.work.remaining,
-                    });
+                    push_omission(
+                        report,
+                        memory,
+                        AnalysisOmission::WorkLimit {
+                            artifact_index: context.index,
+                            stage: AnalysisStage::TransformExecution,
+                            requested: derivation.work_bytes,
+                            remaining: budget.work.remaining,
+                        },
+                    )?;
                     continue;
                 }
-                record_transform_result(context, proposal, derivation, report, found)?;
+                record_transform_result(
+                    context,
+                    proposal,
+                    AdmittedDerivation {
+                        report: derivation,
+                        memory: result_memory,
+                    },
+                    report,
+                    found,
+                    memory,
+                )?;
             }
-            Err(error) => report.omissions.push(AnalysisOmission::TransformFailed {
-                artifact_index: context.index,
-                operation: proposal.operation,
-                message: error.to_string(),
-            }),
+            Err(error) => {
+                let message = memory::format_message(format_args!("{error}"), memory)?;
+                push_omission(
+                    report,
+                    memory,
+                    AnalysisOmission::TransformFailed {
+                        artifact_index: context.index,
+                        operation: operation.clone(),
+                        message,
+                    },
+                )?;
+            }
         }
     }
     Ok(())
@@ -971,32 +1193,55 @@ fn execute_transform_candidates(
 
 fn record_transform_result(
     context: &ArtifactContext<'_>,
-    proposal: TransformExecutionCandidate,
-    result: derivation::DerivationReport,
+    proposal: TransformExecutionCandidate<'_>,
+    mut result: AdmittedDerivation,
     report: &mut ArtifactAnalysis,
-    found: &mut Vec<PendingArtifact>,
+    found: &mut PendingArtifacts,
+    memory: &mut memory::Charge,
 ) -> Result<(), AnalyzerError> {
-    if result.status != DerivationStatus::Completed {
-        report.omissions.push(AnalysisOmission::TransformFailed {
-            artifact_index: context.index,
-            operation: proposal.operation,
-            message: format!("canonical operation stopped at step {:?}", result.status),
-        });
-    } else if !result.output.is_empty() && result.output != context.input_bytes {
-        push_pending(
-            found,
-            PendingArtifact {
-                bytes: result.output,
-                origin: ArtifactOrigin::Transformation {
-                    parent_index: context.index,
-                    input_range: proposal.input_range,
-                    operation: proposal.operation,
-                    evidence: proposal.evidence,
-                    cue_origins: proposal.cue_origins,
-                },
-                depth: context.depth.saturating_add(1),
+    let operation = proposal
+        .proposal
+        .recipe
+        .steps
+        .last()
+        .ok_or(AnalyzerError::AllocationFailure)?;
+    if result.report.status != DerivationStatus::Completed {
+        let message = memory::format_message(
+            format_args!(
+                "canonical operation stopped at step {:?}",
+                result.report.status
+            ),
+            memory,
+        )?;
+        push_omission(
+            report,
+            memory,
+            AnalysisOmission::TransformFailed {
+                artifact_index: context.index,
+                operation: operation.clone(),
+                message,
             },
         )?;
+    } else if !result.report.output.is_empty() && result.report.output != context.input_bytes {
+        // Move the output charge with its bytes before releasing derivation metadata
+        let mut candidate_memory =
+            memory::split(&mut result.memory, result.report.output.capacity())?;
+        let output = std::mem::take(&mut result.report.output);
+        let (cue_origins, cue_memory) = memory::copy_cues(proposal.cue_origins, memory)?;
+        memory::absorb(&mut candidate_memory, cue_memory);
+        drop(result);
+        found.push(PendingArtifact {
+            bytes: output,
+            origin: ArtifactOrigin::Transformation {
+                parent_index: context.index,
+                input_range: proposal.input_range,
+                operation: operation.clone(),
+                evidence: proposal.proposal.evidence.clone(),
+                cue_origins,
+            },
+            depth: context.depth.saturating_add(1),
+            memory: candidate_memory,
+        })?;
     }
     Ok(())
 }
@@ -1032,17 +1277,62 @@ pub fn analyze_artifacts_with_source_sha256(
     source_sha256: &str,
     options: ArtifactAnalysisOptions,
 ) -> Result<ArtifactAnalysis, AnalyzerError> {
+    analyze_artifacts_inner(bytes, source_sha256, options, &mut None)
+}
+
+/// Analyze bytes while admitting owned allocations against one shared live-memory lease
+///
+/// A supplied digest must identify the exact source bytes; otherwise it is computed once
+/// The caller must retain the
+/// lease until the report and every artifact moved from it have been dropped. On failure,
+/// temporary allocations are dropped and the caller's original charge is preserved.
+/// Charges cover managed buffers and documented workspace allowances, not process RSS
+///
+/// # Errors
+/// Returns an error when limits, the digest, allocation, or shared-memory admission fail
+pub fn analyze_artifacts_with_memory(
+    bytes: &[u8],
+    source_sha256: Option<&str>,
+    options: ArtifactAnalysisOptions,
+    memory: &mut MemoryLease,
+) -> Result<ArtifactAnalysis, AnalyzerError> {
+    let mut retained = Some(memory.try_sibling(0)?);
+    let mut digest_memory = memory::sibling(&retained, 0)?;
+    let computed = if source_sha256.is_none() {
+        Some(memory::digest(bytes, &mut digest_memory)?)
+    } else {
+        None
+    };
+    let digest = source_sha256
+        .or(computed.as_deref())
+        .ok_or(AnalyzerError::InvalidSourceHash)?;
+    let report = analyze_artifacts_inner(bytes, digest, options, &mut retained)?;
+    drop(computed);
+    drop(digest_memory);
+    if let Some(retained) = retained {
+        memory.absorb(retained);
+    }
+    Ok(report)
+}
+
+fn analyze_artifacts_inner(
+    bytes: &[u8],
+    source_sha256: &str,
+    options: ArtifactAnalysisOptions,
+    memory: &mut memory::Charge,
+) -> Result<ArtifactAnalysis, AnalyzerError> {
     validate_limits(options.limits)?;
     if !crate::hashing::is_sha256_digest(source_sha256) {
         return Err(AnalyzerError::InvalidSourceHash);
     }
-    let mut report = empty_analysis_report(bytes.len(), source_sha256);
+    let mut report = empty_analysis_report(bytes.len(), source_sha256, memory)?;
     if let Some(omission) = source_input_omission(bytes.len(), options.limits) {
+        memory::reserve_one(&mut report.omissions, memory)?;
         report.omissions.push(omission);
         report.status = AnalysisStatus::Partial;
         return Ok(report);
     }
-    let (work_bytes, zip_expanded_work_bytes) = analyze_queue(bytes, options, &mut report)?;
+    let (work_bytes, zip_expanded_work_bytes) = analyze_queue(bytes, options, &mut report, memory)?;
     report.work_bytes = work_bytes;
     report.zip_expanded_work_bytes = zip_expanded_work_bytes;
     let has_validated_object = report
@@ -1051,15 +1341,20 @@ pub fn analyze_artifacts_with_source_sha256(
         .any(|artifact| artifact.validation.state == ArtifactValidationState::Validated);
     if options.recovery == RecoveryMode::Salvage && !has_validated_object {
         // No current partial-repair parser can safely rebuild unsupported bytes
+        memory::reserve_one(&mut report.omissions, memory)?;
         report.omissions.push(AnalysisOmission::SalvageUnsupported);
     }
     report.status = analysis_status(&report);
     Ok(report)
 }
 
-fn empty_analysis_report(source_length: usize, source_sha256: &str) -> ArtifactAnalysis {
-    ArtifactAnalysis {
-        source_sha256: source_sha256.to_owned(),
+fn empty_analysis_report(
+    source_length: usize,
+    source_sha256: &str,
+    memory: &mut memory::Charge,
+) -> Result<ArtifactAnalysis, AnalyzerError> {
+    Ok(ArtifactAnalysis {
+        source_sha256: memory::copy_string(source_sha256, memory)?,
         source_length,
         artifacts: Vec::new(),
         status: AnalysisStatus::Unsupported,
@@ -1067,7 +1362,7 @@ fn empty_analysis_report(source_length: usize, source_sha256: &str) -> ArtifactA
         region_transform_reports: Vec::new(),
         work_bytes: 0,
         zip_expanded_work_bytes: 0,
-    }
+    })
 }
 
 const fn source_input_omission(length: usize, limits: AnalyzerLimits) -> Option<AnalysisOmission> {
@@ -1090,27 +1385,25 @@ fn analyze_queue(
     source_bytes: &[u8],
     options: ArtifactAnalysisOptions,
     report: &mut ArtifactAnalysis,
+    memory: &mut memory::Charge,
 ) -> Result<(usize, usize), AnalyzerError> {
-    add_source_artifact(source_bytes, report)?;
-    let mut total_output_bytes = source_bytes.len();
+    add_source_artifact(source_bytes, report, memory)?;
     let mut budget = AnalysisBudget::new(options.limits);
-    let mut pending = VecDeque::new();
-    pending
-        .try_reserve(1)
-        .map_err(|_| AnalyzerError::AllocationFailure)?;
-    pending.push_back(0_usize);
-    let mut depth_by_index = vec![0_usize];
+    let mut depth_memory = memory::sibling(memory, 0)?;
+    let mut depth_by_index = Vec::new();
+    memory::reserve_one(&mut depth_by_index, &mut depth_memory)?;
+    depth_by_index.push(0_usize);
+    let mut queue = QueueState {
+        depth_by_index,
+        total_output_bytes: source_bytes.len(),
+        depth_memory,
+    };
 
-    while let Some(index) = pending.pop_front() {
-        process_queue_item(
-            index,
-            options,
-            report,
-            &mut budget,
-            &mut total_output_bytes,
-            &mut depth_by_index,
-            &mut pending,
-        )?;
+    // Each new artifact receives the next index, so a cursor is the same FIFO order
+    let mut index = 0;
+    while index < report.artifacts.len() {
+        process_queue_item(index, options, report, &mut budget, &mut queue, memory)?;
+        index += 1;
     }
     Ok((
         budget.work.used,
@@ -1118,29 +1411,36 @@ fn analyze_queue(
     ))
 }
 
+struct QueueState {
+    depth_by_index: Vec<usize>,
+    total_output_bytes: usize,
+    depth_memory: memory::Charge,
+}
+
 fn add_source_artifact(
     source_bytes: &[u8],
     report: &mut ArtifactAnalysis,
+    memory: &mut memory::Charge,
 ) -> Result<(), AnalyzerError> {
-    let bytes = try_copy_bytes(source_bytes)?;
+    let memory::Bytes {
+        memory: bytes_memory,
+        bytes,
+    } = memory::copy_bytes(source_bytes, memory)?;
     let mut origins = Vec::new();
-    origins
-        .try_reserve_exact(1)
-        .map_err(|_| AnalyzerError::AllocationFailure)?;
+    memory::reserve_one(&mut origins, memory)?;
     origins.push(ArtifactOrigin::Source);
-    report
-        .artifacts
-        .try_reserve_exact(1)
-        .map_err(|_| AnalyzerError::AllocationFailure)?;
+    let sha256 = memory::copy_string(&report.source_sha256, memory)?;
+    memory::reserve_one(&mut report.artifacts, memory)?;
     report.artifacts.push(AnalyzedArtifact {
         index: 0,
         origins,
-        sha256: report.source_sha256.clone(),
+        sha256,
         signature_match_count: 0,
         signatures_scanned: false,
         validation: unsupported_validation(),
         bytes,
     });
+    memory::absorb(memory, bytes_memory);
     Ok(())
 }
 
@@ -1149,14 +1449,15 @@ fn process_queue_item(
     options: ArtifactAnalysisOptions,
     report: &mut ArtifactAnalysis,
     budget: &mut AnalysisBudget,
-    total_output_bytes: &mut usize,
-    depth_by_index: &mut Vec<usize>,
-    pending: &mut VecDeque<usize>,
+    queue: &mut QueueState,
+    memory: &mut memory::Charge,
 ) -> Result<(), AnalyzerError> {
-    let depth = *depth_by_index
+    let depth = *queue
+        .depth_by_index
         .get(index)
         .ok_or(AnalyzerError::AllocationFailure)?;
     if depth > options.limits.max_depth {
+        memory::reserve_one(&mut report.omissions, memory)?;
         report.omissions.push(AnalysisOmission::DepthLimit {
             artifact_index: index,
             maximum: options.limits.max_depth,
@@ -1178,19 +1479,22 @@ fn process_queue_item(
         input_bytes: &input_bytes,
         limits: options.limits,
     };
-    let mut found = Vec::new();
-    let inspection = inspect_artifact(&context, budget, report, &mut found)?;
+    let mut found = PendingArtifacts::new(memory)?;
+    let inspection = inspect_artifact(&context, budget, report, &mut found, memory)?;
     restore_inspected_artifact(index, input_bytes, inspection, report)?;
-    for candidate in found {
-        add_candidate(
-            report,
-            candidate,
-            total_output_bytes,
-            depth_by_index,
-            pending,
-            options.limits,
-        )?;
+    for candidate in std::mem::take(&mut found.values) {
+        add_candidate(report, candidate, queue, options.limits, memory)?;
     }
+    Ok(())
+}
+
+fn push_omission(
+    report: &mut ArtifactAnalysis,
+    memory: &mut memory::Charge,
+    omission: AnalysisOmission,
+) -> Result<(), AnalyzerError> {
+    memory::reserve_one(&mut report.omissions, memory)?;
+    report.omissions.push(omission);
     Ok(())
 }
 
@@ -1408,56 +1712,49 @@ const fn complete_range(length: usize) -> FileRange {
     FileRange { offset: 0, length }
 }
 
-fn try_copy_bytes(bytes: &[u8]) -> Result<Vec<u8>, AnalyzerError> {
-    let mut copy = Vec::new();
-    copy.try_reserve_exact(bytes.len())
-        .map_err(|_| AnalyzerError::AllocationFailure)?;
-    copy.extend_from_slice(bytes);
-    Ok(copy)
-}
-
-fn push_pending(
-    pending: &mut Vec<PendingArtifact>,
-    candidate: PendingArtifact,
-) -> Result<(), AnalyzerError> {
-    pending
-        .try_reserve(1)
-        .map_err(|_| AnalyzerError::AllocationFailure)?;
-    pending.push(candidate);
-    Ok(())
-}
-
 fn add_candidate(
     report: &mut ArtifactAnalysis,
     candidate: PendingArtifact,
-    total_output_bytes: &mut usize,
-    depth_by_index: &mut Vec<usize>,
-    pending: &mut VecDeque<usize>,
+    queue: &mut QueueState,
     limits: AnalyzerLimits,
+    memory: &mut memory::Charge,
 ) -> Result<(), AnalyzerError> {
     if candidate.bytes.is_empty() {
         return Ok(());
     }
-    let digest = sha256(&candidate.bytes);
-    if record_duplicate_origin(report, &candidate, &digest)? {
-        return Ok(());
+    let mut digest_memory = memory::sibling(memory, 0)?;
+    let digest = memory::digest(&candidate.bytes, &mut digest_memory)?;
+    if let Some(index) = report
+        .artifacts
+        .iter()
+        .position(|artifact| artifact.sha256 == digest && artifact.bytes == candidate.bytes)
+    {
+        return record_duplicate_origin(report, candidate, index, memory);
     }
-    let next_total = match candidate_output_size(&candidate, report, *total_output_bytes, limits) {
-        Ok(next_total) => next_total,
-        Err(limit) => {
-            report
-                .omissions
-                .push(candidate_limit_omission(limit, &candidate, limits));
-            return Ok(());
-        }
-    };
+    let next_total =
+        match candidate_output_size(&candidate, report, queue.total_output_bytes, limits) {
+            Ok(next_total) => next_total,
+            Err(limit) => {
+                memory::reserve_one(&mut report.omissions, memory)?;
+                report
+                    .omissions
+                    .push(candidate_limit_omission(limit, &candidate, limits));
+                return Ok(());
+            }
+        };
 
     let index = report.artifacts.len();
     let mut origins = Vec::new();
-    origins
-        .try_reserve_exact(1)
-        .map_err(|_| AnalyzerError::AllocationFailure)?;
-    origins.push(candidate.origin);
+    memory::reserve_one(&mut origins, memory)?;
+    memory::reserve_one(&mut report.artifacts, memory)?;
+    memory::reserve_one(&mut queue.depth_by_index, &mut queue.depth_memory)?;
+    let PendingArtifact {
+        memory: candidate_memory,
+        bytes,
+        origin,
+        depth,
+    } = candidate;
+    origins.push(origin);
     let artifact = AnalyzedArtifact {
         index,
         origins,
@@ -1465,49 +1762,61 @@ fn add_candidate(
         signature_match_count: 0,
         signatures_scanned: false,
         validation: unsupported_validation(),
-        bytes: candidate.bytes,
+        bytes,
     };
-    report
-        .artifacts
-        .try_reserve(1)
-        .map_err(|_| AnalyzerError::AllocationFailure)?;
-    depth_by_index
-        .try_reserve(1)
-        .map_err(|_| AnalyzerError::AllocationFailure)?;
-    pending
-        .try_reserve(1)
-        .map_err(|_| AnalyzerError::AllocationFailure)?;
     report.artifacts.push(artifact);
-    depth_by_index.push(candidate.depth);
-    pending.push_back(index);
-    *total_output_bytes = next_total;
+    queue.depth_by_index.push(depth);
+    memory::absorb(memory, candidate_memory);
+    memory::absorb(memory, digest_memory);
+    queue.total_output_bytes = next_total;
     Ok(())
 }
 
 fn record_duplicate_origin(
     report: &mut ArtifactAnalysis,
-    candidate: &PendingArtifact,
-    digest: &str,
-) -> Result<bool, AnalyzerError> {
-    let Some(existing_index) = report
-        .artifacts
-        .iter()
-        .position(|artifact| artifact.sha256 == digest && artifact.bytes == candidate.bytes)
-    else {
-        return Ok(false);
-    };
+    candidate: PendingArtifact,
+    existing_index: usize,
+    memory: &mut memory::Charge,
+) -> Result<(), AnalyzerError> {
     let existing = report
         .artifacts
         .get_mut(existing_index)
         .ok_or(AnalyzerError::AllocationFailure)?;
     if !existing.origins.contains(&candidate.origin) {
-        existing
-            .origins
-            .try_reserve(1)
-            .map_err(|_| AnalyzerError::AllocationFailure)?;
-        existing.origins.push(candidate.origin.clone());
+        memory::reserve_one(&mut existing.origins, memory)?;
+        let retained = origin_owned_bytes(&candidate.origin)?;
+        let PendingArtifact {
+            memory: mut candidate_memory,
+            bytes,
+            origin,
+            ..
+        } = candidate;
+        drop(bytes);
+        memory::resize(&mut candidate_memory, retained)?;
+        existing.origins.push(origin);
+        memory::absorb(memory, candidate_memory);
     }
-    Ok(true)
+    Ok(())
+}
+
+fn origin_owned_bytes(origin: &ArtifactOrigin) -> Result<usize, AnalyzerError> {
+    match origin {
+        ArtifactOrigin::ArchiveMember {
+            raw_name_sha256,
+            raw_name_hex_preview,
+            ..
+        } => raw_name_sha256
+            .capacity()
+            .checked_add(raw_name_hex_preview.capacity())
+            .ok_or(AnalyzerError::AllocationFailure),
+        ArtifactOrigin::Transformation { cue_origins, .. } => cue_origins
+            .capacity()
+            .checked_mul(std::mem::size_of::<RegionCueOrigin>())
+            .ok_or(AnalyzerError::AllocationFailure),
+        ArtifactOrigin::Source
+        | ArtifactOrigin::SourceRange { .. }
+        | ArtifactOrigin::EmbeddedObject { .. } => Ok(0),
+    }
 }
 
 #[derive(Clone, Copy)]

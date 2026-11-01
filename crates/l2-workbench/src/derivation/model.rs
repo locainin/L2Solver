@@ -52,6 +52,10 @@ impl SecretBytes {
     pub(crate) fn as_bytes(&self) -> &[u8] {
         &self.0
     }
+
+    pub(crate) fn capacity(&self) -> usize {
+        self.0.capacity()
+    }
 }
 
 impl From<Vec<u8>> for SecretBytes {

@@ -1,10 +1,12 @@
 mod analyzer;
+mod analyzer_memory;
 mod code_links;
 mod der;
 mod embedded;
 mod image_support;
 mod inspect;
 mod limits;
+mod origin_memory;
 mod png;
 mod png_pixels;
 mod png_stream;
