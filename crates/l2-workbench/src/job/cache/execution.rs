@@ -27,7 +27,10 @@ use super::{
     retired,
 };
 
-const ENVELOPE_VERSION: u32 = 1;
+mod metadata;
+pub use metadata::ExecutionGeneration;
+
+const ENVELOPE_VERSION: u32 = 2;
 const COMPONENT_NAMES: [&str; 3] = ["graph", "blobs", "executor"];
 const MAX_RELATIVE_PATH_BYTES: i64 = 256;
 const RESERVATION_BLOCK: u64 = 4096;
@@ -47,7 +50,7 @@ pub struct ExecutionCheckpointLimits {
     pub max_metadata_bytes: u64,
 }
 
-#[derive(Clone, Debug, Deserialize, Serialize)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 struct Component {
     bytes: u64,
@@ -57,6 +60,7 @@ struct Component {
 #[derive(Serialize)]
 struct EnvelopeRef<'a> {
     version: u32,
+    revision: u64,
     snapshot_version: u32,
     snapshot: &'a JobSnapshot,
     metadata: &'a Value,
@@ -67,10 +71,20 @@ struct EnvelopeRef<'a> {
 #[serde(deny_unknown_fields)]
 struct Envelope {
     version: u32,
+    #[serde(default)]
+    revision: Option<u64>,
     snapshot_version: u32,
     snapshot: JobSnapshot,
     metadata: Value,
     components: [Component; 3],
+}
+
+const fn envelope_revision(envelope: &Envelope) -> Option<u64> {
+    match (envelope.version, envelope.revision) {
+        (1, None) => Some(0),
+        (ENVELOPE_VERSION, Some(revision)) => Some(revision),
+        _ => None,
+    }
 }
 
 struct Budget {
@@ -220,6 +234,7 @@ impl Write for ComponentWriter {
 ///
 /// When a memory budget is attached, the decoded snapshot and metadata remain charged until drop
 pub struct ActiveExecution<'lease> {
+    generation: ExecutionGeneration,
     snapshot: JobSnapshot,
     metadata: Value,
     graph: File,
@@ -239,6 +254,12 @@ impl std::fmt::Debug for ActiveExecution<'_> {
 }
 
 impl ActiveExecution<'_> {
+    /// Returns the identity of this verified checkpoint revision and its immutable streams
+    #[must_use]
+    pub const fn generation(&self) -> &ExecutionGeneration {
+        &self.generation
+    }
+
     /// Returns the job snapshot committed with these streams
     #[must_use]
     pub const fn snapshot(&self) -> &JobSnapshot {
@@ -309,6 +330,26 @@ impl Lease {
     where
         F: FnOnce(&mut ExecutionWriter) -> Result<Value>,
     {
+        self.save_active_generation(snapshot, limits, write)
+            .map(|_| ())
+    }
+
+    /// Save a generation and return its identity without rereading the Case streams
+    ///
+    /// The identity can be used to update metadata while the same lease remains held.
+    /// The same recipe, memory, and metadata requirements as [`Self::save_active`] apply.
+    ///
+    /// # Errors
+    /// Returns an error for memory, quota, I/O, integrity, serialization, or database failures
+    pub fn save_active_generation<F>(
+        &mut self,
+        snapshot: &JobSnapshot,
+        limits: ExecutionCheckpointLimits,
+        write: F,
+    ) -> Result<ExecutionGeneration>
+    where
+        F: FnOnce(&mut ExecutionWriter) -> Result<Value>,
+    {
         if !snapshot.is_valid_checkpoint() {
             return Err(CacheError::CorruptCheckpoint);
         }
@@ -368,7 +409,11 @@ impl Lease {
             // The new pointer is durable before the old generation can be removed
             let _ = retired::cleanup(&self.cache.inner, self.key.as_str(), &old);
         }
-        Ok(())
+        Ok(ExecutionGeneration::new(
+            relative,
+            prepared.components,
+            &prepared.envelope_json,
+        ))
     }
 
     /// Opens only the committed generation and verifies all component hashes before returning
@@ -415,7 +460,7 @@ impl Lease {
             |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
         )?;
         let envelope: Envelope = serde_json::from_str(&json).map_err(|_| corrupt())?;
-        if envelope.version != ENVELOPE_VERSION
+        if envelope_revision(&envelope).is_none()
             || !supports_job_snapshot_version(envelope.snapshot_version)
             || !envelope.snapshot.is_valid_checkpoint()
         {
@@ -430,11 +475,12 @@ impl Lease {
             limits,
         )?;
         transaction.commit()?;
+        let generation = ExecutionGeneration::new(relative, envelope.components, &json);
         drop(json);
-        drop(relative);
         drop(transient);
         drop(scratch);
         Ok(Some(ActiveExecution {
+            generation,
             snapshot: envelope.snapshot,
             metadata: envelope.metadata,
             graph: streams.graph,
@@ -504,6 +550,7 @@ struct PreparedGeneration {
     envelope_json: String,
     snapshot_json: String,
     bytes: u64,
+    components: [Component; 3],
     _memory: Option<MemoryLease>,
 }
 
@@ -549,6 +596,7 @@ where
     let written_files = [graph_file, blobs_file, executor_file];
     let envelope = EnvelopeRef {
         version: ENVELOPE_VERSION,
+        revision: 0,
         snapshot_version: JOB_SNAPSHOT_VERSION,
         snapshot,
         metadata: &metadata,
@@ -594,6 +642,7 @@ where
         envelope_json,
         snapshot_json,
         bytes: total,
+        components,
         _memory: envelope_memory,
     })
 }

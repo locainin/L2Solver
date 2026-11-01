@@ -15,7 +15,9 @@ mod retired;
 
 pub use entry::{CacheEntry, CommitOutcome, Lease};
 pub use error::{CacheError, Result};
-pub use execution::{ActiveExecution, ExecutionCheckpointLimits, ExecutionWriter};
+pub use execution::{
+    ActiveExecution, ExecutionCheckpointLimits, ExecutionGeneration, ExecutionWriter,
+};
 pub use fingerprint::{FileTimestamp, SourceFingerprint, SourceIdentity};
 pub use key::StageKey;
 pub use manager::Cache;

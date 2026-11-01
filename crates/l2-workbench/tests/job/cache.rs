@@ -23,6 +23,9 @@ mod fingerprint;
 #[path = "cache/execution.rs"]
 mod execution;
 
+#[path = "cache/execution_metadata.rs"]
+mod execution_metadata;
+
 #[path = "cache/memory.rs"]
 mod memory;
 

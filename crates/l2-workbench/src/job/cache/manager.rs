@@ -91,7 +91,7 @@ impl CacheInner {
         result
     }
 
-    fn quota_lock(&self) -> Result<LockGuard> {
+    pub(super) fn quota_lock(&self) -> Result<LockGuard> {
         self.check_locations()?;
         self.locks.lock_with_retry(QUOTA_LOCK, true)
     }
