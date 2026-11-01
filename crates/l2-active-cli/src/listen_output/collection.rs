@@ -16,7 +16,7 @@ use crate::{
 };
 
 #[derive(Serialize)]
-pub(crate) struct FrameView {
+pub struct FrameView {
     captured_bytes: usize,
     original_bytes: u32,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -44,18 +44,18 @@ impl FrameView {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum Disclosure {
+pub enum Disclosure {
     OmitRaw,
     IncludeRaw,
 }
 
 #[derive(Clone, Copy)]
-pub(crate) enum Diagnostics {
+pub enum Diagnostics {
     Detailed,
     CodesOnly,
 }
 
-pub(crate) struct Context<'a> {
+pub struct Context<'a> {
     pub interface: &'a InterfaceSelector,
     pub vlan: Option<l2_active_linux::VlanInfo>,
     pub limits: Limits,
@@ -64,7 +64,7 @@ pub(crate) struct Context<'a> {
 }
 
 impl<'a> Context<'a> {
-    pub fn new(
+    pub const fn new(
         options: &'a crate::ObserveArgs,
         vlan: Option<l2_active_linux::VlanInfo>,
         limits: Limits,
@@ -84,7 +84,7 @@ impl<'a> Context<'a> {
     }
 }
 
-pub(crate) struct Operation {
+pub struct Operation {
     pub name: &'static str,
     pub status: &'static str,
     pub evidence: Evidence,
@@ -106,7 +106,7 @@ struct Report<'a, T, D> {
     limitation: &'static str,
 }
 
-pub(crate) struct Collection<'a, T, D> {
+pub struct Collection<'a, T, D> {
     pub operation: Operation,
     pub interface: &'a InterfaceSelector,
     pub vlan: Option<l2_active_linux::VlanInfo>,

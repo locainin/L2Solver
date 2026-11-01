@@ -52,7 +52,7 @@ struct Details {
     unmatched_packets: u32,
 }
 
-pub(crate) fn write(
+pub fn write(
     context: &Context<'_>,
     selected_group: Option<u8>,
     report: &HsrpReport,

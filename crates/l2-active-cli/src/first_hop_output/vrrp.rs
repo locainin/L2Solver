@@ -1,4 +1,4 @@
-//! Present IPv4 VRRPv3 claims with opt-in original frames
+//! Present IPv4 `VRRPv3` claims with opt-in original frames
 
 use std::{io, io::Write, net::Ipv4Addr, num::NonZeroU8};
 
@@ -48,7 +48,7 @@ struct Details {
     unrelated_packets: u32,
 }
 
-pub(crate) fn write(
+pub fn write(
     context: &Context<'_>,
     selected_vrid: Option<NonZeroU8>,
     report: &VrrpReport,

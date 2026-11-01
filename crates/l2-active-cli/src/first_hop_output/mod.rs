@@ -3,8 +3,8 @@
 mod hsrp;
 mod vrrp;
 
-pub(crate) use crate::listen_output::collection::Context;
+pub use crate::listen_output::collection::Context;
 #[cfg(test)]
-pub(crate) use crate::listen_output::collection::Disclosure;
-pub(crate) use hsrp::write as write_hsrp;
-pub(crate) use vrrp::write as write_vrrp;
+pub use crate::listen_output::collection::Disclosure;
+pub use hsrp::write as write_hsrp;
+pub use vrrp::write as write_vrrp;

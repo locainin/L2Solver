@@ -293,11 +293,11 @@ pub struct ArpProbeArgs {
     pub session: SessionArgs,
 }
 
-pub(super) fn interface_selector(name: &str) -> Result<InterfaceSelector, String> {
+pub fn interface_selector(name: &str) -> Result<InterfaceSelector, String> {
     InterfaceSelector::new(name).map_err(|error| error.to_string())
 }
 
-pub(super) fn ipv4_address(value: &str) -> Result<Ipv4Addr, String> {
+pub fn ipv4_address(value: &str) -> Result<Ipv4Addr, String> {
     let address = value
         .parse::<Ipv4Addr>()
         .map_err(|error| error.to_string())?;
@@ -305,7 +305,7 @@ pub(super) fn ipv4_address(value: &str) -> Result<Ipv4Addr, String> {
     Ok(address)
 }
 
-pub(super) fn mac_address(value: &str) -> Result<MacAddress, String> {
+pub fn mac_address(value: &str) -> Result<MacAddress, String> {
     let mut parts = value.split(':');
     let mut bytes = [0_u8; 6];
     for byte in &mut bytes {
