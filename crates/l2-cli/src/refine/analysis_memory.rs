@@ -6,6 +6,10 @@ use l2_workbench::{
 };
 use std::{error::Error, fmt, io};
 
+#[cfg(test)]
+#[path = "../../tests/refine/formatted_memory.rs"]
+mod tests;
+
 const MAX_WINDOW_STEP_BYTES: usize = 4 * 1024 * 1024;
 const STREAM_BUFFER_BYTES: usize = 64 * 1024;
 const PNG_READ_BUFFER_BYTES: usize = 16 * 1024;
@@ -146,16 +150,21 @@ pub(super) fn format_message(
     arguments: fmt::Arguments<'_>,
     memory: &mut MemoryLease,
 ) -> Result<String, Box<dyn Error>> {
+    let before = memory.bytes();
     let mut message = BudgetedMessage {
         value: String::new(),
         memory,
         error: None,
     };
     if fmt::write(&mut message, arguments).is_err() {
-        return Err(message
+        let error = message
             .error
             .take()
-            .unwrap_or_else(|| "message formatting failed".into()));
+            .unwrap_or_else(|| "message formatting failed".into());
+        // Release the buffer before returning its charge to the shared budget
+        drop(message);
+        memory.try_resize(before)?;
+        return Err(error);
     }
     Ok(message.value)
 }
@@ -166,29 +175,61 @@ struct BudgetedMessage<'a> {
     error: Option<Box<dyn Error>>,
 }
 
-impl fmt::Write for BudgetedMessage<'_> {
-    fn write_str(&mut self, text: &str) -> fmt::Result {
-        let available = self.value.capacity() - self.value.len();
-        if text.len() > available {
-            let additional = self.value.capacity().max(64).max(text.len());
-            let required = self.value.len().checked_add(additional).ok_or(fmt::Error)?;
-            let growth = required - self.value.capacity();
-            if let Err(error) = charge(self.memory, growth) {
-                self.error = Some(error);
-                return Err(fmt::Error);
+impl BudgetedMessage<'_> {
+    fn append(&mut self, text: &str) -> Result<(), Box<dyn Error>> {
+        let required = self
+            .value
+            .len()
+            .checked_add(text.len())
+            .ok_or("formatted message length overflows")?;
+        if required > self.value.capacity() {
+            let old = self.value.capacity();
+            let wanted = old
+                .checked_mul(2)
+                .ok_or("formatted message capacity overflows")?
+                .max(64)
+                .max(required);
+            let before = self.memory.bytes();
+            // Both buffers must fit until the replacement is ready
+            charge(self.memory, wanted)?;
+            let mut next = String::new();
+            if let Err(error) = next.try_reserve_exact(wanted) {
+                drop(next);
+                self.memory.try_resize(before)?;
+                return Err(Box::new(error));
             }
-            let previous = self.value.capacity();
-            if let Err(error) = self.value.try_reserve_exact(additional) {
-                self.error = Some(Box::new(error));
-                return Err(fmt::Error);
+            let admitted = u64::try_from(next.capacity())
+                .ok()
+                .and_then(|bytes| before.checked_add(bytes));
+            let Some(admitted) = admitted else {
+                drop(next);
+                self.memory.try_resize(before)?;
+                return Err("formatted message memory overflows".into());
+            };
+            if let Err(error) = self.memory.try_resize(admitted) {
+                drop(next);
+                self.memory.try_resize(before)?;
+                return Err(Box::new(error));
             }
-            let extra = self.value.capacity() - previous - growth;
-            if let Err(error) = charge(self.memory, extra) {
-                self.error = Some(error);
-                return Err(fmt::Error);
-            }
+            next.push_str(&self.value);
+            let previous = std::mem::replace(&mut self.value, next);
+            drop(previous);
+            let remaining = admitted
+                .checked_sub(u64::try_from(old)?)
+                .ok_or("formatted message charge is inconsistent")?;
+            self.memory.try_resize(remaining)?;
         }
         self.value.push_str(text);
+        Ok(())
+    }
+}
+
+impl fmt::Write for BudgetedMessage<'_> {
+    fn write_str(&mut self, text: &str) -> fmt::Result {
+        if let Err(error) = self.append(text) {
+            self.error = Some(error);
+            return Err(fmt::Error);
+        }
         Ok(())
     }
 }
