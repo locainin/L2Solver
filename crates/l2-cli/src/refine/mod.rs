@@ -8,6 +8,7 @@ mod output;
 mod policy;
 mod publication_memory;
 mod range_members;
+mod range_transform;
 mod range_zip;
 mod read_budget;
 

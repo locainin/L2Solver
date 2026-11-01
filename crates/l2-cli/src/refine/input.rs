@@ -119,6 +119,7 @@ impl InputSet {
         job: &Job,
         buffer: &mut [u8],
     ) -> Result<(), Box<dyn Error>> {
+        use super::file_artifact::FileBacking;
         if !is_safe_flat_file_name(&artifact.file_name) {
             return Err(invalid_input("artifact output name is unsafe"));
         }
@@ -135,37 +136,31 @@ impl InputSet {
             .offset
             .checked_add(artifact.range.length)
             .ok_or_else(|| invalid_input("artifact range overflows"))?;
-        if end > plan.length {
+        if matches!(&artifact.backing, FileBacking::Source) && end > plan.length {
             return Err(invalid_input("artifact range exceeds its source"));
         }
-        let mut source = open_identity_source(self, spec)?;
+        let source = open_identity_source(self, spec)?;
         if metadata_fingerprint(&source.metadata()?) != plan.metadata {
             return Err(invalid_input("input artifact changed before publication"));
         }
-        source.seek(SeekFrom::Start(u64::try_from(artifact.range.offset)?))?;
-        let mut source = CancellableReader::new(source, job);
         let mut target = File::options()
             .write(true)
             .create_new(true)
             .open(staging.join(&artifact.file_name))?;
-        let mut digest = Sha256::new();
-        let mut remaining = artifact.range.length;
-        while remaining > 0 {
-            let count = remaining.min(buffer.len());
-            let part = buffer
-                .get_mut(..count)
-                .ok_or_else(|| invalid_input("source output buffer is invalid"))?;
-            source.read_exact(part)?;
-            target.write_all(part)?;
-            digest.update(part);
-            remaining -= count;
+        match &artifact.backing {
+            FileBacking::Source => {
+                let mut source_copy = source.try_clone()?;
+                source_copy.seek(SeekFrom::Start(u64::try_from(artifact.range.offset)?))?;
+                let mut reader = CancellableReader::new(source_copy, job);
+                copy_verified_range(&mut reader, &mut target, artifact, buffer)?;
+            }
+            FileBacking::Spool { file, .. } => {
+                let mut spool = file.try_clone()?;
+                spool.seek(SeekFrom::Start(u64::try_from(artifact.range.offset)?))?;
+                let mut reader = PrivateReader { inner: spool, job };
+                copy_verified_range(&mut reader, &mut target, artifact, buffer)?;
+            }
         }
-        if format!("{:x}", digest.finalize()) != artifact.sha256 {
-            return Err(invalid_input(
-                "input artifact changed while it was published",
-            ));
-        }
-        let source = source.into_inner();
         if metadata_fingerprint(&source.metadata()?) != plan.metadata {
             return Err(invalid_input(
                 "input artifact changed while it was published",
@@ -183,6 +178,42 @@ impl InputSet {
         }
         target.sync_all()?;
         Ok(())
+    }
+}
+
+fn copy_verified_range(
+    source: &mut impl Read,
+    target: &mut File,
+    artifact: &super::file_artifact::FileArtifact,
+    buffer: &mut [u8],
+) -> Result<(), Box<dyn Error>> {
+    let mut digest = Sha256::new();
+    let mut remaining = artifact.range.length;
+    while remaining > 0 {
+        let count = remaining.min(buffer.len());
+        let part = buffer
+            .get_mut(..count)
+            .ok_or_else(|| invalid_input("source output buffer is invalid"))?;
+        source.read_exact(part)?;
+        target.write_all(part)?;
+        digest.update(part);
+        remaining -= count;
+    }
+    if format!("{:x}", digest.finalize()) != artifact.sha256 {
+        return Err(invalid_input("artifact changed while it was published"));
+    }
+    Ok(())
+}
+
+struct PrivateReader<'a> {
+    inner: File,
+    job: &'a Job,
+}
+
+impl Read for PrivateReader<'_> {
+    fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+        self.job.check_cancelled().map_err(io::Error::other)?;
+        self.inner.read(buffer)
     }
 }
 
@@ -231,10 +262,49 @@ pub(super) struct RangeAnalysis {
     pub(super) archive: Option<l2_workbench::artifact::zip::ZipArtifactReport>,
     pub(super) retain_source: bool,
     pub(super) png: Option<l2_workbench::artifact::StreamPngBoundary>,
+    pub(super) observation: Option<super::range_transform::Observation>,
     pub(super) report_memory: MemoryLease,
 }
 
 impl LoadedSource {
+    pub(super) fn with_range_reader<T>(
+        &self,
+        input_set: &InputSet,
+        source_index: usize,
+        job: &Job,
+        action: impl FnOnce(&mut CancellableReader<'_, File>) -> T,
+    ) -> Result<Option<T>, Box<dyn Error>> {
+        let SourceData::File(source) = &self.data else {
+            return Err(invalid_input("source is not range-backed"));
+        };
+        let read_bytes = u64::try_from(source.length)?
+            .checked_add(1)
+            .ok_or_else(|| invalid_input("source transform read length overflows"))?;
+        if !input_set.reserve_extra_reads(read_bytes)? {
+            return Ok(None);
+        }
+        let spec = input_set
+            .sources
+            .get(source_index)
+            .ok_or_else(|| invalid_input("range source index is missing"))?;
+        let file = open_identity_source(input_set, spec)?;
+        if metadata_fingerprint(&file.metadata()?) != source.metadata {
+            return Err(invalid_input(
+                "input artifact changed before streaming transformation",
+            ));
+        }
+        let mut reader = CancellableReader::new(file, job);
+        let result = action(&mut reader);
+        let file = reader.into_inner();
+        if metadata_fingerprint(&file.metadata()?) != source.metadata {
+            return Err(invalid_input(
+                "input artifact changed during streaming transformation",
+            ));
+        }
+        confirm_range_source_name(input_set, spec, source)?;
+        Ok(Some(result))
+    }
+
     pub(super) const fn length(&self) -> usize {
         match &self.data {
             SourceData::Memory { bytes, .. } => bytes.len(),
@@ -264,6 +334,7 @@ impl LoadedSource {
         options: l2_workbench::artifact::ArtifactAnalysisOptions,
         job: &Job,
         memory: &MemoryBudget,
+        observe_transforms: bool,
     ) -> Result<RangeAnalysis, Box<dyn Error>> {
         let SourceData::File(source) = &self.data else {
             return Err(invalid_input("source is not range-backed"));
@@ -296,8 +367,14 @@ impl LoadedSource {
         let checkpoint = zip_candidate
             .as_ref()
             .and_then(|candidate| (candidate.length < source.length).then_some(candidate.length));
-        let (scanned, mut report_memory) =
-            analyze_source_stream(&mut reader, source.length, options, checkpoint, memory)?;
+        let (scanned, mut report_memory, observation) = analyze_source_stream(
+            &mut reader,
+            source.length,
+            options,
+            checkpoint,
+            memory,
+            observe_transforms,
+        )?;
         let mut report = scanned.analysis;
         let mut png = scanned.png;
         let mut file = reader.into_inner();
@@ -338,6 +415,7 @@ impl LoadedSource {
             archive,
             retain_source,
             png,
+            observation,
             report_memory,
         })
     }
@@ -374,7 +452,15 @@ fn analyze_source_stream(
     options: l2_workbench::artifact::ArtifactAnalysisOptions,
     checkpoint: Option<usize>,
     memory: &MemoryBudget,
-) -> Result<(l2_workbench::artifact::StreamSourceAnalysis, MemoryLease), Box<dyn Error>> {
+    observe_transforms: bool,
+) -> Result<
+    (
+        l2_workbench::artifact::StreamSourceAnalysis,
+        MemoryLease,
+        Option<super::range_transform::Observation>,
+    ),
+    Box<dyn Error>,
+> {
     let mut signature = [0_u8; l2_workbench::artifact::PNG_SIGNATURE.len()];
     let count = length.min(signature.len());
     let prefix = signature
@@ -387,7 +473,8 @@ fn analyze_source_stream(
     let prefix = signature
         .get(..count)
         .ok_or_else(|| invalid_input("source prefix length is invalid"))?;
-    let mut complete = io::Cursor::new(prefix).chain(reader);
+    let complete = io::Cursor::new(prefix).chain(reader);
+    let mut complete = super::range_transform::ObservingReader::new(complete, observe_transforms);
     let mut stream_options = options;
     // Leave work for canonical ZIP validation after observing source markers
     let total_work = options.limits.max_total_work_bytes;
@@ -426,7 +513,7 @@ fn analyze_source_stream(
     )
     .map_err(stream_error)?;
     drop(scratch);
-    Ok((result, retained))
+    Ok((result, retained, complete.finish()))
 }
 
 fn stream_error(error: io::Error) -> Box<dyn Error> {

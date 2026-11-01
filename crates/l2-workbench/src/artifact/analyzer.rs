@@ -297,6 +297,13 @@ pub enum AnalysisOmission {
         /// Reader or metadata limit that stopped validation
         reason: String,
     },
+    /// A whole-source streaming transformation was incomplete or rejected
+    SourceStreamTransform {
+        /// Operation attempted when one was selected
+        operation: Option<Operation>,
+        /// Resource, depth, or transform failure
+        reason: String,
+    },
     /// The shared evidence Case has no remaining space for another source object
     CaseBlobLimit {
         /// Maximum aggregate bytes retained by the Case
@@ -413,7 +420,7 @@ pub struct ArtifactAnalysis {
     /// Syntax assessments scoped to each selected byte region
     #[serde(default)]
     pub region_transform_reports: Vec<ArtifactRegionTransformReport>,
-    /// Accounted byte work consumed by this analysis
+    /// Accounted byte work charged, including conservative failed-attempt reservations
     pub work_bytes: usize,
     /// Declared ZIP member bytes charged, including failed extraction attempts
     #[serde(default)]

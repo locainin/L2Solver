@@ -20,6 +20,7 @@ mod large_formats;
 mod memory;
 mod range_analysis;
 mod read_budget;
+mod streaming;
 
 fn run(options: &RefineOptions, output: &mut impl Write) -> Result<bool, Box<dyn Error>> {
     let job = l2_workbench::job::Job::new("refine test");
@@ -344,7 +345,7 @@ fn unsupported_file_is_preserved_and_marked_incomplete() -> Result<(), Box<dyn E
 }
 
 #[test]
-fn per_input_cache_ignores_version_11_and_reuses_version_12() -> Result<(), Box<dyn Error>> {
+fn per_input_cache_ignores_previous_algorithm_and_reuses_current() -> Result<(), Box<dyn Error>> {
     let directory = tempfile::tempdir()?;
     let cache = l2_workbench::job::cache::Cache::open_at(
         directory.path().join("cache"),
@@ -376,7 +377,10 @@ fn per_input_cache_ignores_version_11_and_reuses_version_12() -> Result<(), Box<
     let previous_key = l2_workbench::job::cache::StageKey::new(
         "file_artifact_analysis",
         1,
-        "l2_artifact_analyzer_v11",
+        format!(
+            "l2_artifact_analyzer_v{}",
+            super::analysis::REFINE_ANALYZER_ALGORITHM_VERSION - 1
+        ),
         &previous_policy,
         &identity,
         &[],
@@ -413,6 +417,108 @@ fn per_input_cache_ignores_version_11_and_reuses_version_12() -> Result<(), Box<
         Some(&1)
     );
     assert!(snapshot.cache_fallbacks.records().is_empty());
+    Ok(())
+}
+
+#[test]
+fn cache_receipts_over_work_or_expansion_limits_are_rejected_and_can_fall_back()
+-> Result<(), Box<dyn Error>> {
+    use l2_workbench::{
+        artifact::{AnalysisStatus, analyze_artifacts_with_source_sha256},
+        job::{
+            Job,
+            cache::{Cache, SourceIdentity, StageKey, StageStatus},
+        },
+    };
+
+    for invalid_work in [true, false] {
+        let directory = tempfile::tempdir()?;
+        let cache = Cache::open_at(
+            directory.path().join("cache"),
+            directory.path().join("state"),
+            16 * 1024 * 1024,
+        )?;
+        let bytes = structural_png()?;
+        let source = loaded_source("source.png", &bytes);
+        let mut recovery = RecoveryOptions::default();
+        let options = analyzer_options(&recovery, false, 4096, 8192);
+        let digest = source.digest().ok_or("source digest missing")?;
+        let mut report = analyze_artifacts_with_source_sha256(&bytes, digest, options)?;
+        if invalid_work {
+            report.work_bytes = options.limits.max_total_work_bytes + 1;
+        } else {
+            report.zip_expanded_work_bytes = options.limits.max_zip_expanded_bytes + 1;
+        }
+        let key = StageKey::new(
+            "file_artifact_analysis",
+            1,
+            format!(
+                "l2_artifact_analyzer_v{}",
+                super::analysis::REFINE_ANALYZER_ALGORITHM_VERSION
+            ),
+            &json!({
+                "schema_version": 1,
+                "transform_proposal_format_version":
+                    l2_workbench::recovery::proposals::TRANSFORM_PROPOSAL_FORMAT_VERSION,
+                "analyzer": options,
+                "profile": "normal",
+            }),
+            &SourceIdentity::from_sha256(digest.to_owned())?,
+            &[],
+        )?;
+        let lease = cache.lease(&key)?;
+        let lengths: Vec<_> = report
+            .artifacts
+            .iter()
+            .map(|item| item.bytes.len())
+            .collect();
+        fs::write(
+            lease.directory().join("analysis.json"),
+            serde_json::to_vec(&json!({
+                "schema_version": 1,
+                "artifact_lengths": lengths,
+                "analysis": &report,
+            }))?,
+        )?;
+        for artifact in &report.artifacts {
+            fs::write(
+                lease
+                    .directory()
+                    .join(format!("artifact-{:08}.bin", artifact.index)),
+                &artifact.bytes,
+            )?;
+        }
+        let status = if report.status == AnalysisStatus::Partial {
+            StageStatus::Partial
+        } else {
+            StageStatus::Complete
+        };
+        drop(lease.commit(
+            status,
+            json!({
+                "schema_version": 1,
+                "receipt": "analysis.json",
+                "artifact_count": report.artifacts.len(),
+            }),
+        )?);
+        recovery.strict_cache = true;
+        assert!(
+            analyze_source_cached(
+                &source,
+                options,
+                &recovery,
+                Some(&cache),
+                &Job::new("strict cache")
+            )
+            .is_err()
+        );
+        recovery.strict_cache = false;
+        let job = Job::new("cache fallback");
+        let actual = analyze_source_cached(&source, options, &recovery, Some(&cache), &job)?;
+        assert!(actual.work_bytes <= options.limits.max_total_work_bytes);
+        assert!(actual.zip_expanded_work_bytes <= options.limits.max_zip_expanded_bytes);
+        assert!(!job.snapshot()?.cache_fallbacks.records().is_empty());
+    }
     Ok(())
 }
 

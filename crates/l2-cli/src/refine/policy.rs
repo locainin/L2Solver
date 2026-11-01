@@ -6,6 +6,7 @@ use l2_workbench::artifact::{AnalyzerLimits, ArtifactAnalysisOptions, RecoveryMo
 use std::error::Error;
 
 pub(super) const MAX_ANALYSIS_FILE_BYTES: usize = 64 * 1024 * 1024;
+pub(super) const STREAM_EXPANSION_RATIO: usize = 1000;
 
 #[derive(Clone, Copy)]
 pub(super) struct RefinePolicy {
@@ -14,6 +15,8 @@ pub(super) struct RefinePolicy {
     pub(super) total_input_limit: usize,
     pub(super) per_file_limit: usize,
     pub(super) case_blob_limit: usize,
+    pub(super) stream_output_limit: usize,
+    pub(super) stream_work_limit: usize,
     pub(super) analyzer: ArtifactAnalysisOptions,
 }
 
@@ -22,12 +25,16 @@ impl RefinePolicy {
         let memory_limit = memory_budget(recovery.memory_limit)?;
         let input_limit = (memory_limit / 4).clamp(1, MAX_ANALYSIS_FILE_BYTES);
         let output_limit = (memory_limit / 3).max(1);
+        let stream_output_limit = usize::try_from(recovery.source_read_limit).unwrap_or(usize::MAX);
         Ok(Self {
             memory_limit,
             source_read_limit: recovery.source_read_limit,
             total_input_limit: memory_limit / 4,
             per_file_limit: input_limit,
             case_blob_limit: (memory_limit / 3).max(1),
+            // Disk-backed bytes have separate operation-wide limits from retained Case bytes
+            stream_output_limit,
+            stream_work_limit: stream_output_limit.saturating_mul(4),
             analyzer: analyzer_options(recovery, salvage, input_limit, output_limit),
         })
     }

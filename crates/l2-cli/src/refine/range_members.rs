@@ -21,7 +21,7 @@ pub(super) fn append_members(
             sum.checked_add(artifact.bytes.len())
         })
         .ok_or("signature work overflows")?;
-    report.zip_expanded_work_bytes = archive.expanded_work_byte_count;
+    let zip_used = report.zip_expanded_work_bytes;
     let mut merger = MemberMerger {
         report,
         options,
@@ -33,7 +33,7 @@ pub(super) fn append_members(
         zip_remaining: options
             .limits
             .max_zip_expanded_bytes
-            .saturating_sub(archive.expanded_work_byte_count),
+            .saturating_sub(zip_used),
         signature_remaining: options
             .limits
             .max_signature_scan_bytes

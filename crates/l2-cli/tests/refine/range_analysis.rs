@@ -59,6 +59,7 @@ fn range_source_admission_and_analysis_read_content_once() -> Result<(), Box<dyn
         options,
         &job,
         &l2_workbench::job::MemoryBudget::new(u64::MAX),
+        true,
     )?;
     let bytes_read = process_read_bytes()? - before;
     assert!(
@@ -352,7 +353,8 @@ fn changing_a_range_source_before_reopening_rejects_analysis() -> Result<(), Box
                 0,
                 ArtifactAnalysisOptions::default(),
                 &Job::new("analyze"),
-                &l2_workbench::job::MemoryBudget::new(u64::MAX)
+                &l2_workbench::job::MemoryBudget::new(u64::MAX),
+                true,
             )
             .is_err(),
         "changed source was analyzed"
@@ -406,6 +408,7 @@ fn many_range_sources_fit_a_small_process_descriptor_limit() -> Result<(), Box<d
             l2_workbench::artifact::ArtifactAnalysisOptions::default(),
             &job,
             &l2_workbench::job::MemoryBudget::new(u64::MAX),
+            true,
         )?;
     }
     Ok(())

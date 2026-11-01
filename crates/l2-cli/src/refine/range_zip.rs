@@ -112,6 +112,7 @@ pub(super) fn inspect(
     let expanded_limit = options
         .limits
         .max_zip_expanded_bytes
+        .saturating_sub(report.zip_expanded_work_bytes)
         .min(remaining_output)
         .min(remaining_work - read_limit);
     let mut budget = ZipReaderBudget {
@@ -155,6 +156,11 @@ pub(super) fn inspect(
         .checked_add(read_work)
         .and_then(|work| work.checked_add(expanded_work))
         .ok_or("ZIP work counter overflow")?;
+    // Failed parser attempts still consumed their admitted expansion work
+    report.zip_expanded_work_bytes = report
+        .zip_expanded_work_bytes
+        .checked_add(expanded_work)
+        .ok_or("ZIP expansion work counter overflow")?;
     report_inspection_result(result, report, memory, before)
 }
 

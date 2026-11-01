@@ -316,6 +316,73 @@ fn range_zip_expansion_is_admitted_before_member_reads_and_retries_without_omiss
 }
 
 #[test]
+fn failed_zip_read_retains_expansion_work_already_charged() -> Result<(), Box<dyn Error>> {
+    use l2_workbench::{
+        artifact::{ArtifactAnalysisOptions, analyze_artifacts},
+        job::{Counter, cache::SourceFingerprint},
+    };
+    use std::io::Write;
+
+    let directory = tempfile::tempdir()?;
+    let path = directory.path().join("archive.zip");
+    let mut writer = zip::ZipWriter::new(fs::File::create(&path)?);
+    let stored =
+        zip::write::SimpleFileOptions::default().compression_method(zip::CompressionMethod::Stored);
+    writer.start_file("small.bin", stored)?;
+    writer.write_all(b"small member")?;
+    writer.start_file("large.bin", stored)?;
+    for _ in 0..128 {
+        writer.write_all(&[7_u8; 16 * 1024])?;
+    }
+    writer.finish()?.sync_all()?;
+    let bytes = fs::read(&path)?;
+    let length = u64::try_from(bytes.len())?;
+    let read_limit = length
+        .checked_add(1)
+        .and_then(|value| value.checked_add(SourceFingerprint::sample_read_bytes(length) * 3))
+        .and_then(|value| value.checked_add(512 * 1024))
+        .ok_or("read limit overflows")?;
+    let memory = MemoryBudget::new(16 * 1024 * 1024);
+    let job = Job::new("limited ZIP reader");
+    let input =
+        crate::refine::input::prepare_input_set_with_limit(&path, read_limit, &job, &memory)?;
+    let options = ArtifactAnalysisOptions::default();
+    let mut report = analyze_artifacts(b"", options)?;
+    let digest = l2_workbench::sha256(&bytes);
+    report.source_sha256.clone_from(&digest);
+    report.source_length = bytes.len();
+    let mut retained = memory.try_reserve(MemoryClass::Executor, 0)?;
+    let result = crate::refine::range_zip::inspect(
+        &mut fs::File::open(&path)?,
+        bytes.len(),
+        &digest,
+        &mut report,
+        options,
+        &input,
+        &job,
+        &mut retained,
+    )?;
+    assert!(
+        result.is_none(),
+        "the bounded ZIP read unexpectedly completed"
+    );
+    assert!(report.zip_expanded_work_bytes >= b"small member".len());
+    assert!(report.omissions.iter().any(|omission| matches!(
+        omission,
+        l2_workbench::artifact::AnalysisOmission::SourceRangeValidationLimit { reason, .. }
+            if reason.contains("ZIP read")
+    )));
+    let reads = job
+        .snapshot()?
+        .counters
+        .get(&Counter::SourceReadBytes)
+        .copied()
+        .unwrap_or(0);
+    assert!(reads <= 512 * 1024);
+    Ok(())
+}
+
+#[test]
 fn manifest_memory_is_admitted_before_reading_manifest_contents() -> Result<(), Box<dyn Error>> {
     use l2_workbench::job::Counter;
     let directory = tempfile::tempdir()?;

@@ -1,7 +1,7 @@
 //! Bounded artifact analysis, per-input caching, and evidence-case construction
 
 use super::{
-    file_artifact::FileArtifact,
+    file_artifact::{DerivedFile, FileArtifact},
     input::{InputSet, LoadedSource, SourceData},
     invalid_input,
     output::{ArtifactRecord, SourceRecord},
@@ -31,7 +31,7 @@ use std::{
     io::{self, Write},
 };
 
-pub(super) const REFINE_ANALYZER_ALGORITHM_VERSION: u32 = 13;
+pub(super) const REFINE_ANALYZER_ALGORITHM_VERSION: u32 = 14;
 pub(super) const CACHE_ANALYSIS_SCHEMA_VERSION: u32 = 1;
 const MAX_CACHE_RECEIPT_BYTES: usize = 8 * 1024 * 1024;
 
@@ -45,6 +45,7 @@ pub(super) fn analyze_sources(
     memory: &MemoryBudget,
 ) -> Result<AnalyzedSources, Box<dyn Error>> {
     let mut analysis = AnalyzedSources::new(policy.case_blob_limit, sources.len(), memory)?;
+    let mut streaming = super::range_transform::StreamingBudget::new(policy, sources)?;
     for (source_index, source) in sources.iter().enumerate() {
         job.check_cancelled()?;
         job.set_current(
@@ -77,6 +78,13 @@ pub(super) fn analyze_sources(
         let mut options = policy.analyzer;
         options.limits.max_total_output_bytes =
             options.limits.max_total_output_bytes.min(remaining);
+        options.limits.max_zip_expanded_bytes = streaming.zip_remaining();
+        if source.bytes().is_some() {
+            options.limits.max_total_work_bytes = options
+                .limits
+                .max_total_work_bytes
+                .min(streaming.work_remaining());
+        }
         let (report, _report_memory) = if source.bytes().is_some() && remaining == 0 {
             (no_case_space(source, policy.case_blob_limit)?, None)
         } else if source.bytes().is_some() {
@@ -85,17 +93,23 @@ pub(super) fn analyze_sources(
                 None,
             )
         } else {
-            let (report, lease) = analyze_file_source(
-                &mut analysis,
-                input_set,
+            let (report, lease) = analyze_file_source(FileAnalysis {
+                analysis: &mut analysis,
+                input: input_set,
                 source_index,
                 source,
                 options,
                 job,
                 memory,
-            )?;
+                streaming: &mut streaming,
+                profile: recovery.profile,
+            })?;
             (report, Some(lease))
         };
+        if source.bytes().is_some() {
+            streaming.charge_range_work(report.work_bytes)?;
+            streaming.charge_zip_work(report.zip_expanded_work_bytes)?;
+        }
         let expanded_members = report
             .artifacts
             .iter()
@@ -109,18 +123,101 @@ pub(super) fn analyze_sources(
     Ok(analysis)
 }
 
+struct FileAnalysis<'a> {
+    analysis: &'a mut AnalyzedSources,
+    input: &'a InputSet,
+    source_index: usize,
+    source: &'a LoadedSource,
+    options: ArtifactAnalysisOptions,
+    job: &'a Job,
+    memory: &'a MemoryBudget,
+    streaming: &'a mut super::range_transform::StreamingBudget,
+    profile: RecoveryProfile,
+}
+
 fn analyze_file_source(
+    context: FileAnalysis<'_>,
+) -> Result<(l2_workbench::artifact::ArtifactAnalysis, MemoryLease), Box<dyn Error>> {
+    let FileAnalysis {
+        analysis,
+        input,
+        source_index,
+        source,
+        mut options,
+        job,
+        memory,
+        streaming,
+        profile,
+    } = context;
+    // The source observation remains live after its scanner buffers are released
+    let _observation_memory = super::range_transform::reserve_stream_object(memory)?;
+    let observation_work = streaming.reserve_observation(source.length())?;
+    streaming.begin_source()?;
+    options.limits.max_total_work_bytes = streaming.range_work_limit(
+        source.length(),
+        options.limits.max_total_work_bytes,
+        profile,
+    );
+    let range = source.analyze_ranges(
+        input,
+        source_index,
+        options,
+        job,
+        memory,
+        observation_work.is_some(),
+    )?;
+    let (mut report, mut report_memory, observation) =
+        retain_source_formats(analysis, source_index, source, range, options, streaming)?;
+    // Source hashing is required even when syntax observation is skipped
+    report.work_bytes = report
+        .work_bytes
+        .checked_add(source.length())
+        .and_then(|work| work.checked_add(observation_work.unwrap_or(0)))
+        .ok_or("stream observation work overflows")?;
+    if let Some(observation) = observation {
+        super::range_transform::append_streams(super::range_transform::StreamContext {
+            analysis,
+            input,
+            source_index,
+            source,
+            observation,
+            report: &mut report,
+            options,
+            job,
+            memory,
+            report_memory: &mut report_memory,
+            budget: streaming,
+        })?;
+    } else {
+        report.omissions.try_reserve(1)?;
+        report.omissions.push(
+            l2_workbench::artifact::AnalysisOmission::SourceStreamTransform {
+                operation: None,
+                reason: String::from("stream observation work budget is exhausted"),
+            },
+        );
+    }
+    record_analysis_work(job, &report)?;
+    Ok((report, report_memory))
+}
+
+fn retain_source_formats(
     analysis: &mut AnalyzedSources,
-    input: &InputSet,
     source_index: usize,
     source: &LoadedSource,
+    range: super::input::RangeAnalysis,
     options: ArtifactAnalysisOptions,
-    job: &Job,
-    memory: &MemoryBudget,
-) -> Result<(l2_workbench::artifact::ArtifactAnalysis, MemoryLease), Box<dyn Error>> {
-    let range = source.analyze_ranges(input, source_index, options, job, memory)?;
-    let report_memory = range.report_memory;
+    streaming: &mut super::range_transform::StreamingBudget,
+) -> Result<
+    (
+        l2_workbench::artifact::ArtifactAnalysis,
+        MemoryLease,
+        Option<super::range_transform::Observation>,
+    ),
+    Box<dyn Error>,
+> {
     let mut report = range.report;
+    streaming.charge_range_work(report.work_bytes)?;
     let mut next_file_index = report.artifacts.len();
     if let Some(archive) = range.archive {
         let parent_index = next_file_index;
@@ -134,7 +231,14 @@ fn analyze_file_source(
                 &archive,
             )?;
         }
+        let previous_work = report.work_bytes;
         super::range_members::append_members(&mut report, archive, parent_index, options)?;
+        streaming.charge_range_work(
+            report
+                .work_bytes
+                .checked_sub(previous_work)
+                .ok_or("range member work decreased")?,
+        )?;
     }
     if let Some(png) = range.png {
         let artifact_index = report
@@ -151,8 +255,8 @@ fn analyze_file_source(
             png,
         )?;
     }
-    record_analysis_work(job, &report)?;
-    Ok((report, report_memory))
+    streaming.charge_zip_work(report.zip_expanded_work_bytes)?;
+    Ok((report, range.report_memory, range.observation))
 }
 
 fn no_case_space(
@@ -225,6 +329,92 @@ impl AnalyzedSources {
             archive.entry_count,
         ));
         Ok(())
+    }
+
+    pub(super) fn append_stream_archive(
+        &mut self,
+        source_index: usize,
+        artifact_index: usize,
+        source: &LoadedSource,
+        source_sha256: &str,
+        archive: &l2_workbench::artifact::zip::ZipArtifactReport,
+        derived: DerivedFile,
+    ) -> Result<(), Box<dyn Error>> {
+        let node_id = self.append_stream_node(
+            source_index,
+            artifact_index,
+            source,
+            source_sha256,
+            &derived.steps,
+        )?;
+        self.file_artifacts.try_reserve(1)?;
+        self.file_artifacts.push(FileArtifact::derived_zip(
+            node_id,
+            source_index,
+            artifact_index,
+            archive,
+            source.length(),
+            derived,
+        ));
+        Ok(())
+    }
+
+    pub(super) fn append_stream_png(
+        &mut self,
+        source_index: usize,
+        artifact_index: usize,
+        source: &LoadedSource,
+        source_sha256: &str,
+        boundary: l2_workbench::artifact::StreamPngBoundary,
+        derived: DerivedFile,
+    ) -> Result<(), Box<dyn Error>> {
+        let node_id = self.append_stream_node(
+            source_index,
+            artifact_index,
+            source,
+            source_sha256,
+            &derived.steps,
+        )?;
+        self.file_artifacts.try_reserve(1)?;
+        self.file_artifacts.push(FileArtifact::derived_png(
+            node_id,
+            source_index,
+            artifact_index,
+            boundary,
+            source.length(),
+            derived,
+        ));
+        Ok(())
+    }
+
+    fn append_stream_node(
+        &mut self,
+        source_index: usize,
+        artifact_index: usize,
+        source: &LoadedSource,
+        source_sha256: &str,
+        steps: &[l2_workbench::derivation::StreamReceipt],
+    ) -> Result<u64, Box<dyn Error>> {
+        let length = u64::try_from(source.length())?;
+        let source_id = self.case.add_source(
+            &format!("refine-source-{source_index}"),
+            "file",
+            length,
+            source_sha256,
+            None,
+        )?;
+        let node_id = self.case.add_node(
+            "stream_transformation_artifact",
+            None,
+            vec![SourceRange {
+                source: source_id,
+                packet: None,
+                offset: 0,
+                length,
+            }],
+            json!({"source_index":source_index,"artifact_index":artifact_index,"steps": steps}),
+        )?;
+        Ok(node_id)
     }
 
     fn append_file_png(
@@ -400,7 +590,7 @@ fn analysis_reason(report: &l2_workbench::artifact::ArtifactAnalysis) -> Option<
     {
         let uncovered_bytes = uncovered_range.map_or(0, |range| range.length);
         return Some(format!(
-            "range analysis searches for embedded PNG and ZIP objects; objects up to {max_object_bytes} bytes fit across windows, subject to budgets; ZIP end observation is subject to work and candidate limits; {uncovered_bytes} source bytes lacked complete range coverage, {omitted_candidates} candidates and {signature_scans_omitted} signature scans were omitted; whole-source transforms were not performed; see artifact validation and member omissions for structural and expansion results"
+            "range analysis searches for embedded PNG and ZIP objects; objects up to {max_object_bytes} bytes fit across windows, subject to budgets; ZIP end observation is subject to work and candidate limits; {uncovered_bytes} source bytes lacked complete range coverage, {omitted_candidates} candidates and {signature_scans_omitted} signature scans were omitted; streaming whole-source transforms cover only selected encodings and compression; see artifact validation and member omissions for structural and expansion results"
         ));
     }
     match report.status {
@@ -723,6 +913,8 @@ fn read_cache_receipt(
         || Some(receipt.analysis.source_sha256.as_str()) != source.digest()
         || receipt.analysis.source_length != source.length()
         || receipt.analysis.artifacts.len() > options.limits.max_artifacts
+        || receipt.analysis.work_bytes > options.limits.max_total_work_bytes
+        || receipt.analysis.zip_expanded_work_bytes > options.limits.max_zip_expanded_bytes
     {
         return Err(invalid_cache_entry(
             "file analysis cache receipt is inconsistent",

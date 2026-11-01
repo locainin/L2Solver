@@ -4,7 +4,7 @@ use super::{
     analysis::{
         CACHE_ANALYSIS_SCHEMA_VERSION, REFINE_ANALYZER_ALGORITHM_VERSION, recovery_profile_name,
     },
-    file_artifact::FileArtifact,
+    file_artifact::{FileArtifact, FileOrigin},
     input::LoadedSource,
     invalid_input,
     policy::RefinePolicy,
@@ -30,7 +30,7 @@ use std::{
     path::{Path, PathBuf},
 };
 
-const REFINE_ALGORITHM_VERSION: u32 = 13;
+const REFINE_ALGORITHM_VERSION: u32 = 15;
 
 #[derive(Serialize)]
 pub(super) struct SourceRecord {
@@ -76,9 +76,16 @@ struct PublishedOriginRecord<'a> {
     source_index: usize,
     source_label: &'a str,
     artifact_index: usize,
-    origin: &'a ArtifactOrigin,
+    origin: PublishedOrigin<'a>,
     validation: l2_workbench::artifact::ValidationSummary,
     signature_match_count: usize,
+}
+
+#[derive(Serialize)]
+#[serde(untagged)]
+enum PublishedOrigin<'a> {
+    Analyzer(&'a ArtifactOrigin),
+    File(&'a FileOrigin),
 }
 
 pub(super) fn result_identity(
@@ -116,6 +123,9 @@ pub(super) fn result_identity_with_source(
             "profile": recovery_profile_name(recovery.profile),
             "memory_limit": u64::try_from(policy.memory_limit)?,
             "source_read_limit": policy.source_read_limit,
+            "stream_output_limit": policy.stream_output_limit,
+            "stream_work_limit": policy.stream_work_limit,
+            "stream_expansion_ratio": super::policy::STREAM_EXPANSION_RATIO,
             "analyzer_algorithm_version": REFINE_ANALYZER_ALGORITHM_VERSION,
             "analysis_receipt_schema_version": CACHE_ANALYSIS_SCHEMA_VERSION,
             "transform_proposal_format_version": TRANSFORM_PROPOSAL_FORMAT_VERSION,
@@ -225,7 +235,7 @@ pub(super) fn make_manifest<'a>(
                     source_index: artifact.source_index,
                     source_label: &source.label,
                     artifact_index: artifact.artifact_index,
-                    origin: &artifact.origin,
+                    origin: PublishedOrigin::Analyzer(&artifact.origin),
                     validation: artifact.validation,
                     signature_match_count: artifact.signature_match_count,
                 });
@@ -269,7 +279,7 @@ fn append_file_records<'a>(
                 source_index: artifact.source_index,
                 source_label: &source.label,
                 artifact_index: artifact.artifact_index,
-                origin: &artifact.origin,
+                origin: PublishedOrigin::File(&artifact.origin),
                 validation: artifact.validation,
                 signature_match_count: 0,
             }],

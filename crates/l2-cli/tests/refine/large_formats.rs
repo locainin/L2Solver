@@ -12,7 +12,7 @@ pub(super) fn write_large_archive(path: &Path, fill: u8, png: &[u8]) -> Result<(
     write_archive_blocks(path, fill, png, 320)
 }
 
-fn write_archive_blocks(
+pub(super) fn write_archive_blocks(
     path: &Path,
     fill: u8,
     png: &[u8],
@@ -36,7 +36,11 @@ fn write_archive_blocks(
     Ok(())
 }
 
-fn write_large_png(path: &Path, blocks: usize, valid_crc: bool) -> Result<u64, Box<dyn Error>> {
+pub(super) fn write_large_png(
+    path: &Path,
+    blocks: usize,
+    valid_crc: bool,
+) -> Result<u64, Box<dyn Error>> {
     let basic = super::structural_png()?;
     let mut file = fs::File::create(path)?;
     file.write_all(basic.get(..33).ok_or("PNG header missing")?)?;
