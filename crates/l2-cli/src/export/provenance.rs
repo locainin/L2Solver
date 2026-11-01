@@ -4,7 +4,7 @@
 use super::COHORT_ARTIFACT_LOOKUP_BUILDS;
 use super::{artifact_collection::ArtifactProvenance, collection::CaseArtifactIndex};
 use crate::workbench;
-use l2_workbench::evidence::{Blob, ByteMapping, Node, SourceRange, clip_byte_mappings};
+use l2_workbench::evidence::{Blob, ByteMapping, Case, Node, SourceRange, clip_byte_mappings};
 use std::{
     collections::{BTreeSet, HashMap, HashSet},
     error::Error,
@@ -46,13 +46,13 @@ impl CohortArtifactContextIndex {
     pub(super) fn for_node(
         &self,
         node: &Node,
-        nodes_by_id: &HashMap<u64, &Node>,
+        case: &Case,
         case_id: Option<&str>,
         case_scope: &serde_json::Value,
     ) -> Result<ArtifactSourceContext, Box<dyn Error>> {
         let mut packet_numbers = BTreeSet::new();
         let mut visited_nodes = HashSet::new();
-        collect_node_packets(node, nodes_by_id, &mut visited_nodes, &mut packet_numbers)?;
+        collect_node_packets(node, case, &mut visited_nodes, &mut packet_numbers)?;
 
         let mut supporting_ids = packet_numbers
             .iter()
@@ -96,7 +96,7 @@ impl CohortArtifactContextIndex {
 
 fn collect_node_packets(
     node: &Node,
-    nodes_by_id: &HashMap<u64, &Node>,
+    case: &Case,
     visited: &mut HashSet<u64>,
     packets: &mut BTreeSet<u64>,
 ) -> Result<(), Box<dyn Error>> {
@@ -104,12 +104,12 @@ fn collect_node_packets(
         return Ok(());
     }
     packets.extend(node.ranges.iter().filter_map(|range| range.packet));
-    collect_node_references(&node.details, nodes_by_id, visited, packets)
+    collect_node_references(&node.details, case, visited, packets)
 }
 
 fn collect_node_references(
     value: &serde_json::Value,
-    nodes_by_id: &HashMap<u64, &Node>,
+    case: &Case,
     visited: &mut HashSet<u64>,
     packets: &mut BTreeSet<u64>,
 ) -> Result<(), Box<dyn Error>> {
@@ -125,22 +125,22 @@ fn collect_node_references(
                         )
                     })?;
                     for reference in references {
-                        collect_referenced_node(key, reference, nodes_by_id, visited, packets)?;
+                        collect_referenced_node(key, reference, case, visited, packets)?;
                     }
                 } else if is_node_reference(key) {
                     // Multi-input record evidence has no single input node
                     if is_optional_node_reference(key) && value.is_null() {
                         continue;
                     }
-                    collect_referenced_node(key, value, nodes_by_id, visited, packets)?;
+                    collect_referenced_node(key, value, case, visited, packets)?;
                 } else {
-                    collect_node_references(value, nodes_by_id, visited, packets)?;
+                    collect_node_references(value, case, visited, packets)?;
                 }
             }
         }
         serde_json::Value::Array(values) => {
             for value in values {
-                collect_node_references(value, nodes_by_id, visited, packets)?;
+                collect_node_references(value, case, visited, packets)?;
             }
         }
         _ => {}
@@ -151,17 +151,17 @@ fn collect_node_references(
 fn collect_referenced_node(
     key: &str,
     value: &serde_json::Value,
-    nodes_by_id: &HashMap<u64, &Node>,
+    case: &Case,
     visited: &mut HashSet<u64>,
     packets: &mut BTreeSet<u64>,
 ) -> Result<(), Box<dyn Error>> {
     let node_id = value.as_u64().ok_or_else(|| {
         node_reference_error(key, "expected an unsigned node ID", json_type(value))
     })?;
-    let referenced = nodes_by_id
-        .get(&node_id)
+    let referenced = case
+        .node(node_id)
         .ok_or_else(|| missing_node_reference_error(key, json_type(value)))?;
-    collect_node_packets(referenced, nodes_by_id, visited, packets)
+    collect_node_packets(referenced, case, visited, packets)
 }
 
 fn node_reference_error(key: &str, expected: &str, value_type: &str) -> String {
@@ -229,17 +229,15 @@ pub(super) fn selected_artifact_source_ranges(
         return Ok(Vec::new());
     };
     let selected_node = index
-        .nodes_by_id
-        .get(&selected_origin.id)
-        .copied()
+        .case
+        .node(selected_origin.id)
         .ok_or("selected artifact source node is missing")?;
     let Some(selected_blob_id) = selected_node.blob.as_deref() else {
         return Ok(Vec::new());
     };
     let selected_blob = index
-        .blobs_by_id
-        .get(selected_blob_id)
-        .copied()
+        .case
+        .blob(selected_blob_id)
         .ok_or("selected artifact bytes are missing")?;
     let validated_bytes = input
         .input_blob
@@ -275,9 +273,8 @@ fn validated_artifact_input<'a>(
         return Ok(None);
     };
     let validation_node = index
-        .nodes_by_id
-        .get(&validation_node_id)
-        .copied()
+        .case
+        .node(validation_node_id)
         .ok_or("artifact validation evidence references a missing node")?;
     let Some(input_node_id) = validation_node
         .details
@@ -287,17 +284,15 @@ fn validated_artifact_input<'a>(
         return Ok(None);
     };
     let input_node = index
-        .nodes_by_id
-        .get(&input_node_id)
-        .copied()
+        .case
+        .node(input_node_id)
         .ok_or("artifact validation input references a missing node")?;
     let Some(input_blob_id) = input_node.blob.as_deref() else {
         return Ok(None);
     };
     let input_blob = index
-        .blobs_by_id
-        .get(input_blob_id)
-        .copied()
+        .case
+        .blob(input_blob_id)
         .ok_or("artifact validation input bytes are missing")?;
     let Some(object_range) = validation_node.details.get("object_range") else {
         return Ok(None);
@@ -343,9 +338,8 @@ fn source_ranges_from_mapping_receipt(
         .as_deref()
         .ok_or("byte mapping receipt has no retained bytes")?;
     let receipt_blob = index
-        .blobs_by_id
-        .get(receipt_blob_id)
-        .copied()
+        .case
+        .blob(receipt_blob_id)
         .ok_or("byte mapping receipt bytes are missing")?;
     let mappings: Vec<ByteMapping> = serde_json::from_slice(&receipt_blob.bytes)?;
     validate_mapping_receipt(&mappings, input)?;
@@ -439,13 +433,13 @@ fn mappings_cover_object(
 pub(super) fn artifact_provenance(
     category: &str,
     context: &ArtifactSourceContext,
-    node: Option<Node>,
+    node: Option<&Node>,
     description: Option<String>,
     selection: Option<serde_json::Value>,
-    signature_candidates: Vec<Node>,
-    nodes_by_id: &HashMap<u64, &Node>,
+    signature_candidates: &[&Node],
+    case: &Case,
 ) -> Result<ArtifactProvenance, Box<dyn Error>> {
-    let selected_node_id = node.as_ref().map(|node| node.id);
+    let selected_node_id = node.map(|node| node.id);
     let validation_node_id = selection
         .as_ref()
         .and_then(|selection| selection.get("validation_evidence_node"))
@@ -458,14 +452,15 @@ pub(super) fn artifact_provenance(
         .into_iter()
         .flatten()
     {
-        if !nodes_by_id.contains_key(&node_id) {
+        if case.node(node_id).is_none() {
             return Err("artifact provenance references a missing Case node".into());
         }
     }
     let source_projection =
-        artifact_source_projection(context, node.as_ref(), selected_node_id, selection.as_ref())?;
+        artifact_source_projection(context, node, selected_node_id, selection.as_ref())?;
     let graph_retained = context.case_id.is_some();
-    let node = graph_retained.then_some(node).flatten();
+    // Copy evidence only when the sidecar retains the corresponding Case
+    let node = if graph_retained { node.cloned() } else { None };
     let selection = graph_retained.then_some(selection).flatten();
     // Keep exact source ranges when their Case graph is omitted from the sidecar
     let source_ranges = if graph_retained {
@@ -476,6 +471,9 @@ pub(super) fn artifact_provenance(
     let canonical_source_ranges = (!source_ranges.is_empty()).then_some(&source_ranges);
     let signature_candidates = if graph_retained {
         signature_candidates
+            .iter()
+            .map(|candidate| (*candidate).clone())
+            .collect()
     } else {
         Vec::new()
     };
@@ -484,13 +482,13 @@ pub(super) fn artifact_provenance(
     let extension_node_id = graph_retained.then_some(extension_node_id).flatten();
     let stable_node = node
         .as_ref()
-        .map(|node| canonical_node(node, nodes_by_id))
+        .map(|node| canonical_node(node, case))
         .transpose()?;
     let stable_selection = selection
         .as_ref()
-        .map(|selection| canonical_selection(selection, nodes_by_id))
+        .map(|selection| canonical_selection(selection, case))
         .transpose()?;
-    let stable_candidates = canonical_nodes(&signature_candidates, nodes_by_id)?;
+    let stable_candidates = canonical_nodes(&signature_candidates, case)?;
     // Flow and cohort Cases can describe the same packet-backed object with different local IDs
     let canonical_origin = serde_json::json!({
         "category": category,
@@ -561,10 +559,7 @@ fn artifact_source_projection<'a>(
     })
 }
 
-fn canonical_node(
-    node: &Node,
-    nodes_by_id: &HashMap<u64, &Node>,
-) -> Result<serde_json::Value, Box<dyn Error>> {
+fn canonical_node(node: &Node, case: &Case) -> Result<serde_json::Value, Box<dyn Error>> {
     let mut ranges = node.ranges.clone();
     ranges.sort_by(|left, right| {
         (&left.source, left.packet, left.offset, left.length).cmp(&(
@@ -575,7 +570,7 @@ fn canonical_node(
         ))
     });
     let mut details = node.details.clone();
-    canonicalize_node_references(&mut details, nodes_by_id)?;
+    canonicalize_node_references(&mut details, case)?;
     Ok(serde_json::json!({
         "kind": node.kind,
         "blob": node.blob,
@@ -586,30 +581,27 @@ fn canonical_node(
 
 fn canonical_selection(
     selection: &serde_json::Value,
-    nodes_by_id: &HashMap<u64, &Node>,
+    case: &Case,
 ) -> Result<serde_json::Value, Box<dyn Error>> {
     let mut selection = selection.clone();
     if let Some(fields) = selection.as_object_mut() {
         fields.remove("id");
         fields.remove("selected_file_name");
     }
-    canonicalize_node_references(&mut selection, nodes_by_id)?;
+    canonicalize_node_references(&mut selection, case)?;
     Ok(selection)
 }
 
-fn canonical_nodes(
-    nodes: &[Node],
-    nodes_by_id: &HashMap<u64, &Node>,
-) -> Result<Vec<serde_json::Value>, Box<dyn Error>> {
+fn canonical_nodes(nodes: &[Node], case: &Case) -> Result<Vec<serde_json::Value>, Box<dyn Error>> {
     nodes
         .iter()
-        .map(|node| canonical_node(node, nodes_by_id))
+        .map(|node| canonical_node(node, case))
         .collect()
 }
 
 fn canonicalize_node_references(
     value: &mut serde_json::Value,
-    nodes_by_id: &HashMap<u64, &Node>,
+    case: &Case,
 ) -> Result<(), Box<dyn Error>> {
     match value {
         serde_json::Value::Object(fields) => {
@@ -631,7 +623,7 @@ fn canonicalize_node_references(
                                 json_type(reference),
                             )
                         })?;
-                        let node = nodes_by_id.get(&node_id).ok_or_else(|| {
+                        let node = case.node(node_id).ok_or_else(|| {
                             missing_node_reference_error(key, json_type(reference))
                         })?;
                         *reference = canonical_node_reference(node);
@@ -644,18 +636,18 @@ fn canonicalize_node_references(
                     let node_id = value.as_u64().ok_or_else(|| {
                         node_reference_error(key, "expected an unsigned node ID", json_type(value))
                     })?;
-                    let node = nodes_by_id
-                        .get(&node_id)
+                    let node = case
+                        .node(node_id)
                         .ok_or_else(|| missing_node_reference_error(key, json_type(value)))?;
                     *value = canonical_node_reference(node);
                 } else {
-                    canonicalize_node_references(value, nodes_by_id)?;
+                    canonicalize_node_references(value, case)?;
                 }
             }
         }
         serde_json::Value::Array(values) => {
             for value in values {
-                canonicalize_node_references(value, nodes_by_id)?;
+                canonicalize_node_references(value, case)?;
             }
         }
         _ => {}

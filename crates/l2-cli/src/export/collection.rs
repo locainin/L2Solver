@@ -1,5 +1,9 @@
 //! Collect native and recovered artifacts from indexed capture Cases
 
+#[cfg(test)]
+#[path = "../../tests/export/archive_parent.rs"]
+mod archive_parent_tests;
+
 use super::{
     artifact_collection::{ArtifactCollection, ArtifactLimits},
     coverage::{RecoveryCoverage, retention_limit_names},
@@ -18,7 +22,7 @@ use super::{
 };
 use crate::{arguments::ExportOptions, workbench};
 use l2_workbench::{
-    evidence::{Blob, Case, EvidenceStatus, Node},
+    evidence::{Case, EvidenceStatus, Node},
     job::{MemoryBudget, MemoryError, Phase},
     reconstruction::Limits,
     tshark::SourceIdentity,
@@ -560,54 +564,31 @@ pub(super) fn collect_cohort_artifacts(
 ) -> Result<(), Box<dyn Error>> {
     // Native and recovered artifacts share this collection-scoped lookup
     let context_index = CohortArtifactContextIndex::new(cohort)?;
-    collect_case_artifacts_with_context(
-        collection,
-        &cohort.result.case,
-        memory,
-        |node, nodes_by_id| context_index.for_node(node, nodes_by_id, case_id, case_scope),
-    )
+    collect_case_artifacts_with_context(collection, &cohort.result.case, memory, |node, case| {
+        context_index.for_node(node, case, case_id, case_scope)
+    })
 }
 
 pub(super) fn collect_case_artifacts_with_context(
     collection: &mut ArtifactCollection,
     case: &Case,
     memory: Option<&MemoryBudget>,
-    mut context_for_node: impl FnMut(
-        &Node,
-        &HashMap<u64, &Node>,
-    ) -> Result<ArtifactSourceContext, Box<dyn Error>>,
+    mut context_for_node: impl FnMut(&Node, &Case) -> Result<ArtifactSourceContext, Box<dyn Error>>,
 ) -> Result<(), Box<dyn Error>> {
     let index = CaseArtifactIndex::new(case)?;
-    collect_native_case_artifacts(collection, case, &index, memory, &mut context_for_node)?;
-    collect_selected_case_artifacts(collection, case, &index, memory, &mut context_for_node)
+    collect_native_case_artifacts(collection, &index, memory, &mut context_for_node)?;
+    collect_selected_case_artifacts(collection, &index, memory, &mut context_for_node)
 }
 
 pub(super) struct CaseArtifactIndex<'a> {
-    pub(super) nodes_by_id: HashMap<u64, &'a Node>,
-    pub(super) blobs_by_id: HashMap<&'a str, &'a Blob>,
-    signature_candidates: HashMap<u64, Vec<Node>>,
+    pub(super) case: &'a Case,
+    signature_candidates: HashMap<u64, Vec<&'a Node>>,
     pub(super) mapping_receipts_by_output: HashMap<u64, &'a Node>,
 }
 
 impl<'a> CaseArtifactIndex<'a> {
     pub(super) fn new(case: &'a Case) -> Result<Self, Box<dyn Error>> {
-        let nodes_by_id = case
-            .nodes()
-            .iter()
-            .map(|node| (node.id, node))
-            .collect::<HashMap<_, _>>();
-        let blobs_by_id = case
-            .blobs()
-            .iter()
-            .map(|blob| (blob.id.as_str(), blob))
-            .collect::<HashMap<_, _>>();
         let mut mapping_receipts_by_output = HashMap::new();
-        let observed_mapping_edges = case
-            .edges()
-            .iter()
-            .filter(|edge| edge.relation == "mapped_by" && edge.status == EvidenceStatus::Observed)
-            .map(|edge| (edge.from, edge.to))
-            .collect::<HashSet<_>>();
         // Imported receipt details are provenance only when their link is observed
         for node in case
             .nodes()
@@ -626,7 +607,7 @@ impl<'a> CaseArtifactIndex<'a> {
                 .get("representation")
                 .and_then(serde_json::Value::as_str)
                 != Some("json_blob")
-                || !observed_mapping_edges.contains(&(output_node, node.id))
+                || !case.has_edge(output_node, node.id, "mapped_by", EvidenceStatus::Observed)
             {
                 continue;
             }
@@ -638,8 +619,7 @@ impl<'a> CaseArtifactIndex<'a> {
             }
         }
         Ok(Self {
-            nodes_by_id,
-            blobs_by_id,
+            case,
             signature_candidates: signature_candidates(case),
             mapping_receipts_by_output,
         })
@@ -648,14 +628,11 @@ impl<'a> CaseArtifactIndex<'a> {
 
 fn collect_native_case_artifacts(
     collection: &mut ArtifactCollection,
-    case: &Case,
     index: &CaseArtifactIndex<'_>,
     memory: Option<&MemoryBudget>,
-    context_for_node: &mut impl FnMut(
-        &Node,
-        &HashMap<u64, &Node>,
-    ) -> Result<ArtifactSourceContext, Box<dyn Error>>,
+    context_for_node: &mut impl FnMut(&Node, &Case) -> Result<ArtifactSourceContext, Box<dyn Error>>,
 ) -> Result<(), Box<dyn Error>> {
+    let case = index.case;
     for node in case.nodes() {
         let Some(description) = export_description(node) else {
             continue;
@@ -663,25 +640,22 @@ fn collect_native_case_artifacts(
         let Some(blob_id) = node.blob.as_deref() else {
             continue;
         };
-        let blob = index
-            .blobs_by_id
-            .get(blob_id)
-            .copied()
+        let blob = case
+            .blob(blob_id)
             .ok_or("exportable node references a missing byte object")?;
-        let context = context_for_node(node, &index.nodes_by_id)?;
+        let context = context_for_node(node, case)?;
         let number = collection.next_file_number()?;
         let origin = artifact_provenance(
             native_category(node),
             &context,
-            Some(node.clone()),
+            Some(node),
             Some(description.to_owned()),
             None,
             index
                 .signature_candidates
                 .get(&node.id)
-                .cloned()
-                .unwrap_or_default(),
-            &index.nodes_by_id,
+                .map_or(&[], Vec::as_slice),
+            case,
         )?;
         let name = file_name(number, node, &blob.bytes, memory)?;
         collection.add_bytes(&blob.bytes, &name, &origin)?;
@@ -691,14 +665,11 @@ fn collect_native_case_artifacts(
 
 fn collect_selected_case_artifacts(
     collection: &mut ArtifactCollection,
-    case: &Case,
     index: &CaseArtifactIndex<'_>,
     memory: Option<&MemoryBudget>,
-    context_for_node: &mut impl FnMut(
-        &Node,
-        &HashMap<u64, &Node>,
-    ) -> Result<ArtifactSourceContext, Box<dyn Error>>,
+    context_for_node: &mut impl FnMut(&Node, &Case) -> Result<ArtifactSourceContext, Box<dyn Error>>,
 ) -> Result<(), Box<dyn Error>> {
+    let case = index.case;
     let selected_artifacts = workbench::artifact_export::select_artifacts(case, memory)?;
     let archive_member_paths = selected_artifacts
         .iter()
@@ -707,15 +678,13 @@ fn collect_selected_case_artifacts(
             provenance
                 .archive_path
                 .as_ref()
-                .map(|path| (provenance.id, path.clone()))
+                .map(|path| (provenance.id, path.as_str()))
         })
         .collect::<HashMap<_, _>>();
     for artifact in selected_artifacts.iter() {
         for selected_origin in artifact.provenance() {
-            let node = index
-                .nodes_by_id
-                .get(&selected_origin.id)
-                .copied()
+            let node = case
+                .node(selected_origin.id)
                 .ok_or("recovered artifact provenance references a missing node")?;
             let number = collection.next_file_number()?;
             let mut selection = serde_json::to_value(selected_origin)?;
@@ -730,7 +699,7 @@ fn collect_selected_case_artifacts(
                         .details
                         .get("archive_node")
                         .and_then(serde_json::Value::as_u64)
-                    && let Some(parent) = index.nodes_by_id.get(&parent_id)
+                    && let Some(parent) = case.node(parent_id)
                 {
                     fields.insert(
                         "archive_parent".to_owned(),
@@ -739,7 +708,7 @@ fn collect_selected_case_artifacts(
                             "kind": parent.kind,
                             "member_path": archive_member_ancestor_path(
                                 parent_id,
-                                &index.nodes_by_id,
+                                case,
                                 &archive_member_paths,
                             ),
                         }),
@@ -749,19 +718,18 @@ fn collect_selected_case_artifacts(
                     fields.insert("source_ranges".to_owned(), serde_json::json!(source_ranges));
                 }
             }
-            let context = context_for_node(node, &index.nodes_by_id)?;
+            let context = context_for_node(node, case)?;
             let origin = artifact_provenance(
                 "recovered_artifact",
                 &context,
-                Some(node.clone()),
+                Some(node),
                 None,
                 Some(selection),
                 index
                     .signature_candidates
                     .get(&node.id)
-                    .cloned()
-                    .unwrap_or_default(),
-                &index.nodes_by_id,
+                    .map_or(&[], Vec::as_slice),
+                case,
             )?;
             collection.add_bytes(
                 artifact.bytes(),
@@ -773,11 +741,11 @@ fn collect_selected_case_artifacts(
     Ok(())
 }
 
-fn archive_member_ancestor_path(
+fn archive_member_ancestor_path<'a>(
     node_id: u64,
-    nodes_by_id: &HashMap<u64, &Node>,
-    archive_member_paths: &HashMap<u64, String>,
-) -> Option<String> {
+    case: &Case,
+    archive_member_paths: &HashMap<u64, &'a str>,
+) -> Option<&'a str> {
     let mut current_id = node_id;
     let mut visited = HashSet::new();
     loop {
@@ -785,9 +753,9 @@ fn archive_member_ancestor_path(
             return None;
         }
         if let Some(path) = archive_member_paths.get(&current_id) {
-            return Some(path.clone());
+            return Some(*path);
         }
-        let node = nodes_by_id.get(&current_id)?;
+        let node = case.node(current_id)?;
         current_id = node
             .details
             .get("input_node")
@@ -795,8 +763,8 @@ fn archive_member_ancestor_path(
     }
 }
 
-fn signature_candidates(case: &Case) -> HashMap<u64, Vec<Node>> {
-    let mut candidates = HashMap::<u64, Vec<Node>>::new();
+fn signature_candidates(case: &Case) -> HashMap<u64, Vec<&Node>> {
+    let mut candidates = HashMap::<u64, Vec<&Node>>::new();
     for node in case
         .nodes()
         .iter()
@@ -809,7 +777,7 @@ fn signature_candidates(case: &Case) -> HashMap<u64, Vec<Node>> {
         else {
             continue;
         };
-        candidates.entry(input_node).or_default().push(node.clone());
+        candidates.entry(input_node).or_default().push(node);
     }
     candidates
 }

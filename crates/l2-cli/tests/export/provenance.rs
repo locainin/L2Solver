@@ -12,7 +12,7 @@ use l2_workbench::{
     store::Flow,
 };
 use serde_json::{Value, json};
-use std::{collections::HashMap, error::Error};
+use std::error::Error;
 
 #[test]
 fn summary_prefers_exact_selected_packet_ranges() -> Result<(), Box<dyn Error>> {
@@ -176,15 +176,7 @@ fn source_provenance(
     case_id: Option<&str>,
     selection: Option<Value>,
 ) -> Result<super::ArtifactProvenance, Box<dyn Error>> {
-    let node = case
-        .node(node_id)
-        .cloned()
-        .ok_or("artifact node is missing")?;
-    let nodes_by_id = case
-        .nodes()
-        .iter()
-        .map(|node| (node.id, node))
-        .collect::<HashMap<_, _>>();
+    let node = case.node(node_id).ok_or("artifact node is missing")?;
     let context = ArtifactSourceContext {
         flow: None,
         supporting_flows: Vec::new(),
@@ -199,8 +191,8 @@ fn source_provenance(
         Some(node),
         None,
         selection,
-        Vec::new(),
-        &nodes_by_id,
+        &[],
+        case,
     )
 }
 
@@ -349,6 +341,117 @@ fn only_observed_mapped_by_receipts_provide_subrange_provenance() -> Result<(), 
 }
 
 #[test]
+fn mapping_receipt_requires_the_exact_observed_edge_for_the_same_nodes()
+-> Result<(), Box<dyn Error>> {
+    let mut case = Case::new();
+    let input = case.add_bytes_node("input", b"content", Vec::new(), json!({}))?;
+    let receipt = case.add_bytes_node(
+        "byte_mapping_receipt",
+        b"[]",
+        Vec::new(),
+        json!({"output_node": input, "representation": "json_blob"}),
+    )?;
+    for (relation, status) in [
+        ("mapped_by", EvidenceStatus::Hypothesis),
+        ("derived_from", EvidenceStatus::Observed),
+    ] {
+        case.add_edge(Edge {
+            from: input,
+            to: receipt,
+            relation: relation.to_owned(),
+            status,
+            reason: "Unrelated evidence does not validate a mapping receipt".to_owned(),
+        })?;
+    }
+    let index = CaseArtifactIndex::new(&case)?;
+    assert!(!index.mapping_receipts_by_output.contains_key(&input));
+    drop(index);
+
+    case.add_edge(Edge {
+        from: input,
+        to: receipt,
+        relation: "mapped_by".to_owned(),
+        status: EvidenceStatus::Observed,
+        reason: "The output has a byte mapping receipt".to_owned(),
+    })?;
+    let index = CaseArtifactIndex::new(&case)?;
+    assert_eq!(
+        index
+            .mapping_receipts_by_output
+            .get(&input)
+            .map(|node| node.id),
+        Some(receipt)
+    );
+    Ok(())
+}
+
+#[test]
+fn signature_candidates_follow_the_input_and_case_retention() -> Result<(), Box<dyn Error>> {
+    let mut case = Case::new();
+    let first = case.add_bytes_node(
+        "http_body",
+        b"first body",
+        Vec::new(),
+        json!({"status": "complete", "framing_complete": true}),
+    )?;
+    let second = case.add_bytes_node(
+        "http_body",
+        b"second body",
+        Vec::new(),
+        json!({"status": "complete", "framing_complete": true}),
+    )?;
+    let first_signature = case.add_node(
+        "file_signature_match",
+        None,
+        Vec::new(),
+        json!({"input_node": first, "observation": "first"}),
+    )?;
+    let second_signature = case.add_node(
+        "file_signature_match",
+        None,
+        Vec::new(),
+        json!({"input_node": second, "observation": "second"}),
+    )?;
+
+    for retained in [false, true] {
+        let temporary = tempfile::tempdir()?;
+        let mut artifacts =
+            super::ArtifactCollection::new(temporary.path(), super::ArtifactLimits::default())?;
+        super::collect_case_artifacts_with_context(&mut artifacts, &case, None, |_, _| {
+            Ok(ArtifactSourceContext {
+                flow: None,
+                supporting_flows: Vec::new(),
+                cohort_scope: None,
+                case_id: retained.then(|| "retained-case".to_owned()),
+                case_scope: json!({"kind": "flow"}),
+            })
+        })?;
+        let mut origins = 0;
+        artifacts.visit_artifact_origins(|_, _, origin| {
+            origins += 1;
+            if retained {
+                let expected = match origin.selected_node_id {
+                    Some(id) if id == first => first_signature,
+                    Some(id) if id == second => second_signature,
+                    _ => return Err("unexpected source node".into()),
+                };
+                let ids: Vec<_> = origin
+                    .signature_candidates
+                    .iter()
+                    .map(|node| node.id)
+                    .collect();
+                assert_eq!(ids, [expected]);
+            } else {
+                assert!(origin.signature_candidates.is_empty());
+            }
+            Ok(())
+        })?;
+        assert_eq!(origins, 2);
+    }
+    Ok(())
+}
+
+#[test]
 fn duplicate_observed_mapping_receipts_are_rejected_deterministically() -> Result<(), Box<dyn Error>>
 {
     let mut case = Case::new();
@@ -468,18 +571,11 @@ fn cohort_artifact_context_falls_back_when_packet_witnesses_are_incomplete()
         .case
         .node(no_witness_node_id)
         .ok_or("artifact with no packet witnesses is missing")?;
-    let nodes_by_id = cohort
-        .result
-        .case
-        .nodes()
-        .iter()
-        .map(|node| (node.id, node))
-        .collect();
     let context_index = CohortArtifactContextIndex::new(&cohort)?;
 
     let context = context_index.for_node(
         incomplete_witness_node,
-        &nodes_by_id,
+        &cohort.result.case,
         Some("cohort-case"),
         &json!({"kind": "cohort"}),
     )?;
@@ -492,7 +588,7 @@ fn cohort_artifact_context_falls_back_when_packet_witnesses_are_incomplete()
 
     let context = context_index.for_node(
         no_witness_node,
-        &nodes_by_id,
+        &cohort.result.case,
         Some("cohort-case"),
         &json!({"kind": "cohort"}),
     )?;
@@ -522,17 +618,9 @@ fn cohort_artifact_context_uses_single_flow_context_for_one_supported_flow()
         .case
         .node(node_id)
         .ok_or("artifact node is missing")?;
-    let nodes_by_id = cohort
-        .result
-        .case
-        .nodes()
-        .iter()
-        .map(|node| (node.id, node))
-        .collect();
-
     let context = CohortArtifactContextIndex::new(&cohort)?.for_node(
         node,
-        &nodes_by_id,
+        &cohort.result.case,
         Some("cohort-case"),
         &json!({"kind": "cohort"}),
     )?;
@@ -559,17 +647,10 @@ fn cohort_context_follows_plural_frame_node_references() -> Result<(), Box<dyn E
         .node(output_node)
         .cloned()
         .ok_or("relational output node is missing")?;
-    let nodes_by_id = cohort
-        .result
-        .case
-        .nodes()
-        .iter()
-        .map(|node| (node.id, node))
-        .collect();
     let context_index = CohortArtifactContextIndex::new(&cohort)?;
     let context = context_index.for_node(
         &candidate_node,
-        &nodes_by_id,
+        &cohort.result.case,
         Some("cohort-case"),
         &json!({"kind": "cohort"}),
     )?;
@@ -588,11 +669,11 @@ fn cohort_context_follows_plural_frame_node_references() -> Result<(), Box<dyn E
     let provenance = artifact_provenance(
         "recovered_artifact",
         &context,
-        Some(candidate_node),
+        Some(&candidate_node),
         None,
         None,
-        Vec::new(),
-        &nodes_by_id,
+        &[],
+        &cohort.result.case,
     )?;
     let canonical_inputs = provenance
         .canonical_origin
@@ -769,17 +850,10 @@ fn cohort_context_for_node(
         .case
         .node(node_id)
         .ok_or("artifact node is missing")?;
-    let nodes_by_id = cohort
-        .result
-        .case
-        .nodes()
-        .iter()
-        .map(|node| (node.id, node))
-        .collect();
     let context_index = CohortArtifactContextIndex::new(&cohort)?;
     context_index.for_node(
         node,
-        &nodes_by_id,
+        &cohort.result.case,
         Some("cohort-case"),
         &json!({"kind": "cohort"}),
     )
