@@ -1,7 +1,7 @@
 //! Bounded, disk-backed recovery evidence sidecar for capture exports
 
 use flate2::{Compression, write::GzEncoder};
-use l2_workbench::evidence::{Case, write_published_case};
+use l2_workbench::evidence::{Case, PUBLISHED_EVIDENCE_ENCODING_VERSION, write_published_case};
 use l2_workbench::job::{MemoryBudget, MemoryClass};
 use serde::Serialize;
 use serde_json::Value;
@@ -13,7 +13,7 @@ use std::{
 };
 
 pub(super) const SIDECAR_FILE_NAME: &str = "evidence.jsonl.gz";
-pub(super) const ENCODING_VERSION: u32 = 5;
+pub(super) const ENCODING_VERSION: u32 = PUBLISHED_EVIDENCE_ENCODING_VERSION;
 // Compression can change which whole Cases fit without changing the record format
 pub(super) const COMPRESSION_POLICY_VERSION: u32 = 2;
 // Level 3 reduces repeated evidence while retaining a fast streaming encoder

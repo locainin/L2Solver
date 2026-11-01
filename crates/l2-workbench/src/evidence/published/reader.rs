@@ -11,9 +11,10 @@ use super::{
     PublishedEvidenceLimits,
     canonical::{CountWriter, HASH_DOMAIN, PLACEHOLDER},
     format::{
-        BlobReference, COMPACT_VERSION, Counts, Details, Header, LEGACY_VERSION, Record, VERSION,
-        expand_compact_details,
+        BlobReference, COMPACT_VERSION, Counts, Details, Header, INDEX_VERSION, LEGACY_VERSION,
+        Record, VERSION, expand_compact_details,
     },
+    runs::{MIN_EDGE_RUN, advance},
 };
 use serde::Serialize;
 use sha2::{Digest, Sha256};
@@ -25,7 +26,7 @@ use std::{
 
 /// Decode supported published records to canonical version-two JSON Lines
 ///
-/// Versions three through five check record order, references, ranges, declared counts, and Case IDs
+/// Versions three through six check record order, references, ranges, declared counts, and Case IDs
 /// Version two is parsed as a stream and copied without changing its bytes. A caller that
 /// persists the output should publish it only after this function succeeds
 ///
@@ -43,7 +44,7 @@ pub fn decode_published_evidence<R: BufRead, W: Write>(
     }
     match version {
         2 => decode_legacy(input, output, limits.maximum_stream_bytes),
-        LEGACY_VERSION | COMPACT_VERSION | VERSION => {
+        LEGACY_VERSION | COMPACT_VERSION | INDEX_VERSION | VERSION => {
             decode_normalized(input, output, limits, version)
         }
         _ => Err(io::Error::other("unsupported published evidence version")),
@@ -193,7 +194,7 @@ impl Blobs {
                 }
                 Ok(Some(id))
             }
-            Some(BlobReference::Index(index)) if version == VERSION => Ok(Some(
+            Some(BlobReference::Index(index)) if version >= INDEX_VERSION => Ok(Some(
                 self.ordered
                     .get(index)
                     .ok_or_else(|| invalid("missing node blob reference"))?
@@ -343,26 +344,76 @@ fn read_edges<R: BufRead, W: Write>(
     canonical: &mut CanonicalWriter<'_, W>,
     header: &Header,
 ) -> io::Result<()> {
-    for index in 0..header.counts.edges {
-        let Record::Edge(record) = reader.required()? else {
-            return Err(invalid("expected edge record"));
+    let max_node = u64::try_from(header.counts.nodes).map_err(io::Error::other)?;
+    let mut index = 0;
+    while index < header.counts.edges {
+        let (mut edge, from_step, to_step, length) = match reader.required()? {
+            Record::Edge(record) => (
+                Edge {
+                    from: record.0,
+                    to: record.1,
+                    relation: record.2.resolve(&header.strings.0)?,
+                    status: record.3,
+                    reason: record.4.resolve(&header.strings.0)?,
+                },
+                0,
+                0,
+                1,
+            ),
+            Record::EdgeRun(record) => {
+                if header.version != VERSION {
+                    return Err(invalid("edge run requires version six"));
+                }
+                if record.4 < MIN_EDGE_RUN
+                    || !(-1..=1).contains(&record.2)
+                    || !(-1..=1).contains(&record.3)
+                {
+                    return Err(invalid("invalid evidence edge run"));
+                }
+                if record.4 > header.counts.edges - index {
+                    return Err(invalid("edge run exceeds declared edge count"));
+                }
+                (
+                    Edge {
+                        from: record.0,
+                        to: record.1,
+                        relation: record.5.resolve(&header.strings.0)?,
+                        status: record.6,
+                        reason: record.7.resolve(&header.strings.0)?,
+                    },
+                    record.2,
+                    record.3,
+                    record.4,
+                )
+            }
+            _ => return Err(invalid("expected edge record")),
         };
-        let max_node = u64::try_from(header.counts.nodes).map_err(io::Error::other)?;
-        if record.0 == 0 || record.1 == 0 || record.0 > max_node || record.1 > max_node {
+        if edge.from == 0 || edge.to == 0 || edge.from > max_node || edge.to > max_node {
             return Err(invalid("missing edge endpoint"));
         }
-        let edge = Edge {
-            from: record.0,
-            to: record.1,
-            relation: record.2.resolve(&header.strings.0)?,
-            status: record.3,
-            reason: record.4.resolve(&header.strings.0)?,
-        };
+        // Validate the last endpoint before expanding any run into canonical output
+        let distance = u64::try_from(length - 1).map_err(io::Error::other)?;
+        let last_from = advance(edge.from, from_step, distance)
+            .ok_or_else(|| invalid("invalid evidence edge run endpoint"))?;
+        let last_to = advance(edge.to, to_step, distance)
+            .ok_or_else(|| invalid("invalid evidence edge run endpoint"))?;
+        if last_from == 0 || last_to == 0 || last_from > max_node || last_to > max_node {
+            return Err(invalid("invalid evidence edge run endpoint"));
+        }
         validate_text(&edge.relation, MAX_RELATION_BYTES, "edge relation")
             .map_err(io::Error::other)?;
         validate_text(&edge.reason, MAX_REASON_BYTES, "edge reason").map_err(io::Error::other)?;
-        comma(canonical, index)?;
-        json(canonical, &edge)?;
+        for offset in 0..length {
+            comma(canonical, index)?;
+            json(canonical, &edge)?;
+            index += 1;
+            if offset + 1 < length {
+                edge.from = advance(edge.from, from_step, 1)
+                    .ok_or_else(|| invalid("invalid evidence edge run endpoint"))?;
+                edge.to = advance(edge.to, to_step, 1)
+                    .ok_or_else(|| invalid("invalid evidence edge run endpoint"))?;
+            }
+        }
     }
     Ok(())
 }

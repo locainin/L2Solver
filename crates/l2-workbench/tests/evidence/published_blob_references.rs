@@ -58,7 +58,12 @@ fn blob_table_references_and_digest_details_recover_the_canonical_case() -> Test
     let encoded = encode(&case)?;
     let records = records(&encoded)?;
     let header = records.first().ok_or("header is missing")?;
-    assert_eq!(header.pointer("/value/version"), Some(&json!(5)));
+    assert_eq!(
+        header.pointer("/value/version"),
+        Some(&json!(
+            l2_workbench::evidence::PUBLISHED_EVIDENCE_ENCODING_VERSION
+        ))
+    );
     let dictionary = header
         .pointer("/value/strings")
         .and_then(Value::as_array)
@@ -86,7 +91,7 @@ fn blob_table_references_and_digest_details_recover_the_canonical_case() -> Test
     let (_, expected) = canonical(&case, &json!({"kind":"reference_test"}), 1)?;
     let mut decoded = Vec::new();
     decode_published_evidence(
-        5,
+        l2_workbench::evidence::PUBLISHED_EVIDENCE_ENCODING_VERSION,
         Cursor::new(encoded),
         &mut decoded,
         PublishedEvidenceLimits::new(1_000_000, 100_000),
@@ -104,7 +109,15 @@ fn blob_references_reject_invalid_indices_and_missing_digest_sources() -> TestRe
     let limits = PublishedEvidenceLimits::new(1_000_000, 100_000);
     for value in [json!(9999), Value::Null] {
         let invalid = replace_record_value(&encoded, "node", "/value/2", value)?;
-        assert!(decode_published_evidence(5, Cursor::new(invalid), Vec::new(), limits).is_err());
+        assert!(
+            decode_published_evidence(
+                l2_workbench::evidence::PUBLISHED_EVIDENCE_ENCODING_VERSION,
+                Cursor::new(invalid),
+                Vec::new(),
+                limits
+            )
+            .is_err()
+        );
     }
     Ok(())
 }
@@ -116,7 +129,7 @@ fn changing_a_valid_blob_index_rejects_the_changed_case_identity() -> TestResult
     let encoded = encode(&case)?;
     let changed = replace_record_value(&encoded, "node", "/value/2", json!(1))?;
     let error = decode_published_evidence(
-        5,
+        l2_workbench::evidence::PUBLISHED_EVIDENCE_ENCODING_VERSION,
         Cursor::new(changed),
         Vec::new(),
         PublishedEvidenceLimits::new(1_000_000, 100_000),
@@ -144,7 +157,7 @@ fn version_four_rejects_version_five_blob_indices() -> TestResult<()> {
 }
 
 #[test]
-fn version_five_accepts_inline_blob_ids_without_changing_the_case() -> TestResult<()> {
+fn current_version_accepts_inline_blob_ids_without_changing_the_case() -> TestResult<()> {
     let case = shared_frame_case()?;
     let encoded = encode(&case)?;
     let blob_id = case
@@ -155,7 +168,7 @@ fn version_five_accepts_inline_blob_ids_without_changing_the_case() -> TestResul
     let (_, expected) = canonical(&case, &json!({"kind":"reference_test"}), 1)?;
     let mut decoded = Vec::new();
     decode_published_evidence(
-        5,
+        l2_workbench::evidence::PUBLISHED_EVIDENCE_ENCODING_VERSION,
         Cursor::new(inline),
         &mut decoded,
         PublishedEvidenceLimits::new(1_000_000, 100_000),
@@ -193,7 +206,7 @@ fn digest_reference_rejects_a_non_null_payload() -> TestResult<()> {
     )?;
     assert!(
         decode_published_evidence(
-            5,
+            l2_workbench::evidence::PUBLISHED_EVIDENCE_ENCODING_VERSION,
             Cursor::new(invalid),
             Vec::new(),
             PublishedEvidenceLimits::new(1_000_000, 100_000)
@@ -212,7 +225,7 @@ fn expanded_digest_references_cannot_exceed_the_node_detail_limit() -> TestResul
         .collect();
     let oversized = replace_record_value(&encoded, "node", "/value/4/1", json!(fields))?;
     let error = decode_published_evidence(
-        5,
+        l2_workbench::evidence::PUBLISHED_EVIDENCE_ENCODING_VERSION,
         Cursor::new(oversized),
         Vec::new(),
         PublishedEvidenceLimits::new(1_000_000, 100_000),

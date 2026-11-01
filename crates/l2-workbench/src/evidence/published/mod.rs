@@ -5,12 +5,16 @@ mod canonical_json;
 mod details_budget;
 mod format;
 mod reader;
+mod runs;
 mod schema;
 mod scratch;
 mod writer;
 
 pub use reader::decode_published_evidence;
 pub use writer::write_published_case;
+
+/// Current published evidence encoding shared with capture export
+pub const PUBLISHED_EVIDENCE_ENCODING_VERSION: u32 = format::VERSION;
 
 /// Bounds applied independently to the input stream, canonical output, and each normalized record
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

@@ -134,7 +134,7 @@ fn assert_unknown_transfer_end(destination: &Path, expected: &[u8]) -> Result<()
     let normalized = std::io::BufReader::new(flate2::read::MultiGzDecoder::new(source));
     let mut canonical = Vec::new();
     l2_workbench::evidence::decode_published_evidence(
-        5,
+        l2_workbench::evidence::PUBLISHED_EVIDENCE_ENCODING_VERSION,
         normalized,
         &mut canonical,
         l2_workbench::evidence::PublishedEvidenceLimits::new(u64::MAX, 32 * 1024 * 1024),

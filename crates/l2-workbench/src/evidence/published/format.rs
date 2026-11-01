@@ -12,7 +12,8 @@ use super::details_budget::count_details;
 
 pub(super) const LEGACY_VERSION: u32 = 3;
 pub(super) const COMPACT_VERSION: u32 = 4;
-pub(super) const VERSION: u32 = 5;
+pub(super) const INDEX_VERSION: u32 = 5;
+pub(super) const VERSION: u32 = 6;
 pub(super) const MAX_STRINGS: usize = 4096;
 pub(super) const MAX_DICTIONARY_BYTES: usize = 512 * 1024;
 
@@ -99,6 +100,7 @@ pub(super) enum Record {
     Blob(Blob),
     Node(Node),
     Edge(Edge),
+    EdgeRun(EdgeRun),
     Limitation(String),
     End,
 }
@@ -261,7 +263,7 @@ pub(super) fn expand_compact_details(
                             budget.field(key, text)?;
                         }
                         1 => budget.raw_field(key, value)?,
-                        2 if version == VERSION => {
+                        2 if version >= INDEX_VERSION => {
                             budget.field(key, digest_reference(value, blob)?)?;
                         }
                         _ => return Err(io::Error::other("invalid evidence detail field kind")),
@@ -279,7 +281,7 @@ pub(super) fn expand_compact_details(
                             .resolve(dictionary)?,
                     ),
                     1 => serde_json::from_str(value.get()).map_err(io::Error::other)?,
-                    2 if version == VERSION => {
+                    2 if version >= INDEX_VERSION => {
                         Value::String(digest_reference(&value, blob)?.to_owned())
                     }
                     _ => return Err(io::Error::other("invalid evidence detail field kind")),
@@ -365,6 +367,19 @@ where
 pub(super) struct Edge(
     pub(super) u64,
     pub(super) u64,
+    pub(super) Text,
+    pub(super) EvidenceStatus,
+    pub(super) Text,
+);
+
+// A run preserves the edge order while advancing each endpoint by at most one
+#[derive(Deserialize)]
+pub(super) struct EdgeRun(
+    pub(super) u64,
+    pub(super) u64,
+    pub(super) i8,
+    pub(super) i8,
+    pub(super) usize,
     pub(super) Text,
     pub(super) EvidenceStatus,
     pub(super) Text,

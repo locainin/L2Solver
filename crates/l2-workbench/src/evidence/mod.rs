@@ -26,7 +26,8 @@ pub use case::{
 pub use error::EvidenceError;
 pub use model::{Blob, ByteMapping, Edge, EvidenceStatus, Node, Source, SourceRange};
 pub use published::{
-    PublishedCaseUsage, PublishedEvidenceLimits, decode_published_evidence, write_published_case,
+    PUBLISHED_EVIDENCE_ENCODING_VERSION, PublishedCaseUsage, PublishedEvidenceLimits,
+    decode_published_evidence, write_published_case,
 };
 pub use receipt_verification::{
     IndexFlowSelectionVerification, ReceiptVerificationError, ReceiptVerificationLimits,

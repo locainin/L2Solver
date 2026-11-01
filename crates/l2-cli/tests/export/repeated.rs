@@ -61,7 +61,7 @@ fn older_evidence_compression_policy_does_not_reuse_the_published_result()
 }
 
 #[test]
-fn older_evidence_encoding_remains_owned_and_refreshes_to_version_five()
+fn older_evidence_encoding_remains_owned_and_refreshes_to_current_version()
 -> Result<(), Box<dyn Error>> {
     let temporary = tempfile::tempdir()?;
     let root = temporary.path();
@@ -74,7 +74,7 @@ fn older_evidence_encoding_remains_owned_and_refreshes_to_version_five()
     let mut manifest: serde_json::Value = serde_json::from_slice(&fs::read(&manifest_path)?)?;
     *manifest
         .pointer_mut("/l2solver_result/identity/settings/evidence_encoding_version")
-        .ok_or("evidence encoding setting is missing")? = serde_json::json!(4);
+        .ok_or("evidence encoding setting is missing")? = serde_json::json!(5);
     fs::write(&manifest_path, serde_json::to_vec(&manifest)?)?;
     let stale = extraction_command(root, &capture, &destination).output()?;
     assert!(!stale.status.success());
@@ -90,7 +90,9 @@ fn older_evidence_encoding_remains_owned_and_refreshes_to_version_five()
     let updated: serde_json::Value = serde_json::from_slice(&fs::read(manifest_path)?)?;
     assert_eq!(
         updated.pointer("/evidence/coverage/encoding_version"),
-        Some(&serde_json::json!(5))
+        Some(&serde_json::json!(
+            l2_workbench::evidence::PUBLISHED_EVIDENCE_ENCODING_VERSION
+        ))
     );
     Ok(())
 }
@@ -451,7 +453,7 @@ fn evidence_jsonl(directory: &Path) -> Result<Vec<u8>, Box<dyn Error>> {
     let decoder = flate2::read::MultiGzDecoder::new(file);
     let mut bytes = Vec::new();
     l2_workbench::evidence::decode_published_evidence(
-        5,
+        l2_workbench::evidence::PUBLISHED_EVIDENCE_ENCODING_VERSION,
         std::io::BufReader::new(decoder),
         &mut bytes,
         l2_workbench::evidence::PublishedEvidenceLimits::new(u64::MAX, 32 * 1024 * 1024),

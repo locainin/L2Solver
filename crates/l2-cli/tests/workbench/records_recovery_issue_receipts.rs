@@ -189,7 +189,7 @@ fn assert_published_receipt(case: &Case, node_id: u64, parsed: &Value) -> TestRe
     write_published_case(case, &json!({"kind":"test"}), 1, &mut encoded, None)?;
     let mut decoded = Vec::new();
     decode_published_evidence(
-        5,
+        l2_workbench::evidence::PUBLISHED_EVIDENCE_ENCODING_VERSION,
         Cursor::new(&encoded),
         &mut decoded,
         PublishedEvidenceLimits::new(1_000_000, 100_000),
@@ -211,7 +211,7 @@ fn assert_published_receipt(case: &Case, node_id: u64, parsed: &Value) -> TestRe
     assert_eq!(published_blob.get("inline_payload"), Some(parsed));
     assert!(
         decode_published_evidence(
-            5,
+            l2_workbench::evidence::PUBLISHED_EVIDENCE_ENCODING_VERSION,
             Cursor::new(&encoded),
             Vec::new(),
             PublishedEvidenceLimits::new(1_000_000, 32),
@@ -229,7 +229,7 @@ fn assert_published_receipt(case: &Case, node_id: u64, parsed: &Value) -> TestRe
         .ok_or("receipt representation marker is truncated")? = b'P';
     assert!(
         decode_published_evidence(
-            5,
+            l2_workbench::evidence::PUBLISHED_EVIDENCE_ENCODING_VERSION,
             Cursor::new(&corrupted),
             Vec::new(),
             PublishedEvidenceLimits::new(1_000_000, 100_000),

@@ -68,7 +68,7 @@ fn expect_early_detail_limit(version: u32, bytes: Vec<u8>) -> TestResult {
 
 #[test]
 fn oversized_dictionary_values_stop_before_later_references_in_all_versions() -> TestResult {
-    for version in 3..=5 {
+    for version in 3..=6 {
         expect_early_detail_limit(
             version,
             dictionary_attack(version, &"x".repeat(MAX_NODE_DETAILS_BYTES + 1), 1)?,
@@ -79,7 +79,7 @@ fn oversized_dictionary_values_stop_before_later_references_in_all_versions() ->
 
 #[test]
 fn repeated_dictionary_values_are_counted_before_they_are_cloned() -> TestResult {
-    for version in 3..=5 {
+    for version in 3..=6 {
         expect_early_detail_limit(version, dictionary_attack(version, &"x".repeat(1000), 5)?)?;
     }
     Ok(())
@@ -87,7 +87,7 @@ fn repeated_dictionary_values_are_counted_before_they_are_cloned() -> TestResult
 
 #[test]
 fn raw_detail_values_stop_before_later_references_in_all_versions() -> TestResult {
-    for version in 3..=5 {
+    for version in 3..=6 {
         let details = if version == 3 {
             json!({"kind":"object","value":[
                 ["first", {"kind":"value","value":"x".repeat(MAX_NODE_DETAILS_BYTES + 1)}],
@@ -110,7 +110,7 @@ fn raw_detail_values_stop_before_later_references_in_all_versions() -> TestResul
 
 #[test]
 fn non_object_raw_details_are_bounded_before_value_construction() -> TestResult {
-    for version in 3..=5 {
+    for version in 3..=6 {
         let raw = json!(["x".repeat(MAX_NODE_DETAILS_BYTES + 1)]);
         let details = if version == 3 {
             json!({"kind":"value","value":raw})
@@ -129,8 +129,12 @@ fn digest_references_are_counted_before_later_invalid_references() -> TestResult
         .map(|number| json!([format!("key_{number}"), 2, null]))
         .collect();
     fields.push(json!(["sentinel", 0, 99999]));
-    let forged = replace_record_value(&fixture(5)?, "node", "/value/4", json!([0, fields]))?;
-    expect_early_detail_limit(5, forged)
+    for version in 5..=6 {
+        let forged =
+            replace_record_value(&fixture(version)?, "node", "/value/4", json!([0, fields]))?;
+        expect_early_detail_limit(version, forged)?;
+    }
+    Ok(())
 }
 
 fn case_with_raw_details(version: u32, raw: &str) -> TestResult<(Vec<u8>, Vec<u8>)> {
@@ -159,7 +163,7 @@ fn canonical_raw_values_keep_duplicate_keys_whitespace_escapes_and_numbers() -> 
         r#" {{ "nested":{{"value":"{}", "value":"kept"}}, "escape":"a\u000ab", "emoji":"\ud83d\udca1", "negative_zero":-0.0, "number":1e0, "large":18446744073709551616, "small":1e-6 }} "#,
         "x".repeat(8_000)
     );
-    for version in 3..=5 {
+    for version in 3..=6 {
         let (wire, expected) = case_with_raw_details(version, &raw)?;
         let mut decoded = Vec::new();
         decode_published_evidence(
@@ -177,7 +181,7 @@ fn canonical_raw_values_keep_duplicate_keys_whitespace_escapes_and_numbers() -> 
 fn escaped_wire_values_may_exceed_the_limit_when_their_canonical_form_fits() -> TestResult {
     let raw = format!("\"{}\"", r"\u0061".repeat(1_000));
     assert!(raw.len() > MAX_NODE_DETAILS_BYTES);
-    for version in 3..=5 {
+    for version in 3..=6 {
         let (wire, expected) = case_with_raw_details(version, &raw)?;
         let mut decoded = Vec::new();
         decode_published_evidence(
@@ -199,7 +203,7 @@ fn exact_limit_with_escapes_and_utf8_remains_readable_in_all_versions() -> TestR
     let details = json!({"text":format!("{prefix}{}", "x".repeat(padding))});
     let raw = serde_json::to_string(&details)?;
     assert_eq!(raw.len(), MAX_NODE_DETAILS_BYTES);
-    for version in 3..=5 {
+    for version in 3..=6 {
         let (wire, expected) = case_with_raw_details(version, &raw)?;
         let mut decoded = Vec::new();
         decode_published_evidence(
@@ -227,7 +231,7 @@ fn exact_limit_object_fields_remain_readable_in_all_versions() -> TestResult {
     let (_, expected) = canonical(&case, &scope, 1)?;
     let mut bytes = Vec::new();
     write_published_case(&case, &scope, 1, &mut bytes)?;
-    for version in 3..=5 {
+    for version in 3..=6 {
         let mut wire = replace_record_value(&bytes, "header", "/value/version", json!(version))?;
         if version == 3 {
             wire = replace_record_value(
@@ -256,7 +260,7 @@ fn exact_limit_object_fields_remain_readable_in_all_versions() -> TestResult {
 #[test]
 fn nested_raw_values_near_the_parser_depth_limit_remain_readable() -> TestResult {
     let raw = format!("{}0{}", "[".repeat(120), "]".repeat(120));
-    for version in 3..=5 {
+    for version in 3..=6 {
         let (wire, expected) = case_with_raw_details(version, &raw)?;
         let mut decoded = Vec::new();
         decode_published_evidence(

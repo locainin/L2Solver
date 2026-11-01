@@ -284,7 +284,7 @@ fn published_export_contains_one_evidence_sidecar_without_artifact_payloads()
     flate2::read::MultiGzDecoder::new(compressed.as_slice()).read_to_end(&mut normalized)?;
     let mut evidence = Vec::new();
     l2_workbench::evidence::decode_published_evidence(
-        5,
+        l2_workbench::evidence::PUBLISHED_EVIDENCE_ENCODING_VERSION,
         std::io::Cursor::new(&normalized),
         &mut evidence,
         l2_workbench::evidence::PublishedEvidenceLimits::new(u64::MAX, 32 * 1024 * 1024),
@@ -311,7 +311,10 @@ fn published_export_contains_one_evidence_sidecar_without_artifact_payloads()
         coverage["raw_retained_bytes"],
         u64::try_from(normalized.len())?
     );
-    assert_eq!(coverage["encoding_version"], 5);
+    assert_eq!(
+        coverage["encoding_version"],
+        l2_workbench::evidence::PUBLISHED_EVIDENCE_ENCODING_VERSION
+    );
     assert_eq!(
         manifest
             .pointer("/evidence/encoding")

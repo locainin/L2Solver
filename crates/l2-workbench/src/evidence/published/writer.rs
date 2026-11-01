@@ -5,6 +5,7 @@ use super::{
     PublishedCaseUsage,
     canonical::{BlobRecords, CanonicalRecord, CountWriter, HASH_DOMAIN, Metadata, PLACEHOLDER},
     format::{Counts, HeaderRef, MAX_DICTIONARY_BYTES, MAX_STRINGS, VERSION},
+    runs::next_run,
     scratch::Scratch,
 };
 use crate::job::MemoryBudget;
@@ -156,7 +157,26 @@ fn write_graph<W: Write>(
         );
         write_record(output, "node", &record)?;
     }
-    for edge in case.edges() {
+    let mut edges = case.edges();
+    while let Some((edge, rest)) = edges.split_first() {
+        // Encode only consecutive identical descriptions and keep every edge position
+        if let Some(run) = next_run(edges) {
+            let record = (
+                edge.from,
+                edge.to,
+                run.from_step,
+                run.to_step,
+                run.length,
+                dictionary.reference(&edge.relation),
+                edge.status,
+                dictionary.reference(&edge.reason),
+            );
+            write_record(output, "edge_run", &record)?;
+            edges = edges
+                .get(run.length..)
+                .ok_or_else(|| io::Error::other("invalid evidence edge run"))?;
+            continue;
+        }
         let record = (
             edge.from,
             edge.to,
@@ -165,6 +185,7 @@ fn write_graph<W: Write>(
             dictionary.reference(&edge.reason),
         );
         write_record(output, "edge", &record)?;
+        edges = rest;
     }
     for limitation in case.limitations() {
         write_record(output, "limitation", limitation)?;
