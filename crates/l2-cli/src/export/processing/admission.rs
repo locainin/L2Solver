@@ -54,10 +54,9 @@ pub(super) fn admit(
         }
         Err(error)
             if active > 0
-                && matches!(
-                    crate::memory_error::find(error.as_ref()),
-                    Some(MemoryError::Limit { .. } | MemoryError::Pressure { .. })
-                ) =>
+                && crate::memory_error::find(error.as_ref()).is_some_and(|error| {
+                    matches!(error, MemoryError::Limit { .. }) || retryable_observation(error)
+                }) =>
         {
             if let Some(job) = context.job {
                 job.set_current(
@@ -73,7 +72,7 @@ pub(super) fn admit(
 
 fn observe(memory: &MemoryBudget) -> Result<MemorySnapshot, MemoryError> {
     let mut snapshot = memory.snapshot()?;
-    if snapshot.system.is_some() || snapshot.system_observation_failures != 0 {
+    if snapshot.system.is_some() || snapshot.system_observation_error.is_some() {
         // Reuse the job's OS monitor; component-only budgets do not enable process accounting
         crate::recovery_job::refresh_memory_observation(memory)?;
         snapshot = memory.snapshot()?;
@@ -96,18 +95,22 @@ fn check_admission_pressure(
         if let Some(job) = job {
             job.check_cancelled()?;
         }
-        let snapshot = observe()?;
+        let observed = observe();
         if let Some(job) = job {
             // Cancellation can arrive while the kernel observation is being read
             job.check_cancelled()?;
         }
-        match check_pressure(&snapshot, growth) {
-            Err(MemoryError::Pressure { .. }) if rechecks > 0 => {
+        match observed.and_then(|snapshot| check_pressure(&snapshot, growth)) {
+            Err(error) if rechecks > 0 && retryable_observation(error) => {
                 rechecks -= 1;
                 if let Some(job) = job {
                     job.set_current(
                         Phase::FramingRecordDiscovery,
-                        "Waiting for released recovery storage to settle",
+                        if matches!(error, MemoryError::Pressure { .. }) {
+                            "Waiting for released recovery storage to settle"
+                        } else {
+                            "Waiting for a reliable system memory observation"
+                        },
                     )?;
                 }
                 // Active workers return immediately so the collector can release their results
@@ -116,6 +119,17 @@ fn check_admission_pressure(
             result => return result.map_err(Into::into),
         }
     }
+}
+
+const fn retryable_observation(error: MemoryError) -> bool {
+    matches!(
+        error,
+        MemoryError::Pressure { .. }
+            | MemoryError::SystemObservationBusy
+            | MemoryError::SystemObservationUnavailable { .. }
+            | MemoryError::SystemObservationStale { .. }
+            | MemoryError::SystemCgroupUnavailable
+    )
 }
 
 fn startup_growth(case: &Case) -> Result<u64, Box<dyn Error>> {
@@ -135,14 +149,26 @@ fn startup_growth(case: &Case) -> Result<u64, Box<dyn Error>> {
 }
 
 fn check_pressure(snapshot: &MemorySnapshot, growth: u64) -> Result<(), MemoryError> {
-    let Some(system) = snapshot.system.filter(|_| {
-        snapshot
-            .system_sample_age_ms
-            .is_some_and(|age| Duration::from_millis(age) <= MAX_MEMORY_SAMPLE_AGE)
-    }) else {
-        // Logical admission remains available; missing OS data stays visible in telemetry
-        return Ok(());
+    let Some(system) = snapshot.system else {
+        // A budget with no observation attempt is intentionally logical-only
+        return match snapshot.system_observation_error {
+            Some(error) => Err(error),
+            None if snapshot.system_observation_failures == 0 => Ok(()),
+            None => Err(MemoryError::SystemObservationUnavailable {
+                kind: std::io::ErrorKind::Other,
+                raw_os_error: None,
+            }),
+        };
     };
+    let Some(age_ms) = snapshot.system_sample_age_ms else {
+        return Err(MemoryError::SystemObservationUnavailable {
+            kind: std::io::ErrorKind::InvalidData,
+            raw_os_error: None,
+        });
+    };
+    if Duration::from_millis(age_ms) > MAX_MEMORY_SAMPLE_AGE {
+        return Err(MemoryError::SystemObservationStale { age_ms });
+    }
     let mut headroom = snapshot
         .limit_bytes
         .saturating_sub(system.process_rss_bytes);

@@ -17,6 +17,7 @@ use serde::Serialize;
 use std::collections::BTreeMap;
 use std::error::Error;
 use std::fmt;
+use std::io;
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
@@ -76,6 +77,22 @@ pub enum MemoryError {
         /// Expected additional bytes for the proposed Case
         requested: u64,
     },
+    /// Another observer is still reading the operating-system memory state
+    SystemObservationBusy,
+    /// The latest operating-system memory read failed
+    SystemObservationUnavailable {
+        /// Error category returned by the provider
+        kind: io::ErrorKind,
+        /// Operating-system error code, when the provider supplied one
+        raw_os_error: Option<i32>,
+    },
+    /// The latest operating-system memory sample is too old for admission
+    SystemObservationStale {
+        /// Age of the sample when admission checked it
+        age_ms: u64,
+    },
+    /// A cgroup that was observed earlier is no longer available
+    SystemCgroupUnavailable,
 }
 
 impl fmt::Display for MemoryError {
@@ -112,6 +129,25 @@ impl fmt::Display for MemoryError {
                 formatter,
                 "memory pressure leaves {available} bytes for a recovery worker requiring {requested} bytes"
             ),
+            Self::SystemObservationBusy => {
+                formatter.write_str("system memory observation is already in progress")
+            }
+            Self::SystemObservationUnavailable { kind, raw_os_error } => {
+                write!(formatter, "system memory observation unavailable ({kind:?}")?;
+                if let Some(code) = raw_os_error {
+                    write!(formatter, ", OS error {code}")?;
+                }
+                formatter.write_str(")")
+            }
+            Self::SystemObservationStale { age_ms } => {
+                write!(
+                    formatter,
+                    "system memory observation is stale ({age_ms} ms old)"
+                )
+            }
+            Self::SystemCgroupUnavailable => {
+                formatter.write_str("previously observed cgroup memory is unavailable")
+            }
         }
     }
 }
@@ -145,6 +181,9 @@ pub struct MemorySnapshot {
     pub system_sample_age_ms: Option<u64>,
     /// Failed OS observations during this invocation
     pub system_observation_failures: u64,
+    /// Current provider failure, kept out of persisted progress snapshots
+    #[serde(skip)]
+    pub system_observation_error: Option<MemoryError>,
     by_class: ClassCharges,
 }
 
@@ -196,7 +235,7 @@ struct State {
     timed_out: u64,
     by_class: ClassCharges,
     buffered_cases: BufferedCaseSnapshot,
-    system_memory: Option<(SystemMemorySnapshot, Instant)>,
+    system_observation: system::ObservationState,
     system_observation_failures: u64,
     working_sets: WorkingSetSnapshot,
     scopes: BTreeMap<u64, working_set::ScopeState>,
@@ -207,6 +246,7 @@ struct State {
 struct Shared {
     limit: u64,
     state: Mutex<State>,
+    observation: Mutex<()>,
     released: Condvar,
 }
 
@@ -239,12 +279,13 @@ impl MemoryBudget {
                     timed_out: 0,
                     by_class: ClassCharges::default(),
                     buffered_cases: BufferedCaseSnapshot::default(),
-                    system_memory: None,
+                    system_observation: system::ObservationState::default(),
                     system_observation_failures: 0,
                     working_sets: WorkingSetSnapshot::default(),
                     scopes: BTreeMap::new(),
                     next_scope: 0,
                 }),
+                observation: Mutex::new(()),
                 released: Condvar::new(),
             }),
             scope: None,
@@ -340,6 +381,7 @@ impl MemoryBudget {
             .state
             .lock()
             .map_err(|_| MemoryError::StatePoisoned)?;
+        let observation = state.system_observation.current();
         Ok(MemorySnapshot {
             limit_bytes: self.shared.limit,
             used_bytes: state.used,
@@ -350,11 +392,12 @@ impl MemoryBudget {
             by_class: state.by_class,
             buffered_cases: state.buffered_cases,
             working_sets: state.working_sets,
-            system: state.system_memory.map(|(sample, _)| sample),
-            system_sample_age_ms: state.system_memory.map(|(_, observed)| {
+            system: observation.map(|(sample, _)| sample),
+            system_sample_age_ms: observation.map(|(_, observed)| {
                 u64::try_from(observed.elapsed().as_millis()).unwrap_or(u64::MAX)
             }),
             system_observation_failures: state.system_observation_failures,
+            system_observation_error: state.system_observation.error(),
         })
     }
 }

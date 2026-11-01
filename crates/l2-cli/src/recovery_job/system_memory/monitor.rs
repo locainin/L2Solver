@@ -18,7 +18,7 @@ pub(in crate::recovery_job) struct Monitor {
 
 impl Monitor {
     pub(in crate::recovery_job) fn start(memory: &MemoryBudget) -> Result<Self, Box<dyn Error>> {
-        // The first observation is ready before recovery can admit a Case
+        // Record the first attempt before recovery can admit a Case, even if the read fails
         observe(memory)?;
         let memory = memory.clone();
         let (stop, receiver) = mpsc::channel();
@@ -28,7 +28,11 @@ impl Monitor {
                 loop {
                     match receiver.recv_timeout(MEMORY_OBSERVATION_INTERVAL) {
                         Ok(()) | Err(mpsc::RecvTimeoutError::Disconnected) => break,
-                        Err(mpsc::RecvTimeoutError::Timeout) => observe(&memory)?,
+                        Err(mpsc::RecvTimeoutError::Timeout) => match observe(&memory) {
+                            Ok(()) | Err(l2_workbench::job::MemoryError::SystemObservationBusy) => {
+                            }
+                            Err(error) => return Err(error),
+                        },
                     }
                 }
                 // Include final publication and cache-cleanup usage in the last snapshot
@@ -62,6 +66,7 @@ pub(in crate::recovery_job) fn observe(
     memory: &MemoryBudget,
 ) -> Result<(), l2_workbench::job::MemoryError> {
     // Reopen proc metadata so moving the process between cgroups cannot leave an old path active
-    let sample = Reader::open(Path::new("/proc/self")).and_then(|reader| reader.sample());
-    memory.observe_system_memory(sample.ok())
+    memory.try_observe_system_memory_with(|| {
+        Reader::open(Path::new("/proc/self")).and_then(|reader| reader.sample())
+    })
 }

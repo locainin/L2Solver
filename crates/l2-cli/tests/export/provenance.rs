@@ -892,7 +892,7 @@ fn cohort_context_for_node(
     )
 }
 
-fn flow(id: i64) -> Flow {
+pub(super) fn flow(id: i64) -> Flow {
     Flow {
         id,
         source_id: format!("source-{id}"),

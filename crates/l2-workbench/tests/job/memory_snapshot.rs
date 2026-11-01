@@ -1,5 +1,143 @@
-use l2_workbench::job::{Job, JobSnapshot, MemoryBudget, MemoryClass, SystemMemorySnapshot};
-use std::error::Error;
+use l2_workbench::job::{
+    CgroupMemoryEvents, CgroupMemorySnapshot, Job, JobSnapshot, MemoryBudget, MemoryClass,
+    MemoryError, SystemMemorySnapshot,
+};
+use std::{
+    error::Error,
+    io,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+        mpsc,
+    },
+    thread,
+    time::Duration,
+};
+
+const fn observation(cgroup: Option<CgroupMemorySnapshot>) -> SystemMemorySnapshot {
+    SystemMemorySnapshot {
+        process_rss_bytes: 700,
+        process_peak_rss_bytes: 800,
+        cgroup,
+    }
+}
+
+fn cgroup_observation() -> CgroupMemorySnapshot {
+    CgroupMemorySnapshot {
+        current_bytes: 700,
+        peak_bytes: None,
+        anonymous_bytes: None,
+        file_bytes: None,
+        kernel_bytes: None,
+        shared_bytes: None,
+        dirty_file_bytes: None,
+        writeback_file_bytes: None,
+        inactive_file_bytes: None,
+        effective_max_bytes: Some(1000),
+        effective_high_bytes: None,
+        max_headroom_bytes: Some(300),
+        high_headroom_bytes: None,
+        events: CgroupMemoryEvents::default(),
+    }
+}
+
+#[test]
+fn overlapping_root_and_worker_observers_do_not_reorder_success_and_failure()
+-> Result<(), Box<dyn Error>> {
+    let budget = MemoryBudget::new(1000);
+    let worker = budget.try_working_set(100)?;
+    let worker_budget = worker.budget().clone();
+    let (entered, entered_rx) = mpsc::channel();
+    let (release, release_rx) = mpsc::channel();
+    let earlier = budget.clone();
+    let first = thread::spawn(move || {
+        earlier.try_observe_system_memory_with(|| {
+            if entered.send(()).is_err() || release_rx.recv_timeout(Duration::from_secs(3)).is_err()
+            {
+                return Err(io::Error::other("test observer did not receive release"));
+            }
+            Ok(observation(None))
+        })
+    });
+    entered_rx.recv_timeout(Duration::from_secs(2))?;
+
+    // A competing provider must not run or block the collector while the first read is active
+    let invoked = Arc::new(AtomicBool::new(false));
+    let called = Arc::clone(&invoked);
+    let later = worker_budget.try_observe_system_memory_with(|| {
+        called.store(true, Ordering::SeqCst);
+        Err(io::Error::from(io::ErrorKind::PermissionDenied))
+    });
+    release.send(())?;
+    first.join().map_err(|_| "observation thread panicked")??;
+    assert_eq!(later, Err(MemoryError::SystemObservationBusy));
+    assert!(!invoked.load(Ordering::SeqCst));
+
+    // Retrying the newer failure clears the old success after the lock is released
+    worker_budget
+        .try_observe_system_memory_with(|| Err(io::Error::from(io::ErrorKind::PermissionDenied)))?;
+    let snapshot = budget.snapshot()?;
+    assert!(snapshot.system.is_none());
+    assert_eq!(snapshot.system_observation_failures, 1);
+    assert_eq!(
+        snapshot.system_observation_error,
+        Some(MemoryError::SystemObservationUnavailable {
+            kind: io::ErrorKind::PermissionDenied,
+            raw_os_error: None,
+        })
+    );
+    Ok(())
+}
+
+#[test]
+fn sample_age_includes_time_spent_reading_the_provider() -> Result<(), Box<dyn Error>> {
+    let budget = MemoryBudget::new(1000);
+    budget.try_observe_system_memory_with(|| {
+        thread::sleep(Duration::from_millis(40));
+        Ok(observation(None))
+    })?;
+    assert!(
+        budget
+            .snapshot()?
+            .system_sample_age_ms
+            .is_some_and(|age| age >= 40)
+    );
+    Ok(())
+}
+
+#[test]
+fn a_previously_observed_cgroup_cannot_silently_disappear() -> Result<(), Box<dyn Error>> {
+    let budget = MemoryBudget::new(1000);
+    budget.observe_system_memory(Some(observation(Some(cgroup_observation()))))?;
+    budget
+        .try_observe_system_memory_with(|| Err(io::Error::from(io::ErrorKind::PermissionDenied)))?;
+    assert!(budget.snapshot()?.system.is_none());
+    budget.observe_system_memory(Some(observation(None)))?;
+    let first = budget.snapshot()?;
+    assert!(first.system.is_none());
+    assert_eq!(first.system_observation_failures, 2);
+    assert_eq!(
+        first.system_observation_error,
+        Some(MemoryError::SystemCgroupUnavailable)
+    );
+    budget.observe_system_memory(Some(observation(None)))?;
+    let second = budget.snapshot()?;
+    assert!(second.system.is_none());
+    assert_eq!(second.system_observation_failures, 3);
+    assert_eq!(
+        second.system_observation_error,
+        Some(MemoryError::SystemCgroupUnavailable)
+    );
+    budget.observe_system_memory(Some(observation(Some(cgroup_observation()))))?;
+    assert!(
+        budget
+            .snapshot()?
+            .system
+            .and_then(|sample| sample.cgroup)
+            .is_some()
+    );
+    Ok(())
+}
 
 #[test]
 fn kernel_observations_do_not_replace_charges_and_failed_samples_clear_stale_data()

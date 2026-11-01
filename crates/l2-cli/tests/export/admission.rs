@@ -89,16 +89,70 @@ fn future_growth_of_active_cases_is_included_in_pressure_admission() -> TestResu
 }
 
 #[test]
-fn unavailable_or_stale_os_observations_do_not_become_current_memory_claims() -> TestResult {
+fn a_logical_only_budget_does_not_require_an_os_observation() -> TestResult {
     let memory = MemoryBudget::new(512 * MIB);
     check_pressure(&memory.snapshot()?, 32 * MIB)?;
+    assert_eq!(memory.snapshot()?.system_observation_failures, 0);
+    Ok(())
+}
+
+#[test]
+fn failed_observation_after_pressure_does_not_admit_new_work() -> TestResult {
+    let memory = observed_budget(460 * MIB, None)?;
+    assert!(matches!(
+        check_pressure(&memory.snapshot()?, 32 * MIB),
+        Err(MemoryError::Pressure { .. })
+    ));
     memory.observe_system_memory(None)?;
-    check_pressure(&memory.snapshot()?, 32 * MIB)?;
-    assert_eq!(memory.snapshot()?.system_observation_failures, 1);
-    let memory = observed_budget(500 * MIB, None)?;
+    let snapshot = memory.snapshot()?;
+    assert_eq!(snapshot.system_observation_failures, 1);
+    assert!(snapshot.system.is_none());
+    assert!(matches!(
+        check_pressure(&snapshot, 32 * MIB),
+        Err(MemoryError::SystemObservationUnavailable { .. })
+    ));
+    Ok(())
+}
+
+#[test]
+fn an_enabled_monitor_that_never_succeeded_does_not_admit_work() -> TestResult {
+    let memory = MemoryBudget::new(512 * MIB);
+    memory.observe_system_memory(None)?;
+    assert!(matches!(
+        check_pressure(&memory.snapshot()?, 32 * MIB),
+        Err(MemoryError::SystemObservationUnavailable { .. })
+    ));
+    Ok(())
+}
+
+#[test]
+fn stale_pressure_does_not_become_an_admission_success() -> TestResult {
+    let memory = observed_budget(460 * MIB, None)?;
     let mut old = memory.snapshot()?;
     old.system_sample_age_ms = Some(10_000);
-    check_pressure(&old, 32 * MIB)?;
+    assert!(matches!(
+        check_pressure(&old, 32 * MIB),
+        Err(MemoryError::SystemObservationStale { age_ms: 10_000 })
+    ));
+    Ok(())
+}
+
+#[test]
+fn a_fresh_healthy_observation_restores_admission_after_failure() -> TestResult {
+    let memory = observed_budget(460 * MIB, None)?;
+    memory.observe_system_memory(None)?;
+    assert!(matches!(
+        check_pressure(&memory.snapshot()?, 32 * MIB),
+        Err(MemoryError::SystemObservationUnavailable { .. })
+    ));
+    memory.observe_system_memory(Some(SystemMemorySnapshot {
+        process_rss_bytes: 100 * MIB,
+        process_peak_rss_bytes: 460 * MIB,
+        cgroup: None,
+    }))?;
+    let snapshot = memory.snapshot()?;
+    assert_eq!(snapshot.system_observation_failures, 1);
+    check_pressure(&snapshot, 32 * MIB)?;
     Ok(())
 }
 
@@ -126,6 +180,141 @@ fn quiescent_admission_rechecks_pressure_before_rejecting_released_worker_storag
         })
     })?;
     assert_eq!(observations, 2);
+    Ok(())
+}
+
+#[test]
+fn quiescent_missing_observation_retries_until_a_fresh_healthy_sample() -> TestResult {
+    let memory = MemoryBudget::new(512 * MIB);
+    memory.observe_system_memory(None)?;
+    let missing = memory.snapshot()?;
+    let healthy = observed_budget(100 * MIB, None)?.snapshot()?;
+    let mut observations = 0;
+    check_admission_pressure(0, 32 * MIB, None, || {
+        observations += 1;
+        Ok(if observations == 1 { missing } else { healthy })
+    })?;
+    assert_eq!(observations, 2);
+    Ok(())
+}
+
+#[test]
+fn quiescent_busy_observer_is_retried_without_assuming_healthy_memory() -> TestResult {
+    let healthy = observed_budget(100 * MIB, None)?.snapshot()?;
+    let mut observations = 0;
+    check_admission_pressure(0, 32 * MIB, None, || {
+        observations += 1;
+        if observations == 1 {
+            Err(MemoryError::SystemObservationBusy)
+        } else {
+            Ok(healthy)
+        }
+    })?;
+    assert_eq!(observations, 2);
+    Ok(())
+}
+
+#[test]
+fn persistent_missing_observation_has_a_bounded_quiescent_failure() -> TestResult {
+    let memory = MemoryBudget::new(512 * MIB);
+    memory.observe_system_memory(None)?;
+    let missing = memory.snapshot()?;
+    let mut observations = 0;
+    let result = check_admission_pressure(0, 32 * MIB, None, || {
+        observations += 1;
+        Ok(missing)
+    });
+    let error = result
+        .err()
+        .ok_or("missing observation allowed admission")?;
+    assert!(matches!(
+        crate::memory_error::find(error.as_ref()),
+        Some(MemoryError::SystemObservationUnavailable { .. })
+    ));
+    assert_eq!(observations, 3);
+    Ok(())
+}
+
+#[test]
+fn active_workers_are_not_joined_inside_an_unavailable_observation_check() -> TestResult {
+    let memory = MemoryBudget::new(512 * MIB);
+    memory.observe_system_memory(None)?;
+    let missing = memory.snapshot()?;
+    let mut observations = 0;
+    let result = check_admission_pressure(2, 32 * MIB, None, || {
+        observations += 1;
+        Ok(missing)
+    });
+    let error = result
+        .err()
+        .ok_or("missing observation allowed admission")?;
+    assert!(matches!(
+        crate::memory_error::find(error.as_ref()),
+        Some(MemoryError::SystemObservationUnavailable { .. })
+    ));
+    assert_eq!(observations, 1);
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn busy_observer_defers_actual_admission_while_a_worker_is_active() -> TestResult {
+    use crate::workbench::full_source::{
+        FlowAnalysis, FullSourceItem, PerFlowCoverage, ReconstructionCaseOmissions,
+    };
+    use l2_workbench::{evidence::Case, investigation::BuildResult};
+    use std::{io, sync::mpsc};
+
+    let item = FullSourceItem::Flow(Box::new(FlowAnalysis {
+        flow: crate::export::provenance_tests::flow(1),
+        result: BuildResult {
+            case: Case::new(),
+            complete: true,
+        },
+        coverage: PerFlowCoverage {
+            selected_records: 0,
+            retained_records: 0,
+            omitted_records: 0,
+            retention_limits: Vec::new(),
+            reconstruction_omissions: ReconstructionCaseOmissions::default(),
+            complete: true,
+        },
+    }));
+    let mut pending = PendingCase::new(item)?;
+    let memory = observed_budget(100 * MIB, None)?;
+    let options = crate::arguments::RecoveryOptions::default();
+    let context = RecoveryContext {
+        cache: None,
+        job: None,
+        memory: Some(&memory),
+        options: &options,
+    };
+    let (entered, entered_rx) = mpsc::channel();
+    let (release, release_rx) = mpsc::channel();
+    let observer_budget = memory.clone();
+    let observer = thread::spawn(move || {
+        observer_budget.try_observe_system_memory_with(|| {
+            entered.send(()).map_err(io::Error::other)?;
+            release_rx
+                .recv_timeout(Duration::from_secs(3))
+                .map_err(io::Error::other)?;
+            Err(io::Error::from(io::ErrorKind::PermissionDenied))
+        })
+    });
+    entered_rx.recv_timeout(Duration::from_secs(2))?;
+
+    // Admission must return control so the collector can release the active worker
+    let admission = admit(&mut pending, 1, &context);
+    release.send(())?;
+    observer.join().map_err(|_| "observer thread panicked")??;
+    assert!(admission?.is_none(), "busy observer allowed admission");
+    assert!(matches!(
+        memory.snapshot()?.system_observation_error,
+        Some(MemoryError::SystemObservationUnavailable {
+            kind: io::ErrorKind::PermissionDenied,
+            ..
+        })
+    ));
     Ok(())
 }
 
@@ -201,5 +390,107 @@ fn cancellation_during_an_observation_stops_further_pressure_rechecks() -> TestR
         Some(JobError::Cancelled)
     ));
     assert_eq!(observations, 1);
+    Ok(())
+}
+
+#[test]
+fn cancellation_during_a_failed_observation_wins_over_retry() -> TestResult {
+    let memory = MemoryBudget::new(512 * MIB);
+    memory.observe_system_memory(None)?;
+    let missing = memory.snapshot()?;
+    let job = Job::new("admission cancelled while observation failed");
+    job.start(Phase::FramingRecordDiscovery, None)?;
+    let mut observations = 0;
+    let result = check_admission_pressure(0, 32 * MIB, Some(&job), || {
+        observations += 1;
+        job.request_cancel();
+        Ok(missing)
+    });
+    let error = result.err().ok_or("cancellation did not stop admission")?;
+    assert!(matches!(
+        error.downcast_ref::<JobError>(),
+        Some(JobError::Cancelled)
+    ));
+    assert_eq!(observations, 1);
+    Ok(())
+}
+
+#[test]
+fn cancellation_during_a_busy_observation_wins_over_retry() -> TestResult {
+    let job = Job::new("admission cancelled while observer is busy");
+    job.start(Phase::FramingRecordDiscovery, None)?;
+    let mut observations = 0;
+    let result = check_admission_pressure(0, 32 * MIB, Some(&job), || {
+        observations += 1;
+        job.request_cancel();
+        Err(MemoryError::SystemObservationBusy)
+    });
+    let error = result.err().ok_or("cancellation did not stop admission")?;
+    assert!(matches!(
+        error.downcast_ref::<JobError>(),
+        Some(JobError::Cancelled)
+    ));
+    assert_eq!(observations, 1);
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+#[ignore = "requires an owned 512 MiB cgroup with swap disabled"]
+fn kernel_pressure_followed_by_simulated_eacces_blocks_admission() -> TestResult {
+    let memory = MemoryBudget::new(512 * MIB);
+    crate::recovery_job::refresh_memory_observation(&memory)?;
+    let initial = memory
+        .snapshot()?
+        .system
+        .and_then(|sample| sample.cgroup)
+        .ok_or("a real cgroup observation is required")?;
+    assert_eq!(initial.effective_max_bytes, Some(512 * MIB));
+    assert!(
+        initial.current_bytes < 384 * MIB,
+        "cgroup starts too close to its limit"
+    );
+
+    // Keep ballast well below the hard cap and request future work separately
+    let mut ballast = Vec::new();
+    let mut pressured = None;
+    for _ in 0..32 {
+        ballast.push(vec![0xa5; 8 * 1024 * 1024]);
+        crate::recovery_job::refresh_memory_observation(&memory)?;
+        let snapshot = memory.snapshot()?;
+        let current = snapshot
+            .system
+            .and_then(|sample| sample.cgroup)
+            .ok_or("cgroup observation disappeared")?;
+        if matches!(
+            check_pressure(&snapshot, 192 * MIB),
+            Err(MemoryError::Pressure { .. })
+        ) {
+            pressured = Some(current);
+            break;
+        }
+        if current.current_bytes >= 384 * MIB {
+            break;
+        }
+    }
+    let actual = pressured.ok_or("bounded ballast did not reach measured admission pressure")?;
+    assert!(actual.current_bytes > initial.current_bytes);
+    assert_eq!(actual.events.max, initial.events.max);
+    assert_eq!(actual.events.oom, initial.events.oom);
+    assert_eq!(actual.events.oom_kill, initial.events.oom_kill);
+
+    // This EACCES is injected after the real pressure sample; kernel permissions are unchanged
+    memory
+        .try_observe_system_memory_with(|| Err(std::io::Error::from_raw_os_error(libc::EACCES)))?;
+    let failed = memory.snapshot()?;
+    assert!(failed.system.is_none());
+    assert_eq!(
+        check_pressure(&failed, 192 * MIB),
+        Err(MemoryError::SystemObservationUnavailable {
+            kind: std::io::ErrorKind::PermissionDenied,
+            raw_os_error: Some(libc::EACCES),
+        })
+    );
+    drop(ballast);
     Ok(())
 }
