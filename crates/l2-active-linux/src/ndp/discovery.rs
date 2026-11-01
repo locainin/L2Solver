@@ -1,4 +1,9 @@
-use std::{io, net::Ipv6Addr};
+use std::{
+    io,
+    net::Ipv6Addr,
+    sync::atomic::AtomicBool,
+    time::{Duration, Instant},
+};
 
 use crate::{InterfaceInfo, InterfaceSelector};
 
@@ -68,20 +73,41 @@ impl NdpInterfaceInfo {
 /// Returns `Unsupported` if Linux IPv6 information is unavailable
 /// Malformed, excessive, changing or inaccessible interface data is rejected
 pub fn discover(selector: &InterfaceSelector) -> io::Result<NdpInterfaceInfo> {
+    discover_until(
+        selector,
+        Instant::now() + Duration::from_secs(2),
+        &AtomicBool::new(false),
+    )
+}
+
+/// Read IPv6 assignments while honoring a caller's deadline and cancellation
+///
+/// # Errors
+/// Returns an operating-system error, `Interrupted` on cancellation, or
+/// `TimedOut` when the deadline expires
+pub fn discover_until(
+    selector: &InterfaceSelector,
+    deadline: Instant,
+    cancelled: &AtomicBool,
+) -> io::Result<NdpInterfaceInfo> {
+    crate::netlink::check_control(deadline, cancelled)?;
     let pinned = crate::pin::PinnedInterface::open(selector)?;
-    let first = crate::discover(selector)?;
-    if first.identity() != pinned.identity {
-        return Err(io::Error::other(
-            "selected interface changed during IPv6 discovery",
-        ));
-    }
+    let (first, first_vlan) =
+        crate::pin::discover_with_pin(selector, &pinned, deadline, cancelled)?;
     let first_assignments = read_snapshot(selector.name(), pinned.identity.ifindex())?;
-    pinned.revalidate(selector)?;
+    crate::pin::revalidate_scope(selector, &pinned, first_vlan.as_ref(), deadline, cancelled)?;
 
     // Compare separate observations while the original interface remains held
-    let second = crate::discover(selector)?;
+    let (second, second_vlan) =
+        crate::pin::discover_with_pin(selector, &pinned, deadline, cancelled)?;
     let second_assignments = read_snapshot(selector.name(), pinned.identity.ifindex())?;
-    pinned.revalidate(selector)?;
+    crate::pin::revalidate_scope(selector, &pinned, second_vlan.as_ref(), deadline, cancelled)?;
+    if first.vlan() != second.vlan() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            crate::VlanScopeChanged,
+        ));
+    }
     if first != second || first_assignments != second_assignments {
         return Err(io::Error::other(
             "interface properties changed during IPv6 discovery",

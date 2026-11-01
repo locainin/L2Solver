@@ -7,7 +7,7 @@ use std::{
 
 use serde::Serialize;
 
-use super::{OutputFormat, diagnostic::io_code};
+use super::{OutputFormat, diagnostic::io_error_code};
 
 /// A native active operation or its output could not be completed
 #[derive(Debug)]
@@ -57,7 +57,7 @@ impl Error {
             Self::Discovery(error)
             | Self::Scope(error)
             | Self::Helper(error)
-            | Self::Output(error) => io_code(error.kind()),
+            | Self::Output(error) => io_error_code(error),
             Self::Plan(_)
             | Self::Address(_)
             | Self::DhcpPlan(l2_active::dhcp::DhcpError::InvalidServerAllowlist) => "invalid_scope",

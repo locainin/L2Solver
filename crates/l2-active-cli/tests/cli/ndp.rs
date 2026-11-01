@@ -137,7 +137,7 @@ fn owned_global_namespace_child() -> Result<(), Box<dyn Error>> {
     let case = std::env::var("L2_TEST_NDP_GLOBAL_CASE")?;
     let interface = std::env::var("L2_TEST_NDP_INTERFACE")?;
     let helper = std::env::var_os("L2_TEST_ACTIVE_HELPER").ok_or("missing helper")?;
-    let output = Command::new(crate::namespace::binary())
+    let output = crate::namespace::command()
         .args([
             "ndp",
             "probe",
@@ -226,7 +226,7 @@ fn owned_namespace_child_asserts_cli_advertisement() -> Result<(), Box<dyn Error
     crate::namespace::assert_owned()?;
     let interface = std::env::var("L2_TEST_NDP_INTERFACE")?;
     let helper = std::env::var_os("L2_TEST_ACTIVE_HELPER").ok_or("missing helper")?;
-    let output = Command::new(crate::namespace::binary())
+    let output = crate::namespace::command()
         .args([
             "ndp",
             "probe",

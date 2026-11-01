@@ -2,6 +2,17 @@
 
 use std::io;
 
+pub fn io_error_code(error: &io::Error) -> &'static str {
+    if error
+        .get_ref()
+        .is_some_and(<dyn std::error::Error + Send + Sync>::is::<l2_active_linux::VlanScopeChanged>)
+    {
+        "scope_changed"
+    } else {
+        io_code(error.kind())
+    }
+}
+
 pub const fn io_code(kind: io::ErrorKind) -> &'static str {
     match kind {
         io::ErrorKind::PermissionDenied => "permission_denied",

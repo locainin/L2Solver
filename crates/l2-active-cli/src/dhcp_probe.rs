@@ -39,7 +39,17 @@ fn run_platform(
 
     use super::{dhcp_output, session_options};
 
-    let (info, plan) = prepare(options)?;
+    let Some((info, plan)) =
+        super::preflight::cancelled_discovery(prepare(options, cancelled), cancelled)?
+    else {
+        return stopped(
+            options,
+            format,
+            output,
+            PreflightStop::Cancelled,
+            HelperStage::NotStarted,
+        );
+    };
     if cancelled.load(Ordering::Acquire) {
         return stopped(
             options,
@@ -76,6 +86,7 @@ fn run_platform(
     let (report, close_error) = session_options::finish(result, link.close())?;
     dhcp_output::write(
         options,
+        info.vlan(),
         &plan,
         &report,
         close_error.as_ref(),
@@ -87,8 +98,9 @@ fn run_platform(
 #[cfg(target_os = "linux")]
 fn prepare(
     options: &DhcpProbeArgs,
+    cancelled: &AtomicBool,
 ) -> Result<(l2_active_linux::InterfaceInfo, l2_active::dhcp::DhcpProbe), Error> {
-    let info = l2_active_linux::discover(&options.interface).map_err(Error::Discovery)?;
+    let info = super::preflight::discover(&options.interface, cancelled)?;
     let source = l2_onpath::MacAddress::new(info.mac()).map_err(Error::Address)?;
     let limits = super::session_options::limits(&options.session)?;
     let allowed =

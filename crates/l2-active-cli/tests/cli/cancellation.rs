@@ -4,6 +4,33 @@ use clap::Parser;
 use l2_active_cli::{ActiveOutcome, Cli, execute};
 
 #[test]
+fn cancelled_capability_query_does_not_open_the_selected_interface() -> Result<(), Box<dyn Error>> {
+    let options = Cli::try_parse_from([
+        "l2solver-active",
+        "capabilities",
+        "--interface",
+        "l2s-no-test",
+        "--format",
+        "json",
+    ])?;
+    let mut output = Vec::new();
+    let outcome = execute(&options.active, &AtomicBool::new(true), &mut output)?;
+    assert_eq!(outcome, ActiveOutcome::Cancelled);
+    let report: serde_json::Value = serde_json::from_slice(&output)?;
+    assert_eq!(
+        report.get("status").and_then(serde_json::Value::as_str),
+        Some("cancelled")
+    );
+    assert_eq!(
+        report
+            .pointer("/scope/interface")
+            .and_then(serde_json::Value::as_str),
+        Some("l2s-no-test")
+    );
+    Ok(())
+}
+
+#[test]
 fn cancellation_before_preflight_does_not_open_the_selected_interface() -> Result<(), Box<dyn Error>>
 {
     let options = Cli::try_parse_from([

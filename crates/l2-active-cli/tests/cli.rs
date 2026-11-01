@@ -21,3 +21,6 @@ mod namespace;
 mod ndp;
 #[path = "cli/output.rs"]
 mod output;
+#[cfg(target_os = "linux")]
+#[path = "cli/vlan.rs"]
+mod vlan;

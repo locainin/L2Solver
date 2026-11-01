@@ -873,6 +873,7 @@ dependencies = [
  "l2-capture",
  "l2-onpath",
  "netlink-packet-core",
+ "netlink-packet-generic",
  "netlink-packet-route",
  "netlink-sys",
  "nix",

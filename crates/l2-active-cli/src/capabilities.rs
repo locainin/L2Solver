@@ -2,10 +2,13 @@
 
 use std::{io::Write, net::Ipv4Addr};
 
-use l2_active_linux::InterfaceInfo;
+use l2_active_linux::{InterfaceInfo, ethernet_capabilities::EthernetCapabilities};
 use serde::Serialize;
 
-use super::{Error, OutputFormat, interface_capabilities::WirelessCapabilities, mac::format_mac};
+use super::{
+    Error, OutputFormat, ethernet_view::EthernetView, interface_capabilities::WirelessCapabilities,
+    interface_view::InterfaceView, mac::format_mac,
+};
 
 #[derive(Serialize)]
 struct Address {
@@ -17,12 +20,8 @@ struct Address {
 struct Report<'a> {
     status: &'static str,
     operation: &'static str,
-    interface: &'a str,
-    ifindex: u32,
-    namespace_device: u64,
-    namespace_inode: u64,
-    interface_device: u64,
-    interface_inode: u64,
+    #[serde(flatten)]
+    interface: InterfaceView<'a>,
     mac: String,
     mtu: u32,
     hardware_type: u16,
@@ -32,20 +31,20 @@ struct Report<'a> {
     raw_packet_permission: &'static str,
     #[serde(flatten)]
     wireless: &'a WirelessCapabilities,
-    hardware_timestamps: &'static str,
-    vlan_offload: &'static str,
+    #[serde(flatten)]
+    ethernet: EthernetView,
 }
 
 pub fn write(
     info: &InterfaceInfo,
     wireless: &WirelessCapabilities,
+    ethernet: EthernetCapabilities,
     format: OutputFormat,
     output: &mut impl Write,
 ) -> Result<(), Error> {
     match format {
-        OutputFormat::Text => write_text(info, wireless, output),
+        OutputFormat::Text => write_text(info, wireless, ethernet, output),
         OutputFormat::Json => {
-            let identity = info.identity();
             let mut ipv4 = Vec::new();
             ipv4.try_reserve_exact(info.ipv4_assignments().len())
                 .map_err(|_| Error::Allocation)?;
@@ -56,12 +55,7 @@ pub fn write(
             let report = Report {
                 status: "ok",
                 operation: "capabilities",
-                interface: info.name(),
-                ifindex: identity.ifindex(),
-                namespace_device: identity.namespace_device(),
-                namespace_inode: identity.namespace_inode(),
-                interface_device: identity.interface_device(),
-                interface_inode: identity.interface_inode(),
+                interface: InterfaceView::new(info.name(), info.identity(), info.vlan()),
                 mac: format_mac(info.mac()),
                 mtu: info.mtu(),
                 hardware_type: info.hardware_type(),
@@ -70,8 +64,7 @@ pub fn write(
                 ipv4,
                 raw_packet_permission: "not_checked",
                 wireless,
-                hardware_timestamps: "not_assessed",
-                vlan_offload: "not_assessed",
+                ethernet: EthernetView::new(ethernet),
             };
             serde_json::to_writer(&mut *output, &report).map_err(Error::Json)?;
             writeln!(output).map_err(Error::Output)
@@ -82,6 +75,7 @@ pub fn write(
 fn write_text(
     info: &InterfaceInfo,
     wireless: &WirelessCapabilities,
+    ethernet: EthernetCapabilities,
     output: &mut impl Write,
 ) -> Result<(), Error> {
     writeln!(
@@ -91,6 +85,7 @@ fn write_text(
         info.identity().ifindex()
     )
     .map_err(Error::Output)?;
+    InterfaceView::new(info.name(), info.identity(), info.vlan()).write_text(output)?;
     writeln!(
         output,
         "Link: {}  MAC: {}  MTU: {}  hardware type: {}",
@@ -152,9 +147,6 @@ fn write_text(
         wireless.monitor_mode, wireless.injection
     )
     .map_err(Error::Output)?;
-    writeln!(
-        output,
-        "Raw packet permission, hardware timestamps, and VLAN offload: not assessed"
-    )
-    .map_err(Error::Output)
+    EthernetView::new(ethernet).write_text(output)?;
+    writeln!(output, "Raw packet permission: not checked").map_err(Error::Output)
 }

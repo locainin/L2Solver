@@ -22,8 +22,10 @@ mod diagnostic;
 mod dot1x_output;
 mod dot1x_probe;
 mod error;
+mod ethernet_view;
 mod execution;
 mod interface_capabilities;
+mod interface_view;
 #[cfg(target_os = "linux")]
 mod listen_output;
 mod listen_probe;

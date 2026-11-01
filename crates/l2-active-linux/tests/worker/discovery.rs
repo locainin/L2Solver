@@ -61,7 +61,7 @@ fn owned_namespace_child_rejects_raw_send_opcode() -> Result<(), Box<dyn Error>>
     let deadline = Instant::now() + limits.timeout();
     let cancelled = AtomicBool::new(false);
     let intent = Intent::listen(MacAddress::new(info.mac())?, limits, ListenKind::Discovery);
-    let mut link = DirectLink::open(&selector, info.identity(), intent, deadline)?;
+    let mut link = DirectLink::open(&selector, info.identity(), info.vlan(), intent, deadline)?;
 
     // Exercise the helper's raw SEND opcode without the client-side guard
     let mut request = Writer::new(wire::SEND);

@@ -41,6 +41,7 @@ fn default_text_reports_request_without_claiming_authentication() -> Result<(), 
     assert_eq!(
         write(
             &options()?,
+            None,
             &plan,
             &report,
             None,
@@ -88,6 +89,7 @@ fn observed_request_retains_frame_without_claiming_authentication() -> Result<()
     assert_eq!(
         write(
             &options()?,
+            None,
             &plan,
             &report,
             None,
@@ -97,6 +99,7 @@ fn observed_request_retains_frame_without_claiming_authentication() -> Result<()
         ActiveOutcome::Completed
     );
     let value: serde_json::Value = serde_json::from_slice(&output)?;
+    crate::fixture_assert::sampled_non_vlan_scope(&value);
     assert_eq!(
         value
             .pointer("/requests/0/identifier")
@@ -134,6 +137,7 @@ fn malformed_frame_keeps_valid_request_but_makes_completion_incomplete()
     assert_eq!(
         write(
             &options()?,
+            None,
             &plan,
             &report,
             None,
@@ -171,6 +175,7 @@ fn no_request_is_inconclusive_after_a_clean_window() -> Result<(), Box<dyn StdEr
     assert_eq!(
         write(
             &options()?,
+            None,
             &plan,
             &report,
             None,

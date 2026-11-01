@@ -1,5 +1,15 @@
 use std::error::Error;
 
+pub fn sampled_non_vlan_scope(value: &serde_json::Value) {
+    assert_eq!(value.pointer("/scope/vlan"), Some(&serde_json::Value::Null));
+    assert_eq!(
+        value
+            .pointer("/scope/scope_validation")
+            .and_then(serde_json::Value::as_str),
+        Some("sampled")
+    );
+}
+
 pub fn frame_hex(value: &serde_json::Value, expected: &[u8]) -> Result<(), Box<dyn Error>> {
     let encoded = value
         .get("frame_hex")

@@ -7,12 +7,14 @@ mod tests;
 use std::io::{self, Write};
 
 use l2_active::dot1x::{Dot1xDestination, Dot1xProbe, Dot1xReport, Dot1xStatus};
+use l2_active_linux::VlanInfo;
 use serde::Serialize;
 
 use super::{
     ActiveOutcome, Dot1xProbeArgs, Error, OutputFormat,
+    interface_view::InterfaceView,
     mac::format_mac,
-    report_common::{self, Evidence, InterfaceView, LimitsView, QualityView, SendMode},
+    report_common::{self, Evidence, LimitsView, QualityView, SendMode},
 };
 
 const LIMITATION: &str = "EAP Requests are unauthenticated and have no transaction binding to Start; they do not prove causation, successful authentication, or port enforcement";
@@ -64,6 +66,7 @@ struct Report<'a> {
 
 pub fn write(
     options: &Dot1xProbeArgs,
+    vlan: Option<VlanInfo>,
     probe: &Dot1xProbe,
     report: &Dot1xReport,
     close_error: Option<&io::Error>,
@@ -88,6 +91,8 @@ pub fn write(
                 report_common::stop_name(summary.stop_reason())
             )
             .map_err(Error::Output)?;
+            InterfaceView::new(options.interface.name(), summary.interface(), vlan)
+                .write_text(output)?;
             for item in report.observations() {
                 writeln!(
                     output,
@@ -115,7 +120,11 @@ pub fn write(
                 status: status_name(report.status()),
                 completion: report_common::completion_name(outcome),
                 scope: Scope {
-                    interface: InterfaceView::new(&options.interface, summary),
+                    interface: InterfaceView::new(
+                        options.interface.name(),
+                        summary.interface(),
+                        vlan,
+                    ),
                     source_mac: format_mac(probe.source_mac().bytes()),
                     dedicated_interface_acknowledged: options.dedicated_interface,
                 },

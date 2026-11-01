@@ -14,6 +14,26 @@ use super as report_common;
 
 use report_common::{Evidence, SendMode};
 
+#[test]
+fn sampled_vlan_change_is_distinguished_in_quality_diagnostics() -> Result<(), Box<dyn StdError>> {
+    let error = io::Error::new(
+        io::ErrorKind::InvalidData,
+        l2_active_linux::VlanScopeChanged,
+    );
+    let value = serde_json::to_value(report_common::diagnostic(&error))?;
+    assert_eq!(
+        value.get("code").and_then(serde_json::Value::as_str),
+        Some("scope_changed")
+    );
+    let generic = io::Error::new(io::ErrorKind::InvalidData, "invalid metadata");
+    let value = serde_json::to_value(report_common::diagnostic(&generic))?;
+    assert_eq!(
+        value.get("code").and_then(serde_json::Value::as_str),
+        Some("io_error")
+    );
+    Ok(())
+}
+
 struct Link {
     identity: LinuxInterfaceIdentity,
     frames: std::collections::VecDeque<l2_capture::CapturedFrame>,
@@ -165,7 +185,7 @@ fn structured_quality_reports_unknown_loss_and_exact_retained_bytes()
     let selector = l2_active_linux::InterfaceSelector::new("test0")?;
     let value = serde_json::json!({
         "quality": report_common::QualityView::new(report.summary(), None),
-        "scope": report_common::InterfaceView::new(&selector, report.summary()),
+        "scope": crate::interface_view::InterfaceView::new(selector.name(), report.summary().interface(), None),
         "limits": report_common::LimitsView::new(limits),
         "completion": report_common::completion_name(ActiveOutcome::Incomplete),
         "frame_hex": report_common::frame_hex(&[0, 0x0f, 0x80, 0xff])?,

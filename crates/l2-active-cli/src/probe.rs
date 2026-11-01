@@ -41,7 +41,19 @@ fn run_platform(
 
     use super::{arp_output, session_options};
 
-    let (info, plan) = prepare(options)?;
+    let Some((info, plan)) =
+        super::preflight::cancelled_discovery(prepare(options, cancelled), cancelled)?
+    else {
+        return write_stopped(
+            "arp_probe",
+            &options.interface,
+            Some(options.target.into()),
+            format,
+            output,
+            PreflightStop::Cancelled,
+            HelperStage::NotStarted,
+        );
+    };
     if cancelled.load(Ordering::Acquire) {
         return write_stopped(
             "arp_probe",
@@ -53,7 +65,7 @@ fn run_platform(
             HelperStage::NotStarted,
         );
     }
-    let helper = session_options::helper(options.helper.as_deref())?;
+    let helper = session_options::helper(options.session.helper.as_deref())?;
     // The same absolute deadline covers helper startup and packet collection
     let requested_deadline = session_options::deadline(plan.limits())?;
     // The worker rechecks this exact interface identity and plan before opening a socket
@@ -83,6 +95,7 @@ fn run_platform(
     let (report, close_error) = session_options::finish(result, link.close())?;
     arp_output::write(
         &options.interface,
+        info.vlan(),
         &plan,
         &report,
         close_error.as_ref(),
@@ -94,19 +107,13 @@ fn run_platform(
 #[cfg(target_os = "linux")]
 fn prepare(
     options: &ArpProbeArgs,
+    cancelled: &AtomicBool,
 ) -> Result<(l2_active_linux::InterfaceInfo, l2_active::ArpProbe), Error> {
-    use std::time::Duration;
-
-    let info = l2_active_linux::discover(&options.interface).map_err(Error::Discovery)?;
+    let info = super::preflight::discover(&options.interface, cancelled)?;
     let source = l2_active_linux::select_arp_source(&info, options.source_ip, options.target)
         .map_err(Error::Scope)?;
     let mac = l2_onpath::MacAddress::new(info.mac()).map_err(Error::Address)?;
-    let limits = l2_active::Limits::new(
-        Duration::from_millis(options.timeout_ms),
-        options.max_received_packets,
-        options.max_received_bytes,
-    )
-    .map_err(Error::Plan)?;
+    let limits = super::session_options::limits(&options.session)?;
     let plan = l2_active::ArpProbe::new(mac, source, options.target, options.expected_mac, limits)
         .map_err(Error::Plan)?;
     Ok((info, plan))

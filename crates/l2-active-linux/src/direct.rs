@@ -1,8 +1,9 @@
 use crate::{
-    InterfaceInfo, InterfaceSelector, discover,
+    InterfaceInfo, InterfaceSelector, VlanInfo,
     intent::{Intent, IntentKind},
     packet::{self, PacketAuxdata},
-    pin::PinnedInterface,
+    pin::{self, PinnedInterface},
+    vlan::VlanPin,
 };
 use l2_active::{ActiveLink, PreSendUsage, ReceiveEvent};
 use l2_capture::LinuxInterfaceIdentity;
@@ -24,11 +25,13 @@ use std::{
 const DRAIN_PACKET_LIMIT: usize = 64;
 const DRAIN_BYTE_LIMIT: u64 = 1_048_576;
 const POLL_INTERVAL: Duration = Duration::from_millis(20);
+const FINAL_SCOPE_TIMEOUT: Duration = Duration::from_millis(500);
 
 // This type is reachable only from the fixed-operation worker
 pub struct DirectLink {
     selector: InterfaceSelector,
     pinned: PinnedInterface,
+    vlan: Option<VlanPin>,
     socket: L2Socket,
     intent: Intent,
     deadline: Instant,
@@ -56,6 +59,7 @@ impl DirectLink {
     pub fn open(
         selector: &InterfaceSelector,
         expected: LinuxInterfaceIdentity,
+        expected_vlan: Option<VlanInfo>,
         intent: Intent,
         deadline: Instant,
     ) -> io::Result<Self> {
@@ -67,13 +71,20 @@ impl DirectLink {
         }
         // Admit the one typed operation before requesting a raw packet socket
         let pinned = PinnedInterface::open(selector)?;
-        let info = discover(selector)?;
-        if pinned.identity != info.identity() || pinned.identity != expected {
+        let cancelled = AtomicBool::new(false);
+        let (info, vlan) = pin::discover_with_pin(selector, &pinned, deadline, &cancelled)?;
+        if pinned.identity != expected {
             return Err(io::Error::other(
                 "selected interface changed during admission",
             ));
         }
-        verify_admission(&intent, &info, selector, deadline, &AtomicBool::new(false))?;
+        if info.vlan() != expected_vlan {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                crate::VlanScopeChanged,
+            ));
+        }
+        verify_admission(&intent, &info, selector, deadline, &cancelled)?;
         if Instant::now() >= deadline {
             return Err(io::Error::new(
                 io::ErrorKind::TimedOut,
@@ -105,6 +116,7 @@ impl DirectLink {
         let link = Self {
             selector: selector.clone(),
             pinned,
+            vlan,
             socket,
             intent,
             deadline,
@@ -115,12 +127,18 @@ impl DirectLink {
             received_bytes: 0,
             drops: 0,
         };
-        link.revalidate()?;
+        link.revalidate(deadline, &cancelled)?;
         Ok(link)
     }
 
-    fn revalidate(&self) -> io::Result<()> {
-        self.pinned.revalidate(&self.selector)?;
+    fn revalidate(&self, deadline: Instant, cancelled: &AtomicBool) -> io::Result<()> {
+        pin::revalidate_scope(
+            &self.selector,
+            &self.pinned,
+            self.vlan.as_ref(),
+            deadline,
+            cancelled,
+        )?;
         let address: SockaddrStorage =
             getsockname(self.socket.as_raw_fd()).map_err(packet::errno)?;
         let index = address
@@ -148,6 +166,52 @@ impl DirectLink {
             ));
         }
         Ok(())
+    }
+
+    fn receive_status(
+        &self,
+        deadline: Instant,
+        cancelled: &AtomicBool,
+    ) -> io::Result<Option<ReceiveEvent>> {
+        if let Some(status) = self.terminal_status(deadline, cancelled) {
+            return Ok(Some(status));
+        }
+        if let Err(error) = self.revalidate(deadline.min(self.deadline), cancelled) {
+            if error.raw_os_error() == Some(nix::libc::ENETDOWN) {
+                return Ok(Some(ReceiveEvent::InterfaceDown));
+            }
+            if matches!(error.get_ref(), Some(source) if source.is::<crate::VlanScopeChanged>()) {
+                return Err(error);
+            }
+            if cancelled.load(Ordering::Acquire) {
+                return Ok(Some(ReceiveEvent::Cancelled));
+            }
+            if error.kind() == io::ErrorKind::TimedOut {
+                if Instant::now() >= self.deadline {
+                    return Ok(Some(ReceiveEvent::BackendTimedOut));
+                }
+                if Instant::now() >= deadline {
+                    return Ok(Some(ReceiveEvent::TimedOut));
+                }
+            }
+            return Err(error);
+        }
+        if !self.pinned.is_up()? {
+            return Ok(Some(ReceiveEvent::InterfaceDown));
+        }
+        Ok(self.terminal_status(deadline, cancelled))
+    }
+
+    fn terminal_status(&self, deadline: Instant, cancelled: &AtomicBool) -> Option<ReceiveEvent> {
+        if cancelled.load(Ordering::Acquire) {
+            Some(ReceiveEvent::Cancelled)
+        } else if Instant::now() >= deadline {
+            Some(ReceiveEvent::TimedOut)
+        } else if Instant::now() >= self.deadline {
+            Some(ReceiveEvent::BackendTimedOut)
+        } else {
+            None
+        }
     }
 
     fn drain(&mut self, deadline: Instant, cancelled: &AtomicBool) -> io::Result<()> {
@@ -203,18 +267,18 @@ impl ActiveLink for DirectLink {
         }
         self.check_time(deadline, cancelled)?;
         self.drain(deadline, cancelled)?;
-        self.revalidate()?;
-        let current = discover(&self.selector)?;
-        if current.identity() != self.pinned.identity {
-            return Err(io::Error::other("interface changed before transmission"));
-        }
-        verify_admission(
-            &self.intent,
-            &current,
+        let deadline = deadline.min(self.deadline);
+        self.revalidate(deadline, cancelled)?;
+        // Refresh mutable properties against the original retained scope
+        let current = pin::snapshot_with_pin(
             &self.selector,
-            deadline.min(self.deadline),
+            &self.pinned,
+            self.vlan.as_ref(),
+            deadline,
             cancelled,
         )?;
+        verify_admission(&self.intent, &current, &self.selector, deadline, cancelled)?;
+        self.revalidate(deadline, cancelled)?;
         self.check_time(deadline, cancelled)?;
         self.attempted = true;
         let sent = self.socket.send(frame)?;
@@ -250,34 +314,8 @@ impl ActiveLink for DirectLink {
             .unwrap_or(usize::MAX);
         let max_bytes = max_bytes.min(remaining).min(l2_capture::MAX_FRAME_LENGTH);
         loop {
-            if cancelled.load(Ordering::Acquire) {
-                return Ok(ReceiveEvent::Cancelled);
-            }
-            let now = Instant::now();
-            if now >= deadline {
-                return Ok(ReceiveEvent::TimedOut);
-            }
-            if now >= self.deadline {
-                return Ok(ReceiveEvent::BackendTimedOut);
-            }
-            if !self.pinned.is_up()? {
-                return Ok(ReceiveEvent::InterfaceDown);
-            }
-            if let Err(error) = self.revalidate() {
-                if error.raw_os_error() == Some(nix::libc::ENETDOWN) {
-                    return Ok(ReceiveEvent::InterfaceDown);
-                }
-                return Err(error);
-            }
-            if cancelled.load(Ordering::Acquire) {
-                return Ok(ReceiveEvent::Cancelled);
-            }
-            let now = Instant::now();
-            if now >= deadline {
-                return Ok(ReceiveEvent::TimedOut);
-            }
-            if now >= self.deadline {
-                return Ok(ReceiveEvent::BackendTimedOut);
+            if let Some(status) = self.receive_status(deadline, cancelled)? {
+                return Ok(status);
             }
             match packet::read_frame(&self.socket, self.pinned.identity, max_bytes, |length| {
                 self.received_packets += 1;
@@ -285,7 +323,9 @@ impl ActiveLink for DirectLink {
                 Ok(())
             }) {
                 Ok(frame) => {
-                    self.revalidate()?;
+                    // A consumed frame must be checked against the operation deadline,
+                    // not the shorter idle polling slice
+                    self.revalidate(self.deadline, cancelled)?;
                     // A delayed read cannot be attributed to an elapsed window
                     crate::deadline::ensure_before(self.deadline)?;
                     return Ok(ReceiveEvent::Frame(frame));
@@ -293,7 +333,7 @@ impl ActiveLink for DirectLink {
                 Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
                     let timeout = deadline
                         .min(self.deadline)
-                        .saturating_duration_since(now)
+                        .saturating_duration_since(Instant::now())
                         .min(POLL_INTERVAL);
                     let millis = u16::try_from(timeout.as_millis().max(1)).unwrap_or(20);
                     let mut descriptors = [PollFd::new(self.socket.as_fd(), PollFlags::POLLIN)];
@@ -317,7 +357,11 @@ impl ActiveLink for DirectLink {
     }
 
     fn capture_backlog(&mut self) -> io::Result<Option<bool>> {
-        self.revalidate()?;
+        // Collection may already have ended, so use a separate bounded final sample
+        self.revalidate(
+            Instant::now() + FINAL_SCOPE_TIMEOUT,
+            &AtomicBool::new(false),
+        )?;
         let mut descriptors = [PollFd::new(self.socket.as_fd(), PollFlags::POLLIN)];
         poll(&mut descriptors, 0_u16).map_err(packet::errno)?;
         let events = descriptors
@@ -340,19 +384,45 @@ fn verify_admission(
     deadline: Instant,
     cancelled: &AtomicBool,
 ) -> io::Result<()> {
-    intent.validate(info, selector)?;
-    if let IntentKind::Ndp { source, target, .. } = intent.kind()
-        && !source.is_unicast_link_local()
+    intent.validate(info)?;
+    if let IntentKind::Ndp {
+        source,
+        target,
+        prefix_len,
+    } = intent.kind()
     {
-        // A configured prefix alone cannot establish a global on-link target
-        crate::route::verify_on_link(
-            selector,
-            info.identity(),
-            *source,
-            *target,
-            deadline,
-            cancelled,
-        )?;
+        let current = crate::ndp::discover_until(selector, deadline, cancelled)?;
+        if current.interface().identity() != info.identity() {
+            return Err(io::Error::other("interface changed during IPv6 admission"));
+        }
+        if current.interface().vlan() != info.vlan() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                crate::VlanScopeChanged,
+            ));
+        }
+        let prepared =
+            crate::ndp::prepare(&current, Some(*source), *target, None, intent.limits())?;
+        if prepared.source_mac() != intent.source_mac()
+            || prepared.prefix_len() != *prefix_len
+            || prepared.frame() != intent.frame()
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "NDP request does not match the selected IPv6 assignment",
+            ));
+        }
+        if !source.is_unicast_link_local() {
+            // A configured prefix alone cannot establish a global on-link target
+            crate::route::verify_on_link(
+                selector,
+                info.identity(),
+                *source,
+                *target,
+                deadline,
+                cancelled,
+            )?;
+        }
     }
     Ok(())
 }

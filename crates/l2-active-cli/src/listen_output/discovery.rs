@@ -6,7 +6,7 @@ use l2_active::{
     Limits,
     discovery::{DiscoveryDisposition, DiscoveryProtocol, DiscoveryReport, DiscoveryStatus},
 };
-use l2_active_linux::InterfaceSelector;
+use l2_active_linux::{InterfaceSelector, VlanInfo};
 use serde::Serialize;
 
 use super::collection::{Collection, FrameView, Operation};
@@ -36,6 +36,7 @@ struct Details {
 
 pub fn write(
     interface: &InterfaceSelector,
+    vlan: Option<VlanInfo>,
     limits: Limits,
     report: &DiscoveryReport,
     close_error: Option<&io::Error>,
@@ -92,7 +93,7 @@ pub fn write(
     Collection {
         operation: Operation { name: "discovery_observe", status, evidence,
             limitation: "LLDP/CDP claims and hold times are unauthenticated; withdrawals do not prove absence, and silence does not prove isolation or physical multicast visibility" },
-        interface, limits, summary: report.summary(), observations,
+        interface, vlan, limits, summary: report.summary(), observations,
         details: Details { unmatched_packets: report.unmatched_packets() }, close_error,
     }.write(format, output)
 }

@@ -14,6 +14,7 @@ fn fixture() -> Result<InterfaceInfo, Box<dyn std::error::Error>> {
             address: Ipv4Addr::new(192, 0, 2, 1),
             netmask: Ipv4Addr::new(255, 255, 255, 0),
         }],
+        vlan: None,
     })
 }
 

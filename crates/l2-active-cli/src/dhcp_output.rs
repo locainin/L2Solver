@@ -10,12 +10,14 @@ use std::{
 };
 
 use l2_active::dhcp::{DhcpProbe, DhcpReport, DhcpStatus};
+use l2_active_linux::VlanInfo;
 use serde::Serialize;
 
 use super::{
     ActiveOutcome, DhcpProbeArgs, Error, OutputFormat,
+    interface_view::InterfaceView,
     mac::format_mac,
-    report_common::{self, Evidence, InterfaceView, LimitsView, QualityView, SendMode},
+    report_common::{self, Evidence, LimitsView, QualityView, SendMode},
 };
 
 const LIMITATION: &str = "DHCP offers and server identifiers are unauthenticated claims; a matching offer does not establish freshness or protection, and silence is inconclusive";
@@ -60,6 +62,7 @@ struct Report<'a> {
 
 pub fn write(
     options: &DhcpProbeArgs,
+    vlan: Option<VlanInfo>,
     probe: &DhcpProbe,
     report: &DhcpReport,
     close_error: Option<&io::Error>,
@@ -84,6 +87,8 @@ pub fn write(
                 report_common::stop_name(summary.stop_reason())
             )
             .map_err(Error::Output)?;
+            InterfaceView::new(options.interface.name(), summary.interface(), vlan)
+                .write_text(output)?;
             for offer in report.observations() {
                 writeln!(
                     output,
@@ -103,32 +108,16 @@ pub fn write(
             writeln!(output, "{LIMITATION}").map_err(Error::Output)?;
         }
         OutputFormat::Json => {
-            let mut offers = Vec::new();
-            offers
-                .try_reserve_exact(report.observations().len())
-                .map_err(|_| Error::Allocation)?;
-            for observation in report.observations() {
-                let frame = observation.frame();
-                offers.push(Offer {
-                    server_identifier: observation.server_identifier(),
-                    offered_address: observation.offered_address(),
-                    lease_seconds: observation.lease_seconds(),
-                    source_mac: format_mac(observation.source_mac().bytes()),
-                    source_ip: observation.source_ip(),
-                    relay_ip: observation.relay_ip(),
-                    udp_checksum_present: observation.udp_checksum_present(),
-                    matches_expected: report.expected_match(observation.server_identifier()),
-                    captured_bytes: frame.captured_len(),
-                    original_bytes: frame.metadata().original_len(),
-                    frame_hex: report_common::frame_hex(frame.bytes())?,
-                });
-            }
             let value = Report {
                 operation: "dhcp_probe",
                 status: status_name(report.status()),
                 completion: report_common::completion_name(outcome),
                 scope: Scope {
-                    interface: InterfaceView::new(&options.interface, summary),
+                    interface: InterfaceView::new(
+                        options.interface.name(),
+                        summary.interface(),
+                        vlan,
+                    ),
                     source_mac: format_mac(probe.source_mac().bytes()),
                     transaction_id: probe.transaction().get(),
                     expected_servers: (!options.expected_server.is_empty())
@@ -137,7 +126,7 @@ pub fn write(
                 limits: LimitsView::new(probe.limits()),
                 quality: QualityView::new(summary, close_error),
                 authenticated: false,
-                offers,
+                offers: offers(report)?,
                 limitation: LIMITATION,
             };
             serde_json::to_writer(&mut *output, &value).map_err(Error::Json)?;
@@ -145,6 +134,30 @@ pub fn write(
         }
     }
     Ok(outcome)
+}
+
+fn offers(report: &DhcpReport) -> Result<Vec<Offer>, Error> {
+    let mut offers = Vec::new();
+    offers
+        .try_reserve_exact(report.observations().len())
+        .map_err(|_| Error::Allocation)?;
+    for observation in report.observations() {
+        let frame = observation.frame();
+        offers.push(Offer {
+            server_identifier: observation.server_identifier(),
+            offered_address: observation.offered_address(),
+            lease_seconds: observation.lease_seconds(),
+            source_mac: format_mac(observation.source_mac().bytes()),
+            source_ip: observation.source_ip(),
+            relay_ip: observation.relay_ip(),
+            udp_checksum_present: observation.udp_checksum_present(),
+            matches_expected: report.expected_match(observation.server_identifier()),
+            captured_bytes: frame.captured_len(),
+            original_bytes: frame.metadata().original_len(),
+            frame_hex: report_common::frame_hex(frame.bytes())?,
+        });
+    }
+    Ok(offers)
 }
 
 const fn status_name(status: DhcpStatus) -> &'static str {

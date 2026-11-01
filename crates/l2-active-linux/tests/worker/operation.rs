@@ -61,7 +61,7 @@ fn owned_namespace_child_checks_raw_operations() -> Result<(), Box<dyn Error>> {
     let deadline = Instant::now() + limits.timeout();
     let cancelled = AtomicBool::new(false);
     let intent = Intent::listen(MacAddress::new(info.mac())?, limits, ListenKind::Discovery);
-    let mut link = DirectLink::open(&selector, info.identity(), intent, deadline)?;
+    let mut link = DirectLink::open(&selector, info.identity(), info.vlan(), intent, deadline)?;
     let mut request = Writer::new(wire::RECEIVE);
     request.u64(0);
     request.u32(65_536);

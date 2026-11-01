@@ -39,6 +39,33 @@ fn json_errors_preserve_runtime_error_categories() -> Result<(), Box<dyn Error>>
 }
 
 #[test]
+fn typed_vlan_scope_change_is_reported_distinctly_from_generic_invalid_data()
+-> Result<(), Box<dyn Error>> {
+    let changed = ActiveError::Helper(std::io::Error::new(
+        ErrorKind::InvalidData,
+        l2_active_linux::VlanScopeChanged,
+    ));
+    let mut output = Vec::new();
+    write_error(&changed, OutputFormat::Json, &mut output)?;
+    let value: serde_json::Value = serde_json::from_slice(&output)?;
+    assert_eq!(
+        value.get("code").and_then(serde_json::Value::as_str),
+        Some("scope_changed")
+    );
+    let generic = ActiveError::Helper(std::io::Error::new(
+        ErrorKind::InvalidData,
+        "invalid metadata",
+    ));
+    assert_eq!(generic.code(), "io_error");
+    let changed_during_discovery = ActiveError::Discovery(std::io::Error::new(
+        ErrorKind::InvalidData,
+        l2_active_linux::VlanScopeChanged,
+    ));
+    assert_eq!(changed_during_discovery.code(), "scope_changed");
+    Ok(())
+}
+
+#[test]
 fn missing_interface_produces_a_structured_not_found_error_without_transmitting()
 -> Result<(), Box<dyn Error>> {
     let mut selected = None;

@@ -33,6 +33,7 @@ fn fixture(assignments: Vec<Ipv6Assignment>) -> Result<NdpInterfaceInfo, Box<dyn
             flags: 0x1001,
             hardware_type: 1,
             assignments: Vec::new(),
+            vlan: None,
         },
         assignments,
     })

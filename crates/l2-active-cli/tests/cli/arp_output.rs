@@ -34,11 +34,16 @@ fn prepared(expected: Option<[u8; 6]>) -> Result<ArpProbe, Box<dyn StdError>> {
     )?)
 }
 
+enum ReceiveFailure {
+    PermissionDenied,
+    ScopeChanged,
+}
+
 struct Link {
     identity: LinuxInterfaceIdentity,
     frames: VecDeque<CapturedFrame>,
     pre_send: Option<PreSendUsage>,
-    fail_after_frames: bool,
+    receive_failure: Option<ReceiveFailure>,
     backend_deadline_early: bool,
     send_error: Option<io::ErrorKind>,
     backlog: Option<bool>,
@@ -54,7 +59,7 @@ impl Link {
             identity,
             frames: frames.into_iter().collect(),
             pre_send: Some(PreSendUsage::new(0, 0)),
-            fail_after_frames: false,
+            receive_failure: None,
             backend_deadline_early: false,
             send_error: None,
             backlog: Some(false),
@@ -89,11 +94,16 @@ impl ActiveLink for Link {
         if let Some(frame) = self.frames.pop_front() {
             return Ok(ReceiveEvent::Frame(frame));
         }
-        if self.fail_after_frames {
-            return Err(io::Error::new(
-                io::ErrorKind::PermissionDenied,
-                "capture denied",
-            ));
+        if let Some(failure) = &self.receive_failure {
+            return Err(match failure {
+                ReceiveFailure::PermissionDenied => {
+                    io::Error::new(io::ErrorKind::PermissionDenied, "capture denied")
+                }
+                ReceiveFailure::ScopeChanged => io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    l2_active_linux::VlanScopeChanged,
+                ),
+            });
         }
         if self.backend_deadline_early {
             return Ok(ReceiveEvent::BackendTimedOut);
@@ -114,6 +124,46 @@ impl ActiveLink for Link {
             Ok(self.backlog)
         }
     }
+}
+
+#[test]
+fn vlan_change_after_a_reply_preserves_evidence_and_marks_the_result_incomplete()
+-> Result<(), Box<dyn StdError>> {
+    let identity = LinuxInterfaceIdentity::new(1, 2, 3, 4, 5)?;
+    let probe = prepared(None)?;
+    let mut link = Link::new(identity, [captured(identity, EXPECTED)?]);
+    link.receive_failure = Some(ReceiveFailure::ScopeChanged);
+    let report = probe.run(&mut link, &AtomicBool::new(false))?;
+    let mut output = Vec::new();
+    let outcome = output::write(
+        &InterfaceSelector::new("test0")?,
+        None,
+        &probe,
+        &report,
+        None,
+        OutputFormat::Json,
+        &mut output,
+    )?;
+    assert_eq!(outcome, ActiveOutcome::Incomplete);
+    let value: serde_json::Value = serde_json::from_slice(&output)?;
+    assert_eq!(
+        value
+            .pointer("/transport_error/code")
+            .and_then(serde_json::Value::as_str),
+        Some("scope_changed")
+    );
+    assert_eq!(
+        value.get("completion").and_then(serde_json::Value::as_str),
+        Some("incomplete")
+    );
+    assert_eq!(
+        value
+            .get("replies")
+            .and_then(serde_json::Value::as_array)
+            .map(Vec::len),
+        Some(1)
+    );
+    Ok(())
 }
 
 fn captured(
@@ -178,6 +228,7 @@ fn text_reports_conflicting_replies_and_unconfirmed_cleanup() -> Result<(), Box<
     let mut bytes = Vec::new();
     let outcome = output::write(
         &InterfaceSelector::new("test0")?,
+        None,
         &probe,
         &report,
         Some(&cleanup),
@@ -194,6 +245,8 @@ fn text_reports_conflicting_replies_and_unconfirmed_cleanup() -> Result<(), Box<
     assert!(text.contains("Helper cleanup: unconfirmed (helper close was not acknowledged)"));
     assert!(text.contains("physical delivery unconfirmed"));
     assert!(text.contains("ARP replies are unauthenticated"));
+    assert!(text.contains("VLAN: none on selected interface"));
+    assert!(text.contains("Scope validation: sampled"));
     Ok(())
 }
 
@@ -209,6 +262,7 @@ fn conflicting_claims_without_an_expected_mac_are_a_finding() -> Result<(), Box<
     let mut bytes = Vec::new();
     let outcome = output::write(
         &InterfaceSelector::new("test0")?,
+        None,
         &probe,
         &report,
         None,
@@ -217,6 +271,13 @@ fn conflicting_claims_without_an_expected_mac_are_a_finding() -> Result<(), Box<
     )?;
     assert_eq!(outcome, ActiveOutcome::Findings);
     let value: serde_json::Value = serde_json::from_slice(&bytes)?;
+    assert_eq!(value.pointer("/scope/vlan"), Some(&serde_json::Value::Null));
+    assert_eq!(
+        value
+            .pointer("/scope/scope_validation")
+            .and_then(serde_json::Value::as_str),
+        Some("sampled")
+    );
     assert_eq!(
         value.get("status").and_then(serde_json::Value::as_str),
         Some("observed")
@@ -247,6 +308,7 @@ fn json_reports_actual_reply_claims_and_socket_acceptance_without_implying_authe
     let mut bytes = Vec::new();
     let outcome = output::write(
         &InterfaceSelector::new("test0")?,
+        None,
         &probe,
         &report,
         None,
@@ -306,10 +368,8 @@ fn json_reports_actual_reply_claims_and_socket_acceptance_without_implying_authe
         .ok_or("missing unexpected reply")?;
     crate::fixture_assert::frame_hex(observed, captured(identity, OTHER)?.bytes())?;
     assert_eq!(
-        value
-            .get("authenticated")
-            .and_then(serde_json::Value::as_bool),
-        Some(false)
+        value.get("authenticated"),
+        Some(&serde_json::Value::Bool(false))
     );
     let limitation = value
         .get("limitation")
@@ -330,6 +390,7 @@ fn cleanup_failure_keeps_observed_reply_but_makes_completion_inconclusive()
     let mut bytes = Vec::new();
     let outcome = output::write(
         &InterfaceSelector::new("test0")?,
+        None,
         &probe,
         &report,
         Some(&cleanup),
@@ -379,6 +440,7 @@ fn no_reply_is_inconclusive_even_when_request_and_cleanup_succeed() -> Result<()
     let mut bytes = Vec::new();
     let outcome = output::write(
         &InterfaceSelector::new("test0")?,
+        None,
         &probe,
         &report,
         None,
@@ -411,6 +473,7 @@ fn cancelled_core_session_reports_no_send_and_preserves_cancellation_outcome()
     let mut bytes = Vec::new();
     let outcome = output::write(
         &InterfaceSelector::new("test0")?,
+        None,
         &probe,
         &report,
         None,
@@ -451,6 +514,7 @@ fn known_outbound_request_is_counted_without_making_the_reply_incomplete()
     let mut bytes = Vec::new();
     let outcome = output::write(
         &InterfaceSelector::new("test0")?,
+        None,
         &probe,
         &report,
         None,
@@ -487,6 +551,7 @@ fn unavailable_pre_send_accounting_stays_unknown_and_incomplete() -> Result<(), 
     let mut bytes = Vec::new();
     let outcome = output::write(
         &InterfaceSelector::new("test0")?,
+        None,
         &probe,
         &report,
         None,
@@ -521,6 +586,7 @@ fn reported_capture_totals_include_confirmed_pre_send_drain() -> Result<(), Box<
     let mut bytes = Vec::new();
     let outcome = output::write(
         &InterfaceSelector::new("test0")?,
+        None,
         &probe,
         &report,
         None,
@@ -551,11 +617,12 @@ fn receive_error_keeps_observed_reply_and_marks_capture_total_unknown()
     let identity = LinuxInterfaceIdentity::new(1, 2, 3, 4, 5)?;
     let probe = prepared(None)?;
     let mut link = Link::new(identity, [captured(identity, EXPECTED)?]);
-    link.fail_after_frames = true;
+    link.receive_failure = Some(ReceiveFailure::PermissionDenied);
     let report = probe.run(&mut link, &AtomicBool::new(false))?;
     let mut bytes = Vec::new();
     let outcome = output::write(
         &InterfaceSelector::new("test0")?,
+        None,
         &probe,
         &report,
         None,
@@ -604,6 +671,7 @@ fn packet_limit_keeps_observed_reply_but_reports_incomplete_collection()
     let mut bytes = Vec::new();
     let outcome = output::write(
         &InterfaceSelector::new("test0")?,
+        None,
         &probe,
         &report,
         None,
@@ -645,6 +713,7 @@ fn earlier_backend_deadline_does_not_present_a_full_observation_window()
     let mut bytes = Vec::new();
     let outcome = output::write(
         &InterfaceSelector::new("test0")?,
+        None,
         &probe,
         &report,
         None,
@@ -679,6 +748,7 @@ fn failed_send_acknowledgement_is_unconfirmed_instead_of_claiming_no_transmissio
     let mut bytes = Vec::new();
     let outcome = output::write(
         &InterfaceSelector::new("test0")?,
+        None,
         &probe,
         &report,
         None,
@@ -716,6 +786,7 @@ fn pending_or_unknown_final_backlog_keeps_observed_reply_incomplete()
         let mut bytes = Vec::new();
         let outcome = output::write(
             &InterfaceSelector::new("test0")?,
+            None,
             &probe,
             &report,
             None,
@@ -748,6 +819,7 @@ fn backlog_query_error_is_preserved_and_never_claims_complete_collection()
     let mut bytes = Vec::new();
     let outcome = output::write(
         &InterfaceSelector::new("test0")?,
+        None,
         &probe,
         &report,
         None,

@@ -1,6 +1,6 @@
-use crate::InterfaceSelector;
+use crate::{InterfaceSelector, VlanInfo};
 use l2_capture::LinuxInterfaceIdentity;
-use std::{io, net::Ipv4Addr};
+use std::{io, net::Ipv4Addr, sync::atomic::AtomicBool, time::Instant};
 
 /// One IPv4 address and its interface-reported network mask
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
@@ -33,6 +33,7 @@ pub struct InterfaceInfo {
     pub(crate) flags: u32,
     pub(crate) hardware_type: u16,
     pub(crate) assignments: Vec<Ipv4Assignment>,
+    pub(crate) vlan: Option<VlanInfo>,
 }
 
 impl InterfaceInfo {
@@ -89,6 +90,12 @@ impl InterfaceInfo {
     pub fn ipv4_assignments(&self) -> &[Ipv4Assignment] {
         &self.assignments
     }
+
+    /// Return the sampled logical VLAN and its pinned immediate parent, if any
+    #[must_use]
+    pub const fn vlan(&self) -> Option<VlanInfo> {
+        self.vlan
+    }
 }
 
 /// Read the identity, addresses and link properties of the selected interface
@@ -103,12 +110,44 @@ pub fn discover(selector: &InterfaceSelector) -> io::Result<InterfaceInfo> {
     crate::pin::discover(selector)
 }
 
+/// Read the selected interface while honoring a caller's deadline and cancellation
+///
+/// # Errors
+/// Returns an operating-system error, `Interrupted` on cancellation, or
+/// `TimedOut` when the deadline expires
+#[cfg(target_os = "linux")]
+pub fn discover_until(
+    selector: &InterfaceSelector,
+    deadline: Instant,
+    cancelled: &AtomicBool,
+) -> io::Result<InterfaceInfo> {
+    crate::netlink::check_control(deadline, cancelled)?;
+    let pinned = crate::pin::PinnedInterface::open(selector)?;
+    crate::pin::discover_with_pin(selector, &pinned, deadline, cancelled).map(|(info, _)| info)
+}
+
 /// Read the identity and properties of an explicitly selected interface
 ///
 /// # Errors
 /// Returns `Unsupported` because this backend requires Linux
 #[cfg(not(target_os = "linux"))]
 pub fn discover(_selector: &InterfaceSelector) -> io::Result<InterfaceInfo> {
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "Linux is required",
+    ))
+}
+
+/// Read the selected interface until the caller's deadline
+///
+/// # Errors
+/// Returns `Unsupported` because this backend requires Linux
+#[cfg(not(target_os = "linux"))]
+pub fn discover_until(
+    _selector: &InterfaceSelector,
+    _deadline: Instant,
+    _cancelled: &AtomicBool,
+) -> io::Result<InterfaceInfo> {
     Err(io::Error::new(
         io::ErrorKind::Unsupported,
         "Linux is required",

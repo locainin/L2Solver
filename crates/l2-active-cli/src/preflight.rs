@@ -1,10 +1,47 @@
 //! Render cancellation or timeout before a probe can send
 
-use std::io::Write;
+use std::{
+    io::Write,
+    sync::atomic::{AtomicBool, Ordering},
+    time::{Duration, Instant},
+};
 
 use serde::Serialize;
 
 use super::{ActiveOutcome, Error, OutputFormat};
+
+#[cfg(test)]
+#[path = "../tests/cli/preflight.rs"]
+mod tests;
+
+pub fn discovery_deadline() -> Result<Instant, Error> {
+    Instant::now()
+        .checked_add(Duration::from_secs(2))
+        .ok_or_else(|| Error::Discovery(std::io::Error::other("discovery deadline overflow")))
+}
+
+pub fn discover(
+    selector: &l2_active_linux::InterfaceSelector,
+    cancelled: &AtomicBool,
+) -> Result<l2_active_linux::InterfaceInfo, Error> {
+    l2_active_linux::discover_until(selector, discovery_deadline()?, cancelled)
+        .map_err(Error::Discovery)
+}
+
+pub fn cancelled_discovery<T>(
+    result: Result<T, Error>,
+    cancelled: &AtomicBool,
+) -> Result<Option<T>, Error> {
+    match result {
+        Err(Error::Discovery(error))
+            if error.kind() == std::io::ErrorKind::Interrupted
+                && cancelled.load(Ordering::Acquire) =>
+        {
+            Ok(None)
+        }
+        other => other.map(Some),
+    }
+}
 
 #[derive(Serialize)]
 struct Stopped<'a> {

@@ -8,7 +8,7 @@ use std::{
         unix::{fs::PermissionsExt, net::UnixStream},
     },
     path::PathBuf,
-    process::{Command, Stdio},
+    process::Stdio,
 };
 
 struct SilentHelper(PathBuf);
@@ -42,13 +42,8 @@ fn helper_open_timeout_is_incomplete_without_claiming_which_deadline_expired()
     let interface = std::env::var("L2_TEST_ACTIVE_INTERFACE")?;
     let target = std::env::var("L2_TEST_ACTIVE_TARGET")?;
     let helper = SilentHelper::new()?;
-    let binary = std::env::var_os("L2_TEST_ACTIVE_BINARY")
-        .unwrap_or_else(|| env!("CARGO_BIN_EXE_l2solver-active").into());
     for (timeout, closed) in [("250", false), ("7000", false), ("250", true)] {
-        let mut command = Command::new(&binary);
-        if std::env::var_os("L2_TEST_ACTIVE_MAIN").is_some() {
-            command.arg("active");
-        }
+        let mut command = crate::namespace::command();
         command
             .args([
                 "arp",

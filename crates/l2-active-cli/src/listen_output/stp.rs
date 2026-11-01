@@ -6,7 +6,7 @@ use l2_active::{
     Limits,
     stp::{StpEvidence, StpReport},
 };
-use l2_active_linux::InterfaceSelector;
+use l2_active_linux::{InterfaceSelector, VlanInfo};
 use serde::Serialize;
 
 use super::collection::{Collection, FrameView, Operation};
@@ -55,6 +55,7 @@ struct Details {
 
 pub fn write(
     interface: &InterfaceSelector,
+    vlan: Option<VlanInfo>,
     limits: Limits,
     report: &StpReport,
     close_error: Option<&io::Error>,
@@ -113,6 +114,7 @@ pub fn write(
             limitation: "BPDUs and root claims are unauthenticated; changed claims do not establish a topology change, and silence does not prove BPDU guard or filtering",
         },
         interface,
+        vlan,
         limits,
         summary: report.summary(),
         observations,

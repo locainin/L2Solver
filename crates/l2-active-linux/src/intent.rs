@@ -10,7 +10,7 @@ mod ndp_tests;
 #[path = "../tests/intent/dot1x.rs"]
 mod dot1x_tests;
 
-use crate::{InterfaceInfo, InterfaceSelector, select_arp_source};
+use crate::{InterfaceInfo, select_arp_source};
 use l2_active::{ArpProbe, Limits, NdpProbe, dhcp::DhcpProbe, dot1x::Dot1xProbe};
 use l2_onpath::MacAddress;
 use std::{
@@ -140,7 +140,7 @@ impl Intent {
         self.source_mac
     }
 
-    pub fn validate(&self, info: &InterfaceInfo, selector: &InterfaceSelector) -> io::Result<()> {
+    pub fn validate(&self, info: &InterfaceInfo) -> io::Result<()> {
         if self.listen_kind().is_some() {
             validate_interface(info, self.source_mac)?;
         } else {
@@ -157,27 +157,6 @@ impl Intent {
         }
         if let IntentKind::Arp { source, target } = self.kind {
             select_arp_source(info, Some(source), target)?;
-        }
-        if let IntentKind::Ndp {
-            source,
-            prefix_len,
-            target,
-        } = self.kind
-        {
-            let current = crate::ndp::discover(selector)?;
-            if current.interface().identity() != info.identity() {
-                return Err(io::Error::other("interface changed during IPv6 admission"));
-            }
-            let prepared = crate::ndp::prepare(&current, Some(source), target, None, self.limits)?;
-            if prepared.source_mac() != self.source_mac
-                || prepared.prefix_len() != prefix_len
-                || prepared.frame() != self.frame
-            {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidInput,
-                    "NDP request does not match the selected IPv6 assignment",
-                ));
-            }
         }
         Ok(())
     }
@@ -203,6 +182,12 @@ pub fn validate_ethernet(
 }
 
 fn validate_interface(info: &InterfaceInfo, source_mac: MacAddress) -> io::Result<()> {
+    if info.vlan().is_some_and(|vlan| !vlan.reorders_headers()) {
+        return Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "VLAN interfaces require header reordering",
+        ));
+    }
     if !info.is_ethernet() {
         return Err(io::Error::new(
             io::ErrorKind::Unsupported,

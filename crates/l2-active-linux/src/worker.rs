@@ -137,6 +137,7 @@ fn open_request(bytes: &[u8]) -> io::Result<(DirectLink, Instant)> {
         std::str::from_utf8(reader.take(name_length)?).map_err(|_| wire::invalid_record())?;
     let selector = InterfaceSelector::new(name)?;
     let identity = wire::read_identity(&mut reader)?;
+    let vlan = wire::read_vlan(&mut reader, identity)?;
     let mac = MacAddress::new(
         reader
             .take(6)?
@@ -201,7 +202,7 @@ fn open_request(bytes: &[u8]) -> io::Result<(DirectLink, Instant)> {
         OpenKind::Dot1x => Intent::dot1x(&Dot1xProbe::new(mac, limits).map_err(invalid_input)?)?,
     };
     let deadline = requested.min(Instant::now() + limits.timeout());
-    let link = DirectLink::open(&selector, identity, intent, deadline)?;
+    let link = DirectLink::open(&selector, identity, vlan, intent, deadline)?;
     Ok((link, deadline))
 }
 

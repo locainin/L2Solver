@@ -106,7 +106,7 @@ fn owned_namespace_child_asserts_cli_offer() -> Result<(), Box<dyn Error>> {
     crate::namespace::assert_owned()?;
     let interface = std::env::var("L2_TEST_DHCP_INTERFACE")?;
     let helper = std::env::var_os("L2_TEST_ACTIVE_HELPER").ok_or("missing helper")?;
-    let output = Command::new(crate::namespace::binary())
+    let output = crate::namespace::command()
         .args([
             "dhcp",
             "probe",

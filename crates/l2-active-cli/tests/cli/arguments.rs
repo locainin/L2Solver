@@ -147,12 +147,77 @@ fn explicit_probe_scope_and_finite_limits_parse_without_opening_a_network_interf
         probe.source_ip.map(|address| address.to_string()),
         Some("192.0.2.2".into())
     );
-    assert_eq!(probe.timeout_ms, 250);
-    assert_eq!(probe.max_received_packets, 12);
-    assert_eq!(probe.max_received_bytes, 8192);
+    assert_eq!(probe.session.timeout_ms, 250);
+    assert_eq!(probe.session.max_received_packets, 12);
+    assert_eq!(probe.session.max_received_bytes, 8192);
     assert_eq!(
-        probe.helper.as_deref(),
+        probe.session.helper.as_deref(),
         Some(std::path::Path::new("tools/active-helper"))
     );
+    Ok(())
+}
+
+#[test]
+fn arp_session_defaults_and_budget_boundaries_remain_unchanged() -> Result<(), Box<dyn Error>> {
+    let parsed = Cli::try_parse_from([
+        "l2solver-active",
+        "arp",
+        "probe",
+        "--interface",
+        "test0",
+        "--target",
+        "192.0.2.10",
+    ])?;
+    let ActiveCommand::Arp {
+        command: ArpCommand::Probe(probe),
+    } = parsed.active.command
+    else {
+        return Err("expected ARP probe".into());
+    };
+    assert_eq!(probe.session.timeout_ms, 2_000);
+    assert_eq!(probe.session.max_received_packets, 2_048);
+    assert_eq!(probe.session.max_received_bytes, 8_388_608);
+    assert!(probe.session.helper.is_none());
+    assert!(
+        Cli::try_parse_from([
+            "l2solver-active",
+            "arp",
+            "probe",
+            "--interface",
+            "test0",
+            "--target",
+            "192.0.2.10",
+            "--timeout-ms",
+            "30000",
+            "--max-received-packets",
+            "4096",
+            "--max-received-bytes",
+            "16777216",
+        ])
+        .is_ok()
+    );
+    for (flag, value) in [
+        ("--timeout-ms", "0"),
+        ("--timeout-ms", "30001"),
+        ("--max-received-packets", "0"),
+        ("--max-received-packets", "4097"),
+        ("--max-received-bytes", "0"),
+        ("--max-received-bytes", "16777217"),
+    ] {
+        assert!(
+            Cli::try_parse_from([
+                "l2solver-active",
+                "arp",
+                "probe",
+                "--interface",
+                "test0",
+                "--target",
+                "192.0.2.10",
+                flag,
+                value,
+            ])
+            .is_err()
+        );
+    }
     Ok(())
 }

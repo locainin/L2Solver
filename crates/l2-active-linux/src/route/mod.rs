@@ -2,7 +2,6 @@
 
 mod message;
 mod policy;
-mod transport;
 
 #[cfg(test)]
 #[path = "../../tests/route/control.rs"]
@@ -21,7 +20,9 @@ use std::{io, net::Ipv6Addr, sync::atomic::AtomicBool, time::Instant};
 
 use l2_capture::LinuxInterfaceIdentity;
 
-use crate::{InterfaceSelector, pin::PinnedInterface};
+use crate::{InterfaceSelector, netlink, pin::PinnedInterface};
+
+const MAX_REPLY_BYTES: usize = 8_192;
 
 #[derive(Clone, Copy, Debug)]
 struct RouteQuery {
@@ -46,7 +47,7 @@ pub fn verify_on_link(
     deadline: Instant,
     cancelled: &AtomicBool,
 ) -> io::Result<()> {
-    transport::check_control(deadline, cancelled)?;
+    netlink::check_control(deadline, cancelled)?;
     if !valid_unicast(source) || !valid_unicast(target) || source == target {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
@@ -64,9 +65,12 @@ pub fn verify_on_link(
         target,
         ifindex: expected.ifindex(),
     };
-    transport::lookup(query, deadline, cancelled)?;
+    let reply = netlink::exchange(deadline, cancelled, MAX_REPLY_BYTES, |sequence, port| {
+        message::request(query, sequence, port)
+    })?;
+    message::parse_reply(&reply, query)?;
     pinned.revalidate(selector)?;
-    transport::check_control(deadline, cancelled)
+    netlink::check_control(deadline, cancelled)
 }
 
 const fn valid_unicast(address: Ipv6Addr) -> bool {

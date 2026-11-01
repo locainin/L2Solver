@@ -10,14 +10,15 @@ use std::{
 };
 
 use l2_active::{ArpProbe, ArpReport};
-use l2_active_linux::InterfaceSelector;
+use l2_active_linux::{InterfaceSelector, VlanInfo};
 use serde::Serialize;
 
 use super::{
     ActiveOutcome, Error, OutputFormat,
+    interface_view::InterfaceView,
     mac::format_mac,
     neighbor_output::{evidence, status_name},
-    report_common::{self, InterfaceView, LimitsView, QualityView, SendMode},
+    report_common::{self, LimitsView, QualityView, SendMode},
 };
 
 const LIMITATION: &str = "ARP replies are unauthenticated and do not establish freshness or protection; link state and queue readiness are sampled and cannot exclude brief outages, prior loss, or later arrivals";
@@ -58,6 +59,7 @@ struct Report<'a> {
 
 pub fn write(
     interface: &InterfaceSelector,
+    vlan: Option<VlanInfo>,
     probe: &ArpProbe,
     report: &ArpReport,
     close_error: Option<&io::Error>,
@@ -65,17 +67,18 @@ pub fn write(
     output: &mut impl Write,
 ) -> Result<ActiveOutcome, Error> {
     let summary = report.summary();
+    let scope = InterfaceView::new(interface.name(), summary.interface(), vlan);
     let evidence = evidence(report.status(), report.has_conflicting_identities());
     let outcome = report_common::outcome(summary, SendMode::Single, evidence, close_error);
     match format {
-        OutputFormat::Text => write_text(interface, probe, report, close_error, outcome, output)?,
-        OutputFormat::Json => write_json(interface, probe, report, close_error, outcome, output)?,
+        OutputFormat::Text => write_text(&scope, probe, report, close_error, outcome, output)?,
+        OutputFormat::Json => write_json(scope, probe, report, close_error, outcome, output)?,
     }
     Ok(outcome)
 }
 
 fn write_text(
-    interface: &InterfaceSelector,
+    scope: &InterfaceView<'_>,
     probe: &ArpProbe,
     report: &ArpReport,
     close_error: Option<&io::Error>,
@@ -87,10 +90,11 @@ fn write_text(
         output,
         "ARP probe: {} on {} (index {})",
         probe.target(),
-        interface.name().escape_debug(),
+        scope.name().escape_debug(),
         summary.interface().ifindex()
     )
     .map_err(Error::Output)?;
+    scope.write_text(output)?;
     writeln!(
         output,
         "Source: {} ({})",
@@ -134,7 +138,7 @@ fn write_text(
 }
 
 fn write_json(
-    interface: &InterfaceSelector,
+    scope: InterfaceView<'_>,
     probe: &ArpProbe,
     report: &ArpReport,
     close_error: Option<&io::Error>,
@@ -161,7 +165,7 @@ fn write_json(
         status: status_name(report.status()),
         completion: report_common::completion_name(outcome),
         scope: Scope {
-            interface: InterfaceView::new(interface, summary),
+            interface: scope,
             source_ip: probe.source_ip(),
             source_mac: format_mac(probe.source_mac().bytes()),
             target: probe.target(),

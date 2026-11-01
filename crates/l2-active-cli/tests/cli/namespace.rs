@@ -1,8 +1,20 @@
-use std::{error::Error, os::unix::fs::MetadataExt, process::Output};
+use std::{
+    error::Error,
+    os::unix::fs::MetadataExt,
+    process::{Command, Output},
+};
 
-pub fn binary() -> std::ffi::OsString {
-    std::env::var_os("L2_TEST_ACTIVE_BINARY")
-        .unwrap_or_else(|| env!("CARGO_BIN_EXE_l2solver-active").into())
+pub fn command() -> Command {
+    let main = std::env::var_os("L2_TEST_MAIN_BINARY");
+    let binary = main
+        .clone()
+        .or_else(|| std::env::var_os("L2_TEST_ACTIVE_BINARY"))
+        .unwrap_or_else(|| env!("CARGO_BIN_EXE_l2solver-active").into());
+    let mut command = Command::new(binary);
+    if main.is_some() || std::env::var_os("L2_TEST_ACTIVE_MAIN").is_some() {
+        command.arg("active");
+    }
+    command
 }
 
 pub fn assert_owned() -> Result<(), Box<dyn Error>> {

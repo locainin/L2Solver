@@ -37,6 +37,7 @@ fn listener_text_escapes_unicode_controls_and_json_preserves_original_values()
         let mut output = Vec::new();
         let outcome = listen_output::write_discovery(
             &selector,
+            None,
             limits,
             &report,
             Some(&error),
@@ -87,6 +88,7 @@ fn listener_json_propagates_real_output_failure() -> Result<(), Box<dyn Error>> 
     assert!(matches!(
         listen_output::write_discovery(
             &selector,
+            None,
             limits,
             &report,
             None,

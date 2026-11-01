@@ -10,13 +10,15 @@ use std::{
 };
 
 use l2_active::{NdpProbe, NdpReport};
+use l2_active_linux::VlanInfo;
 use serde::Serialize;
 
 use super::{
     ActiveOutcome, Error, NdpProbeArgs, OutputFormat,
+    interface_view::InterfaceView,
     mac::format_mac,
     neighbor_output::{evidence, status_name},
-    report_common::{self, InterfaceView, LimitsView, QualityView, SendMode},
+    report_common::{self, LimitsView, QualityView, SendMode},
 };
 
 const LIMITATION: &str = "Neighbor advertisements are unauthenticated claims and cannot establish freshness or ownership; silence is inconclusive and link state is sampled";
@@ -60,6 +62,7 @@ struct Report<'a> {
 
 pub fn write(
     options: &NdpProbeArgs,
+    vlan: Option<VlanInfo>,
     probe: &NdpProbe,
     report: &NdpReport,
     close_error: Option<&io::Error>,
@@ -81,6 +84,8 @@ pub fn write(
                 report_common::stop_name(summary.stop_reason())
             )
             .map_err(Error::Output)?;
+            InterfaceView::new(options.interface.name(), summary.interface(), vlan)
+                .write_text(output)?;
             for observation in report.observations() {
                 writeln!(
                     output,
@@ -115,7 +120,11 @@ pub fn write(
                 status: status_name(report.status()),
                 completion: report_common::completion_name(outcome),
                 scope: Scope {
-                    interface: InterfaceView::new(&options.interface, summary),
+                    interface: InterfaceView::new(
+                        options.interface.name(),
+                        summary.interface(),
+                        vlan,
+                    ),
                     source_ip: probe.source_ip(),
                     source_prefix_len: probe.prefix_len(),
                     source_mac: format_mac(probe.source_mac().bytes()),

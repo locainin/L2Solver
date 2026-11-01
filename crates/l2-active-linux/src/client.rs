@@ -283,12 +283,7 @@ impl HelperLink {
             poisoned: false,
             signalled: false,
         };
-        let request = open_record(
-            selector,
-            expected.identity(),
-            &link.intent,
-            encoded_deadline,
-        )?;
+        let request = open_record(selector, expected, &link.intent, encoded_deadline)?;
         let startup_deadline = admitted_deadline.min(Instant::now() + STARTUP_TIMEOUT);
         let response = link.exchange(&request, startup_deadline, Some(cancelled))?;
         expect_open(&response, link.intent.tag(), link.intent.frame())?;
@@ -588,7 +583,7 @@ impl Drop for HelperLink {
 
 fn open_record(
     selector: &InterfaceSelector,
-    identity: LinuxInterfaceIdentity,
+    expected: &InterfaceInfo,
     intent: &Intent,
     deadline: u64,
 ) -> io::Result<Vec<u8>> {
@@ -597,7 +592,8 @@ fn open_record(
     writer.u8(intent.tag());
     writer.u8(u8::try_from(selector.name().len()).map_err(io::Error::other)?);
     writer.bytes(selector.name().as_bytes());
-    wire::write_identity(&mut writer, identity);
+    wire::write_identity(&mut writer, expected.identity());
+    wire::write_vlan(&mut writer, expected.vlan());
     writer.bytes(&intent.source_mac().bytes());
     match intent.kind() {
         IntentKind::Arp { source, target } => {

@@ -1,4 +1,4 @@
-use crate::{InterfaceInfo, InterfaceSelector, Ipv4Assignment};
+use crate::{InterfaceInfo, InterfaceSelector, Ipv4Assignment, vlan};
 use nix::{errno::Errno, ifaddrs::getifaddrs, net::if_::if_nametoindex};
 use rustix::{
     fd::OwnedFd,
@@ -8,11 +8,25 @@ use std::{
     fs::File,
     io::{self, Read},
     path::Path,
+    sync::atomic::AtomicBool,
+    time::{Duration, Instant},
 };
 
 const NSFS_MAGIC: u64 = 0x6e73_6673;
 const SYSFS_MAGIC: u64 = 0x6265_6572;
 const MAX_IPV4_ASSIGNMENTS: usize = 256;
+const DISCOVERY_TIMEOUT: Duration = Duration::from_secs(2);
+
+#[derive(Debug)]
+pub struct InterfaceIdentityChanged;
+
+impl std::fmt::Display for InterfaceIdentityChanged {
+    fn fmt(&self, output: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        output.write_str("selected interface identity changed")
+    }
+}
+
+impl std::error::Error for InterfaceIdentityChanged {}
 
 // The held descriptors prevent their identities from being recycled mid-session
 pub struct PinnedInterface {
@@ -75,7 +89,7 @@ impl PinnedInterface {
             || interface.st_dev != self.identity.interface_device()
             || interface.st_ino != self.identity.interface_inode()
         {
-            return Err(io::Error::other("selected interface identity changed"));
+            return Err(io::Error::other(InterfaceIdentityChanged));
         }
         Ok(())
     }
@@ -83,6 +97,29 @@ impl PinnedInterface {
 
 pub fn discover(selector: &InterfaceSelector) -> io::Result<InterfaceInfo> {
     let pinned = PinnedInterface::open(selector)?;
+    let cancelled = AtomicBool::new(false);
+    let deadline = Instant::now() + DISCOVERY_TIMEOUT;
+    discover_with_pin(selector, &pinned, deadline, &cancelled).map(|(info, _)| info)
+}
+
+pub fn discover_with_pin(
+    selector: &InterfaceSelector,
+    pinned: &PinnedInterface,
+    deadline: Instant,
+    cancelled: &AtomicBool,
+) -> io::Result<(InterfaceInfo, Option<vlan::VlanPin>)> {
+    let vlan = vlan::pin(selector, pinned, deadline, cancelled)?;
+    let info = snapshot_with_pin(selector, pinned, vlan.as_ref(), deadline, cancelled)?;
+    Ok((info, vlan))
+}
+
+pub fn snapshot_with_pin(
+    selector: &InterfaceSelector,
+    pinned: &PinnedInterface,
+    vlan: Option<&vlan::VlanPin>,
+    deadline: Instant,
+    cancelled: &AtomicBool,
+) -> io::Result<InterfaceInfo> {
     let mac = parse_mac(&read_property(&pinned.interface, "address")?)?;
     let mtu = read_property(&pinned.interface, "mtu")?
         .parse()
@@ -94,8 +131,8 @@ pub fn discover(selector: &InterfaceSelector) -> io::Result<InterfaceInfo> {
     let mut assignments = ipv4_assignments(selector)?;
     assignments.sort_by_key(|assignment| (assignment.address, assignment.netmask));
     assignments.dedup();
-    // Reopen both names after reading to detect replacement during discovery
-    pinned.revalidate(selector)?;
+    // Recheck the held identities and VLAN metadata after sampling properties
+    revalidate_scope(selector, pinned, vlan, deadline, cancelled)?;
     Ok(InterfaceInfo {
         name: selector.name().to_owned(),
         identity: pinned.identity,
@@ -104,7 +141,21 @@ pub fn discover(selector: &InterfaceSelector) -> io::Result<InterfaceInfo> {
         flags,
         hardware_type,
         assignments,
+        vlan: vlan.map(vlan::VlanPin::info),
     })
+}
+
+pub fn revalidate_scope(
+    selector: &InterfaceSelector,
+    selected: &PinnedInterface,
+    vlan: Option<&vlan::VlanPin>,
+    deadline: Instant,
+    cancelled: &AtomicBool,
+) -> io::Result<()> {
+    vlan.map_or_else(
+        || vlan::check_unscoped(selector, selected, deadline, cancelled),
+        |vlan| vlan.revalidate(selector, selected, deadline, cancelled),
+    )
 }
 
 fn read_flags(interface: &OwnedFd) -> io::Result<u32> {

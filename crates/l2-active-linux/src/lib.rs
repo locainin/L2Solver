@@ -3,6 +3,10 @@
 mod admission;
 mod discovery;
 mod selector;
+mod vlan;
+
+/// Hardware and driver capabilities for one selected Ethernet interface
+pub mod ethernet_capabilities;
 
 /// Checked IPv6 source discovery and NDP preparation
 #[cfg(target_os = "linux")]
@@ -10,6 +14,9 @@ pub mod ndp;
 
 #[cfg(target_os = "linux")]
 mod pin;
+
+#[cfg(target_os = "linux")]
+mod netlink;
 
 #[cfg(target_os = "linux")]
 mod route;
@@ -61,5 +68,6 @@ pub use client::HelperLink;
 pub use worker::run_helper;
 
 pub use admission::select_arp_source;
-pub use discovery::{InterfaceInfo, Ipv4Assignment, discover};
+pub use discovery::{InterfaceInfo, Ipv4Assignment, discover, discover_until};
 pub use selector::InterfaceSelector;
+pub use vlan::{VlanInfo, VlanProtocol, VlanScopeChanged};

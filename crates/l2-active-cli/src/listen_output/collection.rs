@@ -10,7 +10,8 @@ use serde_json::ser::{CompactFormatter, Formatter, PrettyFormatter};
 
 use crate::{
     ActiveOutcome, Error, OutputFormat,
-    report_common::{self, Evidence, InterfaceView, LimitsView, QualityView, SendMode},
+    interface_view::InterfaceView,
+    report_common::{self, Evidence, LimitsView, QualityView, SendMode},
 };
 
 #[derive(Serialize)]
@@ -55,6 +56,7 @@ struct Report<'a, T, D> {
 pub(super) struct Collection<'a, T, D> {
     pub operation: Operation,
     pub interface: &'a InterfaceSelector,
+    pub vlan: Option<l2_active_linux::VlanInfo>,
     pub limits: Limits,
     pub summary: &'a RunSummary,
     pub observations: Vec<T>,
@@ -78,7 +80,7 @@ impl<T: Serialize, D: Serialize> Collection<'_, T, D> {
             operation: self.operation.name,
             status: self.operation.status,
             completion: report_common::completion_name(outcome),
-            scope: InterfaceView::new(self.interface, self.summary),
+            scope: InterfaceView::new(self.interface.name(), self.summary.interface(), self.vlan),
             limits: LimitsView::new(self.limits),
             quality: QualityView::new(self.summary, self.close_error),
             authenticated: false,

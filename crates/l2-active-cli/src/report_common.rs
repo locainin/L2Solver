@@ -3,10 +3,9 @@
 use std::{fmt::Write as _, io};
 
 use l2_active::{Limits, RunSummary, StopReason};
-use l2_active_linux::InterfaceSelector;
 use serde::Serialize;
 
-use super::{ActiveOutcome, Error, diagnostic::io_code};
+use super::{ActiveOutcome, Error, diagnostic::io_error_code};
 
 #[cfg(test)]
 #[path = "../tests/reporting/mod.rs"]
@@ -62,30 +61,6 @@ pub fn complete(summary: &RunSummary, mode: SendMode, close_error: Option<&io::E
         && summary.accounting_error().is_none()
         && summary.backlog_error().is_none()
         && close_error.is_none()
-}
-
-#[derive(Debug, Serialize)]
-pub struct InterfaceView<'a> {
-    interface: &'a str,
-    ifindex: u32,
-    namespace_device: u64,
-    namespace_inode: u64,
-    interface_device: u64,
-    interface_inode: u64,
-}
-
-impl<'a> InterfaceView<'a> {
-    pub fn new(selector: &'a InterfaceSelector, summary: &RunSummary) -> Self {
-        let identity = summary.interface();
-        Self {
-            interface: selector.name(),
-            ifindex: identity.ifindex(),
-            namespace_device: identity.namespace_device(),
-            namespace_inode: identity.namespace_inode(),
-            interface_device: identity.interface_device(),
-            interface_inode: identity.interface_inode(),
-        }
-    }
 }
 
 #[derive(Debug, Serialize)]
@@ -231,7 +206,7 @@ pub const fn stop_name(reason: StopReason) -> &'static str {
 
 fn diagnostic(error: &io::Error) -> Diagnostic {
     Diagnostic {
-        code: io_code(error.kind()),
+        code: io_error_code(error),
         message: error.to_string(),
     }
 }
@@ -291,7 +266,7 @@ pub fn write_text_quality(
             writeln!(
                 output,
                 "{stage} error ({}): {}",
-                io_code(error.kind()),
+                io_error_code(error),
                 error.to_string().escape_debug()
             )
             .map_err(Error::Output)?;

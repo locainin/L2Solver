@@ -241,21 +241,9 @@ pub struct ArpProbeArgs {
     #[arg(long, value_name = "MAC", value_parser = mac_address)]
     pub expected_mac: Option<MacAddress>,
 
-    /// Path to the installed active helper, when it is not beside this program
-    #[arg(long, value_name = "PATH")]
-    pub helper: Option<PathBuf>,
-
-    /// Maximum helper startup and probe time in milliseconds
-    #[arg(long, default_value_t = 2_000, value_parser = clap::value_parser!(u64).range(1..=l2_active::MAX_TIMEOUT.as_secs() * 1_000))]
-    pub timeout_ms: u64,
-
-    /// Maximum total received frames examined during the probe
-    #[arg(long, default_value_t = 2_048, value_parser = clap::value_parser!(u32).range(1..=i64::from(l2_active::MAX_RECEIVED_PACKETS)))]
-    pub max_received_packets: u32,
-
-    /// Maximum total received frame bytes examined during the probe
-    #[arg(long, default_value_t = 8_388_608, value_parser = clap::value_parser!(u64).range(1..=l2_active::MAX_RECEIVED_BYTES))]
-    pub max_received_bytes: u64,
+    /// Shared helper selection and finite observation budgets
+    #[command(flatten)]
+    pub session: SessionArgs,
 }
 
 fn interface_selector(name: &str) -> Result<InterfaceSelector, String> {

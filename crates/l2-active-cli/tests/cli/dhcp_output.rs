@@ -45,6 +45,7 @@ fn default_text_reports_observed_offer_and_collection_limits() -> Result<(), Box
     assert_eq!(
         write(
             &options()?,
+            None,
             &plan,
             &report,
             None,
@@ -90,6 +91,7 @@ fn unexpected_server_is_a_finding_with_its_original_offer() -> Result<(), Box<dy
     let mut bytes = Vec::new();
     let outcome = write(
         &options()?,
+        None,
         &plan,
         &report,
         None,
@@ -98,6 +100,7 @@ fn unexpected_server_is_a_finding_with_its_original_offer() -> Result<(), Box<dy
     )?;
     assert_eq!(outcome, ActiveOutcome::Findings);
     let value: serde_json::Value = serde_json::from_slice(&bytes)?;
+    crate::fixture_assert::sampled_non_vlan_scope(&value);
     assert_eq!(
         value.get("status").and_then(serde_json::Value::as_str),
         Some("unexpected_server")
@@ -126,6 +129,7 @@ fn no_offer_is_inconclusive_after_a_clean_deadline() -> Result<(), Box<dyn StdEr
     let mut bytes = Vec::new();
     let outcome = write(
         &options()?,
+        None,
         &plan,
         &report,
         None,
@@ -158,6 +162,7 @@ fn loss_and_failed_cleanup_keep_the_observed_offer_in_an_incomplete_report()
     let mut bytes = Vec::new();
     let outcome = write(
         &options()?,
+        None,
         &plan,
         &report,
         Some(&close),

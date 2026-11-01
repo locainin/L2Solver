@@ -5,8 +5,8 @@ use std::io;
 mod tests;
 
 pub const OPEN: u8 = 1;
-// Version 8 requires direct-route checks for non-link-local NDP
-pub const VERSION: u8 = 8;
+// Version 9 binds each operation to its sampled VLAN and parent identity
+pub const VERSION: u8 = 9;
 pub const SEND: u8 = 2;
 pub const RECEIVE: u8 = 3;
 pub const LOSS: u8 = 4;
@@ -126,18 +126,77 @@ pub fn read_identity(reader: &mut Reader<'_>) -> io::Result<l2_capture::LinuxInt
     .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))
 }
 
+pub fn write_vlan(writer: &mut Writer, vlan: Option<crate::VlanInfo>) {
+    if let Some(vlan) = vlan {
+        writer.u8(1);
+        writer.u16(vlan.id());
+        writer.u8(match vlan.protocol() {
+            crate::VlanProtocol::Ieee8021Q => 1,
+            crate::VlanProtocol::Ieee8021Ad => 2,
+        });
+        write_identity(writer, vlan.parent_identity());
+        writer.u8(u8::from(vlan.reorders_headers()));
+    } else {
+        writer.u8(0);
+    }
+}
+
+pub fn read_vlan(
+    reader: &mut Reader<'_>,
+    selected: l2_capture::LinuxInterfaceIdentity,
+) -> io::Result<Option<crate::VlanInfo>> {
+    match reader.u8()? {
+        0 => Ok(None),
+        1 => {
+            let id = reader.u16()?;
+            if id >= 4095 {
+                return Err(invalid_record());
+            }
+            let protocol = match reader.u8()? {
+                1 => crate::VlanProtocol::Ieee8021Q,
+                2 => crate::VlanProtocol::Ieee8021Ad,
+                _ => return Err(invalid_record()),
+            };
+            let parent = read_identity(reader)?;
+            if parent.namespace_device() != selected.namespace_device()
+                || parent.namespace_inode() != selected.namespace_inode()
+                || parent.ifindex() == selected.ifindex()
+            {
+                return Err(invalid_record());
+            }
+            let reorders_headers = match reader.u8()? {
+                0 => false,
+                1 => true,
+                _ => return Err(invalid_record()),
+            };
+            Ok(Some(crate::VlanInfo {
+                id,
+                protocol,
+                parent,
+                reorders_headers,
+            }))
+        }
+        _ => Err(invalid_record()),
+    }
+}
+
 pub fn error_record(error: &io::Error) -> Vec<u8> {
-    let kind = match error.kind() {
-        io::ErrorKind::InvalidInput => 1,
-        io::ErrorKind::PermissionDenied => 2,
-        io::ErrorKind::NotFound => 3,
-        io::ErrorKind::Unsupported => 4,
-        io::ErrorKind::Interrupted => 5,
-        io::ErrorKind::TimedOut => 6,
-        io::ErrorKind::NotConnected => 7,
-        io::ErrorKind::NetworkUnreachable => 8,
-        io::ErrorKind::HostUnreachable => 9,
-        _ => 0,
+    let kind = if matches!(error.get_ref(), Some(source) if source.is::<crate::VlanScopeChanged>())
+    {
+        10
+    } else {
+        match error.kind() {
+            io::ErrorKind::InvalidInput => 1,
+            io::ErrorKind::PermissionDenied => 2,
+            io::ErrorKind::NotFound => 3,
+            io::ErrorKind::Unsupported => 4,
+            io::ErrorKind::Interrupted => 5,
+            io::ErrorKind::TimedOut => 6,
+            io::ErrorKind::NotConnected => 7,
+            io::ErrorKind::NetworkUnreachable => 8,
+            io::ErrorKind::HostUnreachable => 9,
+            _ => 0,
+        }
     };
     let message: String = error.to_string().chars().take(128).collect();
     let mut writer = Writer::new(ERROR);
@@ -147,7 +206,8 @@ pub fn error_record(error: &io::Error) -> Vec<u8> {
 }
 
 pub fn read_error(reader: &mut Reader<'_>) -> io::Result<io::Error> {
-    let kind = match reader.u8()? {
+    let code = reader.u8()?;
+    let kind = match code {
         1 => io::ErrorKind::InvalidInput,
         2 => io::ErrorKind::PermissionDenied,
         3 => io::ErrorKind::NotFound,
@@ -157,12 +217,16 @@ pub fn read_error(reader: &mut Reader<'_>) -> io::Result<io::Error> {
         7 => io::ErrorKind::NotConnected,
         8 => io::ErrorKind::NetworkUnreachable,
         9 => io::ErrorKind::HostUnreachable,
+        10 => io::ErrorKind::InvalidData,
         0 => io::ErrorKind::Other,
         _ => return Err(invalid_record()),
     };
     let message = std::str::from_utf8(reader.rest()?).map_err(|_| invalid_record())?;
     if message.len() > 512 {
         return Err(invalid_record());
+    }
+    if code == 10 {
+        return Ok(io::Error::new(kind, crate::VlanScopeChanged));
     }
     Ok(io::Error::new(kind, message.to_owned()))
 }

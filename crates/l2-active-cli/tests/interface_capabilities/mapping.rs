@@ -1,4 +1,9 @@
-use std::{error::Error, future, time::Duration};
+use std::{
+    error::Error,
+    future,
+    sync::atomic::{AtomicBool, Ordering},
+    time::Duration,
+};
 
 use super::{QueryFailure, bounded_query, from_failure, from_inventory};
 use wifi_linux::{
@@ -87,15 +92,15 @@ fn no_monitor_evidence_remains_unknown() -> Result<(), Box<dyn Error>> {
 }
 
 #[test]
-fn timeout_and_inventory_errors_stay_unknown_with_distinct_reasons() {
-    let timeout = from_failure(QueryFailure::Timeout);
+fn timeout_and_inventory_errors_stay_unknown_with_distinct_reasons() -> Result<(), Box<dyn Error>> {
+    let timeout = from_failure(QueryFailure::Timeout)?;
     assert_eq!(timeout.status, "unknown");
     assert_eq!(timeout.reason.as_deref(), Some("nl80211_timeout"));
     assert_eq!(timeout.monitor_mode, "unknown");
 
     let failed = from_failure(QueryFailure::Discovery(DiscoveryError::Netlink(
         "permission denied".into(),
-    )));
+    )))?;
     assert_eq!(failed.status, "unknown");
     assert_eq!(failed.reason.as_deref(), Some("nl80211_error"));
     assert!(
@@ -105,6 +110,7 @@ fn timeout_and_inventory_errors_stay_unknown_with_distinct_reasons() {
             .is_some_and(|text| text.contains("permission denied"))
     );
     assert_eq!(failed.injection, "unknown");
+    Ok(())
 }
 
 #[test]
@@ -113,7 +119,7 @@ fn netlink_error_details_are_bounded_and_json_control_characters_are_escaped()
     let failure = from_failure(QueryFailure::Discovery(DiscoveryError::Netlink(format!(
         "\u{1b}{}",
         "x".repeat(1_024)
-    ))));
+    ))))?;
     let detail = failure.detail.as_deref().ok_or("missing error detail")?;
     assert!(detail.chars().count() <= 257);
     let json = serde_json::to_string(&failure)?;
@@ -124,18 +130,37 @@ fn netlink_error_details_are_bounded_and_json_control_characters_are_escaped()
 
 #[test]
 fn pending_inventory_stops_at_the_requested_deadline() {
-    let result = bounded_query(Duration::from_millis(20), || {
+    let result = bounded_query(Duration::from_millis(20), &AtomicBool::new(false), || {
         future::pending::<Result<WirelessInventory, DiscoveryError>>()
     });
     assert!(matches!(result, Err(QueryFailure::Timeout)));
 }
 
 #[test]
-fn late_non_yielding_inventory_is_not_reported_as_success() {
-    let result = bounded_query(Duration::from_millis(5), || async {
-        std::thread::sleep(Duration::from_millis(25));
-        WirelessInventory::new(vec![], vec![])
+fn cancellation_interrupts_a_pending_wireless_inventory() {
+    let cancelled = AtomicBool::new(false);
+    std::thread::scope(|scope| {
+        scope.spawn(|| {
+            std::thread::sleep(Duration::from_millis(20));
+            cancelled.store(true, Ordering::Release);
+        });
+        let result = bounded_query(Duration::from_secs(5), &cancelled, || {
+            future::pending::<Result<WirelessInventory, DiscoveryError>>()
+        });
+        assert!(matches!(result, Err(QueryFailure::Cancelled)));
     });
+}
+
+#[test]
+fn late_non_yielding_inventory_is_not_reported_as_success() {
+    let result = bounded_query(
+        Duration::from_millis(5),
+        &AtomicBool::new(false),
+        || async {
+            std::thread::sleep(Duration::from_millis(25));
+            WirelessInventory::new(vec![], vec![])
+        },
+    );
     assert!(matches!(result, Err(QueryFailure::Timeout)));
 }
 
@@ -143,7 +168,7 @@ fn late_non_yielding_inventory_is_not_reported_as_success() {
 fn query_can_run_inside_an_existing_tokio_runtime() -> Result<(), Box<dyn Error>> {
     let runtime = tokio::runtime::Builder::new_current_thread().build()?;
     let result = runtime.block_on(async {
-        bounded_query(Duration::from_secs(1), || async {
+        bounded_query(Duration::from_secs(1), &AtomicBool::new(false), || async {
             WirelessInventory::new(vec![], vec![])
         })
     });

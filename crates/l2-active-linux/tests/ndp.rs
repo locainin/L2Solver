@@ -1,9 +1,38 @@
 #![cfg(target_os = "linux")]
 
-use std::{fs, io, net::Ipv6Addr, time::Duration};
+use std::{
+    fs, io,
+    net::Ipv6Addr,
+    sync::atomic::AtomicBool,
+    time::{Duration, Instant},
+};
 
 use l2_active::Limits;
 use l2_active_linux::{InterfaceSelector, ndp};
+
+#[test]
+fn bounded_ipv6_discovery_honors_cancellation_and_expired_deadline() -> io::Result<()> {
+    let selector = InterfaceSelector::new("lo")?;
+    let cancelled = AtomicBool::new(true);
+    assert_eq!(
+        ndp::discover_until(
+            &selector,
+            Instant::now() + Duration::from_secs(1),
+            &cancelled
+        )
+        .err()
+        .map(|error| error.kind()),
+        Some(io::ErrorKind::Interrupted)
+    );
+    cancelled.store(false, std::sync::atomic::Ordering::Release);
+    assert_eq!(
+        ndp::discover_until(&selector, Instant::now(), &cancelled)
+            .err()
+            .map(|error| error.kind()),
+        Some(io::ErrorKind::TimedOut)
+    );
+    Ok(())
+}
 
 #[test]
 fn loopback_ipv6_snapshot_is_bound_to_the_selected_interface() -> io::Result<()> {

@@ -44,7 +44,19 @@ fn run_platform(
     use super::{dot1x_output, session_options};
     use l2_active_linux::HelperLink;
 
-    let info = l2_active_linux::discover(&options.interface).map_err(Error::Discovery)?;
+    let Some(info) = super::preflight::cancelled_discovery(
+        super::preflight::discover(&options.interface, cancelled),
+        cancelled,
+    )?
+    else {
+        return stopped(
+            options,
+            format,
+            output,
+            PreflightStop::Cancelled,
+            HelperStage::NotStarted,
+        );
+    };
     let source = l2_onpath::MacAddress::new(info.mac()).map_err(Error::Address)?;
     let limits = session_options::limits(&options.session)?;
     let plan = l2_active::dot1x::Dot1xProbe::new(source, limits)
@@ -86,6 +98,7 @@ fn run_platform(
     let (report, close_error) = session_options::finish(result, link.close())?;
     dot1x_output::write(
         options,
+        info.vlan(),
         &plan,
         &report,
         close_error.as_ref(),

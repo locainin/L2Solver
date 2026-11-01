@@ -39,7 +39,17 @@ fn run_platform(
 
     use super::{ndp_output, session_options};
 
-    let (info, plan) = prepare(options)?;
+    let Some((info, plan)) =
+        super::preflight::cancelled_discovery(prepare(options, cancelled), cancelled)?
+    else {
+        return stopped(
+            options,
+            format,
+            output,
+            PreflightStop::Cancelled,
+            HelperStage::NotStarted,
+        );
+    };
     if cancelled.load(Ordering::Acquire) {
         return stopped(
             options,
@@ -76,6 +86,7 @@ fn run_platform(
     let (report, close_error) = session_options::finish(result, link.close())?;
     ndp_output::write(
         options,
+        info.interface().vlan(),
         &plan,
         &report,
         close_error.as_ref(),
@@ -87,8 +98,14 @@ fn run_platform(
 #[cfg(target_os = "linux")]
 fn prepare(
     options: &NdpProbeArgs,
+    cancelled: &AtomicBool,
 ) -> Result<(l2_active_linux::ndp::NdpInterfaceInfo, l2_active::NdpProbe), Error> {
-    let info = l2_active_linux::ndp::discover(&options.interface).map_err(Error::Discovery)?;
+    let info = l2_active_linux::ndp::discover_until(
+        &options.interface,
+        super::preflight::discovery_deadline()?,
+        cancelled,
+    )
+    .map_err(Error::Discovery)?;
     let limits = super::session_options::limits(&options.session)?;
     let plan = l2_active_linux::ndp::prepare(
         &info,

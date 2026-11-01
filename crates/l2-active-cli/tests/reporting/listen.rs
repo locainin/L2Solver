@@ -42,6 +42,7 @@ fn stp_output_retains_exact_root_claim_and_timer_units() -> Result<(), Box<dyn E
     assert_eq!(
         listen_output::write_stp(
             &InterfaceSelector::new("test0")?,
+            None,
             limits,
             &report,
             None,
@@ -51,6 +52,7 @@ fn stp_output_retains_exact_root_claim_and_timer_units() -> Result<(), Box<dyn E
         ActiveOutcome::Completed
     );
     let value: serde_json::Value = serde_json::from_slice(&output)?;
+    crate::fixture_assert::sampled_non_vlan_scope(&value);
     assert_eq!(
         value
             .pointer("/observations/0/decoded/root/mac")
@@ -100,6 +102,7 @@ fn discovery_retains_observed_identity_when_capture_quality_is_unknown()
     assert_eq!(
         listen_output::write_discovery(
             &selector,
+            None,
             limits,
             &report,
             None,
@@ -145,6 +148,7 @@ fn discovery_retains_observed_identity_when_capture_quality_is_unknown()
     output.clear();
     listen_output::write_discovery(
         &selector,
+        None,
         limits,
         &report,
         None,
@@ -198,6 +202,7 @@ fn valid_discovery_and_parser_limit_preserve_evidence_but_remain_incomplete()
     assert_eq!(
         listen_output::write_discovery(
             &InterfaceSelector::new("test0")?,
+            None,
             limits,
             &report,
             None,
@@ -252,6 +257,7 @@ fn valid_stp_and_unsupported_version_preserve_claims_but_remain_incomplete()
     assert_eq!(
         listen_output::write_stp(
             &InterfaceSelector::new("test0")?,
+            None,
             limits,
             &report,
             None,
@@ -302,6 +308,7 @@ fn silent_listeners_report_inconclusive_with_zero_transmissions() -> Result<(), 
     assert_eq!(
         listen_output::write_stp(
             &selector,
+            None,
             limits,
             &stp,
             None,
@@ -325,6 +332,7 @@ fn silent_listeners_report_inconclusive_with_zero_transmissions() -> Result<(), 
     assert_eq!(
         listen_output::write_discovery(
             &selector,
+            None,
             limits,
             &discovery,
             None,

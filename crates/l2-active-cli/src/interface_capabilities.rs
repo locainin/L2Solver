@@ -1,13 +1,9 @@
 //! Read-only wireless evidence for one selected Linux interface
 
-use std::io;
+use std::{io, sync::atomic::AtomicBool, time::Instant};
 
 #[cfg(target_os = "linux")]
-use std::{
-    future::Future,
-    thread,
-    time::{Duration, Instant},
-};
+use std::{future::Future, sync::atomic::Ordering, thread, time::Duration};
 
 use l2_active_linux::{InterfaceInfo, InterfaceSelector};
 use serde::Serialize;
@@ -80,24 +76,34 @@ impl WirelessCapabilities {
 pub fn discover(
     selector: &InterfaceSelector,
     before: &InterfaceInfo,
+    deadline: Instant,
+    cancelled: &AtomicBool,
 ) -> io::Result<WirelessCapabilities> {
-    let inventory = bounded_query(INVENTORY_TIMEOUT, wifi_linux::discover);
-    let after = l2_active_linux::discover(selector)?;
+    let capabilities = match bounded_query(INVENTORY_TIMEOUT, cancelled, wifi_linux::discover) {
+        Ok(inventory) => from_inventory(before.name(), before.identity().ifindex(), &inventory),
+        Err(error) => from_failure(error),
+    }?;
+    let after = l2_active_linux::discover_until(selector, deadline, cancelled)?;
     if before.identity() != after.identity() {
         return Err(io::Error::other(
             "selected interface changed during wireless discovery",
         ));
     }
-    match inventory {
-        Ok(inventory) => from_inventory(before.name(), before.identity().ifindex(), &inventory),
-        Err(error) => Ok(from_failure(error)),
+    if before.vlan() != after.vlan() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            l2_active_linux::VlanScopeChanged,
+        ));
     }
+    Ok(capabilities)
 }
 
 #[cfg(not(target_os = "linux"))]
 pub fn discover(
     _selector: &InterfaceSelector,
     _before: &InterfaceInfo,
+    _deadline: Instant,
+    _cancelled: &AtomicBool,
 ) -> io::Result<WirelessCapabilities> {
     Err(io::Error::new(
         io::ErrorKind::Unsupported,
@@ -156,6 +162,7 @@ fn from_inventory(
 #[cfg(target_os = "linux")]
 #[derive(Debug)]
 enum QueryFailure {
+    Cancelled,
     Timeout,
     Discovery(DiscoveryError),
     Runtime(io::Error),
@@ -163,14 +170,20 @@ enum QueryFailure {
 }
 
 #[cfg(target_os = "linux")]
-fn from_failure(error: QueryFailure) -> WirelessCapabilities {
+fn from_failure(error: QueryFailure) -> io::Result<WirelessCapabilities> {
     let (reason, detail) = match error {
+        QueryFailure::Cancelled => {
+            return Err(io::Error::new(
+                io::ErrorKind::Interrupted,
+                "discovery cancelled",
+            ));
+        }
         QueryFailure::Timeout => ("nl80211_timeout", None),
         QueryFailure::Discovery(error) => ("nl80211_error", Some(bounded_detail(&error))),
         QueryFailure::Runtime(error) => ("runtime_error", Some(bounded_detail(&error))),
         QueryFailure::WorkerPanicked => ("worker_failed", None),
     };
-    WirelessCapabilities::unavailable("unknown", reason, detail)
+    Ok(WirelessCapabilities::unavailable("unknown", reason, detail))
 }
 
 #[cfg(target_os = "linux")]
@@ -186,7 +199,11 @@ fn bounded_detail(error: &impl std::fmt::Display) -> String {
 }
 
 #[cfg(target_os = "linux")]
-fn bounded_query<F, Fut>(timeout: Duration, query: F) -> Result<WirelessInventory, QueryFailure>
+fn bounded_query<F, Fut>(
+    timeout: Duration,
+    cancelled: &AtomicBool,
+    query: F,
+) -> Result<WirelessInventory, QueryFailure>
 where
     F: FnOnce() -> Fut + Send,
     Fut: Future<Output = Result<WirelessInventory, DiscoveryError>>,
@@ -202,15 +219,29 @@ where
                     .build()
                     .map_err(QueryFailure::Runtime)?;
                 runtime.block_on(async {
-                    tokio::time::timeout_at(tokio::time::Instant::from_std(deadline), query())
-                        .await
-                        .map_err(|_| QueryFailure::Timeout)?
-                        .map_err(QueryFailure::Discovery)
+                    let mut query = std::pin::pin!(query());
+                    loop {
+                        if cancelled.load(Ordering::Acquire) {
+                            return Err(QueryFailure::Cancelled);
+                        }
+                        let remaining = deadline.saturating_duration_since(Instant::now());
+                        if remaining.is_zero() {
+                            return Err(QueryFailure::Timeout);
+                        }
+                        // Poll cancellation while preserving the original future across waits
+                        let slice = remaining.min(Duration::from_millis(25));
+                        if let Ok(result) = tokio::time::timeout(slice, query.as_mut()).await {
+                            return result.map_err(QueryFailure::Discovery);
+                        }
+                    }
                 })
             })
             .map_err(QueryFailure::Runtime)?;
         let result = worker.join().map_err(|_| QueryFailure::WorkerPanicked)?;
         // Synchronous work can finish late before the async timer gets polled again
+        if cancelled.load(Ordering::Acquire) {
+            return Err(QueryFailure::Cancelled);
+        }
         if Instant::now() >= deadline {
             return Err(QueryFailure::Timeout);
         }

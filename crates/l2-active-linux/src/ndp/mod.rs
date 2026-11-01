@@ -8,4 +8,4 @@ mod discovery;
 mod tests;
 
 pub use admission::prepare;
-pub use discovery::{Ipv6Assignment, NdpInterfaceInfo, discover};
+pub use discovery::{Ipv6Assignment, NdpInterfaceInfo, discover, discover_until};

@@ -7,7 +7,18 @@ use netlink_packet_route::{
 };
 use netlink_sys::SocketAddr;
 
-use super::{RouteQuery, message::parse_reply};
+use super::RouteQuery;
+
+fn parse_reply(
+    bytes: &[u8],
+    peer: SocketAddr,
+    sequence: u32,
+    port: u32,
+    query: RouteQuery,
+) -> io::Result<()> {
+    crate::netlink::validate_reply(bytes, peer, sequence, port)?;
+    super::message::parse_reply(bytes, query)
+}
 
 fn response(query: RouteQuery, sequence: u32, port: u32) -> Vec<u8> {
     let mut route = RouteMessage::default();

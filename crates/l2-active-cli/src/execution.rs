@@ -1,11 +1,16 @@
 //! Execute only explicitly scoped native operations
 
-use std::{io::Write, sync::atomic::AtomicBool};
+use std::{
+    io::Write,
+    sync::atomic::{AtomicBool, Ordering},
+};
 
 use super::{
     ActiveArgs, ActiveCommand, ArpCommand, DhcpCommand, Dot1xCommand, Error, ListenCommand,
     NdpCommand, capabilities, dhcp_probe, dot1x_probe, interface_capabilities, listen_probe,
-    ndp_probe, probe,
+    ndp_probe,
+    preflight::{self, HelperStage, PreflightStop},
+    probe,
 };
 
 /// Process outcome that the main application can map to its own exit policy
@@ -32,10 +37,46 @@ pub fn execute(
 ) -> Result<ActiveOutcome, Error> {
     match &args.command {
         ActiveCommand::Capabilities(options) => {
-            let info = l2_active_linux::discover(&options.interface).map_err(Error::Discovery)?;
-            let wireless = interface_capabilities::discover(&options.interface, &info)
-                .map_err(Error::Discovery)?;
-            capabilities::write(&info, &wireless, args.format, output)?;
+            if cancelled.load(Ordering::Acquire) {
+                return stopped_capabilities(options, args.format, output);
+            }
+            let Some(info) = preflight::cancelled_discovery(
+                preflight::discover(&options.interface, cancelled),
+                cancelled,
+            )?
+            else {
+                return stopped_capabilities(options, args.format, output);
+            };
+            let Some(ethernet) = preflight::cancelled_discovery(
+                l2_active_linux::ethernet_capabilities::discover(
+                    &options.interface,
+                    info.identity(),
+                    preflight::discovery_deadline()?,
+                    cancelled,
+                )
+                .map_err(Error::Discovery),
+                cancelled,
+            )?
+            else {
+                return stopped_capabilities(options, args.format, output);
+            };
+            let Some(wireless) = preflight::cancelled_discovery(
+                interface_capabilities::discover(
+                    &options.interface,
+                    &info,
+                    preflight::discovery_deadline()?,
+                    cancelled,
+                )
+                .map_err(Error::Discovery),
+                cancelled,
+            )?
+            else {
+                return stopped_capabilities(options, args.format, output);
+            };
+            if cancelled.load(Ordering::Acquire) {
+                return stopped_capabilities(options, args.format, output);
+            }
+            capabilities::write(&info, &wireless, ethernet, args.format, output)?;
             Ok(ActiveOutcome::Completed)
         }
         ActiveCommand::Arp {
@@ -69,4 +110,20 @@ pub fn execute(
             command: Dot1xCommand::Probe(options),
         } => dot1x_probe::run(options, args.format, cancelled, output),
     }
+}
+
+fn stopped_capabilities(
+    options: &super::InterfaceArgs,
+    format: super::OutputFormat,
+    output: &mut impl Write,
+) -> Result<ActiveOutcome, Error> {
+    preflight::write_stopped(
+        "capabilities",
+        &options.interface,
+        None,
+        format,
+        output,
+        PreflightStop::Cancelled,
+        HelperStage::NotStarted,
+    )
 }

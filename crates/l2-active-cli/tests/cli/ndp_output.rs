@@ -51,6 +51,7 @@ fn default_text_reports_neighbor_claim_and_observation_limits() -> Result<(), Bo
     assert_eq!(
         write(
             &options,
+            None,
             &plan,
             &report,
             None,
@@ -116,6 +117,7 @@ fn unexpected_neighbor_claim_is_retained_when_capture_loss_makes_it_incomplete()
         assert_eq!(
             write(
                 &options,
+                None,
                 &plan,
                 &report,
                 None,
@@ -125,6 +127,7 @@ fn unexpected_neighbor_claim_is_retained_when_capture_loss_makes_it_incomplete()
             expected_outcome
         );
         let value: serde_json::Value = serde_json::from_slice(&bytes)?;
+        crate::fixture_assert::sampled_non_vlan_scope(&value);
         assert_eq!(
             value.get("status").and_then(serde_json::Value::as_str),
             Some("unexpected_identity")

@@ -133,7 +133,7 @@ fn observe_fixture(protocol: &str, prefix: &str, group: &str) -> Result<(), Box<
     .trim()
     .parse()?;
     let baseline = memberships(index, group)?;
-    let mut child = Command::new(crate::namespace::binary())
+    let mut child = crate::namespace::command()
         .args([
             protocol,
             "observe",
