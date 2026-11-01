@@ -107,7 +107,7 @@ impl<A: Admission> Buffer<A> {
         Ok(buffer)
     }
 
-    pub fn from_untracked(bytes: Vec<u8>, lease: A::Lease) -> Self {
+    pub const fn from_untracked(bytes: Vec<u8>, lease: A::Lease) -> Self {
         Self { bytes, lease }
     }
 

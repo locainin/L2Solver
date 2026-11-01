@@ -10,8 +10,8 @@ use crate::{
 };
 use std::{convert::Infallible, error::Error, fmt};
 
-#[derive(Debug)]
-pub(crate) enum RegionMemoryError {
+#[derive(Clone, Copy, Debug)]
+pub enum RegionMemoryError {
     Memory(MemoryError),
     Allocation,
 }

@@ -1068,18 +1068,25 @@ fn prepare_export_directory(
     job: &Job,
     memory: &MemoryBudget,
 ) -> Result<InputSet, Box<dyn Error>> {
+    // Keep the owned anchor path covered for the lifetime of the input set
+    let path_bytes = path.as_os_str().as_encoded_bytes().len();
+    let mut metadata_memory = memory.try_reserve(MemoryClass::Base, u64::try_from(path_bytes)?)?;
+    let mut anchor_path = PathBuf::new();
+    anchor_path.try_reserve_exact(path_bytes)?;
+    metadata_memory.try_resize(u64::try_from(anchor_path.capacity())?)?;
+    anchor_path.push(path);
     #[cfg(target_os = "linux")]
-    let directory = DirectoryAnchor::open(path)?;
+    let directory = DirectoryAnchor::open(anchor_path)?;
     #[cfg(not(target_os = "linux"))]
-    let directory = path.to_owned();
+    let directory = anchor_path;
 
-    let (manifest_bytes, manifest_sha256, metadata_memory) = read_directory_member(
+    let (manifest_bytes, manifest_sha256) = read_directory_member(
         &directory,
         "manifest.json",
         MAX_MANIFEST_BYTES,
         &budget,
         job,
-        memory,
+        &mut metadata_memory,
     )?;
     let manifest_read_bytes = u64::try_from(manifest_bytes.len())?
         .checked_add(1)
@@ -1732,23 +1739,23 @@ fn metadata_fingerprint(metadata: &Metadata) -> MetadataFingerprint {
 
 #[cfg(target_os = "linux")]
 impl DirectoryAnchor {
-    fn open(path: &Path) -> Result<Self, Box<dyn Error>> {
+    fn open(path: PathBuf) -> Result<Self, Box<dyn Error>> {
         use rustix::fs::{Mode, OFlags, open};
         use std::os::unix::fs::MetadataExt;
 
         let descriptor = open(
-            path,
+            path.as_path(),
             OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC | OFlags::NOFOLLOW,
             Mode::empty(),
         )?;
         let opened = File::from(descriptor.try_clone()?).metadata()?;
-        let named = fs::symlink_metadata(path)?;
+        let named = fs::symlink_metadata(&path)?;
         if !named.is_dir() || opened.dev() != named.dev() || opened.ino() != named.ino() {
             return Err(invalid_input("input directory changed while it was opened"));
         }
         Ok(Self {
             descriptor,
-            path: path.to_owned(),
+            path,
             device: opened.dev(),
             inode: opened.ino(),
         })
@@ -1771,8 +1778,8 @@ fn read_directory_member(
     maximum: usize,
     budget: &SourceReadBudget,
     job: &Job,
-    memory: &MemoryBudget,
-) -> Result<(Vec<u8>, String, MemoryLease), Box<dyn Error>> {
+    memory: &mut MemoryLease,
+) -> Result<(Vec<u8>, String), Box<dyn Error>> {
     let file = open_directory_member(directory, name)?;
     let length = checked_length(&file.metadata()?, None, maximum)?;
     read_manifest_snapshot(file, length, maximum, budget, job, memory)
@@ -1785,8 +1792,8 @@ fn read_directory_member(
     maximum: usize,
     budget: &SourceReadBudget,
     job: &Job,
-    memory: &MemoryBudget,
-) -> Result<(Vec<u8>, String, MemoryLease), Box<dyn Error>> {
+    memory: &mut MemoryLease,
+) -> Result<(Vec<u8>, String), Box<dyn Error>> {
     let path = directory.join(name);
     let file = crate::input::regular_no_follow(&path)?;
     let length = checked_length(&file.metadata()?, None, maximum)?;
@@ -1799,8 +1806,8 @@ fn read_manifest_snapshot(
     maximum: usize,
     budget: &SourceReadBudget,
     job: &Job,
-    memory: &MemoryBudget,
-) -> Result<(Vec<u8>, String, MemoryLease), Box<dyn Error>> {
+    memory: &mut MemoryLease,
+) -> Result<(Vec<u8>, String), Box<dyn Error>> {
     // Bound both the raw manifest and its parsed source records before reading
     let records = (length / 2 + 1).min(MAX_MANIFEST_ARTIFACTS);
     let record_size = std::mem::size_of::<InputSpec>()
@@ -1816,7 +1823,7 @@ fn read_manifest_snapshot(
         })
         .and_then(|bytes| bytes.checked_add(1024))
         .ok_or_else(|| invalid_input("manifest memory allowance overflows"))?;
-    let lease = memory.try_reserve(MemoryClass::Base, u64::try_from(allowance)?)?;
+    super::analysis_memory::charge(memory, allowance)?;
     budget.reserve(
         u64::try_from(length)?
             .checked_add(1)
@@ -1828,7 +1835,7 @@ fn read_manifest_snapshot(
         Some(length),
         None,
     )?;
-    Ok((bytes, digest, lease))
+    Ok((bytes, digest))
 }
 
 #[cfg(target_os = "linux")]

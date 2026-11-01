@@ -2,7 +2,7 @@
 
 mod vector;
 
-pub(crate) use vector::{
+pub use vector::{
     Metered, Unrestricted, VectorAdmission, VectorAllocationError, reserve_one_with_memory,
 };
 

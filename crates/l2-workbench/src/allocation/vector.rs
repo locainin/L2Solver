@@ -3,13 +3,13 @@
 use crate::job::{MemoryError, MemoryLease};
 use std::{convert::Infallible, mem::size_of};
 
-pub(crate) trait VectorAdmission {
+pub trait VectorAdmission {
     type Error;
 
     fn reserve_one<T>(&mut self, values: &mut Vec<T>) -> Result<(), Self::Error>;
 }
 
-pub(crate) struct Unrestricted;
+pub struct Unrestricted;
 
 impl VectorAdmission for Unrestricted {
     type Error = Infallible;
@@ -19,7 +19,7 @@ impl VectorAdmission for Unrestricted {
     }
 }
 
-pub(crate) struct Metered<'a>(pub(crate) &'a mut MemoryLease);
+pub struct Metered<'a>(pub &'a mut MemoryLease);
 
 impl VectorAdmission for Metered<'_> {
     type Error = VectorAllocationError;
@@ -30,7 +30,7 @@ impl VectorAdmission for Metered<'_> {
 }
 
 #[derive(Debug)]
-pub(crate) enum VectorAllocationError {
+pub enum VectorAllocationError {
     Memory(MemoryError),
     Allocation,
 }
@@ -41,7 +41,7 @@ impl From<MemoryError> for VectorAllocationError {
     }
 }
 
-pub(crate) fn reserve_one_with_memory<T>(
+pub fn reserve_one_with_memory<T>(
     values: &mut Vec<T>,
     parent: &mut MemoryLease,
 ) -> Result<(), VectorAllocationError> {

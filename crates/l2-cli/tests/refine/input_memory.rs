@@ -169,6 +169,53 @@ fn enlarged_manifest_is_rejected_before_a_recheck_reads_it() -> Result<(), Box<d
 }
 
 #[test]
+fn directory_anchor_requires_memory_before_opening_the_manifest() -> Result<(), Box<dyn Error>> {
+    let directory = tempfile::tempdir()?;
+    assert!(!directory.path().join("manifest.json").exists());
+    let memory = MemoryBudget::new(0);
+    let job = l2_workbench::job::Job::new("directory admission");
+    let error = super::prepare_input_set_with_limit(directory.path(), u64::MAX, &job, &memory)
+        .err()
+        .ok_or("directory anchor bypassed memory admission")?;
+    assert!(matches!(
+        crate::memory_error::find(error.as_ref()),
+        Some(MemoryError::Limit { .. })
+    ));
+    assert_eq!(memory.snapshot()?.used_bytes, 0);
+    Ok(())
+}
+
+#[test]
+fn directory_anchor_path_capacity_stays_charged_with_the_input() -> Result<(), Box<dyn Error>> {
+    let directory = tempfile::tempdir()?;
+    let short = directory.path().join("s");
+    let long = directory.path().join("l".repeat(200));
+    let manifest = br#"{"schema_version":1,"artifacts":[{"file":"one.bin","byte_length":1}]}"#;
+    for path in [&short, &long] {
+        std::fs::create_dir(path)?;
+        std::fs::write(path.join("one.bin"), b"a")?;
+        std::fs::write(path.join("manifest.json"), manifest)?;
+    }
+    let memory = MemoryBudget::new(1024 * 1024);
+    let job = l2_workbench::job::Job::new("directory ownership");
+    let charge = |path: &std::path::Path| -> Result<(u64, u64), Box<dyn Error>> {
+        let input = super::prepare_input_set_with_limit(path, u64::MAX, &job, &memory)?;
+        let directory = input.directory.as_ref().ok_or("directory anchor missing")?;
+        #[cfg(target_os = "linux")]
+        let capacity = directory.path.capacity();
+        #[cfg(not(target_os = "linux"))]
+        let capacity = directory.capacity();
+        Ok((memory.snapshot()?.used_bytes, u64::try_from(capacity)?))
+    };
+    let (short_charge, short_capacity) = charge(&short)?;
+    let (long_charge, long_capacity) = charge(&long)?;
+    assert!(long_capacity > short_capacity);
+    assert_eq!(short_charge - short_capacity, long_charge - long_capacity);
+    assert_eq!(memory.snapshot()?.used_bytes, 0);
+    Ok(())
+}
+
+#[test]
 fn cache_snapshot_is_admitted_before_its_bytes_are_read() -> Result<(), Box<dyn Error>> {
     let path = tempfile::NamedTempFile::new()?;
     let original = b"source cache payload";

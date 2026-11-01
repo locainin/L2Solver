@@ -54,7 +54,7 @@ fn dropping_split_child_first_releases_only_its_own_charge() -> Result<(), Box<d
 #[test]
 fn combining_charges_preserves_working_set_credit_and_rejects_other_owners()
 -> Result<(), Box<dyn Error>> {
-    let root = MemoryBudget::new(1024);
+    let root = MemoryBudget::new(64 * 1024);
     let scope = root.try_working_set(512)?;
     let mut target = scope.budget().try_reserve(MemoryClass::Executor, 80)?;
     let other = scope.budget().try_reserve(MemoryClass::Executor, 120)?;
@@ -63,14 +63,23 @@ fn combining_charges_preserves_working_set_credit_and_rejects_other_owners()
         .try_absorb(other)
         .map_err(|_| "matching charges failed to combine")?;
     assert_eq!(target.bytes(), 200);
-    assert_eq!(root.snapshot()?.used_bytes, before.used_bytes);
-    let foreign = root.try_reserve(MemoryClass::Cache, 20)?;
+    let after = root.snapshot()?;
+    assert_eq!(after.used_bytes, before.used_bytes);
+    assert_eq!(
+        after.working_sets.reserved_bytes,
+        before.working_sets.reserved_bytes
+    );
+    let foreign = root.try_reserve(MemoryClass::Executor, 20)?;
     let foreign = target
         .try_absorb(foreign)
         .err()
         .ok_or("foreign charge was combined")?;
     assert_eq!(target.bytes(), 200);
     assert_eq!(foreign.bytes(), 20);
+    assert_eq!(
+        root.snapshot()?.working_sets.reserved_bytes,
+        before.working_sets.reserved_bytes
+    );
     drop(foreign);
     drop(target);
     drop(scope);

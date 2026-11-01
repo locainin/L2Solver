@@ -28,7 +28,7 @@ pub fn inspect(bytes: &[u8]) -> Result<ArtifactReport, ArtifactError> {
 }
 
 #[derive(Debug)]
-pub(crate) enum InspectMemoryError {
+pub(super) enum InspectMemoryError {
     Format(ArtifactError),
     Memory(MemoryError),
     Allocation,
@@ -60,7 +60,7 @@ impl From<ArtifactError> for InspectMemoryError {
     }
 }
 
-fn legacy_error(error: InspectMemoryError) -> ArtifactError {
+const fn legacy_error(error: InspectMemoryError) -> ArtifactError {
     match error {
         InspectMemoryError::Format(error) => error,
         InspectMemoryError::Memory(_) | InspectMemoryError::Allocation => {
@@ -74,7 +74,7 @@ fn legacy_error(error: InspectMemoryError) -> ArtifactError {
 /// The caller keeps the lease until the returned report is dropped. The ledger charges
 /// logical buffer capacities and the current Rust B-tree layout, not allocator overhead,
 /// process RSS, or allocations internal to third-party libraries
-pub(crate) fn inspect_with_memory(
+pub(super) fn inspect_with_memory(
     bytes: &[u8],
     memory: &mut MemoryLease,
 ) -> Result<ArtifactReport, InspectMemoryError> {

@@ -75,12 +75,10 @@ fn visit_file_signature_matches(
 ) {
     for rule in rules() {
         let mut inspect_offset = |offset| {
-            if let Some(observed) = matching_bytes(bytes, offset, &rule.pattern) {
+            matching_bytes(bytes, offset, &rule.pattern).is_some_and(|observed| {
                 visit(rule, offset, observed);
                 true
-            } else {
-                false
-            }
+            })
         };
         match rule.offsets {
             SignatureOffsets::Declared(offsets) => {

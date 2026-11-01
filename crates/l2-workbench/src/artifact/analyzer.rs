@@ -603,6 +603,7 @@ struct ArtifactContext<'a> {
     limits: AnalyzerLimits,
 }
 
+#[derive(Clone, Copy)]
 struct TransformExecutionCandidate<'a> {
     proposal: &'a TransformProposal,
     input_range: FileRange,
@@ -1082,14 +1083,14 @@ fn derive_region_candidates(
     Ok(())
 }
 
-fn proposal_memory_error(error: ProposalMemoryError) -> AnalyzerError {
+const fn proposal_memory_error(error: ProposalMemoryError) -> AnalyzerError {
     match error {
         ProposalMemoryError::Memory(error) => AnalyzerError::Memory(error),
         ProposalMemoryError::Allocation => AnalyzerError::AllocationFailure,
     }
 }
 
-fn region_memory_error(error: RegionMemoryError) -> AnalyzerError {
+const fn region_memory_error(error: RegionMemoryError) -> AnalyzerError {
     match error {
         RegionMemoryError::Memory(error) => AnalyzerError::Memory(error),
         RegionMemoryError::Allocation => AnalyzerError::AllocationFailure,

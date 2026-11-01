@@ -135,7 +135,7 @@ impl fmt::Display for DerivationError {
 impl Error for DerivationError {}
 
 #[derive(Debug)]
-pub(crate) enum AdmittedDerivationError {
+pub enum AdmittedDerivationError {
     Derivation(DerivationError),
     Memory(MemoryError),
     UnsupportedOperation,
@@ -203,7 +203,7 @@ pub fn run_with_limits(
 /// The lease must outlive the returned report, including reports with a failed step
 /// Errors leave the original lease unchanged after temporary buffers are dropped
 /// Charges cover logical buffer capacities and bounded workspace, not allocator overhead or RSS
-pub(crate) fn run_with_memory(
+pub fn run_with_memory(
     input: &[u8],
     recipe: &Recipe,
     limits: DerivationLimits,
@@ -229,9 +229,8 @@ fn supports_admission(recipe: &Recipe) -> bool {
     if !recipe.constraints.is_empty() {
         return false;
     }
-    let decoder = match recipe.steps.as_slice() {
-        [decoder] | [Operation::Slice { .. }, decoder] => decoder,
-        _ => return false,
+    let ([decoder] | [Operation::Slice { .. }, decoder]) = recipe.steps.as_slice() else {
+        return false;
     };
     matches!(
         decoder,
@@ -530,6 +529,7 @@ struct StepExecution<A: Admission> {
     failed: bool,
 }
 
+#[derive(Clone, Copy)]
 struct StepBudget {
     remaining_intermediate: usize,
     remaining_work: usize,

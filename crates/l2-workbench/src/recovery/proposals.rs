@@ -184,7 +184,7 @@ pub fn propose_transforms(
     }
 }
 
-#[derive(Debug)]
+#[derive(Clone, Copy, Debug)]
 pub(crate) enum ProposalMemoryError {
     Memory(MemoryError),
     Allocation,

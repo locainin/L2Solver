@@ -7,10 +7,10 @@ use std::time::Instant;
 
 type TestResult = Result<(), Box<dyn Error + Send + Sync>>;
 
-#[path = "memory/working_set.rs"]
-mod working_set;
 #[path = "memory/split.rs"]
 mod split;
+#[path = "memory/working_set.rs"]
+mod working_set;
 
 #[test]
 fn buffered_case_observations_measure_retention_without_charging_memory_twice() -> TestResult {

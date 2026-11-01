@@ -35,19 +35,22 @@ fn zip_members_are_omitted_when_their_archive_parent_cannot_be_published()
         .get("artifacts")
         .and_then(serde_json::Value::as_array)
         .ok_or("artifacts missing")?;
-    assert!(!artifacts.iter().any(|artifact| {
-        artifact
-            .get("origins")
-            .and_then(serde_json::Value::as_array)
-            .is_some_and(|origins| {
-                origins.iter().any(|origin| {
-                    origin
-                        .pointer("/origin/kind")
-                        .and_then(serde_json::Value::as_str)
-                        == Some("archive_member")
+    assert!(
+        !artifacts.iter().any(|artifact| {
+            artifact
+                .get("origins")
+                .and_then(serde_json::Value::as_array)
+                .is_some_and(|origins| {
+                    origins.iter().any(|origin| {
+                        origin
+                            .pointer("/origin/kind")
+                            .and_then(serde_json::Value::as_str)
+                            == Some("archive_member")
+                    })
                 })
-            })
-    }), "member was published without its archive parent");
+        }),
+        "member was published without its archive parent"
+    );
     let omissions = manifest
         .pointer("/sources/0/omissions")
         .and_then(serde_json::Value::as_array)

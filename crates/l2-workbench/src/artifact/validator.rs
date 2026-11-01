@@ -485,7 +485,7 @@ fn unmetered_outcome<'a>(
     bytes: &'a [u8],
     format: Option<ArtifactValidationFormat>,
 ) -> ArtifactValidationOutcome<'a> {
-    result.unwrap_or(ArtifactValidationOutcome::Omitted {
+    result.unwrap_or_else(|_| ArtifactValidationOutcome::Omitted {
         format,
         input_range: complete_range(bytes),
         reason: ArtifactResourceOmissionReason::AllocationFailure,

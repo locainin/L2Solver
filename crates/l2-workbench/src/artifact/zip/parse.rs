@@ -360,7 +360,7 @@ fn scan_scratch_bytes(length: usize) -> usize {
     // A ZIP64 locator can lead to a second live buffer while the tail is held
     let zip64 = length
         .checked_sub(EOCD_FIXED_SIZE + ZIP64_LOCATOR_SIZE)
-        .map_or(0, |bytes| bytes.min(ZIP64_SCAN_BLOCK_BYTES).max(4));
+        .map_or(0, |bytes| bytes.clamp(4, ZIP64_SCAN_BLOCK_BYTES));
     tail + zip64
 }
 
