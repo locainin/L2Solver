@@ -37,7 +37,9 @@ pub fn execute(
     output: &mut impl Write,
 ) -> Result<ActiveOutcome, Error> {
     match &args.command {
-        ActiveCommand::Capabilities(options) => query_capabilities(options, args.format, cancelled, output),
+        ActiveCommand::Capabilities(options) => {
+            query_capabilities(options, args.format, cancelled, output)
+        }
         ActiveCommand::Arp {
             command: ArpCommand::Probe(options),
         } => probe::run(options, args.format, cancelled, output),
@@ -119,18 +121,38 @@ fn query_capabilities(
         return stopped_capabilities(options, format, output);
     }
     let Some(info) = preflight::cancelled_discovery(
-        preflight::discover(&options.interface, cancelled), cancelled,
-    )? else { return stopped_capabilities(options, format, output); };
+        preflight::discover(&options.interface, cancelled),
+        cancelled,
+    )?
+    else {
+        return stopped_capabilities(options, format, output);
+    };
     let Some(ethernet) = preflight::cancelled_discovery(
         l2_active_linux::ethernet_capabilities::discover(
-            &options.interface, info.identity(), preflight::discovery_deadline()?, cancelled,
-        ).map_err(Error::Discovery), cancelled,
-    )? else { return stopped_capabilities(options, format, output); };
+            &options.interface,
+            info.identity(),
+            preflight::discovery_deadline()?,
+            cancelled,
+        )
+        .map_err(Error::Discovery),
+        cancelled,
+    )?
+    else {
+        return stopped_capabilities(options, format, output);
+    };
     let Some(wireless) = preflight::cancelled_discovery(
         interface_capabilities::discover(
-            &options.interface, &info, preflight::discovery_deadline()?, cancelled,
-        ).map_err(Error::Discovery), cancelled,
-    )? else { return stopped_capabilities(options, format, output); };
+            &options.interface,
+            &info,
+            preflight::discovery_deadline()?,
+            cancelled,
+        )
+        .map_err(Error::Discovery),
+        cancelled,
+    )?
+    else {
+        return stopped_capabilities(options, format, output);
+    };
     if cancelled.load(Ordering::Acquire) {
         return stopped_capabilities(options, format, output);
     }

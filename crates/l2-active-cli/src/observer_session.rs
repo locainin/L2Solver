@@ -1,6 +1,10 @@
 //! Prepare a bounded receive-only observer before opening its helper
 
-use std::{path::PathBuf, sync::atomic::{AtomicBool, Ordering}, time::Instant};
+use std::{
+    path::PathBuf,
+    sync::atomic::{AtomicBool, Ordering},
+    time::Instant,
+};
 
 use l2_active::Limits;
 use l2_active_linux::InterfaceInfo;
@@ -27,5 +31,10 @@ pub fn prepare(options: &ObserveArgs, cancelled: &AtomicBool) -> Result<Prepared
         return Err(Error::Discovery(std::io::ErrorKind::Interrupted.into()));
     }
     let helper = session_options::helper(options.session.helper.as_deref())?;
-    Ok(Prepared { info, limits, deadline, helper })
+    Ok(Prepared {
+        info,
+        limits,
+        deadline,
+        helper,
+    })
 }

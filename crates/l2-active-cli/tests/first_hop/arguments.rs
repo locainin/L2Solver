@@ -43,11 +43,21 @@ fn discovery_failures_for_first_hop_commands_expose_only_code_and_stage()
 -> Result<(), Box<dyn Error>> {
     for protocol in ["vrrp", "hsrp"] {
         let cli = Cli::try_parse_from([
-            "l2solver-active", protocol, "observe", "--interface", "l2s-no-test", "--format", "json",
+            "l2solver-active",
+            protocol,
+            "observe",
+            "--interface",
+            "l2s-no-test",
+            "--format",
+            "json",
         ])?;
         let mut output = Vec::new();
-        let error = crate::execute(&cli.active, &std::sync::atomic::AtomicBool::new(false), &mut output)
-            .expect_err("missing interface must fail");
+        let error = crate::execute(
+            &cli.active,
+            &std::sync::atomic::AtomicBool::new(false),
+            &mut output,
+        )
+        .expect_err("missing interface must fail");
         assert_eq!(error.code(), "not_found");
         assert_eq!(error.stage(), "discovery");
         assert!(!error.to_string().contains("l2s-no-test"));

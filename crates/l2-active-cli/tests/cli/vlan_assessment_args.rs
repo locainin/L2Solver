@@ -83,10 +83,23 @@ fn vlan_assessment_parses_both_source_choices_and_one_shared_finite_budget()
 #[test]
 fn vlan_assessment_requires_explicit_raw_frame_opt_in() -> Result<(), Box<dyn Error>> {
     let cli = Cli::try_parse_from([
-        "l2solver-active", "vlan", "assess", "--interface", "test0", "--control-interface", "control0",
-        "--target", "192.0.2.20", "--expected-mac", "02:00:00:00:00:02", "--include-raw",
+        "l2solver-active",
+        "vlan",
+        "assess",
+        "--interface",
+        "test0",
+        "--control-interface",
+        "control0",
+        "--target",
+        "192.0.2.20",
+        "--expected-mac",
+        "02:00:00:00:00:02",
+        "--include-raw",
     ])?;
-    let ActiveCommand::Vlan { command: VlanCommand::Assess(options) } = cli.active.command else {
+    let ActiveCommand::Vlan {
+        command: VlanCommand::Assess(options),
+    } = cli.active.command
+    else {
         return Err("expected VLAN assessment".into());
     };
     assert!(options.include_raw);

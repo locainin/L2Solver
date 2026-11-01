@@ -60,7 +60,12 @@ fn run_platform(
         session_options,
     };
 
-    let Prepared { info, limits, deadline, helper } = match observer_session::prepare(options, cancelled) {
+    let Prepared {
+        info,
+        limits,
+        deadline,
+        helper,
+    } = match observer_session::prepare(options, cancelled) {
         Ok(prepared) => prepared,
         Err(Error::Discovery(error)) => {
             return stopped(

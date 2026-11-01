@@ -90,10 +90,23 @@ fn run_platform(
         session_options,
     };
 
-    let Prepared { info, limits, deadline, helper } = match observer_session::prepare(options, cancelled) {
+    let Prepared {
+        info,
+        limits,
+        deadline,
+        helper,
+    } = match observer_session::prepare(options, cancelled) {
         Ok(prepared) => prepared,
-        Err(Error::Discovery(error)) => return stopped(kind, options, format, output,
-            super::preflight::discovery_failure(error, cancelled)?, HelperStage::NotStarted),
+        Err(Error::Discovery(error)) => {
+            return stopped(
+                kind,
+                options,
+                format,
+                output,
+                super::preflight::discovery_failure(error, cancelled)?,
+                HelperStage::NotStarted,
+            );
+        }
         Err(error) => return Err(error),
     };
     let plan = Plan::new(kind, limits);

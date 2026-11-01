@@ -75,7 +75,11 @@ impl<'a> Context<'a> {
             vlan,
             limits,
             close_error,
-            disclosure: if options.include_raw { Disclosure::IncludeRaw } else { Disclosure::OmitRaw },
+            disclosure: if options.include_raw {
+                Disclosure::IncludeRaw
+            } else {
+                Disclosure::OmitRaw
+            },
         }
     }
 }
