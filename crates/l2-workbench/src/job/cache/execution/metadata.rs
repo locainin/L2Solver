@@ -13,9 +13,9 @@ use sha2::{Digest, Sha256};
 /// Identity of one verified active execution revision and its immutable streams
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ExecutionGeneration {
-    relative_path: String,
-    components: [Component; 3],
-    envelope_digest: [u8; 32],
+    pub(super) relative_path: String,
+    pub(super) components: [Component; 3],
+    pub(super) envelope_digest: [u8; 32],
 }
 
 impl ExecutionGeneration {
@@ -52,7 +52,7 @@ impl Lease {
             return Err(CacheError::CorruptCheckpoint);
         }
         self.cache.inner.check_locations()?;
-        let budget = self.cache.inner.memory_budget();
+        let budget = self.cache.memory_budget();
         let previous = read_previous(self, generation, limits)?;
         let next_revision = previous
             .revision
@@ -66,13 +66,7 @@ impl Lease {
             metadata,
             components: &generation.components,
         };
-        let next_size = memory::json_size(&next)?;
-        if next_size > limits.max_metadata_bytes {
-            return Err(CacheError::MetadataTooLarge {
-                limit_bytes: usize::try_from(limits.max_metadata_bytes).unwrap_or(usize::MAX),
-                actual_bytes: usize::try_from(next_size).unwrap_or(usize::MAX),
-            });
-        }
+        let next_size = memory::json_size_bounded(&next, limits.max_metadata_bytes)?;
         let _new_memory = memory::reserve(budget, memory::checkpoint_charge(next_size)?)?;
         let next_json = encode_sized_envelope(&next, next_size)?;
         let snapshot_json = serde_json::to_string(snapshot)?;
@@ -83,27 +77,34 @@ impl Lease {
         // Hold the quota lock until the replacement and progress row commit together
         let _quota = if new_total > previous.total {
             self.cache
-                .reserve_capacity(&self.key, new_total - previous.total)?
+                .reserve_capacity(&self.key, new_total - previous.total, budget)?
         } else {
             self.cache.inner.quota_lock()?
         };
-        commit_metadata(self, &previous, new_total, &next_json, &snapshot_json)?;
+        commit_metadata(
+            self,
+            &previous,
+            new_total,
+            &next_json,
+            &snapshot_json,
+            Change::Metadata,
+        )?;
         generation.envelope_digest = Sha256::digest(next_json.as_bytes()).into();
         Ok(())
     }
 }
 
-struct PreviousEnvelope {
-    path: String,
-    json: String,
-    recorded_bytes: i64,
-    streams: u64,
-    total: u64,
-    revision: u64,
+pub(super) struct PreviousEnvelope {
+    pub(super) path: String,
+    pub(super) json: String,
+    pub(super) recorded_bytes: i64,
+    pub(super) streams: u64,
+    pub(super) total: u64,
+    pub(super) revision: u64,
     _memory: Option<MemoryLease>,
 }
 
-fn read_previous(
+pub(super) fn read_previous(
     lease: &Lease,
     generation: &ExecutionGeneration,
     limits: ExecutionCheckpointLimits,
@@ -133,7 +134,7 @@ fn read_previous(
         .checked_add(memory::metadata_charge(envelope_len)?)
         .and_then(|bytes| bytes.checked_add(path_len))
         .ok_or(CacheError::SizeOverflow)?;
-    let mut admitted = memory::reserve(lease.cache.inner.memory_budget(), old_charge)?;
+    let mut admitted = memory::reserve(lease.cache.memory_budget(), old_charge)?;
     let (path, json, recorded_bytes): (String, String, i64) = transaction.query_row(
         "SELECT relative_path, envelope_json, bytes FROM executions WHERE rowid = ?1",
         [rowid],
@@ -144,7 +145,8 @@ fn read_previous(
     }
     let envelope: Envelope =
         serde_json::from_str(&json).map_err(|_| CacheError::CorruptCheckpoint)?;
-    let revision = envelope_revision(&envelope).ok_or(CacheError::CorruptCheckpoint)?;
+    let revision = envelope_revision(envelope.version, envelope.revision)
+        .ok_or(CacheError::CorruptCheckpoint)?;
     if !supports_job_snapshot_version(envelope.snapshot_version)
         || !envelope.snapshot.is_valid_checkpoint()
         || path != generation.relative_path
@@ -190,12 +192,23 @@ fn read_previous(
     })
 }
 
-fn commit_metadata(
+#[derive(Clone, Copy)]
+pub(super) enum Change<'a> {
+    Metadata,
+    Executor {
+        incoming_token: &'a str,
+        retired_token: &'a str,
+        retired_bytes: u64,
+    },
+}
+
+pub(super) fn commit_metadata(
     lease: &Lease,
     previous: &PreviousEnvelope,
     new_total: u64,
     next_json: &str,
     snapshot_json: &str,
+    change: Change<'_>,
 ) -> Result<()> {
     let mut connection =
         database::open_connection(&lease.cache.inner.state_root, Durability::Checkpoint)?;
@@ -213,6 +226,29 @@ fn commit_metadata(
         )?;
     if updated != 1 {
         return Err(CacheError::CorruptCheckpoint);
+    }
+    if let Change::Executor {
+        incoming_token,
+        retired_token,
+        retired_bytes,
+    } = change
+    {
+        // Displaced files remain counted until their removal is durable
+        transaction.execute(
+            "INSERT INTO execution_reservations(token, key, bytes) VALUES (?1, ?2, ?3)",
+            params![
+                retired_token,
+                lease.key.as_str(),
+                i64::try_from(retired_bytes).map_err(|_| CacheError::SizeOverflow)?
+            ],
+        )?;
+        if transaction.execute(
+            "DELETE FROM execution_reservations WHERE token = ?1 AND key = ?2",
+            params![incoming_token, lease.key.as_str()],
+        )? != 1
+        {
+            return Err(CacheError::CorruptCheckpoint);
+        }
     }
     transaction.commit()?;
     Ok(())

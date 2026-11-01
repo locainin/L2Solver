@@ -32,7 +32,7 @@ pub(super) fn record(
 // Call only while holding the exclusive key lock
 pub(super) fn cleanup(inner: &CacheInner, key: &str, relative_path: &str) -> Result<()> {
     safe_entry_path(inner.entries.path(), key, relative_path)?;
-    let connection = database::open_connection(&inner.state_root, Durability::Checkpoint)?;
+    let mut connection = database::open_connection(&inner.state_root, Durability::Checkpoint)?;
     let is_current: bool = connection.query_row(
         "SELECT EXISTS(SELECT 1 FROM entries WHERE key = ?1 AND relative_path = ?2)
              OR EXISTS(SELECT 1 FROM executions WHERE key = ?1 AND relative_path = ?2)",
@@ -51,11 +51,18 @@ pub(super) fn cleanup(inner: &CacheInner, key: &str, relative_path: &str) -> Res
         Err(error) => return Err(error),
     }
     inner.entries.sync()?;
-    // Release accounting only after the directory removal has reached stable storage
-    connection.execute(
+    // Release both generation and cursor accounting only after durable directory removal
+    let transaction = connection.transaction()?;
+    transaction.execute(
+        "DELETE FROM execution_reservations WHERE key = ?1 AND
+             (token = ?2 OR substr(token, 1, length(?2) + 1) = ?2 || '/')",
+        params![key, relative_path],
+    )?;
+    transaction.execute(
         "DELETE FROM retired_generations WHERE key = ?1 AND relative_path = ?2",
         params![key, relative_path],
     )?;
+    transaction.commit()?;
     Ok(())
 }
 

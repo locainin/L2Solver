@@ -218,7 +218,7 @@ impl CacheInner {
 }
 
 impl Cache {
-    fn configured_memory_budget(&self) -> Option<&MemoryBudget> {
+    pub(super) fn configured_memory_budget(&self) -> Option<&MemoryBudget> {
         self.memory_scope
             .as_ref()
             .or_else(|| self.inner.memory_budget.get().and_then(Option::as_ref))
@@ -1123,7 +1123,18 @@ impl Cache {
             Err(CacheError::Io(error)) if error.kind() == io::ErrorKind::NotFound => {}
             Err(error) => return Err(error),
         }
-        connection.execute("DELETE FROM execution_reservations WHERE key = ?1", [key])?;
+        super::execution::cleanup_cursor_debris(self, key)?;
+        // Cursor files in a retired generation remain charged until that generation is removed
+        connection.execute(
+            "DELETE FROM execution_reservations WHERE key = ?1 AND NOT EXISTS (
+                 SELECT 1 FROM retired_generations
+                 WHERE retired_generations.key = execution_reservations.key
+                   AND (execution_reservations.token = retired_generations.relative_path
+                        OR substr(execution_reservations.token, 1, length(retired_generations.relative_path) + 1)
+                            = retired_generations.relative_path || '/')
+             )",
+            [key],
+        )?;
         Ok(())
     }
 

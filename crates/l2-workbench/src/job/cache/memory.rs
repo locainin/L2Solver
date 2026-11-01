@@ -102,34 +102,61 @@ pub(super) fn reserve_metadata(
 
 struct Counter {
     bytes: u64,
+    limit: Option<u64>,
+    exceeded: bool,
     overflowed: bool,
 }
 
 impl Write for Counter {
     fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
-        let count =
-            u64::try_from(bytes.len()).map_err(|_| io::Error::other("JSON size overflow"))?;
-        if let Some(total) = self.bytes.checked_add(count) {
-            self.bytes = total;
-            Ok(bytes.len())
-        } else {
+        let count = u64::try_from(bytes.len()).map_err(|_| {
             self.overflowed = true;
-            Err(io::Error::other("JSON size overflow"))
+            io::Error::other("JSON size overflow")
+        })?;
+        let Some(total) = self.bytes.checked_add(count) else {
+            self.overflowed = true;
+            return Err(io::Error::other("JSON size overflow"));
+        };
+        if self.limit.is_some_and(|limit| total > limit) {
+            self.bytes = total;
+            self.exceeded = true;
+            return Err(io::Error::other("JSON size limit exceeded"));
         }
+        self.bytes = total;
+        Ok(bytes.len())
     }
     fn flush(&mut self) -> io::Result<()> {
         Ok(())
     }
 }
 
-pub(super) fn json_size<T: Serialize>(value: &T) -> Result<u64> {
+pub(super) fn json_size<T: Serialize + ?Sized>(value: &T) -> Result<u64> {
+    count_json(value, None)
+}
+
+pub(super) fn json_size_bounded<T: Serialize + ?Sized>(value: &T, limit: u64) -> Result<u64> {
+    // Stop traversing metadata as soon as its encoded size cannot fit
+    count_json(value, Some(limit))
+}
+
+fn count_json<T: Serialize + ?Sized>(value: &T, limit: Option<u64>) -> Result<u64> {
     let mut counter = Counter {
         bytes: 0,
+        limit,
+        exceeded: false,
         overflowed: false,
     };
     let result = serde_json::to_writer(&mut counter, value);
     if counter.overflowed {
         return Err(CacheError::SizeOverflow);
+    }
+    if let Some(limit) = limit
+        && counter.exceeded
+    {
+        return Err(CacheError::MetadataTooLarge {
+            limit_bytes: usize::try_from(limit).unwrap_or(usize::MAX),
+            actual_bytes: usize::try_from(counter.bytes).unwrap_or(usize::MAX),
+        });
     }
     result?;
     Ok(counter.bytes)

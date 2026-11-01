@@ -27,10 +27,12 @@ use super::{
     retired,
 };
 
+mod cleanup;
 mod metadata;
+mod update;
 pub use metadata::ExecutionGeneration;
 
-const ENVELOPE_VERSION: u32 = 2;
+const ENVELOPE_VERSION: u32 = 3;
 const COMPONENT_NAMES: [&str; 3] = ["graph", "blobs", "executor"];
 const MAX_RELATIVE_PATH_BYTES: i64 = 256;
 const RESERVATION_BLOCK: u64 = 4096;
@@ -53,6 +55,8 @@ pub struct ExecutionCheckpointLimits {
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 struct Component {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    directory: Option<String>,
     bytes: u64,
     sha256: String,
 }
@@ -79,10 +83,10 @@ struct Envelope {
     components: [Component; 3],
 }
 
-const fn envelope_revision(envelope: &Envelope) -> Option<u64> {
-    match (envelope.version, envelope.revision) {
+const fn envelope_revision(version: u32, revision: Option<u64>) -> Option<u64> {
+    match (version, revision) {
         (1, None) => Some(0),
-        (ENVELOPE_VERSION, Some(revision)) => Some(revision),
+        (2 | ENVELOPE_VERSION, Some(revision)) => Some(revision),
         _ => None,
     }
 }
@@ -462,7 +466,7 @@ impl Lease {
             |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
         )?;
         let envelope: Envelope = serde_json::from_str(&json).map_err(|_| corrupt())?;
-        if envelope_revision(&envelope).is_none()
+        if envelope_revision(envelope.version, envelope.revision).is_none()
             || !supports_job_snapshot_version(envelope.snapshot_version)
             || !envelope.snapshot.is_valid_checkpoint()
         {
@@ -522,24 +526,23 @@ fn verify_streams(
     {
         return Err(corrupt());
     }
-    let path = safe_entry_path(
-        lease.cache.inner.entries.path(),
-        lease.key.as_str(),
-        relative,
-    )?;
-    let generation = path
-        .file_name()
-        .and_then(|name| name.to_str())
-        .ok_or_else(corrupt)?;
-    if !generation.starts_with("active-") {
+    if graph.directory.is_some()
+        || blobs.directory.is_some()
+        || (envelope.version < 3 && executor.directory.is_some())
+    {
         return Err(corrupt());
     }
-    let root = lease.cache.inner.entries.open_child(lease.key.as_str())?;
-    let directory = root.open_child(generation)?;
+    let directory = generation_directory(&lease.cache, lease.key.as_str(), relative)?;
     let graph = verified_component(&directory, COMPONENT_NAMES[0], graph)?;
     let blobs = verified_component(&directory, COMPONENT_NAMES[1], blobs)?;
     let executor_bytes = executor.bytes;
-    let executor = verified_component(&directory, COMPONENT_NAMES[2], executor)?;
+    let executor = match &executor.directory {
+        Some(name) if valid_cursor_directory(name) => {
+            verified_component(&directory.open_child(name)?, COMPONENT_NAMES[2], executor)?
+        }
+        Some(_) => return Err(corrupt()),
+        None => verified_component(&directory, COMPONENT_NAMES[2], executor)?,
+    };
     Ok(VerifiedStreams {
         graph,
         blobs,
@@ -605,13 +608,7 @@ where
         metadata: &metadata,
         components: &components,
     };
-    let encoded = memory::json_size(&envelope)?;
-    if encoded > limits.max_metadata_bytes {
-        return Err(CacheError::MetadataTooLarge {
-            limit_bytes: usize::try_from(limits.max_metadata_bytes).unwrap_or(usize::MAX),
-            actual_bytes: usize::try_from(encoded).unwrap_or(usize::MAX),
-        });
-    }
+    let encoded = memory::json_size_bounded(&envelope, limits.max_metadata_bytes)?;
     let envelope_memory = memory::reserve(memory_budget, memory::checkpoint_charge(encoded)?)?;
     let envelope_json = encode_sized_envelope(&envelope, encoded)?;
     let envelope_bytes =
@@ -664,6 +661,7 @@ fn finish_component(mut component: ComponentWriter) -> Result<(Component, Writte
         .into_inner()
         .map_err(io::IntoInnerError::into_error)?;
     let digest = Component {
+        directory: None,
         bytes: component.bytes,
         sha256: format!("{:x}", component.hash.finalize()),
     };
@@ -842,3 +840,25 @@ fn same_content_identity(left: &Metadata, right: &Metadata) -> bool {
 fn corrupt() -> CacheError {
     CacheError::CorruptEntry("execution checkpoint is corrupt".to_owned())
 }
+
+fn valid_cursor_directory(name: &str) -> bool {
+    name.strip_prefix("cursor-").is_some_and(|suffix| {
+        !suffix.is_empty()
+            && suffix.len() <= 64
+            && suffix.bytes().all(|byte| byte.is_ascii_alphanumeric())
+    })
+}
+
+fn generation_directory(cache: &Cache, key: &str, relative: &str) -> Result<HeldDirectory> {
+    let path = safe_entry_path(cache.inner.entries.path(), key, relative)?;
+    let generation = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or_else(corrupt)?;
+    if !generation.starts_with("active-") {
+        return Err(corrupt());
+    }
+    cache.inner.entries.open_child(key)?.open_child(generation)
+}
+
+pub(super) use cleanup::cleanup_cursor_debris;

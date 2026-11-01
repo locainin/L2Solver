@@ -174,6 +174,29 @@ impl HeldDirectory {
         Ok(file)
     }
 
+    pub(super) fn remove_file(&self, name: &str) -> Result<()> {
+        self.check_location()?;
+        // Reject links and special files before removing the descriptor-relative name
+        self.open_file(name)?;
+        #[cfg(unix)]
+        rustix::fs::unlinkat(&self.file, name, rustix::fs::AtFlags::empty())
+            .map_err(io::Error::from)?;
+        #[cfg(not(unix))]
+        fs::remove_file(self.path.join(name))?;
+        self.check_location()
+    }
+
+    pub(super) fn remove_empty_child(&self, name: &str) -> Result<()> {
+        self.check_location()?;
+        validate_component(name)?;
+        #[cfg(unix)]
+        rustix::fs::unlinkat(&self.file, name, rustix::fs::AtFlags::REMOVEDIR)
+            .map_err(io::Error::from)?;
+        #[cfg(not(unix))]
+        fs::remove_dir(self.path.join(name))?;
+        self.check_location()
+    }
+
     pub(super) fn rename_child_to(&self, name: &str, target: &Self) -> Result<()> {
         self.check_location()?;
         target.check_location()?;

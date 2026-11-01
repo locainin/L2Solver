@@ -26,6 +26,9 @@ mod execution;
 #[path = "cache/execution_metadata.rs"]
 mod execution_metadata;
 
+#[path = "cache/execution_update.rs"]
+mod execution_update;
+
 #[path = "cache/memory.rs"]
 mod memory;
 

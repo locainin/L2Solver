@@ -105,6 +105,80 @@ fn changing_serialized_metadata_cannot_break_the_admitted_size() -> Result<(), B
 }
 
 #[test]
+fn metadata_size_check_stops_serializing_when_the_limit_is_exceeded() -> Result<(), Box<dyn Error>>
+{
+    struct ManyValues {
+        visited: std::cell::Cell<usize>,
+    }
+
+    impl serde::Serialize for ManyValues {
+        fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+            use serde::ser::SerializeSeq;
+            let mut sequence = serializer.serialize_seq(None)?;
+            for index in 0..100_000 {
+                self.visited.set(index + 1);
+                sequence.serialize_element(&0_u8)?;
+            }
+            sequence.end()
+        }
+    }
+
+    struct InvalidValue;
+
+    impl serde::Serialize for InvalidValue {
+        fn serialize<S: serde::Serializer>(&self, _: S) -> Result<S::Ok, S::Error> {
+            Err(serde::ser::Error::custom("injected serialization failure"))
+        }
+    }
+
+    let temporary = tempfile::tempdir()?;
+    let cache = cache_at(temporary.path(), 64 * 1024)?;
+    let key = stage_key("bounded-metadata-serialization")?;
+    let snapshot = Job::new("bounded metadata serialization").snapshot()?;
+    let mut lease = cache.lease(&key)?;
+    let mut generation =
+        lease.save_active_generation(&snapshot, limits(), |_| Ok(json!({"cursor": 1})))?;
+    let metadata = ManyValues {
+        visited: std::cell::Cell::new(0),
+    };
+    let error = lease
+        .update_active_metadata(&mut generation, &snapshot, limits(), &metadata)
+        .err()
+        .ok_or("oversized metadata was accepted")?;
+    let CacheError::MetadataTooLarge {
+        limit_bytes,
+        actual_bytes,
+    } = &error
+    else {
+        return Err("oversized metadata produced the wrong error".into());
+    };
+    assert!(actual_bytes > limit_bytes);
+    assert!(
+        error
+            .to_string()
+            .contains(&format!("at least {actual_bytes}"))
+    );
+    assert!(metadata.visited.get() < 100_000);
+    let active = lease
+        .load_active(limits())?
+        .ok_or("prior generation was lost")?;
+    assert_eq!(active.metadata(), &json!({"cursor": 1}));
+    drop(active);
+    assert!(matches!(
+        lease.update_active_metadata(&mut generation, &snapshot, limits(), &InvalidValue),
+        Err(CacheError::Json(_))
+    ));
+    assert_eq!(
+        lease
+            .load_active(limits())?
+            .ok_or("prior generation was lost")?
+            .metadata(),
+        &json!({"cursor": 1})
+    );
+    Ok(())
+}
+
+#[test]
 fn saving_a_generation_returns_the_same_identity_as_a_verified_load() -> Result<(), Box<dyn Error>>
 {
     let temporary = tempfile::tempdir()?;
@@ -425,7 +499,7 @@ fn legacy_envelope_is_upgraded_and_rejects_an_inconsistent_revision() -> Result<
         |row| row.get(0),
     )?;
     let mut upgraded: serde_json::Value = serde_json::from_str(&encoded)?;
-    assert_eq!(upgraded.get("version"), Some(&json!(2)));
+    assert_eq!(upgraded.get("version"), Some(&json!(3)));
     assert_eq!(upgraded.get("revision"), Some(&json!(1)));
     *upgraded
         .get_mut("version")

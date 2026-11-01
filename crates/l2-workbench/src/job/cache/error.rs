@@ -34,7 +34,7 @@ pub enum CacheError {
     MetadataTooLarge {
         /// Maximum serialized metadata size
         limit_bytes: usize,
-        /// Actual serialized metadata size
+        /// Bytes observed; an early size check can report a lower bound
         actual_bytes: usize,
     },
     /// An input used to build a cache identity is invalid
@@ -78,7 +78,7 @@ impl fmt::Display for CacheError {
                 actual_bytes,
             } => write!(
                 formatter,
-                "cache metadata has {actual_bytes} bytes; maximum is {limit_bytes} bytes"
+                "cache metadata has at least {actual_bytes} bytes; maximum is {limit_bytes} bytes"
             ),
             Self::InvalidInput(message) => write!(formatter, "invalid cache input: {message}"),
             Self::SourceChanged => formatter.write_str("source changed while it was fingerprinted"),
