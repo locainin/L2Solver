@@ -1,8 +1,11 @@
 use super::{
     DerivationLimits, DerivationReport, DerivationStatus, OperandLocation, Operation, Recipe,
     StepFailure, StepReport, StepStatus,
+    memory::{Admission, AdmissionError, Buffer, BufferError, Shared, Unrestricted},
+    transform::TransformError,
 };
 use crate::evidence::Case;
+use crate::job::{MemoryError, MemoryLease};
 use std::{error::Error, fmt};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -131,6 +134,38 @@ impl fmt::Display for DerivationError {
 
 impl Error for DerivationError {}
 
+#[derive(Debug)]
+pub(crate) enum AdmittedDerivationError {
+    Derivation(DerivationError),
+    Memory(MemoryError),
+    UnsupportedOperation,
+}
+
+impl fmt::Display for AdmittedDerivationError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Derivation(error) => write!(formatter, "derivation failed: {error}"),
+            Self::Memory(error) => write!(formatter, "derivation admission failed: {error}"),
+            Self::UnsupportedOperation => formatter.write_str("unsupported admitted recipe"),
+        }
+    }
+}
+
+impl Error for AdmittedDerivationError {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        match self {
+            Self::Derivation(error) => Some(error),
+            Self::Memory(error) => Some(error),
+            Self::UnsupportedOperation => None,
+        }
+    }
+}
+
+enum EngineError<E> {
+    Derivation(DerivationError),
+    Admission(E),
+}
+
 fn format_operand_location(location: OperandLocation) -> String {
     match location {
         OperandLocation::Step { step_index } => format!("step {step_index}"),
@@ -159,14 +194,66 @@ pub fn run_with_limits(
     recipe: &Recipe,
     limits: DerivationLimits,
 ) -> Result<DerivationReport, DerivationError> {
+    validate_plain_request(input, recipe, limits)?;
+    run_unadmitted(input, recipe, limits)
+}
+
+/// Apply supported decoder recipes while the caller retains the output charge
+///
+/// The lease must outlive the returned report, including reports with a failed step
+/// Errors leave the original lease unchanged after temporary buffers are dropped
+/// Charges cover logical buffer capacities and bounded workspace, not allocator overhead or RSS
+pub(crate) fn run_with_memory(
+    input: &[u8],
+    recipe: &Recipe,
+    limits: DerivationLimits,
+    memory: &mut MemoryLease,
+) -> Result<DerivationReport, AdmittedDerivationError> {
+    validate_plain_request(input, recipe, limits).map_err(AdmittedDerivationError::Derivation)?;
+    if !supports_admission(recipe) {
+        return Err(AdmittedDerivationError::UnsupportedOperation);
+    }
+    match run_validated(input, recipe, limits, Shared(memory)) {
+        Ok(report) => Ok(report),
+        Err(EngineError::Derivation(error)) => Err(AdmittedDerivationError::Derivation(error)),
+        Err(EngineError::Admission(AdmissionError::Memory(error))) => {
+            Err(AdmittedDerivationError::Memory(error))
+        }
+        Err(EngineError::Admission(AdmissionError::UnsupportedOperation)) => {
+            Err(AdmittedDerivationError::UnsupportedOperation)
+        }
+    }
+}
+
+fn supports_admission(recipe: &Recipe) -> bool {
+    if !recipe.constraints.is_empty() {
+        return false;
+    }
+    let decoder = match recipe.steps.as_slice() {
+        [decoder] | [Operation::Slice { .. }, decoder] => decoder,
+        _ => return false,
+    };
+    matches!(
+        decoder,
+        Operation::HexDecode {}
+            | Operation::Base64Decode { .. }
+            | Operation::GzipDecompress {}
+            | Operation::ZlibDecompress {}
+    )
+}
+
+fn validate_plain_request(
+    input: &[u8],
+    recipe: &Recipe,
+    limits: DerivationLimits,
+) -> Result<(), DerivationError> {
     if let Some(location) = super::operands::first_selected_input_reference(recipe) {
         return Err(DerivationError::SelectedInputRequired { location });
     }
     if let Some(location) = super::operands::first_external_reference(recipe) {
         return Err(DerivationError::EvidenceCaseRequired { location });
     }
-    validate_request(input, recipe, limits)?;
-    run_validated(input, recipe, limits)
+    validate_request(input, recipe, limits)
 }
 
 fn validate_request(
@@ -217,22 +304,51 @@ fn validate_recipe_identity_with_limits(
     Ok(())
 }
 
-fn run_validated(
+fn run_unadmitted(
     input: &[u8],
     recipe: &Recipe,
     limits: DerivationLimits,
 ) -> Result<DerivationReport, DerivationError> {
+    match run_validated(input, recipe, limits, Unrestricted) {
+        Ok(report) => Ok(report),
+        Err(EngineError::Derivation(error)) => Err(error),
+        Err(EngineError::Admission(never)) => match never {},
+    }
+}
+
+fn run_validated<A: Admission>(
+    input: &[u8],
+    recipe: &Recipe,
+    limits: DerivationLimits,
+    admission: A,
+) -> Result<DerivationReport, EngineError<A::Error>> {
+    // The copied input stays charged before any hashing or report allocation
+    let mut current =
+        Buffer::with_capacity(input.len(), &admission).map_err(|error| match error {
+            BufferError::Allocation => EngineError::Derivation(DerivationError::AllocationFailed),
+            BufferError::Admission(error) => EngineError::Admission(error),
+        })?;
+    current.bytes.extend_from_slice(input);
+    let metadata_bytes = if admission.is_active() {
+        metadata_bound(recipe.steps.len()).map_err(EngineError::Derivation)?
+    } else {
+        0
+    };
+    let mut metadata = admission
+        .reserve(metadata_bytes)
+        .map_err(EngineError::Admission)?;
     let input_sha256 = crate::sha256(input);
-    let execution = execute_steps(input, recipe, limits, input_sha256.clone())?;
+    let execution = execute_steps(current, recipe, limits, input_sha256.clone(), &admission)?;
 
     let constraints = super::constraints::evaluate(
         &recipe.constraints,
-        &execution.output,
+        &execution.output.bytes,
         &execution.output_sha256,
         execution.failed_step,
         limits.max_output_bytes,
     );
-    Ok(DerivationReport {
+    let (output, lease) = execution.output.into_parts();
+    let report = DerivationReport {
         status: execution
             .failed_step
             .map_or(DerivationStatus::Completed, |step_index| {
@@ -240,13 +356,62 @@ fn run_validated(
             }),
         input_length: input.len(),
         input_sha256,
-        output: execution.output,
+        output,
         output_sha256: execution.output_sha256,
         steps: execution.steps,
         constraints,
         intermediate_bytes: execution.intermediate_bytes,
         work_bytes: execution.work_bytes,
-    })
+    };
+    if admission.is_active() {
+        let retained = report_metadata_bytes(&report).map_err(EngineError::Derivation)?;
+        if retained > metadata_bytes {
+            // Reconcile actual capacities while the report still owns its allocations
+            admission
+                .resize(&mut metadata, retained)
+                .map_err(EngineError::Admission)?;
+        }
+    }
+    // Transfer both charges only after the report owns their allocations
+    admission.finish(lease, metadata);
+    Ok(report)
+}
+
+fn metadata_bound(steps: usize) -> Result<u64, DerivationError> {
+    // A digest has 64 hex bytes, with extra room for string formatting growth
+    const DIGEST_ALLOCATION_BYTES: usize = 256;
+    // Two hashes remain per step, with three more live during replacement
+    let digest_bytes = steps
+        .checked_mul(2)
+        .and_then(|count| count.checked_add(3))
+        .and_then(|count| count.checked_mul(DIGEST_ALLOCATION_BYTES));
+    // Reserve extra room for Vec capacity beyond the requested report count
+    let report_bytes = steps
+        .checked_mul(std::mem::size_of::<StepReport>())
+        .and_then(|bytes| bytes.checked_mul(2));
+    digest_bytes
+        .and_then(|digest| report_bytes.and_then(|reports| digest.checked_add(reports)))
+        .and_then(|bytes| u64::try_from(bytes).ok())
+        .ok_or(DerivationError::AllocationFailed)
+}
+
+fn report_metadata_bytes(report: &DerivationReport) -> Result<u64, DerivationError> {
+    let mut bytes = report
+        .steps
+        .capacity()
+        .checked_mul(std::mem::size_of::<StepReport>())
+        .and_then(|bytes| bytes.checked_add(report.input_sha256.capacity()))
+        .and_then(|bytes| bytes.checked_add(report.output_sha256.capacity()))
+        .ok_or(DerivationError::AllocationFailed)?;
+    for step in &report.steps {
+        bytes = bytes
+            .checked_add(step.input_sha256.as_ref().map_or(0, String::capacity))
+            .and_then(|bytes| {
+                bytes.checked_add(step.output_sha256.as_ref().map_or(0, String::capacity))
+            })
+            .ok_or(DerivationError::AllocationFailed)?;
+    }
+    u64::try_from(bytes).map_err(|_| DerivationError::AllocationFailed)
 }
 
 /// Apply a recipe after resolving retained node ranges from one evidence case
@@ -269,7 +434,7 @@ pub fn run_with_case(
     validate_request(input, recipe, limits)?;
     let resolved = super::operands::resolve(recipe, case, None)?;
     Ok(retain_operand_provenance(
-        run_validated(input, &resolved.recipe, limits)?,
+        run_unadmitted(input, &resolved.recipe, limits)?,
         recipe,
         resolved,
     ))
@@ -316,7 +481,7 @@ pub fn run_with_selected_input(
     validate_request(input, recipe, limits)?;
     let resolved = super::operands::resolve(recipe, case, Some(input_node_id))?;
     Ok(retain_operand_provenance(
-        run_validated(input, &resolved.recipe, limits)?,
+        run_unadmitted(input, &resolved.recipe, limits)?,
         recipe,
         resolved,
     ))
@@ -348,8 +513,8 @@ fn retain_operand_provenance(
     report
 }
 
-struct ExecutionResult {
-    output: Vec<u8>,
+struct ExecutionResult<A: Admission> {
+    output: Buffer<A>,
     output_sha256: String,
     steps: Vec<StepReport>,
     intermediate_bytes: usize,
@@ -357,25 +522,27 @@ struct ExecutionResult {
     failed_step: Option<usize>,
 }
 
-struct StepExecution {
-    output: Option<(Vec<u8>, String)>,
+struct StepExecution<A: Admission> {
+    output: Option<(Buffer<A>, String)>,
     report: StepReport,
     intermediate_bytes: usize,
     work_bytes: usize,
     failed: bool,
 }
 
-fn execute_steps(
-    input: &[u8],
+struct StepBudget {
+    remaining_intermediate: usize,
+    remaining_work: usize,
+    reserved_work: usize,
+}
+
+fn execute_steps<A: Admission>(
+    mut current: Buffer<A>,
     recipe: &Recipe,
     limits: DerivationLimits,
     input_sha256: String,
-) -> Result<ExecutionResult, DerivationError> {
-    let mut current = Vec::new();
-    current
-        .try_reserve_exact(input.len())
-        .map_err(|_| DerivationError::AllocationFailed)?;
-    current.extend_from_slice(input);
+    admission: &A,
+) -> Result<ExecutionResult<A>, EngineError<A::Error>> {
     let mut current_sha256 = input_sha256;
     let mut intermediate_bytes = 0_usize;
     let mut work_bytes = 0_usize;
@@ -383,7 +550,7 @@ fn execute_steps(
     let mut steps = Vec::new();
     steps
         .try_reserve_exact(recipe.steps.len())
-        .map_err(|_| DerivationError::AllocationFailed)?;
+        .map_err(|_| EngineError::Derivation(DerivationError::AllocationFailed))?;
 
     for (step_index, operation) in recipe.steps.iter().enumerate() {
         if let Some(after_step) = failed_step {
@@ -391,13 +558,14 @@ fn execute_steps(
             continue;
         }
         let execution = execute_step(
-            &current,
+            &current.bytes,
             &current_sha256,
             operation,
             limits,
             intermediate_bytes,
             work_bytes,
-        );
+            admission,
+        )?;
         if execution.failed {
             failed_step = Some(step_index);
         }
@@ -420,21 +588,22 @@ fn execute_steps(
     })
 }
 
-fn execute_step(
+fn execute_step<A: Admission>(
     input: &[u8],
     input_sha256: &str,
     operation: &Operation,
     limits: DerivationLimits,
     intermediate_bytes: usize,
     work_bytes: usize,
-) -> StepExecution {
+    admission: &A,
+) -> Result<StepExecution<A>, EngineError<A::Error>> {
     let input_length = input.len();
     let remaining_intermediate = limits.max_intermediate_bytes - intermediate_bytes;
     let remaining_work = limits.max_work_bytes - work_bytes;
     let reserved_work = match reserve_operation_work(input_length, operation, remaining_work) {
         Ok(reserved_work) => reserved_work,
         Err(charged_work) => {
-            return failed_step_execution(
+            return Ok(failed_step_execution(
                 operation,
                 input_length,
                 input_sha256,
@@ -442,7 +611,7 @@ fn execute_step(
                     limit: limits.max_work_bytes,
                 },
                 charged_work,
-            );
+            ));
         }
     };
     execute_reserved_step(
@@ -450,9 +619,12 @@ fn execute_step(
         input_sha256,
         operation,
         limits,
-        remaining_intermediate,
-        remaining_work,
-        reserved_work,
+        StepBudget {
+            remaining_intermediate,
+            remaining_work,
+            reserved_work,
+        },
+        admission,
     )
 }
 
@@ -477,32 +649,33 @@ fn reserve_operation_work(
     Ok(reserved_work)
 }
 
-fn execute_reserved_step(
+fn execute_reserved_step<A: Admission>(
     input: &[u8],
     input_sha256: &str,
     operation: &Operation,
     limits: DerivationLimits,
-    remaining_intermediate: usize,
-    remaining_work: usize,
-    reserved_work: usize,
-) -> StepExecution {
+    step_budget: StepBudget,
+    admission: &A,
+) -> Result<StepExecution<A>, EngineError<A::Error>> {
     let input_length = input.len();
-    let work_output_limit = remaining_work - reserved_work;
-    let ordinary_output_limit = limits.max_output_bytes.min(remaining_intermediate);
+    let work_output_limit = step_budget.remaining_work - step_budget.reserved_work;
+    let ordinary_output_limit = limits
+        .max_output_bytes
+        .min(step_budget.remaining_intermediate);
     let work_limited_output = work_output_limit < ordinary_output_limit;
     let output_limit = ordinary_output_limit.min(work_output_limit);
     // Reserve input scanning before applying a decoder, then cap output by remaining work
     let budget = super::transform::OutputBudget {
-        remaining_intermediate,
+        remaining_intermediate: step_budget.remaining_intermediate,
         max_output: output_limit,
         max_intermediate: limits.max_intermediate_bytes,
         max_key_bytes: limits.max_input_bytes,
     };
-    match super::transform::apply(input, operation, budget) {
+    match super::transform::apply(input, operation, budget, admission) {
         Ok(output) => {
-            let output_length = output.len();
-            let output_sha256 = crate::sha256(&output);
-            StepExecution {
+            let output_length = output.bytes.len();
+            let output_sha256 = crate::sha256(&output.bytes);
+            Ok(StepExecution {
                 report: StepReport {
                     operation: operation.clone(),
                     operand_provenance: Vec::new(),
@@ -514,12 +687,14 @@ fn execute_reserved_step(
                 },
                 output: Some((output, output_sha256)),
                 intermediate_bytes: output_length,
-                work_bytes: reserved_work + output_length,
+                work_bytes: step_budget.reserved_work + output_length,
                 failed: false,
-            }
+            })
         }
-        Err(StepFailure::OutputLimitExceeded { .. }) if work_limited_output => {
-            failed_step_execution(
+        Err(TransformError::Step(StepFailure::OutputLimitExceeded { .. }))
+            if work_limited_output =>
+        {
+            Ok(failed_step_execution(
                 operation,
                 input_length,
                 input_sha256,
@@ -527,21 +702,26 @@ fn execute_reserved_step(
                     limit: limits.max_work_bytes,
                 },
                 input_length,
-            )
+            ))
         }
-        Err(error) => {
-            failed_step_execution(operation, input_length, input_sha256, error, reserved_work)
-        }
+        Err(TransformError::Step(error)) => Ok(failed_step_execution(
+            operation,
+            input_length,
+            input_sha256,
+            error,
+            step_budget.reserved_work,
+        )),
+        Err(TransformError::Admission(error)) => Err(EngineError::Admission(error)),
     }
 }
 
-fn failed_step_execution(
+fn failed_step_execution<A: Admission>(
     operation: &Operation,
     input_length: usize,
     input_sha256: &str,
     error: StepFailure,
     work_bytes: usize,
-) -> StepExecution {
+) -> StepExecution<A> {
     StepExecution {
         output: None,
         report: failed_step_report(operation, input_length, input_sha256.to_owned(), error),

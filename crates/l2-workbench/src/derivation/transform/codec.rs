@@ -1,5 +1,5 @@
 use super::super::{Base64Alphabet, Base64Padding, HexCase, StepFailure};
-use super::{OutputBudget, check_output_size};
+use super::{Admission, Buffer, OutputBudget, TransformError, check_output_size};
 use base64::{
     Engine, alphabet,
     engine::{
@@ -8,15 +8,20 @@ use base64::{
     },
 };
 
-pub(super) fn hex_decode(input: &[u8], budget: OutputBudget) -> Result<Vec<u8>, StepFailure> {
+pub(super) fn hex_decode<A: Admission>(
+    input: &[u8],
+    budget: OutputBudget,
+    admission: &A,
+) -> Result<Buffer<A>, TransformError<A::Error>> {
     if !input.len().is_multiple_of(2) {
         return Err(StepFailure::InvalidHexLength {
             length: input.len(),
-        });
+        }
+        .into());
     }
     let output_length = input.len() / 2;
     check_output_size(output_length, budget)?;
-    let mut output = Vec::with_capacity(output_length);
+    let mut output = Buffer::with_capacity(output_length, admission)?;
     for (pair_index, pair) in input.chunks_exact(2).enumerate() {
         let decoded =
             pair.iter()
@@ -27,9 +32,9 @@ pub(super) fn hex_decode(input: &[u8], budget: OutputBudget) -> Result<Vec<u8>, 
                         crate::hex::decode_nibble(byte).ok_or(StepFailure::InvalidHexDigit {
                             offset: pair_index * 2 + nibble_offset,
                         })?;
-                    Ok((value << 4) | nibble)
+                    Ok::<_, StepFailure>((value << 4) | nibble)
                 })?;
-        output.push(decoded);
+        output.bytes.push(decoded);
     }
     Ok(output)
 }
@@ -97,12 +102,13 @@ pub(super) fn base64_encode(
     Ok(base64_engine(alphabet, padding).encode(input).into_bytes())
 }
 
-pub(super) fn base64_decode(
+pub(super) fn base64_decode<A: Admission>(
     input: &[u8],
     alphabet: Base64Alphabet,
     padding: Base64Padding,
     budget: OutputBudget,
-) -> Result<Vec<u8>, StepFailure> {
+    admission: &A,
+) -> Result<Buffer<A>, TransformError<A::Error>> {
     // Bound the decoder's possible output before its internal allocation
     let complete_groups = input.len() / 4;
     let remainder = input.len() % 4;
@@ -122,10 +128,15 @@ pub(super) fn base64_decode(
         })
         .ok_or(StepFailure::InvalidBase64)?;
     check_output_size(estimate, budget)?;
-    let decoded = base64_engine(alphabet, padding)
-        .decode(input)
+    // The decoder needs its own conservative estimate even when padding shortens output
+    let capacity = base64::decoded_len_estimate(input.len());
+    let mut decoded = Buffer::with_capacity(capacity, admission)?;
+    decoded.bytes.resize(capacity, 0);
+    let written = base64_engine(alphabet, padding)
+        .decode_slice(input, &mut decoded.bytes)
         .map_err(|_| StepFailure::InvalidBase64)?;
-    check_output_size(decoded.len(), budget)?;
+    decoded.bytes.truncate(written);
+    check_output_size(decoded.bytes.len(), budget)?;
     Ok(decoded)
 }
 

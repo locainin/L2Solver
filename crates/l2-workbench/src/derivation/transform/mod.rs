@@ -4,6 +4,7 @@ mod codec;
 mod compression;
 mod crypto;
 
+use super::memory::{Admission, Buffer, BufferError};
 use super::{CounterByteOrder, CounterWidth, OperandRef, Operation, SeedCounterOrder, StepFailure};
 
 pub use bits::select_bit_plane_chunks;
@@ -62,82 +63,124 @@ pub(super) struct OutputBudget {
     pub max_key_bytes: usize,
 }
 
-pub(super) fn apply(
+pub(super) enum TransformError<E> {
+    Step(StepFailure),
+    Admission(E),
+}
+
+impl<E> From<StepFailure> for TransformError<E> {
+    fn from(error: StepFailure) -> Self {
+        Self::Step(error)
+    }
+}
+
+impl<E> From<BufferError<E>> for TransformError<E> {
+    fn from(error: BufferError<E>) -> Self {
+        match error {
+            BufferError::Allocation => Self::Step(StepFailure::AllocationFailed),
+            BufferError::Admission(error) => Self::Admission(error),
+        }
+    }
+}
+
+pub(super) fn apply<A: Admission>(
     input: &[u8],
     operation: &Operation,
     budget: OutputBudget,
-) -> Result<Vec<u8>, StepFailure> {
-    let output = dispatch(input, operation, budget)?;
-    check_output_size(output.len(), budget)?;
+    admission: &A,
+) -> Result<Buffer<A>, TransformError<A::Error>> {
+    let output = dispatch(input, operation, budget, admission)?;
+    check_output_size(output.bytes.len(), budget)?;
     Ok(output)
 }
 
-fn dispatch(
+fn dispatch<A: Admission>(
     input: &[u8],
     operation: &Operation,
     budget: OutputBudget,
-) -> Result<Vec<u8>, StepFailure> {
+    admission: &A,
+) -> Result<Buffer<A>, TransformError<A::Error>> {
     match operation {
-        Operation::HexDecode {} => codec::hex_decode(input, budget),
-        Operation::HexEncode { case } => codec::hex_encode(input, *case, budget),
+        Operation::HexDecode {} => codec::hex_decode(input, budget, admission),
+        Operation::HexEncode { case } => {
+            untracked(admission, || codec::hex_encode(input, *case, budget))
+        }
         Operation::Base64Decode { alphabet, padding } => {
-            codec::base64_decode(input, *alphabet, *padding, budget)
+            codec::base64_decode(input, *alphabet, *padding, budget, admission)
         }
-        Operation::Base64Encode { alphabet, padding } => {
+        Operation::Base64Encode { alphabet, padding } => untracked(admission, || {
             codec::base64_encode(input, *alphabet, *padding, budget)
+        }),
+        Operation::XorRepeat { key, offset } => {
+            untracked(admission, || bytes::xor_repeat(input, key, *offset, budget))
         }
-        Operation::XorRepeat { key, offset } => bytes::xor_repeat(input, key, *offset, budget),
         Operation::Sha256CounterXor {
             seed,
             initial_counter,
             counter_width,
             counter_byte_order,
             seed_order,
-        } => crypto::sha256_counter_xor(
-            input,
-            literal_operand(seed)?,
-            *initial_counter,
-            *counter_width,
-            *counter_byte_order,
-            *seed_order,
-            budget,
-        ),
+        } => untracked(admission, || {
+            crypto::sha256_counter_xor(
+                input,
+                literal_operand(seed)?,
+                *initial_counter,
+                *counter_width,
+                *counter_byte_order,
+                *seed_order,
+                budget,
+            )
+        }),
         Operation::AesGcmDecrypt {
             key,
             nonce,
             associated_data,
             tag_layout,
-        } => crypto::aes_gcm_decrypt(
-            input,
-            literal_operand(key)?,
-            literal_operand(nonce)?,
-            literal_operand(associated_data)?,
-            *tag_layout,
-            budget,
-        ),
+        } => untracked(admission, || {
+            crypto::aes_gcm_decrypt(
+                input,
+                literal_operand(key)?,
+                literal_operand(nonce)?,
+                literal_operand(associated_data)?,
+                *tag_layout,
+                budget,
+            )
+        }),
         Operation::ScryptDerive {
             salt,
             log_n,
             r,
             p,
             output_length,
-        } => crypto::scrypt_derive(
-            input,
-            literal_operand(salt)?,
-            *log_n,
-            *r,
-            *p,
-            *output_length,
-            budget,
-        ),
-        Operation::ByteAdd { value } => bytes::byte_add(input, *value, budget),
-        Operation::RotateBits { count } => bytes::rotate_bits(input, *count, budget),
-        Operation::Slice { start, length } => bytes::slice(input, *start, *length, budget),
-        Operation::Select { indices } => bytes::select(input, indices, budget),
+        } => untracked(admission, || {
+            crypto::scrypt_derive(
+                input,
+                literal_operand(salt)?,
+                *log_n,
+                *r,
+                *p,
+                *output_length,
+                budget,
+            )
+        }),
+        Operation::ByteAdd { value } => {
+            untracked(admission, || bytes::byte_add(input, *value, budget))
+        }
+        Operation::RotateBits { count } => {
+            untracked(admission, || bytes::rotate_bits(input, *count, budget))
+        }
+        Operation::Slice { start, length } => {
+            bytes::slice(input, *start, *length, budget, admission)
+        }
+        Operation::Select { indices } => {
+            untracked(admission, || bytes::select(input, indices, budget))
+        }
         Operation::SelectBits {
             indices,
             bits_per_byte,
-        } => bits::select_bits(input, indices, *bits_per_byte, budget),
+        } => untracked(admission, || {
+            bits::select_bits(input, indices, *bits_per_byte, budget)
+        }),
         Operation::SelectBitRange {
             start_bit,
             bit_count,
@@ -145,18 +188,34 @@ fn dispatch(
             phase,
             bits_per_byte,
             remainder,
-        } => bits::select_bit_range(
-            input,
-            bits::BitWindow::new(*start_bit, *bit_count, *stride_bits, *phase),
-            *bits_per_byte,
-            *remainder,
-            budget,
-        ),
-        Operation::Reverse {} => bytes::reverse(input, budget),
-        Operation::Permute { indices } => bytes::permute(input, indices, budget),
-        Operation::GzipDecompress {} => compression::gzip(input, budget),
-        Operation::ZlibDecompress {} => compression::zlib(input, budget),
+        } => untracked(admission, || {
+            bits::select_bit_range(
+                input,
+                bits::BitWindow::new(*start_bit, *bit_count, *stride_bits, *phase),
+                *bits_per_byte,
+                *remainder,
+                budget,
+            )
+        }),
+        Operation::Reverse {} => untracked(admission, || bytes::reverse(input, budget)),
+        Operation::Permute { indices } => {
+            untracked(admission, || bytes::permute(input, indices, budget))
+        }
+        Operation::GzipDecompress {} => compression::gzip(input, budget, admission),
+        Operation::ZlibDecompress {} => compression::zlib(input, budget, admission),
     }
+}
+
+fn untracked<A: Admission>(
+    admission: &A,
+    operation: impl FnOnce() -> Result<Vec<u8>, StepFailure>,
+) -> Result<Buffer<A>, TransformError<A::Error>> {
+    // Refuse operations whose temporary allocations have no admission model
+    admission
+        .reject_untracked_operation()
+        .map_err(TransformError::Admission)?;
+    let lease = admission.reserve(0).map_err(TransformError::Admission)?;
+    Ok(Buffer::from_untracked(operation()?, lease))
 }
 
 fn literal_operand(operand: &OperandRef) -> Result<&[u8], StepFailure> {

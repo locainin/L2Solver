@@ -1,5 +1,5 @@
 use super::super::StepFailure;
-use super::{OutputBudget, check_output_size};
+use super::{Admission, Buffer, OutputBudget, TransformError, check_output_size};
 
 pub(super) fn xor_repeat(
     input: &[u8],
@@ -51,12 +51,13 @@ pub(super) fn rotate_bits(
     Ok(input.iter().map(|byte| byte.rotate_left(shift)).collect())
 }
 
-pub(super) fn slice(
+pub(super) fn slice<A: Admission>(
     input: &[u8],
     start: usize,
     length: Option<usize>,
     budget: OutputBudget,
-) -> Result<Vec<u8>, StepFailure> {
+    admission: &A,
+) -> Result<Buffer<A>, TransformError<A::Error>> {
     let length = match length {
         Some(length) => length,
         None => input
@@ -81,11 +82,8 @@ pub(super) fn slice(
         length,
         input_length: input.len(),
     })?;
-    let mut output = Vec::new();
-    output
-        .try_reserve_exact(selected.len())
-        .map_err(|_| StepFailure::AllocationFailed)?;
-    output.extend_from_slice(selected);
+    let mut output = Buffer::with_capacity(selected.len(), admission)?;
+    output.bytes.extend_from_slice(selected);
     Ok(output)
 }
 
