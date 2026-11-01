@@ -98,6 +98,40 @@ fn source_fingerprint_metadata_is_admitted_and_released_with_its_owner()
 }
 
 #[test]
+fn enlarged_manifest_is_rejected_before_a_recheck_reads_it() -> Result<(), Box<dyn Error>> {
+    let directory = tempfile::tempdir()?;
+    let manifest = directory.path().join("manifest.json");
+    std::fs::write(directory.path().join("one.bin"), b"a")?;
+    std::fs::write(
+        &manifest,
+        br#"{"schema_version":1,"artifacts":[{"file":"one.bin","byte_length":1}]}"#,
+    )?;
+    let memory = MemoryBudget::new(1024 * 1024);
+    let job = l2_workbench::job::Job::new("manifest recheck");
+    let input = super::prepare_input_set_with_limit(directory.path(), u64::MAX, &job, &memory)?;
+    let remaining = memory.snapshot()?.limit_bytes - memory.snapshot()?.used_bytes;
+    let blocker = memory.try_reserve(MemoryClass::Cache, remaining)?;
+    super::ensure_manifest_unchanged(&input, &job)?;
+
+    let replacement = vec![b' '; 128 * 1024];
+    std::fs::write(&manifest, &replacement)?;
+    let before = job.snapshot()?.counters;
+    let error = super::ensure_manifest_unchanged(&input, &job)
+        .expect_err("a differently sized manifest must be rejected");
+    assert!(error.to_string().contains("manifest changed"));
+    let after = job.snapshot()?.counters;
+    assert_eq!(
+        before.get(&l2_workbench::job::Counter::SourceReadBytes),
+        after.get(&l2_workbench::job::Counter::SourceReadBytes)
+    );
+    assert_eq!(std::fs::read(&manifest)?, replacement);
+    drop(blocker);
+    drop(input);
+    assert_eq!(memory.snapshot()?.used_bytes, 0);
+    Ok(())
+}
+
+#[test]
 fn cache_snapshot_is_admitted_before_its_bytes_are_read() -> Result<(), Box<dyn Error>> {
     let path = tempfile::NamedTempFile::new()?;
     let original = b"source cache payload";

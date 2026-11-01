@@ -1190,16 +1190,18 @@ pub(super) fn ensure_manifest_unchanged(
     let file = read_directory_file(input_set, "manifest.json")?;
     let metadata = file.file_metadata()?;
     let opened = metadata_fingerprint(&metadata);
-    let manifest_length = usize::try_from(metadata.len())?;
-    let manifest_read_bytes = metadata
-        .len()
-        .checked_add(1)
-        .ok_or_else(|| invalid_input("manifest read length overflows"))?;
-    input_set.budget.reserve(manifest_read_bytes)?;
+    // The retained admission covers the original length, not a larger replacement
+    let manifest_length = input_set.manifest_read_bytes - 1;
+    if metadata.len() != manifest_length {
+        return Err(invalid_input(
+            "input artifact manifest changed during refinement",
+        ));
+    }
+    input_set.budget.reserve(input_set.manifest_read_bytes)?;
     let (_, digest) = read_snapshot(
         CancellableReader::new(file, job),
         MAX_MANIFEST_BYTES,
-        Some(manifest_length),
+        Some(usize::try_from(manifest_length)?),
         None,
     )?;
     let named = read_directory_file(input_set, "manifest.json")?;
