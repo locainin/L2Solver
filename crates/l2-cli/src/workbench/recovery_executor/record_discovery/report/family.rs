@@ -43,8 +43,10 @@ pub(super) struct FamilySelection {
 pub(super) struct FamilySearchSummary {
     limits: RecordSchemaProposalLimits,
     discovery: FamilyDiscoveryEvidence,
+    reason: Option<&'static str>,
     selectors_retained: usize,
     groups_proposed: usize,
+    group_limit_reached: bool,
     groups_examined: usize,
     groups_with_schemas: usize,
     groups_without_candidate_space: usize,
@@ -105,6 +107,7 @@ struct FamilyGroups {
     incomplete: bool,
     selectors_retained: usize,
     discovery: FamilyDiscoveryEvidence,
+    group_limit_reached: bool,
 }
 
 impl Executor<'_> {
@@ -115,15 +118,18 @@ impl Executor<'_> {
         limits: RecordSchemaProposalLimits,
     ) -> Result<Vec<RecordReportOutput>, RecoveryExecutionError> {
         if uniform.partition.training_session_nodes.len() < 2 {
+            skipped_family(uniform, limits, "insufficient_training_sessions");
             return Ok(Vec::new());
         }
         if context.application_inputs.len() > MAX_APPLICATION_FRAMES {
             mark_incomplete(uniform, "message_family_input_limit");
+            skipped_family(uniform, limits, "message_family_input_limit");
             return Ok(Vec::new());
         }
         let memory_bytes = memory_bound(context, limits)?;
         if memory_bytes > MAX_FAMILY_MEMORY_BYTES {
             mark_incomplete(uniform, "message_family_memory_limit");
+            skipped_family(uniform, limits, "message_family_memory_limit");
             return Ok(Vec::new());
         }
         // Reserve temporary and queued data before learning any selectors
@@ -134,6 +140,7 @@ impl Executor<'_> {
                 Ok(lease) => Some(lease),
                 Err(MemoryError::Limit { .. } | MemoryError::Pressure { .. }) => {
                     mark_incomplete(uniform, "message_family_memory_limit");
+                    skipped_family(uniform, limits, "message_family_memory_limit");
                     return Ok(Vec::new());
                 }
                 Err(source) => return Err(operational("family memory admission failed", source)),
@@ -144,6 +151,7 @@ impl Executor<'_> {
         let work = family_work_bound(context)?;
         if !self.charge_record_case_work(work)? {
             mark_incomplete(uniform, "message_family_work_limit");
+            skipped_family(uniform, limits, "message_family_work_limit");
             return Ok(Vec::new());
         }
         // Keep the uniform report even when a separate family search is incomplete
@@ -153,7 +161,13 @@ impl Executor<'_> {
             discovery: proposal.discovery,
             selectors_retained: proposal.selectors_retained,
             groups_proposed: proposal.groups.len(),
+            group_limit_reached: proposal.group_limit_reached,
             complete_within_limits: !proposal.incomplete,
+            reason: if proposal.group_limit_reached {
+                Some("message_family_group_limit")
+            } else {
+                proposal.incomplete.then_some("message_family_search_limit")
+            },
             ..FamilySearchSummary::default()
         };
         summary
@@ -177,6 +191,7 @@ impl Executor<'_> {
             if !self.charge_record_case_work(bound)? {
                 mark_incomplete(uniform, "message_family_work_limit");
                 summary.complete_within_limits = false;
+                summary.reason = Some("message_family_work_limit");
                 group_summary.result = "not_examined";
                 group_summary.reason = Some("message_family_work_limit");
                 summary.groups.push(group_summary);
@@ -302,6 +317,22 @@ fn frame_examples<'a>(
 fn mark_incomplete(analysis: &mut RecordAnalysis, reason: &'static str) {
     analysis.search_exhaustive_within_plan = false;
     analysis.strategy_omission = Some(reason);
+}
+
+fn skipped_family(
+    analysis: &mut RecordAnalysis,
+    limits: RecordSchemaProposalLimits,
+    reason: &'static str,
+) {
+    analysis.family_search = Some(FamilySearchSummary {
+        limits,
+        discovery: FamilyDiscoveryEvidence {
+            range_pair_limit: DEFAULT_MAX_FAMILY_RANGES,
+            ..FamilyDiscoveryEvidence::default()
+        },
+        reason: Some(reason),
+        ..FamilySearchSummary::default()
+    });
 }
 
 fn family_work_bound(context: &RecordDiscoveryContext) -> Result<usize, RecoveryExecutionError> {
@@ -458,6 +489,7 @@ fn propose_groups(
             incomplete: true,
             selectors_retained: 0,
             discovery,
+            group_limit_reached: false,
         });
     }
     let family_limits = family_limits(limits, FAMILY_WORK_LIMIT);
@@ -469,6 +501,7 @@ fn propose_groups(
     discovery.observation_coverage = Some(report.observation_coverage);
     let mut groups = Vec::new();
     let mut incomplete = !report.complete || discovery.omitted_learning_inputs > 0;
+    let mut group_limit_reached = false;
     for selector in &report.selectors {
         // One supported value can still separate data from varied control messages
         let has_other_training_values = selector
@@ -482,10 +515,6 @@ fn propose_groups(
         }
         let unassigned = unassigned_count(case, &context.application_inputs, selector)?;
         for family in &selector.families {
-            if groups.len() == MAX_GROUPS {
-                incomplete = true;
-                break;
-            }
             let Some(group) = make_group(
                 case,
                 context,
@@ -511,13 +540,18 @@ fn propose_groups(
             }) {
                 continue;
             }
+            if groups.len() == MAX_GROUPS {
+                // Only a new cohort can be omitted by the group limit
+                incomplete = true;
+                group_limit_reached = true;
+                break;
+            }
             groups
                 .try_reserve(1)
                 .map_err(|source| operational("family group allocation failed", source))?;
             groups.push(group);
         }
-        if groups.len() == MAX_GROUPS {
-            incomplete = true;
+        if group_limit_reached {
             break;
         }
     }
@@ -526,6 +560,7 @@ fn propose_groups(
         incomplete,
         selectors_retained: report.selectors.len(),
         discovery,
+        group_limit_reached,
     })
 }
 

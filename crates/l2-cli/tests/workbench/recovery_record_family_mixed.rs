@@ -152,6 +152,7 @@ enum HeldoutChange {
     AlternateLayout,
     StructuredControls,
     TwoByteSelector,
+    ManyFamilies,
 }
 
 fn aligned_archive(contents: &[u8]) -> TestResult<Vec<u8>> {
@@ -208,7 +209,7 @@ fn alternate_messages(archive: &[u8], session: u8) -> TestResult<Vec<Vec<u8>>> {
     Ok(messages)
 }
 
-fn two_byte_messages(archive: &[u8], session: u8) -> TestResult<Vec<Vec<u8>>> {
+fn two_byte_messages(archive: &[u8], session: u8, extra_control: bool) -> TestResult<Vec<Vec<u8>>> {
     let mut messages = Vec::new();
     for (sequence, payload) in archive.chunks_exact(PAYLOAD_BYTES).enumerate() {
         let mut data = vec![0x10, 0x20];
@@ -219,7 +220,8 @@ fn two_byte_messages(archive: &[u8], session: u8) -> TestResult<Vec<Vec<u8>>> {
         ));
         assert_eq!(data.len(), TWO_BYTE_FRAME_BYTES);
         messages.push(data);
-        for selector in [[0x10, 0x30], [0x11, 0x20], [0x11, 0x30]] {
+        let selectors = [[0x10, 0x30], [0x11, 0x20], [0x11, 0x30], [0x12, 0x20]];
+        for selector in selectors.into_iter().take(3 + usize::from(extra_control)) {
             let mut control = selector.to_vec();
             for offset in 0..TWO_BYTE_FRAME_BYTES - selector.len() {
                 let byte = usize::from(session) * 37 + sequence * 19 + offset * 23 + 11;
@@ -232,6 +234,11 @@ fn two_byte_messages(archive: &[u8], session: u8) -> TestResult<Vec<Vec<u8>>> {
 }
 
 fn mixed_fixture(change: HeldoutChange) -> TestResult<MixedFixture> {
+    let two_byte = matches!(
+        change,
+        HeldoutChange::TwoByteSelector | HeldoutChange::ManyFamilies
+    );
+    let extra_control = matches!(change, HeldoutChange::ManyFamilies);
     let mut archives = [
         b"first observed message family".as_slice(),
         b"second observed message family".as_slice(),
@@ -256,8 +263,8 @@ fn mixed_fixture(change: HeldoutChange) -> TestResult<MixedFixture> {
             let session = u8::try_from(index)?;
             if matches!(change, HeldoutChange::AlternateLayout) {
                 alternate_messages(archive, session)
-            } else if matches!(change, HeldoutChange::TwoByteSelector) {
-                two_byte_messages(archive, session)
+            } else if two_byte {
+                two_byte_messages(archive, session, extra_control)
             } else {
                 mixed_messages(archive, session)
             }
@@ -294,7 +301,8 @@ fn mixed_fixture(change: HeldoutChange) -> TestResult<MixedFixture> {
         | HeldoutChange::VariableControls
         | HeldoutChange::AlternateLayout
         | HeldoutChange::StructuredControls
-        | HeldoutChange::TwoByteSelector => {}
+        | HeldoutChange::TwoByteSelector
+        | HeldoutChange::ManyFamilies => {}
         HeldoutChange::UnknownControl => {
             let control = heldout
                 .last_mut()
@@ -317,18 +325,13 @@ fn mixed_fixture(change: HeldoutChange) -> TestResult<MixedFixture> {
     let source = capture(&mut case, "independent mixed message families")?;
     let sessions = add_unframed_sessions(&mut case, &source, vec![("mixed", messages)])?;
     let mut policy = normal_policy(&case)?;
-    // Four samples per session include both layouts in both training sessions
-    policy.record_schema_proposal_limits.discovery.max_messages =
-        if matches!(change, HeldoutChange::TwoByteSelector) {
-            32
-        } else {
-            16
-        };
+    // The learning sample includes each layout in both training sessions
+    policy.record_schema_proposal_limits.discovery.max_messages = if two_byte { 32 } else { 16 };
     let plan = RecoveryPlan {
         framings: vec![FramingKind::FixedSize {
             bytes: if matches!(change, HeldoutChange::AlternateLayout) {
                 ALTERNATE_FRAME_BYTES
-            } else if matches!(change, HeldoutChange::TwoByteSelector) {
+            } else if two_byte {
                 TWO_BYTE_FRAME_BYTES
             } else {
                 FRAME_BYTES
@@ -819,7 +822,59 @@ fn two_byte_selector_separates_overlapping_single_byte_values() -> TestResult<()
             }),
         "a two-byte selector must identify the data family"
     );
+    let reports = run
+        .case
+        .nodes()
+        .iter()
+        .filter(|node| node.kind == REPORT_KIND)
+        .map(|node| decode_report(&run.case, node.id))
+        .collect::<TestResult<Vec<_>>>()?;
+    let exactly_bounded = reports.iter().any(|report| {
+        report.pointer("/family_search/groups_proposed") == Some(&json!(8))
+            && report.pointer("/family_search/group_limit_reached") == Some(&json!(false))
+    });
+    if !exactly_bounded {
+        let counts = family_search_counts(&reports);
+        return Err(format!(
+            "exactly eight groups must not claim a group-limit omission: {counts:?}"
+        )
+        .into());
+    }
     Ok(())
+}
+
+#[test]
+fn family_group_limit_reports_an_additional_distinct_cohort() -> TestResult<()> {
+    let run = execute_mixed_sessions(HeldoutChange::ManyFamilies)?;
+    let reports = run
+        .case
+        .nodes()
+        .iter()
+        .filter(|node| node.kind == REPORT_KIND)
+        .map(|node| decode_report(&run.case, node.id))
+        .collect::<TestResult<Vec<_>>>()?;
+    let limited = reports.iter().any(|report| {
+        report.pointer("/family_search/groups_proposed") == Some(&json!(8))
+            && report.pointer("/family_search/group_limit_reached") == Some(&json!(true))
+            && report.pointer("/family_search/reason") == Some(&json!("message_family_group_limit"))
+    });
+    if !limited {
+        let counts = family_search_counts(&reports);
+        return Err(
+            format!("a distinct cohort beyond the limit must be reported: {counts:?}").into(),
+        );
+    }
+    Ok(())
+}
+
+fn family_search_counts(reports: &[Value]) -> Vec<Value> {
+    reports
+        .iter()
+        .filter_map(|report| report.get("family_search"))
+        .map(|search| {
+            json!({"groups":search.get("groups_proposed"),"limit":search.get("group_limit_reached"),"reason":search.get("reason"),"selectors":search.get("selectors_retained")})
+        })
+        .collect()
 }
 
 #[test]
@@ -887,10 +942,42 @@ fn family_memory_limit_reports_incomplete_analysis_without_leaking_a_lease() -> 
                 decode_report(&case, node.id).is_ok_and(|report| {
                     report.get("strategy_omission") == Some(&json!("message_family_memory_limit"))
                         && report.get("search_exhaustive_within_plan") == Some(&json!(false))
+                        && report.pointer("/family_search/reason")
+                            == Some(&json!("message_family_memory_limit"))
                 })
             })
     );
     assert_eq!(memory.snapshot()?.used_bytes, 0);
+    Ok(())
+}
+
+#[test]
+fn single_session_reports_that_family_learning_needs_another_training_session() -> TestResult<()> {
+    let archive = aligned_archive(b"one observed session")?;
+    let messages = mixed_messages(&archive, 0)?;
+    let mut case = Case::new();
+    let source = capture(&mut case, "single family session")?;
+    add_unframed_sessions(&mut case, &source, vec![("single", vec![messages])])?;
+    let policy = normal_policy(&case)?;
+    let plan = RecoveryPlan {
+        framings: vec![FramingKind::FixedSize { bytes: FRAME_BYTES }],
+        discover_records: true,
+        ..RecoveryPlan::default()
+    };
+    execute(&mut case, &plan, &policy)?;
+    assert!(
+        case.nodes()
+            .iter()
+            .filter(|node| node.kind == REPORT_KIND)
+            .any(|node| {
+                decode_report(&case, node.id).is_ok_and(|report| {
+                    report.pointer("/family_search/reason")
+                        == Some(&json!("insufficient_training_sessions"))
+                        && report.pointer("/family_search/complete_within_limits")
+                            == Some(&json!(false))
+                })
+            })
+    );
     Ok(())
 }
 
