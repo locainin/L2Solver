@@ -575,6 +575,15 @@ fn cache_key_does_not_reuse_the_previous_transform_proposal_policy() -> Result<(
 }
 
 #[test]
+fn cache_key_does_not_reuse_results_without_xor_discovery() -> Result<(), Box<dyn Error>> {
+    let (_, scope) = case_and_scope(b"4142", 19)?;
+    let options = RecoveryOptions::default();
+    let old = previous_recovery_key(&scope, &options, super::RECOVERY_STAGE_VERSION)?;
+    assert_ne!(recovery_key(RecoveryCaseKind::Flow, &scope, &options)?, old);
+    Ok(())
+}
+
+#[test]
 fn changed_recovery_algorithm_rejects_a_stale_partial_result() -> Result<(), Box<dyn Error>> {
     // Earlier stages lack current search, schema handoff, or deferred assembly semantics
     for version in [

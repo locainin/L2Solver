@@ -268,6 +268,14 @@ impl Executor<'_> {
         input_node: u64,
         input_length: usize,
     ) -> Result<(), RecoveryExecutionError> {
+        let omission_count = self.omissions.len();
+        let xor_retained =
+            match self.discover_xor_messages(candidate_id, input_node, input_length)? {
+                super::xor_messages::XorDiscoveryOutcome::Retained => true,
+                super::xor_messages::XorDiscoveryOutcome::Skipped => false,
+                super::xor_messages::XorDiscoveryOutcome::Exhausted => return Ok(()),
+            };
+        let xor_complete = self.omissions.len() == omission_count;
         let scan = transform_proposal_scan(input_length)?;
         let scan_limit = self
             .policy
@@ -291,11 +299,14 @@ impl Executor<'_> {
             self.assess_transform_input(candidate_id, input_length)?;
         self.record_transform_discovery_omissions(input_node, &proposal_report);
         // Retain regional negative evidence before finishing this source as unsupported
-        if self.finish_complete_negative_transform_search(
-            candidate_id,
-            &proposal_report,
-            &region_report,
-        )? {
+        if !xor_retained
+            && self.finish_complete_negative_transform_search(
+                candidate_id,
+                &proposal_report,
+                &region_report,
+                xor_complete,
+            )?
+        {
             return Ok(());
         }
 
@@ -410,6 +421,7 @@ impl Executor<'_> {
         candidate_id: RecoveryCandidateId,
         proposal_report: &TransformProposalReport,
         region_report: &TransformRegionReport,
+        xor_complete: bool,
     ) -> Result<bool, RecoveryExecutionError> {
         let region_has_proposals = region_report
             .regions
@@ -435,10 +447,12 @@ impl Executor<'_> {
         {
             return Ok(false);
         }
-        self.complete_negative_transform_searches = self
-            .complete_negative_transform_searches
-            .checked_add(1)
-            .ok_or(RecoveryError::InvariantFailure)?;
+        if xor_complete {
+            self.complete_negative_transform_searches = self
+                .complete_negative_transform_searches
+                .checked_add(1)
+                .ok_or(RecoveryError::InvariantFailure)?;
+        }
         self.finish(candidate_id, RecoveryResult::Unsupported)?;
         Ok(true)
     }

@@ -44,6 +44,7 @@ mod summary_fixture;
 mod tcp_ancestry;
 mod transform;
 mod validation;
+mod xor_messages;
 
 use super::framing_materialize::FramingSelectionBasis;
 use crate::arguments::RecoveryProfile;
@@ -150,7 +151,11 @@ pub fn recover_case_with_job(
 
 fn discovery_input_coverage_complete(omissions: &[RecoveryOmission]) -> bool {
     omissions.iter().all(|omission| match omission {
-        RecoveryOmission::RelationalIncrementalMetadata { .. } => false,
+        RecoveryOmission::RelationalIncrementalMetadata { .. }
+        | RecoveryOmission::XorMessageOmission { .. } => false,
+        RecoveryOmission::XorSearchLimit {
+            sample_truncated, ..
+        } => !sample_truncated,
         RecoveryOmission::RelationalTransformAnalysis {
             input_coverage_complete,
             ..
@@ -182,6 +187,8 @@ fn search_exhaustive_within_plan(omissions: &[RecoveryOmission]) -> bool {
             omitted_candidates, ..
         } => *omitted_candidates == 0,
         RecoveryOmission::RecordDiscoveryLearningSample { .. }
+        | RecoveryOmission::XorSearchLimit { .. }
+        | RecoveryOmission::XorMessageOmission { .. }
         | RecoveryOmission::RelationalIncrementalMetadata { .. }
         | RecoveryOmission::TransformProposalAssociations { .. }
         | RecoveryOmission::RelationalTransformAnalysis {
@@ -240,6 +247,7 @@ fn report_details_complete(omissions: &[RecoveryOmission]) -> bool {
             ..
         } => *report_details_complete,
         RecoveryOmission::RelationalIncrementalMetadata { .. }
+        | RecoveryOmission::XorMessageOmission { .. }
         | RecoveryOmission::FramingDiscoveryReportDetails { .. }
         | RecoveryOmission::RecordDiscoveryReportDetails { .. }
         | RecoveryOmission::ResourceExhausted {
