@@ -100,6 +100,7 @@ def exercise_command(peer, witness, watch, net_fd, indices, command, parent_net)
                 raise RuntimeError(
                     f"switching observer failed: exit={process.returncode}, stdout={stdout.decode(errors='replace')}, stderr={stderr.decode(errors='replace')}"
                 )
+            owned.require_selected_test(command, stdout)
         finally:
             if process.poll() is None:
                 process.kill()

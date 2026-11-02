@@ -82,10 +82,11 @@ def exercise_command(
             wait_for_ready(process, Path(sync_dir) / "ready", deadline)
             inject(peer, witness, net_fd, indices, deadline, fixture_dir, names)
             verify_no_client_send(watch, process, deadline)
-            process.communicate(timeout=2)
+            stdout, _stderr = process.communicate(timeout=2)
             if process.returncode != 0:
                 # Client output can contain captured packet data
                 raise RuntimeError(f"receive-only command failed: exit={process.returncode}")
+            owned.require_selected_test(command, stdout)
         finally:
             if process.poll() is None:
                 # Failed clients are reaped before the owned pair is removed

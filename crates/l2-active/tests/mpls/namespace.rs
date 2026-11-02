@@ -3,7 +3,6 @@
 use std::{error::Error, path::Path, process::Command};
 
 #[test]
-#[ignore = "uses a proved private network namespace and an owned veth pair"]
 fn owned_veth_delivers_mpls_without_a_client_send() -> Result<(), Box<dyn Error>> {
     let fixture = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/mpls/fixtures/veth.py");
     let output = Command::new("python3").arg(fixture).output()?;
@@ -20,7 +19,6 @@ fn owned_veth_delivers_mpls_without_a_client_send() -> Result<(), Box<dyn Error>
 }
 
 #[test]
-#[ignore = "uses a proved private network namespace and an owned veth pair"]
 fn owned_veth_rejects_a_command_that_never_becomes_ready() -> Result<(), Box<dyn Error>> {
     let fixture = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/mpls/fixtures/veth.py");
     let output = Command::new("python3")
@@ -33,7 +31,6 @@ fn owned_veth_rejects_a_command_that_never_becomes_ready() -> Result<(), Box<dyn
 }
 
 #[test]
-#[ignore = "uses a proved private network namespace and an owned veth pair"]
 fn owned_veth_exercises_a_ready_receive_only_client() -> Result<(), Box<dyn Error>> {
     // The witness accepts no transmission from this receive-only client
     let client = r"
@@ -71,7 +68,6 @@ with socket.socket(socket.AF_PACKET, socket.SOCK_RAW, socket.htons(3)) as link:
 }
 
 #[test]
-#[ignore = "uses a proved private network namespace and an owned veth pair"]
 fn owned_veth_rejects_a_client_transmission() -> Result<(), Box<dyn Error>> {
     // The attempted send can reach only the validated private veth peer
     let client = r"

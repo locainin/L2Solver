@@ -3,7 +3,6 @@
 use std::{error::Error, path::Path, process::Command};
 
 #[test]
-#[ignore = "uses only a verified private user, mount, and network namespace with a veth pair"]
 fn owned_veth_carries_a_synthetic_dhcp_exchange_and_confirms_cleanup() -> Result<(), Box<dyn Error>>
 {
     let fixture = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/dhcp/fixtures/veth.py");
@@ -21,7 +20,6 @@ fn owned_veth_carries_a_synthetic_dhcp_exchange_and_confirms_cleanup() -> Result
 }
 
 #[test]
-#[ignore = "uses only a verified private user, mount, and network namespace with a veth pair"]
 fn owned_veth_does_not_claim_a_discover_when_command_sends_nothing() -> Result<(), Box<dyn Error>> {
     let fixture = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/dhcp/fixtures/veth.py");
     let output = Command::new("python3")
@@ -37,7 +35,6 @@ fn owned_veth_does_not_claim_a_discover_when_command_sends_nothing() -> Result<(
 }
 
 #[test]
-#[ignore = "uses only a verified private user, mount, and network namespace with a veth pair"]
 fn owned_veth_responder_copies_the_request_transaction() -> Result<(), Box<dyn Error>> {
     // This client is executed only after the fixture has verified the isolated namespace
     let client = r"

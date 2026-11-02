@@ -7,7 +7,6 @@ fn fixture() -> std::path::PathBuf {
 }
 
 #[test]
-#[ignore = "uses a proved private namespace and owned veth pair"]
 fn owned_veth_delivers_isl_without_client_transmission() -> Result<(), Box<dyn Error>> {
     let output = Command::new("python3").arg(fixture()).output()?;
     assert!(
@@ -23,7 +22,6 @@ fn owned_veth_delivers_isl_without_client_transmission() -> Result<(), Box<dyn E
 }
 
 #[test]
-#[ignore = "uses a proved private namespace and owned veth pair"]
 fn owned_veth_delivers_positive_and_negative_frames_to_ready_client() -> Result<(), Box<dyn Error>>
 {
     // The harness proves the namespace and pair before starting this client
@@ -59,7 +57,6 @@ with socket.socket(socket.AF_PACKET, socket.SOCK_RAW, socket.htons(3)) as link:
 }
 
 #[test]
-#[ignore = "uses a proved private namespace and owned veth pair"]
 fn owned_veth_detects_an_unexpected_observer_transmission() -> Result<(), Box<dyn Error>> {
     // The negative transmission is confined to the verified private veth
     let client = r"

@@ -129,6 +129,7 @@ def exercise(net_fd, indices, command, parent_net):
                 raise RuntimeError(
                     f"global NDP case failed: case={case}, requests={count}, removed={removed}, exit={process.returncode}, stdout={stdout.decode(errors='replace')}, stderr={stderr.decode(errors='replace')}"
                 )
+            owned.require_selected_test(command, stdout)
         finally:
             if process.poll() is None:
                 process.kill()

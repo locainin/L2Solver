@@ -30,6 +30,12 @@ def require_owned_scope(net_fd, indices):
     ns.require_pair(indices)
 
 
+def require_selected_test(command, stdout):
+    # Libtest reports success when an exact filter selects no tests
+    if "--exact" in command and b"test result: ok. 1 passed; 0 failed;" not in stdout:
+        raise RuntimeError("expected one child test to pass")
+
+
 def next_packet(capture, expected, deadline):
     for _ in range(64):
         if time.monotonic() >= deadline:

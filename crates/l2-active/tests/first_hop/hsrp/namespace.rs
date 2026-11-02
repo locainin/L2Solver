@@ -3,7 +3,6 @@
 use std::{error::Error, path::Path, process::Command};
 
 #[test]
-#[ignore = "uses a proved private network namespace and an owned veth pair"]
 fn owned_veth_delivers_hsrp_without_a_client_send() -> Result<(), Box<dyn Error>> {
     let fixture =
         Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/first_hop/hsrp/fixtures/veth.py");
@@ -21,7 +20,6 @@ fn owned_veth_delivers_hsrp_without_a_client_send() -> Result<(), Box<dyn Error>
 }
 
 #[test]
-#[ignore = "uses a proved private network namespace and an owned veth pair"]
 fn owned_veth_rejects_a_command_that_never_becomes_ready() -> Result<(), Box<dyn Error>> {
     let fixture =
         Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/first_hop/hsrp/fixtures/veth.py");
@@ -35,7 +33,6 @@ fn owned_veth_rejects_a_command_that_never_becomes_ready() -> Result<(), Box<dyn
 }
 
 #[test]
-#[ignore = "uses a proved private network namespace and an owned veth pair"]
 fn owned_veth_delivers_frames_to_a_ready_receive_only_client() -> Result<(), Box<dyn Error>> {
     let client = r"
 import os
@@ -73,7 +70,6 @@ with socket.socket(socket.AF_PACKET, socket.SOCK_RAW, socket.htons(3)) as link:
 }
 
 #[test]
-#[ignore = "uses a proved private network namespace and an owned veth pair"]
 fn owned_veth_detects_a_client_transmission() -> Result<(), Box<dyn Error>> {
     // The namespace harness proves ownership before the test attempts a send
     let client = r"

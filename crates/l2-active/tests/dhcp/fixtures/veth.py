@@ -165,6 +165,7 @@ def exercise_command(peer, client, net_fd, indices, command, parent_net):
             raise RuntimeError(
                 f"DHCP command failed: requests={count}, exit={process.returncode}, stdout={stdout.decode(errors='replace')}, stderr={stderr.decode(errors='replace')}"
             )
+        owned.require_selected_test(command, stdout)
     finally:
         if process.poll() is None:
             process.kill()

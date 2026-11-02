@@ -522,6 +522,10 @@ fn early_backend_deadline_does_not_claim_the_requested_window_completed()
     let report = probe(None, 10, 1024)?.run(&mut link, &AtomicBool::new(false))?;
     assert_eq!(report.status(), NeighborStatus::Observed);
     assert_eq!(report.summary().stop_reason(), StopReason::BackendDeadline);
+    assert_eq!(report.summary().received_packets(), 1);
+    assert_eq!(report.summary().received_bytes(), 60);
+    assert_eq!(report.summary().total_received_packets(), None);
+    assert_eq!(report.summary().total_received_bytes(), None);
     Ok(())
 }
 

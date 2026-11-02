@@ -3,7 +3,6 @@
 use std::{error::Error, path::Path, process::Command};
 
 #[test]
-#[ignore = "uses only a proved private namespace and owned veth pair"]
 fn owned_veth_observes_one_start_and_one_independent_request() -> Result<(), Box<dyn Error>> {
     let fixture = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/dot1x/fixtures/veth.py");
     let output = Command::new("python3").arg(fixture).output()?;
@@ -20,7 +19,6 @@ fn owned_veth_observes_one_start_and_one_independent_request() -> Result<(), Box
 }
 
 #[test]
-#[ignore = "uses only a proved private namespace and owned veth pair"]
 fn owned_veth_does_not_claim_a_start_when_command_sends_nothing() -> Result<(), Box<dyn Error>> {
     let fixture = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/dot1x/fixtures/veth.py");
     let output = Command::new("python3")
@@ -36,7 +34,6 @@ fn owned_veth_does_not_claim_a_start_when_command_sends_nothing() -> Result<(), 
 }
 
 #[test]
-#[ignore = "uses only a proved private namespace and owned veth pair"]
 fn owned_veth_rejects_altered_or_repeated_starts() -> Result<(), Box<dyn Error>> {
     // The harness verifies namespace ownership before this isolated client runs
     let client = r"
@@ -71,7 +68,6 @@ with socket.socket(socket.AF_PACKET, socket.SOCK_RAW, socket.htons(3)) as link:
 }
 
 #[test]
-#[ignore = "uses only a proved private namespace and owned veth pair"]
 fn owned_veth_responder_answers_a_real_start_in_the_selected_namespace()
 -> Result<(), Box<dyn Error>> {
     // The harness verifies namespace ownership before this isolated client runs

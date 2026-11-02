@@ -7,7 +7,6 @@ fn fixture() -> std::path::PathBuf {
 }
 
 #[test]
-#[ignore = "uses a proved private namespace and owned veth pair"]
 fn owned_veth_delivers_switching_frames_without_a_client_send() -> Result<(), Box<dyn Error>> {
     let output = Command::new("python3").arg(fixture()).output()?;
     assert!(
@@ -23,7 +22,6 @@ fn owned_veth_delivers_switching_frames_without_a_client_send() -> Result<(), Bo
 }
 
 #[test]
-#[ignore = "uses a proved private namespace and owned veth pair"]
 fn owned_veth_exercises_a_ready_receive_only_client() -> Result<(), Box<dyn Error>> {
     // The client is started only after the fixture proves its private namespace
     let client = r"
@@ -58,7 +56,6 @@ with socket.socket(socket.AF_PACKET, socket.SOCK_RAW, socket.htons(3)) as link:
 }
 
 #[test]
-#[ignore = "uses a proved private namespace and owned veth pair"]
 fn owned_veth_rejects_a_client_that_never_signals_readiness() -> Result<(), Box<dyn Error>> {
     let output = Command::new("python3")
         .arg(fixture())
@@ -70,7 +67,6 @@ fn owned_veth_rejects_a_client_that_never_signals_readiness() -> Result<(), Box<
 }
 
 #[test]
-#[ignore = "uses a proved private namespace and owned veth pair"]
 fn owned_veth_detects_transmission_by_the_observer() -> Result<(), Box<dyn Error>> {
     // The synthetic test transmission stays inside the proved private veth
     let client = r"
