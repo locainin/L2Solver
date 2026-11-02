@@ -452,7 +452,7 @@ fn import_explicit_without_changing_case() -> Result<(), Box<dyn Error>> {
     )?;
 
     assert!(!output.status.success());
-    assert!(output.stdout.is_empty());
+    assert_eq!(output.stdout.len(), 0);
     assert!(String::from_utf8_lossy(&output.stderr).contains("exceeds the input byte ceiling"));
     assert_eq!(fs::read(&case_path)?, original_case);
     Ok(())

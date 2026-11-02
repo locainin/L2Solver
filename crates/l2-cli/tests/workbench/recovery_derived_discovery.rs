@@ -1448,7 +1448,7 @@ fn assert_explicit_recipe_views(
             .first()
             .copied()
             .ok_or("explicit transform context view is missing")?;
-        assert!(view.ranges.is_empty());
+        assert_eq!(view.ranges.len(), 0);
         views.push(view);
     }
     assert!(fixture.case.nodes().iter().all(|node| {

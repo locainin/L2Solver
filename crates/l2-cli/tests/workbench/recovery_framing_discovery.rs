@@ -404,7 +404,7 @@ fn assert_materialized_frames_respect_run_boundaries(
         .iter()
         .filter(|node| node.kind == "custom_protocol_frame")
         .collect::<Vec<_>>();
-    assert!(!frames.is_empty());
+    assert_ne!(frames.len(), 0);
     for frame in frames {
         let input_node = field!(&frame.details, "input_node")
             .as_u64()
@@ -417,7 +417,7 @@ fn assert_materialized_frames_respect_run_boundaries(
             .map(|edge| edge.from)
             .collect::<Vec<_>>();
         assert_eq!(parents, vec![input_node]);
-        assert!(!frame.ranges.is_empty());
+        assert_ne!(frame.ranges.len(), 0);
         for mapping in &frame.ranges {
             let range_end = mapping
                 .offset

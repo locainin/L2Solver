@@ -80,7 +80,7 @@ fn strict_capture_quota_returns_the_typed_error_without_a_fallback() -> TestResu
         error.downcast_ref::<CacheError>(),
         Some(CacheError::QuotaExceeded { limit_bytes: 0, .. })
     ));
-    assert!(job.snapshot()?.cache_fallbacks.records().is_empty());
+    assert_eq!(job.snapshot()?.cache_fallbacks.records().len(), 0);
     assert_eq!(job.snapshot()?.counters.get(&Counter::Packets), Some(&1));
     Ok(())
 }
@@ -124,7 +124,7 @@ fn reused_content_index_does_not_store_another_index_in_its_alias() -> TestResul
         .ok_or("source alias was not stored")?;
     assert_eq!(fs::read_dir(alias.directory())?.count(), 0);
     assert_eq!(cache.stats()?.entry_bytes, retained_bytes);
-    assert!(job.snapshot()?.cache_fallbacks.records().is_empty());
+    assert_eq!(job.snapshot()?.cache_fallbacks.records().len(), 0);
     Ok(())
 }
 

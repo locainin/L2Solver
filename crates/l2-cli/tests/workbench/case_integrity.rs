@@ -32,7 +32,7 @@ fn malformed_forged_cases_rejected_output() -> Result<(), Box<dyn Error>> {
             &[],
         )?;
         assert_eq!(output.status.code(), Some(1));
-        assert!(output.stdout.is_empty());
+        assert_eq!(output.stdout.len(), 0);
         assert!(!destination.exists());
     }
     Ok(())

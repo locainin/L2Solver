@@ -180,7 +180,7 @@ fn evidence_quota_still_rejects_a_candidate_that_never_started() -> Result<(), B
             RecoveryError::CandidateNotRunning { id }
         )) if id == candidate
     ));
-    assert!(executor.omissions.is_empty());
+    assert_eq!(executor.omissions.len(), 0);
     Ok(())
 }
 

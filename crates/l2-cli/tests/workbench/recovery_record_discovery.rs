@@ -1402,7 +1402,7 @@ fn automatic_framing_materialization_reaches_the_record_discovery_barrier() -> T
         .iter()
         .filter(|candidate| candidate.task() == &RecoveryTask::RecordDiscovery)
         .collect::<Vec<_>>();
-    assert!(!record_discoveries.is_empty());
+    assert_ne!(record_discoveries.len(), 0);
     let materialized_frames = case
         .nodes()
         .iter()
@@ -1859,7 +1859,7 @@ fn accepted_frame_identities(accepted: &Value) -> TestResult<&[Value]> {
         .get("frame_identities")
         .and_then(Value::as_array)
         .ok_or("accepted record schema omitted frame identities")?;
-    assert!(!frame_indices.is_empty());
+    assert_ne!(frame_indices.len(), 0);
     assert_eq!(frame_indices.len(), identities.len());
     for (position, (index, identity)) in frame_indices.iter().zip(identities).enumerate() {
         let expected_index = u64::try_from(position).ok();
@@ -2895,7 +2895,7 @@ fn compact_record_reports_do_not_hide_typed_schema_scheduling() -> TestResult<()
     policy.resources.max_output_bytes = 4_096;
     let limits = policy.record_schema_proposal_limits;
     let (expected_schemas, falsification_count) = typed_survivor_schemas(&sessions, limits)?;
-    assert!(!expected_schemas.is_empty());
+    assert_ne!(expected_schemas.len(), 0);
 
     let plan = RecoveryPlan {
         discover_records: true,

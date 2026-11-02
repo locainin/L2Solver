@@ -258,7 +258,7 @@ fn carrier_plan_without_publishing() -> Result<(), Box<dyn Error>> {
     )?;
 
     assert!(!generated.status.success());
-    assert!(generated.stdout.is_empty());
+    assert_eq!(generated.stdout.len(), 0);
     Ok(())
 }
 
@@ -309,7 +309,7 @@ fn carrier_plan_disagree_retained_bytes() -> Result<(), Box<dyn Error>> {
     )?;
 
     assert!(!generated.status.success());
-    assert!(generated.stdout.is_empty());
+    assert_eq!(generated.stdout.len(), 0);
     assert!(
         String::from_utf8_lossy(&generated.stderr).contains("do not match retained node bytes")
     );

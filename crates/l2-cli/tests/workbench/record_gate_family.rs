@@ -277,12 +277,12 @@ fn exhausted_actual_schema_work_remains_pending_without_a_false_contradiction() 
         "expected a work-limit reason in gate alternatives: {:?}",
         result.details
     );
-    assert!(
+    assert_ne!(
         result
             .details
             .get("schema_search_exhaustive")
-            .and_then(Value::as_bool)
-            != Some(true)
+            .and_then(Value::as_bool),
+        Some(true)
     );
     Ok(())
 }

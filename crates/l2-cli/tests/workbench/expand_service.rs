@@ -15,7 +15,7 @@ fn service_expands_valid_png() -> Result<(), Box<dyn Error>> {
     let outcome = service.expand_selected(root)?;
 
     assert!(outcome.complete);
-    assert!(outcome.rejections.is_empty());
+    assert_eq!(outcome.rejections.len(), 0);
     assert!(outcome.created_nodes.iter().any(|id| {
         service
             .case()
@@ -165,7 +165,7 @@ fn resource_omission_marks_incomplete() -> Result<(), Box<dyn Error>> {
 
     assert!(!outcome.complete);
     assert!(!service.case().collection_complete());
-    assert!(outcome.rejections.is_empty());
+    assert_eq!(outcome.rejections.len(), 0);
     assert!(outcome.created_nodes.iter().any(|id| {
         service.case().nodes().iter().any(|node| {
             node.id == *id

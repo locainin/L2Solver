@@ -154,7 +154,7 @@ fn assert_missing_report_is_fatal(
             EvidenceError::MissingReference { kind: "node" }
         ))
     ));
-    assert!(executor.omissions.is_empty());
+    assert_eq!(executor.omissions.len(), 0);
     executor.transform_proposal_receipts.remove(&candidate_id);
     Ok(())
 }

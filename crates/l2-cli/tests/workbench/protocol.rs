@@ -157,7 +157,7 @@ fn unclassified_tcp_boundary_hypotheses_respect_search_and_report_limits()
             }));
         } else {
             // Missing detail stays an omission rather than an invented empty search
-            assert!(candidates.is_empty());
+            assert_eq!(candidates.len(), 0);
             assert_eq!(boundaries.get("omitted_candidate_details"), Some(&json!(1)));
         }
         assert!(
@@ -230,7 +230,7 @@ fn cli_samples_selected_message_budget() -> Result<(), Box<dyn Error>> {
     let output = run(&args, &case.to_json()?)?;
 
     assert_eq!(output.status.code(), Some(1));
-    assert!(output.stdout.is_empty());
+    assert_eq!(output.stdout.len(), 0);
     assert!(String::from_utf8_lossy(&output.stderr).contains("maximum is 2"));
     Ok(())
 }

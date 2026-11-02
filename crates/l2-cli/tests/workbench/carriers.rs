@@ -137,7 +137,7 @@ fn carrier_cli_source_hash_publishing() -> Result<(), Box<dyn Error>> {
     let result = run(&["carrier", path_arg(&plan)?], b"")?;
 
     assert_eq!(result.status.code(), Some(1));
-    assert!(result.stdout.is_empty());
+    assert_eq!(result.stdout.len(), 0);
     Ok(())
 }
 
