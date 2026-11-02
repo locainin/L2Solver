@@ -125,7 +125,7 @@ fn restored_summary_keeps_its_memory_charge_through_coverage() -> Result<(), Box
     {
         let mut lease = cache.lease(&key)?;
         let mut resume = RecoveryResume::new(&mut lease, &options, None);
-        resume.prepare(&original)?;
+        resume.prepare(&mut original)?;
         let mut executor = test_support::build_executor(&mut original, &plan, &policy)?;
         executor.omissions.push(omission());
         let mut cursor = SchedulerCursor::default();

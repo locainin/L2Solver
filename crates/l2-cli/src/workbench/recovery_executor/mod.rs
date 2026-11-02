@@ -3,6 +3,7 @@
 #[cfg(test)]
 #[path = "../../../tests/workbench/recovery_executor_cancel_boundary.rs"]
 mod cancel_boundary_tests;
+mod case_index_memory;
 #[cfg(test)]
 #[path = "../../../tests/workbench/recovery_case_index.rs"]
 mod case_index_tests;
@@ -284,8 +285,10 @@ fn execute_internal(
     mut resume: Option<&mut RecoveryResume<'_>>,
 ) -> Result<RecoveryExecutionOutcome, RecoveryExecutionError> {
     let policy = resolve_policy(policy.clone())?;
+    let session_memory = prepare_resume(case, resume.as_deref_mut(), job, memory)?;
+    // An optional resume session supplies the ledger for every restored allocation
+    let memory = session_memory.as_ref().or(memory);
     if let Some(active) = resume.as_deref_mut() {
-        active.prepare(case)?;
         match active.load() {
             Ok(Some(mut loaded)) => {
                 match checkpoint::read(
@@ -361,6 +364,29 @@ fn execute_internal(
     finish_executor(executor)
 }
 
+fn prepare_resume(
+    case: &mut Case,
+    active: Option<&mut RecoveryResume<'_>>,
+    job: Option<&JobProgress>,
+    memory: Option<&MemoryBudget>,
+) -> Result<Option<MemoryBudget>, RecoveryExecutionError> {
+    let Some(active) = active else {
+        return Ok(None);
+    };
+    active.prepare(case)?;
+    let session = active.session_memory();
+    let supplied_job = job.and_then(|progress| progress.job.memory_budget());
+    if memory.is_some_and(|budget| !budget.same_ledger(&session))
+        || supplied_job.is_some_and(|budget| !budget.same_ledger(&session))
+    {
+        return Err(RecoveryExecutionError::Operational {
+            stage: RecoveryStage::TransformDiscovery,
+            source: Box::new(l2_workbench::job::MemoryError::IncompatibleWorkingSet),
+        });
+    }
+    Ok(Some(session))
+}
+
 fn new_executor<'case>(
     case: &'case mut Case,
     plan: &'case RecoveryPlan,
@@ -378,7 +404,7 @@ fn new_executor<'case>(
         plan,
         policy,
         coordinator: RecoveryCoordinator::new(resources),
-        case_index: CaseIndex::with_ledger(case_index_ledger),
+        case_index: CaseIndex::with_memory(case_index_ledger, memory)?,
         candidate_ids: Vec::new(),
         candidate_index: HashSet::new(),
         snapshot_candidates,
@@ -778,7 +804,19 @@ impl Executor<'_> {
     }
 }
 
-type ContextualDecodingViewKey = (String, u64, u64);
+type ContextualDecodingViewKey = ([u8; 32], u64, u64);
+
+fn contextual_view_key(
+    blob_id: &str,
+    receipt_node: u64,
+    input_node: u64,
+) -> Result<ContextualDecodingViewKey, RecoveryExecutionError> {
+    let digest = blob_id
+        .strip_prefix("sha256:")
+        .and_then(l2_workbench::parse_sha256_digest)
+        .ok_or(RecoveryError::InvariantFailure)?;
+    Ok((digest, receipt_node, input_node))
+}
 
 #[derive(Default)]
 struct CaseIndex {
@@ -789,6 +827,8 @@ struct CaseIndex {
     node_count: usize,
     edge_count: usize,
     scan_ledger: CaseIndexScanLedger,
+    // Drop all index allocations before releasing their shared admission
+    memory: Option<l2_workbench::job::MemoryLease>,
 }
 
 #[derive(Clone, Copy, serde::Serialize, serde::Deserialize)]
@@ -811,6 +851,7 @@ impl CaseIndex {
     fn restore_from_checkpoint(
         case: &Case,
         cursor: CaseIndexCursor,
+        memory: Option<&MemoryBudget>,
     ) -> Result<Self, RecoveryExecutionError> {
         if cursor.node_count > case.nodes().len()
             || cursor.edge_count > case.edges().len()
@@ -818,7 +859,7 @@ impl CaseIndex {
         {
             return Err(RecoveryError::InvalidCheckpoint.into());
         }
-        let mut index = Self::with_ledger(cursor.scan_ledger);
+        let mut index = Self::with_memory(cursor.scan_ledger, memory)?;
         index.index_new_nodes(case, false, &mut Vec::new(), cursor.node_count)?;
         index.index_new_edges(case, cursor.edge_count)?;
         index.node_count = cursor.node_count;
@@ -826,11 +867,23 @@ impl CaseIndex {
         Ok(index)
     }
 
+    #[cfg(test)]
     fn with_ledger(scan_ledger: CaseIndexScanLedger) -> Self {
         Self {
             scan_ledger,
             ..Self::default()
         }
+    }
+
+    fn with_memory(
+        scan_ledger: CaseIndexScanLedger,
+        memory: Option<&MemoryBudget>,
+    ) -> Result<Self, RecoveryExecutionError> {
+        Ok(Self {
+            scan_ledger,
+            memory: case_index_memory::new(memory)?,
+            ..Self::default()
+        })
     }
 
     #[cfg(test)]
@@ -938,9 +991,14 @@ impl CaseIndex {
                     .checked_add(blob_id.len())
                     .and_then(|total| total.checked_add(2 * std::mem::size_of::<u64>()))
                     .ok_or(RecoveryError::InvariantFailure)?;
-                self.contextual_decoding_views
-                    .entry((blob_id.clone(), receipt_node, input_node))
-                    .or_insert(node.id);
+                let key = contextual_view_key(blob_id, receipt_node, input_node)?;
+                if !self.contextual_decoding_views.contains_key(&key) {
+                    case_index_memory::contextual_view(&mut self.memory)?;
+                    self.contextual_decoding_views
+                        .try_reserve(1)
+                        .map_err(index_allocation_error)?;
+                    self.contextual_decoding_views.insert(key, node.id);
+                }
             }
             if collect_seeds
                 && let (Some(priority), Some(blob_id)) =
@@ -987,25 +1045,50 @@ impl CaseIndex {
                 work = work
                     .checked_add(target.kind.len())
                     .ok_or(RecoveryError::InvariantFailure)?;
-                if target.kind == "decoding_output" {
-                    self.decoding_outputs.entry(edge.from).or_insert(edge.to);
+                if target.kind == "decoding_output"
+                    && !self.decoding_outputs.contains_key(&edge.from)
+                {
+                    case_index_memory::decoding_output(&mut self.memory)?;
+                    self.decoding_outputs
+                        .try_reserve(1)
+                        .map_err(index_allocation_error)?;
+                    self.decoding_outputs.insert(edge.from, edge.to);
                 }
             }
-            if edge.relation == "validated_range" && edge.status == EvidenceStatus::Observed {
-                let inputs = self.validated_ranges_by_receipt.entry(edge.to).or_default();
-                if inputs.insert(edge.from) {
-                    let map_entry_bytes = if inputs.len() == 1 {
-                        2 * std::mem::size_of::<u64>()
-                    } else {
-                        std::mem::size_of::<u64>()
-                    };
-                    work = work
-                        .checked_add(map_entry_bytes)
-                        .ok_or(RecoveryError::InvariantFailure)?;
+            if edge.relation == "validated_range"
+                && edge.status == EvidenceStatus::Observed
+                && !self
+                    .validated_ranges_by_receipt
+                    .get(&edge.to)
+                    .is_some_and(|inputs| inputs.contains(&edge.from))
+            {
+                let new_receipt = !self.validated_ranges_by_receipt.contains_key(&edge.to);
+                case_index_memory::validated_range(&mut self.memory, new_receipt)?;
+                if new_receipt {
+                    self.validated_ranges_by_receipt
+                        .try_reserve(1)
+                        .map_err(index_allocation_error)?;
                 }
+                let inputs = self.validated_ranges_by_receipt.entry(edge.to).or_default();
+                inputs.insert(edge.from);
+                let map_entry_bytes = if inputs.len() == 1 {
+                    2 * std::mem::size_of::<u64>()
+                } else {
+                    std::mem::size_of::<u64>()
+                };
+                work = work
+                    .checked_add(map_entry_bytes)
+                    .ok_or(RecoveryError::InvariantFailure)?;
             }
         }
         Ok(work)
+    }
+}
+
+fn index_allocation_error(source: std::collections::TryReserveError) -> RecoveryExecutionError {
+    RecoveryExecutionError::Operational {
+        stage: RecoveryStage::StructuralValidation,
+        source: Box::new(source),
     }
 }
 

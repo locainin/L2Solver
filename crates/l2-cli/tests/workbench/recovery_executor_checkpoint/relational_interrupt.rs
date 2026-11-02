@@ -1,7 +1,8 @@
 use super::*;
 use crate::arguments::RecoveryOptions;
 use crate::workbench::recovery_executor::{
-    RecoveryExecutionError, RecoveryRunSummary, recover_case_with_job,
+    JobProgress, RecoveryExecutionError, RecoveryExecutionOutcome, RecoveryPlan,
+    recover_case_with_job,
     resume::{RecoveryResume, TestCheckpointPart},
 };
 use l2_workbench::job::{
@@ -23,6 +24,7 @@ const CHILD_INTERRUPT: &str = "L2_TEST_RELATIONAL_RESUME_INTERRUPT";
 const CHILD_TEST: &str = "workbench::recovery_executor::checkpoint_tests::relational_interrupt::relational_checkpoint_crash_child";
 const AGGREGATE_MEMORY: u64 = 512 * 1024 * 1024;
 const WORKER_MEMORY: u64 = 128 * 1024 * 1024;
+const WORK_POLICY_MEMORY: u64 = 64 * 1024 * 1024;
 
 struct OwnedChild(Child);
 
@@ -37,11 +39,37 @@ impl Drop for OwnedChild {
 
 fn options() -> RecoveryOptions {
     RecoveryOptions {
-        memory_limit: 64 * 1024 * 1024,
+        memory_limit: AGGREGATE_MEMORY,
         cache_max_bytes: 128 * 1024 * 1024,
         strict_cache: true,
         ..RecoveryOptions::default()
     }
+}
+
+fn recover_bounded(
+    case: &mut Case,
+    profile: RecoveryProfile,
+    job: Option<&Job>,
+    memory: Option<&MemoryBudget>,
+    resume: Option<&mut RecoveryResume<'_>>,
+) -> Result<RecoveryExecutionOutcome, RecoveryExecutionError> {
+    let policy = super::super::policy::policy_for_profile(case, profile, WORK_POLICY_MEMORY)?;
+    let plan = RecoveryPlan {
+        discover_transforms: true,
+        discover_framing: true,
+        discover_records: true,
+        ..RecoveryPlan::default()
+    };
+    let progress = job.cloned().map(JobProgress::new);
+    super::super::execute_internal(
+        case,
+        &plan,
+        &policy,
+        false,
+        progress.as_ref(),
+        memory,
+        resume,
+    )
 }
 
 fn stage_key() -> Result<StageKey, Box<dyn Error>> {
@@ -95,10 +123,9 @@ fn relational_checkpoint_crash_child() -> Result<(), Box<dyn Error>> {
     let mut lease = cache.lease(&key)?;
     let mut resume = RecoveryResume::new(&mut lease, &options, Some(worker.budget()));
     resume.pause_after_populated_relational_checkpoint(root.join("ready"));
-    let result = recover_case_with_job(
+    let result = recover_bounded(
         &mut fixture.case,
         options.profile,
-        options.memory_limit,
         Some(&scope),
         Some(worker.budget()),
         Some(&mut resume),
@@ -137,10 +164,9 @@ fn oversized_inner_checkpoint_preserves_prior_generation_and_respects_cache_mode
     let expected_job =
         Job::with_memory_budget("uninterrupted overflow reference", expected_worker.budget());
     let expected_scope = expected_job.work_scope(key.as_str())?;
-    let expected = recover_case_with_job(
+    let expected = recover_bounded(
         &mut uninterrupted,
         options.profile,
-        options.memory_limit,
         Some(&expected_scope),
         Some(expected_worker.budget()),
         None,
@@ -170,7 +196,8 @@ fn oversized_inner_checkpoint_preserves_prior_generation_and_respects_cache_mode
 
 #[test]
 fn relational_fixture_respects_its_configured_shared_memory_limit() -> Result<(), Box<dyn Error>> {
-    let options = options();
+    let mut options = options();
+    options.memory_limit = WORK_POLICY_MEMORY;
     let mut fixture = build_session_relative_fixture()?;
     add_previous_output(&mut fixture.case)?;
     let native = fixture.case.checkpoint_prefix()?;
@@ -221,7 +248,7 @@ fn relational_fixture_respects_its_configured_shared_memory_limit() -> Result<()
 struct OverflowReference<'a> {
     initial: &'a Case,
     uninterrupted: &'a Case,
-    expected: &'a RecoveryRunSummary,
+    expected: &'a RecoveryExecutionOutcome,
     work: Value,
     options: &'a RecoveryOptions,
     key: &'a StageKey,
@@ -243,10 +270,9 @@ impl OverflowReference<'_> {
         let mut lease = cache.lease(self.key)?;
         let mut resume = RecoveryResume::new(&mut lease, &configured, Some(worker.budget()));
         resume.force_inner_checkpoint_limit(part, 1);
-        let result = recover_case_with_job(
+        let result = recover_bounded(
             &mut actual_case,
             configured.profile,
-            configured.memory_limit,
             Some(&scope),
             Some(worker.budget()),
             Some(&mut resume),
@@ -330,10 +356,9 @@ fn allocation_failure_during_relational_restore_does_not_restart_optional_cache(
         .clone();
     let mut resume = RecoveryResume::new(&mut lease, &options, Some(worker.budget()));
     resume.fail_allocation_during_relational_load();
-    let error = recover_case_with_job(
+    let error = recover_bounded(
         &mut fixture.case,
         options.profile,
-        options.memory_limit,
         Some(&scope),
         Some(worker.budget()),
         Some(&mut resume),
@@ -392,10 +417,9 @@ fn exercise_interrupted_search(interruption: Interruption) -> Result<(), Box<dyn
         expected_worker.budget(),
     );
     let expected_scope = expected_job.work_scope(key.as_str())?;
-    let expected = recover_case_with_job(
+    let expected = recover_bounded(
         &mut uninterrupted,
         options.profile,
-        options.memory_limit,
         Some(&expected_scope),
         Some(expected_worker.budget()),
         None,
@@ -407,7 +431,7 @@ fn exercise_interrupted_search(interruption: Interruption) -> Result<(), Box<dyn
             .any(|blob| blob.bytes == fixture.plaintext)
     );
     let reference_blob_bytes = uninterrupted.resource_usage().blob_bytes;
-    let checkpoint_decoded_limit = options.memory_limit / 4;
+    let checkpoint_decoded_limit = options.memory_limit;
     println!(
         "uninterrupted Case: {reference_blob_bytes} retained blob bytes; checkpoint decoded limit: {checkpoint_decoded_limit} bytes"
     );
@@ -437,10 +461,9 @@ fn exercise_interrupted_search(interruption: Interruption) -> Result<(), Box<dyn
     let resumed_scope = resumed_job.work_scope(key.as_str())?;
     let mut lease = worker_cache.lease(&key)?;
     let mut resume = RecoveryResume::new(&mut lease, &options, Some(worker.budget()));
-    let actual = recover_case_with_job(
+    let actual = recover_bounded(
         &mut resumed,
         options.profile,
-        options.memory_limit,
         Some(&resumed_scope),
         Some(worker.budget()),
         Some(&mut resume),
@@ -461,7 +484,7 @@ fn exercise_interrupted_search(interruption: Interruption) -> Result<(), Box<dyn
     Ok(())
 }
 
-fn assert_same_summary(actual: &RecoveryRunSummary, expected: &RecoveryRunSummary) {
+fn assert_same_summary(actual: &RecoveryExecutionOutcome, expected: &RecoveryExecutionOutcome) {
     assert_eq!(actual.omissions, expected.omissions);
     assert_eq!(actual.resources, expected.resources);
     assert_eq!(actual.candidate_count, expected.candidate_count);
@@ -606,10 +629,9 @@ fn assert_cancel_after_restore(
     let mut lease = worker_cache.lease(key)?;
     let mut resume = RecoveryResume::new(&mut lease, options, Some(worker.budget()));
     resume.cancel_after_loading_relational_checkpoint();
-    let result = recover_case_with_job(
+    let result = recover_bounded(
         &mut cancelled,
         options.profile,
-        options.memory_limit,
         Some(&scope),
         Some(worker.budget()),
         Some(&mut resume),
@@ -680,10 +702,9 @@ fn corrupt_inner_cursor_preserves_native_and_restores_work(
         let mut configured = options.clone();
         configured.strict_cache = strict;
         let mut resume = RecoveryResume::new(&mut lease, &configured, Some(worker.budget()));
-        let result = recover_case_with_job(
+        let result = recover_bounded(
             &mut native,
             configured.profile,
-            configured.memory_limit,
             Some(&scope),
             Some(worker.budget()),
             Some(&mut resume),
@@ -717,12 +738,4 @@ fn corrupt_inner_cursor_preserves_native_and_restores_work(
         Ok(&metadata)
     })?;
     Ok(())
-}
-
-fn without_cache_hits(mut work: Value) -> Result<Value, Box<dyn Error>> {
-    work.pointer_mut("/counts/counters")
-        .and_then(Value::as_object_mut)
-        .ok_or("missing work counters")?
-        .remove("cache_hits");
-    Ok(work)
 }
