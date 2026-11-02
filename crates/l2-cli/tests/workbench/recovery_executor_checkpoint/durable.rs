@@ -352,9 +352,23 @@ fn oversized_case_checkpoint_preserves_the_prior_generation_and_cache_policy()
 #[test]
 fn historical_case_checkpoint_restores_with_native_case_and_shared_memory()
 -> Result<(), Box<dyn Error>> {
+    exercise_historical_case_checkpoint(64 * 1024 * 1024)
+}
+
+#[test]
+fn historical_case_checkpoint_restores_with_128_mib_shared_memory() -> Result<(), Box<dyn Error>> {
+    exercise_historical_case_checkpoint(128 * 1024 * 1024)
+}
+
+#[test]
+fn historical_case_checkpoint_restores_with_512_mib_shared_memory() -> Result<(), Box<dyn Error>> {
+    exercise_historical_case_checkpoint(512 * 1024 * 1024)
+}
+
+fn exercise_historical_case_checkpoint(memory_limit: u64) -> Result<(), Box<dyn Error>> {
     let temporary = tempfile::tempdir()?;
     let options = RecoveryOptions {
-        memory_limit: 64 * 1024 * 1024,
+        memory_limit,
         cache_max_bytes: 128 * 1024 * 1024,
         strict_cache: true,
         ..RecoveryOptions::default()
