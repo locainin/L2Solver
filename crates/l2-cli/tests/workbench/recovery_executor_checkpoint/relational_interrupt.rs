@@ -1,11 +1,11 @@
 use super::*;
 use crate::arguments::RecoveryOptions;
 use crate::workbench::recovery_executor::{
-    RecoveryRunSummary, recover_case_with_job,
+    RecoveryExecutionError, RecoveryRunSummary, recover_case_with_job,
     resume::{RecoveryResume, TestCheckpointPart},
 };
 use l2_workbench::job::{
-    Counter, Job, MemoryBudget, MemoryWorkingSet,
+    Counter, Job, JobError, MemoryBudget, MemoryWorkingSet,
     cache::{Cache, SourceIdentity, StageKey},
 };
 use serde_json::{Value, json};
@@ -353,6 +353,11 @@ fn exercise_interrupted_search(interruption: Interruption) -> Result<(), Box<dyn
             .iter()
             .any(|blob| blob.bytes == fixture.plaintext)
     );
+    let reference_blob_bytes = uninterrupted.resource_usage().blob_bytes;
+    let checkpoint_decoded_limit = options.memory_limit / 4;
+    println!(
+        "uninterrupted Case: {reference_blob_bytes} retained blob bytes; checkpoint decoded limit: {checkpoint_decoded_limit} bytes"
+    );
     drop(expected_worker);
 
     let committed = run_interrupted_child(temporary.path(), interruption)?;
@@ -370,7 +375,7 @@ fn exercise_interrupted_search(interruption: Interruption) -> Result<(), Box<dyn
             &memory,
         )?;
     }
-    assert_cancel_after_restore(&cache, &key, &options, &fixture.case, &memory)?;
+    assert_cancel_after_restore(&cache, &key, &options, &fixture.case, &memory, committed)?;
 
     let mut resumed = fixture.case;
     let worker = admit_case(&mut resumed, &memory)?;
@@ -535,6 +540,7 @@ fn assert_cancel_after_restore(
     options: &RecoveryOptions,
     initial: &Case,
     memory: &MemoryBudget,
+    committed: u64,
 ) -> Result<(), Box<dyn Error>> {
     let mut cancelled = initial.try_clone()?;
     let worker = admit_case(&mut cancelled, memory)?;
@@ -547,17 +553,21 @@ fn assert_cancel_after_restore(
     let mut lease = worker_cache.lease(key)?;
     let mut resume = RecoveryResume::new(&mut lease, options, Some(worker.budget()));
     resume.cancel_after_loading_relational_checkpoint();
-    assert!(
-        recover_case_with_job(
-            &mut cancelled,
-            options.profile,
-            options.memory_limit,
-            Some(&scope),
-            Some(worker.budget()),
-            Some(&mut resume),
-        )
-        .is_err()
+    let result = recover_case_with_job(
+        &mut cancelled,
+        options.profile,
+        options.memory_limit,
+        Some(&scope),
+        Some(worker.budget()),
+        Some(&mut resume),
     );
+    assert!(result.is_err());
+    assert!(matches!(
+        result,
+        Err(RecoveryExecutionError::Job(JobError::Cancelled))
+    ));
+    assert_eq!(resume.restored_relational_candidates(), Some(committed));
+    assert_eq!(cancelled.to_json()?, initial.to_json()?);
     Ok(())
 }
 

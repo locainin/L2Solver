@@ -1,11 +1,14 @@
 use super::*;
 use crate::arguments::RecoveryOptions;
 use crate::workbench::recovery_executor::{
-    JobProgress, recover_case_with_job, resume::RecoveryResume,
+    JobProgress, RecoveryExecutionError, RecoveryExecutionPolicy, recover_case_with_job,
+    resume::RecoveryResume,
 };
 use l2_workbench::job::{
     Counter, Job, MemoryBudget, MemoryClass,
-    cache::{Cache, Lease, SourceIdentity, StageKey},
+    cache::{
+        Cache, ExecutionCheckpointLimits, ExecutionGeneration, Lease, SourceIdentity, StageKey,
+    },
 };
 use serde_json::json;
 
@@ -95,16 +98,13 @@ fn checkpoint_save_memory_denial_preserves_the_prior_generation() -> Result<(), 
     resume.prepare(executor.case)?;
     resume.save(&executor, &cursor)?;
     drop(resume);
-    let limits = l2_workbench::job::cache::ExecutionCheckpointLimits {
-        max_encoded_bytes: options.cache_max_bytes,
-        max_executor_bytes: options.memory_limit / 8,
-        max_metadata_bytes: 4 * 1024 * 1024,
-    };
+    let limits = checkpoint_limits(&options);
     let active = lease
         .load_active(limits)?
         .ok_or("missing prior checkpoint")?;
     let prior_metadata = active.metadata().clone();
     let prior_executor_bytes = active.executor_bytes();
+    let prior_generation = active.generation().clone();
     drop(active);
 
     let snapshot = memory.snapshot()?;
@@ -128,6 +128,182 @@ fn checkpoint_save_memory_denial_preserves_the_prior_generation() -> Result<(), 
         .ok_or("prior checkpoint was lost")?;
     assert_eq!(active.metadata(), &prior_metadata);
     assert_eq!(active.executor_bytes(), prior_executor_bytes);
+    drop(active);
+    assert_checkpoint_generation_restores(
+        &mut lease,
+        &options,
+        &memory,
+        &prior_generation,
+        limits,
+        &plan,
+        &policy,
+    )?;
+    Ok(())
+}
+
+#[test]
+fn oversized_case_checkpoint_preserves_the_prior_generation_and_cache_policy()
+-> Result<(), Box<dyn Error>> {
+    for strict in [true, false] {
+        exercise_oversized_case_checkpoint(strict)?;
+    }
+    Ok(())
+}
+
+fn exercise_oversized_case_checkpoint(strict: bool) -> Result<(), Box<dyn Error>> {
+    let temporary = tempfile::tempdir()?;
+    let options = RecoveryOptions {
+        memory_limit: 64 * 1024 * 1024,
+        cache_max_bytes: 128 * 1024 * 1024,
+        strict_cache: strict,
+        ..RecoveryOptions::default()
+    };
+    let memory = MemoryBudget::new(options.memory_limit);
+    let worker = memory.try_working_set(options.memory_limit / 2)?;
+    let cache = Cache::open_at(
+        temporary.path().join("cache"),
+        temporary.path().join("state"),
+        options.cache_max_bytes,
+    )?;
+    cache.attach_memory_budget(memory.clone())?;
+    let cache = cache.with_memory_scope(worker.budget())?;
+    let key = StageKey::new(
+        "oversized_case_checkpoint",
+        1,
+        "oversized_case_checkpoint",
+        &json!({}),
+        &SourceIdentity::from_sha256("d".repeat(64))?,
+        &[],
+    )?;
+    let mut case = Case::new();
+    case.use_working_set(&worker)?;
+    let plan = RecoveryPlan::default();
+    let policy = normal_policy(&case)?;
+    let mut executor = test_support::build_executor(&mut case, &plan, &policy)?;
+    let job = Job::with_memory_budget("oversized Case checkpoint", worker.budget());
+    executor.job = Some(JobProgress::new(job.work_scope(key.as_str())?));
+    let cursor = SchedulerCursor::default();
+    let mut lease = cache.lease(&key)?;
+
+    // Save and restore a valid generation before the retained Case grows
+    let mut resume = RecoveryResume::new(&mut lease, &options, Some(worker.budget()));
+    resume.prepare(executor.case)?;
+    resume.save(&executor, &cursor)?;
+    drop(resume);
+    let limits = checkpoint_limits(&options);
+    let active = lease
+        .load_active(limits)?
+        .ok_or("missing prior checkpoint")?;
+    let prior = active.generation().clone();
+    drop(active);
+
+    let mut resume = RecoveryResume::new(&mut lease, &options, Some(worker.budget()));
+    resume.prepare(executor.case)?;
+    let loaded = resume.load()?.ok_or("checkpoint did not restore")?;
+    assert_eq!(loaded.case.resource_usage().blob_bytes, 0);
+    drop(loaded);
+
+    // A later Case can fit its working set while exceeding the snapshot ceiling
+    let maximum = usize::try_from(options.memory_limit / 4)?;
+    let bytes = vec![0x5a; maximum + 1];
+    executor
+        .case
+        .add_bytes_node("checkpoint_growth", &bytes, Vec::new(), json!({}))?;
+    drop(bytes);
+    assert_eq!(executor.case.resource_usage().blob_bytes, maximum + 1);
+    let result = resume.save_or_fallback(&executor, &cursor);
+    assert_oversized_checkpoint_policy(result, strict, maximum, &resume, &job)?;
+    drop(resume);
+
+    assert_checkpoint_generation_restores(
+        &mut lease,
+        &options,
+        worker.budget(),
+        &prior,
+        limits,
+        &plan,
+        &policy,
+    )?;
+    assert!(memory.snapshot()?.peak_bytes <= options.memory_limit);
+    Ok(())
+}
+
+fn assert_oversized_checkpoint_policy(
+    result: Result<(), RecoveryExecutionError>,
+    strict: bool,
+    maximum: usize,
+    resume: &RecoveryResume<'_>,
+    job: &Job,
+) -> Result<(), Box<dyn Error>> {
+    use l2_workbench::{
+        evidence::EvidenceError,
+        job::{CacheFallbackKind, CacheStage},
+    };
+
+    if strict {
+        let error = result
+            .err()
+            .ok_or("strict checkpoint unexpectedly succeeded")?;
+        assert!(matches!(
+            error.source().and_then(|cause| cause.downcast_ref::<EvidenceError>()),
+            Some(EvidenceError::CaseTooLarge { length, maximum: limit })
+                if *length == maximum + 1 && *limit == maximum
+        ));
+    } else {
+        result?;
+        assert!(!resume.due());
+        assert!(
+            job.snapshot()?
+                .cache_fallbacks
+                .records()
+                .iter()
+                .any(|record| {
+                    record.stage() == CacheStage::Checkpoint
+                        && record.kind() == CacheFallbackKind::CommitFailed
+                })
+        );
+    }
+    Ok(())
+}
+
+fn checkpoint_limits(options: &RecoveryOptions) -> ExecutionCheckpointLimits {
+    ExecutionCheckpointLimits {
+        max_encoded_bytes: options.cache_max_bytes,
+        max_executor_bytes: options.memory_limit / 8,
+        max_metadata_bytes: 4 * 1024 * 1024,
+    }
+}
+
+fn assert_checkpoint_generation_restores(
+    lease: &mut Lease,
+    options: &RecoveryOptions,
+    memory: &MemoryBudget,
+    prior: &ExecutionGeneration,
+    limits: ExecutionCheckpointLimits,
+    plan: &RecoveryPlan,
+    policy: &RecoveryExecutionPolicy,
+) -> Result<(), Box<dyn Error>> {
+    // A failed save must leave the old Case and executor cursor usable
+    let active = lease
+        .load_active(limits)?
+        .ok_or("prior checkpoint was lost")?;
+    assert_eq!(active.generation(), prior);
+    drop(active);
+    let original = Case::new();
+    let mut restored = RecoveryResume::new(lease, options, Some(memory));
+    restored.prepare(&original)?;
+    let mut prior_case = restored.load()?.ok_or("prior checkpoint did not restore")?;
+    let (prior_executor, prior_cursor) = checkpoint::read(
+        &mut prior_case.case,
+        plan,
+        policy,
+        prior_case.state.as_slice(),
+        usize::try_from(options.memory_limit / 8)?,
+        Some(memory),
+    )?;
+    prior_cursor.validate(&prior_executor)?;
+    drop(prior_executor);
+    assert_eq!(prior_case.case, original);
     Ok(())
 }
 
