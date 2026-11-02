@@ -11,6 +11,8 @@ use l2_workbench::job::{
 mod checkpoint_bytes;
 #[path = "job/checkpoint_relational_output.rs"]
 mod checkpoint_relational_output;
+#[path = "job/checkpoint_validation.rs"]
+mod checkpoint_validation;
 #[path = "job/memory_snapshot.rs"]
 mod memory_snapshot;
 #[path = "job/model.rs"]

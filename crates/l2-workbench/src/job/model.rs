@@ -481,6 +481,8 @@ pub enum JobError {
     PhaseOverflow(Phase),
     /// Checkpoint preparation conflicts with other pipeline or scoped work
     RestoreAfterStart,
+    /// Saved phase topology or progress cannot form a valid checkpoint
+    InvalidCheckpoint,
     /// A work scope must have a lowercase SHA-256 identity
     InvalidWorkIdentity,
     /// The same work identity is already owned by an active handle
@@ -512,6 +514,9 @@ impl fmt::Display for JobError {
             }
             Self::RestoreAfterStart => formatter
                 .write_str("job checkpoint cannot be prepared after other live work started"),
+            Self::InvalidCheckpoint => {
+                formatter.write_str("job checkpoint has invalid phase topology or progress")
+            }
             Self::Cancelled => formatter.write_str("job cancellation was requested"),
             Self::InvalidWorkIdentity => {
                 formatter.write_str("work identity must be a SHA-256 digest")
@@ -1013,9 +1018,13 @@ impl Job {
     /// remain separate from reads performed during this invocation
     ///
     /// # Errors
-    /// Returns an error if shared state is unavailable, a measurement overflows, or other live
-    /// pipeline work or scoped work has already started
+    /// Returns an error for invalid saved phases or progress, unavailable shared state,
+    /// overflowing measurements, or other live pipeline or scoped work
     pub fn restore(&self, mut snapshot: JobSnapshot) -> Result<(), JobError> {
+        // Refuse malformed phases before reserving memory or changing live state
+        if !snapshot.is_valid_checkpoint() {
+            return Err(JobError::InvalidCheckpoint);
+        }
         let mut state = self.lock_state()?;
         live_preparation(&state)?;
         let existing = state.snapshot.recovery_transitions.funnel_cohort_count();
@@ -1057,9 +1066,12 @@ impl Job {
     /// a restored checkpoint reject live discovery stages and scoped work
     ///
     /// # Errors
-    /// Returns an error if shared state is unavailable, a measurement overflows, or other live
-    /// pipeline work or scoped work has already started
+    /// Returns an error for invalid saved phases or progress, unavailable shared state,
+    /// overflowing measurements, or other live pipeline or scoped work
     pub fn preview_checkpoint(&self, saved: Option<&JobSnapshot>) -> Result<JobSnapshot, JobError> {
+        if saved.is_some_and(|snapshot| !snapshot.is_valid_checkpoint()) {
+            return Err(JobError::InvalidCheckpoint);
+        }
         let state = self.lock_state()?;
         let cancel_requested = self.is_cancelled();
         let live_count = state.snapshot.recovery_transitions.funnel_cohort_count();
