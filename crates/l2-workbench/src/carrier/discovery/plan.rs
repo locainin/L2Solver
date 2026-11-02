@@ -235,6 +235,23 @@ pub(super) fn validate_mappings(
     byte_length: usize,
     mappings: &[DiscoveryMapping],
 ) -> Result<(), DiscoveryError> {
+    validate_mapping_coverage(sample_id, byte_length, mappings, false)
+}
+
+pub(super) fn validate_supporting_mappings(
+    sample_id: u64,
+    byte_length: usize,
+    mappings: &[DiscoveryMapping],
+) -> Result<(), DiscoveryError> {
+    validate_mapping_coverage(sample_id, byte_length, mappings, true)
+}
+
+fn validate_mapping_coverage(
+    sample_id: u64,
+    byte_length: usize,
+    mappings: &[DiscoveryMapping],
+    allow_overlap: bool,
+) -> Result<(), DiscoveryError> {
     if mappings.is_empty() {
         return Err(DiscoveryError::InvalidMapping { sample_id });
     }
@@ -253,7 +270,13 @@ pub(super) fn validate_mappings(
             .offset
             .checked_add(mapping.range.length)
             .ok_or(DiscoveryError::InvalidMapping { sample_id })?;
-        if mapping.offset != cursor
+        let end = mapping
+            .offset
+            .checked_add(range_length)
+            .filter(|end| *end <= byte_length)
+            .ok_or(DiscoveryError::InvalidMapping { sample_id })?;
+        if mapping.offset > cursor
+            || (!allow_overlap && mapping.offset != cursor)
             || range_length == 0
             || !mapping
                 .range
@@ -263,9 +286,8 @@ pub(super) fn validate_mappings(
         {
             return Err(DiscoveryError::InvalidMapping { sample_id });
         }
-        cursor = cursor
-            .checked_add(range_length)
-            .ok_or(DiscoveryError::InvalidMapping { sample_id })?;
+        // Keep all witnesses while checking that their union has no gap
+        cursor = cursor.max(end);
     }
     if cursor != byte_length {
         return Err(DiscoveryError::InvalidMapping { sample_id });

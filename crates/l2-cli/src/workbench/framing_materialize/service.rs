@@ -1,5 +1,5 @@
 use l2_workbench::{
-    carrier::discovery::{DiscoveryMapping, mapped_node},
+    carrier::discovery::{DiscoveryMapping, mapped_node_with_supporting_mappings},
     evidence::{
         ByteMapping, Case, CheckedByteMappingCursor, Edge, EvidenceError, EvidenceStatus,
         clip_byte_mappings,
@@ -494,7 +494,7 @@ fn select_input(case: &Case, node_id: u64) -> Result<Selection, Box<dyn Error>> 
             "selected node must be a retained TCP run or contextual transform output".into(),
         );
     }
-    let mapped = mapped_node(case, node_id)?;
+    let mapped = mapped_node_with_supporting_mappings(case, node_id)?;
     if mapped.bytes.is_empty() {
         return Err("selected framing input is empty".into());
     }

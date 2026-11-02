@@ -8,7 +8,7 @@ pub mod results;
 
 pub use case::{
     MappedNode, discover_case, discover_case_to_store, discover_case_with_view, mapped_node,
-    mapped_node_with_view, replay_case_candidate,
+    mapped_node_with_supporting_mappings, mapped_node_with_view, replay_case_candidate,
 };
 pub use engine::discover;
 pub use model::{

@@ -423,6 +423,133 @@ fn materializes_beyond_report_preview_count() -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
+#[test]
+fn framing_preserves_every_overlapping_retransmission_source() -> Result<(), Box<dyn Error>> {
+    let source_bytes = b"abcdefghcdefefghcd";
+    let input_case =
+        overlapping_run_case(&[(2, 8, 4, 2), (0, 0, 8, 1), (4, 12, 4, 3), (2, 16, 2, 4)])?;
+    let run_id = tcp_run_id(&input_case)?;
+    let output = run(
+        &[
+            "materialize-frames",
+            "-",
+            "--node",
+            &run_id.to_string(),
+            "--fixed-size",
+            "2",
+        ],
+        &input_case.to_json()?,
+    )?;
+
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let case = Case::from_json(&output.stdout)?;
+    let frames = case
+        .nodes()
+        .iter()
+        .filter(|node| node.kind == "custom_protocol_frame")
+        .collect::<Vec<_>>();
+    assert_eq!(frames.len(), 4);
+    for (frame, expected_packets) in
+        frames
+            .into_iter()
+            .zip([&[1][..], &[1, 2, 4][..], &[1, 2, 3][..], &[1, 3][..]])
+    {
+        let receipt_id = case
+            .edges()
+            .iter()
+            .find(|edge| edge.from == frame.id && edge.relation == "mapped_by")
+            .map(|edge| edge.to);
+        let mappings: Vec<ByteMapping> = if let Some(receipt_id) = receipt_id {
+            let receipt = case.node(receipt_id).ok_or("mapping receipt is missing")?;
+            serde_json::from_slice(blob_bytes(&case, receipt)?)?
+        } else {
+            let range = frame
+                .ranges
+                .first()
+                .ok_or("single frame range is missing")?;
+            assert_eq!(frame.ranges.len(), 1);
+            vec![ByteMapping {
+                offset: 0,
+                range: range.clone(),
+            }]
+        };
+        let mut packets = mappings
+            .iter()
+            .filter_map(|mapping| mapping.range.packet)
+            .collect::<Vec<_>>();
+        packets.sort_unstable();
+        assert_eq!(packets, expected_packets);
+        let bytes = blob_bytes(&case, frame)?;
+        // Every reported witness must match the retained frame bytes
+        for mapping in mappings {
+            let source_start = usize::try_from(mapping.range.offset)?;
+            let length = usize::try_from(mapping.range.length)?;
+            assert_eq!(
+                bytes
+                    .get(mapping.offset..mapping.offset + length)
+                    .ok_or("frame range is invalid")?,
+                source_bytes
+                    .get(source_start..source_start + length)
+                    .ok_or("source range is invalid")?
+            );
+        }
+    }
+    assert_eq!(case.node(run_id).ok_or("input is missing")?.ranges.len(), 4);
+    case.validate()?;
+    Ok(())
+}
+
+#[test]
+fn framing_rejects_overlapping_mappings_with_a_gap() -> Result<(), Box<dyn Error>> {
+    let input_case = overlapping_run_case(&[(0, 0, 3, 1), (1, 1, 2, 2), (4, 4, 4, 3)])?;
+    let run_id = tcp_run_id(&input_case)?;
+    let output = run(
+        &[
+            "materialize-frames",
+            "-",
+            "--node",
+            &run_id.to_string(),
+            "--fixed-size",
+            "4",
+        ],
+        &input_case.to_json()?,
+    )?;
+
+    assert!(!output.status.success());
+    assert!(output.stdout.is_empty());
+    Ok(())
+}
+
+fn overlapping_run_case(mappings: &[(usize, u64, u64, u64)]) -> Result<Case, Box<dyn Error>> {
+    let source_bytes = b"abcdefghcdefefghcd";
+    let mut case = Case::new();
+    let source = case.add_source(
+        "retransmissions.pcap",
+        "capture",
+        u64::try_from(source_bytes.len())?,
+        &l2_workbench::sha256(source_bytes),
+        None,
+    )?;
+    let mappings = mappings
+        .iter()
+        .map(|&(offset, source_offset, length, packet)| ByteMapping {
+            offset,
+            range: SourceRange {
+                source: source.clone(),
+                packet: Some(packet),
+                offset: source_offset,
+                length,
+            },
+        })
+        .collect::<Vec<_>>();
+    case.add_mapped_bytes_node("tcp_byte_run", b"abcdefgh", &mappings, json!({}))?;
+    Ok(case)
+}
+
 fn tcp_run_case(bytes: &[u8]) -> Result<Case, Box<dyn Error>> {
     let mut case = Case::new();
     let source = case.add_source(

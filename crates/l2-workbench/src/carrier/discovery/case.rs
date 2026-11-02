@@ -10,7 +10,7 @@ use super::{
         DiscoveryError, DiscoveryMapping, DiscoveryPlan, DiscoveryReport, DiscoverySample,
         DiscoveryView,
     },
-    plan::validate_mappings,
+    plan::{validate_mappings, validate_supporting_mappings},
     results::{
         DiscoveryResultStore, ReplayReceipt, StoreOptions, StoreWriter, StoredDiscoverySummary,
         replay_candidate_with_identity,
@@ -290,7 +290,7 @@ fn collect_samples<'a>(
         if !seen.insert(node_id) {
             return Err(DiscoveryError::InvalidSelection);
         }
-        let mapped = mapped_node_indexed(node_id, index, view)?;
+        let mapped = mapped_node_indexed(node_id, index, view, MappingCoverage::Exact)?;
         let node = mapped.node;
         if !matches!(
             node.kind.as_str(),
@@ -354,13 +354,39 @@ pub fn mapped_node_with_view(
     view: DiscoveryView,
 ) -> Result<MappedNode<'_>, DiscoveryError> {
     let index = CaseIndex::new(case);
-    mapped_node_indexed(node_id, &index, view)
+    mapped_node_indexed(node_id, &index, view, MappingCoverage::Exact)
+}
+
+/// Resolve retained bytes with every supporting source range, including overlaps
+///
+/// This checks the stored mapping structure without re-reading source files
+///
+/// # Errors
+/// Rejects missing bytes, invalid mappings, or incomplete byte coverage
+pub fn mapped_node_with_supporting_mappings(
+    case: &Case,
+    node_id: u64,
+) -> Result<MappedNode<'_>, DiscoveryError> {
+    let index = CaseIndex::new(case);
+    mapped_node_indexed(
+        node_id,
+        &index,
+        DiscoveryView::Bytes,
+        MappingCoverage::Supporting,
+    )
+}
+
+#[derive(Clone, Copy)]
+enum MappingCoverage {
+    Exact,
+    Supporting,
 }
 
 fn mapped_node_indexed<'a>(
     node_id: u64,
     index: &CaseIndex<'a>,
     view: DiscoveryView,
+    coverage: MappingCoverage,
 ) -> Result<MappedNode<'a>, DiscoveryError> {
     let node = index
         .nodes
@@ -373,6 +399,12 @@ fn mapped_node_indexed<'a>(
         .and_then(|blob_id| index.blobs.get(blob_id).copied())
         .ok_or(DiscoveryError::MissingBlob { node_id })?;
     let mappings = case_mappings(node, blob, index)?;
+    match coverage {
+        MappingCoverage::Exact => validate_mappings(node.id, blob.bytes.len(), &mappings)?,
+        MappingCoverage::Supporting => {
+            validate_supporting_mappings(node.id, blob.bytes.len(), &mappings)?;
+        }
+    }
     apply_view(node_id, node, &blob.bytes, mappings, view)
 }
 
@@ -539,7 +571,6 @@ fn case_mappings(
     {
         return Err(DiscoveryError::InvalidCaseMapping { node_id: node.id });
     }
-    validate_mappings(node.id, blob.bytes.len(), &mappings)?;
     Ok(mappings)
 }
 
