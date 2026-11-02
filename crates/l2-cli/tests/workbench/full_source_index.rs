@@ -104,6 +104,31 @@ fn cached_receipt_must_match_indexed_source_metadata() -> Result<(), Box<dyn Err
 }
 
 #[test]
+fn cached_receipt_rejects_stale_transport_totals_and_collection_summary()
+-> Result<(), Box<dyn Error>> {
+    let directory = tempfile::tempdir()?;
+    let mut store = Store::create(directory.path(), Options::default())?;
+    let receipt = store.ingest("input", Cursor::new(LLDP_CAPTURE))?;
+    let mut changed_counts = receipt.clone();
+    changed_counts.transport_packets = 1;
+    changed_counts.unsupported_transport_packets = 0;
+    let mut changed_collection = receipt;
+    changed_collection.collection_summary.capture_dropped += 1;
+    for stale in [changed_counts, changed_collection] {
+        assert!(
+            analyze_indexed_source(
+                &store,
+                &stale,
+                IndexedAnalysisOptions::default(),
+                |_| Ok(())
+            )
+            .is_err()
+        );
+    }
+    Ok(())
+}
+
+#[test]
 fn ingest_receipt_roundtrips_with_canonical_collection_summary() -> Result<(), Box<dyn Error>> {
     let directory = tempfile::tempdir()?;
     let capture = LLDP_CAPTURE;
@@ -336,7 +361,7 @@ fn strict_cache_checks_content_before_trusting_a_matching_fast_alias() -> Result
     let alias_key = StageKey::new(
         "capture_source",
         SCHEMA_VERSION,
-        "pcap-source-alias-v1",
+        "pcap-source-alias-v2",
         &json!({}),
         &SourceIdentity::Fast(fingerprint.sample_hint()),
         &[],
@@ -659,7 +684,7 @@ fn source_alias_key(
     Ok(StageKey::new(
         "capture_source",
         SCHEMA_VERSION,
-        "pcap-source-alias-v1",
+        "pcap-source-alias-v2",
         &json!({}),
         &SourceIdentity::Fast(fingerprint.sample_hint()),
         &[],
@@ -670,7 +695,7 @@ fn source_index_key(identity: &SourceIdentity) -> Result<StageKey, Box<dyn Error
     Ok(StageKey::new(
         "capture_index",
         SCHEMA_VERSION,
-        "pcap-index-v1",
+        "pcap-index-v2",
         &json!({}),
         identity,
         &[],
@@ -714,4 +739,106 @@ fn capture_with_lldp_and_tcp() -> Result<Vec<u8>, Box<dyn Error>> {
     capture.extend_from_slice(&length.to_le_bytes());
     capture.extend_from_slice(frame);
     Ok(capture)
+}
+
+#[test]
+fn prior_cooked_index_and_alias_are_not_reused() -> Result<(), Box<dyn Error>> {
+    let directory = tempfile::tempdir()?;
+    let capture_path = directory.path().join("cooked.pcap");
+    let bytes = cooked_flow_capture()?;
+    fs::write(&capture_path, &bytes)?;
+    let cache = open_test_cache(directory.path())?;
+    let identity = SourceIdentity::sha256_file(&capture_path)?;
+    let old_index_key = StageKey::new(
+        "capture_index",
+        5,
+        "pcap-index-v1",
+        &json!({}),
+        &identity,
+        &[],
+    )?;
+    let lease = cache.lease(&old_index_key)?;
+    let index_dir = lease.directory().join("index");
+    fs::create_dir(&index_dir)?;
+    let mut store = Store::create(&index_dir, Options::default())?;
+    let mut old_receipt = store.ingest("legacy", Cursor::new(&bytes))?;
+    drop(store);
+    // Recreate the older index that stored cooked packets without flow facts
+    let connection = rusqlite::Connection::open(index_dir.join("index.sqlite"))?;
+    connection.execute_batch("UPDATE packets SET flow=NULL,payload_length=0,direction=0; DELETE FROM flows; UPDATE sources SET unsupported=packets; PRAGMA user_version=5;")?;
+    drop(connection);
+    old_receipt.transport_packets = 0;
+    old_receipt.unsupported_transport_packets = old_receipt.packets;
+    drop(lease.commit(StageStatus::Complete, json!({"receipt": old_receipt}))?);
+    let fingerprint = Cache::fingerprint_source(&capture_path)?;
+    let alias = StageKey::new(
+        "capture_source",
+        5,
+        "pcap-source-alias-v1",
+        &json!({}),
+        &SourceIdentity::Fast(fingerprint.sample_hint()),
+        &[],
+    )?;
+    let lease = cache.lease(&alias)?;
+    drop(lease.commit(
+        StageStatus::Complete,
+        json!({"fingerprint": fingerprint, "receipt": old_receipt}),
+    )?);
+
+    let job = Job::new("rebuild prior cooked index");
+    let rebuilt = acquire_indexed_source(
+        &capture_path,
+        directory.path(),
+        &AcquisitionOptions {
+            cache: Some(&cache),
+            job: Some(&job),
+            strict_cache: true,
+            ..AcquisitionOptions::default()
+        },
+    )?;
+    assert_eq!(
+        (
+            rebuilt.receipt.transport_packets,
+            rebuilt.receipt.unsupported_transport_packets
+        ),
+        (1, 0)
+    );
+    assert!(
+        rebuilt
+            .store
+            .packet(&rebuilt.receipt.source_id, 1)?
+            .flow
+            .is_some()
+    );
+    assert!(
+        job.snapshot()?
+            .counters
+            .get(&Counter::CacheMisses)
+            .copied()
+            .unwrap_or(0)
+            > 0
+    );
+    Ok(())
+}
+
+fn cooked_flow_capture() -> Result<Vec<u8>, Box<dyn Error>> {
+    let ethernet = single_flow_capture();
+    let mut cooked = vec![0, 0, 0, 1, 0, 6, 2, 0, 0, 0, 0, 1, 0, 0, 8, 0];
+    cooked.extend_from_slice(ethernet.get(54..).ok_or("missing IP fixture")?);
+    let mut bytes = ethernet.get(..40).ok_or("missing capture header")?.to_vec();
+    bytes
+        .get_mut(20..24)
+        .ok_or("missing link type")?
+        .copy_from_slice(&113_u32.to_le_bytes());
+    let length = u32::try_from(cooked.len())?;
+    bytes
+        .get_mut(32..36)
+        .ok_or("missing captured length")?
+        .copy_from_slice(&length.to_le_bytes());
+    bytes
+        .get_mut(36..40)
+        .ok_or("missing original length")?
+        .copy_from_slice(&length.to_le_bytes());
+    bytes.extend_from_slice(&cooked);
+    Ok(bytes)
 }

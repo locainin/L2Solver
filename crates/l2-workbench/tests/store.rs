@@ -10,6 +10,12 @@ mod frames;
 #[path = "store/collection.rs"]
 mod collection;
 
+#[path = "../../../tests/fixtures/cooked.rs"]
+mod cooked_fixture;
+
+#[path = "store/cooked.rs"]
+mod cooked;
+
 #[path = "store/cache.rs"]
 mod cache;
 
