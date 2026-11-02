@@ -211,7 +211,9 @@ fn membership_entries(index: u32) -> Result<Vec<[u8; 6]>, Box<dyn Error>> {
         }
         let bytes = value
             .as_bytes()
-            .chunks_exact(2)
+            .as_chunks::<2>()
+            .0
+            .iter()
             .map(|pair| Ok(u8::from_str_radix(std::str::from_utf8(pair)?, 16)?))
             .collect::<Result<Vec<_>, Box<dyn Error>>>()?;
         addresses.push(<[u8; 6]>::try_from(bytes).map_err(|_| "invalid multicast address")?);
