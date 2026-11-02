@@ -152,7 +152,7 @@ fn retained_case_keeps_the_exact_selected_mapping_ranges_in_its_selection() -> T
     let mut found = false;
     artifacts.visit_artifact_origins(|_, _, origin| {
         found = true;
-        assert!(origin.source_ranges.is_empty());
+        assert_eq!(origin.source_ranges.len(), 0);
         let ranges = origin
             .selection
             .as_ref()

@@ -51,7 +51,7 @@ fn exports_named_artifact() -> Result<(), Box<dyn Error>> {
         .file_name()
         .and_then(|name| name.to_str())
         .ok_or("recovered object name is not readable")?;
-    assert!(!name.trim().is_empty());
+    assert_ne!(name.trim().len(), 0);
     assert!(!name.contains(['/', '\\']));
     assert!(!name.chars().any(char::is_control));
     assert!(fs::symlink_metadata(object)?.file_type().is_file());
@@ -291,7 +291,7 @@ fn published_export_contains_one_evidence_sidecar_without_artifact_payloads()
         &mut evidence,
         l2_workbench::evidence::PublishedEvidenceLimits::new(u64::MAX, 32 * 1024 * 1024),
     )?;
-    assert!(!evidence.is_empty());
+    assert_ne!(evidence.len(), 0);
     assert!(!evidence.windows(BODY.len()).any(|window| window == BODY));
     let body_base64 = base64::Engine::encode(&base64::engine::general_purpose::STANDARD, BODY);
     assert!(!String::from_utf8_lossy(&evidence).contains(&body_base64));
@@ -527,7 +527,7 @@ fn summarizes_empty_capture() -> Result<(), Box<dyn Error>> {
         String::from_utf8_lossy(&output.stderr)
     );
     assert!(destination.is_dir());
-    assert!(artifact_paths(&destination)?.is_empty());
+    assert_eq!(artifact_paths(&destination)?.len(), 0);
     assert!(destination.join("limitations.txt").is_file());
     let summary = fs::read_to_string(destination.join("summary.txt"))?;
     assert!(summary.to_lowercase().contains("artifact"));
@@ -579,7 +579,7 @@ fn reports_invalid_capture() -> Result<(), Box<dyn Error>> {
 
     assert!(!output.status.success());
     assert!(!destination.exists());
-    assert!(!String::from_utf8_lossy(&output.stderr).trim().is_empty());
+    assert_ne!(String::from_utf8_lossy(&output.stderr).trim().len(), 0);
     assert!(String::from_utf8_lossy(&output.stderr).contains("invalid.pcap"));
     Ok(())
 }
@@ -599,7 +599,7 @@ fn excludes_partial_http_body() -> Result<(), Box<dyn Error>> {
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr)
     );
-    assert!(artifact_paths(&destination)?.is_empty());
+    assert_eq!(artifact_paths(&destination)?.len(), 0);
     let summary = fs::read_to_string(destination.join("summary.txt"))?;
     assert!(summary.contains("No complete HTTP bodies were recovered"));
     Ok(())
@@ -1023,7 +1023,7 @@ fn unsafe_tshark_files_are_skipped() -> Result<(), Box<dyn Error>> {
     let output = export_with_tshark(&capture, &destination, &executable)?;
 
     assert_eq!(output.status.code(), Some(0));
-    assert!(artifact_paths(&destination)?.is_empty());
+    assert_eq!(artifact_paths(&destination)?.len(), 0);
     let summary = fs::read_to_string(destination.join("summary.txt"))?;
     assert!(summary.contains("TShark objects exported: 0"));
     assert!(summary.contains("unsafe object entry"));
@@ -2109,7 +2109,7 @@ fn fragmented_packet_scope() -> Result<(), Box<dyn Error>> {
         .get("incomplete_components")
         .and_then(serde_json::Value::as_array)
         .ok_or("incomplete components are missing")?;
-    assert!(incomplete_components.is_empty());
+    assert_eq!(incomplete_components.len(), 0);
     assert!(
         summary.starts_with("L2Solver capture export\nOverall export: complete (exit status 0)\n")
     );

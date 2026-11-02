@@ -75,7 +75,7 @@ fn held_write_lease_recomputes_without_cache_and_strict_mode_fails() -> Result<(
             .to_string()
             .contains("cache entry is currently in use")
     );
-    assert!(strict_job.snapshot()?.cache_fallbacks.records().is_empty());
+    assert_eq!(strict_job.snapshot()?.cache_fallbacks.records().len(), 0);
 
     drop(held_lease);
     Ok(())
@@ -150,7 +150,7 @@ fn cache_quota_commit_failure_preserves_recovery_and_is_fatal_in_strict_mode()
     .err()
     .ok_or("strict cache mode accepted a quota-rejected commit")?;
     assert!(error.to_string().contains("cache stage needs at least"));
-    assert!(strict_job.snapshot()?.cache_fallbacks.records().is_empty());
+    assert_eq!(strict_job.snapshot()?.cache_fallbacks.records().len(), 0);
     assert_eq!(cache.stats()?.entries, 0);
     Ok(())
 }
