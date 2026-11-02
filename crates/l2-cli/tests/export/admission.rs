@@ -5,6 +5,8 @@ use l2_workbench::job::{
 
 type TestResult = Result<(), Box<dyn Error>>;
 const MIB: u64 = 1024 * 1024;
+#[cfg(target_os = "linux")]
+const PRESSURE_TEST: &str = "export::processing::admission::tests::kernel_pressure_followed_by_simulated_eacces_blocks_admission";
 
 fn observed_budget(
     rss: u64,
@@ -436,8 +438,111 @@ fn cancellation_during_a_busy_observation_wins_over_retry() -> TestResult {
 
 #[cfg(target_os = "linux")]
 #[test]
-#[ignore = "requires an owned 512 MiB cgroup with swap disabled"]
+fn pressure_child_rejects_the_parent_cgroup() -> TestResult {
+    let parent_cgroup = unified_cgroup_path()?;
+    let output = std::process::Command::new(std::env::current_exe()?)
+        .args(["--exact", PRESSURE_TEST, "--nocapture"])
+        .env("L2_TEST_CGROUP_INNER", "1")
+        .env("L2_TEST_PARENT_CGROUP", parent_cgroup)
+        .output()?;
+    assert!(!output.status.success());
+    let diagnostic = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(diagnostic.contains("requires a dedicated 512 MiB cgroup"));
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn unified_cgroup_path() -> Result<String, Box<dyn Error>> {
+    let entries = std::fs::read_to_string("/proc/self/cgroup")?;
+    let paths: Vec<_> = entries
+        .lines()
+        .filter_map(|line| line.strip_prefix("0::"))
+        .collect();
+    let [path] = paths.as_slice() else {
+        return Err("unified cgroup path is unavailable".into());
+    };
+    Ok((*path).to_owned())
+}
+
+#[cfg(target_os = "linux")]
+fn verify_pressure_cgroup() -> TestResult {
+    use std::{os::unix::fs::MetadataExt, path::Path};
+
+    let current = unified_cgroup_path()?;
+    let parent = std::env::var("L2_TEST_PARENT_CGROUP")?;
+    if current == parent {
+        return Err("pressure test requires a dedicated 512 MiB cgroup".into());
+    }
+    let expected_unit = std::env::var("L2_TEST_CGROUP_UNIT")?;
+    let root = Path::new("/sys/fs/cgroup").canonicalize()?;
+    let group = root.join(current.trim_start_matches('/')).canonicalize()?;
+    if !group.starts_with(&root)
+        || group.file_name().and_then(|name| name.to_str()) != Some(expected_unit.as_str())
+        || std::fs::metadata(&group)?.uid() != std::fs::metadata("/proc/self")?.uid()
+        || std::fs::read_to_string(group.join("memory.max"))?.trim() != (512 * MIB).to_string()
+        || std::fs::read_to_string(group.join("memory.swap.max"))?.trim() != "0"
+        || std::fs::read_to_string(group.join("cgroup.procs"))?.trim()
+            != std::process::id().to_string()
+    {
+        return Err("pressure test requires a dedicated 512 MiB cgroup with swap disabled".into());
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn run_pressure_in_owned_cgroup() -> TestResult {
+    let parent = unified_cgroup_path()?;
+    let unit = format!("l2solver-pressure-test-{}.service", std::process::id());
+    // A transient user service limits only the spawned test process
+    let output = std::process::Command::new("timeout")
+        .args([
+            "--kill-after=2s",
+            "30s",
+            "systemd-run",
+            "--user",
+            "--quiet",
+            "--wait",
+            "--pipe",
+            "--collect",
+            "--service-type=exec",
+            "--expand-environment=no",
+            "--property=MemoryMax=512M",
+            "--property=MemorySwapMax=0",
+            "--property=RuntimeMaxSec=25s",
+            "--property=Delegate=yes",
+        ])
+        .arg(format!("--unit={unit}"))
+        .arg("--setenv=L2_TEST_CGROUP_INNER=1")
+        .arg(format!("--setenv=L2_TEST_PARENT_CGROUP={parent}"))
+        .arg(format!("--setenv=L2_TEST_CGROUP_UNIT={unit}"))
+        .arg(std::env::current_exe()?)
+        .args(["--exact", PRESSURE_TEST, "--nocapture"])
+        .output()?;
+    if !output.status.success()
+        || !String::from_utf8_lossy(&output.stdout).contains("kernel_pressure_verified=1")
+    {
+        return Err(format!(
+            "dedicated cgroup pressure test failed: {}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        )
+        .into());
+    }
+    print!("{}", String::from_utf8_lossy(&output.stdout));
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+#[test]
 fn kernel_pressure_followed_by_simulated_eacces_blocks_admission() -> TestResult {
+    if std::env::var_os("L2_TEST_CGROUP_INNER").as_deref() != Some(std::ffi::OsStr::new("1")) {
+        return run_pressure_in_owned_cgroup();
+    }
+    verify_pressure_cgroup()?;
     let memory = MemoryBudget::new(512 * MIB);
     crate::recovery_job::refresh_memory_observation(&memory)?;
     let initial = memory
@@ -492,5 +597,6 @@ fn kernel_pressure_followed_by_simulated_eacces_blocks_admission() -> TestResult
         })
     );
     drop(ballast);
+    println!("kernel_pressure_verified=1");
     Ok(())
 }

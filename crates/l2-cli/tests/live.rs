@@ -61,7 +61,6 @@ fn sorts_interfaces_and_rejects_unknown() -> Result<(), Box<dyn Error>> {
 }
 
 #[test]
-#[ignore = "requires Linux user/network/mount namespaces and ip, bridge, ping, tcpdump"]
 fn observes_stp_from_live_bridge() -> Result<(), Box<dyn Error>> {
     let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("../..")

@@ -1,11 +1,23 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-test_binary=${1:?pass the compiled publish integration-test executable}
-results_root=${2:?pass an existing directory for temporary mountpoints}
-checkpoint_test_binary=${3:-}
-generation_test_binary=${4:-}
-case_buffer_test_binary=${5:-}
+if [[ ${1:-} == --case-buffer-only ]]; then
+    test_binary=
+    case_buffer_test_binary=${2:?pass the compiled case-buffer test executable}
+    results_root=${3:?pass an existing directory for temporary mountpoints}
+    checkpoint_test_binary=
+    generation_test_binary=
+else
+    test_binary=${1:?pass the compiled publish integration-test executable}
+    results_root=${2:?pass an existing directory for temporary mountpoints}
+    checkpoint_test_binary=${3:-}
+    generation_test_binary=${4:-}
+    case_buffer_test_binary=${5:-}
+fi
+
+# The child uses this identity to confirm it is in a different mount namespace
+export L2_TEST_PARENT_MOUNT_NAMESPACE
+L2_TEST_PARENT_MOUNT_NAMESPACE=$(readlink /proc/self/ns/mnt)
 
 run_in_namespace() {
     local binary=$1
@@ -22,8 +34,10 @@ run_in_namespace() {
             return 1
         fi
     }
-    require_test "$binary" faults::real_full_filesystem_preserves_the_existing_directory
-    require_test "$binary" faults::real_read_only_filesystem_preserves_the_existing_directory
+    if [[ -n "$binary" ]]; then
+        require_test "$binary" faults::real_full_filesystem_preserves_the_existing_directory
+        require_test "$binary" faults::real_read_only_filesystem_preserves_the_existing_directory
+    fi
     if [[ -n "$checkpoint_binary" ]]; then
         require_test "$checkpoint_binary" \
             recovery_job::cache::tests::real_full_filesystem_preserves_prior_checkpoint_and_respects_strict_mode
@@ -57,10 +71,12 @@ run_in_namespace() {
 
     # Propagation changes and mounts stay inside this unprivileged namespace
     mount --make-rprivate /
-    mkdir -- "$l2_fault_full_mount" "$l2_fault_readonly_mount"
+    mkdir -- "$l2_fault_full_mount"
     mount -t tmpfs -o size=1m,mode=0700 tmpfs "$l2_fault_full_mount"
-    L2_TEST_ENOSPC_ROOT="$l2_fault_full_mount" "$binary" \
-        --exact faults::real_full_filesystem_preserves_the_existing_directory --nocapture
+    if [[ -n "$binary" ]]; then
+        L2_TEST_ENOSPC_ROOT="$l2_fault_full_mount" "$binary" \
+            --exact faults::real_full_filesystem_preserves_the_existing_directory --nocapture
+    fi
     if [[ -n "$checkpoint_binary" ]]; then
         L2_TEST_ENOSPC_ROOT="$l2_fault_full_mount" "$checkpoint_binary" \
             --exact recovery_job::cache::tests::real_full_filesystem_preserves_prior_checkpoint_and_respects_strict_mode --nocapture
@@ -70,23 +86,26 @@ run_in_namespace() {
             --exact cache::execution::real_full_filesystem_preserves_the_committed_execution_generation --nocapture
     fi
     if [[ -n "$case_buffer_binary" ]]; then
-        L2_TEST_ENOSPC_ROOT="$l2_fault_full_mount" "$case_buffer_binary" \
-            --exact "$case_buffer_test" --ignored --nocapture
+        L2_TEST_ENOSPC_ROOT="$l2_fault_full_mount" L2_TEST_ENOSPC_INNER=1 \
+            "$case_buffer_binary" --exact "$case_buffer_test" --nocapture
     fi
 
-    mount -t tmpfs -o size=1m,mode=0700,uid=0,gid=0 tmpfs "$l2_fault_readonly_mount"
-    mkdir -- "$l2_fault_readonly_mount/bundle"
-    printf '%s' 'previous output' > "$l2_fault_readonly_mount/bundle/payload"
-    mount --bind "$l2_fault_readonly_mount" "$l2_fault_readonly_mount"
-    mount -o remount,bind,ro "$l2_fault_readonly_mount"
-    L2_TEST_EROFS_ROOT="$l2_fault_readonly_mount" "$binary" \
-        --exact faults::real_read_only_filesystem_preserves_the_existing_directory --nocapture
+    if [[ -n "$binary" ]]; then
+        mkdir -- "$l2_fault_readonly_mount"
+        mount -t tmpfs -o size=1m,mode=0700,uid=0,gid=0 tmpfs "$l2_fault_readonly_mount"
+        mkdir -- "$l2_fault_readonly_mount/bundle"
+        printf '%s' 'previous output' > "$l2_fault_readonly_mount/bundle/payload"
+        mount --bind "$l2_fault_readonly_mount" "$l2_fault_readonly_mount"
+        mount -o remount,bind,ro "$l2_fault_readonly_mount"
+        L2_TEST_EROFS_ROOT="$l2_fault_readonly_mount" "$binary" \
+            --exact faults::real_read_only_filesystem_preserves_the_existing_directory --nocapture
+    fi
     cleanup
     trap - EXIT
 }
 
 export -f run_in_namespace
-unshare --user --map-root-user --mount -- \
+unshare --user --map-root-user --mount --pid --mount-proc --fork --kill-child=KILL -- \
     bash -c 'set -euo pipefail; run_in_namespace "$@"' run_in_namespace \
     "$test_binary" "$results_root" "$checkpoint_test_binary" "$generation_test_binary" \
     "$case_buffer_test_binary"

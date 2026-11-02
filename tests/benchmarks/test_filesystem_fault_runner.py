@@ -113,6 +113,63 @@ def test_missing_optional_case_buffer_test_cannot_report_qualification(
 
 
 @pytest.mark.skipif(sys.platform != "linux", reason="requires Linux user namespaces")
+def test_case_buffer_only_rejects_a_binary_without_the_required_test(
+    tmp_path, user_namespace, empty_test_binary
+):
+    result = subprocess.run(
+        [
+            "bash",
+            str(ROOT / "tests/run-publish-filesystem-faults.sh"),
+            "--case-buffer-only",
+            str(empty_test_binary),
+            str(tmp_path),
+        ],
+        capture_output=True,
+        text=True,
+        timeout=20,
+        check=False,
+    )
+
+    assert result.returncode != 0
+    assert "real_full_tmpfs_spill_preserves_previous_output_and_cleans_private_files" in result.stderr
+
+
+@pytest.mark.skipif(sys.platform != "linux", reason="requires Linux user namespaces")
+def test_case_buffer_only_runs_the_named_test_on_a_private_tmpfs(
+    tmp_path, user_namespace
+):
+    test_binary = tmp_path / "case-buffer-tests"
+    test_binary.write_text(
+        "#!/bin/bash\n"
+        "set -euo pipefail\n"
+        'if [[ "$1" == --list ]]; then printf "%s: test\\n" "$3"; exit; fi\n'
+        '[[ "$1" == --exact && "$3" == --nocapture ]]\n'
+        '[[ $(stat -f -c %T "$L2_TEST_ENOSPC_ROOT") == tmpfs ]]\n'
+        '[[ $(readlink /proc/self/ns/mnt) != "$L2_TEST_PARENT_MOUNT_NAMESPACE" ]]\n'
+        'printf "%s\\n" "case-buffer fixture invoked"\n'
+    )
+    test_binary.chmod(0o700)
+
+    result = subprocess.run(
+        [
+            "bash",
+            str(ROOT / "tests/run-publish-filesystem-faults.sh"),
+            "--case-buffer-only",
+            str(test_binary),
+            str(tmp_path),
+        ],
+        capture_output=True,
+        text=True,
+        timeout=20,
+        check=False,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert "case-buffer fixture invoked" in result.stdout
+    assert list(tmp_path.glob("l2-publish-faults.*")) == []
+
+
+@pytest.mark.skipif(sys.platform != "linux", reason="requires Linux user namespaces")
 def test_failed_filesystem_trial_cleans_its_temporary_mountpoints(
     tmp_path, user_namespace
 ):
