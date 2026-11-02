@@ -274,7 +274,7 @@ fn orders_same_deadline_events() -> Result<(), Box<dyn Error>> {
 }
 
 fn assert_displayed<T: Display>(value: T) {
-    assert!(!value.to_string().is_empty());
+    assert_ne!(value.to_string(), "");
 }
 
 #[test]

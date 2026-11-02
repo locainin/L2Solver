@@ -38,10 +38,10 @@ fn decodes_basic_ethernet_ii_frame() {
 
     assert_eq!(decoded.destination, DESTINATION);
     assert_eq!(decoded.source, SOURCE);
-    assert!(decoded.vlan_tags.is_empty());
+    assert_eq!(decoded.vlan_tags, [] as [l2_core::VlanTag; 0]);
     assert_eq!(decoded.field, FrameField::EtherType(0x0800));
     assert_eq!(decoded.payload, &[0xde, 0xad, 0xbe, 0xef]);
-    assert!(decoded.padding.is_empty());
+    assert_eq!(decoded.padding, []);
 }
 
 #[test]
@@ -92,8 +92,8 @@ fn accepts_zero_maximum_ieee_lengths() {
     assert!(empty_result.is_ok());
     if let Ok(decoded_empty) = empty_result {
         assert_eq!(decoded_empty.field, FrameField::Length(0));
-        assert!(decoded_empty.payload.is_empty());
-        assert!(decoded_empty.padding.is_empty());
+        assert_eq!(decoded_empty.payload, []);
+        assert_eq!(decoded_empty.padding, []);
     }
 
     let mut maximum_payload = header(1500);
@@ -103,7 +103,7 @@ fn accepts_zero_maximum_ieee_lengths() {
     if let Ok(decoded_maximum) = maximum_result {
         assert_eq!(decoded_maximum.field, FrameField::Length(1500));
         assert_eq!(decoded_maximum.payload.len(), 1500);
-        assert!(decoded_maximum.padding.is_empty());
+        assert_eq!(decoded_maximum.padding, []);
     }
 }
 

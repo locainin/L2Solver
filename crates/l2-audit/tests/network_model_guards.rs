@@ -140,15 +140,13 @@ fn arp_conflicts_require_protocol_role() {
         Vec::new(),
         3,
     );
-    assert!(
-        build_network_model(&[interface(vec![valid.clone(), wrong_role])])
-            .address_conflicts
-            .is_empty()
+    assert_eq!(
+        build_network_model(&[interface(vec![valid.clone(), wrong_role])]).address_conflicts,
+        [] as [l2_audit::AddressConflict; 0]
     );
-    assert!(
-        build_network_model(&[interface(vec![valid, wrong_protocol])])
-            .address_conflicts
-            .is_empty()
+    assert_eq!(
+        build_network_model(&[interface(vec![valid, wrong_protocol])]).address_conflicts,
+        [] as [l2_audit::AddressConflict; 0]
     );
 }
 

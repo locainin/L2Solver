@@ -85,7 +85,7 @@ fn malformed_ethernet_creates_no_inventory() -> Result<(), Box<dyn std::error::E
     let interface = report.interfaces.first().ok_or("interface")?;
 
     assert_eq!(report.quality.malformed, 1);
-    assert!(interface.macs.is_empty());
+    assert_eq!(interface.macs, [] as [std::string::String; 0]);
     assert!(interface.vlans.is_empty());
     assert_eq!(interface.untagged_packet, None);
     assert!(report.evidence.is_empty());

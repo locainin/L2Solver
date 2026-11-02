@@ -35,8 +35,8 @@ fn cooked_dns_keeps_network_facts_and_scopes_without_ethernet_claims() -> TestRe
             );
         }
         let report = tracker.finish();
-        assert!(report.communications.is_empty());
-        assert!(report.arp_observations.is_empty());
+        assert_eq!(report.communications, [] as [l2_audit::IpCommunication; 0]);
+        assert_eq!(report.arp_observations, [] as [l2_audit::ArpObservation; 0]);
         assert_eq!(report.ip_frames_seen, 2);
         assert_eq!(report.ip_frames_parsed, 2);
         assert_eq!(report.dns_messages_parsed, 2);
@@ -45,7 +45,7 @@ fn cooked_dns_keeps_network_facts_and_scopes_without_ethernet_claims() -> TestRe
         let scope = &observation.scope;
         assert_eq!((scope.section, scope.interface), (4, 9));
         assert_eq!(scope.cooked_ifindex, (version == 276).then_some(67));
-        assert!(scope.vlan_ids.is_empty());
+        assert_eq!(scope.vlan_ids, [] as [(u16, u16); 0]);
         assert_eq!(observation.payload_offset, header + 28);
         assert_eq!(
             report

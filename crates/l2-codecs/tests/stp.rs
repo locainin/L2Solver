@@ -57,7 +57,7 @@ fn decodes_configuration_bpdu_fields() -> Result<(), StpError> {
     assert_eq!(frame.cost, Some(16));
     assert_eq!(frame.port.map(|port| port.raw), Some(0x8001));
     assert_eq!(frame.timers.map(|timers| timers.message_age), Some(0x0100));
-    assert!(frame.padding.is_empty());
+    assert_eq!(frame.padding, []);
     Ok(())
 }
 
@@ -103,7 +103,7 @@ fn minimum_tcn_header_without_padding() -> Result<(), StpError> {
     let frame = decode_stp(&[0, 0, 0, 0x80])?;
 
     assert_eq!(frame.raw, &[0, 0, 0, 0x80]);
-    assert!(frame.padding.is_empty());
+    assert_eq!(frame.padding, []);
     Ok(())
 }
 
@@ -166,9 +166,9 @@ fn rejects_invalid_stp_headers() {
         let result = std::panic::catch_unwind(|| decode_stp(truncated));
         assert!(result.is_ok(), "decoder panicked for {end}-byte input");
         if end < bytes.len() {
-            assert!(result.ok().is_some_and(|value| value.is_err()));
+            assert!(result.is_ok_and(|value| value.is_err()));
         } else {
-            assert!(result.ok().is_some_and(|value| value.is_ok()));
+            assert!(result.is_ok_and(|value| value.is_ok()));
         }
     }
 
@@ -306,7 +306,7 @@ fn stp_error_context_diagnostic_text() {
         StpContext::RapidExtension,
     ];
     for context in contexts {
-        assert!(!context.to_string().is_empty());
+        assert_ne!(context.to_string(), "");
     }
 
     let errors = [
@@ -333,6 +333,6 @@ fn stp_error_context_diagnostic_text() {
         },
     ];
     for error in errors {
-        assert!(!error.to_string().is_empty());
+        assert_ne!(error.to_string(), "");
     }
 }

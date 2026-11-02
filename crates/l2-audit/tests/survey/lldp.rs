@@ -132,7 +132,7 @@ fn duplicate_system_names_ambiguous_every() -> Result<(), Box<dyn std::error::Er
             .first()
             .and_then(|interface| interface.neighbors.first())
             .ok_or("missing neighbor")?;
-        assert!(neighbor.system_name.is_empty());
+        assert_eq!(neighbor.system_name, [] as [u8; 0]);
     }
     Ok(())
 }

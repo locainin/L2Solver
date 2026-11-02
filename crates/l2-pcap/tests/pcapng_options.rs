@@ -185,8 +185,8 @@ fn rejects_truncated_options() -> Result<(), Box<dyn std::error::Error>> {
 
 #[test]
 fn comment_options_known_repeatable() -> Result<(), Box<dyn std::error::Error>> {
-    let comment_a = [b'a'];
-    let comment_b = [b'b', b'c'];
+    let comment_a = *b"a";
+    let comment_b = *b"bc";
     let mut capture = section_header(ByteOrder::Little, -1);
     capture.extend_from_slice(&interface(
         ByteOrder::Little,
@@ -196,13 +196,13 @@ fn comment_options_known_repeatable() -> Result<(), Box<dyn std::error::Error>> 
 
     let mut reader = PcapNgReader::new(Cursor::new(capture))?;
     assert!(reader.next_packet()?.is_none());
-    assert!(
+    assert_eq!(
         reader
             .interface_descriptions()
             .first()
             .ok_or("missing interface")?
-            .unknown_options()
-            .is_empty()
+            .unknown_options(),
+        []
     );
     Ok(())
 }

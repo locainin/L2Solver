@@ -98,7 +98,10 @@ fn evidence_saturation_new_facts_chains() -> TestResult {
         .ok_or("missing change")?;
     // A packet without a retained reference cannot become the proof for a later event
     assert_eq!(change.followup_packet, None);
-    assert!(report.forensics.communications.is_empty());
+    assert_eq!(
+        report.forensics.communications,
+        [] as [l2_audit::IpCommunication; 0]
+    );
     assert_eq!(report.forensics.ip_frames_parsed, 1);
     assert_eq!(report.evidence_refs.len(), 2);
     assert!(

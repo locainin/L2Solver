@@ -422,7 +422,7 @@ fn structural_errors_nonempty_lldp_diagnostics() {
 
     for error in errors {
         let message = error.to_string();
-        assert!(!message.trim().is_empty());
+        assert_ne!(message.trim(), "");
         assert!(message.contains("LLDP"));
     }
 }

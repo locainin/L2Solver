@@ -90,7 +90,7 @@ fn stops_delivery_after_recording_failure() -> Result<(), Box<dyn Error>> {
     ));
     assert!(matches!(link.next_event(), Err(RecordingError::Terminated)));
     assert!(link.is_terminated());
-    assert!(link.recorder().packets.is_empty());
+    assert_eq!(link.recorder().packets, [] as [std::vec::Vec<u8>; 0]);
     Ok(())
 }
 

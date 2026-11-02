@@ -60,7 +60,10 @@ fn zero_padding_fcs_not_flagged() -> TestResult {
         captured_with_fcs(nonzero.clone(), 0, FcsStatus::Unknown)?,
         captured_with_fcs(nonzero, 0, FcsStatus::present(4)?)?,
     ])?;
-    assert!(report.forensics.trailing_data.is_empty());
+    assert_eq!(
+        report.forensics.trailing_data,
+        [] as [l2_audit::TrailingData; 0]
+    );
     assert_eq!(report.forensics.trailer_frames_unchecked, 2);
     Ok(())
 }
@@ -97,7 +100,10 @@ fn invalid_fragmented_not_trailer_fact() -> TestResult {
         captured_with_fcs(ipv4_udp_with_trailer(8, true, &[])?, 0, FcsStatus::Unknown)?,
     ])?;
 
-    assert!(report.forensics.trailing_data.is_empty());
+    assert_eq!(
+        report.forensics.trailing_data,
+        [] as [l2_audit::TrailingData; 0]
+    );
     assert_eq!(report.forensics.ip_frames_seen, 2);
     assert_eq!(report.forensics.ip_frames_parsed, 2);
     assert_eq!(report.forensics.trailer_frames_unchecked, 0);
@@ -116,7 +122,10 @@ fn udp_trailer_shared_forensic_quota() -> TestResult {
 
     let report = survey.finish(&l2_audit::Policy::default())?;
     assert_eq!(report.forensics.communications.len(), 1);
-    assert!(report.forensics.trailing_data.is_empty());
+    assert_eq!(
+        report.forensics.trailing_data,
+        [] as [l2_audit::TrailingData; 0]
+    );
     assert!(
         report
             .resource_limits

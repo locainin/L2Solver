@@ -183,13 +183,9 @@ fn invalid_capacity_shutdown_overflow_atomic() -> Result<(), Box<dyn Error>> {
 
 #[test]
 fn queue_errors_include_actionable_text() {
-    assert!(!QueueError::Full.to_string().is_empty());
-    assert!(!QueueError::InvalidGap.to_string().is_empty());
-    assert!(!QueueError::Closed.to_string().is_empty());
-    assert!(
-        !QueueError::ControlEventRequiresEventApi
-            .to_string()
-            .is_empty()
-    );
-    assert!(!QueueError::InvalidCapacity.to_string().is_empty());
+    assert_ne!(QueueError::Full.to_string(), "");
+    assert_ne!(QueueError::InvalidGap.to_string(), "");
+    assert_ne!(QueueError::Closed.to_string(), "");
+    assert_ne!(QueueError::ControlEventRequiresEventApi.to_string(), "");
+    assert_ne!(QueueError::InvalidCapacity.to_string(), "");
 }

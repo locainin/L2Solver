@@ -61,7 +61,7 @@ fn reads_big_endian_nanosecond_capture() -> Result<(), Box<dyn std::error::Error
     let mut reader = CaptureReader::new(Cursor::new(capture))?;
     let packet = reader.next_packet()?.ok_or("missing packet")?;
 
-    assert!(packet.bytes().is_empty());
+    assert_eq!(packet.bytes(), []);
     assert_eq!(packet.metadata().original_len(), u32::MAX);
     assert_eq!(
         packet

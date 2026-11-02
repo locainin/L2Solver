@@ -62,7 +62,10 @@ fn invalid_capture_ip_remains_unparsed() -> TestResult {
     let mut truncated = traffic(SECOND_MAC, ADDRESS);
     truncated.pop();
     let report = assess([captured(invalid, 0)?, captured(truncated, 0)?])?;
-    assert!(report.forensics.communications.is_empty());
+    assert_eq!(
+        report.forensics.communications,
+        [] as [l2_audit::IpCommunication; 0]
+    );
     assert_eq!(report.forensics.ip_frames_seen, 2);
     assert_eq!(report.forensics.ip_frames_parsed, 0);
     assert!(!report.collection_complete());

@@ -256,7 +256,7 @@ fn allow_requires_all_planned_receipts() -> Result<(), Box<dyn Error>> {
     assert_eq!(result.planned_attempts(), 2);
     assert_eq!(result.matching_receipts(), 2);
     assert_eq!(result.missing_attempts(), 0);
-    assert!(result.limitations().is_empty());
+    assert_eq!(result.limitations(), [] as [String; 0]);
     assert_eq!(
         result
             .evidence()
@@ -412,6 +412,6 @@ fn empty_plan_is_inconclusive() -> Result<(), Box<dyn Error>> {
     let planned = l2_segmentation::plan(&PlanInput::for_replay(RUN)?)?;
     let report = Evaluator::new(&planned).evaluate(&healthy());
     assert_eq!(report.overall_status(), EvaluationStatus::Inconclusive);
-    assert!(report.results().is_empty());
+    assert_eq!(report.results(), []);
     Ok(())
 }
