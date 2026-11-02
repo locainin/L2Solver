@@ -13,6 +13,16 @@ mod durable;
 mod limits;
 #[path = "recovery_executor_checkpoint/memory.rs"]
 mod memory;
+#[path = "recovery_executor_checkpoint/profile_resume.rs"]
+mod profile_resume;
+
+fn without_cache_hits(mut work: serde_json::Value) -> Result<serde_json::Value, Box<dyn Error>> {
+    work.pointer_mut("/counts/counters")
+        .and_then(serde_json::Value::as_object_mut)
+        .ok_or("missing work counters")?
+        .remove("cache_hits");
+    Ok(work)
+}
 #[cfg(target_os = "linux")]
 #[path = "recovery_executor_checkpoint/relational_interrupt.rs"]
 mod relational_interrupt;

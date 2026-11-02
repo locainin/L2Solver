@@ -303,7 +303,7 @@ impl Executor<'_> {
         input_node: u64,
     ) -> Result<u64, RecoveryExecutionError> {
         let blob_id = self.node_blob_id(output_node)?.to_owned();
-        let key = (blob_id.clone(), receipt_node, input_node);
+        let key = super::contextual_view_key(&blob_id, receipt_node, input_node)?;
         if let Some(view_node) = self.case_index.contextual_decoding_views.get(&key).copied() {
             self.ensure_contextual_decoding_view_edges(view_node, receipt_node, input_node)?;
             return Ok(view_node);

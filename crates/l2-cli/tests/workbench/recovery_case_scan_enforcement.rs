@@ -212,7 +212,7 @@ fn retained_case_index_charges_contextual_view_key_bytes_within_both_bounds() ->
             "source_input_node":input_node
         }),
     )?;
-    let first_key = (output_blob_id.clone(), receipt_node, input_node);
+    let first_key = super::super::contextual_view_key(&output_blob_id, receipt_node, input_node)?;
     let initial_bound = case_index_scan_bound(&case)?;
     let mut index = super::super::CaseIndex::new(&case)?;
     assert_eq!(
@@ -251,7 +251,11 @@ fn retained_case_index_charges_contextual_view_key_bytes_within_both_bounds() ->
     assert_eq!(
         index
             .contextual_decoding_views
-            .get(&(output_blob_id, other_receipt_node, input_node)),
+            .get(&super::super::contextual_view_key(
+                &output_blob_id,
+                other_receipt_node,
+                input_node,
+            )?),
         Some(&second_view)
     );
     Ok(())

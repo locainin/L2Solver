@@ -28,6 +28,29 @@ use std::{
 };
 
 #[test]
+fn bounded_xor_search_is_not_counted_as_a_complete_negative() -> Result<(), Box<dyn Error>> {
+    let mut state = 0x482f_57b3_u32;
+    let bytes = (0..192)
+        .map(|_| {
+            state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            state.to_be_bytes().first().copied().unwrap_or_default()
+        })
+        .collect::<Vec<_>>();
+    let mut case = Case::new();
+    let input_node = source(&mut case, "tcp_byte_run", &bytes)?;
+    let plan = RecoveryPlan {
+        discover_transforms: true,
+        ..RecoveryPlan::default()
+    };
+    let outcome = execute(&mut case, &plan, &policy())?;
+    assert!(outcome.omissions.iter().any(|omission| matches!(omission,
+        RecoveryOmission::XorSearchLimit { input_node_id, search_truncated: true, .. } if *input_node_id == input_node
+    )));
+    assert_eq!(outcome.complete_negative_transform_searches, 0);
+    Ok(())
+}
+
+#[test]
 fn recovery_status_separates_transform_search_and_report_omissions() {
     let candidate_omission = RecoveryOmission::TransformDiscoveryAnalysis {
         input_node_id: 7,
@@ -311,7 +334,7 @@ fn failed_contextual_decoding_view_commit_does_not_cache_rolled_back_node()
     let execution_policy = policy();
     let mut executor = super::test_support::build_executor(&mut case, &plan, &execution_policy)?;
     let before = executor.case.try_clone()?;
-    let key = (blob_id(b"output"), receipt_node, input_node);
+    let key = super::contextual_view_key(&blob_id(b"output"), receipt_node, input_node)?;
 
     assert!(
         executor

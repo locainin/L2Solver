@@ -75,17 +75,28 @@ struct Saved<'checkpoint> {
     state: state::State,
 }
 
-struct AdmittedSaved<'checkpoint> {
-    // Drop decoded data before releasing its admission, including on failed restoration
-    saved: Saved<'checkpoint>,
-    memory: Option<MemoryLease>,
-}
-
+#[cfg(test)]
 pub(super) fn write(
     executor: &Executor<'_>,
     cursor: &SchedulerCursor,
     output: &mut impl Write,
     max_bytes: usize,
+) -> Result<(), RecoveryExecutionError> {
+    write_with_memory(
+        executor,
+        cursor,
+        output,
+        max_bytes,
+        executor.memory.as_ref(),
+    )
+}
+
+pub(super) fn write_with_memory(
+    executor: &Executor<'_>,
+    cursor: &SchedulerCursor,
+    output: &mut impl Write,
+    max_bytes: usize,
+    memory: Option<&MemoryBudget>,
 ) -> Result<(), RecoveryExecutionError> {
     // Supplied recipes may not have reached the frontier at this boundary
     for recipe in &executor.plan.recipes {
@@ -97,7 +108,7 @@ pub(super) fn write(
         }
     }
     executor.derived_discovery.validate_checkpoint_recipes()?;
-    let mut buffer = buffer::Buffer::new(max_bytes, executor.memory.as_ref())?;
+    let mut buffer = buffer::Buffer::new(max_bytes, memory)?;
     if let Err(error) = executor
         .coordinator
         .write_checkpoint(executor.case, &mut buffer, max_bytes)
@@ -188,43 +199,36 @@ pub(super) fn read<'a>(
         return Err(RecoveryError::InvalidCheckpoint.into());
     }
     let metadata_admission = memory::admit(bytes, memory)?;
-    let mut decoded = AdmittedSaved {
-        saved: serde_json::from_slice(bytes).map_err(|_| RecoveryError::InvalidCheckpoint)?,
-        memory: metadata_admission.map(l2_workbench::job::JsonMemoryAdmission::into_retained),
-    };
-    if decoded.saved.version != VERSION
-        || decoded.saved.plan != *plan
-        || policy_configuration(&decoded.saved.policy)? != policy_configuration(expected)?
+    // The decoded value is dropped before its earlier admission on every error path
+    let mut saved: Saved<'_> =
+        serde_json::from_slice(bytes).map_err(|_| RecoveryError::InvalidCheckpoint)?;
+    if saved.version != VERSION
+        || saved.plan != *plan
+        || policy_configuration(&saved.policy)? != policy_configuration(expected)?
     {
         return Err(RecoveryError::InvalidCheckpoint.into());
     }
-    decoded.saved.policy.bind_restored_case(case)?;
+    saved.policy.bind_restored_case(case)?;
     let coordinator = RecoveryCoordinator::restore(
         case,
         expected.resources,
-        decoded.saved.coordinator.get().as_bytes(),
+        saved.coordinator.get().as_bytes(),
         max_bytes,
     )?;
-    let index = CaseIndex::restore_from_checkpoint(case, decoded.saved.index)?;
-    let mut executor = decoded.saved.state.restore(
-        case,
-        plan,
-        decoded.saved.policy,
-        coordinator,
-        index,
-        memory,
-    )?;
+    let index = CaseIndex::restore_from_checkpoint(case, saved.index, memory)?;
+    let mut executor = saved
+        .state
+        .restore(case, plan, saved.policy, coordinator, index, memory)?;
+    // The coordinator is parsed and indexed after the outer JSON has been decoded
     // The cursor and executor can outlive each other, but share one admission
-    let metadata_memory = decoded.memory.take().map(Arc::new);
-    decoded
-        .saved
-        .cursor
-        .checkpoint_memory
-        .clone_from(&metadata_memory);
+    let metadata_memory = metadata_admission
+        .map(l2_workbench::job::JsonMemoryAdmission::into_retained)
+        .map(Arc::new);
+    saved.cursor.checkpoint_memory.clone_from(&metadata_memory);
     executor.checkpoint_memory = metadata_memory;
     validate::executor(&executor)?;
-    decoded.saved.cursor.validate(&executor)?;
-    Ok((executor, decoded.saved.cursor))
+    saved.cursor.validate(&executor)?;
+    Ok((executor, saved.cursor))
 }
 
 fn policy_configuration(
