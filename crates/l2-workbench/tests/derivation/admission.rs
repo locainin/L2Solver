@@ -16,6 +16,73 @@ fn recipe(steps: Vec<Operation>) -> Recipe {
     }
 }
 
+#[test]
+fn xor_accounts_for_output_and_releases_failed_admission() -> Result<(), Box<dyn Error>> {
+    let operations = vec![Operation::XorRepeat {
+        key: vec![0x73],
+        offset: 0,
+    }];
+    let input: Vec<_> = b"one\r\n&amp; two".iter().map(|byte| byte ^ 0x73).collect();
+    let budget = MemoryBudget::new(32 * 1024);
+    let mut memory = budget.try_reserve(MemoryClass::Executor, 4)?;
+    let report = run_with_memory(
+        &input,
+        &recipe(operations.clone()),
+        generous_limits(),
+        &mut memory,
+    )?;
+    assert_eq!(report.output, b"one\r\n&amp; two");
+    assert!(memory.bytes() >= 4 + report_heap_bytes(&report)?);
+    drop(report);
+    memory.try_resize(4)?;
+    let small = MemoryBudget::new(5);
+    let mut denied = small.try_reserve(MemoryClass::Executor, 3)?;
+    assert!(matches!(
+        run_with_memory(&input, &recipe(operations), generous_limits(), &mut denied),
+        Err(AdmittedDerivationError::Memory(MemoryError::Limit { .. }))
+    ));
+    assert_eq!(denied.bytes(), 3);
+    assert_eq!(small.snapshot()?.used_bytes, 3);
+    Ok(())
+}
+
+#[test]
+fn direct_normalization_tracks_output_and_restores_denied_lease() -> Result<(), Box<dyn Error>> {
+    let budget = MemoryBudget::new(128);
+    let mut memory = budget.try_reserve(MemoryClass::Executor, 7)?;
+    let output = super::normalize_message_with_memory(b"A\r\n&amp;", &mut memory)?;
+    assert_eq!(output, b"A\n&");
+    assert!(memory.bytes() >= 7 + u64::try_from(output.capacity())?);
+    assert_eq!(budget.snapshot()?.used_bytes, memory.bytes());
+    let limited = MemoryBudget::new(7);
+    let mut denied = limited.try_reserve(MemoryClass::Executor, 5)?;
+    assert!(super::normalize_message_with_memory(b"A\r\n&amp;", &mut denied).is_err());
+    assert_eq!(denied.bytes(), 5);
+    assert_eq!(limited.snapshot()?.used_bytes, 5);
+    Ok(())
+}
+
+#[test]
+fn admitted_xor_reports_charge_cloned_key_material() -> Result<(), Box<dyn Error>> {
+    let key = vec![0x57; 4096];
+    let operation = Operation::XorRepeat { key, offset: 0 };
+    let budget = MemoryBudget::new(metadata_charge(1)? + 1024);
+    let mut memory = budget.try_reserve(MemoryClass::Executor, 3)?;
+    let result = run_with_memory(
+        b"x",
+        &recipe(vec![operation]),
+        generous_limits(),
+        &mut memory,
+    );
+    assert!(matches!(
+        result,
+        Err(AdmittedDerivationError::Memory(MemoryError::Limit { .. }))
+    ));
+    assert_eq!(memory.bytes(), 3);
+    assert_eq!(budget.snapshot()?.used_bytes, 3);
+    Ok(())
+}
+
 fn gzip(bytes: &[u8]) -> Result<Vec<u8>, Box<dyn Error>> {
     let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
     encoder.write_all(bytes)?;

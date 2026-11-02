@@ -10,3 +10,5 @@ mod proposal_associations;
 mod proposals;
 #[path = "recovery/regions.rs"]
 mod regions;
+#[path = "recovery/xor.rs"]
+mod xor;

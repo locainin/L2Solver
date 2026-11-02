@@ -13,7 +13,10 @@ mod transform;
 #[path = "../../tests/derivation/admission.rs"]
 mod admission_tests;
 
-pub use execute::{DerivationError, run, run_with_case, run_with_limits, run_with_selected_input};
+pub use execute::{
+    AdmittedDerivationError, DerivationError, run, run_with_case, run_with_limits, run_with_memory,
+    run_with_selected_input,
+};
 pub use model::{
     AesGcmTagLayout, Base64Alphabet, Base64Padding, BitRemainder, ChecksumByteOrder, Constraint,
     ConstraintFailure, ConstraintReport, ConstraintStatus, CounterByteOrder, CounterWidth,
@@ -25,6 +28,7 @@ pub use stream::{
     STREAM_WORKSPACE_BYTES, StreamInput, StreamLimits, StreamReceipt, StreamTransformError,
     stream_transform,
 };
+pub use transform::{NormalizationError, normalization_work_bound, normalize_message_with_memory};
 
 pub(crate) fn validate_recipe_identity(recipe: &Recipe) -> Result<(), DerivationError> {
     execute::validate_recipe_identity(recipe)
@@ -45,7 +49,6 @@ pub const MAX_RECIPE_PARAMETER_BYTES: usize = 4 * 1024 * 1024;
 /// Default cumulative bytes charged across configured transformation work
 pub const DEFAULT_MAX_WORK_BYTES: usize = MAX_INPUT_BYTES * MAX_STEPS + MAX_INTERMEDIATE_BYTES;
 
-pub(crate) use execute::{AdmittedDerivationError, run_with_memory};
 pub(crate) use identity::OperationIdentity;
 pub(crate) use transform::{
     preview_sha256_counter_xor, select_bit_plane_chunks, sha256_counter_xor_work,

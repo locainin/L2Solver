@@ -1,33 +1,35 @@
 use super::super::StepFailure;
 use super::{Admission, Buffer, OutputBudget, TransformError, check_output_size};
 
-pub(super) fn xor_repeat(
+pub(super) fn xor_repeat<A: Admission>(
     input: &[u8],
     key: &[u8],
     offset: usize,
     budget: OutputBudget,
-) -> Result<Vec<u8>, StepFailure> {
+    admission: &A,
+) -> Result<Buffer<A>, TransformError<A::Error>> {
     if key.is_empty() {
-        return Err(StepFailure::EmptyXorKey);
+        return Err(StepFailure::EmptyXorKey.into());
     }
     if key.len() > budget.max_key_bytes {
         return Err(StepFailure::XorKeyTooLong {
             length: key.len(),
             limit: budget.max_key_bytes,
-        });
+        }
+        .into());
     }
     check_output_size(input.len(), budget)?;
     let key_length = key.len();
     // Reduce the caller offset before adding each input position
     let phase = offset % key_length;
-    let mut output = Vec::with_capacity(input.len());
+    let mut output = Buffer::with_capacity(input.len(), admission)?;
     for (position, byte) in input.iter().copied().enumerate() {
         let key_index = (phase + position % key_length) % key_length;
         let key_byte = key
             .get(key_index)
             .copied()
             .ok_or(StepFailure::EmptyXorKey)?;
-        output.push(byte ^ key_byte);
+        output.bytes.push(byte ^ key_byte);
     }
     Ok(output)
 }
