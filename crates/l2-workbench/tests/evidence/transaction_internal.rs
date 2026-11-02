@@ -129,7 +129,7 @@ fn failed_inner_transaction_restores_only_its_source_changes() -> Result<(), Evi
         .get(1)
         .ok_or(EvidenceError::MissingReference { kind: "source" })?;
     assert_eq!(first_source.aliases, ["first-outer.pcap"]);
-    assert!(second_source.aliases.is_empty());
+    assert_eq!(second_source.aliases.len(), 0);
     case.validate()?;
     Ok(())
 }
@@ -206,7 +206,7 @@ fn rollback_restores_source_blob_attachment_and_deduplication() -> Result<(), Ev
             .first()
             .is_some_and(|source| source.blob.is_none())
     );
-    assert!(case.blobs().is_empty());
+    assert_eq!(case.blobs().len(), 0);
     case.validate()?;
     Ok(())
 }

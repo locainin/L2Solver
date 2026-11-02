@@ -347,7 +347,7 @@ fn field_candidate_aliases_holdout_counterexamples() -> Result<(), Box<dyn Error
     assert_eq!(candidate.holdout.counterexample_count, 2);
     assert_eq!(candidate.holdout.counterexamples.len(), 2);
     assert_eq!(alias.discovery_supported_sessions, 2);
-    assert!(!report.next_observation.is_empty());
+    assert_ne!(report.next_observation.len(), 0);
     Ok(())
 }
 

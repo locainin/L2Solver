@@ -13,8 +13,8 @@ fn invalid_controls_without_budget_omission() {
         input.extend(std::iter::repeat_n(b'A', MAX_LINE_BYTES));
         let report = decode_ftp(&input, COMPLETE);
         assert_eq!(report.status, ParseStatus::Unsupported);
-        assert!(report.budget_omissions.is_empty());
-        assert!(report.findings.is_empty());
+        assert_eq!(report.budget_omissions.len(), 0);
+        assert_eq!(report.findings.len(), 0);
         assert_eq!(report.unparsed, [ByteRange::new(0, input.len())]);
     }
 }
@@ -23,7 +23,7 @@ fn invalid_controls_without_budget_omission() {
 fn unfinished_crlf_without_budget_omission() {
     let report = decode_ftp(b"NOOP\r", COMPLETE);
     assert_eq!(report.status, ParseStatus::Incomplete);
-    assert!(report.budget_omissions.is_empty());
+    assert_eq!(report.budget_omissions.len(), 0);
 }
 
 #[test]
@@ -33,7 +33,7 @@ fn unfinished_delimiter_at_exact_limit() {
     input.push(b'\r');
     let report = decode_ftp(&input, COMPLETE);
     assert_eq!(report.status, ParseStatus::Incomplete);
-    assert!(report.budget_omissions.is_empty());
+    assert_eq!(report.budget_omissions.len(), 0);
 }
 
 #[test]
@@ -43,7 +43,7 @@ fn interior_cr_over_line_limit() {
     input.extend_from_slice(b"\rZ");
     let report = decode_ftp(&input, COMPLETE);
     assert_eq!(report.status, ParseStatus::Unsupported);
-    assert!(report.budget_omissions.is_empty());
+    assert_eq!(report.budget_omissions.len(), 0);
 }
 
 #[test]
@@ -57,7 +57,7 @@ fn impossible_command_without_budget_omission() {
         input.extend(std::iter::repeat_n(b'A', MAX_LINE_BYTES));
         let report = decode_ftp(&input, COMPLETE);
         assert_eq!(report.status, ParseStatus::Unsupported);
-        assert!(report.budget_omissions.is_empty());
+        assert_eq!(report.budget_omissions.len(), 0);
         assert_eq!(report.unparsed, [ByteRange::new(0, input.len())]);
     }
 }

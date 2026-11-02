@@ -10,12 +10,12 @@ fn failed_zero_no_transferred_bytes() -> Result<(), Box<dyn Error>> {
     let failed = report.events.first().ok_or("missing failed syscall")?;
     assert_eq!(failed.return_value, Some(-1));
     assert!(failed.bytes_complete);
-    assert!(failed.bytes.is_empty());
+    assert_eq!(failed.bytes.len(), 0);
     assert!(failed.data_source_range.is_some());
     let empty = report.events.get(1).ok_or("missing zero-length syscall")?;
     assert_eq!(empty.return_value, Some(0));
     assert!(empty.bytes_complete);
-    assert!(empty.bytes.is_empty());
+    assert_eq!(empty.bytes.len(), 0);
     assert!(empty.data_source_range.is_some());
     Ok(())
 }
@@ -50,7 +50,7 @@ fn failed_pointer_complete_empty_observation() -> Result<(), Box<dyn Error>> {
 
     assert_eq!(event.return_value, Some(-1));
     assert!(event.bytes_complete);
-    assert!(event.bytes.is_empty());
+    assert_eq!(event.bytes.len(), 0);
     assert!(event.data_source_range.is_none());
     assert_eq!(event.source_range.offset, 0);
     let syscall_line = trace
@@ -73,7 +73,7 @@ fn positive_result_without_buffer_incomplete() -> Result<(), Box<dyn Error>> {
 
     assert_eq!(event.return_value, Some(3));
     assert!(!event.bytes_complete);
-    assert!(event.bytes.is_empty());
+    assert_eq!(event.bytes.len(), 0);
     assert!(event.data_source_range.is_none());
     assert!(!report.complete);
     assert_eq!(report.incomplete_events, 1);
@@ -88,7 +88,7 @@ fn quoted_sockaddr_not_receive_buffer() -> Result<(), Box<dyn Error>> {
 
     assert_eq!(event.return_value, Some(4));
     assert!(!event.bytes_complete);
-    assert!(event.bytes.is_empty());
+    assert_eq!(event.bytes.len(), 0);
     assert!(event.data_source_range.is_none());
     assert!(!report.complete);
     Ok(())
@@ -132,7 +132,7 @@ fn successful_quoted_pointer_call_retained() -> Result<(), Box<dyn Error>> {
 
     assert_eq!(report.events.len(), 2);
     assert_eq!(failed.return_value, Some(-1));
-    assert!(failed.bytes.is_empty());
+    assert_eq!(failed.bytes.len(), 0);
     assert!(failed.bytes_complete);
     assert!(failed.data_source_range.is_none());
     assert_eq!(successful.bytes, b"AB");
@@ -182,7 +182,7 @@ fn owned_nonblocking_receive_later_bytes() -> Result<(), Box<dyn Error>> {
         .ok_or("successful response bytes were not captured")?;
 
     assert!(failed.bytes_complete);
-    assert!(failed.bytes.is_empty());
+    assert_eq!(failed.bytes.len(), 0);
     assert!(failed.data_source_range.is_none());
     assert!(successful.bytes_complete);
     assert_eq!(successful.direction, super::IoDirection::IntoProcess);

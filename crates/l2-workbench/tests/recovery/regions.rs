@@ -158,8 +158,8 @@ fn whole_buffer_encoding_run_is_assessed_only_by_the_existing_whole_input_path()
     let whole_report = propose_transforms(input, proposal_budget());
     let region_report = propose_region_transforms(input, &[], limits(), proposal_budget());
 
-    assert!(!whole_report.proposals.is_empty());
-    assert!(region_report.regions.is_empty());
+    assert_ne!(whole_report.proposals.len(), 0);
+    assert_eq!(region_report.regions.len(), 0);
     assert!(region_report.coverage.complete);
 }
 
@@ -207,7 +207,7 @@ fn region_count_and_scan_limits_report_incomplete_coverage() {
     small_scan.max_scan_bytes = 32;
     let scan_limited = propose_region_transforms(&large_run, &[], small_scan, proposal_budget());
 
-    assert!(scan_limited.regions.is_empty());
+    assert_eq!(scan_limited.regions.len(), 0);
     assert!(scan_limited.coverage.omissions.scan_bytes > 0);
     assert!(!scan_limited.coverage.complete);
 
@@ -262,7 +262,7 @@ fn explicit_ranges_cannot_exceed_per_region_or_aggregate_budgets() -> Result<(),
         per_region_limit,
         proposal_budget(),
     );
-    assert!(per_region_report.regions.is_empty());
+    assert_eq!(per_region_report.regions.len(), 0);
     assert_eq!(per_region_report.coverage.omissions.region_bytes, 8);
     Ok(())
 }

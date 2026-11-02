@@ -132,7 +132,7 @@ fn retains_a_single_session_hypothesis_without_claiming_heldout_support()
     let report = infer_relational_transform_candidates(&samples, &search_plan())?;
 
     assert_eq!(report.discovery_sessions.len(), 1);
-    assert!(report.heldout_sessions.is_empty());
+    assert_eq!(report.heldout_sessions.len(), 0);
     let candidate = report
         .candidates
         .iter()
@@ -148,7 +148,7 @@ fn retains_a_single_session_hypothesis_without_claiming_heldout_support()
         RelationalFitStatus::ConstraintsSatisfied
     );
     assert_eq!(candidate.heldout.status, RelationalFitStatus::NotEvaluated);
-    assert!(candidate.heldout.checks.is_empty());
+    assert_eq!(candidate.heldout.checks.len(), 0);
     assert_eq!(
         candidate.status,
         RelationalTransformStatus::DiscoveryOnlyHypothesis

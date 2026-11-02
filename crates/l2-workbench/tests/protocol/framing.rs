@@ -31,7 +31,7 @@ fn length_prefix_candidates_holdout_counterexamples() -> Result<(), Box<dyn Erro
     assert_eq!(candidate.holdout.counterexample_count, 0);
     assert_eq!(report.discovery_samples, [1, 2]);
     assert_eq!(report.holdout_samples, [3, 4, 5]);
-    assert!(!report.limitations.is_empty());
+    assert_ne!(report.limitations.len(), 0);
     Ok(())
 }
 
@@ -263,7 +263,7 @@ fn protocol_errors_standard_error_reporting() -> Result<(), Box<dyn Error>> {
         .ok_or("an empty sample set should be rejected")?;
     let standard_error: &dyn Error = &error;
 
-    assert!(!error.to_string().is_empty());
+    assert_ne!(error.to_string().len(), 0);
     assert!(standard_error.source().is_none());
     Ok(())
 }

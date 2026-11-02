@@ -84,7 +84,7 @@ fn checkpoint_output_requires_canonical_padded_base64() -> TestResult<()> {
         .as_str()
         .ok_or("output was not encoded as a string")?;
     let decoded = STANDARD.decode(output)?;
-    assert!(!decoded.is_empty());
+    assert_ne!(decoded.len(), 0);
     assert_eq!(STANDARD.encode(&decoded), output);
 
     // Alter unused trailing bits while keeping the same decoded bytes under a permissive decoder

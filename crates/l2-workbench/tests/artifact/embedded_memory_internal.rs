@@ -36,7 +36,7 @@ fn source_without_markers_needs_no_heap_metadata() -> TestResult {
         None,
         &mut lease,
     )?;
-    assert!(report.candidates.is_empty());
+    assert_eq!(report.candidates.len(), 0);
     assert_eq!(report.validation_attempt_count, 0);
     assert_eq!(lease.bytes(), 0);
     assert_eq!(budget.snapshot()?.used_bytes, 0);

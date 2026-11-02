@@ -180,7 +180,7 @@ fn copied_origin_identities_consume_work_and_can_be_omitted() -> Result<(), Box<
         .first()
         .ok_or("the raw byte fact should fit the work budget")?;
 
-    assert!(byte_fact.origins.is_empty());
+    assert_eq!(byte_fact.origins.len(), 0);
     assert!(!byte_fact.origin_complete);
     assert!(report.coverage.omitted_origins > 0);
     Ok(())
@@ -209,7 +209,7 @@ fn copied_region_values_consume_work_and_preserve_omission_counts() -> Result<()
         .first()
         .ok_or("the requested comparison region should be retained")?;
 
-    assert!(region.values.is_empty());
+    assert_eq!(region.values.len(), 0);
     assert_eq!(region.coverage.omitted_occurrences, 1);
     assert_eq!(report.coverage.omitted_region_values, 1);
     assert!(!report.coverage.complete);

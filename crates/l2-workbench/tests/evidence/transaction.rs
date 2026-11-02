@@ -120,7 +120,7 @@ fn rollback_removes_dedup_index() -> Result<(), EvidenceError> {
         Err::<(), _>(EvidenceError::InvalidSourceRange)
     });
     assert_eq!(result, Err(EvidenceError::InvalidSourceRange));
-    assert!(case.blobs().is_empty());
+    assert_eq!(case.blobs().len(), 0);
 
     assert_eq!(case.add_blob(bytes)?, expected_id);
     case.add_bytes_node("retry", bytes, Vec::new(), json!({}))?;
@@ -138,7 +138,7 @@ fn nested_transactions_follow_results() -> Result<(), EvidenceError> {
         Err::<(), _>(EvidenceError::InvalidSourceRange)
     });
     assert_eq!(result, Err(EvidenceError::InvalidSourceRange));
-    assert!(case.limitations().is_empty());
+    assert_eq!(case.limitations().len(), 0);
     assert!(case.collection_complete());
 
     case.transaction(|case| {

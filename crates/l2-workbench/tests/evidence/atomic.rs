@@ -37,8 +37,8 @@ fn byte_node_not_orphan_blob() {
         )
         .is_err()
     );
-    assert!(case.blobs().is_empty());
-    assert!(case.nodes().is_empty());
+    assert_eq!(case.blobs().len(), 0);
+    assert_eq!(case.nodes().len(), 0);
 }
 
 #[test]
@@ -61,8 +61,8 @@ fn byte_node_ranges_adding_blob() -> Result<(), Box<dyn Error>> {
         )
         .is_err()
     );
-    assert!(case.blobs().is_empty());
-    assert!(case.nodes().is_empty());
+    assert_eq!(case.blobs().len(), 0);
+    assert_eq!(case.nodes().len(), 0);
     Ok(())
 }
 
@@ -84,7 +84,7 @@ fn node_range_without_adding() -> Result<(), Box<dyn Error>> {
         case.add_node("observation", None, ranges, json!({}))
             .is_err()
     );
-    assert!(case.nodes().is_empty());
+    assert_eq!(case.nodes().len(), 0);
     Ok(())
 }
 

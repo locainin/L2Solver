@@ -412,7 +412,7 @@ fn printable_budget_escaping_large_identifiers() -> Result<(), Box<dyn Error>> {
         .discovery
         .as_ref()
         .ok_or("missing limited discovery summary")?;
-    assert!(summary.printable_runs.is_empty());
+    assert_eq!(summary.printable_runs.len(), 0);
     assert_eq!(summary.printable_runs_omitted, 1);
     assert!(!limited.printable_runs_complete);
     Ok(())

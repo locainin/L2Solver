@@ -85,7 +85,7 @@ fn unsupported_usn_without_file_events() -> Result<(), Box<dyn Error>> {
     let report = parse_usn_records(&record)?;
 
     assert!(!report.complete);
-    assert!(report.records.is_empty());
+    assert_eq!(report.records.len(), 0);
     assert_eq!(report.unsupported.len(), 1);
     assert_eq!(
         report.unsupported.first().map(|item| item.major_version),
@@ -172,7 +172,7 @@ fn mft_visitor_ranges_summary_counts() -> Result<(), Box<dyn Error>> {
     assert_eq!(report.source_sha256, format!("sha256:{}", sha256(&bytes)));
     assert_eq!(report.records_seen, 2);
     assert_eq!(report.streamed_records, 2);
-    assert!(report.records.is_empty());
+    assert_eq!(report.records.len(), 0);
     assert_eq!(streamed.len(), 2);
     assert_eq!(
         streamed.get(1).map(|record| record.source_range.offset),
@@ -433,7 +433,7 @@ fn strace_correlate_io_captured_packets() -> Result<(), Box<dyn Error>> {
         .ok_or("controlled write event missing")?;
     assert!(event.bytes_complete);
     assert_eq!(event.direction, IoDirection::OutOfProcess);
-    assert!(!event.frames.is_empty());
+    assert_ne!(event.frames.len(), 0);
 
     let capture_status = capture.0.wait()?;
     assert!(capture_status.success());
@@ -446,7 +446,7 @@ fn strace_correlate_io_captured_packets() -> Result<(), Box<dyn Error>> {
         .ok_or("trace correlation missing")?;
     assert_eq!(correlation.status, TraceMatchStatus::ExactUniqueMatch);
     assert_eq!(correlation.candidate_count, 1);
-    assert!(!correlation.captured_ranges.is_empty());
+    assert_ne!(correlation.captured_ranges.len(), 0);
     Ok(())
 }
 
@@ -578,7 +578,7 @@ fn trace_packet_repeated_bytes_ambiguous() -> Result<(), Box<dyn Error>> {
 
     assert_eq!(result.status, TraceMatchStatus::Ambiguous);
     assert_eq!(result.candidate_count, 2);
-    assert!(result.captured_ranges.is_empty());
+    assert_eq!(result.captured_ranges.len(), 0);
     Ok(())
 }
 

@@ -98,7 +98,7 @@ fn sequence_gaps_without_inventing_frames() -> Result<(), Box<dyn Error>> {
     parser.finalize()?;
     let report = parser.into_report()?;
 
-    assert!(report.messages.is_empty());
+    assert_eq!(report.messages.len(), 0);
     assert!(report.transitions.iter().any(|transition| {
         transition.state == StreamTransitionState::SequenceGap
             && !transition.sequence_ambiguous

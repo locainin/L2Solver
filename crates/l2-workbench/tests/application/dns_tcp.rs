@@ -42,7 +42,7 @@ fn length_prefixed_dns_ranges() -> Result<(), &'static str> {
     assert_eq!(slice(&bytes, frame.message_range)?, message);
     assert_eq!(frame.message.as_ref().map(|value| value.id), Some(0x1234));
     assert!(frame.error.is_none());
-    assert!(report.unparsed.is_empty());
+    assert_eq!(report.unparsed.len(), 0);
     Ok(())
 }
 
@@ -210,7 +210,7 @@ fn zero_length_not_frame_entries() -> Result<(), &'static str> {
     let report = decode_dns_tcp(&bytes, COMPLETE);
 
     assert_eq!(report.status, ParseStatus::Unsupported);
-    assert!(report.findings.is_empty());
+    assert_eq!(report.findings.len(), 0);
     assert_eq!(
         report.unparsed,
         [ByteRange {
@@ -218,7 +218,7 @@ fn zero_length_not_frame_entries() -> Result<(), &'static str> {
             length: zero_prefix_bytes,
         }]
     );
-    assert!(report.budget_omissions.is_empty());
+    assert_eq!(report.budget_omissions.len(), 0);
     Ok(())
 }
 
@@ -245,7 +245,7 @@ fn zero_length_dns_frame_decoded() -> Result<(), &'static str> {
             .first()
             .is_some_and(|frame| frame.message.is_some())
     );
-    assert!(report.budget_omissions.is_empty());
+    assert_eq!(report.budget_omissions.len(), 0);
     Ok(())
 }
 
@@ -269,7 +269,7 @@ fn impossible_dns_not_entry_budget() -> Result<(), &'static str> {
         frame.error.map(|error| error.kind),
         Some(DnsErrorKind::Incomplete)
     );
-    assert!(report.budget_omissions.is_empty());
+    assert_eq!(report.budget_omissions.len(), 0);
     Ok(())
 }
 
@@ -292,6 +292,6 @@ fn oversized_dns_not_message_budget() -> Result<(), &'static str> {
         frame.error.map(|error| error.kind),
         Some(DnsErrorKind::Incomplete)
     );
-    assert!(report.budget_omissions.is_empty());
+    assert_eq!(report.budget_omissions.len(), 0);
     Ok(())
 }

@@ -67,7 +67,7 @@ fn cooked_tcp_preserves_offsets_and_capture_local_scopes() -> Result<(), Box<dyn
                     && session.scope.cooked_ifindex == ifindex
             })
             .ok_or("missing scoped cooked session")?;
-        assert!(session.scope.vlan_ids.is_empty());
+        assert_eq!(session.scope.vlan_ids.len(), 0);
         assert_eq!(session.scope.vlan_aux, None);
         let stream = session
             .directions

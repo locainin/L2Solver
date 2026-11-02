@@ -89,7 +89,7 @@ fn embedded_magic_rejected() -> Result<(), Box<dyn Error>> {
     .concat();
     let report = artifact::discover_embedded_objects(&blob, discovery_limits(blob.len()))?;
 
-    assert!(!report.candidates.is_empty());
+    assert_ne!(report.candidates.len(), 0);
     assert!(
         report
             .candidates

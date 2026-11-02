@@ -125,7 +125,7 @@ fn absolute_stage_restart_preserves_complete_report_order_and_work() -> TestResu
     let resumed_job = Job::new("restarted absolute search").work_scope(SCOPE)?;
     let (resumed, calls, _lease) =
         sliced_after_absolute_restart(&samples, &plan, options, &resumed_job)?;
-    assert!(!baseline.evaluations.is_empty());
+    assert_ne!(baseline.evaluations.len(), 0);
     assert_eq!(resumed, baseline);
     assert_eq!(calls, baseline_calls);
     assert_eq!(resumed_job.work_snapshot()?, baseline_job.work_snapshot()?);

@@ -67,7 +67,7 @@ fn case_applies_blob_policy_and_shared_memory_pressure_together() -> TestResult 
         case.add_blob(b"one"),
         Err(EvidenceError::Memory(MemoryError::Limit { .. }))
     ));
-    assert!(case.blobs().is_empty());
+    assert_eq!(case.blobs().len(), 0);
     Ok(())
 }
 

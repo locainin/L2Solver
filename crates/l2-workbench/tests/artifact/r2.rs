@@ -29,7 +29,7 @@ fn r2_json_source_function_bytes() -> Result<(), Box<dyn Error>> {
     assert_eq!(receipt.tool.name, "radare2");
     assert_eq!(receipt.tool.version, "6.2.2");
     assert!(receipt.complete);
-    assert!(receipt.rejected_functions.is_empty());
+    assert_eq!(receipt.rejected_functions.len(), 0);
     let function = receipt
         .functions
         .first()

@@ -374,7 +374,7 @@ fn signatures_declared_offsets_complete_patterns() -> Result<(), Box<dyn Error>>
     );
 
     let truncated = scan_file_signatures(b"\x89PNG\r\n\x1a");
-    assert!(truncated.matches.is_empty());
+    assert_eq!(truncated.matches.len(), 0);
 
     let mut misplaced_tar = vec![0_u8; 300];
     misplaced_tar

@@ -227,7 +227,7 @@ fn candidate_budget_without_exhaustive_search() -> Result<(), Box<dyn Error>> {
     let report = search(b"input", &bounded)?;
     assert_eq!(report.candidates.len(), 2);
     assert!(!report.search_exhaustive_within_plan);
-    assert!(!report.limits.is_empty());
+    assert_ne!(report.limits.len(), 0);
     let cycles = search(
         b"abba",
         &plan(vec![Family::Reverse], vec![Constraint::Length { bytes: 4 }]),

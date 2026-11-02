@@ -15,8 +15,8 @@ fn invalid_controls_reporting_line_budget() {
         input.extend(std::iter::repeat_n(b'A', MAX_LINE_BYTES));
         let report = decode_http(&input, COMPLETE);
         assert_eq!(report.status, ParseStatus::Unsupported);
-        assert!(report.budget_omissions.is_empty());
-        assert!(report.findings.is_empty());
+        assert_eq!(report.budget_omissions.len(), 0);
+        assert_eq!(report.findings.len(), 0);
         assert_eq!(report.unparsed, [ByteRange::new(0, input.len())]);
     }
 }
@@ -28,7 +28,7 @@ fn unfinished_delimiter_at_exact_limit() {
     input.push(b'\r');
     let report = decode_http(&input, COMPLETE);
     assert_eq!(report.status, ParseStatus::Incomplete);
-    assert!(report.budget_omissions.is_empty());
+    assert_eq!(report.budget_omissions.len(), 0);
 }
 
 #[test]
@@ -38,7 +38,7 @@ fn interior_cr_over_line_limit() {
     input.extend_from_slice(b"\rZ");
     let report = decode_http(&input, COMPLETE);
     assert_eq!(report.status, ParseStatus::Unsupported);
-    assert!(report.budget_omissions.is_empty());
+    assert_eq!(report.budget_omissions.len(), 0);
 }
 
 #[test]
@@ -330,7 +330,7 @@ fn successful_connect_without_http_parsing() -> Result<(), &'static str> {
         slice(bytes, message.range)?,
         b"HTTP/1.1 200 Connection Established\r\n\r\n"
     );
-    assert!(report.unparsed.is_empty());
+    assert_eq!(report.unparsed.len(), 0);
     Ok(())
 }
 
@@ -376,7 +376,7 @@ fn bodyless_status_without_next_response() -> Result<(), &'static str> {
         assert_eq!(first.framing, HttpFraming::NoBody);
         assert!(matches!(first.body, HttpBody::Empty));
         assert_eq!(second.status, ParseStatus::Complete);
-        assert!(report.unparsed.is_empty());
+        assert_eq!(report.unparsed.len(), 0);
     }
     Ok(())
 }
@@ -408,7 +408,7 @@ fn head_not_losing_next_response() -> Result<(), &'static str> {
         assert_eq!(first_message.status, ParseStatus::Unsupported);
         assert_eq!(first_message.framing, HttpFraming::NoBody);
         assert_eq!(next_message.status, ParseStatus::Complete);
-        assert!(report.unparsed.is_empty());
+        assert_eq!(report.unparsed.len(), 0);
     }
     Ok(())
 }
@@ -593,7 +593,7 @@ fn line_limit_boundary_overlong_input() {
     overlong_lf.extend_from_slice(b"\n\n");
     let overlong_report = decode_http(&overlong_lf, COMPLETE);
     assert_eq!(overlong_report.status, ParseStatus::Unsupported);
-    assert!(overlong_report.findings.is_empty());
+    assert_eq!(overlong_report.findings.len(), 0);
     assert_eq!(
         overlong_report.unparsed,
         [ByteRange::new(0, overlong_lf.len())]
@@ -602,7 +602,7 @@ fn line_limit_boundary_overlong_input() {
     let unterminated = request_start_line(MAX_LINE_BYTES);
     let partial_report = decode_http(&unterminated, OPEN_END);
     assert_eq!(partial_report.status, ParseStatus::Incomplete);
-    assert!(partial_report.findings.is_empty());
+    assert_eq!(partial_report.findings.len(), 0);
     assert_eq!(
         partial_report.unparsed,
         [ByteRange::new(0, unterminated.len())]
@@ -615,7 +615,7 @@ fn whitespace_header_without_consuming_input() {
     let report = decode_http(bytes, COMPLETE);
 
     assert_eq!(report.status, ParseStatus::Unsupported);
-    assert!(report.findings.is_empty());
+    assert_eq!(report.findings.len(), 0);
     assert_eq!(report.unparsed, [ByteRange::new(0, bytes.len())]);
 }
 
@@ -625,7 +625,7 @@ fn malformed_reason_not_complete_http() -> Result<(), &'static str> {
     let reason_report =
         decode_http_with_methods(invalid_reason, COMPLETE, &[Some(HttpRequestMethod::Other)]);
     assert_eq!(reason_report.status, ParseStatus::Unsupported);
-    assert!(reason_report.findings.is_empty());
+    assert_eq!(reason_report.findings.len(), 0);
     assert_eq!(
         reason_report.unparsed,
         [ByteRange {
@@ -681,7 +681,7 @@ fn response_status_http_range_rejected() {
         );
 
         assert_eq!(report.status, ParseStatus::Unsupported);
-        assert!(report.findings.is_empty());
+        assert_eq!(report.findings.len(), 0);
         assert_eq!(report.unparsed, [ByteRange::new(0, bytes.len())]);
     }
 }
@@ -710,7 +710,7 @@ fn response_status_optional_reason_phrase() {
     for status_line in ["HTTP/1.1 200\r\n\r\n", "HTTP/1.1 200x\r\n\r\n"] {
         let report = decode_http(status_line.as_bytes(), COMPLETE);
         assert_eq!(report.status, ParseStatus::Unsupported);
-        assert!(report.findings.is_empty());
+        assert_eq!(report.findings.len(), 0);
         assert_eq!(report.unparsed, [ByteRange::new(0, status_line.len())]);
     }
 
@@ -870,7 +870,7 @@ fn mixed_header_without_consuming_tail() {
         let report = decode_http(bytes, COMPLETE);
 
         assert_eq!(report.status, ParseStatus::Unsupported);
-        assert!(report.findings.is_empty());
+        assert_eq!(report.findings.len(), 0);
         assert_eq!(report.unparsed, [ByteRange::new(0, bytes.len())]);
     }
 }

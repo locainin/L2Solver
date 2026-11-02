@@ -22,9 +22,9 @@ fn family_discovery_keeps_region_facts_without_unrelated_length_analysis() -> Te
             .iter()
             .any(|selector| selector.families.len() == 2)
     );
-    assert!(!report.observations.byte_observations.is_empty());
-    assert!(report.observations.integer_interpretations.is_empty());
-    assert!(report.observations.partial_constraints.is_empty());
+    assert_ne!(report.observations.byte_observations.len(), 0);
+    assert_eq!(report.observations.integer_interpretations.len(), 0);
+    assert_eq!(report.observations.partial_constraints.len(), 0);
     Ok(())
 }
 
@@ -112,7 +112,7 @@ fn families_use_repeated_training_values_and_do_not_learn_from_holdout() -> Test
     assert_eq!(family_a.heldout_samples, [5]);
     assert_eq!(family_b.value, b"B");
     assert_eq!(family_b.training_samples, [3, 4]);
-    assert!(family_b.heldout_samples.is_empty());
+    assert_eq!(family_b.heldout_samples.len(), 0);
     assert!(
         selector
             .unassigned
@@ -133,7 +133,7 @@ fn one_off_training_values_are_not_retained_as_family_types() -> TestResult {
     ];
     let report = discover_message_families(&samples, &[1, 2, 3], limits())?;
 
-    assert!(report.selectors.is_empty());
+    assert_eq!(report.selectors.len(), 0);
     assert_eq!(report.training_samples, 3);
     assert_eq!(report.heldout_samples, 0);
     let mut observed_samples = report

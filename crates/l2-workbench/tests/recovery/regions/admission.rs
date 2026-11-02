@@ -26,7 +26,7 @@ fn region_scan_without_candidates_requires_no_heap_reservation() -> Result<(), B
         proposals(),
         &mut retained,
     )?;
-    assert!(report.regions.is_empty());
+    assert_eq!(report.regions.len(), 0);
     assert_eq!(retained.bytes(), 0);
     drop(report);
     drop(retained);

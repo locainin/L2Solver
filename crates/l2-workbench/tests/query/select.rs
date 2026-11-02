@@ -82,7 +82,7 @@ fn status_kind_without_other_packets() -> Result<(), Box<dyn Error>> {
         "status=hypothesis",
     ])?;
 
-    assert!(select(&case, &selector).is_empty());
+    assert_eq!(select(&case, &selector).len(), 0);
 
     let selector = Selector::parse(&[
         "src=192.0.2.0/24",
@@ -142,7 +142,7 @@ fn non_ethernet_types_not_ethernet() -> Result<(), Box<dyn Error>> {
 
     let matches = select(&case, &selector);
 
-    assert!(matches.is_empty());
+    assert_eq!(matches.len(), 0);
     Ok(())
 }
 
@@ -170,7 +170,7 @@ fn vlan_filters_tags_auxiliary_metadata() -> Result<(), Box<dyn Error>> {
     let wire_tag = Selector::parse(&["vlan=5"])?;
     let auxiliary_tag = Selector::parse(&["vlan=7"])?;
 
-    assert!(select(&case, &forged_scope).is_empty());
+    assert_eq!(select(&case, &forged_scope).len(), 0);
     let wire_match = select(&case, &wire_tag);
     assert_eq!(wire_match.len(), 1);
     let wire_match = wire_match.first().ok_or("wire VLAN match missing")?;
@@ -325,7 +325,10 @@ fn exact_ip_retained_packet_facts() -> Result<(), Box<dyn Error>> {
         [198, 51, 100, 1],
         8,
     ))])?;
-    assert!(select(&untimed, &Selector::parse(&["time=0..2147483647"])?).is_empty());
+    assert_eq!(
+        select(&untimed, &Selector::parse(&["time=0..2147483647"])?).len(),
+        0
+    );
     Ok(())
 }
 
@@ -340,7 +343,7 @@ fn fragmented_icmp_not_message_types() -> Result<(), Box<dyn std::error::Error>>
 
     let selected = select(&case, &Selector::parse(&["field.icmp.type=8"])?);
 
-    assert!(selected.is_empty());
+    assert_eq!(selected.len(), 0);
     Ok(())
 }
 

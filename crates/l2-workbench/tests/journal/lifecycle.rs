@@ -326,7 +326,7 @@ fn evidence_hash_bytes_reach_writer() -> Result<(), Box<dyn Error>> {
     let journal = Journal::open_readonly(directory.path(), JournalOptions::default())?;
     let mut output = Cursor::new(Vec::new());
     assert!(journal.write_evidence(&evidence_hash, &mut output).is_err());
-    assert!(output.into_inner().is_empty());
+    assert_eq!(output.into_inner().len(), 0);
     Ok(())
 }
 
@@ -748,7 +748,7 @@ fn tshark_import_exact_source_raw() -> Result<(), Box<dyn Error>> {
     let first_event = events.first().ok_or("missing first TShark event")?;
     assert_eq!(first_event.kind, "tshark_frame");
     assert_eq!(first_event.source, format!("sha256:{capture_hash}"));
-    assert!(first_event.ranges.is_empty());
+    assert_eq!(first_event.ranges.len(), 0);
     assert_eq!(
         first_event
             .fields
