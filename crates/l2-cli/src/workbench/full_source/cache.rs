@@ -39,7 +39,7 @@ const CACHE_INVALID_FALLBACK_MESSAGE: &str =
 const CACHE_QUOTA_FALLBACK_MESSAGE: &str =
     "Cache quota reached; continuing with the available capture index";
 
-pub const NATIVE_CASE_VERSION: u32 = 3;
+pub const NATIVE_CASE_VERSION: u32 = 4;
 
 type Result<T> = std::result::Result<T, Box<dyn Error>>;
 
