@@ -245,7 +245,7 @@ fn smb2_file_basic_set() -> Result<Vec<u8>, Box<dyn Error>> {
     let buffer = smb
         .get_mut(96..128)
         .ok_or("timestamp fixture is too short")?;
-    for (target, timestamp) in buffer.chunks_exact_mut(8).zip(timestamps) {
+    for (target, timestamp) in buffer.as_chunks_mut::<8>().0.iter_mut().zip(timestamps) {
         target.copy_from_slice(&timestamp.to_le_bytes());
     }
     let mut frame = vec![0, 0, 0, u8::try_from(smb.len())?];
