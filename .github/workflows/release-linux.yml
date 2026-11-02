@@ -77,6 +77,18 @@ jobs:
           printf 'XDG_RUNTIME_DIR=%s\nDBUS_SESSION_BUS_ADDRESS=unix:path=%s/bus\n' \
             "$test_runtime" "$test_runtime" >> "$GITHUB_ENV"
 
+      - name: Qualify delegated-scope Python cases
+        shell: bash
+        run: |
+          for variant in explicit default; do
+            systemd-run --user --scope --quiet -p Delegate=yes \
+              /usr/bin/python3 -m pytest -q \
+              "tests/benchmarks/test_cgroup_enforcement.py::test_owned_scope_records_resolved_working_directory[$variant]"
+          done
+          systemd-run --user --scope --quiet -p Delegate=yes -p CPUQuota=100% \
+            env L2_TEST_DELEGATED_SCOPE=1 /usr/bin/python3 -m pytest -q \
+            tests/benchmarks/test_refine_cgroup_integration.py::RefineCgroupIntegrationTests::test_real_runner_samples_live_unlinked_spool_and_process
+
       - name: Check formatting
         run: cargo fmt --all -- --check
 
@@ -87,6 +99,29 @@ jobs:
 
       - name: Install pinned Nextest
         run: cargo install cargo-nextest --locked --version 0.9.138
+
+      - name: Build Linux release candidate
+        run: >-
+          cargo build --locked --release --package l2-cli --package l2-active-cli --package l2-active-linux
+          --bin l2solver --bin l2solver-active --bin l2solver-active-helper
+          --target x86_64-unknown-linux-gnu
+
+      - name: Run Python benchmark regressions
+        run: >-
+          /usr/bin/python3 -m pytest -q tests/benchmarks tests/scripts tests/crates
+          -p subtests
+
+      - name: Check generated completion syntax
+        shell: bash
+        run: |
+          for shell in bash zsh fish; do
+            completion=$(target/x86_64-unknown-linux-gnu/release/l2solver completions "$shell")
+            if [[ -z "$completion" ]]; then
+              printf 'empty %s completion script\n' "$shell" >&2
+              exit 1
+            fi
+            printf '%s\n' "$completion" | "$shell" -n
+          done
 
       - name: Run workspace tests with Nextest
         run: >-
@@ -103,41 +138,6 @@ jobs:
         env:
           RUSTDOCFLAGS: -D warnings
         run: cargo doc --workspace --all-features --no-deps --locked
-
-      - name: Build Linux release candidate
-        run: >-
-          cargo build --locked --release --package l2-cli --package l2-active-cli --package l2-active-linux
-          --bin l2solver --bin l2solver-active --bin l2solver-active-helper
-          --target x86_64-unknown-linux-gnu
-
-      - name: Run Python benchmark regressions
-        run: >-
-          /usr/bin/python3 -m pytest -q tests/benchmarks tests/scripts tests/crates
-          -p subtests
-
-      - name: Qualify delegated-scope Python cases
-        shell: bash
-        run: |
-          for variant in explicit default; do
-            systemd-run --user --scope --quiet -p Delegate=yes \
-              /usr/bin/python3 -m pytest -q \
-              "tests/benchmarks/test_cgroup_enforcement.py::test_owned_scope_records_resolved_working_directory[$variant]"
-          done
-          systemd-run --user --scope --quiet -p Delegate=yes -p CPUQuota=100% \
-            env L2_TEST_DELEGATED_SCOPE=1 /usr/bin/python3 -m pytest -q \
-            tests/benchmarks/test_refine_cgroup_integration.py::RefineCgroupIntegrationTests::test_real_runner_samples_live_unlinked_spool_and_process
-
-      - name: Check generated completion syntax
-        shell: bash
-        run: |
-          for shell in bash zsh fish; do
-            completion=$(target/x86_64-unknown-linux-gnu/release/l2solver completions "$shell")
-            if [[ -z "$completion" ]]; then
-              printf 'empty %s completion script\n' "$shell" >&2
-              exit 1
-            fi
-            printf '%s\n' "$completion" | "$shell" -n
-          done
 
       - name: Install pinned cargo-deny
         run: cargo install cargo-deny --locked --version 0.19.0
