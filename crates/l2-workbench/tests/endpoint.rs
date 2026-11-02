@@ -13,6 +13,9 @@ use l2_workbench::{
 };
 #[path = "endpoint/event_xml.rs"]
 mod event_xml;
+#[cfg(target_os = "linux")]
+#[path = "endpoint/isolation.rs"]
+mod isolation;
 #[path = "endpoint/support.rs"]
 mod support;
 
@@ -397,6 +400,11 @@ fn strace_import_unusable_exact_correlation() -> Result<(), Box<dyn Error>> {
 
 #[test]
 fn strace_correlate_io_captured_packets() -> Result<(), Box<dyn Error>> {
+    // The parent only launches the test after a private scope has been proved
+    #[cfg(target_os = "linux")]
+    if !isolation::run_in_private_namespace()? {
+        return Ok(());
+    }
     let directory = tempfile::tempdir()?;
     let pcap_path = directory.path().join("owned-loopback.pcap");
     let listener = TcpListener::bind(("127.0.0.1", 0))?;
