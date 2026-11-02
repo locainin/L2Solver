@@ -213,6 +213,8 @@ def install(payload, prefix, active, completion_dirs=None):
     generation_path = None
     published = False
     switch_attempted = False
+    new_capability_attempted = False
+    reopen_started = False
     changed_capabilities = []
     old_capabilities = {}
     try:
@@ -232,7 +234,6 @@ def install(payload, prefix, active, completion_dirs=None):
             shutil.rmtree(staging)
             selected = base / identity
         else:
-            staging.chmod(0o755)
             base.mkdir(mode=0o755, exist_ok=True)
             generation_path = base / identity
             staging.rename(generation_path)
@@ -262,9 +263,15 @@ def install(payload, prefix, active, completion_dirs=None):
             # Setting a capability can succeed before its verification fails
             changed_capabilities.append((helper, old_capabilities[helper]))
         if active:
+            new_capability_attempted = generation_path is not None
             enable_capability(helper)
-        else:
+        elif existing:
+            # A copied file has no capability, but a retained generation may
             disable_capability(helper)
+        if stat.S_IMODE(selected.stat().st_mode) == 0o700:
+            # Open a new or quarantined generation only after its policy succeeds
+            reopen_started = True
+            selected.chmod(0o755)
         if old_current != identity:
             (base / ".current-new").symlink_to(identity)
             switch_attempted = True
@@ -290,19 +297,49 @@ def install(payload, prefix, active, completion_dirs=None):
                 raise ValueError(f"{error}; publication outcome unknown: unexpected current generation") from error
         if not published:
             rollback_errors = []
-            if generation_path is not None:
+            retain_generation = False
+            if generation_path is not None and new_capability_attempted:
                 try:
                     disable_capability(generation_path / "l2solver-active-helper")
                 except OSError as failure:
-                    rollback_errors.append(f"could not revoke unpublished helper: {failure}")
+                    retain_generation = True
+                    rollback_errors.append(f"could not revoke unpublished helper {helper}: {failure}")
+                    try:
+                        if stat.S_IMODE(generation_path.stat().st_mode) != 0o700:
+                            generation_path.chmod(0o700)
+                    except OSError as quarantine_failure:
+                        rollback_errors.append(f"could not restrict {generation_path}: {quarantine_failure}")
+            restricted = True
+            if reopen_started and existing:
+                try:
+                    if stat.S_IMODE(selected.stat().st_mode) != 0o700:
+                        selected.chmod(0o700)
+                except OSError as failure:
+                    restricted = False
+                    rollback_errors.append(f"could not restrict {selected}: {failure}")
             # Restore the exact former xattrs if publication did not take place
             for helper, saved in reversed(changed_capabilities):
                 try:
-                    restore_capability(helper, saved)
+                    if not restricted and helper.parent == selected:
+                        # Avoid restoring authority to a generation that stayed accessible
+                        disable_capability(helper)
+                        rollback_errors.append(f"former capability not restored for {helper}")
+                    else:
+                        restore_capability(helper, saved)
                 except OSError as failure:
                     rollback_errors.append(f"could not restore {helper}: {failure}")
-            (base / ".current-new").unlink(missing_ok=True)
-            (base / ".manifest-new").unlink(missing_ok=True)
+            for temporary in (base / ".current-new", base / ".manifest-new"):
+                try:
+                    temporary.unlink(missing_ok=True)
+                except OSError as failure:
+                    if not retain_generation:
+                        raise
+                    rollback_errors.append(f"could not remove {temporary}: {failure}")
+            if retain_generation:
+                raise ValueError(
+                    f"{error}; rollback incomplete: {'; '.join(rollback_errors)}; "
+                    f"generation retained at {generation_path}; administrator inspection required"
+                ) from error
             if previous:
                 write_manifest(base, previous)
             else:

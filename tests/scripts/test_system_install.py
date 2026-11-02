@@ -196,6 +196,170 @@ def test_capability_failure_does_not_publish(installer, payload, tmp_path, monke
     installer.uninstall(prefix)
 
 
+def force_unrevoked_generation(installer, payload, prefix, monkeypatch, descriptors=None):
+    retained = []
+    revoke = installer.disable_capability
+
+    def fail_after_enabling(helper):
+        # Verification may fail after the helper acquired file authority
+        retained.append(helper)
+        if descriptors is not None:
+            descriptors.append(os.open(helper, os.O_RDONLY))
+        raise ValueError("capability verification failed")
+
+    def fail_revoke(helper):
+        if retained and helper == retained[0]:
+            raise PermissionError("capability revocation denied")
+        revoke(helper)
+
+    with monkeypatch.context() as fault:
+        fault.setattr(installer, "enable_capability", fail_after_enabling)
+        fault.setattr(installer, "disable_capability", fail_revoke)
+        with pytest.raises(ValueError, match="rollback incomplete.*revocation denied") as raised:
+            installer.install(payload, prefix, True)
+    return retained[0], str(raised.value)
+
+
+@pytest.mark.parametrize("first_install", [True, False])
+def test_failed_capability_revocation_keeps_owned_helper_and_manifest(
+    installer, payload, tmp_path, monkeypatch, first_install,
+):
+    prefix = tmp_path / "prefix"
+    old = None
+    if not first_install:
+        installer.install(payload, prefix, False)
+        old = (prefix / "bin/l2solver").resolve()
+        (payload / "l2solver").write_text("new executable")
+    descriptors = []
+    try:
+        helper, diagnostic = force_unrevoked_generation(installer, payload, prefix, monkeypatch, descriptors)
+        manifest_path = prefix / "share/l2solver/manifest.json"
+        manifest = json.loads(manifest_path.read_text())
+        assert str(helper) in diagnostic
+        assert helper.is_file() and os.fstat(descriptors[0]).st_nlink == 1
+        assert helper.parent.stat().st_mode & 0o777 == 0o700
+        assert helper.parent.name in manifest["generations"]
+        assert installer.digest(helper) == manifest["generations"][helper.parent.name][helper.name]
+        if first_install:
+            assert not os.path.lexists(prefix / "share/l2solver/current")
+            assert all(os.path.lexists(prefix / path) for path in manifest["links"])
+        else:
+            assert (prefix / "bin/l2solver").resolve() == old
+            assert installer.read_manifest(prefix) == manifest
+            installer.uninstall(prefix)
+            assert not helper.exists()
+    finally:
+        for descriptor in descriptors:
+            os.close(descriptor)
+
+
+@pytest.mark.parametrize("switch_fails", [True, False])
+def test_retry_reopens_quarantined_generation_only_after_capability_policy_succeeds(
+    installer, payload, tmp_path, monkeypatch, switch_fails,
+):
+    prefix = tmp_path / "prefix"
+    installer.install(payload, prefix, False)
+    old = (prefix / "bin/l2solver").resolve()
+    (payload / "l2solver").write_text("new executable")
+    helper, _ = force_unrevoked_generation(installer, payload, prefix, monkeypatch)
+    assert helper.parent.stat().st_mode & 0o777 == 0o700
+
+    def enable_after_retry(path):
+        assert path == helper
+        assert path.parent.stat().st_mode & 0o777 == 0o700
+
+    replace = installer.os.replace
+    with monkeypatch.context() as retry:
+        retry.setattr(installer, "enable_capability", enable_after_retry)
+        if switch_fails:
+            def fail_switch(source, destination):
+                if Path(destination).name == "current":
+                    raise PermissionError("switch denied")
+                return replace(source, destination)
+
+            retry.setattr(installer.os, "replace", fail_switch)
+            with pytest.raises(PermissionError, match="switch denied"):
+                installer.install(payload, prefix, True)
+        else:
+            installer.install(payload, prefix, True)
+    if switch_fails:
+        assert (prefix / "bin/l2solver").resolve() == old
+        assert helper.parent.stat().st_mode & 0o777 == 0o700
+    else:
+        assert (prefix / "bin/l2solver-active-helper").resolve() == helper
+        assert helper.parent.stat().st_mode & 0o777 == 0o755
+    installer.uninstall(prefix)
+
+
+def test_failed_revoke_after_failed_switch_removes_temporary_pointer(installer, payload, tmp_path, monkeypatch):
+    prefix = tmp_path / "prefix"
+    installer.install(payload, prefix, False)
+    old = (prefix / "bin/l2solver").resolve()
+    (payload / "l2solver").write_text("new executable")
+    selected = []
+    revoke = installer.disable_capability
+    replace = installer.os.replace
+
+    def enable(helper):
+        selected.append(helper)
+
+    def fail_revoke(helper):
+        if selected and helper == selected[0]:
+            raise PermissionError("capability revocation denied")
+        revoke(helper)
+
+    def fail_switch(source, destination):
+        if Path(destination).name == "current":
+            raise PermissionError("switch denied")
+        return replace(source, destination)
+
+    with monkeypatch.context() as fault:
+        fault.setattr(installer, "enable_capability", enable)
+        fault.setattr(installer, "disable_capability", fail_revoke)
+        fault.setattr(installer.os, "replace", fail_switch)
+        with pytest.raises(ValueError, match="switch denied; rollback incomplete.*revocation denied"):
+            installer.install(payload, prefix, True)
+    assert (prefix / "bin/l2solver").resolve() == old
+    assert selected[0].parent.stat().st_mode & 0o777 == 0o700
+    assert not os.path.lexists(prefix / "share/l2solver/.current-new")
+    assert selected[0].parent.name in installer.read_manifest(prefix)["generations"]
+    installer.uninstall(prefix)
+
+
+def test_retry_does_not_restore_capability_if_quarantine_cannot_be_reapplied(installer, payload, tmp_path, monkeypatch):
+    prefix = tmp_path / "prefix"
+    installer.install(payload, prefix, False)
+    old = (prefix / "bin/l2solver").resolve()
+    (payload / "l2solver").write_text("new executable")
+    helper, _ = force_unrevoked_generation(installer, payload, prefix, monkeypatch)
+    capabilities = {helper: b"previous capability"}
+    chmod = Path.chmod
+    replace = installer.os.replace
+
+    def fail_restrict(path, mode, *args, **kwargs):
+        if path == helper.parent and mode == 0o700:
+            raise PermissionError("directory restriction denied")
+        return chmod(path, mode, *args, **kwargs)
+
+    def fail_switch(source, destination):
+        if Path(destination).name == "current":
+            raise PermissionError("switch denied")
+        return replace(source, destination)
+
+    with monkeypatch.context() as retry:
+        retry.setattr(installer, "read_capability", lambda path: capabilities.get(path))
+        retry.setattr(installer, "enable_capability", lambda path: capabilities.__setitem__(path, b"new capability"))
+        retry.setattr(installer, "disable_capability", lambda path: capabilities.pop(path, None))
+        retry.setattr(installer.os, "replace", fail_switch)
+        retry.setattr(Path, "chmod", fail_restrict)
+        with pytest.raises(ValueError, match="could not restrict.*former capability not restored"):
+            installer.install(payload, prefix, True)
+    assert helper not in capabilities
+    assert (prefix / "bin/l2solver").resolve() == old
+    assert helper.is_file() and helper.parent.name in installer.read_manifest(prefix)["generations"]
+    installer.uninstall(prefix)
+
+
 def test_old_helper_revocation_failure_preserves_current_pair(installer, payload, tmp_path, monkeypatch):
     prefix = tmp_path / "prefix"
     installer.install(payload, prefix, False)

@@ -191,6 +191,91 @@ def main():
     publish("--payload", "/stage/payload", "--prefix", prefix, *selection)
     assert (root / "local/bin/l2solver").resolve() == first
     assert not cap(resolved("/local/bin/l2solver-active-helper"))
+    # Fail verification after a real setcap, then deny revocation during rollback
+    capability_failure = root / "stage/fail_capability_cleanup.py"
+    capability_failure.write_text('''\
+import json
+import os
+from pathlib import Path
+import sys
+
+sys.path.insert(0, "/stage")
+import system_install
+
+prefix = Path(sys.argv[1])
+enable = system_install.enable_capability
+disable = system_install.disable_capability
+retained = []
+
+def fail_verification(helper):
+    enable(helper)
+    retained.append(helper)
+    raise ValueError("injected verification failure")
+
+def deny_revoke(helper):
+    if retained and helper == retained[0]:
+        raise PermissionError("injected revocation failure")
+    disable(helper)
+
+system_install.enable_capability = fail_verification
+system_install.disable_capability = deny_revoke
+try:
+    system_install.install(Path("/stage/payload"), prefix, True)
+except ValueError as error:
+    assert "rollback incomplete" in str(error)
+    assert str(retained[0]) in str(error)
+else:
+    raise AssertionError("capability cleanup unexpectedly succeeded")
+
+helper = retained[0]
+assert helper.is_file()
+assert helper.parent.stat().st_mode & 0o777 == 0o700
+assert os.getxattr(helper, "security.capability")
+manifest = json.loads((prefix / "share/l2solver/manifest.json").read_text())
+assert helper.parent.name in manifest["generations"]
+print(json.dumps({"helper": str(helper)}))
+''')
+    first_failure = json.loads(execute(
+        "/usr/bin/python3", "-I", "/stage/fail_capability_cleanup.py", "/revoke-first",
+    ).stdout)
+    failed_first_helper = first_failure["helper"]
+    assert cap(failed_first_helper) == f"{failed_first_helper} cap_net_raw=ep"
+    assert not os.path.lexists(root / "revoke-first/share/l2solver/current")
+    # The incomplete first install remains isolated and needs administrator inspection
+    os.removexattr(root / failed_first_helper.lstrip("/"), "security.capability")
+
+    publish("--payload", "/stage/payload", "--prefix", "/revoke-upgrade", "--enable-active")
+    old_upgrade_helper = resolved("/revoke-upgrade/bin/l2solver-active-helper")
+    (payload / "README.md").write_text("changed upgrade receipt")
+    failed_upgrade = json.loads(execute(
+        "/usr/bin/python3", "-I", "/stage/fail_capability_cleanup.py", "/revoke-upgrade",
+    ).stdout)
+    failed_upgrade_helper = failed_upgrade["helper"]
+    assert cap(failed_upgrade_helper) == f"{failed_upgrade_helper} cap_net_raw=ep"
+    assert resolved("/revoke-upgrade/bin/l2solver-active-helper") == old_upgrade_helper
+    assert cap(old_upgrade_helper) == f"{old_upgrade_helper} cap_net_raw=ep"
+    # A retry reuses the quarantined generation after rechecking its capability
+    publish("--payload", "/stage/payload", "--prefix", "/revoke-upgrade", "--enable-active")
+    assert resolved("/revoke-upgrade/bin/l2solver-active-helper") == failed_upgrade_helper
+    assert (root / failed_upgrade_helper.lstrip("/")).parent.stat().st_mode & 0o777 == 0o755
+    assert not cap(old_upgrade_helper)
+    helper_fd = os.open(root / failed_upgrade_helper.lstrip("/"), os.O_RDONLY)
+    hidden_publisher = publisher.with_name("system_install.hidden")
+    publisher.rename(hidden_publisher)
+    try:
+        execute("/revoke-upgrade/bin/l2solver-uninstall")
+    finally:
+        hidden_publisher.rename(publisher)
+    try:
+        os.getxattr(helper_fd, "security.capability")
+        raise AssertionError("uninstaller left capability on the open helper inode")
+    except OSError as error:
+        assert error.errno == errno.ENODATA
+    finally:
+        os.close(helper_fd)
+    assert not (root / "revoke-upgrade/share/l2solver").exists()
+    (payload / "README.md").write_text("README.md")
+
     (payload / "l2solver").write_text("#!/bin/sh\nprintf 'upgraded fixture\\n'\n")
     publish("--payload", "/stage/payload", "--prefix", prefix, *selection, "--enable-active")
     assert execute("/local/bin/l2solver").stdout == "upgraded fixture\n"
