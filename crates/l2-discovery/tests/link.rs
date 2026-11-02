@@ -85,7 +85,7 @@ fn cooked_fixed_headers_require_every_byte() -> Result<(), &'static str> {
         }
         let frame = decode_network_frame(link_type, &bytes).ok_or("missing empty cooked frame")?;
         assert_eq!(frame.payload_offset(), header_len);
-        assert!(frame.payload().is_empty());
+        assert_eq!(frame.payload(), []);
     }
     Ok(())
 }

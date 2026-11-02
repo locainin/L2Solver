@@ -16,7 +16,7 @@ fn streaming_replay_default_without_retaining() -> Result<(), Box<dyn Error>> {
     let mut replay = ReplayLink::new(reader)?;
     let mut observed = 0;
     while let Some(frame) = replay.recv()? {
-        assert!(frame.bytes().is_empty());
+        assert_eq!(frame.bytes(), []);
         observed += 1;
     }
     assert_eq!(observed, records);

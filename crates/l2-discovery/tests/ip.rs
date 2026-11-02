@@ -60,8 +60,8 @@ fn ordinary_udp_addresses_ports_trailer() -> Result<(), &'static str> {
     assert_eq!(transport.ports, (12345, 443));
     assert_eq!(transport.header, TransportHeader::Udp);
     assert_eq!(transport.payload_offset, packet.declared_len);
-    assert!(transport.payload.is_empty());
-    assert!(transport.trailing_bytes.is_empty());
+    assert_eq!(transport.payload, []);
+    assert_eq!(transport.trailing_bytes, []);
     Ok(())
 }
 
@@ -91,7 +91,7 @@ fn empty_ipv4_within_declared_envelope() -> Result<(), &'static str> {
     let frame = ethernet(0x0800, &bytes);
     let packet = ip_packet(&frame).ok_or("missing header-only IPv4 packet")?;
     assert_eq!(packet.declared_len, 20);
-    assert!(packet.trailing_bytes.is_empty());
+    assert_eq!(packet.trailing_bytes, []);
     assert_eq!(packet.ports(), None);
     assert!(packet.transport.is_none());
     Ok(())
@@ -145,7 +145,7 @@ fn tcp_fields_ip_options() -> Result<(), &'static str> {
     );
     assert_eq!(transport.payload_offset, 48);
     assert_eq!(transport.payload, [0xde, 0xad]);
-    assert!(transport.trailing_bytes.is_empty());
+    assert_eq!(transport.trailing_bytes, []);
     assert_eq!(
         transport.payload_offset + transport.payload.len(),
         packet.declared_len
@@ -289,7 +289,7 @@ fn atomic_ipv6_fragment_excludes_padding() -> Result<(), &'static str> {
     assert_eq!(transport.ports, (12345, 53));
     assert_eq!(transport.payload_offset, 56);
     assert_eq!(transport.payload, [0xde, 0xad]);
-    assert!(transport.trailing_bytes.is_empty());
+    assert_eq!(transport.trailing_bytes, []);
     assert_eq!(
         transport.payload_offset + transport.payload.len() + transport.trailing_bytes.len(),
         packet.declared_len

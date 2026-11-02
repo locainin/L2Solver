@@ -56,7 +56,10 @@ fn zero_sender_never_arp_conflicts() -> Result<(), Box<dyn std::error::Error>> {
         survey.observe(&arp_frame(mac, mac, [0; 4])?)?;
     }
     let report = survey.finish(&Policy::default())?;
-    assert!(report.network_model.address_conflicts.is_empty());
+    assert_eq!(
+        report.network_model.address_conflicts,
+        [] as [l2_audit::AddressConflict; 0]
+    );
     assert!(
         !report
             .exposures

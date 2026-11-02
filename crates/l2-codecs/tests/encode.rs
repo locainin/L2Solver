@@ -280,6 +280,6 @@ fn lldp_encode_error_diagnostic_text() {
     ];
 
     for error in errors {
-        assert!(!error.to_string().is_empty());
+        assert_ne!(error.to_string(), "");
     }
 }

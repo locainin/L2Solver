@@ -71,7 +71,7 @@ fn errors_render_context_io_sources() -> Result<(), Box<dyn std::error::Error>> 
         Error::InvalidHeaderLayout,
     ];
     for error in errors {
-        assert!(!error.to_string().is_empty());
+        assert_ne!(error.to_string(), "");
     }
 
     let error = Error::Io(io::Error::other("source detail"));

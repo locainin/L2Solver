@@ -330,7 +330,7 @@ fn rejects_duplicate_sequences() -> Result<(), Box<dyn Error>> {
 fn replay_guard_explicit_identity_limit() -> Result<(), Box<dyn Error>> {
     let mut guard = ReplayGuard::new();
     for identity in 0..MAX_REPLAY_IDENTITIES {
-        let identity = u16::try_from(identity).map_or(0, |value| value);
+        let identity = u16::try_from(identity).unwrap_or(0);
         assert_eq!(
             guard.accept(&verified(&canary_with_index(identity, 1)?)?),
             Ok(())
@@ -339,7 +339,7 @@ fn replay_guard_explicit_identity_limit() -> Result<(), Box<dyn Error>> {
     assert_eq!(guard.len(), MAX_REPLAY_IDENTITIES);
     assert_eq!(
         guard.accept(&verified(&canary_with_index(
-            u16::try_from(MAX_REPLAY_IDENTITIES).map_or(0, |value| value),
+            u16::try_from(MAX_REPLAY_IDENTITIES).unwrap_or(0),
             1,
         )?)?),
         Err(ReplayError::IdentityLimit {
