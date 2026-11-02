@@ -152,6 +152,39 @@ impl CacheEntry {
 }
 
 impl Lease {
+    /// Return the memory budget configured for this lease, if any
+    #[must_use]
+    pub fn memory_budget(&self) -> Option<&MemoryBudget> {
+        self.cache.configured_memory_budget()
+    }
+
+    /// Charge subsequent operations on this lease to a shared memory budget
+    ///
+    /// The binding is local to this lease and cannot replace an unrelated ledger or
+    /// another worker's scope
+    ///
+    /// # Errors
+    /// Returns an error when the lease already belongs to a different budget or worker
+    pub fn bind_memory_budget(&mut self, budget: &MemoryBudget) -> Result<()> {
+        // Fix an unattached cache's choice before checking for an incompatible ledger
+        if self
+            .cache
+            .memory_budget()
+            .is_some_and(|current| !current.same_ledger(budget))
+            || self
+                .cache
+                .memory_scope
+                .as_ref()
+                .is_some_and(|current| !current.same_owner(budget))
+        {
+            return Err(CacheError::InvalidInput(
+                "cache lease belongs to another memory budget or worker",
+            ));
+        }
+        self.cache.memory_scope = Some(budget.clone());
+        Ok(())
+    }
+
     pub(super) const fn new(
         cache: Cache,
         key: StageKey,

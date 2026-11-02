@@ -74,3 +74,51 @@ fn unrelated_budget_cannot_take_case_memory_ownership() -> Result<(), Box<dyn Er
     assert_eq!(other_budget.snapshot()?.used_bytes, 0);
     Ok(())
 }
+
+#[test]
+fn case_admission_accounts_existing_data_and_rejects_another_ledger() -> Result<(), Box<dyn Error>>
+{
+    let root = MemoryBudget::new(4 * 1024 * 1024);
+    let foreign = MemoryBudget::new(4 * 1024 * 1024);
+    let mut case = Case::new();
+    case.add_bytes_node("original", b"retained bytes", Vec::new(), json!({}))?;
+    let expected = case.to_json()?;
+
+    case.admit_memory_budget(&root)?;
+    let charge = case.charged_memory_bytes().ok_or("Case was not charged")?;
+    assert!(charge > 0);
+    assert_eq!(root.snapshot()?.used_bytes, charge);
+    // A worker on the same ledger may read the native Case without charging it twice
+    let worker = root.try_working_set(1024)?;
+    case.admit_memory_budget(worker.budget())?;
+    assert!(matches!(
+        case.admit_memory_budget(&foreign),
+        Err(l2_workbench::evidence::EvidenceError::Memory(
+            MemoryError::IncompatibleWorkingSet
+        ))
+    ));
+    assert_eq!(case.to_json()?, expected);
+    assert_eq!(foreign.snapshot()?.used_bytes, 0);
+    drop(worker);
+    drop(case);
+    assert_eq!(root.snapshot()?.used_bytes, 0);
+    Ok(())
+}
+
+#[test]
+fn failed_case_admission_keeps_the_original_case_uncharged() -> Result<(), Box<dyn Error>> {
+    let mut case = Case::new();
+    case.add_bytes_node("original", b"retained bytes", Vec::new(), json!({}))?;
+    let original = case.to_json()?;
+    let budget = MemoryBudget::new(1);
+    assert!(matches!(
+        case.admit_memory_budget(&budget),
+        Err(l2_workbench::evidence::EvidenceError::Memory(
+            MemoryError::Limit { .. }
+        ))
+    ));
+    assert_eq!(case.to_json()?, original);
+    assert_eq!(case.charged_memory_bytes(), None);
+    assert_eq!(budget.snapshot()?.used_bytes, 0);
+    Ok(())
+}

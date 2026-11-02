@@ -32,6 +32,7 @@ mod hex;
 mod integer;
 mod serialization;
 
+pub use allocation::btree_node_bytes;
 pub use hashing::{parse_sha256_digest, sha256};
 
 #[cfg(test)]

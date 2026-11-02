@@ -1,6 +1,7 @@
 //! Bind checkpoint state to the immutable prefix of its original evidence Case
 
 use super::{Blob, Case, CaseResourceLimits, Edge, EvidenceError, Node, Source};
+use crate::job::MemoryLease;
 use serde::{Serialize, Serializer, ser::SerializeSeq};
 use sha2::{Digest, Sha256};
 use std::{
@@ -20,6 +21,8 @@ pub struct CasePrefixBinding {
     complete: bool,
     sources: Vec<SourceBinding>,
     graph_digest: [u8; 32],
+    // The source bindings must be dropped before their shared admission
+    memory: Option<MemoryLease>,
 }
 
 #[derive(Debug)]
@@ -67,31 +70,7 @@ impl Case {
     /// # Errors
     /// Returns an error if bounded metadata cannot be allocated or hashed
     pub fn checkpoint_prefix(&self) -> Result<CasePrefixBinding, EvidenceError> {
-        let mut sources = Vec::new();
-        sources.try_reserve_exact(self.sources.len()).map_err(|_| {
-            EvidenceError::AllocationFailed {
-                field: "checkpoint source bindings",
-            }
-        })?;
-        for source in &self.sources {
-            let mut aliases = Vec::new();
-            aliases
-                .try_reserve_exact(source.aliases.len())
-                .map_err(|_| EvidenceError::AllocationFailed {
-                    field: "checkpoint source aliases",
-                })?;
-            aliases.extend(
-                source
-                    .aliases
-                    .iter()
-                    .map(|alias| <[u8; 32]>::from(Sha256::digest(alias.as_bytes()))),
-            );
-            sources.push(SourceBinding {
-                core_digest: source_digest(source)?,
-                aliases,
-                had_blob: source.blob.is_some(),
-            });
-        }
+        let (sources, memory) = checkpoint_source_bindings(self)?;
         let mut binding = CasePrefixBinding {
             nodes: self.nodes.len(),
             blobs: self.blobs.len(),
@@ -100,12 +79,95 @@ impl Case {
             complete: self.collection_complete,
             sources,
             graph_digest: [0; 32],
+            memory,
         };
         binding.graph_digest = binding
             .graph_digest_for(self)?
             .ok_or(EvidenceError::InvalidJson)?;
         Ok(binding)
     }
+}
+
+const fn prefix_overflow() -> EvidenceError {
+    EvidenceError::ArithmeticOverflow {
+        field: "checkpoint prefix memory",
+    }
+}
+
+fn checkpoint_source_bindings(
+    case: &Case,
+) -> Result<(Vec<SourceBinding>, Option<MemoryLease>), EvidenceError> {
+    let source_bytes = case
+        .sources
+        .len()
+        .checked_mul(size_of::<SourceBinding>())
+        .ok_or_else(prefix_overflow)?;
+    let expected = case
+        .sources
+        .iter()
+        .try_fold(source_bytes, |total, source| {
+            total.checked_add(source.aliases.len().checked_mul(size_of::<[u8; 32]>())?)
+        })
+        .ok_or_else(prefix_overflow)?;
+    let mut memory = case
+        .memory
+        .as_ref()
+        .map(|memory| {
+            u64::try_from(expected)
+                .map_err(|_| prefix_overflow())
+                .and_then(|bytes| memory.try_scratch(bytes))
+        })
+        .transpose()?;
+    let mut sources = Vec::new();
+    sources
+        .try_reserve_exact(case.sources.len())
+        .map_err(|_| EvidenceError::AllocationFailed {
+            field: "checkpoint source bindings",
+        })?;
+    for source in &case.sources {
+        sources.push(checkpoint_source_binding(source)?);
+    }
+    let base = sources
+        .capacity()
+        .checked_mul(size_of::<SourceBinding>())
+        .ok_or_else(prefix_overflow)?;
+    let actual = sources
+        .iter()
+        .try_fold(base, |total, source| {
+            total.checked_add(
+                source
+                    .aliases
+                    .capacity()
+                    .checked_mul(size_of::<[u8; 32]>())?,
+            )
+        })
+        .ok_or_else(prefix_overflow)?;
+    if let Some(memory) = &mut memory {
+        memory
+            .try_resize(u64::try_from(actual).map_err(|_| prefix_overflow())?)
+            .map_err(EvidenceError::Memory)?;
+    }
+    Ok((sources, memory))
+}
+
+fn checkpoint_source_binding(source: &Source) -> Result<SourceBinding, EvidenceError> {
+    let mut aliases = Vec::new();
+    aliases
+        .try_reserve_exact(source.aliases.len())
+        .map_err(|_| EvidenceError::AllocationFailed {
+            field: "checkpoint source aliases",
+        })?;
+    aliases.extend(
+        source
+            .aliases
+            .iter()
+            .map(|alias| <[u8; 32]>::from(Sha256::digest(alias.as_bytes()))),
+    );
+    Ok(SourceBinding {
+        core_digest: source_digest(source)?,
+        aliases,
+        had_blob: source.blob.is_some(),
+    })
 }
 
 impl CasePrefixBinding {
@@ -126,6 +188,18 @@ impl CasePrefixBinding {
             {
                 return Ok(false);
             }
+            let bytes = super::memory::map_bytes::<[u8; 32], ()>(source.aliases.len())?;
+            let _scratch = self
+                .memory
+                .as_ref()
+                .map(|memory| {
+                    let bytes =
+                        u64::try_from(bytes).map_err(|_| EvidenceError::ArithmeticOverflow {
+                            field: "checkpoint prefix aliases",
+                        })?;
+                    memory.try_sibling(bytes).map_err(EvidenceError::Memory)
+                })
+                .transpose()?;
             let mut aliases = HashSet::new();
             aliases.try_reserve(source.aliases.len()).map_err(|_| {
                 EvidenceError::AllocationFailed {
