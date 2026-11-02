@@ -10,11 +10,90 @@ import sys
 
 def run(command, *, success=True):
     result = subprocess.run(command, text=True, capture_output=True, check=False)
-    if success and result.returncode != 0:
+    if success is True and result.returncode != 0:
         raise AssertionError(f"command failed: {command!r}\n{result.stdout}\n{result.stderr}")
-    if not success and result.returncode == 0:
+    if success is False and result.returncode == 0:
         raise AssertionError(f"command unexpectedly succeeded: {command!r}")
     return result
+
+
+def real_lifecycle(root, checkout, payload, selection, execute, publish, cap, resolved):
+    def unprivileged(*args, success=True):
+        return run([
+            "chroot", "--userspec=65534:65534", str(root), "/usr/bin/env",
+            "PATH=/local/bin:/usr/bin:/bin", "HOME=/tmp", *args,
+        ], success=success)
+
+    # The mounted views and veth pair are private to this user and network namespace
+    assert set(os.listdir(root / "sys/class/net")) == {"lo"}
+    run(["ip", "link", "add", "l2left", "type", "veth", "peer", "name", "l2right"])
+    for name, address in (("l2left", "198.18.0.1/24"), ("l2right", "198.18.0.2/24")):
+        run(["ip", "address", "add", address, "dev", name])
+        run(["ip", "link", "set", "dev", name, "up"])
+    shutil.copyfile(checkout / "tests/pcaps/lldp.pcap", root / "stage/lldp.pcap")
+    for shell in ("bash", "zsh", "fish"):
+        completion = unprivileged("/stage/payload/l2solver", "completions", shell).stdout
+        (payload / shell).write_text(completion)
+
+    publish("--check", "--prefix", "/local", *selection)
+    publish("--payload", "/stage/payload", "--prefix", "/local", *selection)
+    first = resolved("/local/bin/l2solver")
+    first_helper = resolved("/local/bin/l2solver-active-helper")
+    assert first.rsplit("/", 1)[0] == first_helper.rsplit("/", 1)[0]
+    assert "l2solver " in unprivileged("l2solver", "--version").stdout
+    assert "l2solver-active " in unprivileged("l2solver-active", "--version").stdout
+    assert "LLDP Valid" in unprivileged("l2solver", "inspect", "/stage/lldp.pcap").stdout
+    assert "arp" in unprivileged("l2solver", "active", "--help").stdout
+    for shell, path in (
+        ("bash", "/local/share/custom/bash/l2solver"),
+        ("zsh", "/local/share/custom/zsh/_l2solver"),
+        ("fish", "/local/share/custom/fish/l2solver.fish"),
+    ):
+        assert (root / path.lstrip("/")).read_text() == (payload / shell).read_text()
+        if shutil.which(shell):
+            unprivileged(shell, "-n", path)
+
+    probe = ["arp", "probe", "--interface", "l2left", "--target", "198.18.0.2", "--timeout-ms", "2000"]
+    denied = unprivileged("l2solver-active", *probe, success=False)
+    assert "cap_net_raw" in denied.stderr.lower() or "permitted" in denied.stderr.lower()
+    assert not cap(first_helper)
+
+    # A new receipt and opt-in make a distinct, complete matching generation
+    (payload / "receipt.json").write_text('{"release":"second"}\n')
+    publish("--payload", "/stage/payload", "--prefix", "/local", *selection, "--enable-active")
+    second = resolved("/local/bin/l2solver")
+    second_helper = resolved("/local/bin/l2solver-active-helper")
+    assert first != second and second.rsplit("/", 1)[0] == second_helper.rsplit("/", 1)[0]
+    assert cap(second_helper) == f"{second_helper} cap_net_raw=ep"
+    assert not cap(first_helper)
+    assert not cap(resolved("/local/bin/l2solver"))
+    assert not cap(resolved("/local/bin/l2solver-active"))
+    assert "LLDP Valid" in unprivileged("l2solver", "inspect", "/stage/lldp.pcap").stdout
+    result = unprivileged("l2solver-active", *probe, success=None)
+    assert result.returncode in (0, 3), result.stderr
+    assert "198.18.0.2" in result.stdout
+    assert "Send called: true; socket acceptance: confirmed" in result.stdout
+    assert "Helper cleanup: confirmed" in result.stdout
+    # The retained old executable must still choose its own unprivileged helper
+    old_client = first.rsplit("/", 1)[0] + "/l2solver-active"
+    denied = unprivileged(old_client, *probe, success=False)
+    assert "cap_net_raw" in denied.stderr.lower() or "permitted" in denied.stderr.lower()
+
+    publish("--payload", "/stage/payload", "--prefix", "/local", *selection)
+    assert not cap(second_helper)
+    assert not cap(resolved("/local/bin/l2solver-active-helper"))
+    unprivileged("l2solver", "--version")
+    (root / "stage/system_install.py").unlink()
+    execute("/local/bin/l2solver-uninstall")
+    assert not (root / "local/share/l2solver").exists()
+    for path in (
+        "local/bin/l2solver", "local/bin/l2solver-active", "local/bin/l2solver-active-helper",
+        "local/bin/l2solver-uninstall", "local/share/custom/bash/l2solver",
+        "local/share/custom/zsh/_l2solver", "local/share/custom/fish/l2solver.fish",
+    ):
+        assert not os.path.lexists(root / path)
+    assert (root / "stage/lldp.pcap").is_file()
+    print("real executable installer lifecycle passed")
 
 
 def main():
@@ -30,7 +109,12 @@ def main():
     root = scratch / "root"
     root.mkdir()
     # This tmpfs and every bind mount exist only in the private mount namespace
-    run(["mount", "-t", "tmpfs", "-o", "size=32m,mode=755", "tmpfs", str(root)])
+    binaries = Path(sys.argv[5]) if len(sys.argv) > 5 else None
+    # Payload and three installed generations coexist during the real lifecycle
+    size = str(sum((binaries / name).stat().st_size for name in (
+        "l2solver", "l2solver-active", "l2solver-active-helper",
+    )) * 4 + 64 * 1024 * 1024) if binaries else "32m"
+    run(["mount", "-t", "tmpfs", "-o", f"size={size},mode=755", "tmpfs", str(root)])
     (root / "usr").mkdir()
     run(["mount", "--bind", "/usr", str(root / "usr")])
     run(["mount", "-o", "remount,bind,ro", str(root / "usr")])
@@ -43,13 +127,26 @@ def main():
             run(["mount", "--bind", str(source), str(root / name)])
             run(["mount", "-o", "remount,bind,ro", str(root / name)])
     (root / "stage/payload").mkdir(parents=True)
+    if binaries:
+        for name in ("proc", "sys", "dev", "tmp"):
+            (root / name).mkdir()
+        (root / "tmp").chmod(0o1777)
+        run(["mount", "-t", "proc", "-o", "nosuid,nodev,noexec", "proc", str(root / "proc")])
+        run(["mount", "-t", "sysfs", "-o", "ro,nosuid,nodev,noexec", "sysfs", str(root / "sys")])
+        (root / "dev/null").touch()
+        run(["mount", "--bind", "/dev/null", str(root / "dev/null")])
     publisher = root / "stage/system_install.py"
     shutil.copyfile(checkout / "scripts/system_install.py", publisher)
     payload = root / "stage/payload"
-    for name in ("l2solver", "l2solver-active"):
-        (payload / name).write_text("#!/bin/sh\nprintf 'first fixture\\n'\n")
-    # An actual ELF inode allows the kernel to enforce file capability settings
-    shutil.copyfile("/usr/bin/true", payload / "l2solver-active-helper")
+    if binaries:
+        for name in ("l2solver", "l2solver-active", "l2solver-active-helper"):
+            shutil.copyfile(binaries / name, payload / name)
+            (payload / name).chmod(0o755)
+    else:
+        for name in ("l2solver", "l2solver-active"):
+            (payload / name).write_text("#!/bin/sh\nprintf 'first fixture\\n'\n")
+        # An actual ELF inode allows the kernel to enforce file capability settings
+        shutil.copyfile("/usr/bin/true", payload / "l2solver-active-helper")
     for name in ("bash", "zsh", "fish", "README.md", "install.md", "NOTICE-JEMALLOC.txt", "receipt.json"):
         (payload / name).write_text("{}" if name == "receipt.json" else name)
     prefix = "/local"
@@ -73,6 +170,10 @@ def main():
 
     def resolved(path):
         return execute("/usr/bin/readlink", "-f", path).stdout.strip()
+
+    if binaries:
+        real_lifecycle(root, checkout, payload, selection, execute, publish, cap, resolved)
+        return
 
     # Unmanaged destinations are left untouched by the preflight
     foreign = root / "foreign/bin/l2solver"
@@ -105,6 +206,34 @@ def main():
     assert execute("/local/bin/l2solver").stdout == "upgraded fixture\n"
     assert not list((root / "local/share").glob(".l2solver-*"))
     (payload / "README.md").write_text("README.md")
+    # A failed pointer switch must restore the old helper's real capability
+    switch_failure = root / "stage/fail_switch.py"
+    switch_failure.write_text('''\
+import os
+from pathlib import Path
+import sys
+
+sys.path.insert(0, "/stage")
+import system_install
+
+replace = os.replace
+def fail_switch(source, destination):
+    if Path(destination).name == "current":
+        raise PermissionError("injected pointer switch failure")
+    return replace(source, destination)
+
+system_install.os.replace = fail_switch
+try:
+    system_install.install(Path("/stage/payload"), Path("/local"), False)
+except PermissionError as error:
+    assert "injected pointer switch failure" in str(error)
+else:
+    raise AssertionError("pointer switch unexpectedly succeeded")
+''')
+    execute("/usr/bin/python3", "-I", "/stage/fail_switch.py")
+    assert resolved("/local/bin/l2solver-active-helper") == helper
+    assert cap(helper) == f"{helper} cap_net_raw=ep"
+    assert execute("/local/bin/l2solver").stdout == "upgraded fixture\n"
     # Switching to the default policy revokes the former helper's real xattr
     publish("--payload", "/stage/payload", "--prefix", prefix, *selection)
     assert not cap(helper)

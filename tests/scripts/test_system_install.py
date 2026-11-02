@@ -97,6 +97,76 @@ def test_failed_switch_keeps_old_pair(installer, payload, tmp_path, monkeypatch)
     installer.uninstall(prefix)
 
 
+@pytest.mark.parametrize("first_install", [True, False])
+def test_interrupt_after_pointer_switch_keeps_new_generation_and_manifest(installer, payload, tmp_path, monkeypatch, first_install):
+    prefix = tmp_path / "prefix"
+    old = None
+    if not first_install:
+        installer.install(payload, prefix, False)
+        old = (prefix / "bin/l2solver").resolve()
+    (payload / "l2solver").write_text("new executable")
+    replace = installer.os.replace
+
+    def interrupt_after_switch(source, destination):
+        replace(source, destination)
+        if Path(destination).name == "current":
+            raise KeyboardInterrupt("interrupted after pointer switch")
+
+    monkeypatch.setattr(installer.os, "replace", interrupt_after_switch)
+    with pytest.raises(KeyboardInterrupt, match="interrupted after pointer switch"):
+        installer.install(payload, prefix, False)
+    assert (prefix / "bin/l2solver").resolve() != old
+    assert (prefix / "bin/l2solver").read_text() == "new executable"
+    assert installer.read_manifest(prefix) is not None
+
+
+def test_unknown_switch_outcome_keeps_both_generations_for_inspection(installer, payload, tmp_path, monkeypatch):
+    prefix = tmp_path / "prefix"
+    installer.install(payload, prefix, False)
+    old = (prefix / "bin/l2solver").resolve()
+    (payload / "l2solver").write_text("new executable")
+    replace = installer.os.replace
+    readlink = installer.os.readlink
+    switched = False
+
+    def interrupt_after_switch(source, destination):
+        nonlocal switched
+        replace(source, destination)
+        if Path(destination).name == "current":
+            switched = True
+            raise OSError("switch result lost")
+
+    def fail_readlink(path, *args, **kwargs):
+        if switched and Path(path).name == "current":
+            raise PermissionError("current generation cannot be read")
+        return readlink(path, *args, **kwargs)
+
+    with monkeypatch.context() as fault:
+        fault.setattr(installer.os, "replace", interrupt_after_switch)
+        fault.setattr(installer.os, "readlink", fail_readlink)
+        with pytest.raises(ValueError, match="publication outcome unknown"):
+            installer.install(payload, prefix, False)
+    assert old.is_file()
+    assert (prefix / "bin/l2solver").read_text() == "new executable"
+    assert len(installer.read_manifest(prefix)["generations"]) == 2
+
+
+def test_reinstall_current_generation_does_not_replace_current_pointer(installer, payload, tmp_path, monkeypatch):
+    prefix = tmp_path / "prefix"
+    installer.install(payload, prefix, False)
+    current = (prefix / "bin/l2solver").resolve()
+    replace = installer.os.replace
+
+    def refuse_pointer_replacement(source, destination):
+        if Path(destination).name == "current":
+            pytest.fail("current pointer did not need replacement")
+        return replace(source, destination)
+
+    monkeypatch.setattr(installer.os, "replace", refuse_pointer_replacement)
+    installer.install(payload, prefix, False)
+    assert (prefix / "bin/l2solver").resolve() == current
+
+
 def test_manifest_traversal_never_deletes_foreign_file(installer, payload, tmp_path):
     prefix = tmp_path / "prefix"
     installer.install(payload, prefix, False)
@@ -124,6 +194,93 @@ def test_capability_failure_does_not_publish(installer, payload, tmp_path, monke
         installer.install(payload, prefix, True)
     assert (prefix / "bin/l2solver").resolve() == old
     installer.uninstall(prefix)
+
+
+def test_old_helper_revocation_failure_preserves_current_pair(installer, payload, tmp_path, monkeypatch):
+    prefix = tmp_path / "prefix"
+    installer.install(payload, prefix, False)
+    old_binary = (prefix / "bin/l2solver").resolve()
+    old_helper = (prefix / "bin/l2solver-active-helper").resolve()
+    (payload / "l2solver").write_text("new executable")
+    revoke = installer.disable_capability
+
+    def deny_old_helper(path):
+        if path == old_helper:
+            raise PermissionError("old helper capability cannot be removed")
+        revoke(path)
+
+    monkeypatch.setattr(installer, "disable_capability", deny_old_helper)
+    with pytest.raises(PermissionError, match="old helper capability"):
+        installer.install(payload, prefix, False)
+    assert (prefix / "bin/l2solver").resolve() == old_binary
+    assert (prefix / "bin/l2solver-active-helper").resolve() == old_helper
+    assert installer.read_manifest(prefix)["generations"].keys() == {old_binary.parent.name}
+
+
+def test_interrupt_after_old_capability_removal_restores_original_xattr(installer, payload, tmp_path, monkeypatch):
+    prefix = tmp_path / "prefix"
+    installer.install(payload, prefix, False)
+    old = (prefix / "bin/l2solver").resolve()
+    old_helper = (prefix / "bin/l2solver-active-helper").resolve()
+    (payload / "l2solver").write_text("new executable")
+    capabilities = {old_helper: b"original capability"}
+
+    def interrupt_after_remove(path):
+        capabilities.pop(path, None)
+        if path == old_helper:
+            raise KeyboardInterrupt("interrupted immediately after removal")
+
+    monkeypatch.setattr(installer, "read_capability", lambda path: capabilities.get(path))
+    monkeypatch.setattr(installer, "disable_capability", interrupt_after_remove)
+    monkeypatch.setattr(installer.os, "setxattr", lambda path, _name, value: capabilities.__setitem__(path, value))
+    with pytest.raises(KeyboardInterrupt, match="interrupted immediately"):
+        installer.install(payload, prefix, False)
+    assert (prefix / "bin/l2solver").resolve() == old
+    assert capabilities[old_helper] == b"original capability"
+
+
+def test_sync_failure_after_switch_reports_new_pair_is_active(installer, payload, tmp_path, monkeypatch):
+    prefix = tmp_path / "prefix"
+    installer.install(payload, prefix, False)
+    old = (prefix / "bin/l2solver").resolve()
+    (payload / "l2solver").write_text("new executable")
+    sync = installer.os.fsync
+
+    def fail_new_generation_sync(fd):
+        current = prefix / "share/l2solver/current"
+        if (Path(f"/proc/self/fd/{fd}").resolve() == current.parent
+                and current.resolve().name != old.parent.name):
+            raise OSError("injected directory sync failure")
+        return sync(fd)
+
+    monkeypatch.setattr(installer.os, "fsync", fail_new_generation_sync)
+    with pytest.raises(ValueError, match="new installation is active.*sync"):
+        installer.install(payload, prefix, False)
+    assert (prefix / "bin/l2solver").resolve() != old
+    assert installer.read_manifest(prefix) is not None
+
+
+def test_capability_restore_failure_is_reported_as_incomplete_rollback(installer, payload, tmp_path, monkeypatch):
+    prefix = tmp_path / "prefix"
+    installer.install(payload, prefix, False)
+    old = (prefix / "bin/l2solver").resolve()
+    (payload / "l2solver").write_text("new executable")
+    replace = installer.os.replace
+
+    def fail_switch(source, destination):
+        if Path(destination).name == "current":
+            raise PermissionError("pointer switch denied")
+        return replace(source, destination)
+
+    def fail_restore(_path, _value):
+        raise PermissionError("capability restoration denied")
+
+    monkeypatch.setattr(installer.os, "replace", fail_switch)
+    monkeypatch.setattr(installer, "restore_capability", fail_restore)
+    with pytest.raises(ValueError, match="pointer switch denied; rollback incomplete:.*capability restoration denied"):
+        installer.install(payload, prefix, False)
+    assert (prefix / "bin/l2solver").resolve() == old
+    assert installer.read_manifest(prefix) is not None
 
 
 def test_uninstaller_requires_root_before_reading_paths(tmp_path):
@@ -175,6 +332,7 @@ def test_reinstall_of_earlier_generation_switches_complete_set(installer, payloa
 def test_failed_active_reactivation_revokes_unpublished_helper(installer, payload, tmp_path, monkeypatch):
     prefix = tmp_path / "prefix"
     privileged = set()
+    monkeypatch.setattr(installer, "read_capability", lambda path: b"enabled" if path.resolve() in privileged else None)
     monkeypatch.setattr(installer, "enable_capability", lambda path: privileged.add(path.resolve()))
     monkeypatch.setattr(installer, "disable_capability", lambda path: privileged.discard(path.resolve()))
     installer.install(payload, prefix, True)

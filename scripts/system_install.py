@@ -153,13 +153,27 @@ def enable_capability(helper):
         raise ValueError("CAP_NET_RAW verification failed; active operations unavailable")
 
 
-def disable_capability(helper):
+def read_capability(helper):
     try:
-        os.getxattr(helper, "security.capability")
-        os.removexattr(helper, "security.capability")
+        return os.getxattr(helper, "security.capability")
     except OSError as error:
         if error.errno not in (errno.ENODATA, errno.ENOTSUP):
             raise
+        return None
+
+
+def disable_capability(helper):
+    if read_capability(helper) is not None:
+        os.removexattr(helper, "security.capability")
+
+
+def restore_capability(helper, value):
+    if read_capability(helper) == value:
+        return
+    if value is None:
+        disable_capability(helper)
+    else:
+        os.setxattr(helper, "security.capability", value)
 
 
 def installed_prefix(script):
@@ -191,13 +205,16 @@ def install(payload, prefix, active, completion_dirs=None):
         if previous is None and os.path.lexists(entry):
             raise ValueError(f"foreign destination refused: {entry}")
     base = prefix / "share/l2solver"
+    old_current = os.readlink(base / "current") if previous else None
     base.parent.mkdir(parents=True, exist_ok=True)
     # A private generation is never runnable through PATH before the final switch
     staging = Path(tempfile.mkdtemp(prefix=".l2solver-", dir=base.parent))
     created_links = []
     generation_path = None
     published = False
-    reactivated = None
+    switch_attempted = False
+    changed_capabilities = []
+    old_capabilities = {}
     try:
         for name in FILES:
             source = Path(__file__) if name == "l2solver-uninstall" else payload / name
@@ -215,19 +232,11 @@ def install(payload, prefix, active, completion_dirs=None):
             shutil.rmtree(staging)
             selected = base / identity
         else:
-            if active:
-                enable_capability(staging / "l2solver-active-helper")
             staging.chmod(0o755)
             base.mkdir(mode=0o755, exist_ok=True)
             generation_path = base / identity
             staging.rename(generation_path)
             selected = generation_path
-        if existing and active:
-            if os.readlink(base / "current") != identity:
-                reactivated = selected / "l2solver-active-helper"
-            enable_capability(selected / "l2solver-active-helper")
-        elif not active:
-            disable_capability(selected / "l2solver-active-helper")
         data = {"schema": 1, "links": destinations, "generations": dict(previous["generations"]) if previous else {}}
         data["generations"][identity] = hashes
         for relative, target in destinations.items():
@@ -238,24 +247,60 @@ def install(payload, prefix, active, completion_dirs=None):
                 created_links.append(entry)
         # Journal all owned generations before changing the single active pointer
         write_manifest(base, data)
-        (base / ".current-new").symlink_to(identity)
-        os.replace(base / ".current-new", base / "current")
-        published = True
-        # Retain old byte sets for running clients, but revoke their packet authority
         if previous:
-            for generation in previous["generations"]:
-                if generation != identity:
-                    disable_capability(base / generation / "l2solver-active-helper")
+            old_capabilities = {
+                base / generation / "l2solver-active-helper": read_capability(base / generation / "l2solver-active-helper")
+                for generation in previous["generations"]
+            }
+            # Revoke older helpers before publication so a failed revoke cannot leave an extra privileged helper
+            for helper, saved in old_capabilities.items():
+                if helper.parent != selected:
+                    changed_capabilities.append((helper, saved))
+                    disable_capability(helper)
+        helper = selected / "l2solver-active-helper"
+        if existing:
+            # Setting a capability can succeed before its verification fails
+            changed_capabilities.append((helper, old_capabilities[helper]))
+        if active:
+            enable_capability(helper)
+        else:
+            disable_capability(helper)
+        if old_current != identity:
+            (base / ".current-new").symlink_to(identity)
+            switch_attempted = True
+            os.replace(base / ".current-new", base / "current")
+        published = True
         directory_fd = os.open(base, os.O_RDONLY | os.O_DIRECTORY)
         try:
             os.fsync(directory_fd)
         finally:
             os.close(directory_fd)
-    except BaseException:
+    except BaseException as error:
+        if not published and switch_attempted:
+            # An interrupt can arrive after the atomic rename but before its return
+            try:
+                actual_current = os.readlink(base / "current")
+            except FileNotFoundError:
+                actual_current = None
+            except OSError as failure:
+                raise ValueError(f"{error}; publication outcome unknown: {failure}") from error
+            if actual_current == identity:
+                published = True
+            elif actual_current != old_current:
+                raise ValueError(f"{error}; publication outcome unknown: unexpected current generation") from error
         if not published:
-            # A failed switch must not leave an older, unpublished helper privileged
-            if reactivated is not None:
-                disable_capability(reactivated)
+            rollback_errors = []
+            if generation_path is not None:
+                try:
+                    disable_capability(generation_path / "l2solver-active-helper")
+                except OSError as failure:
+                    rollback_errors.append(f"could not revoke unpublished helper: {failure}")
+            # Restore the exact former xattrs if publication did not take place
+            for helper, saved in reversed(changed_capabilities):
+                try:
+                    restore_capability(helper, saved)
+                except OSError as failure:
+                    rollback_errors.append(f"could not restore {helper}: {failure}")
             (base / ".current-new").unlink(missing_ok=True)
             (base / ".manifest-new").unlink(missing_ok=True)
             if previous:
@@ -265,10 +310,13 @@ def install(payload, prefix, active, completion_dirs=None):
             for entry in created_links:
                 entry.unlink()
             if generation_path is not None:
-                disable_capability(generation_path / "l2solver-active-helper")
                 shutil.rmtree(generation_path)
             if not previous and base.exists():
                 base.rmdir()
+            if rollback_errors:
+                raise ValueError(f"{error}; rollback incomplete: {'; '.join(rollback_errors)}") from error
+        elif isinstance(error, OSError):
+            raise ValueError(f"new installation is active, but publication or final filesystem sync failed: {error}") from error
         raise
     finally:
         if staging.exists():
