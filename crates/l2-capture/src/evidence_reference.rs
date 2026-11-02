@@ -67,21 +67,14 @@ impl FromStr for EvidenceSourceId {
         }
 
         let mut digest = [0; 32];
-        for (index, pair) in encoded_digest
-            .as_bytes()
-            .as_chunks::<2>()
-            .0
-            .iter()
-            .enumerate()
+        for (byte, &[high, low]) in digest
+            .iter_mut()
+            .zip(encoded_digest.as_bytes().as_chunks::<2>().0.iter())
         {
-            let mut digits = pair.iter().copied();
-            let Some(high) = digits.next().and_then(hex_nibble) else {
+            let Some(high) = hex_nibble(high) else {
                 return Err(EvidenceReferenceError::InvalidSourceId);
             };
-            let Some(low) = digits.next().and_then(hex_nibble) else {
-                return Err(EvidenceReferenceError::InvalidSourceId);
-            };
-            let Some(byte) = digest.get_mut(index) else {
+            let Some(low) = hex_nibble(low) else {
                 return Err(EvidenceReferenceError::InvalidSourceId);
             };
             *byte = (high << 4) | low;
