@@ -126,6 +126,9 @@ jobs:
 
       - name: Check dependency policy
         run: |
+          # Frozen policy checks require both locked dependency graphs locally
+          cargo fetch --locked
+          cargo fetch --locked --manifest-path fuzz/Cargo.toml
           cargo deny --frozen check
           cargo deny --frozen --manifest-path fuzz/Cargo.toml check
 

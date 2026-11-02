@@ -43,6 +43,18 @@ def test_workflow_validates_development_pushes_and_pull_requests():
     assert re.search(r"(?m)^  workflow_dispatch:$", events)
 
 
+def test_frozen_dependency_checks_fetch_both_locked_workspaces_first():
+    workflow = (ROOT / ".github/workflows/release-linux.yml").read_text()
+    policy = workflow[workflow.index("- name: Check dependency policy"):]
+    policy = policy.split("\n      - name:", 1)[0]
+    commands = [line.strip() for line in policy.splitlines()]
+    first_check = commands.index("cargo deny --frozen check")
+    for command in ("cargo fetch --locked", "cargo fetch --locked --manifest-path fuzz/Cargo.toml"):
+        assert command in commands
+        assert commands.index(command) < first_check
+    assert "cargo deny --frozen --manifest-path fuzz/Cargo.toml check" in commands
+
+
 def test_review_workflow_runs_python_doctests_and_warning_checked_rustdoc():
     workflow = (ROOT / ".github/workflows/release-linux.yml").read_text()
     assert "pytest -q tests/benchmarks" in workflow
