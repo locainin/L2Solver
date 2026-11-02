@@ -111,12 +111,9 @@ pub(super) fn xor_key(value: &str) -> Result<Vec<u8>, String> {
         return Err(String::from("XOR key must contain at most 256 bytes"));
     }
     let mut key = Vec::with_capacity(bytes.len() / 2);
-    for pair in bytes.chunks_exact(2) {
-        let [high, low] = pair else {
-            return Err(String::from(INVALID_XOR_HEX));
-        };
-        let high = hex_nibble(*high).ok_or_else(|| String::from(INVALID_XOR_HEX))?;
-        let low = hex_nibble(*low).ok_or_else(|| String::from(INVALID_XOR_HEX))?;
+    for &[high, low] in bytes.as_chunks::<2>().0 {
+        let high = hex_nibble(high).ok_or_else(|| String::from(INVALID_XOR_HEX))?;
+        let low = hex_nibble(low).ok_or_else(|| String::from(INVALID_XOR_HEX))?;
         key.push((high << 4) | low);
     }
     Ok(key)

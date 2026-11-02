@@ -187,13 +187,12 @@ fn decode_hex(value: &str) -> Result<Vec<u8>, &'static str> {
     }
     value
         .as_bytes()
-        .chunks_exact(2)
-        .map(|pair| {
-            let [high, low] = pair else {
-                return Err("hex parser received an incomplete byte");
-            };
-            let high = hex_nibble(*high)?;
-            let low = hex_nibble(*low)?;
+        .as_chunks::<2>()
+        .0
+        .iter()
+        .map(|&[high, low]| {
+            let high = hex_nibble(high)?;
+            let low = hex_nibble(low)?;
             Ok((high << 4) | low)
         })
         .collect()
