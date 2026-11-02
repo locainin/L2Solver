@@ -24,7 +24,7 @@ fuzz_target!(|data: &[u8]| {
                     Some(ip.declared_len)
                 );
                 if matches!(transport.header, TransportHeader::Tcp { .. }) {
-                    assert!(transport.trailing_bytes.is_empty());
+                    assert_eq!(transport.trailing_bytes.len(), 0);
                 }
                 if let Some(decoding) = l2_discovery::dns::udp_message(ip) {
                     assert_eq!(transport.header, TransportHeader::Udp);
