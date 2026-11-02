@@ -89,6 +89,7 @@ wait_ready() {
             return 0
         fi
         if ! kill -0 "$capture_pid" 2>/dev/null; then
+            cat -- "$status_file" >&2
             wait "$capture_pid"
             return 1
         fi
@@ -163,7 +164,8 @@ ip -n l2-a link set port-a down
 ip -n l2-a link set port-a up
 ip -n l2-a -details link show port-a > "$output/namespace-link.txt"
 # Linux bridge BPDUs supply an independent kernel-generated protocol fixture
-timeout --kill-after=1s 10s ip netns exec l2-a tcpdump -U -i port-a -s 65535 -c 1 \
+# Only namespace root maps to the unprivileged caller, so keep that capture identity
+timeout --kill-after=1s 10s ip netns exec l2-a tcpdump -Z root -U -i port-a -s 65535 -c 1 \
     -w "$output/linux-stp.pcap" ether dst 01:80:c2:00:00:00 \
     > "$output/namespace-stp-status.txt" 2>&1 &
 capture_pid=$!
