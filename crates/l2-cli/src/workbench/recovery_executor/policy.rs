@@ -928,7 +928,14 @@ fn source_work_profile(
             .max(record_case_max_input_bytes(record_plan)?),
     };
 
-    accumulate_seed_task_work(case, &plan, &node_blobs, &blob_lengths, &mut profile)?;
+    accumulate_seed_task_work(
+        case,
+        &plan,
+        &node_blobs,
+        &blob_lengths,
+        scan_bounds,
+        &mut profile,
+    )?;
     reserve_discovery_phase_work(
         case,
         framing_plan,
@@ -945,6 +952,7 @@ fn accumulate_seed_task_work(
     plan: &RecoveryPlan,
     node_blobs: &HashMap<u64, &str>,
     blob_lengths: &HashMap<&str, usize>,
+    scan_bounds: CaseScanWorkBounds,
     profile: &mut SourceWorkProfile,
 ) -> Result<(), RecoveryExecutionError> {
     let mut scheduled = HashMap::<&str, Vec<RecoveryTask>>::new();
@@ -960,6 +968,11 @@ fn accumulate_seed_task_work(
             )
         })?;
         let scheduled_tasks = scheduled.entry(blob_id).or_default();
+        let xor_work = xor_source_work(case, node_id, &kind, input_length, scan_bounds.framing)?;
+        profile.task_work = profile
+            .task_work
+            .checked_add(xor_work)
+            .ok_or(RecoveryError::InvariantFailure)?;
         if scheduled_tasks.is_empty() {
             profile.unique_bytes =
                 profile
@@ -990,6 +1003,65 @@ fn accumulate_seed_task_work(
         }
     }
     Ok(())
+}
+
+// Reserve optional XOR work only for bounded TCP roots
+fn xor_source_work(
+    case: &Case,
+    node_id: u64,
+    kind: &str,
+    input_length: usize,
+    graph_work: usize,
+) -> Result<usize, RecoveryExecutionError> {
+    if kind != "tcp_byte_run" || input_length > super::xor_messages::MAX_XOR_INPUT_BYTES {
+        return Ok(0);
+    }
+    let scan = l2_workbench::recovery::xor::xor_proposal_scan_work_bound(input_length)
+        .ok_or(RecoveryError::InvariantFailure)?;
+    if scan == 0 {
+        return Ok(0);
+    }
+    let node = case.node(node_id).ok_or(RecoveryError::InvariantFailure)?;
+    let mapped_bytes = node
+        .ranges
+        .iter()
+        .try_fold(0_usize, |total, range| {
+            usize::try_from(range.length)
+                .ok()
+                .and_then(|length| total.checked_add(length))
+        })
+        .ok_or(RecoveryError::InvariantFailure)?;
+    let projection_bytes = mapped_bytes.min(super::xor_messages::MAX_PROJECTED_BYTES);
+    let execution = input_length
+        .checked_mul(super::xor_messages::XOR_INPUT_WORK_FACTOR)
+        .and_then(|bytes| {
+            l2_workbench::derivation::normalization_work_bound(projection_bytes)
+                .and_then(|work| bytes.checked_add(work))
+        })
+        .and_then(|bytes| {
+            projection_bytes
+                .checked_mul(super::xor_messages::XOR_PUBLICATION_WORK_FACTOR)
+                .and_then(|receipt| bytes.checked_add(receipt))
+        })
+        .and_then(|bytes| bytes.checked_mul(l2_workbench::recovery::xor::XOR_MAX_CANDIDATES))
+        .ok_or(RecoveryError::InvariantFailure)?;
+    let ranges = node
+        .ranges
+        .len()
+        .min(super::xor_messages::MAX_PACKET_MAPPINGS);
+    let receipt_work = ranges
+        .checked_mul(8 * 1024)
+        .and_then(|work| {
+            ranges
+                .checked_mul(ranges)
+                .and_then(|pairs| pairs.checked_mul(256))
+                .and_then(|comparisons| work.checked_add(comparisons))
+        })
+        .ok_or(RecoveryError::InvariantFailure)?;
+    scan.checked_add(graph_work)
+        .and_then(|work| work.checked_add(receipt_work))
+        .and_then(|work| work.checked_add(execution))
+        .ok_or_else(|| RecoveryError::InvariantFailure.into())
 }
 
 fn reserve_discovery_phase_work(

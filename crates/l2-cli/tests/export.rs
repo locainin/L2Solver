@@ -14,6 +14,8 @@ const FTP_BODY: &[u8] = b"example FTP transfer bytes\r\n";
 mod cache_failure;
 #[path = "export/relational.rs"]
 mod relational;
+#[path = "export/xor_messages.rs"]
+mod xor_messages;
 #[path = "export/repeated.rs"]
 mod repeated;
 #[path = "export/tshark_identity.rs"]
