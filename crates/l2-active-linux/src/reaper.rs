@@ -23,7 +23,7 @@ pub struct Lease(&'static AtomicUsize);
 impl Lease {
     fn acquire(slots: &'static AtomicUsize) -> io::Result<Self> {
         slots
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |count| {
+            .try_update(Ordering::AcqRel, Ordering::Acquire, |count| {
                 (count < MAX_ACTIVE_HELPERS).then_some(count + 1)
             })
             .map_err(|_| {
