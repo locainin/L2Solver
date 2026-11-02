@@ -1,7 +1,7 @@
 //! Bounded passive fingerprints for common Layer-2 and LAN control traffic
 //!
-//! This crate only examines an already decoded [`l2_core::EthernetFrame`]. It
-//! borrows all packet data, keeps no observation state, and has no transmit or
+//! This crate examines bounded Ethernet and Linux cooked captures. It borrows
+//! all packet data, keeps no observation state, and has no transmit or
 //! interface authority. LLDP and STP remain owned by `l2-codecs`; their enum
 //! values exist so a caller can merge inventories from both decoders.
 
@@ -20,6 +20,7 @@ mod igmp;
 mod ip;
 mod ipv4;
 mod ipv6;
+pub mod link;
 mod macsec;
 mod mka;
 mod mld;
@@ -32,8 +33,12 @@ mod vrrp;
 
 pub use arp::{ArpPacket, arp_packet};
 pub use dispatch::{discover, fingerprint};
-pub use fragments::{FragmentPacket, IpFamily, fragment_packet, fragment_transport};
-pub use ip::{IpHeader, IpPacket, ip_header, ip_packet};
+pub use fragments::{
+    FragmentPacket, IpFamily, fragment_packet, fragment_packet_from_payload, fragment_transport,
+};
+pub use ip::{
+    IpHeader, IpPacket, ip_header, ip_header_from_payload, ip_packet, ip_packet_from_payload,
+};
 pub use model::{
     Discovery, Fingerprint, FingerprintStatus, IdentityRole, NetworkAddress, Protocol,
     ProtocolIdentity,

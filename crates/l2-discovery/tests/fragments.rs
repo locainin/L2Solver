@@ -89,3 +89,42 @@ fn reassembled_payload_canonical_transport_boundaries() -> Result<(), &'static s
     assert!(fragment_transport(IpFamily::V6, 44, &bytes).is_none());
     Ok(())
 }
+
+#[test]
+fn raw_fragment_payloads_keep_family_offsets_and_truncation() -> Result<(), &'static str> {
+    use l2_discovery::fragment_packet_from_payload;
+
+    let mut v4 = ipv4(0x2002, b"abcdefgh")?;
+    let v4_fragment = fragment_packet_from_payload(0x0800, &v4).ok_or("missing IPv4 fragment")?;
+    assert_eq!(
+        (
+            v4_fragment.family,
+            v4_fragment.offset,
+            v4_fragment.payload_offset
+        ),
+        (IpFamily::V4, 16, 20)
+    );
+    assert_eq!(v4_fragment.payload, b"abcdefgh");
+    v4.truncate(23);
+    let partial = fragment_packet_from_payload(0x0800, &v4).ok_or("missing partial fragment")?;
+    assert_eq!(partial.payload, b"abc");
+    assert!(!partial.captured_complete);
+
+    let mut v6 = vec![0x60, 0, 0, 0, 0, 16, 44, 64];
+    v6.extend_from_slice(&[0; 32]);
+    v6.extend_from_slice(&[17, 0, 0, 9, 0, 0, 0, 42]);
+    v6.extend_from_slice(b"abcdefgh");
+    let v6_fragment = fragment_packet_from_payload(0x86dd, &v6).ok_or("missing IPv6 fragment")?;
+    assert_eq!(
+        (
+            v6_fragment.family,
+            v6_fragment.offset,
+            v6_fragment.payload_offset
+        ),
+        (IpFamily::V6, 8, 48)
+    );
+    assert_eq!(v6_fragment.payload, b"abcdefgh");
+    assert!(fragment_packet_from_payload(0x0806, &v6).is_none());
+    assert!(fragment_packet_from_payload(0x86dd, v6.get(..47).ok_or("short fixture")?).is_none());
+    Ok(())
+}

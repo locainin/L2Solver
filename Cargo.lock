@@ -969,6 +969,7 @@ dependencies = [
 name = "l2-discovery"
 version = "0.1.0"
 dependencies = [
+ "l2-capture",
  "l2-core",
  "serde",
  "serde_json",

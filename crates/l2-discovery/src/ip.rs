@@ -93,9 +93,20 @@ pub fn ipv6_header(packet: &[u8]) -> Option<IpHeader> {
 /// jumbograms or invalid header bounds return no observation. No payload is exposed
 #[must_use]
 pub fn ip_header(frame: &EthernetFrame<'_>) -> Option<IpHeader> {
-    let mut header = match frame.field {
-        FrameField::EtherType(0x0800) => ipv4_header(frame.payload)?,
-        FrameField::EtherType(0x86dd) => ipv6_header(frame.payload)?,
+    let FrameField::EtherType(protocol) = frame.field else {
+        return None;
+    };
+    ip_header_from_payload(protocol, frame.payload)
+}
+
+/// Read supported IP header facts from a protocol identifier and bounded payload
+///
+/// The identifier must have `EtherType` semantics for this link-layer format
+#[must_use]
+pub fn ip_header_from_payload(protocol: u16, payload: &[u8]) -> Option<IpHeader> {
+    let mut header = match protocol {
+        0x0800 => ipv4_header(payload)?,
+        0x86dd => ipv6_header(payload)?,
         _ => return None,
     };
     // A zero-length IPv6 packet with a hop-by-hop header may be a jumbogram
@@ -103,7 +114,7 @@ pub fn ip_header(frame: &EthernetFrame<'_>) -> Option<IpHeader> {
         if header.total_len == 40 && header.protocol != 59 {
             return None;
         }
-        walk_ipv6(frame.payload, &mut header)?;
+        walk_ipv6(payload, &mut header)?;
     }
     Some(header)
 }
@@ -114,8 +125,19 @@ pub fn ip_header(frame: &EthernetFrame<'_>) -> Option<IpHeader> {
 /// return no observation. Source and destination addresses remain header claims
 #[must_use]
 pub fn ip_packet<'a>(frame: &EthernetFrame<'a>) -> Option<IpPacket<'a>> {
-    let header = ip_header(frame)?;
-    let bytes = frame.payload.get(..header.total_len)?;
+    let FrameField::EtherType(protocol) = frame.field else {
+        return None;
+    };
+    ip_packet_from_payload(protocol, frame.payload)
+}
+
+/// Read a complete IP envelope from a protocol identifier and bounded payload
+///
+/// The identifier must have `EtherType` semantics for this link-layer format
+#[must_use]
+pub fn ip_packet_from_payload(protocol: u16, payload: &[u8]) -> Option<IpPacket<'_>> {
+    let header = ip_header_from_payload(protocol, payload)?;
+    let bytes = payload.get(..header.total_len)?;
     let transport = if header.fragmented {
         None
     } else {
@@ -128,7 +150,7 @@ pub fn ip_packet<'a>(frame: &EthernetFrame<'a>) -> Option<IpPacket<'a>> {
         transport,
         fragmented: header.fragmented,
         declared_len: header.total_len,
-        trailing_bytes: frame.payload.get(header.total_len..)?,
+        trailing_bytes: payload.get(header.total_len..)?,
     })
 }
 

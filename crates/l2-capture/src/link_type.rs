@@ -13,8 +13,12 @@ pub enum LinkType {
     Ethernet,
     /// IEEE 802.11 frames without a radiotap prefix
     Ieee80211,
+    /// Linux cooked capture with a 16-byte SLL header
+    LinuxSll,
     /// IEEE 802.11 frames with a radiotap prefix
     Ieee80211Radiotap,
+    /// Linux cooked capture with a 20-byte SLL2 header
+    LinuxSll2,
     /// A link-layer assignment not decoded by this workspace
     Unknown(u16),
 }
@@ -35,7 +39,9 @@ impl LinkType {
         match raw {
             1 => Self::Ethernet,
             105 => Self::Ieee80211,
+            113 => Self::LinuxSll,
             127 => Self::Ieee80211Radiotap,
+            276 => Self::LinuxSll2,
             other => Self::Unknown(other),
         }
     }
@@ -46,7 +52,9 @@ impl LinkType {
         match self {
             Self::Ethernet => 1,
             Self::Ieee80211 => 105,
+            Self::LinuxSll => 113,
             Self::Ieee80211Radiotap => 127,
+            Self::LinuxSll2 => 276,
             Self::Unknown(raw) => raw,
         }
     }
@@ -56,7 +64,11 @@ impl LinkType {
     pub const fn is_supported(self) -> bool {
         matches!(
             self,
-            Self::Ethernet | Self::Ieee80211 | Self::Ieee80211Radiotap
+            Self::Ethernet
+                | Self::Ieee80211
+                | Self::Ieee80211Radiotap
+                | Self::LinuxSll
+                | Self::LinuxSll2
         )
     }
 
@@ -78,7 +90,9 @@ impl LinkType {
         match self {
             Self::Ethernet => "Ethernet",
             Self::Ieee80211 => "IEEE 802.11",
+            Self::LinuxSll => "Linux cooked SLL",
             Self::Ieee80211Radiotap => "IEEE 802.11 Radiotap",
+            Self::LinuxSll2 => "Linux cooked SLL2",
             Self::Unknown(_) => "unknown",
         }
     }
