@@ -3,8 +3,8 @@ use nix::{
     errno::Errno,
     poll::{PollFd, PollFlags, poll},
     sys::socket::{
-        AddressFamily, ControlMessageOwned, MsgFlags, SockFlag, SockType, recvmsg, send,
-        setsockopt, socketpair, sockopt::PassCred,
+        AddressFamily, ControlMessageOwned, MsgFlags, SockFlag, SockType, UnixCredentials, recvmsg,
+        send, setsockopt, socketpair, sockopt::PassCred,
     },
 };
 use std::{
@@ -21,6 +21,14 @@ mod tests;
 pub struct Peer {
     pub pid: u32,
     pub uid: u32,
+}
+
+impl Peer {
+    fn matches(self, credential: &UnixCredentials) -> bool {
+        self.pid != 0
+            && u32::try_from(credential.pid()).ok() == Some(self.pid)
+            && credential.uid() == self.uid
+    }
 }
 
 pub struct Channel {
@@ -86,9 +94,8 @@ impl Channel {
     pub fn try_receive(&self) -> io::Result<Option<Vec<u8>>> {
         let mut bytes = crate::buffer::zeroed(wire::MAX_RECORD)?;
         let mut iov = [IoSliceMut::new(&mut bytes)];
-        // Linux accepts at most 253 descriptors in one SCM_RIGHTS message
-        let space = nix::sys::socket::cmsg_space::<nix::libc::ucred>()
-            + nix::sys::socket::cmsg_space::<[i32; 253]>();
+        // Linux emits credentials first and closes descriptors that do not fit
+        let space = nix::sys::socket::cmsg_space::<nix::libc::ucred>();
         let mut ancillary = crate::buffer::zeroed(space)?;
         let message = match recvmsg::<()>(
             self.fd.as_raw_fd(),
@@ -101,28 +108,29 @@ impl Channel {
             Err(error) => return Err(errno(error)),
         };
         let count = message.bytes;
+        let truncated = message.flags.contains(MsgFlags::MSG_CTRUNC);
         let mut verified = false;
         let mut extra = false;
         let mut wrong_peer = false;
         let mut close_error = None;
-        for control in message.cmsgs().map_err(errno)? {
-            match control {
-                ControlMessageOwned::ScmCredentials(credential) => {
-                    wrong_peer |= verified
-                        || u32::try_from(credential.pid()).ok() != Some(self.peer.pid)
-                        || credential.uid() != self.peer.uid;
-                    verified = true;
-                }
-                ControlMessageOwned::ScmRights(fds) => {
-                    // A helper record never transfers authority via descriptors
-                    for fd in fds {
-                        if let Err(error) = nix::unistd::close(fd) {
-                            close_error.get_or_insert_with(|| errno(error));
-                        }
+        if !truncated {
+            for control in message.cmsgs().map_err(errno)? {
+                match control {
+                    ControlMessageOwned::ScmCredentials(credential) => {
+                        wrong_peer |= verified || !self.peer.matches(&credential);
+                        verified = true;
                     }
-                    extra = true;
+                    ControlMessageOwned::ScmRights(fds) => {
+                        // A helper record never transfers authority via descriptors
+                        for fd in fds {
+                            if let Err(error) = nix::unistd::close(fd) {
+                                close_error.get_or_insert_with(|| errno(error));
+                            }
+                        }
+                        extra = true;
+                    }
+                    _ => extra = true,
                 }
-                _ => extra = true,
             }
         }
         if let Some(error) = close_error {
@@ -140,7 +148,7 @@ impl Channel {
                 "unexpected helper peer credentials",
             ));
         }
-        if !verified || extra || count > wire::MAX_RECORD {
+        if truncated || !verified || extra || count > wire::MAX_RECORD {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 "invalid helper record or ancillary data",
