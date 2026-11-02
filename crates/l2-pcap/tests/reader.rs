@@ -1,5 +1,8 @@
 // The classic PCAP reader suite is grouped by format, limits, and I/O
 // behavior so failures point directly at the contract under test
+#[path = "../../../tests/fixtures/captures.rs"]
+pub mod captures;
+
 #[path = "reader/boundaries.rs"]
 mod boundaries;
 #[path = "reader/common.rs"]

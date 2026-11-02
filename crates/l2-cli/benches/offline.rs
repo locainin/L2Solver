@@ -8,6 +8,9 @@ use std::{
     time::Instant,
 };
 
+#[path = "../../../tests/fixtures/captures.rs"]
+pub mod captures;
+
 const BENCH_ITERATIONS: u32 = 50_000_000;
 
 fn main() -> Result<(), Box<dyn Error>> {
@@ -19,8 +22,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         }
         return Ok(());
     }
-    let bytes = include_bytes!("../../../tests/pcaps/lldp.pcap");
-    let mut capture = l2_pcap::CaptureReader::new(bytes.as_slice())?;
+    let mut capture = l2_pcap::CaptureReader::new(captures::LLDP)?;
     let packet = capture
         .next_packet()?
         .ok_or("benchmark fixture has no packet")?;

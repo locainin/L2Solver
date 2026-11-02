@@ -21,8 +21,10 @@ use std::{
     time::{Duration, Instant},
 };
 
-const LLDP_CAPTURE: &[u8] = include_bytes!("../../../../tests/pcaps/lldp.pcap");
-const STP_CAPTURE: &[u8] = include_bytes!("../../../../tests/pcaps/linux-stp.pcap");
+use crate::capture_fixtures as captures;
+
+const LLDP_CAPTURE: &[u8] = captures::LLDP;
+const STP_CAPTURE: &[u8] = captures::LINUX_STP;
 
 #[path = "full_source/cache/cases.rs"]
 mod native_case_cache_tests;

@@ -16,6 +16,7 @@ __pycache__/
 
 # Private data, documentation and review material
 /pcap_samples/
+/tests/pcaps/
 /review/
 /docs/
 /notes/
@@ -27,14 +28,14 @@ __pycache__/
 .env
 .env.*
 
-# Root archives and captures stay local; deliberate test fixtures remain tracked
+# Local archives and capture files
 /*.zip
 /*.zip.sha256
 /*.bundle
 /review-*.manifest
-/*.[cC][aA][pP]
-/*.[pP][cC][aA][pP]
-/*.[pP][cC][aA][pP][nN][gG]
+*.[cC][aA][pP]
+*.[pP][cC][aA][pP]
+*.[pP][cC][aA][pP][nN][gG]
 
 # Generated benchmark and extraction outputs
 /benchmarks/cache/

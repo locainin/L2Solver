@@ -1,4 +1,7 @@
-use super::common::{ByteOrder, CaptureConfig, PacketConfig, one_packet};
+use super::{
+    captures,
+    common::{ByteOrder, CaptureConfig, PacketConfig, one_packet},
+};
 use l2_pcap::{CaptureReader, Error};
 use std::io::{self, Cursor, Read};
 
@@ -91,10 +94,10 @@ fn fragmented_reads_reassemble_records() -> Result<(), Box<dyn std::error::Error
             self.inner.read(destination)
         }
     }
-    let capture = include_bytes!("../../../../tests/pcaps/lldp.pcap");
+    let capture = captures::LLDP;
     for limit in 1..16 {
         let source = Fragmented {
-            inner: capture.as_slice(),
+            inner: capture,
             limit,
         };
         let mut reader = CaptureReader::new(source)?;

@@ -1,3 +1,7 @@
+#[path = "../../../../tests/fixtures/capture_paths.rs"]
+mod capture_paths;
+use crate::capture_fixtures as captures;
+
 use super::{
     TsharkOptions, decode_packets, prepare_capture_from_at,
     process::{self, ProcessError},
@@ -305,12 +309,11 @@ fn tshark_process_oversized_diagnostics_truncating() {
 
 #[test]
 fn tshark_enrichment_when_tshark_available() -> Result<(), Box<dyn Error>> {
+    let fixtures = capture_paths::CapturePaths::new()?;
     if Command::new("tshark").arg("--version").output().is_err() {
         return Ok(());
     }
-    let capture = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("../../tests/pcaps/lldp.pcap")
-        .canonicalize()?;
+    let capture = fixtures.path("lldp.pcap").canonicalize()?;
     let temporary = tempfile::tempdir()?;
     let keylog = temporary.path().join("keys.log");
     fs::write(&keylog, b"# Explicit key log for receipt coverage\n")?;

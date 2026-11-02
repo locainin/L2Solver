@@ -115,10 +115,7 @@ fn recovery_commands_reject_an_output_option_without_a_value()
 fn separator_allows_real_hyphenated_inputs_for_recovery_commands()
 -> Result<(), Box<dyn std::error::Error>> {
     let temporary = tempfile::tempdir()?;
-    fs::write(
-        temporary.path().join("-input.pcap"),
-        include_bytes!("../../../../tests/pcaps/lldp.pcap"),
-    )?;
+    fs::write(temporary.path().join("-input.pcap"), crate::captures::LLDP)?;
     fs::write(temporary.path().join("-input.bin"), b"ordinary file input")?;
 
     for command in ["extract", "export"] {

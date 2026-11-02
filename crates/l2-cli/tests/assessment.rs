@@ -1,3 +1,8 @@
+#[path = "../../../tests/fixtures/capture_paths.rs"]
+mod capture_paths;
+#[path = "../../../tests/fixtures/captures.rs"]
+pub mod captures;
+
 use std::{
     path::PathBuf,
     process::{Command, Stdio},
@@ -8,8 +13,10 @@ mod text {
 
     #[test]
     fn puts_security_result_before_detail() -> Result<(), Box<dyn std::error::Error>> {
+        let fixtures = crate::capture_paths::CapturePaths::new()?;
         let output = Command::new(env!("CARGO_BIN_EXE_l2solver"))
-            .args(["assess", "../../tests/pcaps/lldp.pcap"])
+            .arg("assess")
+            .arg(fixtures.path("lldp.pcap"))
             .output()?;
 
         assert!(output.status.success());
@@ -40,8 +47,11 @@ mod text {
 
     #[test]
     fn verbosity_reveals_inventory_and_diagnostics() -> Result<(), Box<dyn std::error::Error>> {
+        let fixtures = crate::capture_paths::CapturePaths::new()?;
         let verbose = Command::new(env!("CARGO_BIN_EXE_l2solver"))
-            .args(["assess", "../../tests/pcaps/lldp.pcap", "-v"])
+            .arg("assess")
+            .arg(fixtures.path("lldp.pcap"))
+            .arg("-v")
             .output()?;
         assert!(verbose.status.success());
         let text = String::from_utf8(verbose.stdout)?;
@@ -49,7 +59,9 @@ mod text {
         assert!(text.contains("Assessment coverage"));
 
         let diagnostic = Command::new(env!("CARGO_BIN_EXE_l2solver"))
-            .args(["assess", "../../tests/pcaps/lldp.pcap", "-vv", "--evidence"])
+            .arg("assess")
+            .arg(fixtures.path("lldp.pcap"))
+            .args(["-vv", "--evidence"])
             .output()?;
         assert!(diagnostic.status.success());
         let text = String::from_utf8(diagnostic.stdout)?;
@@ -60,8 +72,11 @@ mod text {
 
     #[test]
     fn no_color_overrides_explicit_color() -> Result<(), Box<dyn std::error::Error>> {
+        let fixtures = crate::capture_paths::CapturePaths::new()?;
         let output = Command::new(env!("CARGO_BIN_EXE_l2solver"))
-            .args(["assess", "../../tests/pcaps/lldp.pcap", "--color", "always"])
+            .arg("assess")
+            .arg(fixtures.path("lldp.pcap"))
+            .args(["--color", "always"])
             .env("NO_COLOR", "1")
             .output()?;
         assert!(output.status.success());
@@ -72,8 +87,12 @@ mod text {
     #[cfg(unix)]
     #[test]
     fn closed_consumer_success_exit_status() -> Result<(), Box<dyn std::error::Error>> {
+        let fixtures = crate::capture_paths::CapturePaths::new()?;
         let mut command = Command::new(env!("CARGO_BIN_EXE_l2solver"));
-        command.args(["assess", "../../tests/pcaps/lldp.pcap", "-vv"]);
+        command
+            .arg("assess")
+            .arg(fixtures.path("lldp.pcap"))
+            .arg("-vv");
         assert_eq!(run_with_closed_stdout(&mut command)?, Some(0));
         Ok(())
     }
@@ -87,7 +106,7 @@ mod text {
         ));
         std::fs::create_dir(&directory)?;
         let capture = directory.join("incomplete.pcap");
-        let mut bytes = include_bytes!("../../../tests/pcaps/lldp.pcap").to_vec();
+        let mut bytes = crate::captures::LLDP.to_vec();
         // A one-byte second record makes the report retain a finding and mark quality incomplete
         bytes.extend_from_slice(&[
             2, 0, 0, 0, // seconds
@@ -109,6 +128,7 @@ mod text {
     #[cfg(unix)]
     #[test]
     fn closed_consumer_findings_exit_status() -> Result<(), Box<dyn std::error::Error>> {
+        let fixtures = crate::capture_paths::CapturePaths::new()?;
         let directory = std::env::temp_dir().join(format!(
             "l2solver-assessment-finding-pipe-{}",
             std::process::id()
@@ -119,7 +139,9 @@ mod text {
 
         let mut command = Command::new(env!("CARGO_BIN_EXE_l2solver"));
         command
-            .args(["assess", "../../tests/pcaps/lldp.pcap", "--ci"])
+            .arg("assess")
+            .arg(fixtures.path("lldp.pcap"))
+            .arg("--ci")
             .arg("--policy")
             .arg(&policy);
         let status = run_with_closed_stdout(&mut command)?;
@@ -130,13 +152,16 @@ mod text {
 
     #[test]
     fn output_file_atomic_never_overwritten() -> Result<(), Box<dyn std::error::Error>> {
+        let fixtures = crate::capture_paths::CapturePaths::new()?;
         let directory =
             std::env::temp_dir().join(format!("l2solver-report-output-{}", std::process::id()));
         std::fs::create_dir(&directory)?;
         let report = directory.join("report.txt");
         let run = || {
             Command::new(env!("CARGO_BIN_EXE_l2solver"))
-                .args(["assess", "../../tests/pcaps/lldp.pcap", "--output"])
+                .arg("assess")
+                .arg(fixtures.path("lldp.pcap"))
+                .arg("--output")
                 .arg(&report)
                 .output()
         };
@@ -144,7 +169,10 @@ mod text {
         let first = run()?;
         assert!(first.status.success());
         assert!(first.stdout.is_empty());
-        assert!(String::from_utf8(first.stderr)?.contains(&report.display().to_string()));
+        assert!(
+            String::from_utf8(first.stderr)?
+                .contains(&report.display().to_string().escape_debug().to_string())
+        );
         assert!(std::fs::read_to_string(&report)?.contains("L2Solver assessment"));
         assert_eq!(run()?.status.code(), Some(1));
         assert!(!PathBuf::from(&report).with_extension("tmp").exists());
@@ -169,8 +197,11 @@ mod json {
 
     #[test]
     fn keeps_coverage_out_of_findings() -> Result<(), Box<dyn std::error::Error>> {
+        let fixtures = crate::capture_paths::CapturePaths::new()?;
         let output = Command::new(env!("CARGO_BIN_EXE_l2solver"))
-            .args(["assess", "../../tests/pcaps/lldp.pcap", "--format", "json"])
+            .arg("assess")
+            .arg(fixtures.path("lldp.pcap"))
+            .args(["--format", "json"])
             .output()?;
 
         assert!(output.status.success());

@@ -1,9 +1,16 @@
+#[path = "../../../tests/fixtures/capture_paths.rs"]
+mod capture_paths;
+#[path = "../../../tests/fixtures/captures.rs"]
+pub mod captures;
+
 use std::process::Command;
 
 #[test]
 fn preserves_json_frame_metadata() -> Result<(), Box<dyn std::error::Error>> {
+    let fixtures = crate::capture_paths::CapturePaths::new()?;
     let output = Command::new(env!("CARGO_BIN_EXE_l2solver"))
-        .args(["json", "../../tests/pcaps/lldp.pcap"])
+        .arg("json")
+        .arg(fixtures.path("lldp.pcap"))
         .output()?;
     assert!(output.status.success());
     let value: serde_json::Value = serde_json::from_slice(&output.stdout)?;
@@ -24,7 +31,7 @@ fn preserves_json_frame_metadata() -> Result<(), Box<dyn std::error::Error>> {
         .ok_or("missing raw evidence")?
         .as_array()
         .ok_or("raw evidence is not array")?;
-    let expected = include_bytes!("../../../tests/pcaps/lldp.pcap")
+    let expected = crate::captures::LLDP
         .get(40..)
         .ok_or("fixture missing payload")?;
     assert_eq!(
@@ -40,8 +47,10 @@ fn preserves_json_frame_metadata() -> Result<(), Box<dyn std::error::Error>> {
 
 #[test]
 fn reports_malformed_frame_status() -> Result<(), Box<dyn std::error::Error>> {
+    let fixtures = crate::capture_paths::CapturePaths::new()?;
     let output = Command::new(env!("CARGO_BIN_EXE_l2solver"))
-        .args(["json", "../../tests/pcaps/short.pcap"])
+        .arg("json")
+        .arg(fixtures.path("short.pcap"))
         .output()?;
     assert_eq!(output.status.code(), Some(3));
     let value: serde_json::Value = serde_json::from_slice(&output.stdout)?;
@@ -57,7 +66,7 @@ fn reports_malformed_frame_status() -> Result<(), Box<dyn std::error::Error>> {
 
 #[test]
 fn reports_unsupported_frame_status() -> Result<(), Box<dyn std::error::Error>> {
-    let mut capture = include_bytes!("../../../tests/pcaps/linux-stp.pcap").to_vec();
+    let mut capture = crate::captures::LINUX_STP.to_vec();
     *capture
         .get_mut(24 + 16 + 19)
         .ok_or("missing STP version byte")? = 3;
@@ -70,7 +79,7 @@ fn reports_unsupported_frame_status() -> Result<(), Box<dyn std::error::Error>> 
     std::fs::write(&path, capture)?;
 
     let output = Command::new(env!("CARGO_BIN_EXE_l2solver"))
-        .args(["json"])
+        .arg("json")
         .arg(&path)
         .output()?;
     assert_eq!(output.status.code(), Some(3));

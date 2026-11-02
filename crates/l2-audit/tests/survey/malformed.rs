@@ -1,4 +1,6 @@
-use super::common::{LINUX_STP_PCAP, captured, source_with_suffix, tagged_ethernet_frame};
+use super::common::{
+    LINUX_STP_PCAP, STP_FIXTURE_MAC, captured, source_with_suffix, tagged_ethernet_frame,
+};
 use l2_audit::{Policy, Survey};
 
 #[test]
@@ -46,7 +48,7 @@ fn malformed_stp_keeps_ethernet_inventory() -> Result<(), Box<dyn std::error::Er
     let interface = report.interfaces.first().ok_or("interface")?;
 
     assert_eq!(report.quality.malformed, 1);
-    assert_eq!(interface.macs, ["36:09:f1:ae:e3:29"]);
+    assert_eq!(interface.macs, [STP_FIXTURE_MAC]);
     assert_eq!(interface.untagged_packet, Some(1));
     assert_eq!(interface.stp_frames, 0);
     assert!(interface.stp.is_empty());
@@ -67,7 +69,7 @@ fn unsupported_stp_keeps_ethernet_inventory() -> Result<(), Box<dyn std::error::
     let interface = report.interfaces.first().ok_or("interface")?;
 
     assert_eq!(report.quality.unsupported_stp, 1);
-    assert_eq!(interface.macs, ["36:09:f1:ae:e3:29"]);
+    assert_eq!(interface.macs, [STP_FIXTURE_MAC]);
     assert_eq!(interface.untagged_packet, Some(1));
     assert_eq!(interface.stp_frames, 0);
     assert!(interface.stp.is_empty());

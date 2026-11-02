@@ -2,6 +2,9 @@ use l2_capture::{CaptureMetadata, CapturedFrame, InterfaceId};
 use l2_io::{FakeLink, LinkEvent, LinkIo, QueueError};
 use std::error::Error;
 
+#[path = "../../../tests/fixtures/captures.rs"]
+pub mod captures;
+
 fn frame(bytes: &[u8], original_len: usize) -> Result<CapturedFrame, Box<dyn Error>> {
     Ok(CapturedFrame::new(
         bytes.to_vec(),
@@ -35,8 +38,7 @@ fn fake_legacy_frame_receive_method() -> Result<(), Box<dyn Error>> {
 
 #[test]
 fn replay_adapter_source_frames() -> Result<(), Box<dyn Error>> {
-    let bytes = include_bytes!("../../../tests/pcaps/lldp.pcap");
-    let mut link = l2_io::ReplayLink::new(bytes.as_slice())?;
+    let mut link = l2_io::ReplayLink::new(captures::LLDP)?;
     let frame = link.recv()?.ok_or("missing frame")?;
     assert_eq!(frame.captured_len(), 41);
     assert_eq!(frame.metadata().original_len(), 41);

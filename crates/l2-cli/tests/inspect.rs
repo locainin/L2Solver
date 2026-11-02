@@ -1,3 +1,8 @@
+#[path = "../../../tests/fixtures/capture_paths.rs"]
+mod capture_paths;
+#[path = "../../../tests/fixtures/captures.rs"]
+pub mod captures;
+
 use std::{
     error::Error,
     process::{Command, Stdio},
@@ -5,12 +10,17 @@ use std::{
 
 #[test]
 fn escapes_terminal_control_bytes() -> Result<(), Box<dyn std::error::Error>> {
+    let fixtures = crate::capture_paths::CapturePaths::new()?;
     let output = Command::new(env!("CARGO_BIN_EXE_l2solver"))
-        .args(["inspect", "../../tests/pcaps/lldp.pcap"])
+        .arg("inspect")
+        .arg(fixtures.path("lldp.pcap"))
         .output()?;
     assert!(output.status.success());
     let text = String::from_utf8(output.stdout)?;
-    assert!(text.contains("Capture: ../../tests/pcaps/lldp.pcap"));
+    assert!(text.contains(&format!(
+        "Capture: {}",
+        fixtures.path("lldp.pcap").display().to_string().escape_debug()
+    )));
     assert!(text.contains("LLDP Valid"));
     assert!(text.contains("core\\x1b\\x07"));
     assert!(!text.contains('\u{1b}'));
@@ -21,8 +31,10 @@ fn escapes_terminal_control_bytes() -> Result<(), Box<dyn std::error::Error>> {
 
 #[test]
 fn rejects_malformed_pcapng_shows_help() -> Result<(), Box<dyn std::error::Error>> {
+    let fixtures = crate::capture_paths::CapturePaths::new()?;
     let unsupported = Command::new(env!("CARGO_BIN_EXE_l2solver"))
-        .args(["inspect", "../../tests/pcaps/unsupported.pcapng"])
+        .arg("inspect")
+        .arg(fixtures.path("unsupported.pcapng"))
         .output()?;
     assert!(!unsupported.status.success());
     let missing = Command::new(env!("CARGO_BIN_EXE_l2solver")).output()?;
@@ -42,21 +54,26 @@ fn rejects_malformed_pcapng_shows_help() -> Result<(), Box<dyn std::error::Error
 
 #[test]
 fn malformed_capture_names_input() -> Result<(), Box<dyn std::error::Error>> {
-    let path = "../../tests/pcaps/unsupported.pcapng";
+    let fixtures = crate::capture_paths::CapturePaths::new()?;
+    let path = fixtures.path("unsupported.pcapng");
     let output = Command::new(env!("CARGO_BIN_EXE_l2solver"))
-        .args(["capture", "inspect", path])
+        .args(["capture", "inspect"])
+        .arg(&path)
         .output()?;
     assert_eq!(output.status.code(), Some(1));
     let stderr = String::from_utf8(output.stderr)?;
-    assert!(stderr.contains(path), "{stderr}");
-    assert_eq!(stderr.matches(path).count(), 1, "{stderr}");
+    let path = path.display().to_string().escape_debug().to_string();
+    assert!(stderr.contains(&path), "{stderr}");
+    assert_eq!(stderr.matches(path.as_str()).count(), 1, "{stderr}");
     Ok(())
 }
 
 #[test]
 fn reports_malformed_frame_and_fails() -> Result<(), Box<dyn std::error::Error>> {
+    let fixtures = crate::capture_paths::CapturePaths::new()?;
     let output = Command::new(env!("CARGO_BIN_EXE_l2solver"))
-        .args(["inspect", "../../tests/pcaps/short.pcap"])
+        .arg("inspect")
+        .arg(fixtures.path("short.pcap"))
         .output()?;
     assert_eq!(output.status.code(), Some(3));
     let text = String::from_utf8(output.stdout)?;
@@ -67,7 +84,7 @@ fn reports_malformed_frame_and_fails() -> Result<(), Box<dyn std::error::Error>>
 
 #[test]
 fn reports_unsupported_stp_and_fails() -> Result<(), Box<dyn std::error::Error>> {
-    let mut capture = include_bytes!("../../../tests/pcaps/linux-stp.pcap").to_vec();
+    let mut capture = crate::captures::LINUX_STP.to_vec();
     *capture
         .get_mut(24 + 16 + 19)
         .ok_or("missing STP version byte")? = 3;
@@ -80,7 +97,7 @@ fn reports_unsupported_stp_and_fails() -> Result<(), Box<dyn std::error::Error>>
     std::fs::write(&path, capture)?;
 
     let output = Command::new(env!("CARGO_BIN_EXE_l2solver"))
-        .args(["inspect"])
+        .arg("inspect")
         .arg(&path)
         .output()?;
     assert_eq!(output.status.code(), Some(3));
@@ -92,7 +109,7 @@ fn reports_unsupported_stp_and_fails() -> Result<(), Box<dyn std::error::Error>>
 
 #[test]
 fn unknown_ethertype_remains_observable() -> Result<(), Box<dyn Error>> {
-    let mut capture = include_bytes!("../../../tests/pcaps/lldp.pcap").to_vec();
+    let mut capture = crate::captures::LLDP.to_vec();
     capture
         .get_mut(52..54)
         .ok_or("missing EtherType")?
@@ -122,9 +139,18 @@ fn unknown_ethertype_remains_observable() -> Result<(), Box<dyn Error>> {
 
 #[test]
 fn unknown_command_extra_arguments_rejected() -> Result<(), Box<dyn std::error::Error>> {
+    let fixtures = crate::capture_paths::CapturePaths::new()?;
+    let path = fixtures.path("lldp.pcap");
     for args in [
-        vec!["unknown", "../../tests/pcaps/lldp.pcap"],
-        vec!["inspect", "../../tests/pcaps/lldp.pcap", "extra"],
+        vec![
+            std::ffi::OsString::from("unknown"),
+            path.as_os_str().to_owned(),
+        ],
+        vec![
+            std::ffi::OsString::from("inspect"),
+            path.as_os_str().to_owned(),
+            std::ffi::OsString::from("extra"),
+        ],
     ] {
         let output = Command::new(env!("CARGO_BIN_EXE_l2solver"))
             .args(args)
@@ -156,7 +182,7 @@ fn explains_disabled_live_commands() -> Result<(), Box<dyn std::error::Error>> {
 #[cfg(unix)]
 #[test]
 fn closed_pipe_success_requested_line() -> Result<(), Box<dyn Error>> {
-    let source = include_bytes!("../../../tests/pcaps/lldp.pcap");
+    let source = crate::captures::LLDP;
     let header = source.get(..24).ok_or("missing PCAP header")?;
     let record = source.get(24..).ok_or("missing PCAP record")?;
     let directory =

@@ -1,3 +1,8 @@
+#[path = "../../../tests/fixtures/capture_paths.rs"]
+mod capture_paths;
+#[path = "../../../tests/fixtures/captures.rs"]
+pub mod captures;
+
 #[path = "../src/forensic_report.rs"]
 mod forensic_report;
 
@@ -25,13 +30,18 @@ fn parses_relationships() -> Result<(), Box<dyn std::error::Error>> {
 
 #[test]
 fn command_reads_capture_without_case() -> Result<(), Box<dyn std::error::Error>> {
+    let fixtures = crate::capture_paths::CapturePaths::new()?;
     let output = ProcessCommand::new(env!("CARGO_BIN_EXE_l2solver"))
-        .args(["relationships", "../../tests/pcaps/lldp.pcap"])
+        .arg("relationships")
+        .arg(fixtures.path("lldp.pcap"))
         .output()?;
 
     assert!(output.status.success());
     let text = String::from_utf8(output.stdout)?;
-    assert!(text.starts_with("Capture: ../../tests/pcaps/lldp.pcap\nCapture relationships\n"));
+    assert!(text.starts_with(&format!(
+        "Capture: {}\nCapture relationships\n",
+        fixtures.path("lldp.pcap").display().to_string().escape_debug()
+    )));
     assert!(text.contains("Forensic observations"));
     assert!(text.contains("does not establish ownership, delivery, cause, or intent"));
     assert!(!text.contains("graph"));

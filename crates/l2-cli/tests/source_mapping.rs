@@ -1,3 +1,8 @@
+#[path = "../../../tests/fixtures/capture_paths.rs"]
+mod capture_paths;
+#[path = "../../../tests/fixtures/captures.rs"]
+pub mod captures;
+
 use std::process::Command;
 
 use l2_audit::AssessmentProfile;
@@ -35,12 +40,13 @@ fn test_directory() -> Result<std::path::PathBuf, Box<dyn std::error::Error>> {
 
 #[test]
 fn schema_three_uses_source_mapping() -> Result<(), Box<dyn std::error::Error>> {
+    let fixtures = crate::capture_paths::CapturePaths::new()?;
     let directory = test_directory()?;
     let policy = write_policy(&directory)?;
     let result = Command::new(env!("CARGO_BIN_EXE_l2solver"))
+        .arg("assess")
+        .arg(fixtures.path("lldp.pcap"))
         .args([
-            "assess",
-            "../../tests/pcaps/lldp.pcap",
             "--policy",
             policy.to_str().ok_or("non-UTF8 temporary path")?,
             "--source",
@@ -60,12 +66,13 @@ fn schema_three_uses_source_mapping() -> Result<(), Box<dyn std::error::Error>> 
 
 #[test]
 fn schema_three_policy_missing_mapping() -> Result<(), Box<dyn std::error::Error>> {
+    let fixtures = crate::capture_paths::CapturePaths::new()?;
     let directory = test_directory()?;
     let policy = write_policy(&directory)?;
     let result = Command::new(env!("CARGO_BIN_EXE_l2solver"))
+        .arg("assess")
+        .arg(fixtures.path("lldp.pcap"))
         .args([
-            "assess",
-            "../../tests/pcaps/lldp.pcap",
             "--policy",
             policy.to_str().ok_or("non-UTF8 temporary path")?,
         ])

@@ -25,6 +25,14 @@ fn vcs_secret_paths() {
         "pcap_samples/local/lab/capture.pcapng",
         "pcap_samples/2025/sample/runs/index/index.sqlite",
         "pcap_samples/2025/sample/capture.pcap",
+        "pcap_samples/2025/sample/source.json",
+        "pcap_samples/kbandla-pcaps.json",
+        "pcap_samples",
+        "tests/pcaps",
+        "tests/pcaps/README.md",
+        "tests/pcaps/manifest.json",
+        "review",
+        "review/notes.txt",
         "capture.pcap",
         "capture.PCAP",
         "capture.pcapng",
@@ -53,12 +61,7 @@ fn vcs_secret_paths() {
         "crates/l2-core/src/lib.rs",
         "docs/investigations.md",
         "benchmarks/runner/capture.py",
-        "pcap_samples/kbandla-pcaps.json",
-        "pcap_samples/wireshark/http-chunked-gzip/source.json",
-        "tests/pcaps/short.pcap",
-        "tests/pcaps/fixture.PCAP",
-        "tests/pcaps/manifest.json",
-        "tests/pcaps/README.md",
+        "tests/fixtures/captures.rs",
         "docs/profiles/bloat-review5.txt",
         "docs/reference.zip",
         "docs/profiles/hyperfine-review5.json",
@@ -69,34 +72,27 @@ fn vcs_secret_paths() {
 }
 
 #[test]
-fn compressed_partial_source_visibility() {
+fn captures_are_excluded_at_any_depth_without_hiding_source_files() {
     for path in [
-        "pcap_samples/capture.pcap.gz",
-        "pcap_samples/2025/sample/capture.pcapng.gz",
-        "pcap_samples/2025/sample/capture.cap.bz2",
-        "pcap_samples/2025/sample/capture.pcap.xz",
-        "pcap_samples/2025/sample/capture.pcapng.zst",
-        "pcap_samples/2025/sample/capture.pcap.lz4",
-        "pcap_samples/2025/sample/captures.zip",
-        "pcap_samples/2025/sample/captures.7z",
-        "pcap_samples/2025/sample/CAPTURE.PCAPNG.GZ",
-        "pcap_samples/2025/sample/capture.pcap.part",
-        "pcap_samples/2025/sample/capture.pcap.gz.partial",
-        "pcap_samples/2025/sample/Unconfirmed 12345.crdownload",
-        "pcap_samples/2025/sample/capture.pcapng.download",
+        "root.pcap",
+        "nested/input.PCAP",
+        "one/two/packet.pCaPnG",
+        "tests/fixtures/packet.CaP",
+        "tests/pcaps/fixture.pcap",
+        "pcap_samples/source.json",
+        "review/review-notes.md",
     ] {
         assert!(is_excluded_path(Path::new(path)), "{path}");
     }
 
-    // Metadata and fixtures remain eligible even when their names mention captures
+    // Similar source names remain eligible outside the private directories
     for path in [
-        "pcap_samples/2025/sample/source.json",
-        "pcap_samples/2025/sample/capture.pcap.gz.json",
-        "pcap_samples/2025/sample/archive.zip.md",
-        "pcap_samples/2025/sample/partial-downloads.md",
-        "pcap_samples/2025/sample/gzip-notes.txt",
-        "tests/pcaps/capture.pcap.gz",
-        "tests/pcaps/unfinished.pcap.part",
+        "tests/fixtures/captures.rs",
+        "tests/pcaps.rs",
+        "pcap_samples.rs",
+        "review.rs",
+        "nested/capture.pcap.rs",
+        "nested/capture.cap.json",
         "docs/archives/reference.zip",
         "docs/downloads/example.crdownload",
     ] {
@@ -106,14 +102,25 @@ fn compressed_partial_source_visibility() {
 
 #[test]
 #[cfg(unix)]
-fn root_captures_excluded_fixtures_kept() -> Result<(), Box<dyn std::error::Error>> {
-    let root = test_root("root-captures")?;
+fn capture_files_and_private_directories_are_excluded_from_packages()
+-> Result<(), Box<dyn std::error::Error>> {
+    let root = test_root("capture-exclusion")?;
     create_file(&root.join("capture.PCAP"), b"root capture")?;
     create_file(&root.join("capture.pcapng"), b"root capture")?;
     create_file(&root.join("capture.CaP"), b"root capture")?;
     create_file(&root.join("tests/pcaps/fixture.pcap"), b"fixture capture")?;
     create_file(&root.join("tests/pcaps/manifest.json"), b"{}")?;
     create_file(&root.join("tests/pcaps/README.md"), b"fixture notes")?;
+    create_file(&root.join("nested/capture.pCaPnG"), b"nested capture")?;
+    create_file(&root.join("nested/input.CAP"), b"nested capture")?;
+    create_file(&root.join("pcap_samples/source.json"), b"private metadata")?;
+    create_file(&root.join("review/notes.txt"), b"private review")?;
+    // Excluded directories must not be traversed even when they contain a symlink
+    std::os::unix::fs::symlink("missing", root.join("review/alias"))?;
+    create_file(
+        &root.join("tests/fixtures/captures.rs"),
+        b"// fixture source",
+    )?;
     create_file(&root.join("docs/reference.zip"), b"reference archive")?;
 
     let entries = collect_entries(&root)?;
@@ -125,9 +132,7 @@ fn root_captures_excluded_fixtures_kept() -> Result<(), Box<dyn std::error::Erro
         paths,
         vec![
             String::from("docs/reference.zip"),
-            String::from("tests/pcaps/README.md"),
-            String::from("tests/pcaps/fixture.pcap"),
-            String::from("tests/pcaps/manifest.json"),
+            String::from("tests/fixtures/captures.rs"),
         ]
     );
     remove_test_root(&root)?;
@@ -201,7 +206,6 @@ fn package_skips_secrets_and_sorts() -> Result<(), Box<dyn std::error::Error>> {
         vec![
             String::from("a.txt"),
             String::from("marker.rs"),
-            String::from("pcap_samples/2025/sample/source.json"),
             String::from("z.txt")
         ]
     );

@@ -1,3 +1,6 @@
+#[path = "../../../tests/fixtures/captures.rs"]
+pub mod captures;
+
 use std::{error::Error, process::Command};
 
 #[test]
@@ -73,10 +76,9 @@ fn paged_cases_conditions_conflicting_manifest() -> Result<(), Box<dyn Error>> {
         3,
         false,
     );
-    let packet =
-        l2_pcap::CaptureReader::new(include_bytes!("../../../tests/pcaps/lldp.pcap").as_slice())?
-            .next_packet()?
-            .ok_or("missing fixture packet")?;
+    let packet = l2_pcap::CaptureReader::new(crate::captures::LLDP)?
+        .next_packet()?
+        .ok_or("missing fixture packet")?;
     let time = packet
         .metadata()
         .timestamp()

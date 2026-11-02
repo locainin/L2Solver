@@ -1,3 +1,8 @@
+#[path = "../../../tests/fixtures/capture_paths.rs"]
+mod capture_paths;
+#[path = "../../../tests/fixtures/captures.rs"]
+pub mod captures;
+
 use l2_capture::{
     CaptureMetadata, CaptureTimestamp, CapturedFrame, Direction, FcsStatus, InterfaceId,
     TimestampResolution, TimestampSource,
@@ -85,25 +90,30 @@ fn write_two_source_capture(
 
 #[test]
 fn baseline_create_and_compare() -> Result<(), Box<dyn Error>> {
+    let fixtures = crate::capture_paths::CapturePaths::new()?;
     let directory = std::env::temp_dir().join(format!("l2solver-baseline-{}", std::process::id()));
     std::fs::create_dir(&directory)?;
     let baseline = directory.join("office.json");
     let create = || {
         Command::new(env!("CARGO_BIN_EXE_l2solver"))
-            .args(["baseline", "create", "../../tests/pcaps/lldp.pcap"])
+            .args(["baseline", "create"])
+            .arg(fixtures.path("lldp.pcap"))
             .arg(&baseline)
             .output()
     };
     let created = create()?;
     assert!(created.status.success());
-    assert!(String::from_utf8(created.stdout)?.contains(&baseline.display().to_string()));
+    assert!(
+        String::from_utf8(created.stdout)?
+            .contains(&baseline.display().to_string().escape_debug().to_string())
+    );
     let original = std::fs::read(&baseline)?;
     assert_eq!(create()?.status.code(), Some(1));
     assert_eq!(std::fs::read(&baseline)?, original);
     let same = Command::new(env!("CARGO_BIN_EXE_l2solver"))
         .args(["baseline", "compare"])
         .arg(&baseline)
-        .arg("../../tests/pcaps/lldp.pcap")
+        .arg(fixtures.path("lldp.pcap"))
         .output()?;
     assert!(same.status.success());
     let same_text = String::from_utf8(same.stdout)?;
@@ -112,7 +122,7 @@ fn baseline_create_and_compare() -> Result<(), Box<dyn Error>> {
     let changed = Command::new(env!("CARGO_BIN_EXE_l2solver"))
         .args(["baseline", "compare"])
         .arg(&baseline)
-        .arg("../../tests/pcaps/linux-stp.pcap")
+        .arg(fixtures.path("linux-stp.pcap"))
         .output()?;
     assert_eq!(changed.status.code(), Some(0));
     let text = String::from_utf8(changed.stdout)?;
@@ -167,6 +177,7 @@ fn stable_labels_survive_idb_reordering() -> Result<(), Box<dyn Error>> {
 
 #[test]
 fn baseline_rejects_unobserved_source_mapping() -> Result<(), Box<dyn Error>> {
+    let fixtures = crate::capture_paths::CapturePaths::new()?;
     let directory = std::env::temp_dir().join(format!(
         "l2solver-baseline-unobserved-source-{}",
         std::process::id()
@@ -175,7 +186,8 @@ fn baseline_rejects_unobserved_source_mapping() -> Result<(), Box<dyn Error>> {
     let baseline = directory.join("baseline.json");
 
     let output = Command::new(env!("CARGO_BIN_EXE_l2solver"))
-        .args(["baseline", "create", "../../tests/pcaps/lldp.pcap"])
+        .args(["baseline", "create"])
+        .arg(fixtures.path("lldp.pcap"))
         .arg(&baseline)
         .args(["--source", "0:0=desk-a", "--source", "9:9=typo"])
         .output()?;
@@ -222,7 +234,7 @@ fn baseline_preserves_stp_identity_fields() -> Result<(), Box<dyn Error>> {
     std::fs::create_dir(&directory)?;
     let capture = directory.join("stp.pcap");
     let baseline = directory.join("stp.json");
-    let mut bytes = include_bytes!("../../../tests/pcaps/linux-stp.pcap").to_vec();
+    let mut bytes = crate::captures::LINUX_STP.to_vec();
     // Set the first root bridge's extension while leaving its priority bits unchanged
     *bytes.get_mut(24 + 16 + 23).ok_or("root bridge extension")? = 1;
     std::fs::write(&capture, bytes)?;
@@ -254,6 +266,7 @@ fn baseline_preserves_stp_identity_fields() -> Result<(), Box<dyn Error>> {
 
 #[test]
 fn incomplete_compare_never_claims_unchanged() -> Result<(), Box<dyn Error>> {
+    let fixtures = crate::capture_paths::CapturePaths::new()?;
     let directory = std::env::temp_dir().join(format!(
         "l2solver-baseline-compare-quality-{}",
         std::process::id()
@@ -264,9 +277,7 @@ fn incomplete_compare_never_claims_unchanged() -> Result<(), Box<dyn Error>> {
     std::fs::write(&baseline, br#"{"schema_version":2,"facts":[]}"#)?;
     std::fs::write(
         &empty_capture,
-        include_bytes!("../../../tests/pcaps/lldp.pcap")
-            .get(..24)
-            .ok_or("header")?,
+        crate::captures::LLDP.get(..24).ok_or("header")?,
     )?;
 
     let empty = Command::new(env!("CARGO_BIN_EXE_l2solver"))
@@ -280,7 +291,7 @@ fn incomplete_compare_never_claims_unchanged() -> Result<(), Box<dyn Error>> {
     let incomplete = Command::new(env!("CARGO_BIN_EXE_l2solver"))
         .args(["baseline", "compare"])
         .arg(&baseline)
-        .arg("../../tests/pcaps/short.pcap")
+        .arg(fixtures.path("short.pcap"))
         .output()?;
     assert_eq!(incomplete.status.code(), Some(3));
     assert!(String::from_utf8(incomplete.stdout)?.contains("Collection is incomplete"));
@@ -304,9 +315,7 @@ fn incomplete_compare_shows_retained_differences() -> Result<(), Box<dyn Error>>
     )?;
     std::fs::write(
         &empty_capture,
-        include_bytes!("../../../tests/pcaps/lldp.pcap")
-            .get(..24)
-            .ok_or("header")?,
+        crate::captures::LLDP.get(..24).ok_or("header")?,
     )?;
 
     let comparison = Command::new(env!("CARGO_BIN_EXE_l2solver"))
@@ -336,9 +345,7 @@ mod broken_pipe_outcomes {
         write_large_baseline(&baseline)?;
         std::fs::write(
             &capture,
-            include_bytes!("../../../tests/pcaps/lldp.pcap")
-                .get(..24)
-                .ok_or("capture header")?,
+            crate::captures::LLDP.get(..24).ok_or("capture header")?,
         )?;
 
         let mut command = Command::new(env!("CARGO_BIN_EXE_l2solver"));
@@ -355,6 +362,7 @@ mod broken_pipe_outcomes {
 
     #[test]
     fn changed_compare_keeps_ci_status() -> Result<(), Box<dyn Error>> {
+        let fixtures = crate::capture_paths::CapturePaths::new()?;
         let directory = temporary_directory("changed")?;
         let baseline = directory.join("baseline.json");
         write_large_baseline(&baseline)?;
@@ -363,7 +371,7 @@ mod broken_pipe_outcomes {
         command
             .args(["baseline", "compare"])
             .arg(&baseline)
-            .arg("../../tests/pcaps/linux-stp.pcap")
+            .arg(fixtures.path("linux-stp.pcap"))
             .arg("--fail-on-change");
         let status = run_closed(&mut command)?;
 
@@ -412,12 +420,14 @@ mod broken_pipe_outcomes {
 
 #[test]
 fn invalid_capture_not_create_baseline() -> Result<(), Box<dyn Error>> {
+    let fixtures = crate::capture_paths::CapturePaths::new()?;
     let directory =
         std::env::temp_dir().join(format!("l2solver-baseline-invalid-{}", std::process::id()));
     std::fs::create_dir(&directory)?;
     let baseline = directory.join("invalid.json");
     let output = Command::new(env!("CARGO_BIN_EXE_l2solver"))
-        .args(["baseline", "create", "../../tests/pcaps/short.pcap"])
+        .args(["baseline", "create"])
+        .arg(fixtures.path("short.pcap"))
         .arg(&baseline)
         .output()?;
     assert_eq!(output.status.code(), Some(1));
@@ -433,12 +443,7 @@ fn empty_cannot_comparable_baseline() -> Result<(), Box<dyn Error>> {
     std::fs::create_dir(&directory)?;
     let input = directory.join("empty.pcap");
     let baseline = directory.join("empty.json");
-    std::fs::write(
-        &input,
-        include_bytes!("../../../tests/pcaps/lldp.pcap")
-            .get(..24)
-            .ok_or("header")?,
-    )?;
+    std::fs::write(&input, crate::captures::LLDP.get(..24).ok_or("header")?)?;
     let output = Command::new(env!("CARGO_BIN_EXE_l2solver"))
         .args(["baseline", "create"])
         .arg(input)

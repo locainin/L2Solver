@@ -1,4 +1,4 @@
-use super::common::{LINUX_STP_PCAP, captured, ethernet_frame, frame};
+use super::common::{LINUX_STP_PCAP, STP_FIXTURE_MAC, captured, ethernet_frame, frame};
 use l2_audit::{Policy, Survey, Verdict};
 
 fn stp_configuration_frame(root_bridge: [u8; 8]) -> Vec<u8> {
@@ -56,7 +56,7 @@ fn later_expected_root_earlier_violation() -> Result<(), Box<dyn std::error::Err
     survey.observe(&unexpected)?;
     survey.observe(&original)?;
     let report = survey.finish(&Policy {
-        expected_stp_root: Some("36:09:f1:ae:e3:29".into()),
+        expected_stp_root: Some(STP_FIXTURE_MAC.into()),
         ..Policy::default()
     })?;
     assert!(report.findings.iter().any(|f| f.check_id == "STP-002"
@@ -120,7 +120,7 @@ fn history_keeps_priority_and_extension() -> Result<(), Box<dyn std::error::Erro
             .root
             .mac
             .as_str(),
-        "36:09:f1:ae:e3:29"
+        STP_FIXTURE_MAC
     );
     assert_eq!(
         interface
@@ -130,7 +130,7 @@ fn history_keeps_priority_and_extension() -> Result<(), Box<dyn std::error::Erro
             .root
             .mac
             .as_str(),
-        "36:09:f1:ae:e3:29"
+        STP_FIXTURE_MAC
     );
     Ok(())
 }

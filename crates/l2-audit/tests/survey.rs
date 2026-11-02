@@ -1,3 +1,6 @@
+#[path = "../../../tests/fixtures/captures.rs"]
+pub mod captures;
+
 #[path = "survey/common.rs"]
 mod common;
 #[path = "survey/errors.rs"]

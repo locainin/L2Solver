@@ -1,3 +1,8 @@
+#[path = "../../../tests/fixtures/capture_paths.rs"]
+mod capture_paths;
+#[path = "../../../tests/fixtures/captures.rs"]
+pub mod captures;
+
 use std::{error::Error, process::Command};
 
 mod text {
@@ -5,8 +10,11 @@ mod text {
 
     #[test]
     fn separates_exposure_and_isolation_status() -> Result<(), Box<dyn Error>> {
+        let fixtures = crate::capture_paths::CapturePaths::new()?;
         let output = Command::new(env!("CARGO_BIN_EXE_l2solver"))
-            .args(["survey", "../../tests/pcaps/lldp.pcap", "-v"])
+            .arg("survey")
+            .arg(fixtures.path("lldp.pcap"))
+            .arg("-v")
             .output()?;
         assert!(output.status.success());
         let text = String::from_utf8(output.stdout)?;
@@ -20,13 +28,11 @@ mod text {
 
     #[test]
     fn renders_expected_text_sections() -> Result<(), Box<dyn Error>> {
+        let fixtures = crate::capture_paths::CapturePaths::new()?;
         let output = Command::new(env!("CARGO_BIN_EXE_l2solver"))
-            .args([
-                "survey",
-                "../../tests/pcaps/linux-stp.pcap",
-                "-vv",
-                "--evidence",
-            ])
+            .arg("survey")
+            .arg(fixtures.path("linux-stp.pcap"))
+            .args(["-vv", "--evidence"])
             .output()?;
         assert!(output.status.success());
         let text = String::from_utf8(output.stdout)?;
@@ -51,6 +57,7 @@ mod policy {
 
     #[test]
     fn policy_failure_ci_exit_mode() -> Result<(), Box<dyn Error>> {
+        let fixtures = crate::capture_paths::CapturePaths::new()?;
         let directory =
             std::env::temp_dir().join(format!("l2solver-survey-finding-{}", std::process::id()));
         std::fs::create_dir(&directory)?;
@@ -58,7 +65,8 @@ mod policy {
         std::fs::write(&policy, br#"{"allow_untagged":false}"#)?;
 
         let output = Command::new(env!("CARGO_BIN_EXE_l2solver"))
-            .args(["survey", "../../tests/pcaps/lldp.pcap"])
+            .arg("survey")
+            .arg(fixtures.path("lldp.pcap"))
             .arg("--policy")
             .arg(&policy)
             .output()?;
@@ -67,7 +75,9 @@ mod policy {
         assert!(String::from_utf8(output.stdout)?.contains("VLAN-002"));
 
         let ci = Command::new(env!("CARGO_BIN_EXE_l2solver"))
-            .args(["assess", "../../tests/pcaps/lldp.pcap", "--policy"])
+            .arg("assess")
+            .arg(fixtures.path("lldp.pcap"))
+            .arg("--policy")
             .arg(&policy)
             .arg("--ci")
             .output()?;
@@ -84,13 +94,11 @@ mod json {
 
     #[test]
     fn keeps_evidence_and_excludes_passes() -> Result<(), Box<dyn Error>> {
+        let fixtures = crate::capture_paths::CapturePaths::new()?;
         let output = Command::new(env!("CARGO_BIN_EXE_l2solver"))
-            .args([
-                "survey",
-                "../../tests/pcaps/linux-stp.pcap",
-                "--format",
-                "json",
-            ])
+            .arg("survey")
+            .arg(fixtures.path("linux-stp.pcap"))
+            .args(["--format", "json"])
             .output()?;
         assert!(output.status.success());
         let report: serde_json::Value = serde_json::from_slice(&output.stdout)?;
@@ -142,15 +150,11 @@ mod json {
 
     #[test]
     fn full_profile_recorded_planned() -> Result<(), Box<dyn Error>> {
+        let fixtures = crate::capture_paths::CapturePaths::new()?;
         let output = Command::new(env!("CARGO_BIN_EXE_l2solver"))
-            .args([
-                "assess",
-                "../../tests/pcaps/lldp.pcap",
-                "--profile",
-                "full",
-                "--format",
-                "json",
-            ])
+            .arg("assess")
+            .arg(fixtures.path("lldp.pcap"))
+            .args(["--profile", "full", "--format", "json"])
             .output()?;
         assert!(output.status.success());
         let report: serde_json::Value = serde_json::from_slice(&output.stdout)?;
@@ -189,7 +193,7 @@ mod identity {
 
     #[test]
     fn preserves_outer_and_claimed_macs() -> Result<(), Box<dyn Error>> {
-        let source = include_bytes!("../../../tests/pcaps/lldp.pcap");
+        let source = crate::captures::LLDP;
         let mut capture = source
             .get(..24)
             .ok_or("missing PCAP global header")?
@@ -238,19 +242,22 @@ mod policy_errors {
 
     #[test]
     fn policy_typos_malformed_capture_fail() -> Result<(), Box<dyn Error>> {
+        let fixtures = crate::capture_paths::CapturePaths::new()?;
         let directory =
             std::env::temp_dir().join(format!("l2solver-survey-policy-{}", std::process::id()));
         std::fs::create_dir(&directory)?;
         let policy = directory.join("policy.json");
         std::fs::write(&policy, br#"{"alowed_vlans":[10]}"#)?;
         let output = Command::new(env!("CARGO_BIN_EXE_l2solver"))
-            .args(["survey", "../../tests/pcaps/lldp.pcap"])
+            .arg("survey")
+            .arg(fixtures.path("lldp.pcap"))
             .arg("--policy")
             .arg(&policy)
             .output()?;
         assert_eq!(output.status.code(), Some(1));
         let output = Command::new(env!("CARGO_BIN_EXE_l2solver"))
-            .args(["survey", "../../tests/pcaps/short.pcap"])
+            .arg("survey")
+            .arg(fixtures.path("short.pcap"))
             .output()?;
         assert_eq!(output.status.code(), Some(3));
         std::fs::remove_dir_all(directory)?;
@@ -263,8 +270,11 @@ mod html {
 
     #[test]
     fn renders_standalone_escaped_html() -> Result<(), Box<dyn Error>> {
+        let fixtures = crate::capture_paths::CapturePaths::new()?;
         let output = Command::new(env!("CARGO_BIN_EXE_l2solver"))
-            .args(["survey", "../../tests/pcaps/lldp.pcap", "--format", "html"])
+            .arg("survey")
+            .arg(fixtures.path("lldp.pcap"))
+            .args(["--format", "html"])
             .output()?;
         assert!(output.status.success());
         let text = String::from_utf8(output.stdout)?;
@@ -281,7 +291,7 @@ mod resource_limits {
 
     #[test]
     fn bounds_embedded_bytes_before_output() -> Result<(), Box<dyn Error>> {
-        let source = include_bytes!("../../../tests/pcaps/lldp.pcap");
+        let source = crate::captures::LLDP;
         let mut capture = source
             .get(..24)
             .ok_or("missing PCAP global header")?
@@ -354,7 +364,7 @@ mod resource_limits {
 
     #[test]
     fn over_budget_without_partial_output() -> Result<(), Box<dyn Error>> {
-        let source = include_bytes!("../../../tests/pcaps/lldp.pcap");
+        let source = crate::captures::LLDP;
         let mut capture = source
             .get(..24)
             .ok_or("missing PCAP global header")?
@@ -421,7 +431,7 @@ mod inventory {
 
     #[test]
     fn limit_returns_incomplete() -> Result<(), Box<dyn Error>> {
-        let source = include_bytes!("../../../tests/pcaps/lldp.pcap");
+        let source = crate::captures::LLDP;
         let mut capture = source
             .get(..24)
             .ok_or("missing PCAP global header")?

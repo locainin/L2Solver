@@ -1,6 +1,9 @@
 use l2_audit::{EvidenceLocator, Policy, ResourceLimit, Survey, SurveyLimits};
 use l2_capture::{CaptureMetadata, CapturedFrame, InterfaceId};
 
+#[path = "../../../tests/fixtures/captures.rs"]
+pub mod captures;
+
 fn ethernet_frame(source_suffix: u16) -> Result<CapturedFrame, Box<dyn std::error::Error>> {
     let [high, low] = source_suffix.to_be_bytes();
     let mut bytes = vec![0; 10];
@@ -49,8 +52,7 @@ fn keeps_collecting_after_evidence_saturation() -> Result<(), Box<dyn std::error
 
 #[test]
 fn evidence_reference_preserves_capture_location() -> Result<(), Box<dyn std::error::Error>> {
-    let bytes = include_bytes!("../../../tests/pcaps/lldp.pcap");
-    let mut reader = l2_pcap::CaptureReader::new(bytes.as_slice())?;
+    let mut reader = l2_pcap::CaptureReader::new(captures::LLDP)?;
     let packet = reader.next_packet()?.ok_or("missing packet")?;
     let mut survey = Survey::new();
     survey.observe(&packet)?;

@@ -112,10 +112,10 @@ fn report_json(path: &Path, output: &mut impl Write) -> Result<(), Box<dyn Error
 
 #[cfg(feature = "dev-fixtures")]
 fn fixture(name: &str, output: &mut impl Write) -> Result<(), Box<dyn Error>> {
-    // Embedded fixtures avoid path traversal through developer-provided names
+    // Generated fixtures avoid file reads and path traversal through fixture names
     let bytes: &[u8] = match name {
-        "lldp" => include_bytes!("../../../tests/pcaps/lldp.pcap"),
-        "linux-stp" => include_bytes!("../../../tests/pcaps/linux-stp.pcap"),
+        "lldp" => crate::capture_fixtures::LLDP,
+        "linux-stp" => crate::capture_fixtures::LINUX_STP,
         _ => return Err("unknown fixture; available fixtures: lldp, linux-stp".into()),
     };
     writeln!(

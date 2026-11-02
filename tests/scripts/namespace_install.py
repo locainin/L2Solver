@@ -7,6 +7,10 @@ import shutil
 import subprocess
 import sys
 
+# Use the same synthetic HTTP builder as package qualification
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+from benchmarks.qualification.fixture import http_capture
+
 
 def run(command, *, success=True):
     result = subprocess.run(command, text=True, capture_output=True, check=False)
@@ -30,7 +34,7 @@ def real_lifecycle(root, checkout, payload, selection, execute, publish, cap, re
     for name, address in (("l2left", "198.18.0.1/24"), ("l2right", "198.18.0.2/24")):
         run(["ip", "address", "add", address, "dev", name])
         run(["ip", "link", "set", "dev", name, "up"])
-    shutil.copyfile(checkout / "tests/pcaps/lldp.pcap", root / "stage/lldp.pcap")
+    (root / "stage/synthetic.pcap").write_bytes(http_capture())
     for shell in ("bash", "zsh", "fish"):
         completion = unprivileged("/stage/payload/l2solver", "completions", shell).stdout
         (payload / shell).write_text(completion)
@@ -42,7 +46,7 @@ def real_lifecycle(root, checkout, payload, selection, execute, publish, cap, re
     assert first.rsplit("/", 1)[0] == first_helper.rsplit("/", 1)[0]
     assert "l2solver " in unprivileged("l2solver", "--version").stdout
     assert "l2solver-active " in unprivileged("l2solver-active", "--version").stdout
-    assert "LLDP Valid" in unprivileged("l2solver", "inspect", "/stage/lldp.pcap").stdout
+    assert "IP 192.0.2.10 -> 192.0.2.20 protocol=6" in unprivileged("l2solver", "inspect", "/stage/synthetic.pcap").stdout
     assert "arp" in unprivileged("l2solver", "active", "--help").stdout
     for shell, path in (
         ("bash", "/local/share/custom/bash/l2solver"),
@@ -68,7 +72,7 @@ def real_lifecycle(root, checkout, payload, selection, execute, publish, cap, re
     assert not cap(first_helper)
     assert not cap(resolved("/local/bin/l2solver"))
     assert not cap(resolved("/local/bin/l2solver-active"))
-    assert "LLDP Valid" in unprivileged("l2solver", "inspect", "/stage/lldp.pcap").stdout
+    assert "IP 192.0.2.10 -> 192.0.2.20 protocol=6" in unprivileged("l2solver", "inspect", "/stage/synthetic.pcap").stdout
     result = unprivileged("l2solver-active", *probe, success=None)
     assert result.returncode in (0, 3), result.stderr
     assert "198.18.0.2" in result.stdout
@@ -92,7 +96,7 @@ def real_lifecycle(root, checkout, payload, selection, execute, publish, cap, re
         "local/share/custom/zsh/_l2solver", "local/share/custom/fish/l2solver.fish",
     ):
         assert not os.path.lexists(root / path)
-    assert (root / "stage/lldp.pcap").is_file()
+    assert (root / "stage/synthetic.pcap").is_file()
     print("real executable installer lifecycle passed")
 
 

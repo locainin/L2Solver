@@ -1,3 +1,6 @@
+#[path = "../../../tests/fixtures/captures.rs"]
+pub mod captures;
+
 #[path = "../src/inspect.rs"]
 mod inspect;
 #[path = "../src/render.rs"]
@@ -13,8 +16,7 @@ use l2_io::{FakeLink, Packet};
 fn counts_loss_continues_malformed() -> Result<(), Box<dyn std::error::Error>> {
     let mut source = FakeLink::default();
     source.push_rx(packet(vec![0], 60)?)?;
-    let mut capture =
-        l2_pcap::CaptureReader::new(include_bytes!("../../../tests/pcaps/lldp.pcap").as_slice())?;
+    let mut capture = l2_pcap::CaptureReader::new(crate::captures::LLDP)?;
     source.push_rx(capture.next_packet()?.ok_or("missing fixture frame")?)?;
     let mut output = Vec::new();
     let summary = inspect::inspect(&mut source, &mut output)?;

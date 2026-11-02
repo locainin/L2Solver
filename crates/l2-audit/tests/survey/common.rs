@@ -1,8 +1,10 @@
 use l2_capture::{CaptureMetadata, CapturedFrame, InterfaceId};
 
-// Shared captures keep path resolution in one place after the suite is split
-pub const LLDP_PCAP: &[u8] = include_bytes!("../../../../tests/pcaps/lldp.pcap");
-pub const LINUX_STP_PCAP: &[u8] = include_bytes!("../../../../tests/pcaps/linux-stp.pcap");
+// Shared names keep fixture access consistent across the survey suite
+pub use super::captures::{LINUX_STP as LINUX_STP_PCAP, LLDP as LLDP_PCAP};
+
+// The synthetic STP source and root share this locally administered address
+pub const STP_FIXTURE_MAC: &str = "02:00:00:00:00:02";
 
 pub fn frame(bytes: Vec<u8>, original: u32) -> Result<CapturedFrame, l2_capture::FrameError> {
     CapturedFrame::new(

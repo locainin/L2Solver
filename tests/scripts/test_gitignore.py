@@ -19,7 +19,7 @@ def repository(tmp_path):
 
 
 @pytest.mark.parametrize("directory", [
-    "pcap_samples", "review", "docs", "notes", "reports", "investigations",
+    "pcap_samples", "tests/pcaps", "review", "docs", "notes", "reports", "investigations",
 ])
 def test_private_directories_ignore_arbitrary_nested_files(repository, directory):
     result = subprocess.run(
@@ -51,7 +51,7 @@ def test_source_and_deliberate_binary_fixtures_remain_trackable(repository):
     paths = [
         "Cargo.toml", "Cargo.lock", "NOTICE-JEMALLOC.txt", "scripts/install.sh",
         "crates/l2-cli/src/main.rs", "fuzz/fuzz_targets/ethernet.rs",
-        "tests/pcaps/lldp.pcap", "crates/l2-active/tests/dhcp/fixtures/offer.bin",
+        "tests/fixtures/captures.rs", "crates/l2-active/tests/dhcp/fixtures/offer.bin",
         "benchmarks/package_release.py", ".github/workflows/release-linux.yml",
         "crates/example/review/input.bin", "crates/example/docs/input.bin",
     ]
@@ -61,3 +61,16 @@ def test_source_and_deliberate_binary_fixtures_remain_trackable(repository):
     )
     assert result.returncode == 1, result.stderr
     assert result.stdout == ""
+
+
+@pytest.mark.parametrize("path", [
+    "sample.pcap", "sample.PCAPNG", "sample.CaP",
+    "tests/fixtures/sample.pcap", "crates/example/sample.PcApNg",
+    "nested/deeper/sample.cap",
+])
+def test_capture_files_are_ignored_at_every_directory_depth(repository, path):
+    result = subprocess.run(
+        ["git", "-c", "core.excludesFile=", "check-ignore", "--no-index", path],
+        cwd=repository, capture_output=True, text=True,
+    )
+    assert result.returncode == 0, result.stderr

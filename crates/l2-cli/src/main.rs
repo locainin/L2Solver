@@ -10,6 +10,9 @@ mod baseline_model;
 mod bounded_json;
 mod cache_cli;
 mod capture_compare;
+#[cfg(any(test, feature = "dev-fixtures"))]
+#[path = "../../../tests/fixtures/captures.rs"]
+pub mod capture_fixtures;
 mod capture_tcp;
 mod case_snapshot;
 mod completion;

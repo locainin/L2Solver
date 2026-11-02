@@ -1,13 +1,23 @@
+#[path = "../../../tests/fixtures/capture_paths.rs"]
+mod capture_paths;
+#[path = "../../../tests/fixtures/captures.rs"]
+pub mod captures;
+
 use std::process::{Command, Stdio};
 
 #[test]
 fn reports_no_stp_without_verdict() -> Result<(), Box<dyn std::error::Error>> {
+    let fixtures = crate::capture_paths::CapturePaths::new()?;
     let output = Command::new(env!("CARGO_BIN_EXE_l2solver"))
-        .args(["observe", "../../tests/pcaps/lldp.pcap"])
+        .arg("observe")
+        .arg(fixtures.path("lldp.pcap"))
         .output()?;
     assert!(output.status.success());
     let text = String::from_utf8(output.stdout)?;
-    assert!(text.contains("Capture: ../../tests/pcaps/lldp.pcap"));
+    assert!(text.contains(&format!(
+        "Capture: {}",
+        fixtures.path("lldp.pcap").display().to_string().escape_debug()
+    )));
     assert!(text.contains("frames=1 stp=0"));
     assert!(text.contains("timestamp_regressions=0 missing_timestamps=0"));
     assert!(text.contains("STP observation: complete"));
@@ -16,13 +26,15 @@ fn reports_no_stp_without_verdict() -> Result<(), Box<dyn std::error::Error>> {
 }
 
 #[test]
-fn matches_tshark_stp_fields() -> Result<(), Box<dyn std::error::Error>> {
+fn reports_expected_synthetic_stp_fields() -> Result<(), Box<dyn std::error::Error>> {
+    let fixtures = crate::capture_paths::CapturePaths::new()?;
     let output = Command::new(env!("CARGO_BIN_EXE_l2solver"))
-        .args(["observe", "../../tests/pcaps/linux-stp.pcap"])
+        .arg("observe")
+        .arg(fixtures.path("linux-stp.pcap"))
         .output()?;
     assert!(output.status.success());
     let text = String::from_utf8(output.stdout)?;
-    assert!(text.contains("36:09:f1:ae:e3:29 (priority=32768 extension=0)"));
+    assert!(text.contains("02:00:00:00:00:02 (priority=32768 extension=0)"));
     assert!(text.contains("frames=1 stp=1"));
     assert!(text.contains("event=1 time=0ns"));
     Ok(())
@@ -30,7 +42,7 @@ fn matches_tshark_stp_fields() -> Result<(), Box<dyn std::error::Error>> {
 
 #[test]
 fn reports_replay_time_regressions() -> Result<(), Box<dyn std::error::Error>> {
-    let source = include_bytes!("../../../tests/pcaps/linux-stp.pcap");
+    let source = crate::captures::LINUX_STP;
     let header = source.get(..24).ok_or("missing PCAP header")?;
     let record = source.get(24..).ok_or("missing PCAP record")?;
     let directory =
@@ -43,7 +55,7 @@ fn reports_replay_time_regressions() -> Result<(), Box<dyn std::error::Error>> {
     ] {
         let mut capture = header.to_vec();
         for seconds in [1_u32, second, second + 1] {
-            // Keep kernel frame bytes intact and alter only record timestamps
+            // Keep generated frame bytes intact and alter only record timestamps
             let record_start = capture.len();
             capture.extend_from_slice(&seconds.to_le_bytes());
             capture.extend_from_slice(&0_u32.to_le_bytes());
@@ -75,8 +87,10 @@ fn reports_replay_time_regressions() -> Result<(), Box<dyn std::error::Error>> {
 
 #[test]
 fn malformed_capture_returns_incomplete() -> Result<(), Box<dyn std::error::Error>> {
+    let fixtures = crate::capture_paths::CapturePaths::new()?;
     let output = Command::new(env!("CARGO_BIN_EXE_l2solver"))
-        .args(["observe", "../../tests/pcaps/short.pcap"])
+        .arg("observe")
+        .arg(fixtures.path("short.pcap"))
         .output()?;
     assert_eq!(output.status.code(), Some(3));
     let text = String::from_utf8(output.stdout)?;
@@ -89,7 +103,7 @@ fn malformed_capture_returns_incomplete() -> Result<(), Box<dyn std::error::Erro
 fn malformed_iteration_names_input() -> Result<(), Box<dyn std::error::Error>> {
     let temporary = tempfile::tempdir()?;
     let path = temporary.path().join("truncated-record.pcap");
-    let mut capture = include_bytes!("../../../tests/pcaps/lldp.pcap")
+    let mut capture = crate::captures::LLDP
         .get(..24)
         .ok_or("missing capture header")?
         .to_vec();
@@ -113,7 +127,7 @@ fn malformed_iteration_names_input() -> Result<(), Box<dyn std::error::Error>> {
 
 #[test]
 fn counts_semantic_invalidity_as_incomplete() -> Result<(), Box<dyn std::error::Error>> {
-    let mut capture = include_bytes!("../../../tests/pcaps/lldp.pcap")
+    let mut capture = crate::captures::LLDP
         .get(..24)
         .ok_or("missing capture header")?
         .to_vec();
@@ -146,7 +160,7 @@ fn counts_semantic_invalidity_as_incomplete() -> Result<(), Box<dyn std::error::
 
 #[test]
 fn counts_unsupported_stp_as_incomplete() -> Result<(), Box<dyn std::error::Error>> {
-    let mut capture = include_bytes!("../../../tests/pcaps/linux-stp.pcap").to_vec();
+    let mut capture = crate::captures::LINUX_STP.to_vec();
     *capture.get_mut(59).ok_or("missing STP version byte")? = 3;
     let directory =
         std::env::temp_dir().join(format!("l2solver-unsupported-stp-{}", std::process::id()));
@@ -169,8 +183,10 @@ fn counts_unsupported_stp_as_incomplete() -> Result<(), Box<dyn std::error::Erro
 #[cfg(unix)]
 #[test]
 fn closed_pipe_keeps_incomplete_status() -> Result<(), Box<dyn std::error::Error>> {
+    let fixtures = crate::capture_paths::CapturePaths::new()?;
     let mut process = Command::new(env!("CARGO_BIN_EXE_l2solver"))
-        .args(["observe", "../../tests/pcaps/short.pcap"])
+        .arg("observe")
+        .arg(fixtures.path("short.pcap"))
         .stdout(Stdio::piped())
         .spawn()?;
     drop(process.stdout.take().ok_or("missing stdout")?);
@@ -191,7 +207,7 @@ fn block(kind: u32, body: &[u8]) -> Result<Vec<u8>, Box<dyn std::error::Error>> 
 #[test]
 fn reports_missing_simple_packet_timestamp() -> Result<(), Box<dyn std::error::Error>> {
     let mut capture = pcapng_prefix(None)?;
-    let frame = include_bytes!("../../../tests/pcaps/linux-stp.pcap")
+    let frame = crate::captures::LINUX_STP
         .get(40..)
         .ok_or("missing frame")?;
     let mut packet = u32::try_from(frame.len())?.to_le_bytes().to_vec();
@@ -235,7 +251,7 @@ fn pcapng_prefix(resolution: Option<u8>) -> Result<Vec<u8>, Box<dyn std::error::
 #[test]
 fn preserves_unsupported_timestamp_span() -> Result<(), Box<dyn std::error::Error>> {
     let mut capture = pcapng_prefix(Some(0))?;
-    let frame = include_bytes!("../../../tests/pcaps/linux-stp.pcap")
+    let frame = crate::captures::LINUX_STP
         .get(40..)
         .ok_or("missing frame")?;
     for ticks in [0_u64, u64::MAX] {

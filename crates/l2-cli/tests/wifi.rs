@@ -1,3 +1,8 @@
+#[path = "../../../tests/fixtures/capture_paths.rs"]
+mod capture_paths;
+#[path = "../../../tests/fixtures/captures.rs"]
+pub mod captures;
+
 use l2_capture::{
     CaptureMetadata, CaptureTimestamp, CapturedFrame, Direction, FcsStatus, InterfaceId, LinkType,
     TimestampResolution, TimestampSource,
@@ -220,8 +225,11 @@ mod broken_pipe_outcomes {
 
     #[test]
     fn incomplete_assessment_keeps_status() -> Result<(), Box<dyn Error>> {
+        let fixtures = crate::capture_paths::CapturePaths::new()?;
         let mut command = Command::new(env!("CARGO_BIN_EXE_l2solver"));
-        command.args(["wifi", "assess", "../../tests/pcaps/lldp.pcap"]);
+        command
+            .args(["wifi", "assess"])
+            .arg(fixtures.path("lldp.pcap"));
 
         assert_eq!(run_closed(&mut command)?, Some(3));
         Ok(())
@@ -390,13 +398,11 @@ fn wifi_policy_unknown_nested_fields() -> Result<(), Box<dyn Error>> {
 
 #[test]
 fn wifi_text_retains_advertisement_drift() -> Result<(), Box<dyn Error>> {
+    let fixtures = crate::capture_paths::CapturePaths::new()?;
     let output = Command::new(env!("CARGO_BIN_EXE_l2solver"))
-        .args([
-            "wifi",
-            "assess",
-            "../../tests/pcaps/wifi-drift-radiotap.pcap",
-            "-v",
-        ])
+        .args(["wifi", "assess"])
+        .arg(fixtures.path("wifi-drift-radiotap.pcap"))
+        .arg("-v")
         .output()?;
 
     assert_eq!(output.status.code(), Some(3));
@@ -411,8 +417,10 @@ fn wifi_text_retains_advertisement_drift() -> Result<(), Box<dyn Error>> {
 
 #[test]
 fn wifi_command_ethernet_input_honestly() -> Result<(), Box<dyn Error>> {
+    let fixtures = crate::capture_paths::CapturePaths::new()?;
     let output = Command::new(env!("CARGO_BIN_EXE_l2solver"))
-        .args(["wifi", "assess", "../../tests/pcaps/lldp.pcap"])
+        .args(["wifi", "assess"])
+        .arg(fixtures.path("lldp.pcap"))
         .arg("-vv")
         .output()?;
 

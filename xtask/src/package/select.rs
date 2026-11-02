@@ -17,26 +17,8 @@ use std::path::{Component, Path};
 #[cfg(unix)]
 use std::{ffi::OsString, io::Read};
 
-// Capture archives and partial downloads may have no capture suffix of their own
-const SAMPLE_ARTIFACT_EXTENSIONS: &[&str] = &[
-    "cap",
-    "pcap",
-    "pcapng",
-    "gz",
-    "bz2",
-    "xz",
-    "zst",
-    "lz4",
-    "zip",
-    "7z",
-    "part",
-    "partial",
-    "crdownload",
-    "download",
-];
-
-// Root-level raw captures are local inputs, while test fixtures stay packageable
-const ROOT_CAPTURE_EXTENSIONS: &[&str] = &["cap", "pcap", "pcapng"];
+// Raw captures remain local regardless of their location in the source tree
+const CAPTURE_EXTENSIONS: &[&str] = &["cap", "pcap", "pcapng"];
 
 /// Return whether a relative path belongs to an excluded build, VCS, review, or secret path
 #[must_use]
@@ -73,9 +55,9 @@ pub fn is_excluded_path(path: &Path) -> bool {
     }
     let root = components.first().copied();
     let second = components.get(1).copied();
-    if root == Some("investigations")
+    if matches!(root, Some("investigations" | "pcap_samples" | "review"))
         || root == Some("benchmarks") && matches!(second, Some("cache" | "results"))
-        || root == Some("pcap_samples") && second == Some("local")
+        || root == Some("tests") && second == Some("pcaps")
         || components.windows(2).any(|pair| {
             matches!(
                 pair,
@@ -89,16 +71,9 @@ pub fn is_excluded_path(path: &Path) -> bool {
         return false;
     };
     let lower = name.to_ascii_lowercase();
-    // Keep sample bytes local while retaining capture fixtures elsewhere
-    let local_capture_artifact = root == Some("pcap_samples")
-        && (components.contains(&"runs")
-            || SAMPLE_ARTIFACT_EXTENSIONS
-                .iter()
-                .any(|extension| has_extension(name, extension)));
-    let root_capture_artifact = components.len() == 1
-        && ROOT_CAPTURE_EXTENSIONS
-            .iter()
-            .any(|extension| has_extension(name, extension));
+    let capture_artifact = CAPTURE_EXTENSIONS
+        .iter()
+        .any(|extension| has_extension(name, extension));
     let generated_heaptrack_doc = root == Some("docs")
         && matches!(second, Some("profiles" | "screenshots"))
         && lower.starts_with("heaptrack-");
@@ -111,8 +86,7 @@ pub fn is_excluded_path(path: &Path) -> bool {
         || lower == "secrets.json"
         || has_secret_extension(name)
         || is_review_output_name(&lower)
-        || local_capture_artifact
-        || root_capture_artifact
+        || capture_artifact
         || lower == "perf.data"
         || lower.starts_with("perf.data.")
         || lower.starts_with("heaptrack.")

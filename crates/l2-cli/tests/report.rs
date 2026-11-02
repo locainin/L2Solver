@@ -1,9 +1,12 @@
+#[path = "../../../tests/fixtures/captures.rs"]
+pub mod captures;
+
 #[path = "../src/report.rs"]
 mod report;
 
 #[test]
 fn capture_evidence_protocol_status_separate() -> Result<(), Box<dyn std::error::Error>> {
-    let bytes = include_bytes!("../../../tests/pcaps/lldp.pcap")
+    let bytes = crate::captures::LLDP
         .get(40..)
         .ok_or("fixture payload missing")?;
     let parsed = report::assess(bytes);

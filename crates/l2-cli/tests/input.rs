@@ -1,3 +1,8 @@
+#[path = "../../../tests/fixtures/capture_paths.rs"]
+mod capture_paths;
+#[path = "../../../tests/fixtures/captures.rs"]
+pub mod captures;
+
 use std::{
     error::Error,
     io::Write,
@@ -54,6 +59,7 @@ fn read_error_names_path() -> Result<(), Box<dyn Error>> {
 
 #[test]
 fn offline_operands_reject_directories() -> Result<(), Box<dyn Error>> {
+    let fixtures = crate::capture_paths::CapturePaths::new()?;
     let root = directory("non-regular-input");
     std::fs::create_dir(&root)?;
 
@@ -92,7 +98,8 @@ fn offline_operands_reject_directories() -> Result<(), Box<dyn Error>> {
     assert!(String::from_utf8(baseline_compare.stderr)?.contains("regular file"));
 
     let policy = Command::new(env!("CARGO_BIN_EXE_l2solver"))
-        .args(["survey", "../../tests/pcaps/lldp.pcap"])
+        .arg("survey")
+        .arg(fixtures.path("lldp.pcap"))
         .arg("--policy")
         .arg(&root)
         .output()?;
@@ -122,7 +129,7 @@ fn run_with_stdin(
 
 #[test]
 fn capture_dash_reads_bounded_stdin() -> Result<(), Box<dyn Error>> {
-    let capture = include_bytes!("../../../tests/pcaps/lldp.pcap");
+    let capture = crate::captures::LLDP;
     for arguments in [["inspect", "-"], ["json", "-"], ["observe", "-"]] {
         let output = run_with_stdin(&arguments, capture)?;
         assert!(output.status.success(), "stdin mode failed: {arguments:?}");
@@ -149,11 +156,12 @@ fn capture_dash_reads_bounded_stdin() -> Result<(), Box<dyn Error>> {
 #[cfg(unix)]
 #[test]
 fn named_pipes_reject_without_waiting() -> Result<(), Box<dyn Error>> {
+    let fixtures = crate::capture_paths::CapturePaths::new()?;
     let root = directory("named-pipe-input");
     std::fs::create_dir(&root)?;
     let pipe = root.join("pipe");
     assert!(Command::new("mkfifo").arg(&pipe).status()?.success());
-    let capture = "../../tests/pcaps/lldp.pcap";
+    let capture = fixtures.path("lldp.pcap");
 
     for arguments in [
         vec!["inspect".into(), pipe.as_os_str().to_owned()],
@@ -162,7 +170,7 @@ fn named_pipes_reject_without_waiting() -> Result<(), Box<dyn Error>> {
         vec!["survey".into(), pipe.as_os_str().to_owned()],
         vec![
             "survey".into(),
-            capture.into(),
+            capture.as_os_str().to_owned(),
             "--policy".into(),
             pipe.as_os_str().to_owned(),
         ],
@@ -170,7 +178,7 @@ fn named_pipes_reject_without_waiting() -> Result<(), Box<dyn Error>> {
             "baseline".into(),
             "compare".into(),
             pipe.as_os_str().to_owned(),
-            capture.into(),
+            capture.as_os_str().to_owned(),
         ],
     ] {
         // The outer timeout makes a regression fail in bounded test time
