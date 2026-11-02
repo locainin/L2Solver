@@ -60,17 +60,22 @@ fn classic_cooked_dns_reports_header_metadata_and_exact_payload_location() -> Te
         assert_eq!(record.pointer("/raw_bytes"), Some(&json!(&bytes)));
         assert_eq!(bytes.get(header_len + 20 + 8..), Some(dns.as_slice()));
 
-        let text = run(&["capture", "inspect", "-"], &capture)?;
-        assert!(text.status.success());
-        let text = String::from_utf8(text.stdout)?;
-        assert!(text.contains("Linux cooked"), "{text}");
-        assert!(text.contains("hardware_type=1"), "{text}");
-        assert!(text.contains("protocol=0x0800"), "{text}");
-        assert!(text.contains("address=02:03:04:05:06:07"), "{text}");
-        assert!(text.contains("IP 192.0.2.1 -> 198.51.100.2"), "{text}");
-        assert!(!text.contains("tags="), "{text}");
-        assert_eq!(text.contains("ifindex=7"), ifindex.is_some(), "{text}");
+        assert_cooked_inspection(&capture, ifindex)?;
     }
+    Ok(())
+}
+
+fn assert_cooked_inspection(capture: &[u8], ifindex: Option<u32>) -> TestResult {
+    let text = run(&["capture", "inspect", "-"], capture)?;
+    assert!(text.status.success());
+    let text = String::from_utf8(text.stdout)?;
+    assert!(text.contains("Linux cooked"), "{text}");
+    assert!(text.contains("hardware_type=1"), "{text}");
+    assert!(text.contains("protocol=0x0800"), "{text}");
+    assert!(text.contains("address=02:03:04:05:06:07"), "{text}");
+    assert!(text.contains("IP 192.0.2.1 -> 198.51.100.2"), "{text}");
+    assert!(!text.contains("tags="), "{text}");
+    assert_eq!(text.contains("ifindex=7"), ifindex.is_some(), "{text}");
     Ok(())
 }
 

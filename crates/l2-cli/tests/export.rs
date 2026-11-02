@@ -2127,6 +2127,25 @@ fn fragmented_packet_scope() -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
+#[test]
+fn unsupported_capture_summary_states_that_native_transport_analysis_did_not_run()
+-> Result<(), Box<dyn Error>> {
+    let temporary = tempfile::tempdir()?;
+    let capture = temporary.path().join("unsupported-link.pcap");
+    let destination = temporary.path().join("output");
+    let executable = install_tshark(temporary.path(), "")?;
+    let mut bytes = capture_with_http_body(BODY)?;
+    bytes.get_mut(20..24).ok_or("missing link type")?.copy_from_slice(&147_u32.to_le_bytes());
+    fs::write(&capture, bytes)?;
+    let output = export_with_tshark(&capture, &destination, &executable)?;
+    // Completion within supported scope remains compatible with existing callers
+    assert_eq!(output.status.code(), Some(0));
+    let summary = fs::read_to_string(destination.join("summary.txt"))?;
+    assert!(summary.contains("Supported transport records: 0"));
+    assert!(summary.contains("Native transport analysis: not performed; no source records had a supported transport envelope"));
+    Ok(())
+}
+
 fn export(capture: &Path, destination: Option<&Path>) -> Result<Output, std::io::Error> {
     let mut command = Command::new(env!("CARGO_BIN_EXE_l2solver"));
     command.arg("export").arg(capture);
