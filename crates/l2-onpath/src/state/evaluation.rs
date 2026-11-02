@@ -135,7 +135,6 @@ pub struct LifecycleEvidence<'a> {
 
 impl<'a> LifecycleEvidence<'a> {
     /// Return accepted original-binding receipts in endpoint order
-    #[must_use]
     pub fn original_bindings(
         &self,
     ) -> impl ExactSizeIterator<Item = &'a OriginalBindingReceipt> + '_ {
@@ -143,7 +142,6 @@ impl<'a> LifecycleEvidence<'a> {
     }
 
     /// Return accepted cleanup receipts in endpoint order
-    #[must_use]
     pub fn cleanup_receipts(&self) -> impl ExactSizeIterator<Item = &'a CleanupReceipt> + '_ {
         self.cleanup.values()
     }
