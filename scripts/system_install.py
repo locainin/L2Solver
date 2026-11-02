@@ -152,6 +152,7 @@ def install(payload, prefix, active):
     created_links = []
     generation_path = None
     published = False
+    reactivated = None
     try:
         for name in FILES:
             source = Path(__file__) if name == "l2solver-uninstall" else payload / name
@@ -177,6 +178,8 @@ def install(payload, prefix, active):
             staging.rename(generation_path)
             selected = generation_path
         if existing and active:
+            if os.readlink(base / "current") != identity:
+                reactivated = selected / "l2solver-active-helper"
             enable_capability(selected / "l2solver-active-helper")
         elif not active:
             disable_capability(selected / "l2solver-active-helper")
@@ -205,6 +208,9 @@ def install(payload, prefix, active):
             os.close(directory_fd)
     except BaseException:
         if not published:
+            # A failed switch must not leave an older, unpublished helper privileged
+            if reactivated is not None:
+                disable_capability(reactivated)
             (base / ".current-new").unlink(missing_ok=True)
             (base / ".manifest-new").unlink(missing_ok=True)
             if previous:
@@ -214,6 +220,7 @@ def install(payload, prefix, active):
             for entry in created_links:
                 entry.unlink()
             if generation_path is not None:
+                disable_capability(generation_path / "l2solver-active-helper")
                 shutil.rmtree(generation_path)
             if not previous and base.exists():
                 base.rmdir()
@@ -229,6 +236,9 @@ def uninstall(prefix):
     if data is None:
         raise ValueError("no recognized installation")
     base = prefix / "share/l2solver"
+    # Revoke authority even if another process holds an open helper file
+    for generation in data["generations"]:
+        disable_capability(base / generation / "l2solver-active-helper")
     # Validate everything before removing any command or documentation
     for relative in data["links"]:
         (prefix / relative).unlink()

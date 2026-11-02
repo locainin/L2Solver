@@ -172,3 +172,39 @@ def test_reinstall_of_earlier_generation_switches_complete_set(installer, payloa
     (payload / "l2solver").write_bytes(original)
     installer.install(payload, prefix, False)
     assert (prefix / "bin/l2solver").resolve() == old
+
+
+def test_failed_active_reactivation_revokes_unpublished_helper(installer, payload, tmp_path, monkeypatch):
+    prefix = tmp_path / "prefix"
+    privileged = set()
+    monkeypatch.setattr(installer, "enable_capability", lambda path: privileged.add(path.resolve()))
+    monkeypatch.setattr(installer, "disable_capability", lambda path: privileged.discard(path.resolve()))
+    installer.install(payload, prefix, True)
+    old = (prefix / "bin/l2solver-active-helper").resolve()
+    installer.install(payload, prefix, False)
+    assert old not in privileged
+    replace = installer.os.replace
+
+    def fail_switch(source, destination):
+        if Path(destination).name == "current":
+            raise PermissionError("switch denied")
+        return replace(source, destination)
+
+    monkeypatch.setattr(installer.os, "replace", fail_switch)
+    with pytest.raises(PermissionError):
+        installer.install(payload, prefix, True)
+    assert old not in privileged
+
+
+def test_uninstall_revokes_helper_authority_before_removal(installer, payload, tmp_path, monkeypatch):
+    prefix = tmp_path / "prefix"
+    installer.install(payload, prefix, False)
+    revoked = []
+
+    def revoke(path):
+        assert path.is_file()
+        revoked.append(path)
+
+    monkeypatch.setattr(installer, "disable_capability", revoke)
+    installer.uninstall(prefix)
+    assert len(revoked) == 1
