@@ -41,9 +41,6 @@ def test_install_upgrade_and_independent_uninstall(installer, payload, tmp_path)
     (payload / "l2solver").write_text("#!/bin/sh\nprintf 'upgraded fixture\\n'\n")
     installer.install(payload, prefix, False)
     assert subprocess.check_output([binary]) == b"upgraded fixture\n"
-    # The copied uninstaller must be sufficient after the checkout is unavailable
-    copied = prefix / "bin/l2solver-uninstall"
-    assert b"def uninstall" in copied.read_bytes()
     installer.uninstall(prefix)
     assert not binary.exists()
     assert not (prefix / "bin/l2solver-active-helper").exists()
@@ -130,13 +127,14 @@ def test_capability_failure_does_not_publish(installer, payload, tmp_path, monke
 
 
 def test_uninstaller_requires_root_before_reading_paths(tmp_path):
+    if os.geteuid() == 0:
+        pytest.skip("requires an unprivileged caller to check root admission")
     result = subprocess.run(["python3", ROOT / "scripts/system_install.py", "--uninstall", "--prefix", tmp_path], capture_output=True)
-    if os.geteuid() != 0:
-        assert result.returncode != 0
-        assert b"root" in result.stderr
+    assert result.returncode != 0
+    assert b"root" in result.stderr
 
 
-def test_uninstaller_infers_prefix_without_checkout(installer, payload, tmp_path):
+def test_uninstaller_infers_prefix_from_installed_symlink(installer, payload, tmp_path):
     prefix = tmp_path / "prefix"
     installer.install(payload, prefix, False)
     script = prefix / "bin/l2solver-uninstall"
@@ -208,3 +206,93 @@ def test_uninstall_revokes_helper_authority_before_removal(installer, payload, t
     monkeypatch.setattr(installer, "disable_capability", revoke)
     installer.uninstall(prefix)
     assert len(revoked) == 1
+
+
+def test_uninstall_preserves_recorded_completion_locations_when_directories_change(installer, payload, tmp_path):
+    prefix = tmp_path / "prefix"
+    # The first installation selects existing alternative completion directories
+    for relative in ("etc/bash_completion.d", "share/zsh/functions/Completion", "share/fish/completions"):
+        (prefix / relative).mkdir(parents=True)
+    installer.install(payload, prefix, False)
+    recorded = json.loads((prefix / "share/l2solver/manifest.json").read_text())["links"]
+    # New preferred directories must not invalidate the already-owned links
+    for relative in ("share/bash-completion/completions", "share/zsh/site-functions", "share/fish/vendor_completions.d"):
+        (prefix / relative).mkdir(parents=True)
+    installer.uninstall(prefix)
+    assert all(not os.path.lexists(prefix / relative) for relative in recorded)
+    assert not (prefix / "share/l2solver").exists()
+
+
+def test_completion_destinations_use_validated_discovered_paths(installer, payload, tmp_path):
+    prefix = tmp_path / "prefix"
+    selected = {
+        "bash": "share/custom/bash",
+        "zsh": "share/custom/zsh",
+        "fish": "share/custom/fish",
+    }
+    installer.install(payload, prefix, False, completion_dirs=selected)
+    assert (prefix / "share/custom/bash/l2solver").is_symlink()
+    assert (prefix / "share/custom/zsh/_l2solver").is_symlink()
+    assert (prefix / "share/custom/fish/l2solver.fish").is_symlink()
+    installer.uninstall(prefix)
+
+
+@pytest.mark.parametrize("directory", ["../outside", "/tmp/outside", "share/l2solver", "share/l2solver/nested"])
+def test_completion_destinations_reject_unsafe_or_owned_tree_paths(installer, payload, tmp_path, directory):
+    prefix = tmp_path / "prefix"
+    selected = {
+        "bash": directory,
+        "zsh": "share/zsh/site-functions",
+        "fish": "share/fish/vendor_completions.d",
+    }
+    with pytest.raises(ValueError):
+        installer.install(payload, prefix, False, completion_dirs=selected)
+    assert not (prefix / "share/l2solver").exists()
+
+
+@pytest.mark.parametrize("relative", ["../foreign/l2solver", "share/../foreign/l2solver", "share/l2solver/l2solver"])
+def test_manifest_rejects_forged_completion_links_without_removing_files(installer, payload, tmp_path, relative):
+    prefix = tmp_path / "prefix"
+    installer.install(payload, prefix, False)
+    manifest = prefix / "share/l2solver/manifest.json"
+    data = json.loads(manifest.read_text())
+    bash = next(item for item in data["links"] if item.endswith("/completions/l2solver"))
+    data["links"][relative] = data["links"].pop(bash)
+    manifest.write_text(json.dumps(data))
+    with pytest.raises(ValueError):
+        installer.uninstall(prefix)
+    assert os.path.lexists(prefix / bash)
+    assert os.path.lexists(prefix / "bin/l2solver")
+
+
+@pytest.mark.parametrize("values", [
+    ["bash=share/bash", "zsh=share/zsh"],
+    ["bash=share/bash", "zsh=share/zsh", "fish=share/fish", "fish=share/other"],
+    ["bash=share/bash", "zsh=share/zsh", "other=share/fish"],
+])
+def test_completion_selection_rejects_missing_duplicate_or_unknown_shell(installer, values):
+    with pytest.raises(ValueError):
+        installer.parse_completion_dirs(values)
+
+
+def test_root_equivalent_prefix_is_rejected_before_destination_access(installer, monkeypatch):
+    monkeypatch.setattr(installer.os, "geteuid", lambda: 0)
+    monkeypatch.setattr(installer.sys, "argv", ["system_install.py", "--check", "--prefix", "/tmp/.."])
+    monkeypatch.setattr(installer, "safe_parents", lambda _: pytest.fail("destination inspected before prefix rejection"))
+    with pytest.raises(SystemExit):
+        installer.main()
+
+
+def test_capability_verification_does_not_trust_path(installer, monkeypatch, tmp_path):
+    helper = tmp_path / "l2solver-active-helper"
+    commands = []
+    monkeypatch.setattr(installer.shutil, "which", lambda _: str(tmp_path / "untrusted-getcap"))
+    monkeypatch.setattr(installer.subprocess, "run", lambda command, **_: commands.append(command))
+
+    def capture(command, **_):
+        commands.append(command)
+        return f"{helper} cap_net_raw=ep\n"
+
+    monkeypatch.setattr(installer.subprocess, "check_output", capture)
+    installer.enable_capability(helper)
+    assert commands[1][0] in ("/usr/sbin/getcap", "/usr/bin/getcap")

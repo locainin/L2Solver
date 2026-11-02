@@ -16,6 +16,12 @@ import tempfile
 
 BINARIES = ("l2solver", "l2solver-active", "l2solver-active-helper")
 FILES = (*BINARIES, "l2solver-uninstall", "bash", "zsh", "fish", "README.md", "install.md", "NOTICE-JEMALLOC.txt", "receipt.json")
+COMPLETION_NAMES = {"bash": "l2solver", "zsh": "_l2solver", "fish": "l2solver.fish"}
+COMPLETION_CANDIDATES = {
+    "bash": ("share/bash-completion/completions", "etc/bash_completion.d"),
+    "zsh": ("share/zsh/site-functions", "share/zsh/functions/Completion"),
+    "fish": ("share/fish/vendor_completions.d", "share/fish/completions"),
+}
 
 
 def digest(path):
@@ -37,20 +43,51 @@ def safe_parents(path):
                 raise ValueError(f"untrusted directory: {parent}")
 
 
-def links(prefix):
+def completion_directory(value):
+    # Accept only normalized paths beneath the protected prefix
+    path = Path(value)
+    if (path.is_absolute() or str(path) != value or len(path.parts) < 2
+            or path.parts[0] not in ("share", "etc") or ".." in path.parts
+            or path.parts[:2] == ("share", "l2solver")):
+        raise ValueError(f"unsafe completion directory: {value}")
+    return str(path)
+
+
+def links(prefix, completion_dirs=None):
     result = {f"bin/{name}": f"../share/l2solver/current/{name}" for name in (*BINARIES, "l2solver-uninstall")}
-    # Probe existing prefix directories rather than writing into distribution paths
-    candidates = {
-        "bash": ("share/bash-completion/completions", "etc/bash_completion.d"),
-        "zsh": ("share/zsh/site-functions", "share/zsh/functions/Completion"),
-        "fish": ("share/fish/vendor_completions.d", "share/fish/completions"),
-    }
-    for shell, choices in candidates.items():
-        directory = next((item for item in choices if (prefix / item).is_dir()), choices[0])
-        name = {"bash": "l2solver", "zsh": "_l2solver", "fish": "l2solver.fish"}[shell]
+    if completion_dirs is None:
+        # Preserve the original fallback for calls without discovery information
+        completion_dirs = {
+            shell: next((item for item in choices if (prefix / item).is_dir()), choices[0])
+            for shell, choices in COMPLETION_CANDIDATES.items()
+        }
+    if set(completion_dirs) != set(COMPLETION_NAMES):
+        raise ValueError("completion directories must name bash, zsh and fish")
+    for shell, name in COMPLETION_NAMES.items():
+        directory = completion_directory(completion_dirs[shell])
         destination = f"{directory}/{name}"
         result[destination] = os.path.relpath(prefix / "share/l2solver/current" / shell, (prefix / destination).parent)
     return result
+
+
+def validate_links(prefix, recorded):
+    if not isinstance(recorded, dict):
+        raise ValueError("unsafe manifest links")
+    binaries = {f"bin/{name}" for name in (*BINARIES, "l2solver-uninstall")}
+    completion_dirs = {}
+    for relative in recorded:
+        if not isinstance(relative, str):
+            raise ValueError("unsafe manifest link")
+        if relative in binaries:
+            continue
+        path = Path(relative)
+        shell = next((shell for shell, name in COMPLETION_NAMES.items() if path.name == name), None)
+        if shell is None or shell in completion_dirs or str(path) != relative:
+            raise ValueError(f"unsafe manifest link: {relative}")
+        completion_dirs[shell] = completion_directory(str(path.parent))
+    # The recorded destinations remain authoritative even when search paths change
+    if recorded != links(prefix, completion_dirs):
+        raise ValueError("unsafe or incomplete manifest links")
 
 
 def read_manifest(prefix):
@@ -67,13 +104,7 @@ def read_manifest(prefix):
     data = json.loads(path.read_text())
     if set(data) != {"schema", "links", "generations"} or data["schema"] != 1 or not data["generations"]:
         raise ValueError("unrecognized installation manifest")
-    # Stored paths must match one of the finite supported completion layouts
-    permitted = links(prefix)
-    for relative, target in data["links"].items():
-        if permitted.get(relative) != target:
-            raise ValueError(f"unsafe manifest link: {relative}")
-    if set(data["links"]) != set(permitted):
-        raise ValueError("incompatible completion layout; restore previous directories")
+    validate_links(prefix, data["links"])
     for generation, hashes in data["generations"].items():
         if not re.fullmatch(r"[0-9a-f]{64}", generation) or set(hashes) != set(FILES):
             raise ValueError("unsafe manifest generation")
@@ -117,7 +148,7 @@ def write_manifest(base, data):
 
 def enable_capability(helper):
     subprocess.run(["/usr/sbin/setcap" if Path("/usr/sbin/setcap").exists() else "/usr/bin/setcap", "cap_net_raw=ep", str(helper)], check=True)
-    result = subprocess.check_output([shutil.which("getcap") or "/usr/sbin/getcap", str(helper)], text=True)
+    result = subprocess.check_output(["/usr/sbin/getcap" if Path("/usr/sbin/getcap").exists() else "/usr/bin/getcap", str(helper)], text=True)
     if result.strip() != f"{helper} cap_net_raw=ep":
         raise ValueError("CAP_NET_RAW verification failed; active operations unavailable")
 
@@ -135,11 +166,25 @@ def installed_prefix(script):
     return Path(script).resolve().parents[3]
 
 
-def install(payload, prefix, active):
+def parse_completion_dirs(values):
+    if not values:
+        return None
+    selected = {}
+    for value in values:
+        shell, separator, directory = value.partition("=")
+        if not separator or shell not in COMPLETION_NAMES or shell in selected:
+            raise ValueError("invalid completion directory selection")
+        selected[shell] = completion_directory(directory)
+    if set(selected) != set(COMPLETION_NAMES):
+        raise ValueError("completion directories must name bash, zsh and fish")
+    return selected
+
+
+def install(payload, prefix, active, completion_dirs=None):
     prefix = Path(os.path.abspath(prefix))
     safe_parents(prefix)
     previous = read_manifest(prefix)
-    destinations = previous["links"] if previous else links(prefix)
+    destinations = previous["links"] if previous else links(prefix, completion_dirs)
     for relative in destinations:
         entry = prefix / relative
         safe_parents(entry.parent)
@@ -259,11 +304,16 @@ def main():
     parser.add_argument("--check", action="store_true")
     parser.add_argument("--payload", type=Path)
     parser.add_argument("--enable-active", action="store_true")
+    parser.add_argument("--completion-dir", action="append", default=[], metavar="SHELL=PATH")
     args = parser.parse_args()
     if os.geteuid() != 0:
         parser.error("the publication/uninstall step requires root; run scripts/install.sh as an ordinary user")
-    if not args.prefix.is_absolute() or args.prefix == Path("/"):
+    if not args.prefix.is_absolute():
         parser.error("prefix must be an absolute local installation directory")
+    args.prefix = Path(os.path.abspath(args.prefix))
+    if args.prefix == Path("/"):
+        parser.error("prefix must be an absolute local installation directory")
+    completion_dirs = parse_completion_dirs(args.completion_dir)
     # The shared lock lives outside the tree so uninstall cannot unlink a held lock
     safe_parents(args.prefix)
     args.prefix.mkdir(parents=True, exist_ok=True)
@@ -273,14 +323,16 @@ def main():
         if args.check:
             previous = read_manifest(args.prefix)
             if previous is None:
-                for relative in links(args.prefix):
+                for relative in links(args.prefix, completion_dirs):
                     safe_parents((args.prefix / relative).parent)
                     if os.path.lexists(args.prefix / relative):
                         raise ValueError(f"foreign destination: {args.prefix / relative}")
+            elif completion_dirs is not None and previous["links"] != links(args.prefix, completion_dirs):
+                print("warning: retaining existing completion destinations from the protected manifest", file=sys.stderr)
         elif args.uninstall:
             uninstall(args.prefix)
         elif args.payload:
-            install(args.payload, args.prefix, args.enable_active)
+            install(args.payload, args.prefix, args.enable_active, completion_dirs)
         else:
             parser.error("--payload is required for installation")
     finally:

@@ -13,6 +13,7 @@ import tempfile
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT / "scripts"))
 import system_install
+import completion_paths
 
 BINARIES = system_install.BINARIES
 
@@ -31,7 +32,10 @@ def main():
         parser.error("run this Linux source installer as an ordinary user; Cargo must never run as root")
     if sys.version_info < (3, 11):
         parser.error("Python 3.11 or newer is required")
-    if not args.prefix.is_absolute() or args.prefix == Path("/"):
+    if not args.prefix.is_absolute():
+        parser.error("--prefix must be an absolute local installation directory")
+    args.prefix = Path(os.path.abspath(args.prefix))
+    if args.prefix == Path("/"):
         parser.error("--prefix must be an absolute local installation directory")
     for name in ("cargo", "rustc", "cc", "git", "sudo", "ldd"):
         if not shutil.which(name):
@@ -46,10 +50,17 @@ def main():
         if found and Path(found).absolute() != expected:
             parser.error(f"PATH collision: {found}; resolve it before installing {expected}")
     if args.live:
-        subprocess.run(["pkg-config", "--exists", "libpcap"], check=True)
-    # Destination checks run without privilege before committing to a release build
+        if not shutil.which("pkg-config"):
+            parser.error("missing dependency: pkg-config; install it and retry")
+        if subprocess.run(["pkg-config", "--exists", "libpcap"], check=False).returncode:
+            parser.error("libpcap was not found; install libpcap development files and retry")
+    # Discover shell paths before sudo, with per-user startup files isolated
+    selected = completion_paths.discover(args.prefix)
+    completion_args = [part for shell, directory in selected.items()
+                       for part in ("--completion-dir", f"{shell}={directory}")]
+    # Check local directory trust before validating protected records through sudo
     system_install.safe_parents(args.prefix)
-    subprocess.run(["sudo", "/usr/bin/python3", "-I", str(ROOT / "scripts/system_install.py"), "--check", "--prefix", str(args.prefix)], check=True)
+    subprocess.run(["sudo", "/usr/bin/python3", "-I", str(ROOT / "scripts/system_install.py"), "--check", "--prefix", str(args.prefix), *completion_args], check=True)
     command = ["cargo", "build", "--release", "--locked", "-p", "l2-cli", "-p", "l2-active-cli", "-p", "l2-active-linux", "--bins", "--message-format=json-render-diagnostics"]
     if args.live:
         command.extend(["--features", "l2-cli/live"])
@@ -86,7 +97,7 @@ def main():
             "version": output(str(binary), "--version"), "command": command,
         }
         (payload / "receipt.json").write_text(json.dumps(receipt, indent=2) + "\n")
-        publish = ["sudo", "/usr/bin/python3", "-I", str(ROOT / "scripts/system_install.py"), "--payload", directory, "--prefix", str(args.prefix)]
+        publish = ["sudo", "/usr/bin/python3", "-I", str(ROOT / "scripts/system_install.py"), "--payload", directory, "--prefix", str(args.prefix), *completion_args]
         if args.enable_active:
             publish.append("--enable-active")
         subprocess.run(publish, check=True)
