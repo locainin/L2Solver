@@ -99,7 +99,7 @@ fn retained_omissions_keep_their_report_charge_until_the_source_record_drops()
         options,
         &mut lease,
     )?;
-    assert!(!report.omissions.is_empty());
+    assert_ne!(report.omissions.len(), 0);
     sources.append_source(
         0,
         &source,
@@ -115,7 +115,7 @@ fn retained_omissions_keep_their_report_charge_until_the_source_record_drops()
         .source_records
         .first()
         .ok_or("source record missing")?;
-    assert!(!record.omissions.is_empty());
+    assert_ne!(record.omissions.len(), 0);
     let retained = crate::refine::analysis_memory::omissions_owned_bytes(&record.omissions)?
         + record.label.capacity()
         + record.sha256.as_ref().map_or(0, String::capacity)

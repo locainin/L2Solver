@@ -29,7 +29,7 @@ fn checkpoint_memory_pressure_is_preserved_in_optional_and_strict_modes()
             .err()
             .ok_or("memory pressure was silently treated as an optional cache miss")?;
         assert!(crate::memory_error::find(error.as_ref()).is_some());
-        assert!(job.snapshot()?.cache_fallbacks.records().is_empty());
+        assert_eq!(job.snapshot()?.cache_fallbacks.records().len(), 0);
         assert_eq!(memory.snapshot()?.used_bytes, 0);
     }
     Ok(())
@@ -183,7 +183,7 @@ fn checkpoint_restoration_cannot_hide_a_job_state_error() -> Result<(), Box<dyn 
             error.downcast_ref::<JobError>(),
             Some(&JobError::RestoreAfterStart)
         );
-        assert!(running.snapshot()?.cache_fallbacks.records().is_empty());
+        assert_eq!(running.snapshot()?.cache_fallbacks.records().len(), 0);
     }
     Ok(())
 }
@@ -202,7 +202,7 @@ fn invalid_recovery_identity_is_not_downgraded_to_a_cache_fallback() -> Result<(
     let result =
         RecoveryCache::from_cache(cache, &invalid_identity, &RecoveryOptions::default(), &job);
     assert!(result.is_err(), "invalid identity must remain an error");
-    assert!(job.snapshot()?.cache_fallbacks.records().is_empty());
+    assert_eq!(job.snapshot()?.cache_fallbacks.records().len(), 0);
     Ok(())
 }
 

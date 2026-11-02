@@ -55,7 +55,7 @@ fn merge_source_member(
 #[test]
 fn source_archive_member_output_limit_keeps_source_range_and_entry() -> Result<(), Box<dyn Error>> {
     let (report, _memory) = merge_source_member(1024, 1)?;
-    assert!(report.artifacts.is_empty());
+    assert_eq!(report.artifacts.len(), 0);
     let omission = report.omissions.first().ok_or("output omission missing")?;
     let omission = serde_json::to_value(omission)?;
     assert_eq!(
@@ -75,7 +75,7 @@ fn source_archive_member_output_limit_keeps_source_range_and_entry() -> Result<(
 #[test]
 fn source_archive_member_work_limit_keeps_source_range_and_entry() -> Result<(), Box<dyn Error>> {
     let (report, _memory) = merge_source_member(0, 1024)?;
-    assert!(report.artifacts.is_empty());
+    assert_eq!(report.artifacts.len(), 0);
     let omission = report.omissions.first().ok_or("work omission missing")?;
     let omission = serde_json::to_value(omission)?;
     assert_eq!(
@@ -99,7 +99,7 @@ fn source_archive_member_work_limit_keeps_source_range_and_entry() -> Result<(),
 #[test]
 fn unanalysed_member_is_omitted_when_hash_work_cannot_be_admitted() -> Result<(), Box<dyn Error>> {
     let (report, omissions) = merge_unanalyzed_member(0)?;
-    assert!(report.artifacts.is_empty());
+    assert_eq!(report.artifacts.len(), 0);
     assert_eq!(report.work_bytes, 0);
     assert!(report.omissions.iter().any(|omission| matches!(
         omission,

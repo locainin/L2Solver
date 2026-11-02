@@ -326,7 +326,7 @@ fn zip_candidate_growth_returns_typed_pressure_and_releases_its_probe() -> Resul
             .and_then(|error| error.downcast_ref::<MemoryError>()),
         Some(MemoryError::Limit { .. })
     ));
-    assert!(report.omissions.is_empty());
+    assert_eq!(report.omissions.len(), 0);
     drop(ends);
     drop(omission_memory);
     assert_eq!(budget.snapshot()?.used_bytes, 0);
@@ -387,7 +387,7 @@ fn source_prefix_and_zip_observation_keep_their_live_charges() -> Result<(), Box
             .iter()
             .map(|candidate| candidate.sha256.capacity())
             .sum::<usize>();
-    assert!(!observation.candidates.is_empty());
+    assert_ne!(observation.candidates.len(), 0);
     assert_eq!(scanned.source_digest_memory.bytes(), expected_source);
     assert_eq!(scanned.probe.memory.bytes(), u64::try_from(expected_probe)?);
     assert!(budget.snapshot()?.used_bytes >= expected_source + u64::try_from(expected_probe)?);
