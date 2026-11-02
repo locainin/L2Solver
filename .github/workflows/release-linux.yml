@@ -45,7 +45,15 @@ jobs:
           cargo clippy --workspace --all-targets --all-features --locked --
           -D warnings
 
-      - name: Run workspace tests
+      - name: Install pinned Nextest
+        run: cargo install cargo-nextest --locked --version 0.9.138
+
+      - name: Run workspace tests with Nextest
+        run: >-
+          cargo nextest run --workspace --all-targets --all-features --locked
+          --status-level skip --final-status-level skip
+
+      - name: Run independent Cargo reference tests
         run: >-
           cargo test --workspace --all-targets --all-features --locked
 
@@ -61,8 +69,8 @@ jobs:
 
       - name: Build Linux release candidate
         run: >-
-          cargo build --locked --release --package l2-cli --package l2-active-linux
-          --bin l2solver --bin l2solver-active-helper
+          cargo build --locked --release --package l2-cli --package l2-active-cli --package l2-active-linux
+          --bin l2solver --bin l2solver-active --bin l2solver-active-helper
           --target x86_64-unknown-linux-gnu
 
       - name: Install candidate check tools
@@ -74,7 +82,7 @@ jobs:
 
       - name: Run Python benchmark regressions
         run: >-
-          /usr/bin/python3 -m pytest -q tests/benchmarks
+          /usr/bin/python3 -m pytest -q tests/benchmarks tests/scripts tests/crates
           -p subtests
           --ignore=tests/benchmarks/test_cgroup_enforcement.py
           --ignore=tests/benchmarks/test_filesystem_fault_runner.py

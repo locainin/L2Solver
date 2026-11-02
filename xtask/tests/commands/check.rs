@@ -13,7 +13,8 @@ fn check_commands_keep_execution_order() {
     assert_eq!(
         subcommands,
         [
-            "fmt", "deny", "deny", "check", "clippy", "clippy", "clippy", "test",
+            "fmt", "deny", "deny", "check", "clippy", "clippy", "clippy", "nextest", "test",
+            "test",
         ]
         .map(|command| Some(OsStr::new(command)))
     );
@@ -72,10 +73,31 @@ fn preserves_workspace_coverage() {
             "warnings",
         ],
         &[
+            "nextest",
+            "run",
+            "--workspace",
+            "--all-targets",
+            "--all-features",
+            "--offline",
+            "--locked",
+            "--status-level",
+            "skip",
+            "--final-status-level",
+            "skip",
+        ],
+        &[
             "test",
             "--workspace",
             "--all-targets",
             "--all-features",
+            "--offline",
+            "--locked",
+        ],
+        &[
+            "test",
+            "--workspace",
+            "--all-features",
+            "--doc",
             "--offline",
             "--locked",
         ],

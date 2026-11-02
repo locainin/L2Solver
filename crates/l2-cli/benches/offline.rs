@@ -1,6 +1,7 @@
 //! Fixed-workload parser benchmark with capture setup outside the timed region
 
 use std::{
+    env,
     error::Error,
     hint::black_box,
     io::{self, Write},
@@ -10,6 +11,14 @@ use std::{
 const BENCH_ITERATIONS: u32 = 50_000_000;
 
 fn main() -> Result<(), Box<dyn Error>> {
+    let arguments = env::args_os().skip(1).collect::<Vec<_>>();
+    // Test discovery must not execute the fixed workload or emit timing output
+    if arguments.iter().any(|argument| argument == "--list") {
+        if !arguments.iter().any(|argument| argument == "--ignored") {
+            writeln!(io::stdout().lock(), "ethernet_lldp: benchmark")?;
+        }
+        return Ok(());
+    }
     let bytes = include_bytes!("../../../tests/pcaps/lldp.pcap");
     let mut capture = l2_pcap::CaptureReader::new(bytes.as_slice())?;
     let packet = capture
