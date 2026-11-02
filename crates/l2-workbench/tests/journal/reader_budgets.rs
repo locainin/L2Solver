@@ -120,6 +120,8 @@ fn derivation_references_oversized_hashes_loading() -> Result<(), Box<dyn Error>
             &recipe,
         )?;
         let connection = rusqlite::Connection::open(directory.path().join("journal.sqlite"))?;
+        // Permit this fixture to contain the invalid reference checked by the reader
+        connection.pragma_update(None, "foreign_keys", false)?;
         connection.execute(
             &format!("UPDATE hypotheses SET {column}=?1 WHERE id=?2"),
             rusqlite::params!["x".repeat(OVERSIZED_COLUMN_BYTES), id],

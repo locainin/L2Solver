@@ -568,6 +568,8 @@ fn migration_oversized_hashes_loading() -> Result<(), Box<dyn Error>> {
         let source = tempfile::tempdir()?;
         create_legacy_fixture(source.path(), *version, CheckOutcome::Pass)?;
         let connection = Connection::open(source.path().join("journal.sqlite"))?;
+        // Permit this fixture to contain the invalid reference checked by migration
+        connection.pragma_update(None, "foreign_keys", false)?;
         connection.execute(
             &format!("UPDATE checks SET {column}=?1"),
             ["x".repeat(65_536)],
