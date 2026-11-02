@@ -129,3 +129,60 @@ fn reports_candidate_budget_and_bounded_sample() {
     assert!(report.search_truncated);
     assert!(contains_plaintext(&longer, &lines.repeat(50)));
 }
+
+#[test]
+fn scan_reserves_work_at_the_minimum_input_length() {
+    let short = vec![0xd1; 47];
+    let minimum = vec![0xd1; 48];
+    assert!(!propose_xor(&short, 7).search_truncated);
+    assert_eq!(xor_proposal_scan_work_bound(short.len()), Some(0));
+    assert!(propose_xor(&minimum, 7).search_truncated);
+    assert!(xor_proposal_scan_work_bound(minimum.len()).is_some_and(|work| work > 0));
+}
+
+#[test]
+fn sample_truncation_reports_only_omitted_input() {
+    let exact: Vec<u8> = (0..=u8::MAX).cycle().take(4096).collect();
+    let mut longer = exact.clone();
+    longer.push(0);
+    assert!(!propose_xor(&exact, 7).sample_truncated);
+    assert!(propose_xor(&longer, 7).sample_truncated);
+}
+
+#[test]
+fn search_omits_repeated_key_aliases() -> Result<(), Box<dyn std::error::Error>> {
+    let lines = b"status: completed 42 items\r\nfolder: reports and notes\r\nmessage: account ready &amp; active\r\nresult: saved 18 records\r\n";
+    let input = encoded(lines, &[0x83]);
+    let report = propose_xor(&input, 32);
+    assert!(!report.proposals.is_empty());
+    for proposal in report.proposals {
+        let [Operation::XorRepeat { key, .. }] = proposal.recipe.steps.as_slice() else {
+            return Err("expected a repeating XOR recipe".into());
+        };
+        for period in 1..key.len() {
+            if key.len().is_multiple_of(period) {
+                assert!(
+                    !key.iter().copied().eq(key
+                        .iter()
+                        .copied()
+                        .take(period)
+                        .cycle()
+                        .take(key.len())),
+                    "repeated key alias {key:?}"
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn truncated_utf8_character_preserves_the_valid_sample_prefix() {
+    let block = b"01: parcel arrived at the station\n02: review the status report\n03: client response is ready now\n";
+    let mut plaintext: Vec<u8> = block.iter().copied().cycle().take(4095).collect();
+    plaintext.extend_from_slice("é is available\n".as_bytes());
+    let input = encoded(&plaintext, &[0xd3]);
+    let report = propose_xor(&input, 7);
+    assert!(report.sample_truncated);
+    assert!(contains_plaintext(&input, &plaintext));
+}
