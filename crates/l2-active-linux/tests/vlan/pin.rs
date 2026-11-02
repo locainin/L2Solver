@@ -7,6 +7,9 @@ use std::{
 
 use crate::{InterfaceSelector, pin::PinnedInterface};
 
+#[path = "../support/child_mode.rs"]
+mod child_mode;
+
 #[test]
 fn link_query_names_only_the_selected_interface_index() -> Result<(), Box<dyn Error>> {
     use netlink_packet_core::{NLM_F_REQUEST, NetlinkPayload};
@@ -69,8 +72,10 @@ fn non_vlan_interface_is_reported_without_a_vlan_pin() -> Result<(), Box<dyn Err
 }
 
 #[test]
-#[ignore = "uses only a proved private namespace and owned VLAN interfaces"]
 fn vlan_pin_retains_parent_and_rejects_stale_or_stacked_scope() -> Result<(), Box<dyn Error>> {
+    if child_mode::selected("vlan-pin")? {
+        return owned_vlan_pin_child_checks_scope_and_parent();
+    }
     let script = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/vlan/kernel.py");
     let result = std::process::Command::new("python3")
         .arg(script)
@@ -87,8 +92,6 @@ fn vlan_pin_retains_parent_and_rejects_stale_or_stacked_scope() -> Result<(), Bo
     Ok(())
 }
 
-#[test]
-#[ignore = "invoked only by the proved private VLAN namespace fixture"]
 fn owned_vlan_pin_child_checks_scope_and_parent() -> Result<(), Box<dyn Error>> {
     use std::os::unix::fs::MetadataExt;
 

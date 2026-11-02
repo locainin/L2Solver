@@ -1,7 +1,6 @@
 use std::{error::Error, path::Path, process::Command};
 
 #[test]
-#[ignore = "requires private user and network namespaces with the ip command"]
 fn vlan_capabilities_report_real_kernel_metadata_for_both_tag_protocols()
 -> Result<(), Box<dyn Error>> {
     let script = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/vlan/namespace.py");
@@ -25,10 +24,8 @@ fn vlan_capabilities_report_real_kernel_metadata_for_both_tag_protocols()
 }
 
 #[test]
-#[ignore = "requires a matching active helper and private user and network namespaces"]
 fn vlan_arp_reports_the_validated_scope_and_real_reply() -> Result<(), Box<dyn Error>> {
-    let helper =
-        std::env::var_os("L2_TEST_ACTIVE_HELPER").ok_or("missing matching active helper")?;
+    let helper = crate::namespace::matching_helper()?;
     let script = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/vlan/namespace.py");
     let output = Command::new("python3")
         .arg(script)

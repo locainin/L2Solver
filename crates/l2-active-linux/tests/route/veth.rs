@@ -12,20 +12,24 @@ use std::{
 use super::verify_on_link;
 use crate::{InterfaceSelector, discover};
 
+#[path = "../support/child_mode.rs"]
+mod child_mode;
+
+const PARENT_TEST: &str =
+    "route::veth_tests::owned_veth_distinguishes_direct_gateway_and_reject_routes";
+
 #[test]
-#[ignore = "uses a proved private user, mount, and network namespace with an owned veth pair"]
 fn owned_veth_distinguishes_direct_gateway_and_reject_routes() -> Result<(), Box<dyn Error>> {
+    if child_mode::selected(PARENT_TEST)? {
+        return owned_namespace_child_checks_kernel_routes();
+    }
     let fixture = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/listen/namespace.py");
     let result = Command::new("python3")
         .arg(fixture)
         .arg("--")
         .arg(std::env::current_exe()?)
-        .args([
-            "--ignored",
-            "--exact",
-            "route::veth_tests::owned_namespace_child_checks_kernel_routes",
-            "--nocapture",
-        ])
+        .env(child_mode::ENV, PARENT_TEST)
+        .args(["--exact", PARENT_TEST, "--nocapture"])
         .output()?;
     assert!(
         result.status.success(),
@@ -38,8 +42,6 @@ fn owned_veth_distinguishes_direct_gateway_and_reject_routes() -> Result<(), Box
     Ok(())
 }
 
-#[test]
-#[ignore = "invoked only after the namespace fixture proves the owned veth pair"]
 fn owned_namespace_child_checks_kernel_routes() -> Result<(), Box<dyn Error>> {
     let parent = (
         std::env::var("L2_TEST_PARENT_NET_DEVICE")?.parse::<u64>()?,

@@ -1,8 +1,67 @@
 use std::{
     error::Error,
-    os::unix::fs::MetadataExt,
+    ffi::OsStr,
+    path::PathBuf,
     process::{Command, Output},
 };
+
+/// Build the helper from the same workspace and return Cargo's artifact path
+///
+/// # Errors
+/// Returns an error when Cargo fails or does not report the helper executable
+pub fn build_helper(cargo: &OsStr) -> Result<PathBuf, Box<dyn Error>> {
+    let output = Command::new(cargo)
+        .current_dir(env!("CARGO_MANIFEST_DIR"))
+        .args([
+            "build",
+            "--locked",
+            "--jobs=1",
+            "--package",
+            "l2-active-linux",
+            "--bin",
+            "l2solver-active-helper",
+            "--message-format=json",
+        ])
+        .output()?;
+    if !output.status.success() {
+        return Err(format!(
+            "building the matching active helper failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        )
+        .into());
+    }
+    // Cargo selects the configured target directory and supplies the actual path
+    for line in output.stdout.split(|byte| *byte == b'\n') {
+        if line.is_empty() {
+            continue;
+        }
+        let message: serde_json::Value = serde_json::from_slice(line)?;
+        if message.get("reason").and_then(serde_json::Value::as_str) == Some("compiler-artifact")
+            && message
+                .pointer("/target/name")
+                .and_then(serde_json::Value::as_str)
+                == Some("l2solver-active-helper")
+            && let Some(path) = message
+                .get("executable")
+                .and_then(serde_json::Value::as_str)
+        {
+            return Ok(PathBuf::from(path));
+        }
+    }
+    Err("Cargo did not report the active helper executable".into())
+}
+
+/// Use an explicit qualification helper or build the matching workspace helper
+///
+/// # Errors
+/// Returns an error when building the helper fails
+pub fn matching_helper() -> Result<PathBuf, Box<dyn Error>> {
+    if let Some(path) = std::env::var_os("L2_TEST_ACTIVE_HELPER") {
+        return Ok(PathBuf::from(path));
+    }
+    let cargo = std::env::var_os("CARGO").unwrap_or_else(|| "cargo".into());
+    build_helper(&cargo)
+}
 
 /// Build the command selected by the test environment
 #[must_use]
@@ -19,21 +78,34 @@ pub fn command() -> Command {
     command
 }
 
-/// Check that the network namespace differs from the parent
+fn verify_owned_scope() -> Result<(), Box<dyn Error>> {
+    let verifier =
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/cli/fixtures/verify_namespace.py");
+    let output = Command::new("python3").arg(verifier).output()?;
+    if !output.status.success() {
+        return Err(String::from_utf8_lossy(&output.stderr).into_owned().into());
+    }
+    Ok(())
+}
+
+/// Run child mode only after the kernel scope and owned devices are proved
 ///
 /// # Errors
-/// Returns an error when either namespace identity cannot be read or parsed
-///
-/// # Panics
-/// Panics when the current namespace matches the parent namespace
-pub fn assert_owned() -> Result<(), Box<dyn Error>> {
-    let parent = (
-        std::env::var("L2_TEST_PARENT_NET_DEVICE")?.parse::<u64>()?,
-        std::env::var("L2_TEST_PARENT_NET_INODE")?.parse::<u64>()?,
-    );
-    let namespace = std::fs::metadata("/proc/thread-self/ns/net")?;
-    assert_ne!((namespace.dev(), namespace.ino()), parent);
-    Ok(())
+/// Returns an error for an unexpected child mode or unproved namespace
+pub fn child_mode(expected: &str) -> Result<bool, Box<dyn Error>> {
+    let Some(actual) = std::env::var_os("L2_ACTIVE_CLI_TEST_CHILD") else {
+        if std::env::var_os("L2_TEST_PARENT_NET_DEVICE").is_some()
+            || std::env::var_os("L2_TEST_PARENT_NET_INODE").is_some()
+        {
+            return Err("missing private child mode".into());
+        }
+        return Ok(false);
+    };
+    if actual != expected {
+        return Err("unexpected private child mode".into());
+    }
+    verify_owned_scope()?;
+    Ok(true)
 }
 
 /// Check the command output and return its report

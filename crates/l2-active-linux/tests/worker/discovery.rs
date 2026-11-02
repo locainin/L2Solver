@@ -19,19 +19,40 @@ use std::{
     time::{Duration, Instant},
 };
 
+#[path = "../support/child_mode.rs"]
+mod child_mode;
+
+const PARENT_TEST: &str = "worker::discovery_tests::owned_veth_worker_rejects_a_raw_send_opcode";
+
 #[test]
-#[ignore = "uses a proved private namespace and independent veth sender"]
+fn worker_child_rejects_the_parent_network_namespace() -> Result<(), Box<dyn Error>> {
+    let namespace = std::fs::metadata("/proc/thread-self/ns/net")?;
+    let parent = PARENT_TEST;
+    let output = Command::new(std::env::current_exe()?)
+        .args(["--exact", parent, "--nocapture"])
+        .env(child_mode::ENV, parent)
+        .env("L2_TEST_PARENT_NET_DEVICE", namespace.dev().to_string())
+        .env("L2_TEST_PARENT_NET_INODE", namespace.ino().to_string())
+        .output()?;
+    assert!(
+        !output.status.success(),
+        "worker child accepted the parent network namespace"
+    );
+    Ok(())
+}
+
+#[test]
 fn owned_veth_worker_rejects_a_raw_send_opcode() -> Result<(), Box<dyn Error>> {
+    if child_mode::selected(PARENT_TEST)? {
+        return owned_namespace_child_rejects_raw_send_opcode();
+    }
     let fixture = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/listen/namespace.py");
     let output = Command::new("python3")
         .arg(fixture)
         .arg("--")
         .arg(std::env::current_exe()?)
-        .args([
-            "--ignored",
-            "--exact",
-            "worker::discovery_tests::owned_namespace_child_rejects_raw_send_opcode",
-        ])
+        .env(child_mode::ENV, PARENT_TEST)
+        .args(["--exact", PARENT_TEST])
         .output()?;
     assert!(
         output.status.success(),
@@ -45,8 +66,6 @@ fn owned_veth_worker_rejects_a_raw_send_opcode() -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
-#[test]
-#[ignore = "invoked only by the proved isolated discovery fixture"]
 fn owned_namespace_child_rejects_raw_send_opcode() -> Result<(), Box<dyn Error>> {
     let parent_device: u64 = std::env::var("L2_TEST_PARENT_NET_DEVICE")?.parse()?;
     let parent_inode: u64 = std::env::var("L2_TEST_PARENT_NET_INODE")?.parse()?;

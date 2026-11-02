@@ -3,7 +3,9 @@
 use std::{
     error::Error,
     num::NonZeroU8,
+    os::unix::fs::MetadataExt,
     path::Path,
+    process::Command,
     sync::atomic::AtomicBool,
     time::{Duration, Instant},
 };
@@ -17,19 +19,38 @@ use l2_active_linux::{HelperLink, InterfaceSelector, discover};
 #[path = "support/receive_only.rs"]
 mod support;
 
+const PARENT_TEST: &str = "owned_veth_helper_observes_vrrp_v3_without_sending_or_exposing_v2";
+
 #[test]
-#[ignore = "uses a proved private namespace and independent veth sender"]
+fn receive_only_child_rejects_the_parent_network_namespace() -> Result<(), Box<dyn Error>> {
+    let namespace = std::fs::metadata("/proc/thread-self/ns/net")?;
+    let parent = PARENT_TEST;
+    let output = Command::new(std::env::current_exe()?)
+        .args(["--exact", parent, "--nocapture"])
+        .env(support::child_mode::ENV, parent)
+        .env("L2_TEST_PARENT_NET_DEVICE", namespace.dev().to_string())
+        .env("L2_TEST_PARENT_NET_INODE", namespace.ino().to_string())
+        .output()?;
+    assert!(
+        !output.status.success(),
+        "receive-only child accepted the parent network namespace"
+    );
+    Ok(())
+}
+
+#[test]
 fn owned_veth_helper_observes_vrrp_v3_without_sending_or_exposing_v2() -> Result<(), Box<dyn Error>>
 {
+    if support::child_mode::selected(PARENT_TEST)? {
+        return owned_namespace_child_observes_vrrp_without_sending();
+    }
     support::run_fixture(
         "../l2-active/tests/first_hop/vrrp/fixtures/veth.py",
-        "owned_namespace_child_observes_vrrp_without_sending",
+        PARENT_TEST,
         "advertisements_delivered=true no_client_send=true cleanup_confirmed=true",
     )
 }
 
-#[test]
-#[ignore = "invoked only inside the proved private VRRP fixture"]
 fn owned_namespace_child_observes_vrrp_without_sending() -> Result<(), Box<dyn Error>> {
     support::assert_owned()?;
     let selector = InterfaceSelector::new(&std::env::var("L2_TEST_VRRP_INTERFACE")?)?;

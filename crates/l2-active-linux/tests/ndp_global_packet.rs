@@ -14,6 +14,9 @@ use std::{
     time::{Duration, Instant},
 };
 
+#[path = "support/child_mode.rs"]
+mod child_mode;
+
 fn run_fixture(case: &str) -> Result<(), Box<dyn Error>> {
     let fixture = Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("../l2-active/tests/ndp/fixtures/global_veth.py");
@@ -21,12 +24,8 @@ fn run_fixture(case: &str) -> Result<(), Box<dyn Error>> {
         .arg(fixture)
         .arg("--")
         .arg(std::env::current_exe()?)
-        .args([
-            "--ignored",
-            "--exact",
-            "owned_global_ndp_child",
-            "--nocapture",
-        ])
+        .env(child_mode::ENV, PARENT_TEST)
+        .args(["--exact", PARENT_TEST, "--nocapture"])
         .env("L2_TEST_NDP_GLOBAL_CASE", case)
         .env(
             "L2_TEST_ACTIVE_HELPER",
@@ -46,38 +45,36 @@ fn run_fixture(case: &str) -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
+const PARENT_TEST: &str = "global_direct_route_sends_one_solicitation_and_observes_a_reply";
+
 #[test]
-#[ignore = "uses a verified private namespace and an owned veth pair"]
 fn global_direct_route_sends_one_solicitation_and_observes_a_reply() -> Result<(), Box<dyn Error>> {
+    if child_mode::selected(PARENT_TEST)? {
+        return owned_global_ndp_child();
+    }
     run_fixture("direct")
 }
 
 #[test]
-#[ignore = "uses a verified private namespace and an owned veth pair"]
 fn global_address_prefix_without_a_route_does_not_authorize_a_send() -> Result<(), Box<dyn Error>> {
     run_fixture("no_route")
 }
 
 #[test]
-#[ignore = "uses a verified private namespace and an owned veth pair"]
 fn global_gateway_route_does_not_authorize_a_send() -> Result<(), Box<dyn Error>> {
     run_fixture("gateway")
 }
 
 #[test]
-#[ignore = "uses a verified private namespace and an owned veth pair"]
 fn global_route_on_another_interface_does_not_authorize_a_send() -> Result<(), Box<dyn Error>> {
     run_fixture("other_interface")
 }
 
 #[test]
-#[ignore = "uses a verified private namespace and an owned veth pair"]
 fn global_route_removed_after_open_prevents_the_send() -> Result<(), Box<dyn Error>> {
     run_fixture("route_removed")
 }
 
-#[test]
-#[ignore = "invoked only by the verified private global-NDP fixture"]
 fn owned_global_ndp_child() -> Result<(), Box<dyn Error>> {
     let parent_device: u64 = std::env::var("L2_TEST_PARENT_NET_DEVICE")?.parse()?;
     let parent_inode: u64 = std::env::var("L2_TEST_PARENT_NET_INODE")?.parse()?;

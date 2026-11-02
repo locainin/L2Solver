@@ -13,6 +13,9 @@ mod errors;
 #[cfg(target_os = "linux")]
 #[path = "first_hop/namespace_cli.rs"]
 mod first_hop;
+#[cfg(target_os = "linux")]
+#[path = "cli/helper_artifact.rs"]
+mod helper_artifact;
 #[path = "cli/helper_timeout.rs"]
 mod helper_timeout;
 #[path = "cli/listen.rs"]

@@ -21,18 +21,20 @@ mod support;
 const VALID: &[u8] = include_bytes!("../../l2-active/tests/isl/fixtures/valid.bin");
 const MODE_FLAGS: u32 = 0x300;
 
+const PARENT_TEST: &str = "owned_veth_delivers_isl_through_the_restricted_helper";
+
 #[test]
-#[ignore = "uses a proved private namespace and owned receive-only veth pair"]
 fn owned_veth_delivers_isl_through_the_restricted_helper() -> Result<(), Box<dyn Error>> {
+    if support::child_mode::selected(PARENT_TEST)? {
+        return owned_namespace_child_observes_isl_without_sending();
+    }
     support::run_fixture(
         "../l2-active/tests/isl/fixtures/veth.py",
-        "owned_namespace_child_observes_isl_without_sending",
+        PARENT_TEST,
         "isl_delivered=true no_client_send=true cleanup_confirmed=true",
     )
 }
 
-#[test]
-#[ignore = "invoked only by the proved private ISL fixture"]
 fn owned_namespace_child_observes_isl_without_sending() -> Result<(), Box<dyn Error>> {
     support::assert_owned()?;
     let selector = InterfaceSelector::new(&std::env::var("L2_TEST_ISL_INTERFACE")?)?;

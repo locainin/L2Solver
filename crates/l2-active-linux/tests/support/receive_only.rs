@@ -3,16 +3,20 @@ use std::{
     sync::atomic::AtomicBool, time::Instant,
 };
 
+#[path = "child_mode.rs"]
+pub mod child_mode;
+
 use l2_active::ActiveLink;
 use l2_active_linux::{HelperLink, InterfaceSelector, discover};
 
-pub fn run_fixture(fixture: &str, child: &str, marker: &str) -> Result<(), Box<dyn Error>> {
+pub fn run_fixture(fixture: &str, parent: &str, marker: &str) -> Result<(), Box<dyn Error>> {
     let fixture = Path::new(env!("CARGO_MANIFEST_DIR")).join(fixture);
     let output = Command::new("python3")
         .arg(fixture)
         .arg("--")
         .arg(std::env::current_exe()?)
-        .args(["--ignored", "--exact", child, "--nocapture"])
+        .args(["--exact", parent, "--nocapture"])
+        .env(child_mode::ENV, parent)
         .env(
             "L2_TEST_ACTIVE_HELPER",
             env!("CARGO_BIN_EXE_l2solver-active-helper"),

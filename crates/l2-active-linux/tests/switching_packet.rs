@@ -91,28 +91,33 @@ impl Context {
     }
 }
 
+const DTP_PARENT_TEST: &str = "owned_veth_delivers_dtp_through_the_restricted_helper";
+const VTP_PARENT_TEST: &str = "owned_veth_delivers_vtp_through_the_restricted_helper";
+
 #[test]
-#[ignore = "uses a proved private namespace and owned receive-only veth pair"]
 fn owned_veth_delivers_dtp_through_the_restricted_helper() -> Result<(), Box<dyn Error>> {
+    if support::child_mode::selected(DTP_PARENT_TEST)? {
+        return owned_namespace_child_observes_dtp_without_sending();
+    }
     support::run_fixture(
         "../l2-active/tests/switching/fixtures/veth.py",
-        "owned_namespace_child_observes_dtp_without_sending",
+        DTP_PARENT_TEST,
         "switching_delivered=true no_client_send=true cleanup_confirmed=true",
     )
 }
 
 #[test]
-#[ignore = "uses a proved private namespace and owned receive-only veth pair"]
 fn owned_veth_delivers_vtp_through_the_restricted_helper() -> Result<(), Box<dyn Error>> {
+    if support::child_mode::selected(VTP_PARENT_TEST)? {
+        return owned_namespace_child_observes_vtp_without_sending();
+    }
     support::run_fixture(
         "../l2-active/tests/switching/fixtures/veth.py",
-        "owned_namespace_child_observes_vtp_without_sending",
+        VTP_PARENT_TEST,
         "switching_delivered=true no_client_send=true cleanup_confirmed=true",
     )
 }
 
-#[test]
-#[ignore = "invoked only by the proved private switching fixture"]
 fn owned_namespace_child_observes_dtp_without_sending() -> Result<(), Box<dyn Error>> {
     let context = Context::new()?;
     let monitor = DtpMonitor::new(context.limits);
@@ -164,8 +169,6 @@ fn owned_namespace_child_observes_dtp_without_sending() -> Result<(), Box<dyn Er
     Ok(())
 }
 
-#[test]
-#[ignore = "invoked only by the proved private switching fixture"]
 fn owned_namespace_child_observes_vtp_without_sending() -> Result<(), Box<dyn Error>> {
     let context = Context::new()?;
     let monitor = VtpMonitor::new(context.limits);

@@ -3,6 +3,8 @@
 import importlib.util
 import socket
 import struct
+import subprocess
+import sys
 import unittest
 from pathlib import Path
 
@@ -57,6 +59,25 @@ class PacketRepresentationTests(unittest.TestCase):
         capture.result = (bytes(60), [], 0, None)
         with self.assertRaises(RuntimeError):
             vlan.packet_with_auxiliary_tag(capture)
+
+
+class EmptyCapture:
+    def recvmsg(self, _size, _control_size):
+        raise TimeoutError
+
+
+class AdmissionChildTests(unittest.TestCase):
+    def test_rejects_success_when_no_admission_child_test_ran(self):
+        process = subprocess.Popen(
+            [sys.executable, "-c", "print('test result: ok. 0 passed; 0 failed;')"],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+        with self.assertRaisesRegex(RuntimeError, "VLAN admission/change check failed"):
+            vlan.change_case(
+                "deny_off", process, EmptyCapture(), None, None, bytes(60), bytes(60),
+                "802.1Q", None, None, None, None, None,
+            )
 
 
 if __name__ == "__main__":

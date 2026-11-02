@@ -19,18 +19,20 @@ use l2_active_linux::{HelperLink, InterfaceSelector, discover};
 #[path = "support/receive_only.rs"]
 mod support;
 
+const PARENT_TEST: &str = "owned_veth_delivers_hsrp_through_the_restricted_helper";
+
 #[test]
-#[ignore = "uses a proved private namespace and owned receive-only veth pair"]
 fn owned_veth_delivers_hsrp_through_the_restricted_helper() -> Result<(), Box<dyn Error>> {
+    if support::child_mode::selected(PARENT_TEST)? {
+        return owned_namespace_child_observes_hsrp_without_sending();
+    }
     support::run_fixture(
         "../l2-active/tests/first_hop/hsrp/fixtures/veth.py",
-        "owned_namespace_child_observes_hsrp_without_sending",
+        PARENT_TEST,
         "messages_delivered=true no_client_send=true cleanup_confirmed=true",
     )
 }
 
-#[test]
-#[ignore = "invoked only by the proved private HSRP fixture"]
 fn owned_namespace_child_observes_hsrp_without_sending() -> Result<(), Box<dyn Error>> {
     support::assert_owned()?;
     let selector = InterfaceSelector::new(&std::env::var("L2_TEST_HSRP_INTERFACE")?)?;

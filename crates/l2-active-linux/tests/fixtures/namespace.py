@@ -152,6 +152,7 @@ def exercise(runner, helper, parent_net, indices):
     environment["L2_TEST_PARENT_NET_DEVICE"] = str(parent_net[0])
     environment["L2_TEST_PARENT_NET_INODE"] = str(parent_net[1])
     environment["L2_TEST_ACTIVE_HELPER"] = helper
+    environment["L2_ACTIVE_LINUX_TEST_CHILD"] = "arp"
     # Queue only candidates admitted by each probe's locked ARP filter
     stale = reply
     backlog_stale = arp_frame(SOURCE_MAC, PEER_MAC, 2, BACKLOG_IP, SOURCE_MAC, SOURCE_IP)
@@ -162,7 +163,7 @@ def exercise(runner, helper, parent_net, indices):
         capture.settimeout(0.05)
         witness.bind((SOURCE, 0))
         witness.settimeout(0.1)
-        process = subprocess.Popen([runner, "--ignored", "--exact", "owned_namespace_child_performs_one_arp_probe", "--nocapture"], stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=environment)
+        process = subprocess.Popen([runner, "--exact", "owned_veth_carries_one_real_arp_probe_and_confirms_cleanup", "--nocapture"], stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=environment)
         request_count = 0
         quiet_count = 0
         down_count = 0
@@ -222,7 +223,9 @@ def exercise(runner, helper, parent_net, indices):
                     require_pair(indices)
                     command("ip", "link", "set", "dev", SOURCE, "down")
             stdout, stderr = process.communicate(timeout=5)
-            if request_count != 1 or quiet_count != 1 or down_count != 1 or backlog_count != 1 or not injected or process.returncode != 0:
+            if (request_count != 1 or quiet_count != 1 or down_count != 1 or backlog_count != 1
+                    or not injected or process.returncode != 0
+                    or b"test result: ok. 1 passed; 0 failed;" not in stdout):
                 raise RuntimeError(f"packet test failed: request_count={request_count}, quiet_count={quiet_count}, down_count={down_count}, backlog_count={backlog_count}, injected={injected}, exit={process.returncode}, stdout={stdout.decode(errors='replace')}, stderr={stderr.decode(errors='replace')}")
             require_pair(indices)
             command("ip", "link", "set", "dev", SOURCE, "up")

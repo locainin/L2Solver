@@ -18,18 +18,25 @@ use std::{
     time::{Duration, Instant},
 };
 
+#[path = "support/child_mode.rs"]
+mod child_mode;
+
+const PARENT_TEST: &str = "owned_veth_carries_one_typed_discover_and_correlated_offer";
+
 #[test]
-#[ignore = "uses an owned namespace and independent DHCP veth responder"]
 fn owned_veth_carries_one_typed_discover_and_correlated_offer() -> Result<(), Box<dyn Error>> {
+    if child_mode::selected(PARENT_TEST)? {
+        return owned_namespace_child_performs_one_dhcp_discover();
+    }
     let fixture =
         Path::new(env!("CARGO_MANIFEST_DIR")).join("../l2-active/tests/dhcp/fixtures/veth.py");
     let output = Command::new("python3")
         .arg(fixture)
         .arg("--")
         .arg(std::env::current_exe()?)
-        .arg("--ignored")
+        .env(child_mode::ENV, PARENT_TEST)
         .arg("--exact")
-        .arg("owned_namespace_child_performs_one_dhcp_discover")
+        .arg(PARENT_TEST)
         .arg("--nocapture")
         .env(
             "L2_TEST_ACTIVE_HELPER",
@@ -48,8 +55,6 @@ fn owned_veth_carries_one_typed_discover_and_correlated_offer() -> Result<(), Bo
     Ok(())
 }
 
-#[test]
-#[ignore = "invoked only by the proved isolated DHCP namespace fixture"]
 fn owned_namespace_child_performs_one_dhcp_discover() -> Result<(), Box<dyn Error>> {
     let parent_device: u64 = std::env::var("L2_TEST_PARENT_NET_DEVICE")?.parse()?;
     let parent_inode: u64 = std::env::var("L2_TEST_PARENT_NET_INODE")?.parse()?;

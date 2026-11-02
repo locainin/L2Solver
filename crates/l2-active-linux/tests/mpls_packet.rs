@@ -16,18 +16,20 @@ use l2_active_linux::{HelperLink, InterfaceSelector, discover};
 #[path = "support/receive_only.rs"]
 mod support;
 
+const PARENT_TEST: &str = "owned_veth_helper_observes_local_mpls_without_sending";
+
 #[test]
-#[ignore = "uses a proved private namespace and independent veth sender"]
 fn owned_veth_helper_observes_local_mpls_without_sending() -> Result<(), Box<dyn Error>> {
+    if support::child_mode::selected(PARENT_TEST)? {
+        return owned_namespace_child_observes_mpls_without_sending();
+    }
     support::run_fixture(
         "../l2-active/tests/mpls/fixtures/veth.py",
-        "owned_namespace_child_observes_mpls_without_sending",
+        PARENT_TEST,
         "mpls_delivered=true no_client_send=true cleanup_confirmed=true",
     )
 }
 
-#[test]
-#[ignore = "invoked only inside the proved private MPLS fixture"]
 fn owned_namespace_child_observes_mpls_without_sending() -> Result<(), Box<dyn Error>> {
     support::assert_owned()?;
     let selector = InterfaceSelector::new(&std::env::var("L2_TEST_MPLS_INTERFACE")?)?;

@@ -6,6 +6,9 @@ fn program(vrid: Option<NonZeroU8>) -> std::io::Result<Vec<rscap::filter::BpfIns
     shared::program(|program| super::vrrp(program, vrid))
 }
 
+const PARENT_TEST: &str =
+    "filter::vrrp::tests::vrrp_filter_accepts_scoped_v3_and_rejects_v2_or_unrelated_frames";
+
 #[test]
 fn vrrp_filters_produce_bounded_forward_only_programs() -> Result<(), Box<dyn Error>> {
     for selected in [None, NonZeroU8::new(42)] {
@@ -17,21 +20,25 @@ fn vrrp_filters_produce_bounded_forward_only_programs() -> Result<(), Box<dyn Er
 }
 
 #[test]
-#[ignore = "uses a proved private namespace and owned veth pair"]
 fn vrrp_filter_accepts_scoped_v3_and_rejects_v2_or_unrelated_frames() -> Result<(), Box<dyn Error>>
 {
-    shared::run_fixture("vrrp-any", "filter::vrrp::tests::vrrp_any_child")?;
-    shared::run_fixture("vrrp-42", "filter::vrrp::tests::vrrp_42_child")
+    if let Some(mode) = std::env::var_os(shared::child_mode::ENV) {
+        if mode == "vrrp-any" {
+            return vrrp_any_child();
+        }
+        if mode == "vrrp-42" {
+            return vrrp_42_child();
+        }
+        return Err("unexpected VRRP filter child mode".into());
+    }
+    shared::run_fixture("vrrp-any", PARENT_TEST)?;
+    shared::run_fixture("vrrp-42", PARENT_TEST)
 }
 
-#[test]
-#[ignore = "invoked only inside the proved private filter fixture"]
 fn vrrp_any_child() -> Result<(), Box<dyn Error>> {
     shared::check_child(program(None)?)
 }
 
-#[test]
-#[ignore = "invoked only inside the proved private filter fixture"]
 fn vrrp_42_child() -> Result<(), Box<dyn Error>> {
     shared::check_child(program(NonZeroU8::new(42))?)
 }

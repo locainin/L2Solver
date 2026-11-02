@@ -6,10 +6,33 @@ use std::{
 };
 
 #[test]
-#[ignore = "requires a matching helper and a proved private network namespace"]
+fn vlan_canary_registers_only_its_parent_as_an_ordinary_test() -> Result<(), Box<dyn Error>> {
+    let output = Command::new(std::env::current_exe()?)
+        .arg("--list")
+        .output()?;
+    assert!(output.status.success());
+    let listed = String::from_utf8(output.stdout)?;
+    assert!(listed.contains("namespace_tests::real_vlan_canary_assessment_observes_forwarding_and_keeps_silence_inconclusive"));
+    assert!(!listed.contains("owned_vlan_canary_assessment_child"));
+    let output = Command::new(std::env::current_exe()?)
+        .args(["--ignored", "--list"])
+        .output()?;
+    assert!(output.status.success());
+    assert!(
+        !String::from_utf8(output.stdout)?.contains(
+            "namespace_tests::real_vlan_canary_assessment_observes_forwarding_and_keeps_silence_inconclusive"
+        )
+    );
+    Ok(())
+}
+
+#[test]
 fn real_vlan_canary_assessment_observes_forwarding_and_keeps_silence_inconclusive()
 -> Result<(), Box<dyn Error>> {
-    let helper = std::env::var_os("L2_TEST_ACTIVE_HELPER").ok_or("missing active helper")?;
+    if crate::namespace::child_mode("vlan_canary")? {
+        return owned_vlan_canary_assessment_child();
+    }
+    let helper = crate::namespace::matching_helper()?;
     let script = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/vlan_assessment/namespace.py");
     let output = Command::new("python3")
         .arg(script)
@@ -30,10 +53,7 @@ fn real_vlan_canary_assessment_observes_forwarding_and_keeps_silence_inconclusiv
     Ok(())
 }
 
-#[test]
-#[ignore = "invoked only by the proved private VLAN canary fixture"]
 fn owned_vlan_canary_assessment_child() -> Result<(), Box<dyn Error>> {
-    crate::namespace::assert_owned()?;
     let helper = std::env::var_os("L2_TEST_ACTIVE_HELPER").ok_or("missing helper")?;
     let case = std::env::var("L2_TEST_VLAN_ASSESSMENT_CASE")?;
     let output = run_cli(&case, &helper)?;

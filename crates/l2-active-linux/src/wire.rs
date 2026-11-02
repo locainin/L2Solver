@@ -5,8 +5,8 @@ use std::io;
 mod tests;
 
 pub const OPEN: u8 = 1;
-// Version 10 binds each receive-only operation to its typed profile selection
-pub const VERSION: u8 = 10;
+// Version 11 includes the admitted worker deadline in the open acknowledgement
+pub const VERSION: u8 = 11;
 pub const SEND: u8 = 2;
 pub const RECEIVE: u8 = 3;
 pub const LOSS: u8 = 4;

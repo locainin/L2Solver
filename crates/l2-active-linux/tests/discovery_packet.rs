@@ -15,20 +15,23 @@ use std::{
     time::{Duration, Instant},
 };
 
+#[path = "support/child_mode.rs"]
+mod child_mode;
+
+const PARENT_TEST: &str = "owned_veth_receives_scoped_discovery_without_transmitting";
+
 #[test]
-#[ignore = "uses a proved private namespace and independent veth sender"]
 fn owned_veth_receives_scoped_discovery_without_transmitting() -> Result<(), Box<dyn Error>> {
+    if child_mode::selected(PARENT_TEST)? {
+        return owned_namespace_child_observes_discovery_without_sending();
+    }
     let fixture = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/listen/namespace.py");
     let output = Command::new("python3")
         .arg(fixture)
         .arg("--")
         .arg(std::env::current_exe()?)
-        .args([
-            "--ignored",
-            "--exact",
-            "owned_namespace_child_observes_discovery_without_sending",
-            "--nocapture",
-        ])
+        .env(child_mode::ENV, PARENT_TEST)
+        .args(["--exact", PARENT_TEST, "--nocapture"])
         .env(
             "L2_TEST_ACTIVE_HELPER",
             env!("CARGO_BIN_EXE_l2solver-active-helper"),
@@ -46,8 +49,6 @@ fn owned_veth_receives_scoped_discovery_without_transmitting() -> Result<(), Box
     Ok(())
 }
 
-#[test]
-#[ignore = "invoked only by the proved isolated discovery fixture"]
 fn owned_namespace_child_observes_discovery_without_sending() -> Result<(), Box<dyn Error>> {
     let parent_device: u64 = std::env::var("L2_TEST_PARENT_NET_DEVICE")?.parse()?;
     let parent_inode: u64 = std::env::var("L2_TEST_PARENT_NET_INODE")?.parse()?;

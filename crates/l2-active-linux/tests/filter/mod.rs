@@ -49,21 +49,25 @@ fn intents() -> Result<[Intent; 6], Box<dyn Error>> {
     ])
 }
 
+#[path = "../support/child_mode.rs"]
+mod child_mode;
+
+const PARENT_TEST: &str =
+    "filter::tests::fixed_filters_accept_scoped_candidates_and_reject_unrelated_payloads";
+
 #[test]
-#[ignore = "uses only a proved private namespace and owned veth pair"]
 fn fixed_filters_accept_scoped_candidates_and_reject_unrelated_payloads()
 -> Result<(), Box<dyn Error>> {
+    if child_mode::selected(PARENT_TEST)? {
+        return owned_namespace_child_checks_each_filter();
+    }
     let fixture = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/filter/namespace.py");
     let output = Command::new("python3")
         .arg(fixture)
         .arg("--")
         .arg(std::env::current_exe()?)
-        .args([
-            "--ignored",
-            "--exact",
-            "filter::tests::owned_namespace_child_checks_each_filter",
-            "--nocapture",
-        ])
+        .env(child_mode::ENV, PARENT_TEST)
+        .args(["--exact", PARENT_TEST, "--nocapture"])
         .output()?;
     assert!(
         output.status.success(),
@@ -78,8 +82,6 @@ fn fixed_filters_accept_scoped_candidates_and_reject_unrelated_payloads()
     Ok(())
 }
 
-#[test]
-#[ignore = "invoked only inside the proved private filter fixture"]
 fn owned_namespace_child_checks_each_filter() -> Result<(), Box<dyn Error>> {
     let parent_device: u64 = std::env::var("L2_TEST_PARENT_NET_DEVICE")?.parse()?;
     let parent_inode: u64 = std::env::var("L2_TEST_PARENT_NET_INODE")?.parse()?;

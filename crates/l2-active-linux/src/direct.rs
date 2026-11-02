@@ -31,6 +31,10 @@ const FINAL_SCOPE_TIMEOUT: Duration = Duration::from_millis(500);
 #[path = "../tests/receive/post_read.rs"]
 mod post_read_tests;
 
+#[cfg(test)]
+#[path = "../tests/receive/deadline.rs"]
+mod deadline_tests;
+
 // This type is reachable only from the fixed-operation worker
 pub struct DirectLink {
     selector: InterfaceSelector,
@@ -39,6 +43,7 @@ pub struct DirectLink {
     socket: L2Socket,
     intent: Intent,
     deadline: Instant,
+    deadline_bound: u64,
     sent: bool,
     attempted: bool,
     pre_send: PreSendUsage,
@@ -62,6 +67,10 @@ impl DirectLink {
 
     pub fn deadline_elapsed(&self) -> bool {
         Instant::now() >= self.deadline
+    }
+
+    pub(crate) const fn deadline_bound(&self) -> u64 {
+        self.deadline_bound
     }
 
     pub fn open(
@@ -121,6 +130,8 @@ impl DirectLink {
         } else {
             socket
         };
+        // Keep a conservative monotonic bound for the client and expired requests
+        let deadline_bound = crate::deadline::encode_deadline(deadline, l2_active::MAX_TIMEOUT)?;
         let link = Self {
             selector: selector.clone(),
             pinned,
@@ -128,6 +139,7 @@ impl DirectLink {
             socket,
             intent,
             deadline,
+            deadline_bound,
             sent: false,
             attempted: false,
             pre_send: PreSendUsage::new(0, 0),
@@ -194,13 +206,10 @@ impl DirectLink {
             if cancelled.load(Ordering::Acquire) {
                 return Ok(Some(ReceiveEvent::Cancelled));
             }
-            if error.kind() == io::ErrorKind::TimedOut {
-                if Instant::now() >= self.deadline {
-                    return Ok(Some(ReceiveEvent::BackendTimedOut));
-                }
-                if Instant::now() >= deadline {
-                    return Ok(Some(ReceiveEvent::TimedOut));
-                }
+            if error.kind() == io::ErrorKind::TimedOut
+                && let Some(status) = deadline_status(Instant::now(), deadline, self.deadline)
+            {
+                return Ok(Some(status));
             }
             return Err(error);
         }
@@ -212,14 +221,9 @@ impl DirectLink {
 
     fn terminal_status(&self, deadline: Instant, cancelled: &AtomicBool) -> Option<ReceiveEvent> {
         if cancelled.load(Ordering::Acquire) {
-            Some(ReceiveEvent::Cancelled)
-        } else if Instant::now() >= deadline {
-            Some(ReceiveEvent::TimedOut)
-        } else if Instant::now() >= self.deadline {
-            Some(ReceiveEvent::BackendTimedOut)
-        } else {
-            None
+            return Some(ReceiveEvent::Cancelled);
         }
+        deadline_status(Instant::now(), deadline, self.deadline)
     }
 
     fn drain(&mut self, deadline: Instant, cancelled: &AtomicBool) -> io::Result<()> {
@@ -383,6 +387,21 @@ impl ActiveLink for DirectLink {
             ));
         }
         Ok(Some(events.contains(PollFlags::POLLIN)))
+    }
+}
+
+pub fn deadline_status(
+    now: Instant,
+    deadline: Instant,
+    backend: Instant,
+) -> Option<ReceiveEvent> {
+    // When both are past, preserve the deadline that actually ended first
+    if now >= backend && backend < deadline {
+        Some(ReceiveEvent::BackendTimedOut)
+    } else if now >= deadline {
+        Some(ReceiveEvent::TimedOut)
+    } else {
+        None
     }
 }
 

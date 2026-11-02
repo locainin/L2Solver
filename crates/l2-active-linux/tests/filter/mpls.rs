@@ -15,13 +15,16 @@ fn mpls_filter_produces_a_bounded_forward_only_program() -> Result<(), Box<dyn E
 }
 
 #[test]
-#[ignore = "uses a proved private namespace and owned veth pair"]
 fn mpls_filter_accepts_the_local_endpoint_and_rejects_other_scopes() -> Result<(), Box<dyn Error>> {
-    shared::run_fixture("mpls", "filter::mpls::tests::mpls_child")
+    if shared::child_mode::selected("mpls")? {
+        return mpls_child();
+    }
+    shared::run_fixture(
+        "mpls",
+        "filter::mpls::tests::mpls_filter_accepts_the_local_endpoint_and_rejects_other_scopes",
+    )
 }
 
-#[test]
-#[ignore = "invoked only inside the proved private filter fixture"]
 fn mpls_child() -> Result<(), Box<dyn Error>> {
     shared::check_child(program()?)
 }

@@ -23,6 +23,11 @@ fn instructions(group: Option<u8>) -> io::Result<Vec<BpfInstruction>> {
     program.finish()
 }
 
+#[path = "../support/child_mode.rs"]
+mod child_mode;
+
+const PARENT_TEST: &str = "filter::hsrp::tests::kernel_hsrp_filters_apply_profile_and_bounds";
+
 #[test]
 fn hsrp_groups_produce_bounded_forward_only_programs() -> Result<(), Box<dyn Error>> {
     for group in [None, Some(0), Some(255)] {
@@ -34,19 +39,17 @@ fn hsrp_groups_produce_bounded_forward_only_programs() -> Result<(), Box<dyn Err
 }
 
 #[test]
-#[ignore = "uses only a proved private namespace and owned veth pair"]
 fn kernel_hsrp_filters_apply_profile_and_bounds() -> Result<(), Box<dyn Error>> {
+    if child_mode::selected(PARENT_TEST)? {
+        return owned_namespace_checks_hsrp_filters();
+    }
     let fixture = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/filter/hsrp_namespace.py");
     let output = Command::new("python3")
         .arg(fixture)
         .arg("--")
         .arg(std::env::current_exe()?)
-        .args([
-            "--ignored",
-            "--exact",
-            "filter::hsrp::tests::owned_namespace_checks_hsrp_filters",
-            "--nocapture",
-        ])
+        .env(child_mode::ENV, PARENT_TEST)
+        .args(["--exact", PARENT_TEST, "--nocapture"])
         .output()?;
     assert!(
         output.status.success(),
@@ -60,8 +63,6 @@ fn kernel_hsrp_filters_apply_profile_and_bounds() -> Result<(), Box<dyn Error>> 
     Ok(())
 }
 
-#[test]
-#[ignore = "invoked only inside the proved private filter fixture"]
 fn owned_namespace_checks_hsrp_filters() -> Result<(), Box<dyn Error>> {
     let parent_device: u64 = std::env::var("L2_TEST_PARENT_NET_DEVICE")?.parse()?;
     let parent_inode: u64 = std::env::var("L2_TEST_PARENT_NET_INODE")?.parse()?;

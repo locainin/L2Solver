@@ -7,9 +7,11 @@ use std::{
 };
 
 #[test]
-#[ignore = "requires a matching helper and a verified isolated veth namespace"]
 fn real_dtp_cli_observes_claims_without_transmission_or_raw_disclosure()
 -> Result<(), Box<dyn Error>> {
+    if crate::namespace::child_mode("dtp")? {
+        return dtp_namespace_child();
+    }
     exercise(
         "dtp",
         "../l2-active/tests/switching/fixtures/veth.py",
@@ -18,9 +20,11 @@ fn real_dtp_cli_observes_claims_without_transmission_or_raw_disclosure()
 }
 
 #[test]
-#[ignore = "requires a matching helper and a verified isolated veth namespace"]
 fn real_vtp_cli_observes_claims_without_transmission_or_raw_disclosure()
 -> Result<(), Box<dyn Error>> {
+    if crate::namespace::child_mode("vtp")? {
+        return vtp_namespace_child();
+    }
     exercise(
         "vtp",
         "../l2-active/tests/switching/fixtures/veth.py",
@@ -29,9 +33,11 @@ fn real_vtp_cli_observes_claims_without_transmission_or_raw_disclosure()
 }
 
 #[test]
-#[ignore = "requires a matching helper and a verified isolated veth namespace"]
 fn real_isl_cli_observes_claims_without_transmission_or_raw_disclosure()
 -> Result<(), Box<dyn Error>> {
+    if crate::namespace::child_mode("isl")? {
+        return isl_namespace_child();
+    }
     exercise(
         "isl",
         "../l2-active/tests/isl/fixtures/veth.py",
@@ -40,18 +46,23 @@ fn real_isl_cli_observes_claims_without_transmission_or_raw_disclosure()
 }
 
 fn exercise(protocol: &str, fixture: &str, marker: &str) -> Result<(), Box<dyn Error>> {
+    let helper = crate::namespace::matching_helper()?;
+    let parent_test = match protocol {
+        "dtp" => "switching::real_dtp_cli_observes_claims_without_transmission_or_raw_disclosure",
+        "vtp" => "switching::real_vtp_cli_observes_claims_without_transmission_or_raw_disclosure",
+        "isl" => "switching::real_isl_cli_observes_claims_without_transmission_or_raw_disclosure",
+        _ => return Err("unknown switching fixture".into()),
+    };
     let fixture = Path::new(env!("CARGO_MANIFEST_DIR")).join(fixture);
     for raw in [false, true] {
         let output = Command::new("python3")
             .arg(&fixture)
             .arg("--")
             .arg(std::env::current_exe()?)
-            .args([
-                "--ignored",
-                "--exact",
-                &format!("switching::{protocol}_namespace_child"),
-            ])
+            .args(["--exact", parent_test])
+            .env("L2_ACTIVE_CLI_TEST_CHILD", protocol)
             .env("L2_TEST_INCLUDE_RAW", if raw { "1" } else { "0" })
+            .env("L2_TEST_ACTIVE_HELPER", &helper)
             .output()?;
         assert!(
             output.status.success(),
@@ -63,20 +74,14 @@ fn exercise(protocol: &str, fixture: &str, marker: &str) -> Result<(), Box<dyn E
     Ok(())
 }
 
-#[test]
-#[ignore = "invoked only by the proved private switching fixture"]
 fn dtp_namespace_child() -> Result<(), Box<dyn Error>> {
     observe("dtp", "SWITCHING", "01000ccccccc", "dtp.bin")
 }
 
-#[test]
-#[ignore = "invoked only by the proved private switching fixture"]
 fn vtp_namespace_child() -> Result<(), Box<dyn Error>> {
     observe("vtp", "SWITCHING", "01000ccccccc", "vtp-summary.bin")
 }
 
-#[test]
-#[ignore = "invoked only by the proved private ISL fixture"]
 fn isl_namespace_child() -> Result<(), Box<dyn Error>> {
     observe("isl", "ISL", "01000c000003", "valid.bin")
 }
@@ -87,7 +92,6 @@ fn observe(
     group: &str,
     expected_file: &str,
 ) -> Result<(), Box<dyn Error>> {
-    crate::namespace::assert_owned()?;
     let interface = std::env::var(format!("L2_TEST_{prefix}_INTERFACE"))?;
     let fixture_key = if prefix == "SWITCHING" {
         "L2_TEST_SWITCHING_FIXTURES".to_owned()

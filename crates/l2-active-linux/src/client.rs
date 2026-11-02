@@ -48,6 +48,7 @@ pub struct HelperLink {
     intent: Intent,
     identity: LinuxInterfaceIdentity,
     deadline: Instant,
+    send_confirmed: bool,
     poisoned: bool,
     signalled: bool,
 }
@@ -416,7 +417,7 @@ impl HelperLink {
         }
         let encoded_deadline =
             crate::deadline::encode_deadline(requested_deadline, intent.limits().timeout())?;
-        let admitted_deadline = crate::deadline::admitted_deadline(encoded_deadline)?;
+        let admitted_deadline = crate::deadline::decode_deadline(encoded_deadline)?;
         if expected.name() != selector.name() {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
@@ -445,17 +446,20 @@ impl HelperLink {
             intent,
             identity: expected.identity(),
             deadline: admitted_deadline,
+            send_confirmed: false,
             poisoned: false,
             signalled: false,
         };
         let request = open_record(selector, expected, &link.intent, encoded_deadline)?;
         let startup_deadline = admitted_deadline.min(Instant::now() + STARTUP_TIMEOUT);
         let response = link.exchange(&request, startup_deadline, Some(cancelled))?;
-        expect_open(
+        link.deadline = expect_open(
             &response,
             link.intent.tag(),
             link.intent.profile(),
             link.intent.frame(),
+            encoded_deadline,
+            link.deadline,
         )?;
         if cancelled.load(Ordering::Acquire) {
             link.cancel();
@@ -613,12 +617,16 @@ impl ActiveLink for HelperLink {
     }
 
     fn send(&mut self, frame: &[u8], deadline: Instant, cancelled: &AtomicBool) -> io::Result<()> {
-        if self.intent.listen_kind().is_some() || frame != self.intent.frame() {
+        if self.intent.listen_kind().is_some()
+            || self.send_confirmed
+            || frame != self.intent.frame()
+        {
             return Err(io::Error::new(
                 io::ErrorKind::PermissionDenied,
                 "frame differs from the admitted request",
             ));
         }
+        let deadline = deadline.min(self.deadline);
         let mut request = Writer::new(wire::SEND);
         request.u64(crate::deadline::encode_deadline(
             deadline,
@@ -629,7 +637,10 @@ impl ActiveLink for HelperLink {
             deadline + RESPONSE_RESERVE,
             Some(cancelled),
         )?;
-        expect_ok(&response)
+        expect_ok(&response)?;
+        // Preserve the worker's single-send result even after the deadline
+        self.send_confirmed = true;
+        Ok(())
     }
 
     fn receive(
@@ -649,25 +660,32 @@ impl ActiveLink for HelperLink {
                 self.cancel();
                 return Ok(ReceiveEvent::Cancelled);
             }
-            if Instant::now() >= deadline {
-                return Ok(ReceiveEvent::TimedOut);
+            if let Some(status) =
+                crate::direct::deadline_status(Instant::now(), deadline, self.deadline)
+            {
+                return Ok(status);
             }
+            let effective = deadline.min(self.deadline);
             let mut request = Writer::new(wire::RECEIVE);
-            let Some(encoded) = receive_deadline(deadline)? else {
-                return Ok(ReceiveEvent::TimedOut);
+            let Some(encoded) = receive_deadline(effective)? else {
+                return Ok(if self.deadline < deadline {
+                    ReceiveEvent::BackendTimedOut
+                } else {
+                    ReceiveEvent::TimedOut
+                });
             };
             request.u64(encoded);
             request.u32(u32::try_from(max_bytes).map_err(io::Error::other)?);
             let response = self.exchange(
                 &request.finish(),
-                deadline + RESPONSE_RESERVE,
+                effective + RESPONSE_RESERVE,
                 Some(cancelled),
             )?;
             let mut reader = Reader::new(&response);
             match reader.u8()? {
                 wire::FRAME => {
                     // IPC scheduling cannot turn a late read into timely evidence
-                    crate::deadline::ensure_before(deadline)?;
+                    crate::deadline::ensure_before(effective)?;
                     return decode_frame(&mut reader, self.identity, max_bytes)
                         .map(ReceiveEvent::Frame);
                 }
@@ -805,7 +823,9 @@ fn expect_open(
     expected_tag: u8,
     expected_profile: u16,
     expected: &[u8],
-) -> io::Result<()> {
+    requested_deadline: u64,
+    client_deadline: Instant,
+) -> io::Result<Instant> {
     let mut reader = Reader::new(record);
     match reader.u8()? {
         wire::OK => {
@@ -829,7 +849,15 @@ fn expect_open(
                     "helper reconstructed a different request",
                 ));
             }
-            reader.finish()
+            let admitted_deadline = reader.u64()?;
+            reader.finish()?;
+            if admitted_deadline == 0 || admitted_deadline > requested_deadline {
+                return Err(wire::invalid_record());
+            }
+            let admitted =
+                client_deadline.min(crate::deadline::decode_deadline(admitted_deadline)?);
+            crate::deadline::ensure_before(admitted)?;
+            Ok(admitted)
         }
         wire::ERROR => Err(wire::read_error(&mut reader)?),
         _ => Err(wire::invalid_record()),

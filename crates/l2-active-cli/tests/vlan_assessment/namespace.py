@@ -86,6 +86,7 @@ def run_case(runner, helper, parent_net, net_fd, pair, created, forwarded, raw=F
         "L2_TEST_PARENT_NET_INODE": str(parent_net[1]),
         "L2_TEST_ACTIVE_HELPER": helper,
         "L2_TEST_VLAN_ASSESSMENT_CASE": case,
+        "L2_ACTIVE_CLI_TEST_CHILD": "vlan_canary",
     })
     control_request = ns.arp_frame(bytes([255]) * 6, ns.SOURCE_MAC, 1,
                                    socket.inet_aton("192.0.2.1"), bytes(6), TARGET)
@@ -99,7 +100,7 @@ def run_case(runner, helper, parent_net, net_fd, pair, created, forwarded, raw=F
         capture.setsockopt(vlan.SOL_PACKET, vlan.PACKET_AUXDATA, 1)
         capture.settimeout(0.04)
         process = subprocess.Popen(
-            [runner, "--ignored", "--exact", "namespace_tests::owned_vlan_canary_assessment_child", "--nocapture"],
+            [runner, "--exact", "namespace_tests::real_vlan_canary_assessment_observes_forwarding_and_keeps_silence_inconclusive", "--nocapture"],
             env=environment, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
         )
         try:
@@ -117,7 +118,8 @@ def run_case(runner, helper, parent_net, net_fd, pair, created, forwarded, raw=F
                 elif packet in expected:
                     raise RuntimeError("canary requests arrived in the wrong order")
             stdout, stderr = process.communicate(timeout=8)
-            if process.returncode != 0 or len(observed) != len(expected):
+            if (process.returncode != 0 or len(observed) != len(expected)
+                    or b"test result: ok. 1 passed; 0 failed;" not in stdout):
                 raise RuntimeError(f"{case} assessment failed: witnessed={observed}, "
                                    f"stderr={stderr.decode(errors='replace')}, stdout={stdout.decode(errors='replace')}")
             require_scope(net_fd, pair, created, forwarded)

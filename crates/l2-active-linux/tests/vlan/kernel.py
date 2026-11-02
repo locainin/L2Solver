@@ -73,13 +73,13 @@ def run_pin_child(command, parent_net, indices, case, interface):
         "L2_TEST_VLAN_PARENT_INDEX": str(indices[ns.SOURCE]),
         "L2_TEST_VLAN_PIN_CASE": case,
         "L2_TEST_VLAN_INTERFACE": interface,
+        "L2_ACTIVE_LINUX_TEST_CHILD": "vlan-pin",
     })
     result = subprocess.run(
-        [*command, "--ignored", "--exact", "vlan::pin_tests::owned_vlan_pin_child_checks_scope_and_parent", "--nocapture"],
+        [*command, "--exact", "vlan::pin_tests::vlan_pin_retains_parent_and_rejects_stale_or_stacked_scope", "--nocapture"],
         env=environment, capture_output=True, text=True, timeout=8,
     )
-    if result.returncode:
-        raise RuntimeError(f"VLAN pin check failed: {result.stderr} {result.stdout}")
+    vlan.require_child_pass(result.returncode, result.stdout, result.stderr, "VLAN pin check")
 
 
 def check_pin(net_fd, indices, command, parent_net):

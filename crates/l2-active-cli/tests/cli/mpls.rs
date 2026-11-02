@@ -73,9 +73,12 @@ fn cancelled_mpls_command_never_opens_a_helper_or_sends() -> Result<(), Box<dyn 
 
 #[cfg(target_os = "linux")]
 #[test]
-#[ignore = "uses a proved private namespace and matching active helper"]
 fn owned_veth_mpls_cli_observes_scoped_frames_and_honors_raw_opt_in() -> Result<(), Box<dyn Error>>
 {
+    if crate::namespace::child_mode("mpls")? {
+        return owned_namespace_mpls_cli_child();
+    }
+    let helper = crate::namespace::matching_helper()?;
     let fixture = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("../l2-active/tests/mpls/fixtures/veth.py");
     for raw in [false, true] {
@@ -84,11 +87,12 @@ fn owned_veth_mpls_cli_observes_scoped_frames_and_honors_raw_opt_in() -> Result<
             .arg("--")
             .arg(std::env::current_exe()?)
             .args([
-                "--ignored",
                 "--exact",
-                "mpls::owned_namespace_mpls_cli_child",
+                "mpls::owned_veth_mpls_cli_observes_scoped_frames_and_honors_raw_opt_in",
             ])
+            .env("L2_ACTIVE_CLI_TEST_CHILD", "mpls")
             .env("L2_TEST_INCLUDE_RAW", if raw { "1" } else { "0" })
+            .env("L2_TEST_ACTIVE_HELPER", &helper)
             .output()?;
         // The fixture's failure output can include untrusted process diagnostics
         assert!(
@@ -104,12 +108,9 @@ fn owned_veth_mpls_cli_observes_scoped_frames_and_honors_raw_opt_in() -> Result<
 }
 
 #[cfg(target_os = "linux")]
-#[test]
-#[ignore = "invoked only inside the proved private MPLS fixture"]
 fn owned_namespace_mpls_cli_child() -> Result<(), Box<dyn Error>> {
     use std::{fs, path::Path, process::Stdio};
 
-    crate::namespace::assert_owned()?;
     let interface = std::env::var("L2_TEST_MPLS_INTERFACE")?;
     let fixture_dir = std::env::var_os("L2_TEST_MPLS_FIXTURE").ok_or("missing fixtures")?;
     let sync_dir = std::env::var_os("L2_TEST_MPLS_SYNC_DIR").ok_or("missing sync directory")?;

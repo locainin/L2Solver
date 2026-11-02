@@ -102,11 +102,12 @@ pub fn run_helper() -> io::Result<()> {
         return Err(error);
     }
     let frame = link.request_frame();
-    let mut opened = Writer::with_capacity(wire::OK, frame.len() + 6)?;
+    let mut opened = Writer::with_capacity(wire::OK, frame.len() + 14)?;
     opened.u8(link.request_tag());
     opened.u16(link.request_profile());
     opened.u16(u16::try_from(frame.len()).map_err(io::Error::other)?);
     opened.bytes(frame);
+    opened.u64(link.deadline_bound());
     channel.send(&opened.finish(), startup_deadline)?;
     loop {
         let request = channel.receive(operation_deadline)?;
@@ -250,11 +251,13 @@ fn operation(
             let deadline = match crate::deadline::decode_deadline(encoded_deadline) {
                 Ok(value) => value,
                 Err(error) if error.kind() == io::ErrorKind::TimedOut => {
-                    let status = if link.deadline_elapsed() {
-                        wire::FINAL_TIMEOUT
-                    } else {
-                        wire::TIMEOUT
-                    };
+                    // A slice known to end before the worker bound consumed no frame
+                    let status =
+                        if encoded_deadline > link.deadline_bound() && link.deadline_elapsed() {
+                            wire::FINAL_TIMEOUT
+                        } else {
+                            wire::TIMEOUT
+                        };
                     return Ok(Writer::new(status).finish());
                 }
                 Err(error) => return Err(error),

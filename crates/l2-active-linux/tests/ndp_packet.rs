@@ -14,8 +14,12 @@ use std::{
     time::{Duration, Instant},
 };
 
+#[path = "support/child_mode.rs"]
+mod child_mode;
+
+const PARENT_TEST: &str = "owned_veth_carries_one_typed_link_local_solicitation_and_advertisement";
+
 #[test]
-#[ignore = "uses a proved private namespace and owned veth pair"]
 fn ndp_fixture_witnesses_synthetic_exchange_and_cleanup() -> Result<(), Box<dyn Error>> {
     let fixture =
         Path::new(env!("CARGO_MANIFEST_DIR")).join("../l2-active/tests/ndp/fixtures/veth.py");
@@ -34,7 +38,6 @@ fn ndp_fixture_witnesses_synthetic_exchange_and_cleanup() -> Result<(), Box<dyn 
 }
 
 #[test]
-#[ignore = "uses a proved private namespace and owned veth pair"]
 fn ndp_fixture_rejects_a_command_that_sends_no_solicitation() -> Result<(), Box<dyn Error>> {
     let fixture =
         Path::new(env!("CARGO_MANIFEST_DIR")).join("../l2-active/tests/ndp/fixtures/veth.py");
@@ -51,14 +54,15 @@ fn ndp_fixture_rejects_a_command_that_sends_no_solicitation() -> Result<(), Box<
 }
 
 #[test]
-#[ignore = "uses a proved private namespace and independent NDP veth responder"]
 fn owned_veth_carries_one_typed_link_local_solicitation_and_advertisement()
 -> Result<(), Box<dyn Error>> {
+    if child_mode::selected(PARENT_TEST)? {
+        return owned_namespace_child_performs_one_link_local_ndp_probe();
+    }
     run_owned_veth(None)
 }
 
 #[test]
-#[ignore = "uses a proved private namespace and independent NDP veth responder"]
 fn owned_veth_counts_only_frames_admitted_by_the_ndp_filter() -> Result<(), Box<dyn Error>> {
     for candidate in ["fragment", "other-target", "bad-hop"] {
         run_owned_veth(Some(candidate))?;
@@ -74,12 +78,8 @@ fn run_owned_veth(filter_noise: Option<&str>) -> Result<(), Box<dyn Error>> {
         .arg(fixture)
         .arg("--")
         .arg(std::env::current_exe()?)
-        .args([
-            "--ignored",
-            "--exact",
-            "owned_namespace_child_performs_one_link_local_ndp_probe",
-            "--nocapture",
-        ])
+        .env(child_mode::ENV, PARENT_TEST)
+        .args(["--exact", PARENT_TEST, "--nocapture"])
         .env(
             "L2_TEST_ACTIVE_HELPER",
             env!("CARGO_BIN_EXE_l2solver-active-helper"),
@@ -109,8 +109,6 @@ fn run_owned_veth(filter_noise: Option<&str>) -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
-#[test]
-#[ignore = "invoked only by the proved isolated NDP namespace fixture"]
 fn owned_namespace_child_performs_one_link_local_ndp_probe() -> Result<(), Box<dyn Error>> {
     let parent_device: u64 = std::env::var("L2_TEST_PARENT_NET_DEVICE")?.parse()?;
     let parent_inode: u64 = std::env::var("L2_TEST_PARENT_NET_INODE")?.parse()?;

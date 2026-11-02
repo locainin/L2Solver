@@ -104,8 +104,11 @@ fn global_target_parses_as_a_candidate_requiring_route_authorization() -> Result
 
 #[cfg(target_os = "linux")]
 #[test]
-#[ignore = "uses verified isolated veth namespaces and a built active helper"]
 fn global_ndp_cli_requires_a_direct_route_and_observes_the_reply() -> Result<(), Box<dyn Error>> {
+    if crate::namespace::child_mode("global_ndp")? {
+        return owned_global_namespace_child();
+    }
+    let helper = crate::namespace::matching_helper()?;
     let fixture = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("../l2-active/tests/ndp/fixtures/global_veth.py");
     for case in ["direct", "no_route"] {
@@ -113,8 +116,13 @@ fn global_ndp_cli_requires_a_direct_route_and_observes_the_reply() -> Result<(),
             .arg(&fixture)
             .arg("--")
             .arg(std::env::current_exe()?)
-            .args(["--ignored", "--exact", "ndp::owned_global_namespace_child"])
+            .args([
+                "--exact",
+                "ndp::global_ndp_cli_requires_a_direct_route_and_observes_the_reply",
+            ])
+            .env("L2_ACTIVE_CLI_TEST_CHILD", "global_ndp")
             .env("L2_TEST_NDP_GLOBAL_CASE", case)
+            .env("L2_TEST_ACTIVE_HELPER", &helper)
             .output()?;
         assert!(
             output.status.success(),
@@ -130,10 +138,7 @@ fn global_ndp_cli_requires_a_direct_route_and_observes_the_reply() -> Result<(),
 }
 
 #[cfg(target_os = "linux")]
-#[test]
-#[ignore = "invoked only by the verified owned global-NDP fixture"]
 fn owned_global_namespace_child() -> Result<(), Box<dyn Error>> {
-    crate::namespace::assert_owned()?;
     let case = std::env::var("L2_TEST_NDP_GLOBAL_CASE")?;
     let interface = std::env::var("L2_TEST_NDP_INTERFACE")?;
     let helper = std::env::var_os("L2_TEST_ACTIVE_HELPER").ok_or("missing helper")?;
@@ -193,8 +198,11 @@ fn owned_global_namespace_child() -> Result<(), Box<dyn Error>> {
 
 #[cfg(target_os = "linux")]
 #[test]
-#[ignore = "uses a verified isolated veth namespace and a built active helper"]
 fn ndp_cli_observes_owned_veth_advertisement_and_confirms_cleanup() -> Result<(), Box<dyn Error>> {
+    if crate::namespace::child_mode("ndp")? {
+        return owned_namespace_child_asserts_cli_advertisement();
+    }
+    let helper = crate::namespace::matching_helper()?;
     let fixture = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("../l2-active/tests/ndp/fixtures/veth.py");
     let output = Command::new("python3")
@@ -202,10 +210,11 @@ fn ndp_cli_observes_owned_veth_advertisement_and_confirms_cleanup() -> Result<()
         .arg("--")
         .arg(std::env::current_exe()?)
         .args([
-            "--ignored",
             "--exact",
-            "ndp::owned_namespace_child_asserts_cli_advertisement",
+            "ndp::ndp_cli_observes_owned_veth_advertisement_and_confirms_cleanup",
         ])
+        .env("L2_ACTIVE_CLI_TEST_CHILD", "ndp")
+        .env("L2_TEST_ACTIVE_HELPER", helper)
         .output()?;
     assert!(
         output.status.success(),
@@ -220,10 +229,7 @@ fn ndp_cli_observes_owned_veth_advertisement_and_confirms_cleanup() -> Result<()
 }
 
 #[cfg(target_os = "linux")]
-#[test]
-#[ignore = "invoked only by the verified owned veth fixture"]
 fn owned_namespace_child_asserts_cli_advertisement() -> Result<(), Box<dyn Error>> {
-    crate::namespace::assert_owned()?;
     let interface = std::env::var("L2_TEST_NDP_INTERFACE")?;
     let helper = std::env::var_os("L2_TEST_ACTIVE_HELPER").ok_or("missing helper")?;
     let output = crate::namespace::command()

@@ -73,8 +73,11 @@ fn cancelled_dhcp_discovery_does_not_open_an_interface_or_send() -> Result<(), B
 
 #[cfg(target_os = "linux")]
 #[test]
-#[ignore = "uses a verified isolated veth namespace and a built active helper"]
 fn dhcp_cli_observes_owned_veth_offer_and_confirms_helper_cleanup() -> Result<(), Box<dyn Error>> {
+    if crate::namespace::child_mode("dhcp")? {
+        return owned_namespace_child_asserts_cli_offer();
+    }
+    let helper = crate::namespace::matching_helper()?;
     let fixture = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("../l2-active/tests/dhcp/fixtures/veth.py");
     let output = Command::new("python3")
@@ -82,10 +85,11 @@ fn dhcp_cli_observes_owned_veth_offer_and_confirms_helper_cleanup() -> Result<()
         .arg("--")
         .arg(std::env::current_exe()?)
         .args([
-            "--ignored",
             "--exact",
-            "dhcp::owned_namespace_child_asserts_cli_offer",
+            "dhcp::dhcp_cli_observes_owned_veth_offer_and_confirms_helper_cleanup",
         ])
+        .env("L2_ACTIVE_CLI_TEST_CHILD", "dhcp")
+        .env("L2_TEST_ACTIVE_HELPER", helper)
         .output()?;
     assert!(
         output.status.success(),
@@ -100,10 +104,7 @@ fn dhcp_cli_observes_owned_veth_offer_and_confirms_helper_cleanup() -> Result<()
 }
 
 #[cfg(target_os = "linux")]
-#[test]
-#[ignore = "invoked only by the verified owned veth fixture"]
 fn owned_namespace_child_asserts_cli_offer() -> Result<(), Box<dyn Error>> {
-    crate::namespace::assert_owned()?;
     let interface = std::env::var("L2_TEST_DHCP_INTERFACE")?;
     let helper = std::env::var_os("L2_TEST_ACTIVE_HELPER").ok_or("missing helper")?;
     let output = crate::namespace::command()

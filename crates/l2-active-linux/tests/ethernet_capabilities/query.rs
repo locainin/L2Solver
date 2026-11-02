@@ -130,7 +130,6 @@ fn query_failures_preserve_denied_unsupported_and_unknown_distinctions()
 }
 
 #[test]
-#[ignore = "compares read-only loopback results with the installed ethtool command"]
 fn loopback_advertisements_match_independent_ethtool_queries()
 -> Result<(), Box<dyn std::error::Error>> {
     use std::process::Command;

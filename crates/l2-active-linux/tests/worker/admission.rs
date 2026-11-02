@@ -96,15 +96,18 @@ fn unknown_open_intent_is_rejected_before_opening_a_socket() -> io::Result<()> {
 }
 
 #[test]
-fn worker_rejects_version_nine_before_socket_admission() {
-    let mut writer = Writer::new(wire::OPEN);
-    writer.u8(9);
-    assert_eq!(
-        open_request(&writer.finish())
-            .err()
-            .map(|error| error.kind()),
-        Some(io::ErrorKind::InvalidData)
-    );
+fn worker_rejects_incompatible_versions_before_socket_admission() {
+    for version in [9, 10, 12] {
+        let mut writer = Writer::new(wire::OPEN);
+        writer.u8(version);
+        assert_eq!(
+            open_request(&writer.finish())
+                .err()
+                .map(|error| error.kind()),
+            Some(io::ErrorKind::InvalidData),
+            "version {version}"
+        );
+    }
 }
 
 #[test]

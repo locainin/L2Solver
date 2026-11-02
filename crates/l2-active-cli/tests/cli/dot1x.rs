@@ -99,8 +99,11 @@ fn cancelled_acknowledged_probe_does_not_open_or_transmit() -> Result<(), Box<dy
 
 #[cfg(target_os = "linux")]
 #[test]
-#[ignore = "uses a verified isolated veth namespace and a built active helper"]
 fn dot1x_cli_observes_owned_veth_request_and_confirms_cleanup() -> Result<(), Box<dyn Error>> {
+    if crate::namespace::child_mode("dot1x")? {
+        return owned_namespace_child_asserts_cli_request();
+    }
+    let helper = crate::namespace::matching_helper()?;
     let fixture = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("../l2-active/tests/dot1x/fixtures/veth.py");
     let output = Command::new("python3")
@@ -108,10 +111,11 @@ fn dot1x_cli_observes_owned_veth_request_and_confirms_cleanup() -> Result<(), Bo
         .arg("--")
         .arg(std::env::current_exe()?)
         .args([
-            "--ignored",
             "--exact",
-            "dot1x::owned_namespace_child_asserts_cli_request",
+            "dot1x::dot1x_cli_observes_owned_veth_request_and_confirms_cleanup",
         ])
+        .env("L2_ACTIVE_CLI_TEST_CHILD", "dot1x")
+        .env("L2_TEST_ACTIVE_HELPER", helper)
         .output()?;
     assert!(
         output.status.success(),
@@ -126,10 +130,7 @@ fn dot1x_cli_observes_owned_veth_request_and_confirms_cleanup() -> Result<(), Bo
 }
 
 #[cfg(target_os = "linux")]
-#[test]
-#[ignore = "invoked only by the verified owned veth fixture"]
 fn owned_namespace_child_asserts_cli_request() -> Result<(), Box<dyn Error>> {
-    crate::namespace::assert_owned()?;
     let interface = std::env::var("L2_TEST_DOT1X_INTERFACE")?;
     let helper = std::env::var_os("L2_TEST_ACTIVE_HELPER").ok_or("missing helper")?;
     let output = crate::namespace::command()

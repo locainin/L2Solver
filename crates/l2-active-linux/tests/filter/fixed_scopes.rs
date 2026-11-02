@@ -17,6 +17,9 @@ use crate::filter::{
     EQUAL, LOAD_WORD, Label, PACKET_OUTGOING, PACKET_TYPE, Program, VLAN_TAG_PRESENT,
 };
 
+#[path = "../support/child_mode.rs"]
+pub(super) mod child_mode;
+
 pub(super) fn program(emit: impl FnOnce(&mut Program)) -> io::Result<Vec<BpfInstruction>> {
     let mut program = Program::new()?;
     // Match the fixed common admission before adding the protocol-specific rule
@@ -28,14 +31,15 @@ pub(super) fn program(emit: impl FnOnce(&mut Program)) -> io::Result<Vec<BpfInst
     program.finish()
 }
 
-pub(super) fn run_fixture(profile: &str, child_test: &str) -> Result<(), Box<dyn Error>> {
+pub(super) fn run_fixture(profile: &str, parent: &str) -> Result<(), Box<dyn Error>> {
     let fixture = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/filter/first_hop_mpls.py");
     let output = Command::new("python3")
         .arg(fixture)
         .arg(profile)
         .arg("--")
         .arg(std::env::current_exe()?)
-        .args(["--ignored", "--exact", child_test, "--nocapture"])
+        .args(["--exact", parent, "--nocapture"])
+        .env(child_mode::ENV, profile)
         .output()?;
     assert!(
         output.status.success(),

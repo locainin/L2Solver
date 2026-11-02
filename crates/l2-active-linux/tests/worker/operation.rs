@@ -19,19 +19,24 @@ use std::{
     time::{Duration, Instant},
 };
 
+#[path = "../support/child_mode.rs"]
+mod child_mode;
+
+const PARENT_TEST: &str =
+    "worker::operation_tests::owned_veth_worker_checks_raw_operation_boundaries";
+
 #[test]
-#[ignore = "uses a proved private namespace and independent veth sender"]
 fn owned_veth_worker_checks_raw_operation_boundaries() -> Result<(), Box<dyn Error>> {
+    if child_mode::selected(PARENT_TEST)? {
+        return owned_namespace_child_checks_raw_operations();
+    }
     let fixture = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/listen/namespace.py");
     let output = Command::new("python3")
         .arg(fixture)
         .arg("--")
         .arg(std::env::current_exe()?)
-        .args([
-            "--ignored",
-            "--exact",
-            "worker::operation_tests::owned_namespace_child_checks_raw_operations",
-        ])
+        .env(child_mode::ENV, PARENT_TEST)
+        .args(["--exact", PARENT_TEST])
         .output()?;
     assert!(
         output.status.success(),
@@ -45,8 +50,6 @@ fn owned_veth_worker_checks_raw_operation_boundaries() -> Result<(), Box<dyn Err
     Ok(())
 }
 
-#[test]
-#[ignore = "invoked only by the proved isolated discovery fixture"]
 fn owned_namespace_child_checks_raw_operations() -> Result<(), Box<dyn Error>> {
     let parent_device: u64 = std::env::var("L2_TEST_PARENT_NET_DEVICE")?.parse()?;
     let parent_inode: u64 = std::env::var("L2_TEST_PARENT_NET_INODE")?.parse()?;
@@ -62,6 +65,7 @@ fn owned_namespace_child_checks_raw_operations() -> Result<(), Box<dyn Error>> {
     let cancelled = AtomicBool::new(false);
     let intent = Intent::listen(MacAddress::new(info.mac())?, limits, ListenKind::Discovery);
     let mut link = DirectLink::open(&selector, info.identity(), info.vlan(), intent, deadline)?;
+    let worker_bound = link.deadline_bound();
     let mut request = Writer::new(wire::RECEIVE);
     request.u64(0);
     request.u32(65_536);
@@ -119,10 +123,19 @@ fn owned_namespace_child_checks_raw_operations() -> Result<(), Box<dyn Error>> {
             .iter()
             .any(|item| item.protocol() == DiscoveryProtocol::Cdp)
     );
-    // Once the worker deadline expires the same record has a final response
+    // An earlier expired slice remains a slice timeout after the worker expires
     assert!(link.deadline_elapsed());
+    assert_eq!(dispatch(&mut link, &cancelled, &expired)?, [wire::TIMEOUT]);
+    std::thread::sleep(Duration::from_millis(2));
+    let mut later = Writer::new(wire::RECEIVE);
+    later.u64(
+        worker_bound
+            .checked_add(1)
+            .ok_or("invalid worker deadline")?,
+    );
+    later.u32(65_536);
     assert_eq!(
-        dispatch(&mut link, &cancelled, &expired)?,
+        dispatch(&mut link, &cancelled, &later.finish())?,
         [wire::FINAL_TIMEOUT]
     );
     drop(link);

@@ -2,6 +2,12 @@ use std::error::Error;
 
 use super::super::{MAX_INSTRUCTIONS, Program};
 
+#[path = "../support/child_mode.rs"]
+mod child_mode;
+
+const PARENT_TEST: &str =
+    "filter::switching::tests::switching_filters_admit_only_scoped_candidates_in_the_kernel";
+
 #[test]
 fn dtp_and_vtp_programs_are_bounded_and_finish_successfully() -> Result<(), Box<dyn Error>> {
     for populate in [super::dtp as fn(&mut Program), super::vtp] {
@@ -15,8 +21,10 @@ fn dtp_and_vtp_programs_are_bounded_and_finish_successfully() -> Result<(), Box<
 }
 
 #[test]
-#[ignore = "uses only a proved private namespace and owned veth pair"]
 fn switching_filters_admit_only_scoped_candidates_in_the_kernel() -> Result<(), Box<dyn Error>> {
+    if child_mode::selected(PARENT_TEST)? {
+        return switching_filter_namespace_child();
+    }
     use std::{path::Path, process::Command};
 
     let fixture = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/filter/switching_namespace.py");
@@ -24,12 +32,8 @@ fn switching_filters_admit_only_scoped_candidates_in_the_kernel() -> Result<(), 
         .arg(fixture)
         .arg("--")
         .arg(std::env::current_exe()?)
-        .args([
-            "--ignored",
-            "--exact",
-            "filter::switching::tests::switching_filter_namespace_child",
-            "--nocapture",
-        ])
+        .env(child_mode::ENV, PARENT_TEST)
+        .args(["--exact", PARENT_TEST, "--nocapture"])
         .output()?;
     assert!(
         output.status.success(),
@@ -44,8 +48,6 @@ fn switching_filters_admit_only_scoped_candidates_in_the_kernel() -> Result<(), 
     Ok(())
 }
 
-#[test]
-#[ignore = "invoked only inside the proved private filter fixture"]
 fn switching_filter_namespace_child() -> Result<(), Box<dyn Error>> {
     use rscap::{
         Interface,

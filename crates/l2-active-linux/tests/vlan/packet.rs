@@ -1,4 +1,6 @@
 mod synchronize;
+#[path = "../support/child_mode.rs"]
+mod child_mode;
 
 use l2_active::{ArpProbe, ArpReport, Limits, NeighborStatus, StopReason};
 use l2_active_linux::{HelperLink, InterfaceSelector, discover};
@@ -23,6 +25,21 @@ fn vlan_witness_distinguishes_auxiliary_and_unmodified_frames() -> Result<(), Bo
     assert!(
         result.status.success(),
         "VLAN witness checks failed: {}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    Ok(())
+}
+
+#[test]
+fn vlan_pin_fixture_requires_its_child_test_to_run() -> Result<(), Box<dyn Error>> {
+    let test = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/vlan/test_kernel.py");
+    let result = Command::new("python3")
+        .arg(test)
+        .env("PYTHONDONTWRITEBYTECODE", "1")
+        .output()?;
+    assert!(
+        result.status.success(),
+        "VLAN pin child checks failed: {}",
         String::from_utf8_lossy(&result.stderr)
     );
     Ok(())
@@ -56,57 +73,53 @@ fn fixture(protocol: &str, case: &str) -> Result<(), Box<dyn Error>> {
 }
 
 #[test]
-#[ignore = "uses a proved private namespace and an owned veth pair with one VLAN interface"]
 fn ieee8021q_arp_uses_the_configured_vlan_and_filters_wrong_vid() -> Result<(), Box<dyn Error>> {
+    if child_mode::selected("vlan-normal")? {
+        return owned_vlan_child_rejects_wrong_vid_and_observes_matching_reply();
+    }
     fixture("802.1Q", "normal")
 }
 
 #[test]
-#[ignore = "uses a proved private namespace and an owned veth pair with one VLAN interface"]
 fn ieee8021ad_arp_uses_the_configured_vlan_and_filters_wrong_vid() -> Result<(), Box<dyn Error>> {
     fixture("802.1ad", "normal")
 }
 
 #[test]
-#[ignore = "uses a proved private namespace and an owned veth pair with one VLAN interface"]
 fn reorder_off_is_rejected_before_any_transmission() -> Result<(), Box<dyn Error>> {
+    if child_mode::selected("vlan-change")? {
+        return owned_vlan_child_checks_reorder_admission_and_changes();
+    }
     fixture("802.1Q", "deny_off")
 }
 
 #[test]
-#[ignore = "uses a proved private namespace and an owned veth pair with one VLAN interface"]
 fn reorder_changed_after_open_blocks_the_send() -> Result<(), Box<dyn Error>> {
     fixture("802.1Q", "before_send")
 }
 
 #[test]
-#[ignore = "uses a proved private namespace and an owned veth pair with one VLAN interface"]
 fn reorder_changed_after_discovery_rejects_open() -> Result<(), Box<dyn Error>> {
     fixture("802.1Q", "before_open")
 }
 
 #[test]
-#[ignore = "uses a proved private namespace and an owned veth pair with one VLAN interface"]
 fn reorder_changed_after_reply_retains_observation_and_marks_incomplete()
 -> Result<(), Box<dyn Error>> {
     fixture("802.1Q", "after_reply")
 }
 
 #[test]
-#[ignore = "uses a proved private namespace and an owned veth pair with one VLAN interface"]
 fn selected_name_changed_after_reply_retains_observation_and_marks_incomplete()
 -> Result<(), Box<dyn Error>> {
     fixture("802.1Q", "rename_after_reply")
 }
 
 #[test]
-#[ignore = "uses a proved private namespace and an owned veth pair with one VLAN interface"]
 fn final_scope_sample_detects_change_after_the_last_retained_frame() -> Result<(), Box<dyn Error>> {
     fixture("802.1Q", "after_limit")
 }
 
-#[test]
-#[ignore = "invoked only by the proved isolated VLAN fixture"]
 fn owned_vlan_child_rejects_wrong_vid_and_observes_matching_reply() -> Result<(), Box<dyn Error>> {
     let parent_device: u64 = std::env::var("L2_TEST_PARENT_NET_DEVICE")?.parse()?;
     let parent_inode: u64 = std::env::var("L2_TEST_PARENT_NET_INODE")?.parse()?;
@@ -162,8 +175,6 @@ fn owned_vlan_child_rejects_wrong_vid_and_observes_matching_reply() -> Result<()
     Ok(())
 }
 
-#[test]
-#[ignore = "invoked only by the proved isolated VLAN fixture"]
 fn owned_vlan_child_checks_reorder_admission_and_changes() -> Result<(), Box<dyn Error>> {
     let parent_device: u64 = std::env::var("L2_TEST_PARENT_NET_DEVICE")?.parse()?;
     let parent_inode: u64 = std::env::var("L2_TEST_PARENT_NET_INODE")?.parse()?;

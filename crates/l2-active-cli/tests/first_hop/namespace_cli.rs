@@ -7,20 +7,34 @@ use std::{
 };
 
 #[test]
-#[ignore = "requires a matching helper and a verified isolated veth namespace"]
 fn real_vrrp_cli_observes_claims_without_transmitting_or_leaking_by_default()
 -> Result<(), Box<dyn Error>> {
+    if crate::namespace::child_mode("vrrp")? {
+        return vrrp_namespace_child();
+    }
     exercise_fixture("vrrp", "advertisements_delivered=true no_client_send=true")
 }
 
 #[test]
-#[ignore = "requires a matching helper and a verified isolated veth namespace"]
 fn real_hsrp_cli_observes_claims_without_transmitting_or_leaking_by_default()
 -> Result<(), Box<dyn Error>> {
+    if crate::namespace::child_mode("hsrp")? {
+        return hsrp_namespace_child();
+    }
     exercise_fixture("hsrp", "messages_delivered=true no_client_send=true")
 }
 
 fn exercise_fixture(protocol: &str, expected: &str) -> Result<(), Box<dyn Error>> {
+    let helper = crate::namespace::matching_helper()?;
+    let parent_test = match protocol {
+        "vrrp" => {
+            "first_hop::real_vrrp_cli_observes_claims_without_transmitting_or_leaking_by_default"
+        }
+        "hsrp" => {
+            "first_hop::real_hsrp_cli_observes_claims_without_transmitting_or_leaking_by_default"
+        }
+        _ => return Err("unknown first-hop fixture".into()),
+    };
     let fixture = Path::new(env!("CARGO_MANIFEST_DIR")).join(format!(
         "../l2-active/tests/first_hop/{protocol}/fixtures/veth.py"
     ));
@@ -29,12 +43,10 @@ fn exercise_fixture(protocol: &str, expected: &str) -> Result<(), Box<dyn Error>
             .arg(&fixture)
             .arg("--")
             .arg(std::env::current_exe()?)
-            .args([
-                "--ignored",
-                "--exact",
-                &format!("first_hop::{protocol}_namespace_child"),
-            ])
+            .args(["--exact", parent_test])
+            .env("L2_ACTIVE_CLI_TEST_CHILD", protocol)
             .env("L2_TEST_INCLUDE_RAW", if raw { "1" } else { "0" })
+            .env("L2_TEST_ACTIVE_HELPER", &helper)
             .output()?;
         assert!(
             output.status.success(),
@@ -49,14 +61,10 @@ fn exercise_fixture(protocol: &str, expected: &str) -> Result<(), Box<dyn Error>
     Ok(())
 }
 
-#[test]
-#[ignore = "invoked only by the proved VRRP veth fixture"]
 fn vrrp_namespace_child() -> Result<(), Box<dyn Error>> {
     observe("vrrp", "VRRP", "01005e000012", "--vrid", "42", "valid.bin")
 }
 
-#[test]
-#[ignore = "invoked only by the proved HSRP veth fixture"]
 fn hsrp_namespace_child() -> Result<(), Box<dyn Error>> {
     observe(
         "hsrp",
@@ -76,7 +84,6 @@ fn observe(
     value: &str,
     fixture: &str,
 ) -> Result<(), Box<dyn Error>> {
-    crate::namespace::assert_owned()?;
     let interface = std::env::var(format!("L2_TEST_{prefix}_INTERFACE"))?;
     let fixture_dir =
         std::env::var_os(format!("L2_TEST_{prefix}_FIXTURE")).ok_or("missing fixtures")?;

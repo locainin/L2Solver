@@ -17,21 +17,24 @@ use l2_active::{
 use l2_active_linux::{HelperLink, InterfaceSelector, discover};
 use l2_onpath::MacAddress;
 
+#[path = "support/child_mode.rs"]
+mod child_mode;
+
+const PARENT_TEST: &str = "owned_veth_carries_one_typed_start_and_observes_request";
+
 #[test]
-#[ignore = "uses an owned namespace and independent EAPOL veth responder"]
 fn owned_veth_carries_one_typed_start_and_observes_request() -> Result<(), Box<dyn Error>> {
+    if child_mode::selected(PARENT_TEST)? {
+        return owned_namespace_child_performs_one_eapol_start();
+    }
     let fixture =
         Path::new(env!("CARGO_MANIFEST_DIR")).join("../l2-active/tests/dot1x/fixtures/veth.py");
     let output = Command::new("python3")
         .arg(fixture)
         .arg("--")
         .arg(std::env::current_exe()?)
-        .args([
-            "--ignored",
-            "--exact",
-            "owned_namespace_child_performs_one_eapol_start",
-            "--nocapture",
-        ])
+        .env(child_mode::ENV, PARENT_TEST)
+        .args(["--exact", PARENT_TEST, "--nocapture"])
         .env(
             "L2_TEST_ACTIVE_HELPER",
             env!("CARGO_BIN_EXE_l2solver-active-helper"),
@@ -49,8 +52,6 @@ fn owned_veth_carries_one_typed_start_and_observes_request() -> Result<(), Box<d
     Ok(())
 }
 
-#[test]
-#[ignore = "invoked only by the proved isolated EAPOL namespace fixture"]
 fn owned_namespace_child_performs_one_eapol_start() -> Result<(), Box<dyn Error>> {
     require_private_namespace()?;
     let selector = InterfaceSelector::new(&std::env::var("L2_TEST_DOT1X_INTERFACE")?)?;

@@ -13,9 +13,60 @@ use std::{
     time::{Duration, Instant},
 };
 
+#[path = "support/child_mode.rs"]
+mod child_mode;
+
+const PARENT_TEST: &str = "owned_veth_carries_one_real_arp_probe_and_confirms_cleanup";
+const CHILD_MODE: &str = "arp";
+
 #[test]
-#[ignore = "creates only an owned user, mount and network namespace with a veth pair"]
+fn arp_fixture_child_is_not_discovered_as_a_test() -> Result<(), Box<dyn Error>> {
+    let output = Command::new(std::env::current_exe()?)
+        .arg("--list")
+        .output()?;
+    assert!(output.status.success(), "test discovery failed: {output:?}");
+    assert!(
+        !String::from_utf8(output.stdout)?
+            .contains("owned_namespace_child_performs_one_arp_probe: test")
+    );
+    Ok(())
+}
+
+#[test]
+fn arp_child_mode_rejects_the_parent_network_namespace() -> Result<(), Box<dyn Error>> {
+    let namespace = std::fs::metadata("/proc/thread-self/ns/net")?;
+    let output = Command::new(std::env::current_exe()?)
+        .args(["--exact", PARENT_TEST, "--nocapture"])
+        .env(child_mode::ENV, CHILD_MODE)
+        .env("L2_TEST_PARENT_NET_DEVICE", namespace.dev().to_string())
+        .env("L2_TEST_PARENT_NET_INODE", namespace.ino().to_string())
+        .output()?;
+    assert!(
+        !output.status.success(),
+        "child mode accepted the parent network namespace"
+    );
+    Ok(())
+}
+
+#[test]
+fn arp_child_mode_rejects_an_unknown_selector() -> Result<(), Box<dyn Error>> {
+    let output = Command::new(std::env::current_exe()?)
+        .args(["--exact", PARENT_TEST, "--nocapture"])
+        .env(child_mode::ENV, "not-an-arp-child")
+        .output()?;
+    assert!(!output.status.success(), "unknown child mode was accepted");
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("unexpected namespace fixture child mode")
+    );
+    Ok(())
+}
+
+#[test]
 fn owned_veth_carries_one_real_arp_probe_and_confirms_cleanup() -> Result<(), Box<dyn Error>> {
+    // The fixture sets child mode only after it proves the private network
+    if child_mode::selected(CHILD_MODE)? {
+        return owned_namespace_child_performs_one_arp_probe();
+    }
     let script = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/namespace.py");
     let output = Command::new("python3")
         .arg(script)
@@ -37,8 +88,6 @@ fn owned_veth_carries_one_real_arp_probe_and_confirms_cleanup() -> Result<(), Bo
     Ok(())
 }
 
-#[test]
-#[ignore = "invoked only by the proved isolated namespace fixture"]
 fn owned_namespace_child_performs_one_arp_probe() -> Result<(), Box<dyn Error>> {
     let parent_device: u64 = std::env::var("L2_TEST_PARENT_NET_DEVICE")?.parse()?;
     let parent_inode: u64 = std::env::var("L2_TEST_PARENT_NET_INODE")?.parse()?;

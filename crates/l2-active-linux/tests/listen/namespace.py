@@ -86,7 +86,10 @@ def exercise_capture(command, environment, indices):
                 sent.write_text("sent", encoding="ascii")
                 stdout, stderr = process.communicate(timeout=10)
                 if not observed.is_file():
-                    raise RuntimeError("receiver omitted observation acknowledgement")
+                    raise RuntimeError(
+                        "receiver omitted observation acknowledgement: "
+                        f"{stderr.decode(errors='replace')} {stdout.decode(errors='replace')}"
+                    )
                 if process.returncode != 0:
                     raise RuntimeError(f"discovery receiver failed: {stderr.decode(errors='replace')} {stdout.decode(errors='replace')}")
                 # Check that the tested endpoint did not send discovery traffic
@@ -140,8 +143,9 @@ def child(mode, command, raw_fds, parent_uid):
             "L2_TEST_PARENT_NET_INODE": str(parent_net[1]),
         })
         if mode == "membership":
-            test = "listen::membership::tests::owned_namespace_child_joins_and_releases_only_fixed_groups"
-            result = subprocess.run([*command, "--ignored", "--exact", test], env=environment, capture_output=True, text=True, timeout=10)
+            test = "listen::membership::tests::owned_veth_memberships_are_released_on_socket_close"
+            environment["L2_ACTIVE_LINUX_TEST_CHILD"] = test
+            result = subprocess.run([*command, "--exact", test], env=environment, capture_output=True, text=True, timeout=10)
             if result.returncode != 0 or "1 passed" not in result.stdout:
                 raise RuntimeError(f"membership child failed: {result.stderr} {result.stdout}")
         else:

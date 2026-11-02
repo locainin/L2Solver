@@ -3,7 +3,7 @@ use crate::{
     channel::{Channel, Peer},
     wire,
 };
-use l2_active::{ArpProbe, Limits};
+use l2_active::{ActiveLink, ArpProbe, Limits, ReceiveEvent};
 use l2_capture::LinuxInterfaceIdentity;
 use l2_onpath::MacAddress;
 use nix::unistd::{Pid, getpgid, getpgrp};
@@ -18,6 +18,41 @@ use std::{
     },
     time::{Duration, Instant},
 };
+
+fn test_bound() -> io::Result<u64> {
+    crate::deadline::encode_deadline(
+        Instant::now() + Duration::from_secs(1),
+        l2_active::MAX_TIMEOUT,
+    )
+}
+
+fn link_for_deadline(deadline: Instant) -> Result<HelperLink, Box<dyn std::error::Error>> {
+    let uid = nix::unistd::getuid().as_raw();
+    let (channel, _peer) = Channel::pair(Peer {
+        pid: std::process::id(),
+        uid,
+    })?;
+    let limits = Limits::new(Duration::from_secs(1), 1, 60)?;
+    let probe = ArpProbe::new(
+        MacAddress::new([2, 0, 0, 0, 0, 1])?,
+        Ipv4Addr::new(192, 0, 2, 1),
+        Ipv4Addr::new(192, 0, 2, 2),
+        None,
+        limits,
+    )?;
+    Ok(HelperLink {
+        channel,
+        control: None,
+        child: None,
+        lease: None,
+        intent: crate::intent::Intent::arp(&probe)?,
+        identity: LinuxInterfaceIdentity::new(1, 2, 3, 4, 5)?,
+        deadline,
+        send_confirmed: false,
+        poisoned: false,
+        signalled: false,
+    })
+}
 
 #[test]
 fn helper_runs_in_a_different_process_group_from_the_terminal_frontend() -> io::Result<()> {
@@ -47,12 +82,27 @@ fn helper_open_requires_exact_reconstructed_frame_bytes() -> io::Result<()> {
     writer.u16(0);
     writer.u16(3);
     writer.bytes(&[1, 2, 3]);
+    writer.u64(test_bound()?);
     let record = writer.finish();
-    expect_open(&record, 1, 0, &[1, 2, 3])?;
+    expect_open(
+        &record,
+        1,
+        0,
+        &[1, 2, 3],
+        u64::MAX,
+        Instant::now() + Duration::from_secs(1),
+    )?;
     assert_eq!(
-        expect_open(&record, 1, 0, &[1, 2, 4])
-            .err()
-            .map(|error| error.kind()),
+        expect_open(
+            &record,
+            1,
+            0,
+            &[1, 2, 4],
+            u64::MAX,
+            Instant::now() + Duration::from_secs(1)
+        )
+        .err()
+        .map(|error| error.kind()),
         Some(io::ErrorKind::InvalidData)
     );
     Ok(())
@@ -64,14 +114,192 @@ fn helper_open_rejects_a_different_empty_frame_listen_profile() -> io::Result<()
     writer.u8(4);
     writer.u16(0);
     writer.u16(0);
+    writer.u64(test_bound()?);
     let record = writer.finish();
-    expect_open(&record, 4, 0, &[])?;
+    expect_open(
+        &record,
+        4,
+        0,
+        &[],
+        u64::MAX,
+        Instant::now() + Duration::from_secs(1),
+    )?;
     assert_eq!(
-        expect_open(&record, 5, 0, &[])
-            .err()
-            .map(|error| error.kind()),
+        expect_open(
+            &record,
+            5,
+            0,
+            &[],
+            u64::MAX,
+            Instant::now() + Duration::from_secs(1)
+        )
+        .err()
+        .map(|error| error.kind()),
         Some(io::ErrorKind::InvalidData)
     );
+    Ok(())
+}
+
+#[test]
+fn helper_open_accepts_a_worker_deadline_in_the_acknowledgement() -> io::Result<()> {
+    let client = Instant::now() + Duration::from_secs(2);
+    let worker = Instant::now() + Duration::from_secs(1);
+    let bound = crate::deadline::encode_deadline(worker, l2_active::MAX_TIMEOUT)?;
+    let mut writer = wire::Writer::new(wire::OK);
+    writer.u8(4);
+    writer.u16(0);
+    writer.u16(0);
+    writer.u64(bound);
+    let admitted = expect_open(&writer.finish(), 4, 0, &[], bound, client)?;
+    assert!(admitted <= worker, "worker deadline must not be extended");
+    assert!(admitted <= client, "client deadline must not be extended");
+    Ok(())
+}
+
+#[test]
+fn helper_open_rejects_missing_expired_zero_and_extended_worker_deadlines() -> io::Result<()> {
+    let requested = test_bound()?;
+    for (bound, kind) in [
+        (None, io::ErrorKind::InvalidData),
+        (Some(0), io::ErrorKind::InvalidData),
+        (Some(1), io::ErrorKind::TimedOut),
+        (requested.checked_add(1), io::ErrorKind::InvalidData),
+    ] {
+        let mut writer = wire::Writer::new(wire::OK);
+        writer.u8(4);
+        writer.u16(0);
+        writer.u16(0);
+        if let Some(bound) = bound {
+            writer.u64(bound);
+        }
+        assert_eq!(
+            expect_open(
+                &writer.finish(),
+                4,
+                0,
+                &[],
+                requested,
+                Instant::now() + Duration::from_secs(1),
+            )
+            .err()
+            .map(|error| error.kind()),
+            Some(kind),
+            "worker bound {bound:?}"
+        );
+    }
+    for payload in [vec![0; 7], vec![0; 9]] {
+        let mut writer = wire::Writer::new(wire::OK);
+        writer.u8(4);
+        writer.u16(0);
+        writer.u16(0);
+        writer.bytes(&payload);
+        assert_eq!(
+            expect_open(
+                &writer.finish(),
+                4,
+                0,
+                &[],
+                requested,
+                Instant::now() + Duration::from_secs(1),
+            )
+            .err()
+            .map(|error| error.kind()),
+            Some(io::ErrorKind::InvalidData),
+            "malformed deadline length {}",
+            payload.len()
+        );
+    }
+    Ok(())
+}
+
+#[test]
+fn helper_open_retains_an_earlier_client_deadline() -> io::Result<()> {
+    let client = Instant::now() + Duration::from_secs(1);
+    let worker = Instant::now() + Duration::from_secs(2);
+    let bound = crate::deadline::encode_deadline(worker, l2_active::MAX_TIMEOUT)?;
+    let mut writer = wire::Writer::new(wire::OK);
+    writer.u8(4);
+    writer.u16(0);
+    writer.u16(0);
+    writer.u64(bound);
+    assert_eq!(
+        expect_open(&writer.finish(), 4, 0, &[], bound, client)?,
+        client
+    );
+    Ok(())
+}
+
+#[test]
+fn helper_open_rejects_an_expired_client_deadline() -> io::Result<()> {
+    let bound = test_bound()?;
+    let mut writer = wire::Writer::new(wire::OK);
+    writer.u8(4);
+    writer.u16(0);
+    writer.u16(0);
+    writer.u64(bound);
+    assert_eq!(
+        expect_open(&writer.finish(), 4, 0, &[], bound, Instant::now())
+            .err()
+            .map(|error| error.kind()),
+        Some(io::ErrorKind::TimedOut)
+    );
+    Ok(())
+}
+
+#[test]
+fn receive_reports_an_earlier_worker_deadline_even_when_both_deadlines_expired()
+-> Result<(), Box<dyn std::error::Error>> {
+    let now = Instant::now();
+    let mut link = link_for_deadline(now - Duration::from_millis(20))?;
+    let result = link.receive(now - Duration::from_millis(10), &AtomicBool::new(false), 60)?;
+    assert!(matches!(result, ReceiveEvent::BackendTimedOut));
+    Ok(())
+}
+
+#[test]
+fn receive_reports_an_earlier_caller_deadline_when_both_deadlines_expired()
+-> Result<(), Box<dyn std::error::Error>> {
+    let now = Instant::now();
+    let mut link = link_for_deadline(now - Duration::from_millis(10))?;
+    let result = link.receive(now - Duration::from_millis(20), &AtomicBool::new(false), 60)?;
+    assert!(matches!(result, ReceiveEvent::TimedOut));
+    Ok(())
+}
+
+#[test]
+fn send_rejects_an_expired_admitted_deadline_even_if_caller_allows_more_time()
+-> Result<(), Box<dyn std::error::Error>> {
+    let now = Instant::now();
+    let mut link = link_for_deadline(now - Duration::from_millis(1))?;
+    let frame = link.intent.frame().to_vec();
+    let error = link
+        .send(
+            &frame,
+            now + Duration::from_secs(1),
+            &AtomicBool::new(false),
+        )
+        .err()
+        .ok_or("send outlived the admitted deadline")?;
+    assert_eq!(error.kind(), io::ErrorKind::TimedOut);
+    Ok(())
+}
+
+#[test]
+fn confirmed_send_is_rejected_before_the_expired_deadline_check()
+-> Result<(), Box<dyn std::error::Error>> {
+    let now = Instant::now();
+    let mut link = link_for_deadline(now - Duration::from_millis(1))?;
+    link.send_confirmed = true;
+    let frame = link.intent.frame().to_vec();
+    let error = link
+        .send(
+            &frame,
+            now + Duration::from_secs(1),
+            &AtomicBool::new(false),
+        )
+        .err()
+        .ok_or("confirmed send was accepted again")?;
+    assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
     Ok(())
 }
 
@@ -82,18 +310,40 @@ fn helper_open_rejects_a_different_listener_selection() -> io::Result<()> {
         writer.u8(kind);
         writer.u16(profile);
         writer.u16(0);
+        writer.u64(test_bound()?);
         let record = writer.finish();
-        expect_open(&record, kind, profile, &[])?;
+        expect_open(
+            &record,
+            kind,
+            profile,
+            &[],
+            u64::MAX,
+            Instant::now() + Duration::from_secs(1),
+        )?;
         assert_eq!(
-            expect_open(&record, kind, different, &[])
-                .err()
-                .map(|error| error.kind()),
+            expect_open(
+                &record,
+                kind,
+                different,
+                &[],
+                u64::MAX,
+                Instant::now() + Duration::from_secs(1)
+            )
+            .err()
+            .map(|error| error.kind()),
             Some(io::ErrorKind::InvalidData)
         );
         assert_eq!(
-            expect_open(&record, if kind == 7 { 8 } else { 7 }, profile, &[])
-                .err()
-                .map(|error| error.kind()),
+            expect_open(
+                &record,
+                if kind == 7 { 8 } else { 7 },
+                profile,
+                &[],
+                u64::MAX,
+                Instant::now() + Duration::from_secs(1)
+            )
+            .err()
+            .map(|error| error.kind()),
             Some(io::ErrorKind::InvalidData)
         );
     }
@@ -138,6 +388,7 @@ fn cancellation_interrupts_a_silent_helper_during_open() -> Result<(), Box<dyn s
         intent: crate::intent::Intent::arp(&probe)?,
         identity,
         deadline: Instant::now() + Duration::from_secs(1),
+        send_confirmed: false,
         poisoned: false,
         signalled: false,
     };

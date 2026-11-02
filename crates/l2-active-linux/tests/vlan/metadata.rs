@@ -183,7 +183,6 @@ fn rejects_wrong_index_truncated_message_and_trailing_bytes() -> Result<(), Box<
 }
 
 #[test]
-#[ignore = "queries only VLAN interfaces in a proved private network namespace"]
 fn decodes_real_kernel_vlan_metadata_for_both_protocols_and_reorder_states()
 -> Result<(), Box<dyn Error>> {
     let script = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/vlan/kernel.py");

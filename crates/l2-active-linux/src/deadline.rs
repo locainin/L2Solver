@@ -42,21 +42,6 @@ pub fn decode_deadline(deadline: u64) -> io::Result<Instant> {
         .ok_or_else(|| io::Error::other("monotonic deadline overflow"))
 }
 
-pub fn admitted_deadline(deadline: u64) -> io::Result<Instant> {
-    let bound = decode_deadline(deadline)?;
-    let now = Instant::now();
-    let remaining = bound
-        .checked_duration_since(now)
-        .filter(|value| !value.is_zero())
-        .ok_or_else(expired)?;
-    // A small conservative guard covers independent clock sampling in the worker
-    let guard = (remaining / 10).min(Duration::from_millis(1));
-    bound
-        .checked_sub(guard)
-        .filter(|value| *value > now)
-        .ok_or_else(expired)
-}
-
 pub fn ensure_before(deadline: Instant) -> io::Result<()> {
     if Instant::now() >= deadline {
         return Err(expired());

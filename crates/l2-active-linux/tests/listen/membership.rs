@@ -2,6 +2,9 @@ use std::{error::Error, io};
 
 use super::{DISCOVERY_GROUPS, MembershipError, checked_ifindex, join_groups};
 
+#[path = "../support/child_mode.rs"]
+mod child_mode;
+
 #[test]
 fn joins_exactly_the_four_required_multicast_groups_in_order() -> Result<(), Box<dyn Error>> {
     let mut joined = Vec::new();
@@ -63,8 +66,12 @@ fn rejects_zero_or_unrepresentable_interface_indices() {
 }
 
 #[test]
-#[ignore = "creates only a proved private network namespace and owned veth pair"]
 fn owned_veth_memberships_are_released_on_socket_close() -> Result<(), Box<dyn Error>> {
+    if child_mode::selected(
+        "listen::membership::tests::owned_veth_memberships_are_released_on_socket_close",
+    )? {
+        return owned_namespace_child_joins_and_releases_only_fixed_groups();
+    }
     let script = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/listen/namespace.py");
     let output = std::process::Command::new("python3")
         .arg(script)
@@ -79,8 +86,6 @@ fn owned_veth_memberships_are_released_on_socket_close() -> Result<(), Box<dyn E
     Ok(())
 }
 
-#[test]
-#[ignore = "invoked only by the proved isolated namespace fixture"]
 fn owned_namespace_child_joins_and_releases_only_fixed_groups() -> Result<(), Box<dyn Error>> {
     use super::{join_discovery, join_pae, join_stp};
     use rscap::{
@@ -225,7 +230,6 @@ fn interface_flags() -> Result<u32, Box<dyn Error>> {
 }
 
 #[test]
-#[ignore = "creates only a proved private network namespace and owned veth pair"]
 fn discovery_fixture_rejects_a_receiver_that_never_arms() -> Result<(), Box<dyn Error>> {
     let script = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/listen/namespace.py");
     let result = std::process::Command::new("python3")
@@ -241,7 +245,6 @@ fn discovery_fixture_rejects_a_receiver_that_never_arms() -> Result<(), Box<dyn 
 }
 
 #[test]
-#[ignore = "creates only a proved private network namespace and owned veth pair"]
 fn discovery_fixture_delivers_four_independent_link_local_frames() -> Result<(), Box<dyn Error>> {
     let base = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/listen");
     let result = std::process::Command::new("python3")
@@ -262,7 +265,6 @@ fn discovery_fixture_delivers_four_independent_link_local_frames() -> Result<(),
 }
 
 #[test]
-#[ignore = "creates only a proved private network namespace and owned veth pair"]
 fn discovery_fixture_rejects_readiness_without_confirmed_observation() -> Result<(), Box<dyn Error>>
 {
     let script = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/listen/namespace.py");

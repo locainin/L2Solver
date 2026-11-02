@@ -103,6 +103,12 @@ def wait_ready(ready, process, deadline):
         time.sleep(0.005)
 
 
+def require_child_pass(returncode, stdout, stderr, description):
+    # Libtest exits successfully even when an exact selector matches no tests
+    if returncode or "test result: ok. 1 passed; 0 failed;" not in stdout:
+        raise RuntimeError(f"{description} failed: {stderr} {stdout}")
+
+
 def change_case(case, process, peer, lower, logical, request, reply, protocol, ready, go, net_fd, indices, vlan_index):
     deadline = time.monotonic() + 5
     if case in ("after_reply", "after_limit", "rename_after_reply"):
@@ -129,8 +135,8 @@ def change_case(case, process, peer, lower, logical, request, reply, protocol, r
         stdout, stderr = process.communicate(timeout=5)
         if case not in ("after_reply", "after_limit", "rename_after_reply") and find_packet(peer, tagged(request, protocol, VID), time.monotonic() + 0.2, auxiliary=True):
             raise RuntimeError("helper transmitted after VLAN scope became unsupported")
-        if process.returncode != 0:
-            raise RuntimeError(f"VLAN admission/change check failed: {stderr.decode(errors='replace')} {stdout.decode(errors='replace')}")
+        require_child_pass(process.returncode, stdout.decode(errors="replace"),
+                           stderr.decode(errors="replace"), "VLAN admission/change check")
     finally:
         if renamed:
             ns.command("ip", "link", "set", "dev", "l2moved0", "name", VLAN)
@@ -163,10 +169,11 @@ def exchange(command, parent_net, protocol, net_fd, indices, vlan_index):
         ready = Path(directory) / "ready"
         go = Path(directory) / "go"
         environment.update({"L2_TEST_VLAN_READY": str(ready), "L2_TEST_VLAN_GO": str(go)})
-        child = ("owned_vlan_child_rejects_wrong_vid_and_observes_matching_reply" if case == "normal"
-                 else "owned_vlan_child_checks_reorder_admission_and_changes")
+        child = ("ieee8021q_arp_uses_the_configured_vlan_and_filters_wrong_vid" if case == "normal"
+                 else "reorder_off_is_rejected_before_any_transmission")
+        environment["L2_ACTIVE_LINUX_TEST_CHILD"] = "vlan-normal" if case == "normal" else "vlan-change"
         process = subprocess.Popen(
-            [command[0], "--ignored", "--exact", child, "--nocapture"],
+            [command[0], "--exact", child, "--nocapture"],
             env=environment, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
         )
         try:
@@ -192,8 +199,8 @@ def exchange(command, parent_net, protocol, net_fd, indices, vlan_index):
                 if (delivered is not None) != (vid == VID):
                     raise RuntimeError(f"logical VLAN delivery disagreed with VID {vid}: {delivered}")
             stdout, stderr = process.communicate(timeout=8)
-            if process.returncode != 0:
-                raise RuntimeError(f"VLAN receiver failed: {stderr.decode(errors='replace')} {stdout.decode(errors='replace')}")
+            require_child_pass(process.returncode, stdout.decode(errors="replace"),
+                               stderr.decode(errors="replace"), "VLAN receiver")
         finally:
             if process.poll() is None:
                 process.kill()

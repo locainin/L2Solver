@@ -7,8 +7,8 @@ use std::{
         fd::OwnedFd,
         unix::{fs::PermissionsExt, net::UnixStream},
     },
-    path::PathBuf,
-    process::Stdio,
+    path::{Path, PathBuf},
+    process::{Command, Output, Stdio},
 };
 
 struct SilentHelper(PathBuf);
@@ -35,10 +35,71 @@ impl Drop for SilentHelper {
     }
 }
 
+fn run_timeout_fixture(child: &str) -> Result<Output, Box<dyn Error>> {
+    let fixture =
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/cli/fixtures/silent_helper_veth.py");
+    Ok(Command::new("python3")
+        .arg(fixture)
+        .arg("--")
+        .arg(std::env::current_exe()?)
+        .args(["--exact", child])
+        .env("L2_ACTIVE_CLI_TEST_CHILD", "silent_helper")
+        .output()?)
+}
+
 #[test]
-#[ignore = "requires L2_TEST_ACTIVE_INTERFACE and L2_TEST_ACTIVE_TARGET; silent helper sends no traffic"]
+fn helper_timeout_fixture_rejects_a_missing_child() -> Result<(), Box<dyn Error>> {
+    let output = run_timeout_fixture("missing_namespace_child")?;
+    assert!(
+        !output.status.success(),
+        "zero executed child tests were accepted"
+    );
+    assert!(String::from_utf8_lossy(&output.stderr).contains("expected one child test"));
+    Ok(())
+}
+
+#[test]
+fn helper_timeout_fixture_detects_a_client_send() -> Result<(), Box<dyn Error>> {
+    let fixture =
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/cli/fixtures/silent_helper_veth.py");
+    let sender = r"
+import os
+import socket
+with socket.socket(socket.AF_PACKET, socket.SOCK_RAW) as link:
+    link.bind((os.environ['L2_TEST_ACTIVE_INTERFACE'], 0))
+    link.send(bytes.fromhex('ffffffffffff0200000000010800') + bytes(46))
+";
+    let output = Command::new("python3")
+        .arg(fixture)
+        .args(["--", "python3", "-c", sender])
+        .output()?;
+    assert!(!output.status.success(), "client transmission was accepted");
+    assert!(String::from_utf8_lossy(&output.stderr).contains("silent-helper test sent a packet"));
+    Ok(())
+}
+
+#[test]
 fn helper_open_timeout_is_incomplete_without_claiming_which_deadline_expired()
 -> Result<(), Box<dyn Error>> {
+    if crate::namespace::child_mode("silent_helper")? {
+        return owned_namespace_helper_open_timeout();
+    }
+    let output = run_timeout_fixture(
+        "helper_timeout::helper_open_timeout_is_incomplete_without_claiming_which_deadline_expired",
+    )?;
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&output.stdout)
+            .contains("silent_helper_no_send=true cleanup_confirmed=true")
+    );
+    Ok(())
+}
+
+fn owned_namespace_helper_open_timeout() -> Result<(), Box<dyn Error>> {
     let interface = std::env::var("L2_TEST_ACTIVE_INTERFACE")?;
     let target = std::env::var("L2_TEST_ACTIVE_TARGET")?;
     let helper = SilentHelper::new()?;

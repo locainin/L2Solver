@@ -68,18 +68,28 @@ fn cancelled_receive_only_commands_do_not_open_or_send() -> Result<(), Box<dyn E
 
 #[cfg(target_os = "linux")]
 #[test]
-#[ignore = "uses verified isolated veth namespaces and a built active helper"]
 fn receive_only_cli_commands_observe_owned_veth_frames_and_release_memberships()
 -> Result<(), Box<dyn Error>> {
-    for (fixture, child, marker) in [
+    if let Some(mode) = std::env::var_os("L2_ACTIVE_CLI_TEST_CHILD") {
+        if mode == "stp" && crate::namespace::child_mode("stp")? {
+            return stp_namespace_child();
+        }
+        if mode == "discovery" && crate::namespace::child_mode("discovery")? {
+            return discovery_namespace_child();
+        }
+        return Err("unexpected private child mode".into());
+    }
+    crate::namespace::child_mode("stp")?;
+    let helper = crate::namespace::matching_helper()?;
+    for (fixture, mode, marker) in [
         (
             "../l2-active-linux/tests/stp/namespace.py",
-            "listen::stp_namespace_child",
+            "stp",
             "stp_observed=true",
         ),
         (
             "../l2-active-linux/tests/listen/namespace.py",
-            "listen::discovery_namespace_child",
+            "discovery",
             "cdp_sent=1",
         ),
     ] {
@@ -88,7 +98,9 @@ fn receive_only_cli_commands_observe_owned_veth_frames_and_release_memberships()
             .arg(fixture)
             .arg("--")
             .arg(std::env::current_exe()?)
-            .args(["--ignored", "--exact", child])
+            .args(["--exact", "listen::receive_only_cli_commands_observe_owned_veth_frames_and_release_memberships"])
+            .env("L2_ACTIVE_CLI_TEST_CHILD", mode)
+            .env("L2_TEST_ACTIVE_HELPER", &helper)
             .output()?;
         assert!(
             output.status.success(),
@@ -101,15 +113,11 @@ fn receive_only_cli_commands_observe_owned_veth_frames_and_release_memberships()
 }
 
 #[cfg(target_os = "linux")]
-#[test]
-#[ignore = "invoked only by the verified owned STP fixture"]
 fn stp_namespace_child() -> Result<(), Box<dyn Error>> {
     observe_fixture("stp", "STP", "0180c2000000")
 }
 
 #[cfg(target_os = "linux")]
-#[test]
-#[ignore = "invoked only by the verified owned discovery fixture"]
 fn discovery_namespace_child() -> Result<(), Box<dyn Error>> {
     observe_fixture("discovery", "DISCOVERY", "0180c200000e")
 }
@@ -118,7 +126,6 @@ fn discovery_namespace_child() -> Result<(), Box<dyn Error>> {
 fn observe_fixture(protocol: &str, prefix: &str, group: &str) -> Result<(), Box<dyn Error>> {
     use std::{fs, process::Stdio};
 
-    crate::namespace::assert_owned()?;
     let interface = std::env::var(format!("L2_TEST_{prefix}_INTERFACE"))?;
     let ready =
         std::env::var_os(format!("L2_TEST_{prefix}_READY")).ok_or("missing readiness path")?;
