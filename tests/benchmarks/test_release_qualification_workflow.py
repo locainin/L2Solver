@@ -23,10 +23,16 @@ def test_review_upload_follows_candidate_checks_and_is_labeled_unqualified():
     assert "l2solver-qualification/elf-*/*.txt" in upload_step
     assert "l2solver-qualification/startup/*/stdout.log" in upload_step
     assert "l2solver-qualification/startup/*/stderr.log" in upload_step
-    assert (
-        "if: github.event_name == 'workflow_dispatch' || "
-        "(github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v'))"
-    ) in upload_step
+
+
+def test_candidate_upload_requires_a_version_tag_and_excludes_manual_source_checks():
+    workflow = (ROOT / ".github/workflows/release-linux.yml").read_text()
+    upload_step = workflow[workflow.index("- name: Upload unqualified review candidate"):]
+    condition = re.search(r"(?m)^        if: (.+)$", upload_step)
+    assert condition is not None
+    assert condition.group(1) == (
+        "github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')"
+    )
 
 
 def test_workflow_validates_development_pushes_and_pull_requests():
