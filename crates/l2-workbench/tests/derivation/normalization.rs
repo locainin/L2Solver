@@ -6,9 +6,7 @@ use l2_workbench::{
 fn normalize(input: &[u8]) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
     let budget = MemoryBudget::new(1024 * 1024);
     let mut lease = budget.try_reserve(MemoryClass::Executor, 0)?;
-    let output = normalize_message_with_memory(input, &mut lease)?;
-    // The charge remains live until the owned result has been copied for this test
-    Ok(output.clone())
+    Ok(normalize_message_with_memory(input, &mut lease)?)
 }
 
 #[test]
