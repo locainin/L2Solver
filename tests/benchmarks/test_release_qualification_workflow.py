@@ -82,6 +82,18 @@ def test_namespace_labs_have_required_tools_and_nextest_collects_all_failures():
     assert "--no-fail-fast" in nextest.split()
 
 
+def test_runner_prerequisites_and_python_fail_before_the_full_rust_suite():
+    workflow = (ROOT / ".github/workflows/release-linux.yml").read_text()
+    services = workflow.index("- name: Prepare isolated-test user services")
+    scopes = workflow.index("- name: Qualify delegated-scope Python cases")
+    clippy = workflow.index("- name: Check workspace Clippy")
+    release = workflow.index("- name: Build Linux release candidate")
+    python = workflow.index("- name: Run Python benchmark regressions")
+    nextest = workflow.index("- name: Run workspace tests with Nextest")
+    assert services < scopes < clippy
+    assert release < python < nextest
+
+
 def test_review_workflow_runs_python_doctests_and_warning_checked_rustdoc():
     workflow = (ROOT / ".github/workflows/release-linux.yml").read_text()
     assert "pytest -q tests/benchmarks" in workflow
