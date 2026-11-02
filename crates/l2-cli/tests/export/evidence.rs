@@ -282,7 +282,7 @@ fn omitted_case_evidence_does_not_leave_export_node_references() -> Result<(), B
         assert!(origin.extension_node_id.is_none());
         assert!(origin.node.is_none());
         assert!(origin.selection.is_none());
-        assert!(origin.signature_candidates.is_empty());
+        assert_eq!(origin.signature_candidates.len(), 0);
         assert_eq!(
             origin.source_ranges.as_slice(),
             std::slice::from_ref(&source_range)
@@ -490,13 +490,16 @@ fn empty_sidecar_is_valid_gzip_when_its_physical_member_fits() -> Result<(), Box
     let path = temporary.path().join(SIDECAR_FILE_NAME);
     let encoded = fs::read(&path)?;
     assert_eq!(u64::try_from(encoded.len())?, coverage.retained_bytes);
-    assert!(read_sidecar_bytes(&path)?.is_empty());
+    assert_eq!(read_sidecar_bytes(&path)?.len(), 0);
 
     let zero_budget_directory = tempfile::tempdir()?;
     let mut zero_budget = sidecar_with_budget(zero_budget_directory.path(), 0)?;
     assert_eq!(zero_budget.coverage().retained_bytes, 0);
     zero_budget.finish()?;
-    assert!(fs::read(zero_budget_directory.path().join(SIDECAR_FILE_NAME))?.is_empty());
+    assert_eq!(
+        fs::read(zero_budget_directory.path().join(SIDECAR_FILE_NAME))?.len(),
+        0
+    );
     Ok(())
 }
 
@@ -540,7 +543,7 @@ fn evidence_budget_uses_physical_gzip_bytes_and_tracks_raw_bytes() -> Result<(),
     assert_eq!(omitted_coverage.raw_omitted_bytes, raw_bytes);
     let omitted_path = omitted_directory.path().join(SIDECAR_FILE_NAME);
     assert_eq!(fs::metadata(&omitted_path)?.len(), empty_member_bytes);
-    assert!(read_sidecar(&omitted_path)?.is_empty());
+    assert_eq!(read_sidecar(&omitted_path)?.len(), 0);
     Ok(())
 }
 
@@ -673,7 +676,7 @@ fn evidence_budget_omits_a_whole_case_and_leaves_no_artifact_node_reference()
     assert_eq!(coverage.omitted_cases, 1);
     assert_eq!(coverage.retained_bytes, 0);
     assert!(coverage.omitted_bytes > 0);
-    assert!(fs::read(temporary.path().join(SIDECAR_FILE_NAME))?.is_empty());
+    assert_eq!(fs::read(temporary.path().join(SIDECAR_FILE_NAME))?.len(), 0);
     assert_eq!(artifacts.coverage().unique_artifacts_retained, 1);
 
     let mut encoded = Vec::new();

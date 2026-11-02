@@ -221,7 +221,7 @@ fn refresh_recomputes_and_atomically_replaces_the_cached_recovery() -> Result<()
         0
     );
     assert_eq!(snapshot.counters.get(&Counter::CacheMisses), Some(&1));
-    assert!(snapshot.cache_fallbacks.records().is_empty());
+    assert_eq!(snapshot.cache_fallbacks.records().len(), 0);
     assert_eq!(cache.stats()?.entries, 1);
     Ok(())
 }
@@ -247,7 +247,7 @@ fn valid_cache_miss_and_no_cache_do_not_record_fallback_diagnostics() -> Result<
     )?;
 
     let cold_snapshot = job.snapshot()?;
-    assert!(cold_snapshot.cache_fallbacks.records().is_empty());
+    assert_eq!(cold_snapshot.cache_fallbacks.records().len(), 0);
     assert_eq!(cold_snapshot.counters.get(&Counter::CacheMisses), Some(&1));
 
     let mut no_cache = options.clone();
@@ -267,7 +267,7 @@ fn valid_cache_miss_and_no_cache_do_not_record_fallback_diagnostics() -> Result<
     )?;
 
     let no_cache_snapshot = no_cache_job.snapshot()?;
-    assert!(no_cache_snapshot.cache_fallbacks.records().is_empty());
+    assert_eq!(no_cache_snapshot.cache_fallbacks.records().len(), 0);
     assert_eq!(
         no_cache_snapshot.counters.get(&Counter::CacheHits),
         Some(&0)
@@ -644,7 +644,7 @@ fn assert_previous_recovery_recomputed(version: u32) -> Result<(), Box<dyn Error
         current.coverage.is_complete(),
         "stale partial recovery was replayed"
     );
-    assert!(current.omissions.is_empty());
+    assert_eq!(current.omissions.len(), 0);
     assert!(
         !current_case
             .nodes()
@@ -736,7 +736,7 @@ fn cached_case_with_inaccurate_snapshot_usage_is_rejected_and_recomputed()
         )
         .is_err()
     );
-    assert!(strict_job.snapshot()?.cache_fallbacks.records().is_empty());
+    assert_eq!(strict_job.snapshot()?.cache_fallbacks.records().len(), 0);
 
     let job = Job::new("repair corrupt cache entry");
     let (mut fresh_case, fresh_scope) = case_and_scope(b"4142", 19)?;

@@ -51,7 +51,7 @@ fn availability_change_conflicts_until_refresh() -> Result<(), Box<dyn Error>> {
         tshark_version(&fixture.destination)?,
         "TShark (Wireshark) 4.4.1"
     );
-    assert!(!invocation_log(&fixture)?.is_empty());
+    assert_ne!(invocation_log(&fixture)?.len(), 0);
     Ok(())
 }
 
