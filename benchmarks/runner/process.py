@@ -7,6 +7,7 @@ import stat
 import subprocess
 import time
 from collections.abc import Callable, Mapping
+from contextlib import ExitStack
 from dataclasses import dataclass
 from pathlib import Path
 from typing import BinaryIO
@@ -97,11 +98,14 @@ def sampled_rss(pid):
     return None
 
 
-def _sampled_process_io(pid):
+def _sampled_process_io(io_stream):
     # Linux procfs separates syscall bytes from storage-layer bytes
     try:
+        # Seeking to zero refreshes the counters on the next procfs read
+        io_stream.seek(0)
+        text = io_stream.read()
         counters = {}
-        for line in Path(f"/proc/{pid}/io").read_text(encoding="ascii").splitlines():
+        for line in text.splitlines():
             name, value = line.split(":", maxsplit=1)
             if name in _PROCESS_IO_FIELDS:
                 counters[name] = int(value.strip())
@@ -117,15 +121,41 @@ def _sampled_process_io(pid):
         return None
 
 
-def _sample_process_io(metrics, pid):
-    observed = _sampled_process_io(pid)
-    if observed is None:
-        return
-    previous = metrics["process_io_bytes"] or {}
-    metrics["process_io_bytes"] = {
-        name: max(value, previous.get(name, 0)) for name, value in observed.items()
-    }
-    metrics["io_samples"] += 1
+class _ProcessIoSampler:
+    def __init__(self, child, handles):
+        self.child = child
+        self.handles = handles
+        self.stream = None
+        self._open()
+
+    def _open(self):
+        # A reaped PID may already refer to a different process
+        if self.child.returncode is not None:
+            return
+        try:
+            # Keep procfs access when older kernels change a zombie's file owner
+            self.stream = self.handles.enter_context(
+                Path(f"/proc/{self.child.pid}/io").open("r", encoding="ascii")
+            )
+        except OSError:
+            pass
+
+    def sample(self, metrics):
+        if self.child.returncode is not None:
+            return
+        if self.stream is None:
+            # A later sample can recover if the first procfs open was denied
+            self._open()
+        if self.stream is None:
+            return
+        observed = _sampled_process_io(self.stream)
+        if observed is None:
+            return
+        previous = metrics["process_io_bytes"] or {}
+        metrics["process_io_bytes"] = {
+            name: max(value, previous.get(name, 0)) for name, value in observed.items()
+        }
+        metrics["io_samples"] += 1
 
 
 def _child_cpu_usage():
@@ -208,8 +238,8 @@ def _drain_available(stream, maximum_logs, deadline=None):
             return data_read, issue
 
 
-def _stop_result(child, streams, status, message, metrics):
-    _sample_process_io(metrics, child.pid)
+def _stop_result(child, streams, status, message, metrics, process_io):
+    process_io.sample(metrics)
     stop_owned_processes(child)
     if any(not _log_path_matches(stream) for stream in streams):
         status, message = "tool_failure", "Analyzer log was removed or replaced"
@@ -229,13 +259,23 @@ def _send_interrupt(child):
     return True
 
 
-def _timeout_result(child, streams, metrics):
+def _timeout_result(child, streams, metrics, process_io):
     return _stop_result(
-        child, streams, "timeout", "Analyzer deadline exceeded", metrics
+        child, streams, "timeout", "Analyzer deadline exceeded", metrics, process_io
     )
 
 
 def monitor(child, streams, deadline, maximum_logs, interrupt_when=None, sample=None):
+    with ExitStack() as handles:
+        process_io = _ProcessIoSampler(child, handles)
+        return _monitor(
+            child, streams, deadline, maximum_logs, interrupt_when, sample, process_io
+        )
+
+
+def _monitor(
+    child, streams, deadline, maximum_logs, interrupt_when, sample, process_io
+):
     metrics = {
         "peak_sampled_rss_bytes": None,
         "rss_samples": 0,
@@ -255,7 +295,7 @@ def monitor(child, streams, deadline, maximum_logs, interrupt_when=None, sample=
     while True:
         # A process observed after its deadline cannot be accepted as a successful run
         if time.monotonic() >= deadline:
-            return _timeout_result(child, streams, metrics)
+            return _timeout_result(child, streams, metrics, process_io)
         if sample is not None:
             # A failed observer stops the owned child instead of reporting missing data as zero
             sample()
@@ -265,7 +305,7 @@ def monitor(child, streams, deadline, maximum_logs, interrupt_when=None, sample=
             metrics["peak_sampled_rss_bytes"] = max(
                 rss, metrics["peak_sampled_rss_bytes"] or 0
             )
-        _sample_process_io(metrics, child.pid)
+        process_io.sample(metrics)
         data_read = False
         for stream in streams:
             if not _log_path_matches(stream):
@@ -275,13 +315,16 @@ def monitor(child, streams, deadline, maximum_logs, interrupt_when=None, sample=
                     "tool_failure",
                     f"Analyzer {stream.name} log was removed or replaced",
                     metrics,
+                    process_io,
                 )
             read_data, issue = _drain_available(stream, maximum_logs, deadline)
             data_read |= read_data
             if issue == "deadline":
-                return _timeout_result(child, streams, metrics)
+                return _timeout_result(child, streams, metrics, process_io)
             if issue is not None:
-                return _stop_result(child, streams, "tool_failure", issue, metrics)
+                return _stop_result(
+                    child, streams, "tool_failure", issue, metrics, process_io
+                )
 
         # Check exit before a callback so a completed child is never interrupted
         exited = _child_exit_observed(child)
@@ -293,17 +336,19 @@ def monitor(child, streams, deadline, maximum_logs, interrupt_when=None, sample=
 
         # Recheck after the poll; a scheduler delay must not turn a late exit into success
         if time.monotonic() >= deadline:
-            return _timeout_result(child, streams, metrics)
+            return _timeout_result(child, streams, metrics, process_io)
         if exited:
             # Drain the bounded configured tail, then require pipe EOF before accepting the logs
             for stream in streams:
                 _, issue = _drain_available(stream, maximum_logs, deadline)
                 if issue == "deadline":
-                    return _timeout_result(child, streams, metrics)
+                    return _timeout_result(child, streams, metrics, process_io)
                 if issue is not None:
-                    return _stop_result(child, streams, "tool_failure", issue, metrics)
+                    return _stop_result(
+                        child, streams, "tool_failure", issue, metrics, process_io
+                    )
             if time.monotonic() >= deadline:
-                return _timeout_result(child, streams, metrics)
+                return _timeout_result(child, streams, metrics, process_io)
             if any(not _log_path_matches(stream) for stream in streams):
                 return _stop_result(
                     child,
@@ -311,6 +356,7 @@ def monitor(child, streams, deadline, maximum_logs, interrupt_when=None, sample=
                     "tool_failure",
                     "Analyzer log was removed or replaced",
                     metrics,
+                    process_io,
                 )
             if any(not stream.eof for stream in streams):
                 return _stop_result(
@@ -319,9 +365,10 @@ def monitor(child, streams, deadline, maximum_logs, interrupt_when=None, sample=
                     "tool_failure",
                     "Analyzer log capture was incomplete after process exit",
                     metrics,
+                    process_io,
                 )
             metrics["log_capture_complete"] = True
-            _sample_process_io(metrics, child.pid)
+            process_io.sample(metrics)
             stop_owned_processes(child)
             return child.returncode, None, None, metrics
         if not data_read:
@@ -380,7 +427,9 @@ def run_child(
         try:
             for stream in streams:
                 os.set_blocking(stream.pipe.fileno(), False)
-            result = monitor(child, streams, deadline, max_log_bytes, interrupt_when, sample)
+            result = monitor(
+                child, streams, deadline, max_log_bytes, interrupt_when, sample
+            )
         finally:
             # Also stop descendants still in the owned group after completion or cancellation
             stop_owned_processes(child)
