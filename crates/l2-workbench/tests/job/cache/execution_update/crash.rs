@@ -8,7 +8,8 @@ use std::{
 };
 
 const CHILD_ROOT: &str = "L2_TEST_EXECUTOR_UPDATE_CRASH_ROOT";
-const CHILD_TEST: &str = "cache::execution_update::crash::executor_update_crash_child";
+const CHILD_TEST: &str =
+    "cache::execution_update::crash::killed_executor_update_preserves_the_last_committed_cursor";
 
 struct OwnedChild(Child);
 
@@ -22,10 +23,33 @@ impl Drop for OwnedChild {
 }
 
 #[test]
-#[ignore = "runs only as a controlled child of killed_executor_update_preserves_the_last_committed_cursor"]
+fn executor_fixture_entry_points_are_not_registered_as_tests() -> Result<(), Box<dyn Error>> {
+    let output = Command::new(std::env::current_exe()?)
+        .arg("--list")
+        .output()?;
+    assert!(output.status.success(), "test discovery failed: {output:?}");
+    let listing = String::from_utf8(output.stdout)?;
+    for fixture in [
+        "executor_update_crash_child: test",
+        "bounded_cleanup_child: test",
+    ] {
+        assert!(
+            !listing.contains(fixture),
+            "fixture is registered: {fixture}"
+        );
+    }
+    Ok(())
+}
+
+#[test]
+fn crash_child_rejects_an_unowned_directory_without_writing() -> Result<(), Box<dyn Error>> {
+    assert_child_rejects_unowned_root(CHILD_ROOT, CHILD_TEST)
+}
+
 fn executor_update_crash_child() -> Result<(), Box<dyn Error>> {
     let root = std::env::var_os(CHILD_ROOT).ok_or("missing controlled child directory")?;
     let root = Path::new(&root);
+    check_child_root(root)?;
     let cache = cache_at(root, 64 * 1024)?;
     let mut lease = cache.lease(&stage_key("executor-update")?)?;
     let active = lease
@@ -49,13 +73,18 @@ fn executor_update_crash_child() -> Result<(), Box<dyn Error>> {
 
 #[test]
 fn killed_executor_update_preserves_the_last_committed_cursor() -> Result<(), Box<dyn Error>> {
+    // The parent supplies a private fixture root only to its controlled child
+    if std::env::var_os(CHILD_ROOT).is_some() {
+        return executor_update_crash_child();
+    }
     let mut fixture = Fixture::new(None)?;
+    fixture.mark_child_root()?;
     let snapshot = fixture.initial_snapshot.clone();
     let usage = fixture.cache.stats()?.entry_bytes;
     drop(fixture.lease);
     let log = fs::File::create(fixture.temporary.path().join("child.log"))?;
     let child = Command::new(std::env::current_exe()?)
-        .args(["--ignored", "--exact", CHILD_TEST, "--nocapture"])
+        .args(["--exact", CHILD_TEST, "--nocapture"])
         .env(CHILD_ROOT, fixture.temporary.path())
         .stdout(Stdio::from(log.try_clone()?))
         .stderr(Stdio::from(log))

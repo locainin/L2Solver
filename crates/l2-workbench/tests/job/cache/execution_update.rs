@@ -6,6 +6,49 @@ use l2_workbench::job::{
 use serde_json::{Value, json};
 use std::{error::Error, fs, io, path::PathBuf};
 
+#[cfg(target_os = "linux")]
+const CHILD_ROOT_MARKER: &str = "controlled-cache-test-root";
+#[cfg(target_os = "linux")]
+const CHILD_ROOT_MARKER_CONTENT: &[u8] = b"controlled cache test";
+
+#[cfg(target_os = "linux")]
+fn check_child_root(root: &std::path::Path) -> io::Result<()> {
+    // Reject accidental child-mode paths before opening or changing the cache
+    if fs::read(root.join(CHILD_ROOT_MARKER))? != CHILD_ROOT_MARKER_CONTENT {
+        return Err(io::Error::other(
+            "controlled child root marker does not match",
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn assert_child_rejects_unowned_root(
+    root_variable: &str,
+    child_test: &str,
+) -> Result<(), Box<dyn Error>> {
+    for wrong_marker in [false, true] {
+        let unrelated = tempfile::tempdir()?;
+        let marker = unrelated.path().join(CHILD_ROOT_MARKER);
+        if wrong_marker {
+            fs::write(&marker, b"unrelated marker")?;
+        }
+        let output = std::process::Command::new(std::env::current_exe()?)
+            .args(["--exact", child_test, "--nocapture"])
+            .env(root_variable, unrelated.path())
+            .output()?;
+        assert!(!output.status.success(), "unowned child root was accepted");
+        assert_eq!(
+            fs::read_dir(unrelated.path())?.count(),
+            usize::from(wrong_marker)
+        );
+        if wrong_marker {
+            assert_eq!(fs::read(marker)?, b"unrelated marker");
+        }
+    }
+    Ok(())
+}
+
 struct Fixture {
     temporary: tempfile::TempDir,
     cache: Cache,
@@ -16,6 +59,14 @@ struct Fixture {
 }
 
 impl Fixture {
+    #[cfg(target_os = "linux")]
+    fn mark_child_root(&self) -> io::Result<()> {
+        fs::write(
+            self.temporary.path().join(CHILD_ROOT_MARKER),
+            CHILD_ROOT_MARKER_CONTENT,
+        )
+    }
+
     fn new(memory: Option<&l2_workbench::job::MemoryBudget>) -> Result<Self, Box<dyn Error>> {
         let temporary = tempfile::tempdir()?;
         let cache = cache_at(temporary.path(), 64 * 1024)?;

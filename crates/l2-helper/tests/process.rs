@@ -11,6 +11,7 @@ mod process_support;
 
 const SESSION: [u8; 16] = [41; 16];
 const BINDING: (u64, u64, u32, u32) = (10, 20, 41, 1);
+const HELPER_CHILD_ENV: &str = "L2_HELPER_PROCESS_TEST_CHILD";
 
 fn session() -> Result<SessionId, Box<dyn std::error::Error>> {
     Ok(SessionId::new(SESSION)?)
@@ -23,16 +24,35 @@ fn binding() -> Result<InterfaceBindingRequest, Box<dyn std::error::Error>> {
 }
 
 #[test]
+fn process_fixture_entry_points_are_not_registered_as_tests()
+-> Result<(), Box<dyn std::error::Error>> {
+    let output = Command::new(std::env::current_exe()?)
+        .arg("--list")
+        .output()?;
+    assert!(output.status.success(), "test discovery failed: {output:?}");
+    let listing = String::from_utf8(output.stdout)?;
+    for fixture in ["helper_child_process: test", "helper_child_exit: test"] {
+        assert!(
+            !listing.contains(fixture),
+            "fixture is registered: {fixture}"
+        );
+    }
+    Ok(())
+}
+
+#[test]
 fn process_request_reply_and_cancel() -> Result<(), Box<dyn std::error::Error>> {
-    let Some((frontend, helper_data, helper_control)) = process_support::inherited_pair()? else {
-        return Ok(());
-    };
+    // Only the explicitly selected child uses inherited helper descriptors
+    if std::env::var_os(HELPER_CHILD_ENV).is_some() {
+        return run_helper_child_process();
+    }
+    let (frontend, helper_data, helper_control) = process_support::inherited_pair()?;
     let expected = frontend.peer_identity()?;
     let child = Command::new(std::env::current_exe()?)
         .arg("--exact")
-        .arg("helper_child_process")
-        .arg("--ignored")
+        .arg("process_request_reply_and_cancel")
         .arg("--nocapture")
+        .env(HELPER_CHILD_ENV, "1")
         .env("L2_HELPER_EXPECTED_UID", expected.uid().to_string())
         .env("L2_HELPER_EXPECTED_PID", expected.pid().to_string())
         .stdin(Stdio::from(helper_data))
@@ -61,14 +81,10 @@ fn process_request_reply_and_cancel() -> Result<(), Box<dyn std::error::Error>> 
 
 #[test]
 fn process_reports_peer_exit() -> Result<(), Box<dyn std::error::Error>> {
-    let Some((frontend, helper_data, helper_control)) = process_support::inherited_pair()? else {
-        return Ok(());
-    };
+    let (frontend, helper_data, helper_control) = process_support::inherited_pair()?;
+    // Discovery exits without executing any test or consuming the inherited channels
     let child = Command::new(std::env::current_exe()?)
-        .arg("--exact")
-        .arg("helper_child_exit")
-        .arg("--ignored")
-        .arg("--nocapture")
+        .arg("--list")
         .stdin(Stdio::from(helper_data))
         .stderr(Stdio::from(helper_control))
         .stdout(Stdio::null())
@@ -86,9 +102,7 @@ fn process_reports_peer_exit() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-#[test]
-#[ignore = "run by the process boundary parent test"]
-fn helper_child_process() -> Result<(), Box<dyn std::error::Error>> {
+fn run_helper_child_process() -> Result<(), Box<dyn std::error::Error>> {
     let expected = PeerIdentity::new(
         std::env::var("L2_HELPER_EXPECTED_UID")?.parse()?,
         std::env::var("L2_HELPER_EXPECTED_PID")?.parse()?,
@@ -111,7 +125,3 @@ fn helper_child_process() -> Result<(), Box<dyn std::error::Error>> {
     assert_eq!(report.bytes(), 4);
     Ok(())
 }
-
-#[test]
-#[ignore = "run by the process boundary parent test"]
-fn helper_child_exit() {}
