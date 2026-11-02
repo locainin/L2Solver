@@ -228,7 +228,7 @@ pub fn run_with_memory(
     }
 }
 
-fn supports_admission(recipe: &Recipe) -> bool {
+const fn supports_admission(recipe: &Recipe) -> bool {
     if !recipe.constraints.is_empty() {
         return false;
     }

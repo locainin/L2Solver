@@ -227,9 +227,7 @@ fn parse_line(
 }
 
 fn is_stack_frame_line(line: &[u8]) -> bool {
-    std::str::from_utf8(line)
-        .ok()
-        .is_some_and(|text| text.trim_start().starts_with('>'))
+    std::str::from_utf8(line).is_ok_and(|text| text.trim_start().starts_with('>'))
 }
 
 fn retain_stack_frame(
@@ -541,10 +539,8 @@ fn descriptor_text(argument: &str) -> &str {
 fn parse_socket_tuple(descriptor: &str) -> Option<SocketTuple> {
     let (transport, prefix) = if let Some(rest) = descriptor.strip_prefix("TCP:[") {
         (TraceTransport::Tcp, rest)
-    } else if let Some(rest) = descriptor.strip_prefix("UDP:[") {
-        (TraceTransport::Udp, rest)
     } else {
-        return None;
+        (TraceTransport::Udp, descriptor.strip_prefix("UDP:[")?)
     };
     let tuple = prefix.strip_suffix(']')?;
     let (local, peer) = tuple.split_once("->")?;
