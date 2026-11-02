@@ -1,13 +1,16 @@
 use std::error::Error;
 use std::sync::Mutex;
-use std::sync::atomic::AtomicBool;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use super::RenderVerbosity;
 use super::cancellation::{HandlerTarget, record_interrupt};
 use super::render::{JsonEvent, JsonEventTracker, RedrawGate, render_human_line, render_json_line};
 use super::renderer::{LinePolicy, observe_lines};
-use l2_workbench::job::{Counter, Job, Phase, PhaseOutcome, PhaseState};
+use l2_workbench::job::{
+    Counter, Job, Phase, PhaseOutcome, PhaseState, RecoveryTransition, RecoveryTransitionOutcome,
+    RecoveryTransitionStage,
+};
 
 fn capture_json_lines(job: &Job, policy: LinePolicy) -> Result<Vec<String>, Box<dyn Error>> {
     let stop = AtomicBool::new(true);
@@ -144,6 +147,53 @@ fn json_mode_emits_a_parseable_newline_delimited_snapshot() -> Result<(), Box<dy
             .and_then(serde_json::Value::as_str),
         Some("preparation")
     );
+    Ok(())
+}
+
+#[test]
+fn final_json_snapshot_includes_transition_recorded_before_stop() -> Result<(), Box<dyn Error>> {
+    let job = Job::new("publication progress");
+    let stop = AtomicBool::new(false);
+    let output = Mutex::new(Vec::new());
+
+    observe_lines(
+        &job,
+        &stop,
+        |snapshot| {
+            // Record publication after this snapshot and request a final update
+            if !stop.load(Ordering::Relaxed) {
+                job.record_recovery_transition(RecoveryTransition {
+                    stage: RecoveryTransitionStage::Publication,
+                    outcome: RecoveryTransitionOutcome::Published,
+                    sample: None,
+                })?;
+                stop.store(true, Ordering::Release);
+            }
+            render_json_line(snapshot)
+        },
+        |line| {
+            output
+                .lock()
+                .map_err(|_| std::io::Error::other("test output lock is poisoned"))?
+                .push(line.to_owned());
+            Ok(())
+        },
+        LinePolicy::EverySnapshot,
+    )?;
+
+    let lines = output
+        .into_inner()
+        .map_err(|_| std::io::Error::other("test output lock is poisoned"))?;
+    let last = lines.last().ok_or("final progress snapshot is missing")?;
+    let snapshot: serde_json::Value = serde_json::from_str(last)?;
+    let records = snapshot
+        .pointer("/recovery_transitions/records")
+        .and_then(serde_json::Value::as_array)
+        .ok_or("transition records are missing")?;
+    assert!(records.iter().any(|record| {
+        record.get("stage").and_then(serde_json::Value::as_str) == Some("publication")
+            && record.get("outcome").and_then(serde_json::Value::as_str) == Some("published")
+    }));
     Ok(())
 }
 

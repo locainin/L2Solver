@@ -138,11 +138,12 @@ pub(super) fn observe_lines(
     let mut json_events = JsonEventTracker::default();
 
     loop {
+        // A final snapshot must be taken after the stop request
+        let finishing = stop.load(Ordering::Acquire);
         let snapshot = job.snapshot()?;
         let line = render_line(&snapshot)?;
         // The gate caps changed output and still refreshes unchanged status as a heartbeat
         let changed = previous_line.as_deref() != Some(line.as_str());
-        let finishing = stop.load(Ordering::Acquire);
         let pending_event = if line_policy == LinePolicy::QuietJsonEvents {
             json_events.pending_event(&snapshot)
         } else {
@@ -177,6 +178,8 @@ fn run_terminal(
     let mut progress_phase = None;
 
     loop {
+        // Check for shutdown before capturing the last progress state
+        let finishing = stop.load(Ordering::Acquire);
         let snapshot = job.snapshot()?;
         // The bar reads the same snapshot that persistence and JSON output consume
         update_progress_bar(
@@ -186,7 +189,7 @@ fn run_terminal(
             &mut progress_phase,
         )?;
 
-        if stop.load(Ordering::Acquire) {
+        if finishing {
             if let Some(progress_bar) = progress_bar {
                 progress_bar.finish();
             }
