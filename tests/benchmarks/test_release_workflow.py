@@ -34,7 +34,8 @@ def completion_check(tmp_path):
         'if [ "$2" = "$L2_TEST_BAD_SHELL" ]; then\n'
         '    if [ "$L2_TEST_BAD_MODE" = generator ]; then exit 7; fi\n'
         '    if [ "$L2_TEST_BAD_MODE" = empty ]; then exit 0; fi\n'
-        "    printf 'if\\n'\n"
+        # A condition makes the unfinished block invalid in each supported shell
+        "    printf 'if true\\n'\n"
         "else\n"
         "    printf 'echo complete\\n'\n"
         "fi\n"
