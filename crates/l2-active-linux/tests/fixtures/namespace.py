@@ -3,6 +3,7 @@
 import fcntl
 import json
 import os
+import signal
 import socket
 import struct
 import subprocess
@@ -14,6 +15,7 @@ NS_GET_USERNS = 0xB701
 NS_GET_NSTYPE = 0xB703
 CLONE_NEWNS = 0x00020000
 CLONE_NEWUSER = 0x10000000
+CLONE_NEWPID = 0x20000000
 CLONE_NEWNET = 0x40000000
 SOURCE = "l2src0"
 PEER = "l2dst0"
@@ -28,6 +30,19 @@ BACKLOG_IP = socket.inet_aton("192.0.2.5")
 
 def command(*args):
     return subprocess.run(args, check=True, capture_output=True, text=True, timeout=5)
+
+
+def wait_for_owned_process(process, timeout):
+    try:
+        return process.communicate(timeout=timeout)
+    except BaseException:
+        # A timeout or interruption must also stop fixture descendants
+        try:
+            os.killpg(process.pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+        process.communicate(timeout=5)
+        raise
 
 
 def identity(fd):
@@ -45,15 +60,19 @@ def expect_namespace_type(fd, expected):
 
 
 def prove_scope(parent_fds, parent_uid):
-    current = {name: open_namespace(name) for name in ("user", "mnt", "net")}
+    expected_types = {"user": CLONE_NEWUSER, "mnt": CLONE_NEWNS, "net": CLONE_NEWNET}
+    if "pid" in parent_fds:
+        expected_types["pid"] = CLONE_NEWPID
+    current = {name: open_namespace(name) for name in expected_types}
     try:
-        expected_types = {"user": CLONE_NEWUSER, "mnt": CLONE_NEWNS, "net": CLONE_NEWNET}
         for name, expected in expected_types.items():
             expect_namespace_type(parent_fds[name], expected)
             expect_namespace_type(current[name], expected)
             if identity(parent_fds[name]) == identity(current[name]):
                 raise RuntimeError(f"{name} namespace did not change")
-        for name in ("mnt", "net"):
+        for name in expected_types:
+            if name == "user":
+                continue
             owner = fcntl.ioctl(current[name], NS_GET_USERNS)
             try:
                 if identity(owner) != identity(current["user"]):
