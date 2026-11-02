@@ -302,8 +302,9 @@ fn inspect_tool(prepared: &PreparedCapture) -> Result<ToolInspection, Box<dyn Er
         OsString::from("-C"),
         OsString::from(PROFILE),
     ];
-    let mut plugin_args = profile_args.to_vec();
-    plugin_args.extend([OsString::from("-G"), OsString::from("plugins")]);
+    // Older TShark releases require -G and its report name before other options
+    let mut plugin_args = vec![OsString::from("-G"), OsString::from("plugins")];
+    plugin_args.extend_from_slice(&profile_args);
     let plugin_output = run_phase(
         &prepared.executable,
         &plugin_args,
@@ -319,8 +320,8 @@ fn inspect_tool(prepared: &PreparedCapture) -> Result<ToolInspection, Box<dyn Er
     )?;
     let plugins = parse_plugins(&plugin_output.stdout)?;
 
-    let mut preferences_args = profile_args.to_vec();
-    preferences_args.extend([OsString::from("-G"), OsString::from("currentprefs")]);
+    let mut preferences_args = vec![OsString::from("-G"), OsString::from("currentprefs")];
+    preferences_args.extend_from_slice(&profile_args);
     let preferences_output = run_phase(
         &prepared.executable,
         &preferences_args,
