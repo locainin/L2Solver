@@ -1659,8 +1659,10 @@ fn framed_transform_lineage_batches_second_stage_outputs() -> Result<(), Box<dyn
     let batch = successful_record_batch(&outcome.candidates, &schema, 2)?;
     let input_nodes = record_batch_input_nodes(batch)?;
     let expected_parts = framed_record_bytes()
-        .chunks_exact(8)
-        .map(<[u8]>::to_vec)
+        .as_chunks::<8>()
+        .0
+        .iter()
+        .map(|pair| pair.to_vec())
         .collect::<Vec<_>>();
     let expected_hex_inputs = expected_parts
         .iter()
@@ -4519,7 +4521,7 @@ fn base64_hex_framed_record_bytes() -> Result<Vec<u8>, Box<dyn Error>> {
     use base64::Engine as _;
 
     let mut bytes = Vec::new();
-    for record_part in framed_record_bytes().chunks_exact(8) {
+    for record_part in framed_record_bytes().as_chunks::<8>().0 {
         let hexadecimal = hexadecimal_bytes(record_part)?;
         bytes.extend_from_slice(
             base64::engine::general_purpose::STANDARD
@@ -4969,14 +4971,12 @@ fn hex_bytes(value: &str) -> Result<Vec<u8>, Box<dyn Error>> {
     }
     let mut bytes = Vec::new();
     bytes.try_reserve_exact(value.len() / 2)?;
-    for pair in value.as_bytes().chunks_exact(2) {
-        let high = pair
-            .first()
-            .and_then(|byte| char::from(*byte).to_digit(16))
+    for &[high, low] in value.as_bytes().as_chunks::<2>().0 {
+        let high = char::from(high)
+            .to_digit(16)
             .ok_or("hex fixture has an invalid digit")?;
-        let low = pair
-            .get(1)
-            .and_then(|byte| char::from(*byte).to_digit(16))
+        let low = char::from(low)
+            .to_digit(16)
             .ok_or("hex fixture has an invalid digit")?;
         bytes.push(u8::try_from((high << 4) | low)?);
     }

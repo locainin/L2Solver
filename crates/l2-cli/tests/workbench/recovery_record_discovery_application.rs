@@ -273,7 +273,9 @@ fn archive_record_messages(archive: &[u8]) -> TestResult<Vec<Vec<u8>>> {
         return Err("record archive must align to complete payload chunks".into());
     }
     archive
-        .chunks_exact(5)
+        .as_chunks::<5>()
+        .0
+        .iter()
         .enumerate()
         .map(|(index, payload)| Ok(record(b"\x19\x82\xd1", u16::try_from(index)?, payload)))
         .collect()

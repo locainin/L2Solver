@@ -23,7 +23,9 @@ fn aligned_archive(contents: &[u8]) -> TestResult<Vec<u8>> {
 
 fn message_parts(archive: &[u8], identifier: [u8; 3]) -> TestResult<Vec<Vec<u8>>> {
     archive
-        .chunks_exact(5)
+        .as_chunks::<5>()
+        .0
+        .iter()
         .enumerate()
         .map(|(index, payload)| {
             let mut frame = Vec::with_capacity(11);
@@ -95,7 +97,7 @@ fn assert_distinct_funnel_cohorts(
     let source_digest = source
         .strip_prefix("sha256:")
         .ok_or("invalid source identity")?;
-    for group in sessions.chunks_exact(2) {
+    for group in sessions.as_chunks::<2>().0 {
         let session_nodes = group
             .iter()
             .map(|session| session.episode_node)
