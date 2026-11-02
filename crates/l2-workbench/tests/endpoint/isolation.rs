@@ -118,7 +118,7 @@ fn child_mode_rejects_the_callers_namespace_before_starting_capture() -> Result<
     // Pass real descriptors for the current namespaces to test identity rejection
     let launcher = r"
 import os, sys
-fds = [os.open('/proc/self/ns/' + name, os.O_RDONLY) for name in ('user', 'mnt', 'net')]
+fds = [os.open('/proc/self/ns/' + name, os.O_RDONLY) for name in ('user', 'mnt', 'net', 'pid')]
 for fd in fds:
     os.set_inheritable(fd, True)
 os.environ['L2_TEST_ENDPOINT_PARENT_FDS'] = ','.join(str(fd) for fd in fds)
@@ -133,6 +133,11 @@ os.execv(sys.argv[1], [sys.argv[1], '--exact', 'strace_correlate_io_captured_pac
         .env("PATH", path)
         .output()?;
     assert_unproved_child_was_rejected(&output, &marker);
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("user namespace did not change"),
+        "current namespace was rejected for the wrong reason: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
     Ok(())
 }
 
@@ -143,6 +148,7 @@ fn timeout_kills_the_owned_process_group() -> Result<(), Box<dyn Error>> {
     let check = r"
 import importlib.util, os, signal, subprocess, sys, time
 from pathlib import Path
+sys.dont_write_bytecode = True
 spec = importlib.util.spec_from_file_location('endpoint_namespace', sys.argv[1])
 fixture = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(fixture)
@@ -169,7 +175,7 @@ try:
         raise RuntimeError('child process did not start')
     child = int(marker.read_text())
     try:
-        fixture.wait_for_owned_process(process, 0.1)
+        fixture.ns.wait_for_owned_process(process, 0.1)
     except subprocess.TimeoutExpired:
         pass
     else:
@@ -180,7 +186,7 @@ try:
     while time.monotonic() < deadline:
         try:
             state = Path(f'/proc/{child}/stat').read_text().split()[2]
-        except FileNotFoundError:
+        except (FileNotFoundError, ProcessLookupError):
             break
         if state == 'Z':
             break
