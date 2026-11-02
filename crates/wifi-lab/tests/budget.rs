@@ -52,7 +52,7 @@ fn radio_window_budget_checked_add() -> Result<(), Box<dyn Error>> {
         air.add_radio(radio),
         Err(LabError::WindowLimit { maximum: 1 })
     );
-    assert!(air.radios().is_empty());
+    assert_eq!(air.radios(), []);
     Ok(())
 }
 

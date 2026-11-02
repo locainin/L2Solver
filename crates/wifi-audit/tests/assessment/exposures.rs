@@ -40,8 +40,8 @@ fn rogue_bssid_exposes_evidence() -> Result<(), Box<dyn std::error::Error>> {
     assert!(assessment.finding("WIFI-SEC-POLICY-001").is_some());
     assert!(assessment.finding("WIFI-PMF-POLICY-001").is_some());
     assert!(assessment.finding("WIFI-WPS-POLICY-001").is_some());
-    assert!(!assessment.findings().is_empty());
-    assert!(!assessment.coverage_entries().is_empty());
+    assert_ne!(assessment.findings(), []);
+    assert_ne!(assessment.coverage_entries(), []);
     assert!(assessment.finding("missing").is_none());
     Ok(())
 }

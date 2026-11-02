@@ -233,6 +233,6 @@ fn zero_length_retained_radio_metadata() -> Result<(), Box<dyn std::error::Error
     assert_eq!(encode(&fields, &mut bytes)?, bytes.len());
     let decoded = decode(&bytes)?;
     assert_eq!(decoded.fields().zero_length_psdu(), Some(1));
-    assert!(decoded.wifi_bytes().is_empty());
+    assert_eq!(decoded.wifi_bytes(), []);
     Ok(())
 }

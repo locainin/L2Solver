@@ -467,7 +467,7 @@ fn rejected_physical_not_partial_state() -> Result<(), Box<dyn std::error::Error
     ])?;
     let normalized = physical.finish()?;
     let phy = normalized.first().ok_or("missing physical radio")?;
-    assert!(phy.modes().is_empty());
+    assert_eq!(phy.modes(), []);
     Ok(())
 }
 
