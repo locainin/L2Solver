@@ -1,67 +1,45 @@
-/target
-/fuzz/target
-/fuzz/artifacts
-/fuzz/corpus
+# Build and test outputs
+/target/
+/fuzz/target/
+/fuzz/artifacts/
+/fuzz/corpus/
 /mutants.out*
+__pycache__/
+/.pytest_cache/
+/.ruff_cache/
+
+# Local profiling outputs
 /heaptrack.*
 /perf.data*
 /flamegraph.svg
 /.bacon-locations
 
-/review.zip
-/review.zip.sha256
-/review-*.zip
-/review-*.zip.sha256
-/review-*.manifest
-
-# Public capture bytes and generated reports remain local benchmark data
-/benchmarks/cache/
-# Capture archives and partial downloads remain local at every nesting level
-/pcap_samples/**/*.[cC][aA][pP]
-/pcap_samples/**/*.[pP][cC][aA][pP]
-/pcap_samples/**/*.[pP][cC][aA][pP][nN][gG]
-/pcap_samples/**/*.[gG][zZ]
-/pcap_samples/**/*.[bB][zZ]2
-/pcap_samples/**/*.[xX][zZ]
-/pcap_samples/**/*.[zZ][sS][tT]
-/pcap_samples/**/*.[lL][zZ]4
-/pcap_samples/**/*.[zZ][iI][pP]
-/pcap_samples/**/*.7[zZ]
-/pcap_samples/**/*.[pP][aA][rR][tT]
-/pcap_samples/**/*.[pP][aA][rR][tT][iI][aA][lL]
-/pcap_samples/**/*.[cC][rR][dD][oO][wW][nN][lL][oO][aA][dD]
-/pcap_samples/**/*.[dD][oO][wW][nN][lL][oO][aA][dD]
-/pcap_samples/**/runs/
-/pcap_samples/local/
-# Root captures stay local; tests/pcaps keeps deliberate fixture files
-/*.[cC][aA][pP]
-/*.[pP][cC][aA][pP]
-/*.[pP][cC][aA][pP][nN][gG]
-/benchmarks/results/
+# Private data, documentation and review material
+/pcap_samples/
+/review/
+/docs/
+/notes/
+/reports/
 /investigations/
-# Generated extraction results and transient staging are not source fixtures
-/*.export/
-/challenge-export-current/
-/.l2solver-*/
-/l2solver-source.zip
-/docs/evidence/
-/docs/evidence-review*/
-/docs/profiles/
-/docs/screenshots/
-/docs/reports/*.html
-__pycache__/
-
-# Keep this development snapshot limited to reviewed source and required notices
 *.md
 *.rst
 *.log
 .env
 .env.*
-/notes/
-/reports/
-/pcap_samples/
-/benchmarks/malware-traffic-analysis.json
+
+# Root archives and captures stay local; deliberate test fixtures remain tracked
 /*.zip
+/*.zip.sha256
 /*.bundle
-/.pytest_cache/
-/.ruff_cache/
+/review-*.manifest
+/*.[cC][aA][pP]
+/*.[pP][cC][aA][pP]
+/*.[pP][cC][aA][pP][nN][gG]
+
+# Generated benchmark and extraction outputs
+/benchmarks/cache/
+/benchmarks/results/
+/benchmarks/malware-traffic-analysis.json
+/*.export/
+/challenge-export-current/
+/.l2solver-*/
