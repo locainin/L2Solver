@@ -50,8 +50,22 @@ jobs:
         run: |
           sudo apt-get update
           sudo DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
-            binutils dbus-user-session ethtool fish iproute2 iputils-ping libcap2-bin libpcap-dev \
+            apparmor binutils dbus-user-session ethtool fish iproute2 iputils-ping libcap2-bin libpcap-dev \
             python3-pytest python3-pytest-subtests python3-scapy tcpdump tshark zsh
+
+      - name: Permit isolated test namespaces
+        shell: bash
+        run: |
+          # Ubuntu requires an explicit user-namespace permission for this utility
+          namespace_profile="$RUNNER_TEMP/l2solver-ci-unshare.profile"
+          cat > "$namespace_profile" <<'PROFILE'
+          abi <abi/4.0>,
+          profile l2solver-ci-unshare /usr/bin/unshare flags=(unconfined) {
+            userns,
+          }
+          PROFILE
+          sudo apparmor_parser --replace "$namespace_profile"
+          unshare --user --map-root-user --net --mount --pid --mount-proc --fork true
 
       - name: Prepare isolated-test user services
         shell: bash
