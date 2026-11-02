@@ -11,6 +11,8 @@ use l2_workbench::{
     reconstruction::{ReconstructionReport, Reconstructor},
     sha256,
 };
+#[path = "endpoint/capture.rs"]
+mod capture;
 #[path = "endpoint/event_xml.rs"]
 mod event_xml;
 #[cfg(target_os = "linux")]
@@ -406,10 +408,10 @@ fn strace_correlate_io_captured_packets() -> Result<(), Box<dyn Error>> {
         return Ok(());
     }
     let directory = tempfile::tempdir()?;
-    let pcap_path = directory.path().join("owned-loopback.pcap");
+    let capture_path = directory.path().join("owned-loopback.pcapng");
     let listener = TcpListener::bind(("127.0.0.1", 0))?;
     let port = listener.local_addr()?.port();
-    let mut capture = start_loopback_capture(&pcap_path, port)?;
+    let mut capture = start_loopback_capture(&capture_path, port)?;
     let output = Command::new("strace")
         .args([
             "-f",
@@ -445,8 +447,8 @@ fn strace_correlate_io_captured_packets() -> Result<(), Box<dyn Error>> {
 
     let capture_status = capture.0.wait()?;
     assert!(capture_status.success());
-    let pcap = std::fs::read(pcap_path)?;
-    let (case, reconstruction) = index_captured_pcap(&pcap)?;
+    let capture_bytes = std::fs::read(capture_path)?;
+    let (case, reconstruction) = index_pcapng_packets(&capture_bytes)?;
     let scope = capture_source_id(&case)?;
     let correlation = correlate_trace_with_capture(&report, &reconstruction, &case, Some(scope))
         .into_iter()
@@ -474,13 +476,11 @@ impl Drop for CaptureProcess {
 
 fn start_loopback_capture(path: &Path, port: u16) -> Result<CaptureProcess, Box<dyn Error>> {
     let filter = format!("tcp and host 127.0.0.1 and port {port}");
+    // The default PCAPNG format works across the supported dumpcap releases
     let mut capture = CaptureProcess(
         Command::new("dumpcap")
-            .args([
-                "-i", "lo", "-p", "-f", &filter, "-c", "5", "-F", "pcap", "-w",
-            ])
+            .args(["-i", "lo", "-p", "-f", &filter, "-c", "5", "-w"])
             .arg(path)
-            .arg("tcp")
             .stdout(Stdio::null())
             .stderr(Stdio::piped())
             .spawn()?,
@@ -496,11 +496,11 @@ fn start_loopback_capture(path: &Path, port: u16) -> Result<CaptureProcess, Box<
     Ok(capture)
 }
 
-fn index_captured_pcap(bytes: &[u8]) -> Result<(Case, ReconstructionReport), Box<dyn Error>> {
+fn index_pcapng_packets(bytes: &[u8]) -> Result<(Case, ReconstructionReport), Box<dyn Error>> {
     let mut reader = CaptureSource::new(Cursor::new(bytes))?;
     let mut case = Case::new();
     let source = case.add_source(
-        "owned-loopback.pcap",
+        "owned-loopback.pcapng",
         "capture",
         u64::try_from(bytes.len())?,
         &sha256(bytes),
@@ -511,9 +511,8 @@ fn index_captured_pcap(bytes: &[u8]) -> Result<(Case, ReconstructionReport), Box
     while let Some(frame) = reader.next_packet()? {
         packet = packet.checked_add(1).ok_or("packet number overflow")?;
         reconstructor.observe(packet, &frame)?;
-        let Some(CaptureLocator::ClassicPcap { data_offset, .. }) = frame.metadata().locator()
-        else {
-            return Err("classic PCAP source range missing".into());
+        let Some(CaptureLocator::PcapNg { data_offset, .. }) = frame.metadata().locator() else {
+            return Err("PCAPNG packet source range missing".into());
         };
         case.add_bytes_node(
             "packet",
@@ -528,7 +527,7 @@ fn index_captured_pcap(bytes: &[u8]) -> Result<(Case, ReconstructionReport), Box
         )?;
     }
     if packet == 0 {
-        return Err("loopback PCAP contains no packet records".into());
+        return Err("loopback capture contains no packet records".into());
     }
     Ok((case, reconstructor.finish()?))
 }
