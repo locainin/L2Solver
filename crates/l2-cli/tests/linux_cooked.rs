@@ -350,6 +350,59 @@ fn cooked_unknown_protocol_in_selected_scope_remains_unresolved() -> TestResult 
 }
 
 #[test]
+fn cooked_qinq_packet_in_selected_scope_keeps_tcp_range_incomplete() -> TestResult {
+    for link_type in [113, 276] {
+        for protocol in [0x9100_u16, 0x9200, 0x9300] {
+            let first = cooked(link_type, 7, &ipv4(6, &tcp(10, b"ab"))?);
+            // The inner tuple and sequence could conflict with the selected range
+            let mut vlan_payload = vec![0, 7, 0x08, 0x00];
+            vlan_payload.extend_from_slice(&ipv4(6, &tcp(10, b"XY"))?);
+            let mut vlan = cooked(link_type, 7, &vlan_payload);
+            let protocol_offset = if link_type == 113 { 14 } else { 0 };
+            vlan.get_mut(protocol_offset..protocol_offset + 2)
+                .ok_or("missing cooked protocol")?
+                .copy_from_slice(&protocol.to_be_bytes());
+            let capture = classic(
+                link_type,
+                &[
+                    (&first, u32::try_from(first.len())?),
+                    (&vlan, u32::try_from(vlan.len())?),
+                ],
+            )?;
+            let output = run(
+                &[
+                    "capture",
+                    "tcp-range",
+                    "-",
+                    "--packet",
+                    "1",
+                    "--length",
+                    "2",
+                    "--format",
+                    "json",
+                ],
+                &capture,
+            )?;
+            assert_eq!(
+                output.status.code(),
+                Some(3),
+                "link {link_type}, protocol {protocol:#06x}"
+            );
+            let result: Value = serde_json::from_slice(&output.stdout)?;
+            assert_eq!(result.pointer("/complete"), Some(&json!(false)));
+            assert_eq!(result.pointer("/matching_packets"), Some(&json!(1)));
+            assert_eq!(result.pointer("/unresolved_packets"), Some(&json!(1)));
+            assert_eq!(
+                result.pointer("/unresolved_sources/0/reason"),
+                Some(&json!("unsupported_protocol"))
+            );
+            assert_eq!(result.pointer("/range/spans/0/bytes"), Some(&json!(b"ab")));
+        }
+    }
+    Ok(())
+}
+
+#[test]
 fn malformed_cooked_and_unsupported_link_types_remain_distinct() -> TestResult {
     let malformed = [0_u8; 8];
     let unknown = [0_u8; 32];
