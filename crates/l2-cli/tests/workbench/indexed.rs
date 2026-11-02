@@ -35,7 +35,7 @@ fn indexed_capture_reopened_verified_exported() -> Result<(), Box<dyn Error>> {
     );
     let result = run(&["indexed", path_arg(&directory)?, "flows"], b"")?;
     assert!(result.status.success());
-    assert!(result.stdout.is_empty());
+    assert_eq!(result.stdout.len(), 0);
     Ok(())
 }
 
@@ -151,7 +151,7 @@ fn duplicate_content_error_without_publishing() -> Result<(), Box<dyn Error>> {
     )?;
 
     assert!(!result.status.success());
-    assert!(result.stdout.is_empty());
+    assert_eq!(result.stdout.len(), 0);
     let diagnostic = String::from_utf8(result.stderr)?;
     assert!(diagnostic.contains("duplicate capture source content"));
     assert!(!diagnostic.contains("UNIQUE constraint"));

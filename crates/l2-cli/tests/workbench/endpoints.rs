@@ -95,7 +95,7 @@ fn unknown_endpoint_rejected_usage_error() -> Result<(), Box<dyn Error>> {
         &[],
     )?;
     assert_eq!(output.status.code(), Some(2));
-    assert!(output.stdout.is_empty());
+    assert_eq!(output.stdout.len(), 0);
     Ok(())
 }
 
@@ -119,7 +119,7 @@ fn input_rejected_non_trace_formats() -> Result<(), Box<dyn Error>> {
         &[],
     )?;
     assert_eq!(output.status.code(), Some(1));
-    assert!(output.stdout.is_empty());
+    assert_eq!(output.stdout.len(), 0);
     assert!(String::from_utf8_lossy(&output.stderr).contains("only with --format strace"));
     Ok(())
 }

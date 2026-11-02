@@ -772,7 +772,7 @@ fn exercise_invalid_executor_state(
     if strict_cache {
         assert!(result.is_err());
         assert_eq!(native.to_json()?, original);
-        assert!(job.snapshot()?.cache_fallbacks.records().is_empty());
+        assert_eq!(job.snapshot()?.cache_fallbacks.records().len(), 0);
     } else {
         result?;
         assert_eq!(native.to_json()?, expected.to_json()?);

@@ -68,7 +68,7 @@ fn build_output_path_noticed() -> Result<(), Box<dyn Error>> {
         &empty_capture(),
     )?;
     assert!(output.status.success());
-    assert!(output.stdout.is_empty());
+    assert_eq!(output.stdout.len(), 0);
     assert!(
         String::from_utf8(output.stderr)?
             .contains(&format!("Output written to {}", destination.display()))
@@ -83,7 +83,7 @@ fn malformed_suffix_no_case_bytes() -> Result<(), Box<dyn Error>> {
     bytes.extend_from_slice(&[1, 2, 3]);
     let output = run(&["build", "-"], &bytes)?;
     assert_eq!(output.status.code(), Some(1));
-    assert!(output.stdout.is_empty());
+    assert_eq!(output.stdout.len(), 0);
     Ok(())
 }
 
@@ -95,7 +95,7 @@ fn malformed_build_names_input() -> Result<(), Box<dyn Error>> {
 
     let result = run(&["build", path_arg(&malformed)?], b"")?;
     assert_eq!(result.status.code(), Some(1));
-    assert!(result.stdout.is_empty());
+    assert_eq!(result.stdout.len(), 0);
     let stderr = String::from_utf8(result.stderr)?;
     let path = malformed.display().to_string();
     assert!(stderr.contains(&path), "{stderr}");
@@ -172,7 +172,7 @@ fn explicit_byte_beyond_default_limit() -> Result<(), Box<dyn Error>> {
             .next_back(),
         Some(257)
     );
-    assert!(output.stderr.is_empty());
+    assert_eq!(output.stderr.len(), 0);
     Ok(())
 }
 
@@ -225,7 +225,7 @@ fn zero_budgets_reading_publishing_case() -> Result<(), Box<dyn Error>> {
     ] {
         let output = run(&["build", "-", option, "0"], b"")?;
         assert_eq!(output.status.code(), Some(2), "accepted {option}=0");
-        assert!(output.stdout.is_empty());
+        assert_eq!(output.stdout.len(), 0);
         assert!(
             !String::from_utf8_lossy(&output.stderr).contains("unexpected argument"),
             "the budget option must be recognized before its zero value is rejected"
@@ -263,7 +263,7 @@ fn incomplete_case_diagnostic_pipe_closed() -> Result<(), Box<dyn Error>> {
     let output = child.wait_with_output()?;
 
     assert_eq!(output.status.code(), Some(3));
-    assert!(output.stdout.is_empty());
+    assert_eq!(output.stdout.len(), 0);
     let case = Case::from_json(&fs::read(&destination)?)?;
     assert!(!case.collection_complete());
     assert_eq!(

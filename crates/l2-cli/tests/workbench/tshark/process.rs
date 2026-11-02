@@ -330,7 +330,7 @@ fn new_and_changed_objects_wait_for_a_second_unchanged_scan() -> Result<(), Box<
     // Explicit scan boundaries avoid relying on process scheduling between writes
     std::fs::write(&stable_path, b"stable")?;
     monitor.scan_objects(scan_policy)?;
-    assert!(monitor.stable_objects.is_empty());
+    assert_eq!(monitor.stable_objects.len(), 0);
 
     std::fs::write(&late_path, b"late")?;
     monitor.scan_objects(scan_policy)?;

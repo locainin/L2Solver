@@ -110,7 +110,7 @@ fn discovery_report_must_contain_rule_selected_by_cli() -> Result<(), Box<dyn Er
     )?;
 
     assert!(!output.status.success());
-    assert!(output.stdout.is_empty());
+    assert_eq!(output.stdout.len(), 0);
     Ok(())
 }
 
@@ -520,7 +520,7 @@ fn framing_rejects_overlapping_mappings_with_a_gap() -> Result<(), Box<dyn Error
     )?;
 
     assert!(!output.status.success());
-    assert!(output.stdout.is_empty());
+    assert_eq!(output.stdout.len(), 0);
     Ok(())
 }
 

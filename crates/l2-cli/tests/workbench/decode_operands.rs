@@ -101,8 +101,8 @@ fn operand_ranges_exceed_retained_blob() -> Result<(), Box<dyn Error>> {
         )?;
         let output = run_decode(&recipe, input, &case)?;
         assert_eq!(output.status.code(), Some(1));
-        assert!(output.stdout.is_empty());
-        assert!(!output.stderr.is_empty());
+        assert_eq!(output.stdout.len(), 0);
+        assert_ne!(output.stderr.len(), 0);
     }
     Ok(())
 }
@@ -131,7 +131,7 @@ fn operand_references_nodes_unretained_blobs() -> Result<(), Box<dyn Error>> {
         )?;
         let output = run_decode(&recipe, input, &case)?;
         assert_eq!(output.status.code(), Some(1));
-        assert!(output.stdout.is_empty());
+        assert_eq!(output.stdout.len(), 0);
     }
     Ok(())
 }

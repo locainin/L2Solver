@@ -94,7 +94,7 @@ fn code_command_mapping_hash_mismatch() -> Result<(), Box<dyn Error>> {
         b"",
     )?;
     assert_eq!(limited.status.code(), Some(1));
-    assert!(limited.stdout.is_empty());
+    assert_eq!(limited.stdout.len(), 0);
     assert!(String::from_utf8_lossy(&limited.stderr).contains("input exceeds 1 bytes"));
 
     mapping.binary_sha256 = l2_workbench::sha256(b"a different analyzed binary identity");
@@ -111,7 +111,7 @@ fn code_command_mapping_hash_mismatch() -> Result<(), Box<dyn Error>> {
         b"",
     )?;
     assert_eq!(mismatch.status.code(), Some(1));
-    assert!(mismatch.stdout.is_empty());
+    assert_eq!(mismatch.stdout.len(), 0);
     assert!(String::from_utf8_lossy(&mismatch.stderr).contains("differs from the static receipt"));
     Ok(())
 }

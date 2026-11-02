@@ -383,7 +383,7 @@ fn optional_native_commit_failure_preserves_the_already_computed_case() -> TestR
         );
         if strict_cache {
             assert!(result.is_err());
-            assert!(job.snapshot()?.cache_fallbacks.records().is_empty());
+            assert_eq!(job.snapshot()?.cache_fallbacks.records().len(), 0);
         } else {
             let actual = result?;
             assert_eq!(actual.case, expected.case);

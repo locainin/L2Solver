@@ -185,7 +185,7 @@ fn checkpoint_writer_charges_its_retained_coordinator_buffer_and_releases_it()
     let usage = budget.snapshot()?;
     assert!(usage.peak_bytes > 0);
     assert_eq!(usage.used_bytes, 0);
-    assert!(!output.is_empty());
+    assert_ne!(output.len(), 0);
     Ok(())
 }
 

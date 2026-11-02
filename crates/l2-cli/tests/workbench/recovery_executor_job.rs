@@ -28,7 +28,7 @@ fn cancelled_job_stops_recovery_before_policy_scans_or_case_mutation() -> Result
     .ok_or("cancelled recovery unexpectedly completed")?;
 
     assert!(error.to_string().contains("cancellation was requested"));
-    assert!(case.nodes().is_empty());
+    assert_eq!(case.nodes().len(), 0);
     assert_eq!(
         job.snapshot()?
             .phase(Phase::FramingRecordDiscovery)
@@ -52,7 +52,7 @@ fn job_aware_recovery_accepts_profile_and_memory_limits() -> Result<(), Box<dyn 
     )?;
 
     assert!(summary.case_evidence_collection_complete);
-    assert!(case.nodes().is_empty());
+    assert_eq!(case.nodes().len(), 0);
     Ok(())
 }
 

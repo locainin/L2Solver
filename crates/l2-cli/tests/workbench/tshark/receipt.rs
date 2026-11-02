@@ -131,7 +131,7 @@ fn missing_extra_decoded_packets_written() -> Result<(), Box<dyn Error>> {
 
         assert_error_contains(run(&options, &mut output), "packet count")?;
 
-        assert!(output.is_empty());
+        assert_eq!(output.len(), 0);
     }
     Ok(())
 }
@@ -174,7 +174,7 @@ fn malformed_truncated_cannot_source_completeness() -> Result<(), Box<dyn Error>
 
         assert!(run(&options, &mut output).is_err(), "accepted {frames:?}");
 
-        assert!(output.is_empty());
+        assert_eq!(output.len(), 0);
     }
     Ok(())
 }

@@ -70,7 +70,7 @@ fn discovered_groups_keep_exact_contradictions_and_inputs_in_one_receipt() -> Te
         receipt_node.details.get("incomplete_group_count"),
         Some(&json!(2))
     );
-    assert!(outcome.outcome.issue_node_ids.is_empty());
+    assert_eq!(outcome.outcome.issue_node_ids.len(), 0);
     assert_eq!(outcome.rejected_inputs.len(), 1);
     assert_eq!(
         outcome
@@ -267,7 +267,7 @@ fn discovered_complete_objects_keep_their_exact_bytes_and_group_links() -> TestR
         Some(&json!(1))
     );
     assert_eq!(outcome.outcome.group_node_ids.len(), 2);
-    assert!(outcome.outcome.issue_node_ids.is_empty());
+    assert_eq!(outcome.outcome.issue_node_ids.len(), 0);
     let object = outcome
         .outcome
         .group_node_ids

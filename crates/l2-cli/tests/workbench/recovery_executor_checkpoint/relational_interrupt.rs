@@ -372,7 +372,7 @@ fn allocation_failure_during_relational_restore_does_not_restart_optional_cache(
         )
     ));
     assert_eq!(fixture.case.to_json()?, native);
-    assert!(job.snapshot()?.cache_fallbacks.records().is_empty());
+    assert_eq!(job.snapshot()?.cache_fallbacks.records().len(), 0);
     drop(resume);
     let saved = lease
         .load_active(limits)?

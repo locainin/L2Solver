@@ -11,7 +11,7 @@ fn output_publication_not_existing_case() -> Result<(), Box<dyn Error>> {
         &empty_capture(),
     )?;
     assert_eq!(output.status.code(), Some(1));
-    assert!(output.stdout.is_empty());
+    assert_eq!(output.stdout.len(), 0);
     assert_eq!(fs::read(destination)?, b"preserve");
     Ok(())
 }
