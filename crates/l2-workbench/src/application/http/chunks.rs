@@ -206,7 +206,7 @@ fn parse_chunk_size(line: &[u8]) -> Option<usize> {
     let size_end = line
         .iter()
         .position(|byte| *byte == b';')
-        .map_or(line.len(), |index| index);
+        .unwrap_or(line.len());
     let digits = line.get(..size_end)?;
     if digits.is_empty() || !valid_chunk_extension(line.get(size_end..)?) {
         return None;

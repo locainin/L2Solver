@@ -1425,5 +1425,5 @@ fn record_omission(
 }
 
 fn usize_as_u64(value: usize) -> u64 {
-    u64::try_from(value).map_or(u64::MAX, core::convert::identity)
+    u64::try_from(value).unwrap_or(u64::MAX)
 }
