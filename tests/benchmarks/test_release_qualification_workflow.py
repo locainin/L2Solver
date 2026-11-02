@@ -71,6 +71,16 @@ def test_network_tests_require_scoped_namespace_permission_and_a_real_probe():
     assert "systemctl stop apparmor" not in workflow
 
 
+def test_namespace_lab_has_ripgrep_and_nextest_collects_all_failures():
+    workflow = (ROOT / ".github/workflows/release-linux.yml").read_text()
+    tools = workflow[workflow.index("- name: Install candidate check tools"):]
+    tools = tools.split("\n      - name:", 1)[0]
+    assert "ripgrep" in tools.split()
+    nextest = workflow[workflow.index("- name: Run workspace tests with Nextest"):]
+    nextest = nextest.split("\n      - name:", 1)[0]
+    assert "--no-fail-fast" in nextest.split()
+
+
 def test_review_workflow_runs_python_doctests_and_warning_checked_rustdoc():
     workflow = (ROOT / ".github/workflows/release-linux.yml").read_text()
     assert "pytest -q tests/benchmarks" in workflow
