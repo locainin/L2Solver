@@ -23,8 +23,7 @@ fn instructions(group: Option<u8>) -> io::Result<Vec<BpfInstruction>> {
     program.finish()
 }
 
-#[path = "../support/child_mode.rs"]
-mod child_mode;
+use crate::child_mode;
 
 const PARENT_TEST: &str = "filter::hsrp::tests::kernel_hsrp_filters_apply_profile_and_bounds";
 

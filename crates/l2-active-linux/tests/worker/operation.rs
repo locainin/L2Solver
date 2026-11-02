@@ -19,8 +19,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-#[path = "../support/child_mode.rs"]
-mod child_mode;
+use crate::child_mode;
 
 const PARENT_TEST: &str =
     "worker::operation_tests::owned_veth_worker_checks_raw_operation_boundaries";
@@ -123,9 +122,21 @@ fn owned_namespace_child_checks_raw_operations() -> Result<(), Box<dyn Error>> {
             .iter()
             .any(|item| item.protocol() == DiscoveryProtocol::Cdp)
     );
+    check_expired_requests(&mut link, &cancelled, &expired, worker_bound)?;
+    drop(link);
+    signal_fixture("L2_TEST_DISCOVERY_OBSERVED", b"observed")?;
+    Ok(())
+}
+
+fn check_expired_requests(
+    link: &mut DirectLink,
+    cancelled: &AtomicBool,
+    expired: &[u8],
+    worker_bound: u64,
+) -> Result<(), Box<dyn Error>> {
     // An earlier expired slice remains a slice timeout after the worker expires
     assert!(link.deadline_elapsed());
-    assert_eq!(dispatch(&mut link, &cancelled, &expired)?, [wire::TIMEOUT]);
+    assert_eq!(dispatch(link, cancelled, expired)?, [wire::TIMEOUT]);
     std::thread::sleep(Duration::from_millis(2));
     let mut later = Writer::new(wire::RECEIVE);
     later.u64(
@@ -135,11 +146,9 @@ fn owned_namespace_child_checks_raw_operations() -> Result<(), Box<dyn Error>> {
     );
     later.u32(65_536);
     assert_eq!(
-        dispatch(&mut link, &cancelled, &later.finish())?,
+        dispatch(link, cancelled, &later.finish())?,
         [wire::FINAL_TIMEOUT]
     );
-    drop(link);
-    signal_fixture("L2_TEST_DISCOVERY_OBSERVED", b"observed")?;
     Ok(())
 }
 

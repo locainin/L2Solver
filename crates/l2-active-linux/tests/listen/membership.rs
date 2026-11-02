@@ -2,8 +2,7 @@ use std::{error::Error, io};
 
 use super::{DISCOVERY_GROUPS, MembershipError, checked_ifindex, join_groups};
 
-#[path = "../support/child_mode.rs"]
-mod child_mode;
+use crate::child_mode;
 
 #[test]
 fn joins_exactly_the_four_required_multicast_groups_in_order() -> Result<(), Box<dyn Error>> {

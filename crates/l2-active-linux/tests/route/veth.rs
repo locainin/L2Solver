@@ -12,8 +12,7 @@ use std::{
 use super::verify_on_link;
 use crate::{InterfaceSelector, discover};
 
-#[path = "../support/child_mode.rs"]
-mod child_mode;
+use crate::child_mode;
 
 const PARENT_TEST: &str =
     "route::veth_tests::owned_veth_distinguishes_direct_gateway_and_reject_routes";

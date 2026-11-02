@@ -17,8 +17,7 @@ use crate::filter::{
     EQUAL, LOAD_WORD, Label, PACKET_OUTGOING, PACKET_TYPE, Program, VLAN_TAG_PRESENT,
 };
 
-#[path = "../support/child_mode.rs"]
-pub(super) mod child_mode;
+use crate::child_mode;
 
 pub(super) fn program(emit: impl FnOnce(&mut Program)) -> io::Result<Vec<BpfInstruction>> {
     let mut program = Program::new()?;

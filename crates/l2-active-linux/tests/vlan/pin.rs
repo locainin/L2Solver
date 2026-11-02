@@ -7,8 +7,7 @@ use std::{
 
 use crate::{InterfaceSelector, pin::PinnedInterface};
 
-#[path = "../support/child_mode.rs"]
-mod child_mode;
+use crate::child_mode;
 
 #[test]
 fn link_query_names_only_the_selected_interface_index() -> Result<(), Box<dyn Error>> {

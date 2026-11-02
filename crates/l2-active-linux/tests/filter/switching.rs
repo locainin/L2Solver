@@ -1,9 +1,8 @@
-use std::error::Error;
+use std::{error::Error, path::Path, process::Command};
 
 use super::super::{MAX_INSTRUCTIONS, Program};
 
-#[path = "../support/child_mode.rs"]
-mod child_mode;
+use crate::child_mode;
 
 const PARENT_TEST: &str =
     "filter::switching::tests::switching_filters_admit_only_scoped_candidates_in_the_kernel";
@@ -25,8 +24,6 @@ fn switching_filters_admit_only_scoped_candidates_in_the_kernel() -> Result<(), 
     if child_mode::selected(PARENT_TEST)? {
         return switching_filter_namespace_child();
     }
-    use std::{path::Path, process::Command};
-
     let fixture = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/filter/switching_namespace.py");
     let output = Command::new("python3")
         .arg(fixture)

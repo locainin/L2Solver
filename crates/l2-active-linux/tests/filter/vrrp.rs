@@ -22,7 +22,7 @@ fn vrrp_filters_produce_bounded_forward_only_programs() -> Result<(), Box<dyn Er
 #[test]
 fn vrrp_filter_accepts_scoped_v3_and_rejects_v2_or_unrelated_frames() -> Result<(), Box<dyn Error>>
 {
-    if let Some(mode) = std::env::var_os(shared::child_mode::ENV) {
+    if let Some(mode) = std::env::var_os(crate::child_mode::ENV) {
         if mode == "vrrp-any" {
             return vrrp_any_child();
         }

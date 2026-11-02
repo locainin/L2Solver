@@ -49,8 +49,7 @@ fn intents() -> Result<[Intent; 6], Box<dyn Error>> {
     ])
 }
 
-#[path = "../support/child_mode.rs"]
-mod child_mode;
+use crate::child_mode;
 
 const PARENT_TEST: &str =
     "filter::tests::fixed_filters_accept_scoped_candidates_and_reject_unrelated_payloads";

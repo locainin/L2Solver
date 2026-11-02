@@ -250,8 +250,16 @@ fn helper_open_rejects_an_expired_client_deadline() -> io::Result<()> {
 fn receive_reports_an_earlier_worker_deadline_even_when_both_deadlines_expired()
 -> Result<(), Box<dyn std::error::Error>> {
     let now = Instant::now();
-    let mut link = link_for_deadline(now - Duration::from_millis(20))?;
-    let result = link.receive(now - Duration::from_millis(10), &AtomicBool::new(false), 60)?;
+    let mut link = link_for_deadline(
+        now.checked_sub(Duration::from_millis(20))
+            .ok_or("clock cannot represent the earlier deadline")?,
+    )?;
+    let result = link.receive(
+        now.checked_sub(Duration::from_millis(10))
+            .ok_or("clock cannot represent the earlier deadline")?,
+        &AtomicBool::new(false),
+        60,
+    )?;
     assert!(matches!(result, ReceiveEvent::BackendTimedOut));
     Ok(())
 }
@@ -260,8 +268,16 @@ fn receive_reports_an_earlier_worker_deadline_even_when_both_deadlines_expired()
 fn receive_reports_an_earlier_caller_deadline_when_both_deadlines_expired()
 -> Result<(), Box<dyn std::error::Error>> {
     let now = Instant::now();
-    let mut link = link_for_deadline(now - Duration::from_millis(10))?;
-    let result = link.receive(now - Duration::from_millis(20), &AtomicBool::new(false), 60)?;
+    let mut link = link_for_deadline(
+        now.checked_sub(Duration::from_millis(10))
+            .ok_or("clock cannot represent the earlier deadline")?,
+    )?;
+    let result = link.receive(
+        now.checked_sub(Duration::from_millis(20))
+            .ok_or("clock cannot represent the earlier deadline")?,
+        &AtomicBool::new(false),
+        60,
+    )?;
     assert!(matches!(result, ReceiveEvent::TimedOut));
     Ok(())
 }
@@ -270,7 +286,10 @@ fn receive_reports_an_earlier_caller_deadline_when_both_deadlines_expired()
 fn send_rejects_an_expired_admitted_deadline_even_if_caller_allows_more_time()
 -> Result<(), Box<dyn std::error::Error>> {
     let now = Instant::now();
-    let mut link = link_for_deadline(now - Duration::from_millis(1))?;
+    let mut link = link_for_deadline(
+        now.checked_sub(Duration::from_millis(1))
+            .ok_or("clock cannot represent the earlier deadline")?,
+    )?;
     let frame = link.intent.frame().to_vec();
     let error = link
         .send(
@@ -288,7 +307,10 @@ fn send_rejects_an_expired_admitted_deadline_even_if_caller_allows_more_time()
 fn confirmed_send_is_rejected_before_the_expired_deadline_check()
 -> Result<(), Box<dyn std::error::Error>> {
     let now = Instant::now();
-    let mut link = link_for_deadline(now - Duration::from_millis(1))?;
+    let mut link = link_for_deadline(
+        now.checked_sub(Duration::from_millis(1))
+            .ok_or("clock cannot represent the earlier deadline")?,
+    )?;
     link.send_confirmed = true;
     let frame = link.intent.frame().to_vec();
     let error = link

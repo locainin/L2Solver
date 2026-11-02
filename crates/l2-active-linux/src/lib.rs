@@ -5,6 +5,10 @@ mod discovery;
 mod selector;
 mod vlan;
 
+#[cfg(all(test, target_os = "linux"))]
+#[path = "../tests/support/child_mode.rs"]
+mod child_mode;
+
 /// Hardware and driver capabilities for one selected Ethernet interface
 pub mod ethernet_capabilities;
 

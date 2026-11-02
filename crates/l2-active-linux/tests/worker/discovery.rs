@@ -19,8 +19,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-#[path = "../support/child_mode.rs"]
-mod child_mode;
+use crate::child_mode;
 
 const PARENT_TEST: &str = "worker::discovery_tests::owned_veth_worker_rejects_a_raw_send_opcode";
 

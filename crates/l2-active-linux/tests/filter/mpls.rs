@@ -16,7 +16,7 @@ fn mpls_filter_produces_a_bounded_forward_only_program() -> Result<(), Box<dyn E
 
 #[test]
 fn mpls_filter_accepts_the_local_endpoint_and_rejects_other_scopes() -> Result<(), Box<dyn Error>> {
-    if shared::child_mode::selected("mpls")? {
+    if crate::child_mode::selected("mpls")? {
         return mpls_child();
     }
     shared::run_fixture(

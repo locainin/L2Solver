@@ -4,9 +4,10 @@ use l2_active::ReceiveEvent;
 
 #[test]
 fn earlier_worker_deadline_remains_final_after_both_deadlines_expire() {
-    let now = Instant::now();
-    let worker = now - Duration::from_millis(20);
-    let request = now - Duration::from_millis(10);
+    let base = Instant::now();
+    let worker = base + Duration::from_millis(10);
+    let request = base + Duration::from_millis(20);
+    let now = base + Duration::from_millis(30);
     assert!(matches!(
         super::deadline_status(now, request, worker),
         Some(ReceiveEvent::BackendTimedOut)
@@ -15,9 +16,10 @@ fn earlier_worker_deadline_remains_final_after_both_deadlines_expire() {
 
 #[test]
 fn earlier_request_deadline_is_preserved_after_both_deadlines_expire() {
-    let now = Instant::now();
-    let request = now - Duration::from_millis(20);
-    let worker = now - Duration::from_millis(10);
+    let base = Instant::now();
+    let request = base + Duration::from_millis(10);
+    let worker = base + Duration::from_millis(20);
+    let now = base + Duration::from_millis(30);
     assert!(matches!(
         super::deadline_status(now, request, worker),
         Some(ReceiveEvent::TimedOut)
