@@ -103,8 +103,11 @@ fn relational_checkpoint_crash_child() -> Result<(), Box<dyn Error>> {
         Some(worker.budget()),
         Some(&mut resume),
     );
-    if std::env::var_os(CHILD_INTERRUPT).is_some() && job.is_cancelled() && result.is_err() {
-        return Ok(());
+    if std::env::var_os(CHILD_INTERRUPT).is_some() && job.is_cancelled() {
+        return match result {
+            Err(RecoveryExecutionError::Job(JobError::Cancelled)) => Ok(()),
+            other => Err(format!("expected cooperative cancellation, got {other:?}").into()),
+        };
     }
     Err("recovery finished before the parent killed the committed search".into())
 }
@@ -160,6 +163,56 @@ fn oversized_inner_checkpoint_preserves_prior_generation_and_respects_cache_mode
     for part in [TestCheckpointPart::Gate, TestCheckpointPart::Cursor] {
         for strict in [true, false] {
             reference.exercise(part, strict)?;
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn relational_fixture_respects_its_configured_shared_memory_limit() -> Result<(), Box<dyn Error>> {
+    let options = options();
+    let mut fixture = build_session_relative_fixture()?;
+    add_previous_output(&mut fixture.case)?;
+    let native = fixture.case.checkpoint_prefix()?;
+    // Exercise the same limit for policy sizing and the shared memory ledger
+    let memory = MemoryBudget::new(options.memory_limit);
+    let worker = memory.try_working_set(options.memory_limit / 2)?;
+    fixture.case.use_working_set(&worker)?;
+    let job = Job::with_memory_budget("bounded relational recovery", worker.budget());
+    let result = recover_case_with_job(
+        &mut fixture.case,
+        options.profile,
+        options.memory_limit,
+        Some(&job),
+        Some(worker.budget()),
+        None,
+    );
+    let observation = memory.snapshot()?;
+    assert!(observation.peak_bytes <= options.memory_limit);
+    fixture.case.validate()?;
+    assert!(native.matches(&fixture.case)?);
+    // A successful run must recover the artifact; otherwise admission must explain the stop
+    match result {
+        Ok(_) => assert!(
+            fixture
+                .case
+                .blobs()
+                .iter()
+                .any(|blob| blob.bytes == fixture.plaintext)
+        ),
+        Err(error) => {
+            assert!(
+                matches!(
+                    crate::memory_error::find(&error),
+                    Some(l2_workbench::job::MemoryError::Limit {
+                        limit,
+                        used,
+                        requested,
+                    }) if limit == options.memory_limit && requested > limit.saturating_sub(used)
+                ),
+                "expected a shared-memory denial, got {error}"
+            );
+            assert!(observation.rejected > 0);
         }
     }
     Ok(())

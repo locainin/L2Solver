@@ -145,12 +145,24 @@ fn checkpoint_save_memory_denial_preserves_the_prior_generation() -> Result<(), 
 fn oversized_case_checkpoint_preserves_the_prior_generation_and_cache_policy()
 -> Result<(), Box<dyn Error>> {
     for strict in [true, false] {
-        exercise_oversized_case_checkpoint(strict)?;
+        exercise_oversized_case_checkpoint(strict, 16 * 1024 * 1024 + 1)?;
     }
     Ok(())
 }
 
-fn exercise_oversized_case_checkpoint(strict: bool) -> Result<(), Box<dyn Error>> {
+#[test]
+fn historical_case_checkpoint_size_preserves_the_prior_generation_and_cache_policy()
+-> Result<(), Box<dyn Error>> {
+    for strict in [true, false] {
+        exercise_oversized_case_checkpoint(strict, 31_311_328)?;
+    }
+    Ok(())
+}
+
+fn exercise_oversized_case_checkpoint(
+    strict: bool,
+    blob_bytes: usize,
+) -> Result<(), Box<dyn Error>> {
     let temporary = tempfile::tempdir()?;
     let options = RecoveryOptions {
         memory_limit: 64 * 1024 * 1024,
@@ -205,14 +217,14 @@ fn exercise_oversized_case_checkpoint(strict: bool) -> Result<(), Box<dyn Error>
 
     // A later Case can fit its working set while exceeding the snapshot ceiling
     let maximum = usize::try_from(options.memory_limit / 4)?;
-    let bytes = vec![0x5a; maximum + 1];
+    let bytes = vec![0x5a; blob_bytes];
     executor
         .case
         .add_bytes_node("checkpoint_growth", &bytes, Vec::new(), json!({}))?;
     drop(bytes);
-    assert_eq!(executor.case.resource_usage().blob_bytes, maximum + 1);
+    assert_eq!(executor.case.resource_usage().blob_bytes, blob_bytes);
     let result = resume.save_or_fallback(&executor, &cursor);
-    assert_oversized_checkpoint_policy(result, strict, maximum, &resume, &job)?;
+    assert_oversized_checkpoint_policy(result, strict, blob_bytes, maximum, &resume, &job)?;
     drop(resume);
 
     assert_checkpoint_generation_restores(
@@ -231,6 +243,7 @@ fn exercise_oversized_case_checkpoint(strict: bool) -> Result<(), Box<dyn Error>
 fn assert_oversized_checkpoint_policy(
     result: Result<(), RecoveryExecutionError>,
     strict: bool,
+    blob_bytes: usize,
     maximum: usize,
     resume: &RecoveryResume<'_>,
     job: &Job,
@@ -247,7 +260,7 @@ fn assert_oversized_checkpoint_policy(
         assert!(matches!(
             error.source().and_then(|cause| cause.downcast_ref::<EvidenceError>()),
             Some(EvidenceError::CaseTooLarge { length, maximum: limit })
-                if *length == maximum + 1 && *limit == maximum
+                if *length == blob_bytes && *limit == maximum
         ));
     } else {
         result?;
