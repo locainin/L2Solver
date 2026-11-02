@@ -24,3 +24,5 @@ mod streaming_files;
 mod support;
 #[path = "derivation/transforms.rs"]
 mod transforms;
+#[path = "derivation/normalization.rs"]
+mod normalization;

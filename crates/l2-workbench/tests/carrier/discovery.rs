@@ -4,6 +4,7 @@ use l2_workbench::{
         discovery::{
             DiscoveryError, DiscoveryMapping, DiscoveryPlan, DiscoverySample, DiscoveryView,
             ResetMode, SampleOrder, discover, discover_case, discover_case_with_view,
+            mapped_node_with_supporting_mappings,
         },
     },
     derivation::{BitRemainder, Constraint},
@@ -768,6 +769,26 @@ fn tcp_byte_run_case() -> Result<(Case, u64, u64, u64), Box<dyn Error>> {
         })?;
     }
     Ok((case, run, episode, direction))
+}
+
+#[test]
+fn supporting_byte_mapping_ignores_unrelated_episode_and_parent_edges() -> Result<(), Box<dyn Error>>
+{
+    let (mut case, run, _, _) = tcp_byte_run_case()?;
+    for _ in 0..128 {
+        let episode = case.add_node("tcp_episode", None, Vec::new(), json!({}))?;
+        case.add_edge(Edge {
+            from: run,
+            to: episode,
+            relation: "supports".to_owned(),
+            status: EvidenceStatus::Observed,
+            reason: "generated unrelated context".to_owned(),
+        })?;
+    }
+    let mapped = mapped_node_with_supporting_mappings(&case, run)?;
+    assert_eq!(mapped.bytes, b"AB");
+    assert_eq!(mapped.mappings.len(), 2);
+    Ok(())
 }
 
 fn native_udp_payload_case() -> Result<(Case, Vec<u64>), Box<dyn Error>> {

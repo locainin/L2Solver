@@ -3,6 +3,7 @@ mod bytes;
 mod codec;
 mod compression;
 mod crypto;
+mod normalization;
 
 use super::memory::{Admission, Buffer, BufferError};
 use super::{
@@ -12,6 +13,9 @@ use super::{
 
 pub use bits::select_bit_plane_chunks;
 pub(super) use codec::base64_engine;
+pub use normalization::{
+    NormalizationError, normalization_work_bound, normalize_message_with_memory,
+};
 
 pub(super) fn crypto_work_overhead(input_length: usize, operation: &Operation) -> Option<usize> {
     crypto::work_overhead(input_length, operation)
@@ -115,7 +119,7 @@ fn dispatch<A: Admission>(
             codec::base64_encode(input, *alphabet, *padding, budget)
         }),
         Operation::XorRepeat { key, offset } => {
-            untracked(admission, || bytes::xor_repeat(input, key, *offset, budget))
+            bytes::xor_repeat(input, key, *offset, budget, admission)
         }
         Operation::Sha256CounterXor {
             seed,
