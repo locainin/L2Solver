@@ -322,7 +322,11 @@ fn exercise_mapped_evidence(case: &mut Case, source_id: &str, input: &[u8]) {
         .unwrap_or_else(|_| panic!("valid bounded mapping was rejected"));
     check_mapped_receipt(case, node_id, source_id, &output, &mappings, input.len());
 
-    let before_failure = case.clone();
+    // Keep an independent snapshot to check that rejected mappings leave no changes
+    let before_failure = match case.try_clone() {
+        Ok(snapshot) => snapshot,
+        Err(error) => panic!("bounded evidence snapshot was rejected: {error}"),
+    };
     let Some(invalid_range) = mappings.first().map(|mapping| mapping.range.clone()) else {
         return;
     };
