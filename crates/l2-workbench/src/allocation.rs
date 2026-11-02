@@ -7,6 +7,7 @@ pub use vector::{
 };
 
 /// One Rust 1.96 `BTreeMap` node, including unused slots and internal child pointers
+#[must_use]
 pub fn btree_node_bytes<K, V>() -> Option<usize> {
     let slots = 11_usize.checked_mul(size_of::<(K, V)>())?;
     let header = 14_usize.checked_mul(size_of::<usize>())?;

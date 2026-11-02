@@ -179,3 +179,40 @@ fn scoped_handle_rejects_unattached_or_different_ledgers() -> Result<(), Box<dyn
     assert_eq!(foreign.snapshot()?.used_bytes, 0);
     Ok(())
 }
+
+#[test]
+fn lease_local_budget_charges_execution_and_rejects_foreign_ledgers() -> Result<(), Box<dyn Error>>
+{
+    let directory = tempfile::tempdir()?;
+    let cache = super::cache_at(directory.path(), 64 * 1024)?;
+    let key = stage_key("lease-local-budget")?;
+    let budget = MemoryBudget::new(LIMIT);
+    let foreign = MemoryBudget::new(LIMIT);
+    let snapshot = Job::new("lease-local budget").snapshot()?;
+    let mut lease = cache.lease(&key)?;
+    lease.bind_memory_budget(&budget)?;
+    assert!(matches!(
+        lease.bind_memory_budget(&foreign),
+        Err(CacheError::InvalidInput(_))
+    ));
+    // Exhaustion must be observed by the cache itself before writing a generation
+    let held = budget.try_reserve(MemoryClass::Executor, LIMIT - 1)?;
+    assert!(matches!(
+        lease.save_active(&snapshot, limits(), |_| Ok(json!({}))),
+        Err(CacheError::Memory(MemoryError::Limit { .. }))
+    ));
+    drop(held);
+    lease.save_active(&snapshot, limits(), |writer| {
+        let (graph, blobs, executor) = writer.streams();
+        graph.write_all(b"graph")?;
+        blobs.write_all(b"blobs")?;
+        executor.write_all(b"cursor")?;
+        Ok(json!({}))
+    })?;
+    let active = lease.load_active(limits())?.ok_or("generation missing")?;
+    assert!(budget.snapshot()?.used(MemoryClass::Cache) > 0);
+    drop(active);
+    drop(lease);
+    assert_eq!(budget.snapshot()?.used_bytes, 0);
+    Ok(())
+}
