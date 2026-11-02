@@ -6,6 +6,9 @@ use l2_workbench::{
     reconstruction::Origin,
 };
 
+#[path = "stream_checkpoint_schedule.rs"]
+mod stream_checkpoint_schedule;
+
 pub fn exercise(input: &[u8]) {
     exercise_contiguous(input);
     exercise_gaps_and_overlapping_origins(input);
@@ -33,19 +36,34 @@ fn parser() -> StreamMessageParser {
 }
 
 fn exercise_contiguous(input: &[u8]) {
+    let mut uninterrupted = parser();
     let mut parser = parser();
-    // Small generated chunks exercise boundaries and checkpoint resumption cheaply
+    let count = input
+        .len()
+        .div_ceil(stream_checkpoint_schedule::CHUNK_BYTES);
+    let selector = input.first().copied().unwrap_or_default();
+    // Small generated chunks exercise boundaries for both resumed and live parsers
     let mut offset = 0;
-    for (index, chunk) in input.chunks(13).enumerate() {
+    for (index, chunk) in input
+        .chunks(stream_checkpoint_schedule::CHUNK_BYTES)
+        .enumerate()
+    {
         let origin = Origin {
             packet: u32::try_from(index + 1).unwrap(),
             frame_offset: 54,
             offset,
             length: chunk.len(),
         };
-        parser.push_chunk(offset, chunk, &[origin]).unwrap();
-        let encoded = serde_json::to_vec(&parser).unwrap();
-        parser = serde_json::from_slice(&encoded).unwrap();
+        parser
+            .push_chunk(offset, chunk, std::slice::from_ref(&origin))
+            .unwrap();
+        uninterrupted
+            .push_chunk(offset, chunk, std::slice::from_ref(&origin))
+            .unwrap();
+        if stream_checkpoint_schedule::should_checkpoint(index, count, selector) {
+            let encoded = serde_json::to_vec(&parser).unwrap();
+            parser = serde_json::from_slice(&encoded).unwrap();
+        }
         offset += chunk.len();
     }
     if !input.is_empty() {
@@ -56,6 +74,8 @@ fn exercise_contiguous(input: &[u8]) {
         assert!(changed.into_report().is_err());
     }
     let report = parser.into_report().unwrap();
+    // Checkpoints must preserve every message, transition, and source receipt
+    assert_eq!(report, uninterrupted.into_report().unwrap());
     for message in report.messages {
         assert_eq!(
             message.bytes.as_slice(),
