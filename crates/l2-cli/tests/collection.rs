@@ -137,6 +137,6 @@ fn paged_cases_conditions_conflicting_manifest() -> Result<(), Box<dyn Error>> {
         .arg(&bundle)
         .output()?;
     assert_eq!(rejected.status.code(), Some(1));
-    assert!(rejected.stdout.is_empty());
+    assert_eq!(rejected.stdout.len(), 0);
     Ok(())
 }

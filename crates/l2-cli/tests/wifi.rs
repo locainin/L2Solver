@@ -31,7 +31,7 @@ fn radiotap(bytes: &[u8]) -> Vec<u8> {
 }
 
 fn beacon_named_on_channel(bssid: [u8; 6], ssid: &[u8], channel: u8) -> Vec<u8> {
-    let ssid_length = u8::try_from(ssid.len()).ok().map_or(0, |value| value);
+    let ssid_length = u8::try_from(ssid.len()).ok().unwrap_or(0);
     let mut frame = Vec::from(0x0080_u16.to_le_bytes());
     frame.extend_from_slice(&[0, 0]);
     frame.extend_from_slice(&[0xff; 6]);

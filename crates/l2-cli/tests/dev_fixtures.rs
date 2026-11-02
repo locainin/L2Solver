@@ -49,7 +49,7 @@ fn inspection_rejects_an_unknown_fixture_name() -> Result<(), Box<dyn Error>> {
         .output()?;
 
     assert_eq!(output.status.code(), Some(1));
-    assert!(output.stdout.is_empty());
+    assert_eq!(output.stdout.len(), 0);
     assert!(String::from_utf8(output.stderr)?.contains("unknown fixture"));
     Ok(())
 }

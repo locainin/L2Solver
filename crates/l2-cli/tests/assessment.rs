@@ -168,7 +168,7 @@ mod text {
 
         let first = run()?;
         assert!(first.status.success());
-        assert!(first.stdout.is_empty());
+        assert_eq!(first.stdout.len(), 0);
         assert!(
             String::from_utf8(first.stderr)?
                 .contains(&report.display().to_string().escape_debug().to_string())

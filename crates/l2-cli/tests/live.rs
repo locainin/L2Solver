@@ -110,7 +110,7 @@ fn verify_saved_recording(path: &Path) -> Result<(), Box<dyn Error>> {
     let mut capture = l2_pcap::CaptureSource::new(fs::File::open(path)?)?;
     let mut packets = 0_u64;
     while let Some(frame) = capture.next_packet()? {
-        assert!(!frame.bytes().is_empty());
+        assert_ne!(frame.bytes().len(), 0);
         let identity = frame
             .metadata()
             .linux_interface()
@@ -148,7 +148,7 @@ fn verify_recording_json_replay(path: &Path) -> Result<(), Box<dyn Error>> {
                 .get("raw_bytes")
                 .and_then(serde_json::Value::as_array)
                 .ok_or("replay omitted raw packet bytes")?;
-            assert!(!bytes.is_empty());
+            assert_ne!(bytes.len(), 0);
             packets = packets.checked_add(1).ok_or("packet count overflow")?;
         }
     }
