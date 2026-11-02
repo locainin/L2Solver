@@ -334,7 +334,7 @@ fn rejects_truncated_records() -> Result<(), Box<dyn Error>> {
         discovery_limits(8),
     )?;
 
-    assert!(report.surviving.is_empty());
+    assert_eq!(report.surviving.len(), 0);
     assert_eq!(report.falsifications.len(), 1);
     let falsification = report
         .falsifications
@@ -374,7 +374,7 @@ fn rejects_heldout_contradictions() -> Result<(), Box<dyn Error>> {
         discovery_limits(8),
     )?;
 
-    assert!(report.surviving.is_empty());
+    assert_eq!(report.surviving.len(), 0);
     assert_eq!(report.falsifications.len(), 1);
     let falsification = report
         .falsifications
@@ -775,7 +775,7 @@ fn rejects_corrupted_lists() -> Result<(), Box<dyn Error>> {
         discovery_limits(8),
     )?;
 
-    assert!(report.surviving.is_empty());
+    assert_eq!(report.surviving.len(), 0);
     let falsification = report
         .falsifications
         .iter()

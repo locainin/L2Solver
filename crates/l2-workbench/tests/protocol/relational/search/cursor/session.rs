@@ -458,7 +458,7 @@ fn live_slices_reuse_preparation_and_restart_preserves_the_same_search() -> Test
         }
     };
     assert!(pauses > 2 && previous_count > 16);
-    assert!(!baseline.evaluations.is_empty());
+    assert_ne!(baseline.evaluations.len(), 0);
     assert_eq!(actual, baseline);
     assert_eq!(calls, baseline_calls);
     assert_eq!(resumed_job.work_snapshot()?, baseline_job.work_snapshot()?);
@@ -717,7 +717,7 @@ fn history_reuse_pauses_after_bounded_traversal_even_without_a_new_transform() -
         |_, candidate, _, _| Ok::<_, Infallible>(evaluate(candidate)),
     )?;
     assert!(baseline.report.candidates_examined > 16);
-    assert!(baseline.evaluations.is_empty());
+    assert_eq!(baseline.evaluations.len(), 0);
     let mut session =
         RelationalSearchSession::new(&samples, &plan, None, options, Some(&mut history))?;
     let mut calls = 0;

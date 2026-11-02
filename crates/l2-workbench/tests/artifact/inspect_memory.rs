@@ -90,9 +90,9 @@ fn empty_elf_tables_do_not_reserve_section_or_symbol_ceilings() -> TestResult {
     let budget = MemoryBudget::new(512);
     let mut lease = budget.try_reserve(MemoryClass::Executor, 0)?;
     let report = inspect_with_memory(&image, &mut lease)?;
-    assert!(report.sections.is_empty());
-    assert!(report.mappings.is_empty());
-    assert!(report.references.is_empty());
+    assert_eq!(report.sections.len(), 0);
+    assert_eq!(report.mappings.len(), 0);
+    assert_eq!(report.references.len(), 0);
     assert_eq!(report, inspect(&image)?);
     assert!(budget.snapshot()?.peak_bytes < 512);
     Ok(())

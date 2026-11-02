@@ -135,7 +135,7 @@ fn older_job_snapshots_restore_without_cache_fallbacks() -> TestResult {
     let snapshot: JobSnapshot = serde_json::from_value(saved)?;
     let resumed = Job::new("resumed old checkpoint");
     resumed.restore(snapshot)?;
-    assert!(resumed.snapshot()?.cache_fallbacks.records().is_empty());
+    assert_eq!(resumed.snapshot()?.cache_fallbacks.records().len(), 0);
     Ok(())
 }
 

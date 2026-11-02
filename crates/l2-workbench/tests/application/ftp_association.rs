@@ -283,7 +283,7 @@ fn exact_scope_without_nat_rewriting() -> Result<(), &'static str> {
         .ok_or("missing PASV endpoint")?;
 
     assert_eq!(assessment.status, FtpAssociationStatus::NoExactSession);
-    assert!(candidate.sessions.is_empty());
+    assert_eq!(candidate.sessions.len(), 0);
     assert!(
         report
             .limitations
@@ -401,7 +401,7 @@ fn closed_passive_not_later_store() -> Result<(), &'static str> {
 
     assert_eq!(report.transfers.len(), 2);
     assert_eq!(stale_endpoint.endpoint.port, 60_000);
-    assert!(stale_endpoint.sessions.is_empty());
+    assert_eq!(stale_endpoint.sessions.len(), 0);
     assert_eq!(new_endpoint.endpoint.port, 60_001);
     assert_eq!(new_endpoint.sessions.len(), 1);
     assert_eq!(
@@ -632,7 +632,7 @@ fn assert_payload_direction_closed(
         FtpAssociationStatus::NoExactSession,
         "{mode:?} {action:?}"
     );
-    assert!(endpoint.sessions.is_empty());
+    assert_eq!(endpoint.sessions.len(), 0);
     Ok(())
 }
 
@@ -674,7 +674,7 @@ fn endpoint_facts_episode_not_reused() -> Result<(), &'static str> {
         .ok_or("missing transfer assessment")?;
 
     assert_eq!(assessment.status, FtpAssociationStatus::NoPriorEndpointFact);
-    assert!(assessment.endpoint_candidates.is_empty());
+    assert_eq!(assessment.endpoint_candidates.len(), 0);
     Ok(())
 }
 
@@ -716,7 +716,7 @@ fn endpoint_facts_tuple_not_reused() -> Result<(), &'static str> {
             .first()
             .ok_or("missing transfer assessment")?;
         assert_eq!(assessment.status, FtpAssociationStatus::NoPriorEndpointFact);
-        assert!(assessment.endpoint_candidates.is_empty());
+        assert_eq!(assessment.endpoint_candidates.len(), 0);
     }
     Ok(())
 }
@@ -764,7 +764,7 @@ fn same_packet_transfer_ranges_ordered() -> Result<(), &'static str> {
         after_assessment.status,
         FtpAssociationStatus::NoPriorEndpointFact
     );
-    assert!(after_assessment.endpoint_candidates.is_empty());
+    assert_eq!(after_assessment.endpoint_candidates.len(), 0);
     Ok(())
 }
 
@@ -949,7 +949,7 @@ fn session_candidate_budget_global_dropped() -> Result<(), &'static str> {
     assert_eq!(report.omitted_session_candidates, MAX_ASSOCIATED_SESSIONS);
     assert!(!report.complete);
     assert!(last.truncated);
-    assert!(last_endpoint.sessions.is_empty());
+    assert_eq!(last_endpoint.sessions.len(), 0);
     assert!(last_endpoint.truncated);
     Ok(())
 }
@@ -1090,7 +1090,7 @@ fn empty_stream_not_endpoint_candidate() -> Result<(), &'static str> {
         .ok_or("missing endpoint fact")?;
 
     assert_eq!(assessment.status, FtpAssociationStatus::NoExactSession);
-    assert!(candidate.sessions.is_empty());
+    assert_eq!(candidate.sessions.len(), 0);
     Ok(())
 }
 
@@ -1164,7 +1164,7 @@ fn transfer_without_associated_port_guessing() -> Result<(), &'static str> {
         .first()
         .ok_or("missing transfer assessment")?;
     assert_eq!(assessment.status, FtpAssociationStatus::NoPriorEndpointFact);
-    assert!(assessment.endpoint_candidates.is_empty());
+    assert_eq!(assessment.endpoint_candidates.len(), 0);
     Ok(())
 }
 
@@ -1197,6 +1197,6 @@ fn future_endpoint_not_earlier_transfer() -> Result<(), &'static str> {
     let assessment = report.transfers.first().ok_or("missing earlier transfer")?;
 
     assert_eq!(assessment.status, FtpAssociationStatus::NoPriorEndpointFact);
-    assert!(assessment.endpoint_candidates.is_empty());
+    assert_eq!(assessment.endpoint_candidates.len(), 0);
     Ok(())
 }

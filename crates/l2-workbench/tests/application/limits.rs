@@ -109,9 +109,9 @@ fn nested_entry_incomplete_without_omissions() {
     let http_report = inspect(&http, true, true).http;
 
     assert_eq!(http_report.status, ParseStatus::Incomplete);
-    assert!(http_report.budget_omissions.is_empty());
+    assert_eq!(http_report.budget_omissions.len(), 0);
     assert_eq!(ftp_report.status, ParseStatus::Incomplete);
-    assert!(ftp_report.budget_omissions.is_empty());
+    assert_eq!(ftp_report.budget_omissions.len(), 0);
 }
 
 fn oversized_multiline_reply() -> Vec<u8> {

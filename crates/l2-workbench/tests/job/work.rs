@@ -195,11 +195,12 @@ fn transition_restore_recomputes_aggregate_without_double_counting() -> TestResu
             .map(RecoveryTransitionRecord::count),
         Some(1)
     );
-    assert!(
+    assert_eq!(
         job.checkpoint_snapshot()?
             .recovery_transitions
             .records()
-            .is_empty()
+            .len(),
+        0
     );
     Ok(())
 }

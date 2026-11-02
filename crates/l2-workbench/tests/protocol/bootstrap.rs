@@ -223,14 +223,14 @@ fn execution_plan_retains_evaluated_hypotheses_when_report_preview_is_empty()
     let first = protocol::bootstrap_framing_with_execution_plan(&runs, limits)?;
     let second = protocol::bootstrap_framing_with_execution_plan(&runs, limits)?;
 
-    assert!(first.report.hypotheses.is_empty());
+    assert_eq!(first.report.hypotheses.len(), 0);
     assert_eq!(
         first.report.omitted_hypothesis_details,
         first.execution_plan.hypotheses.len()
     );
     assert!(first.report.search_exhaustive_within_plan);
     assert!(!first.report.report_details_complete);
-    assert!(!first.execution_plan.hypotheses.is_empty());
+    assert_ne!(first.execution_plan.hypotheses.len(), 0);
     assert_eq!(
         first.execution_plan.hypotheses,
         second.execution_plan.hypotheses
@@ -366,7 +366,7 @@ fn execution_plan_does_not_claim_exhaustiveness_after_search_omissions()
     assert_eq!(output.execution_plan.hypotheses.len(), 1);
     assert!(output.report.omitted_candidates > 0);
     assert!(!output.report.search_exhaustive_within_plan);
-    assert!(output.report.hypotheses.is_empty());
+    assert_eq!(output.report.hypotheses.len(), 0);
     assert_eq!(output.report.omitted_hypothesis_details, 1);
     assert_eq!(
         output.execution_plan.surviving_hypotheses,
@@ -520,7 +520,7 @@ fn single_run_reports_no_holdout() -> Result<(), Box<dyn Error>> {
         FramingValidationBasis::DiscoveryOnly
     );
     assert_eq!(report.discovery_samples, [1]);
-    assert!(report.holdout_samples.is_empty());
+    assert_eq!(report.holdout_samples.len(), 0);
     assert!(
         report
             .limitations
@@ -552,7 +552,7 @@ fn one_session_reports_no_holdout() -> Result<(), Box<dyn Error>> {
     );
     assert_eq!(report.split_basis, HoldoutBasis::CompleteSessions);
     assert_eq!(report.discovery_samples, [1, 2]);
-    assert!(report.holdout_samples.is_empty());
+    assert_eq!(report.holdout_samples.len(), 0);
     Ok(())
 }
 

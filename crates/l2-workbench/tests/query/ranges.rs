@@ -55,12 +55,13 @@ fn source_ranges_composed_network_filters() -> Result<(), Box<dyn Error>> {
     assert_eq!(result.node_id, derived);
     assert_eq!(result.packet_numbers, [1]);
     assert_eq!(result.statuses, [EvidenceStatus::ConstraintSatisfied]);
-    assert!(
+    assert_eq!(
         select(
             &case,
             &Selector::parse(&["kind=derived_bytes", "port=443"])?
         )
-        .is_empty()
+        .len(),
+        0
     );
     Ok(())
 }
@@ -96,7 +97,10 @@ fn equal_packet_sources_never_cross() -> Result<(), Box<dyn Error>> {
         json!({"record":1,"link_type":1}),
     )?;
     let derived = case.add_node("derived_bytes", None, ranges, json!({}))?;
-    assert!(select(&case, &Selector::parse(&["kind=derived_bytes", "port=80"])?).is_empty());
+    assert_eq!(
+        select(&case, &Selector::parse(&["kind=derived_bytes", "port=80"])?).len(),
+        0
+    );
     let selected = select(
         &case,
         &Selector::parse(&["kind=derived_bytes", "port=443"])?,
@@ -136,12 +140,13 @@ fn range_filter_single_match() -> Result<(), Box<dyn Error>> {
         .flat_map(|node| node.ranges.clone())
         .collect();
     case.add_node("derived_bytes", None, ranges, json!({}))?;
-    assert!(
+    assert_eq!(
         select(
             &case,
             &Selector::parse(&["kind=derived_bytes", "port=80", "vlan=38"])?
         )
-        .is_empty()
+        .len(),
+        0
     );
     let intermediate = case.add_node("operation", None, Vec::new(), json!({}))?;
     let unlocated = case.add_node("unlocated_output", None, Vec::new(), json!({}))?;
@@ -154,12 +159,13 @@ fn range_filter_single_match() -> Result<(), Box<dyn Error>> {
             reason: "Only a graph relationship is present".to_owned(),
         })?;
     }
-    assert!(
+    assert_eq!(
         select(
             &case,
             &Selector::parse(&["kind=unlocated_output", "port=80"])?
         )
-        .is_empty()
+        .len(),
+        0
     );
     Ok(())
 }

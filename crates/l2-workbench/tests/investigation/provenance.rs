@@ -128,7 +128,7 @@ fn byte_mapping_literal_recovered_bytes() -> Result<(), Box<dyn Error>> {
         .iter()
         .filter(|edge| edge.relation == "mapped_by")
         .collect();
-    assert!(!edges.is_empty());
+    assert_ne!(edges.len(), 0);
     for edge in edges {
         let output_node = result
             .case

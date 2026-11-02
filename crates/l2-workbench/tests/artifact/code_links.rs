@@ -159,7 +159,7 @@ fn overlapping_runtime_mapping_is_ambiguous() -> Result<(), Box<dyn Error>> {
     let link = report.links.first().ok_or("frame link is missing")?;
     assert_eq!(link.status, CodeLinkStatus::AmbiguousRuntimeMapping);
     assert_eq!(link.function_name, None);
-    assert!(link.captured_ranges.is_empty());
+    assert_eq!(link.captured_ranges.len(), 0);
     Ok(())
 }
 
@@ -197,7 +197,7 @@ fn process_identity_applying_runtime_addresses() -> Result<(), Box<dyn Error>> {
     let link = report.links.first().ok_or("frame link is missing")?;
     assert_eq!(link.status, CodeLinkStatus::ProcessIdentityUnavailable);
     assert_eq!(link.function_name, None);
-    assert!(link.captured_ranges.is_empty());
+    assert_eq!(link.captured_ranges.len(), 0);
     Ok(())
 }
 
@@ -353,7 +353,7 @@ fn function_mapping_without_packet_match() -> Result<(), Box<dyn Error>> {
         link.status,
         CodeLinkStatus::FunctionMappedWithoutPacketMatch
     );
-    assert!(link.captured_ranges.is_empty());
+    assert_eq!(link.captured_ranges.len(), 0);
     assert_eq!(
         link.trace_match_status,
         Some(TraceMatchStatus::BytesNotObserved)

@@ -22,7 +22,7 @@ fn admitted_search_charges_allocations_and_restores_failed_attempts()
     let budget = MemoryBudget::new(256 * 1024);
     let mut lease = budget.try_reserve(MemoryClass::Executor, 7)?;
     let report = propose_xor_with_memory(&input, 7, &mut lease)?;
-    assert!(!report.proposals.is_empty());
+    assert_ne!(report.proposals.len(), 0);
     assert!(lease.bytes() > 7);
     assert_eq!(budget.snapshot()?.used_bytes, lease.bytes());
     drop(report);
@@ -69,17 +69,16 @@ fn discovers_messages_containing_valid_utf8_text() {
     let lines = "01: café opened near the blue station\n02: résumé is ready to review\n03: meeting moved to mañana afternoon\n04: voilà, the final report is ready\n".as_bytes();
     let input = encoded(lines, &[0xd3]);
     assert!(contains_plaintext(&input, lines));
-    assert!(propose_xor(lines, 7).proposals.is_empty());
+    assert_eq!(propose_xor(lines, 7).proposals.len(), 0);
 }
 
 #[test]
 fn rejects_cleartext_short_and_pseudorandom_data() {
     let lines = b"status: completed 42 items\nfolder: reports and notes\nmessage: account ready\nresult: saved 18 records\n";
-    assert!(propose_xor(lines, 32).proposals.is_empty());
-    assert!(
-        propose_xor(&encoded(b"hi\n", &[0x53]), 32)
-            .proposals
-            .is_empty()
+    assert_eq!(propose_xor(lines, 32).proposals.len(), 0);
+    assert_eq!(
+        propose_xor(&encoded(b"hi\n", &[0x53]), 32).proposals.len(),
+        0
     );
     let mut state = 0x9e37_79b9_u32;
     let random: Vec<u8> = (0..4096)
@@ -90,9 +89,9 @@ fn rejects_cleartext_short_and_pseudorandom_data() {
             state.to_le_bytes()[0]
         })
         .collect();
-    assert!(propose_xor(&random, 32).proposals.is_empty());
+    assert_eq!(propose_xor(&random, 32).proposals.len(), 0);
     let repeated_binary: Vec<u8> = (0..=u8::MAX).cycle().take(4096).collect();
-    assert!(propose_xor(&repeated_binary, 32).proposals.is_empty());
+    assert_eq!(propose_xor(&repeated_binary, 32).proposals.len(), 0);
 }
 
 #[test]
@@ -101,11 +100,11 @@ fn reports_candidate_budget_and_bounded_sample() {
     let input = encoded(lines, &[0xd5]);
     let all = propose_xor(&input, 32);
     let none = propose_xor(&input, 0);
-    assert!(!all.proposals.is_empty());
+    assert_ne!(all.proposals.len(), 0);
     let debug = format!("{all:?}");
     assert!(!debug.contains("XorRepeat"));
     assert!(!debug.contains("key:"));
-    assert!(none.proposals.is_empty());
+    assert_eq!(none.proposals.len(), 0);
     assert_eq!(
         none.omitted_candidates,
         all.proposals.len() + all.omitted_candidates
@@ -154,7 +153,7 @@ fn search_omits_repeated_key_aliases() -> Result<(), Box<dyn std::error::Error>>
     let lines = b"status: completed 42 items\r\nfolder: reports and notes\r\nmessage: account ready &amp; active\r\nresult: saved 18 records\r\n";
     let input = encoded(lines, &[0x83]);
     let report = propose_xor(&input, 32);
-    assert!(!report.proposals.is_empty());
+    assert_ne!(report.proposals.len(), 0);
     for proposal in report.proposals {
         let [Operation::XorRepeat { key, .. }] = proposal.recipe.steps.as_slice() else {
             return Err("expected a repeating XOR recipe".into());

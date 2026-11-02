@@ -142,7 +142,7 @@ fn byte_wraps_across_value() -> Result<(), Box<dyn Error>> {
     assert_eq!(reversed.output, input);
 
     let empty = run_steps(&[], vec![Operation::ByteAdd { value: 173 }])?;
-    assert!(empty.output.is_empty());
+    assert_eq!(empty.output.len(), 0);
     Ok(())
 }
 
@@ -160,6 +160,6 @@ fn bit_rotation_byte_counts_inverse() -> Result<(), Box<dyn Error>> {
     assert_eq!(identity.output, input);
 
     let empty = run_steps(&[], vec![Operation::RotateBits { count: 255 }])?;
-    assert!(empty.output.is_empty());
+    assert_eq!(empty.output.len(), 0);
     Ok(())
 }

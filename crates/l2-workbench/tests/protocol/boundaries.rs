@@ -171,8 +171,8 @@ fn shared_range_previews_partition_counts() -> Result<(), Box<dyn Error>> {
     assert_eq!(first.frames.len(), 2);
     assert_eq!(second.frame_count, 3);
     assert_eq!(second.omitted_frames, 3);
-    assert!(second.frames.is_empty());
-    assert!(report.aliases.is_empty());
+    assert_eq!(second.frames.len(), 0);
+    assert_eq!(report.aliases.len(), 0);
     assert_eq!(report.omitted_alias_candidates, 2);
     Ok(())
 }
@@ -347,15 +347,15 @@ fn inferred_candidates_aliases_distinct_hypotheses() -> Result<(), Box<dyn Error
     };
     let report = protocol::infer_run_boundaries_with_limits(&run, ProtocolLimits::default())?;
 
-    assert!(!report.candidates.is_empty());
+    assert_ne!(report.candidates.len(), 0);
     assert!(
         report
             .candidates
             .iter()
             .any(|candidate| candidate.kind == FramingKind::Delimiter { byte: b'\n' })
     );
-    assert!(!report.next_observation.is_empty());
-    assert!(!report.limitations.is_empty());
+    assert_ne!(report.next_observation.len(), 0);
+    assert_ne!(report.limitations.len(), 0);
     Ok(())
 }
 
@@ -394,7 +394,7 @@ fn alias_detection_boundaries_retained_examples() -> Result<(), Box<dyn Error>> 
     assert_eq!(first.omitted_frames, 3);
     assert_eq!(second.omitted_frames, 3);
     assert_eq!(first.frames, second.frames);
-    assert!(report.aliases.is_empty());
+    assert_eq!(report.aliases.len(), 0);
     Ok(())
 }
 
