@@ -304,7 +304,9 @@ fn invalid_cookie_opcode_and_ambiguous_overloaded_fields_are_not_offers()
 fn distinct_offers_stop_at_the_fixed_observation_cap() -> Result<(), Box<dyn Error>> {
     let bytes = include_bytes!("fixtures/many-offers.bin");
     let frames = bytes
-        .chunks_exact(OFFER.len())
+        .as_chunks::<{ OFFER.len() }>()
+        .0
+        .iter()
         .map(|frame| Ok(ReceiveEvent::Frame(capture(frame)?)))
         .collect::<Result<Vec<_>, Box<dyn Error>>>()?;
     assert_eq!(frames.len(), 65);
