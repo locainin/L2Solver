@@ -8,6 +8,8 @@ mod constraints;
 mod encoding;
 #[path = "derivation/limits.rs"]
 mod limits;
+#[path = "derivation/normalization.rs"]
+mod normalization;
 #[path = "derivation/operands.rs"]
 mod operands;
 #[path = "derivation/operations.rs"]
@@ -24,5 +26,3 @@ mod streaming_files;
 mod support;
 #[path = "derivation/transforms.rs"]
 mod transforms;
-#[path = "derivation/normalization.rs"]
-mod normalization;

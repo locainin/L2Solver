@@ -14,12 +14,12 @@ const FTP_BODY: &[u8] = b"example FTP transfer bytes\r\n";
 mod cache_failure;
 #[path = "export/relational.rs"]
 mod relational;
-#[path = "export/xor_messages.rs"]
-mod xor_messages;
 #[path = "export/repeated.rs"]
 mod repeated;
 #[path = "export/tshark_identity.rs"]
 mod tshark_identity;
+#[path = "export/xor_messages.rs"]
+mod xor_messages;
 
 #[test]
 fn exports_named_artifact() -> Result<(), Box<dyn Error>> {
@@ -2135,7 +2135,10 @@ fn unsupported_capture_summary_states_that_native_transport_analysis_did_not_run
     let destination = temporary.path().join("output");
     let executable = install_tshark(temporary.path(), "")?;
     let mut bytes = capture_with_http_body(BODY)?;
-    bytes.get_mut(20..24).ok_or("missing link type")?.copy_from_slice(&147_u32.to_le_bytes());
+    bytes
+        .get_mut(20..24)
+        .ok_or("missing link type")?
+        .copy_from_slice(&147_u32.to_le_bytes());
     fs::write(&capture, bytes)?;
     let output = export_with_tshark(&capture, &destination, &executable)?;
     // Completion within supported scope remains compatible with existing callers

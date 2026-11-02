@@ -17,10 +17,7 @@ use l2_workbench::{
             StageStatus,
         },
     },
-    recovery::{
-        proposals::TRANSFORM_PROPOSAL_FORMAT_VERSION,
-        xor::XOR_PROPOSAL_FORMAT_VERSION,
-    },
+    recovery::{proposals::TRANSFORM_PROPOSAL_FORMAT_VERSION, xor::XOR_PROPOSAL_FORMAT_VERSION},
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
