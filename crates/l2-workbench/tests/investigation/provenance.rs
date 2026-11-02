@@ -81,7 +81,12 @@ fn conflicting_retransmissions_never_gain_exact_coverage_from_supporting_witness
             frames_seen: u64::try_from(records.len())?,
         })?;
         let mut runs = Vec::new();
-        for node in result.case.nodes().iter().filter(|node| node.kind == "tcp_byte_run") {
+        for node in result
+            .case
+            .nodes()
+            .iter()
+            .filter(|node| node.kind == "tcp_byte_run")
+        {
             let mapped = mapped_node_with_supporting_mappings(&result.case, node.id)?;
             // Each retained witness must match the actual source bytes even after overlap
             let encoded = serde_json::to_value(&mapped.mappings)?;
