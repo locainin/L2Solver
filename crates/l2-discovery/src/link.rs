@@ -133,10 +133,14 @@ impl<'a> NetworkEnvelope<'a> {
     pub const fn field(&self) -> Option<FrameField> {
         match self {
             Self::Ethernet(frame) => Some(frame.field),
+            // Linux also recognizes these legacy QinQ protocol identifiers
             Self::LinuxCooked(frame)
                 if !matches!(frame.hardware_type, 770 | 803 | 824)
                     && frame.protocol >= ETHERTYPE_MIN
-                    && !matches!(frame.protocol, TPID_8021Q | TPID_8021AD) =>
+                    && !matches!(
+                        frame.protocol,
+                        TPID_8021Q | TPID_8021AD | 0x9100 | 0x9200 | 0x9300
+                    ) =>
             {
                 Some(FrameField::EtherType(frame.protocol))
             }

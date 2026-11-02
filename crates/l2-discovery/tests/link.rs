@@ -137,7 +137,7 @@ fn cooked_packet_types_preserve_each_assigned_value() -> Result<(), &'static str
 #[test]
 fn cooked_unsupported_protocol_meanings_are_not_ethernet_fields() -> Result<(), &'static str> {
     for link_type in [LinkType::LinuxSll, LinkType::LinuxSll2] {
-        for protocol in [0x0001, 0x0004, 0x8100, 0x88a8] {
+        for protocol in [0x0001, 0x0004, 0x8100, 0x88a8, 0x9100, 0x9200, 0x9300] {
             let bytes = cooked(link_type, protocol, 0, &[]);
             let frame = decode_network_frame(link_type, &bytes).ok_or("missing cooked frame")?;
             assert_eq!(frame.protocol(), protocol);
