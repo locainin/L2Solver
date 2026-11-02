@@ -1,4 +1,4 @@
-use super::{Options, Result, SCHEMA_VERSION, invalid};
+use super::{Options, Result, SCHEMA_VERSION, context::Context, invalid};
 use rusqlite::Connection;
 use rusqlite::limits::Limit;
 
@@ -45,8 +45,21 @@ pub(super) fn create(connection: &Connection) -> Result<()> {
 pub(super) fn validate(connection: &Connection) -> Result<()> {
     let app: i64 = connection.pragma_query_value(None, "application_id", |row| row.get(0))?;
     let version: i64 = connection.pragma_query_value(None, "user_version", |row| row.get(0))?;
-    if app != APPLICATION_ID || version != i64::from(SCHEMA_VERSION) {
+    if app != APPLICATION_ID || (version != 5 && version != i64::from(SCHEMA_VERSION)) {
         return Err(invalid("unsupported capture index schema"));
+    }
+    if version == 5 {
+        // Old cooked records were kept as opaque bytes and need a fresh index
+        let mut statement = connection.prepare("SELECT value FROM contexts")?;
+        let mut rows = statement.query([])?;
+        while let Some(row) = rows.next()? {
+            let context: Context = serde_json::from_str(&row.get::<_, String>(0)?)?;
+            if context.is_linux_cooked() {
+                return Err(invalid(
+                    "capture index predates cooked support; rebuild it from retained sources",
+                ));
+            }
+        }
     }
     Ok(())
 }

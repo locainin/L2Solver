@@ -4,8 +4,9 @@ use super::{
 };
 use crate::evidence::SourceRange;
 use l2_audit::ForensicScope;
-use l2_capture::{CapturedFrame, EvidenceSourceId, LinkType};
-use l2_discovery::{dns::DnsMessage, ip_packet};
+use l2_capture::{CapturedFrame, EvidenceSourceId};
+use l2_core::FrameField;
+use l2_discovery::{dns::DnsMessage, ip_packet_from_payload, link::decode_network_frame};
 use rusqlite::{Connection, params};
 use serde_json::Value;
 use std::{net::IpAddr, str::FromStr};
@@ -62,20 +63,24 @@ pub(super) fn packet_facts(
             addresses: Some([transport.source.clone(), transport.destination.clone()]),
         });
     }
-    if frame.metadata().link_type() != LinkType::Ethernet {
-        return Ok(PacketFacts {
-            scope: None,
-            addresses: None,
-        });
-    }
-    let Ok(decoded) = l2_core::decode(frame.bytes()) else {
+    let Some(decoded) = decode_network_frame(frame.metadata().link_type(), frame.bytes()) else {
         return Ok(PacketFacts {
             scope: None,
             addresses: None,
         });
     };
-    let scope = cache.retain(connection, &ForensicScope::new(frame.metadata(), &decoded))?;
-    let addresses = ip_packet(&decoded).map(|ip| {
+    let scope = cache.retain(
+        connection,
+        &ForensicScope::from_network_frame(frame.metadata(), &decoded),
+    )?;
+    // Unknown cooked protocol meanings cannot be interpreted as IP
+    let ip = match decoded.field() {
+        Some(FrameField::EtherType(protocol)) => {
+            ip_packet_from_payload(protocol, decoded.payload())
+        }
+        Some(FrameField::Length(_)) | None => None,
+    };
+    let addresses = ip.map(|ip| {
         [
             flows::address_bytes(ip.source),
             flows::address_bytes(ip.destination),

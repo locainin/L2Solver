@@ -8,8 +8,9 @@ use super::{
     scopes, shared,
 };
 use l2_audit::ForensicScope;
-use l2_capture::{CaptureLocator, CapturedFrame, EvidenceSourceId, LinkType};
-use l2_discovery::ip_packet;
+use l2_capture::{CaptureLocator, CapturedFrame, EvidenceSourceId};
+use l2_core::FrameField;
+use l2_discovery::{ip_packet_from_payload, link::decode_network_frame};
 use l2_pcap::{CaptureLimits, CaptureSource};
 use rusqlite::{Connection, OptionalExtension, params};
 use sha2::{Digest, Sha256};
@@ -253,19 +254,23 @@ pub(super) fn transport<'a>(
     connection: &Connection,
     scope_cache: &mut scopes::Cache,
 ) -> Result<Option<Transport<'a>>> {
-    if frame.metadata().link_type() != LinkType::Ethernet {
-        return Ok(None);
-    }
-    let Ok(decoded) = l2_core::decode(frame.bytes()) else {
+    let Some(decoded) = decode_network_frame(frame.metadata().link_type(), frame.bytes()) else {
         return Ok(None);
     };
-    let Some(ip) = ip_packet(&decoded) else {
+    // Cooked protocol fields are usable only when their hardware layout is understood
+    let Some(FrameField::EtherType(protocol)) = decoded.field() else {
+        return Ok(None);
+    };
+    let Some(ip) = ip_packet_from_payload(protocol, decoded.payload()) else {
         return Ok(None);
     };
     let Some(transport) = ip.transport else {
         return Ok(None);
     };
-    let scope = scope_cache.retain(connection, &ForensicScope::new(frame.metadata(), &decoded))?;
+    let scope = scope_cache.retain(
+        connection,
+        &ForensicScope::from_network_frame(frame.metadata(), &decoded),
+    )?;
     Ok(Some(Transport {
         scope,
         protocol: ip.protocol,
@@ -274,6 +279,6 @@ pub(super) fn transport<'a>(
         ports: transport.ports,
         payload: transport.payload,
         payload_offset: offset
-            + u64::try_from(14 + decoded.vlan_tags.len() * 4 + transport.payload_offset)?,
+            + u64::try_from(decoded.payload_offset() + transport.payload_offset)?,
     }))
 }

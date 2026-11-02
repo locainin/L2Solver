@@ -19,7 +19,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::json;
 
 const NATIVE_CASE_STAGE: &str = "native_case";
-const NATIVE_CASE_ALGORITHM: &str = "l2-native-case-v2";
+const NATIVE_CASE_ALGORITHM: &str = "l2-native-case-v3";
 
 #[derive(Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
