@@ -55,6 +55,22 @@ def test_frozen_dependency_checks_fetch_both_locked_workspaces_first():
     assert "cargo deny --frozen --manifest-path fuzz/Cargo.toml check" in commands
 
 
+def test_network_tests_require_scoped_namespace_permission_and_a_real_probe():
+    workflow = (ROOT / ".github/workflows/release-linux.yml").read_text()
+    setup = workflow[workflow.index("- name: Permit isolated test namespaces"):]
+    setup = setup.split("\n      - name:", 1)[0]
+    assert "profile l2solver-ci-unshare /usr/bin/unshare flags=(unconfined)" in setup
+    assert "userns," in setup
+    load = setup.index('sudo apparmor_parser --replace "$namespace_profile"')
+    probe = setup.index(
+        "unshare --user --map-root-user --net --mount --pid --mount-proc --fork true"
+    )
+    assert load < probe
+    assert workflow.index(setup) < workflow.index("- name: Run workspace tests with Nextest")
+    assert "apparmor_restrict_unprivileged_userns" not in workflow
+    assert "systemctl stop apparmor" not in workflow
+
+
 def test_review_workflow_runs_python_doctests_and_warning_checked_rustdoc():
     workflow = (ROOT / ".github/workflows/release-linux.yml").read_text()
     assert "pytest -q tests/benchmarks" in workflow
