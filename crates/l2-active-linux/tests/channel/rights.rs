@@ -9,6 +9,8 @@ use std::{
 
 #[path = "records.rs"]
 mod records;
+#[path = "truncated.rs"]
+mod truncated;
 
 fn count_open_identity(device: u64, inode: u64) -> io::Result<usize> {
     let mut count = 0;
@@ -39,12 +41,13 @@ fn records_close_received_descriptors_before_reporting_the_error() -> io::Result
         pid: std::process::id(),
         uid: nix::unistd::getuid().as_raw(),
     };
-    for (data, expected) in [
-        (&[][..], io::ErrorKind::BrokenPipe),
-        (&[1][..], io::ErrorKind::InvalidData),
+    for (data, expected, descriptor_count) in [
+        (&[][..], io::ErrorKind::BrokenPipe, 1),
+        (&[1][..], io::ErrorKind::InvalidData, 1),
+        (&[1][..], io::ErrorKind::InvalidData, 253),
     ] {
         let (channel, remote) = Channel::pair(peer)?;
-        let rights = [file.as_raw_fd()];
+        let rights = vec![file.as_raw_fd(); descriptor_count];
         let controls = [ControlMessage::ScmRights(&rights)];
         let payload = [IoSlice::new(data)];
         sendmsg::<()>(
@@ -58,13 +61,13 @@ fn records_close_received_descriptors_before_reporting_the_error() -> io::Result
         assert_eq!(
             channel.try_receive().err().map(|error| error.kind()),
             Some(expected),
-            "payload length {}",
-            data.len()
+            "payload length {}, descriptor count {descriptor_count}",
+            data.len(),
         );
         assert_eq!(
             count_open_identity(metadata.dev(), metadata.ino())?,
             before,
-            "received descriptor leaked into the frontend process"
+            "received descriptor leaked into the frontend process for {descriptor_count} descriptors"
         );
     }
     Ok(())

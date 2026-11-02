@@ -1,6 +1,8 @@
 use super::super::{Channel, Peer};
 use crate::wire::MAX_RECORD;
-use nix::sys::socket::{AddressFamily, MsgFlags, SockFlag, SockType, recv, send, socketpair};
+use nix::sys::socket::{
+    AddressFamily, MsgFlags, SockFlag, SockType, UnixCredentials, recv, send, socketpair,
+};
 use std::{
     io,
     os::fd::{AsRawFd, OwnedFd},
@@ -13,6 +15,26 @@ fn own_peer() -> Peer {
     Peer {
         pid: std::process::id(),
         uid: nix::unistd::getuid().as_raw(),
+    }
+}
+
+#[test]
+fn unmapped_process_id_cannot_authenticate_a_peer() {
+    // Linux reports PID zero when the sender is outside the receiver's PID namespace
+    let credential = UnixCredentials::from(nix::libc::ucred {
+        pid: 0,
+        uid: own_peer().uid,
+        gid: 0,
+    });
+    for pid in [0, 1] {
+        assert!(
+            !Peer {
+                pid,
+                uid: credential.uid(),
+            }
+            .matches(&credential),
+            "an unmapped process must not match peer PID {pid}"
+        );
     }
 }
 

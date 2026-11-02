@@ -26,8 +26,12 @@ pub fn encode_deadline(deadline: Instant, ceiling: Duration) -> io::Result<u64> 
 
 pub fn decode_deadline(deadline: u64) -> io::Result<Instant> {
     let sampled = Instant::now();
+    decode_deadline_at(deadline, sampled, monotonic_nanos()?)
+}
+
+fn decode_deadline_at(deadline: u64, sampled: Instant, monotonic: u64) -> io::Result<Instant> {
     let remaining = deadline
-        .checked_sub(monotonic_nanos()?)
+        .checked_sub(monotonic)
         .filter(|value| *value > 0)
         .ok_or_else(expired)?;
     let duration = Duration::from_nanos(remaining);
