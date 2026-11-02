@@ -236,7 +236,7 @@ fn management_action_frames() -> Result<(), Box<dyn std::error::Error>> {
     };
     assert_eq!(action.category, 7);
     assert_eq!(action.action, 9);
-    assert!(action.payload.is_empty());
+    assert_eq!(action.payload, []);
     Ok(())
 }
 

@@ -17,7 +17,7 @@ fn zero_length_psdu_is_valid() -> Result<(), Box<dyn std::error::Error>> {
         70,
         ObservationStatus::Observed,
     );
-    assert!(survey.diagnostics().is_empty());
+    assert_eq!(survey.diagnostics(), []);
     Ok(())
 }
 

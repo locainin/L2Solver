@@ -38,11 +38,11 @@ fn rejects_invalid_policies() -> Result<(), Box<dyn std::error::Error>> {
 
     let network = WirelessNetworkPolicy::new(b"Corp".to_vec())?;
     assert_eq!(network.ssid(), b"Corp");
-    assert!(network.allowed_bssids().is_empty());
-    assert!(network.security_modes().is_empty());
+    assert_eq!(network.allowed_bssids(), []);
+    assert_eq!(network.security_modes(), []);
     assert_eq!(network.pmf(), PmfRequirement::Optional);
     assert!(!network.wps_allowed());
-    assert!(network.allowed_channels().is_empty());
+    assert_eq!(network.allowed_channels(), []);
     let policy = WirelessPolicy {
         networks: vec![network.clone(), network],
         unlisted_ssids_forbidden: false,

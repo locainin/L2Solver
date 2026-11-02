@@ -109,7 +109,7 @@ fn timed_capture_sequence_zero_accepted() -> Result<(), Box<dyn std::error::Erro
         ObservationStatus::Observed
     );
     assert_eq!(survey.access_points().count(), 1);
-    assert!(survey.diagnostics().is_empty());
+    assert_eq!(survey.diagnostics(), []);
     Ok(())
 }
 
@@ -325,7 +325,7 @@ fn fcs_not_parsed_ie() -> Result<(), Box<dyn std::error::Error>> {
         ObservationStatus::Observed,
     );
     assert_eq!(survey.access_points().len(), 1);
-    assert!(survey.diagnostics().is_empty());
+    assert_eq!(survey.diagnostics(), []);
     Ok(())
 }
 

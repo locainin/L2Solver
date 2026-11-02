@@ -2,7 +2,7 @@ use super::common::{AP, STATION};
 
 // Keep malformed oversized fixture inputs non-panicking like the original builder
 fn length_byte(length: usize) -> u8 {
-    u8::try_from(length).ok().map_or(0, |value| value)
+    u8::try_from(length).unwrap_or(0)
 }
 
 // Build an RSN transition element with both PSK and SAE authentication suites

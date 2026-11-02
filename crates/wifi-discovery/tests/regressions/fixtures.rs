@@ -1,7 +1,7 @@
 use super::common::AP;
 
 fn length_byte(length: usize) -> u8 {
-    u8::try_from(length).ok().map_or(0, |value| value)
+    u8::try_from(length).unwrap_or(0)
 }
 
 pub fn beacon() -> Vec<u8> {
