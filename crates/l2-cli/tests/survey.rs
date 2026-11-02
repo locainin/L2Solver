@@ -131,19 +131,21 @@ mod json {
                 })
             })
             .ok_or("missing STP exposure")?;
-        assert!(
-            !stp.get("evidence_packets")
+        assert_ne!(
+            stp.get("evidence_packets")
                 .ok_or("missing evidence field")?
                 .as_array()
                 .ok_or("missing evidence references")?
-                .is_empty()
+                .len(),
+            0
         );
-        assert!(
-            !report
+        assert_ne!(
+            report
                 .get("evidence")
                 .and_then(serde_json::Value::as_array)
                 .ok_or("missing raw evidence")?
-                .is_empty()
+                .len(),
+            0
         );
         Ok(())
     }
@@ -334,7 +336,7 @@ mod resource_limits {
             .args(["--format", "json"])
             .output()?;
         assert_eq!(output.status.code(), Some(0));
-        assert!(output.stderr.is_empty());
+        assert_eq!(output.stderr.len(), 0);
         assert!(output.stdout.len() <= 32 * 1024 * 1024);
         let report: serde_json::Value = serde_json::from_slice(&output.stdout)?;
         assert!(
@@ -418,7 +420,7 @@ mod resource_limits {
         std::fs::remove_dir_all(directory)?;
 
         assert_eq!(output.status.code(), Some(1));
-        assert!(output.stdout.is_empty());
+        assert_eq!(output.stdout.len(), 0);
         assert!(
             String::from_utf8(output.stderr)?.contains("survey JSON output exceeds 33554432 bytes")
         );

@@ -113,7 +113,7 @@ fn rejects_bytes_after_output_limit() -> Result<(), Box<dyn Error>> {
         .ok_or("named writer accepted bytes over its limit")?;
     assert!(named_error.to_string().contains("baseline JSON"));
     assert_eq!(named.written(), 0);
-    assert!(named_destination.is_empty());
+    assert_eq!(named_destination.len(), 0);
     Ok(())
 }
 

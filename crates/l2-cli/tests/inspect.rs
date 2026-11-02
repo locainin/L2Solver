@@ -156,7 +156,7 @@ fn unknown_command_extra_arguments_rejected() -> Result<(), Box<dyn std::error::
             .args(args)
             .output()?;
         assert_eq!(output.status.code(), Some(2));
-        assert!(output.stdout.is_empty());
+        assert_eq!(output.stdout.len(), 0);
         assert!(String::from_utf8(output.stderr)?.contains("--help"));
     }
     Ok(())

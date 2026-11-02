@@ -6,7 +6,7 @@ fn empty_invocation_shows_full_help_and_succeeds() -> Result<(), Box<dyn std::er
     let output = Command::new(env!("CARGO_BIN_EXE_l2solver")).output()?;
 
     assert_eq!(output.status.code(), Some(0));
-    assert!(output.stderr.is_empty());
+    assert_eq!(output.stderr.len(), 0);
     let help = String::from_utf8(output.stdout)?;
     for detail in [
         "Usage: l2solver",

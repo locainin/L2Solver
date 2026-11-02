@@ -477,7 +477,7 @@ fn clean_eof_emitting_comparison() -> Result<(), Box<dyn Error>> {
         .output()?;
 
     assert_eq!(output.status.code(), Some(1));
-    assert!(output.stdout.is_empty());
+    assert_eq!(output.stdout.len(), 0);
     assert!(String::from_utf8(output.stderr)?.contains("record header"));
     Ok(())
 }
@@ -492,7 +492,7 @@ fn missing_selected_packets_scanning() -> Result<(), Box<dyn Error>> {
         .output()?;
 
     assert_eq!(output.status.code(), Some(1));
-    assert!(output.stdout.is_empty());
+    assert_eq!(output.stdout.len(), 0);
     assert!(String::from_utf8(output.stderr)?.contains("packet 2"));
     Ok(())
 }

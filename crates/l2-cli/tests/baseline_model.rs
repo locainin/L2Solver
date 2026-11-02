@@ -49,7 +49,7 @@ mod comparison {
     #[test]
     fn equal_facts_no_security_verdict() -> Result<(), Box<dyn std::error::Error>> {
         let baseline = Baseline::new(facts(&["lldp:core-01"])?)?;
-        assert!(baseline.compare(&baseline)?.is_empty());
+        assert_eq!(baseline.compare(&baseline)?.len(), 0);
         Ok(())
     }
 }
