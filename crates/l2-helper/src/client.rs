@@ -375,7 +375,7 @@ impl FrontendClient {
         let _ = self
             .state
             .health
-            .fetch_update(
+            .try_update(
                 Ordering::AcqRel,
                 Ordering::Acquire,
                 |current| match current {
@@ -390,7 +390,7 @@ impl FrontendClient {
         let _ = self
             .state
             .health
-            .fetch_update(
+            .try_update(
                 Ordering::AcqRel,
                 Ordering::Acquire,
                 |current| match current {
@@ -411,7 +411,7 @@ impl FrontendClient {
     }
 
     fn next_sequence(&self) -> Result<u64, RequestFailure> {
-        let sequence = self.state.next_sequence.fetch_update(
+        let sequence = self.state.next_sequence.try_update(
             Ordering::Relaxed,
             Ordering::Relaxed,
             |current| current.checked_add(1),
