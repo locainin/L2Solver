@@ -1,4 +1,5 @@
 """Exercise publication and removal without modifying system installation paths."""
+import hashlib
 import importlib.util
 import json
 import os
@@ -25,9 +26,148 @@ def payload(tmp_path):
     for name in ("l2solver", "l2solver-active", "l2solver-active-helper"):
         (source / name).write_text("#!/bin/sh\nprintf 'installed fixture\\n'\n")
         (source / name).chmod(0o755)
-    for name in ("bash", "zsh", "fish", "README.md", "install.md", "NOTICE-JEMALLOC.txt", "receipt.json"):
+    for name in ("bash", "zsh", "fish", "NOTICE-JEMALLOC.txt", "receipt.json"):
         (source / name).write_text('{}' if name == "receipt.json" else name)
     return source
+
+
+def legacy_installation(installer, payload, prefix):
+    # Recreate the previous schema and file modes without relying on Git history
+    names = (
+        "l2solver", "l2solver-active", "l2solver-active-helper", "l2solver-uninstall",
+        "bash", "zsh", "fish", "README.md", "install.md", "NOTICE-JEMALLOC.txt", "receipt.json",
+    )
+    base = prefix / "share/l2solver"
+    directory = base / "legacy-fixture"
+    directory.mkdir(parents=True)
+    hashes = {}
+    for name in names:
+        if name == "l2solver-uninstall":
+            contents = b"#!/bin/sh\nexit 0\n"
+        elif name in ("README.md", "install.md"):
+            contents = name.encode()
+        else:
+            contents = (payload / name).read_bytes()
+        entry = directory / name
+        entry.write_bytes(contents)
+        entry.chmod(0o755 if name in (*installer.BINARIES, "l2solver-uninstall") else 0o644)
+        hashes[name] = hashlib.sha256(contents).hexdigest()
+    generation = hashlib.sha256(json.dumps([hashes, False], sort_keys=True).encode()).hexdigest()
+    directory.rename(base / generation)
+    directory = base / generation
+    destinations = installer.links(prefix)
+    for relative, target in destinations.items():
+        link = prefix / relative
+        link.parent.mkdir(parents=True, exist_ok=True)
+        link.symlink_to(target)
+    (base / "current").symlink_to(generation)
+    manifest = base / "manifest.json"
+    manifest.write_text(json.dumps({"schema": 1, "links": destinations, "generations": {generation: hashes}}))
+    manifest.chmod(0o600)
+    return directory
+
+
+def test_legacy_generation_upgrades_without_docs_and_uninstalls_all_generations(installer, payload, tmp_path):
+    prefix = tmp_path / "prefix"
+    old = legacy_installation(installer, payload, prefix)
+
+    installer.install(payload, prefix, False)
+
+    current = (prefix / "bin/l2solver").resolve().parent
+    assert current != old
+    assert {entry.name for entry in current.iterdir()} == {
+        "l2solver", "l2solver-active", "l2solver-active-helper", "l2solver-uninstall",
+        "bash", "zsh", "fish", "NOTICE-JEMALLOC.txt", "receipt.json",
+    }
+    manifest = installer.read_manifest(prefix)
+    assert set(manifest["generations"]) == {old.name, current.name}
+    assert set(manifest["generations"][old.name]) == {entry.name for entry in old.iterdir()}
+    assert set(manifest["generations"][current.name]) == {entry.name for entry in current.iterdir()}
+    installer.uninstall(prefix)
+    assert not (prefix / "share/l2solver").exists()
+    assert not os.path.lexists(prefix / "bin/l2solver")
+
+
+def test_legacy_generation_can_be_uninstalled_without_upgrade(installer, payload, tmp_path):
+    prefix = tmp_path / "prefix"
+    legacy_installation(installer, payload, prefix)
+    installer.uninstall(prefix)
+    assert not (prefix / "share/l2solver").exists()
+    assert not os.path.lexists(prefix / "bin/l2solver")
+
+
+def test_mixed_generations_keep_current_install_when_legacy_file_changes(installer, payload, tmp_path):
+    prefix = tmp_path / "prefix"
+    old = legacy_installation(installer, payload, prefix)
+    installer.install(payload, prefix, False)
+    current = (prefix / "bin/l2solver").resolve()
+    (old / "README.md").write_text("modified")
+
+    with pytest.raises(ValueError, match="modified"):
+        installer.uninstall(prefix)
+    assert (prefix / "bin/l2solver").resolve() == current
+    assert current.is_file()
+    assert old.is_dir()
+
+
+@pytest.mark.parametrize("damage", ["missing_readme", "missing_install", "extra_manifest", "extra_file", "changed_file", "mode", "symlink", "invalid_hashes"])
+def test_unsafe_legacy_generation_blocks_upgrade_and_uninstall(installer, payload, tmp_path, damage):
+    prefix = tmp_path / "prefix"
+    directory = legacy_installation(installer, payload, prefix)
+    manifest = prefix / "share/l2solver/manifest.json"
+    data = json.loads(manifest.read_text())
+    hashes = data["generations"][directory.name]
+    if damage in ("missing_readme", "missing_install"):
+        name = "README.md" if damage == "missing_readme" else "install.md"
+        del hashes[name]
+        (directory / name).unlink()
+        manifest.write_text(json.dumps(data))
+    elif damage == "extra_manifest":
+        hashes["foreign"] = hashlib.sha256(b"keep").hexdigest()
+        (directory / "foreign").write_bytes(b"keep")
+        manifest.write_text(json.dumps(data))
+    elif damage == "extra_file":
+        (directory / "foreign").write_bytes(b"keep")
+    elif damage == "changed_file":
+        (directory / "README.md").write_text("modified")
+    elif damage == "mode":
+        (directory / "README.md").chmod(0o600)
+    elif damage == "symlink":
+        (directory / "README.md").unlink()
+        (directory / "README.md").symlink_to(tmp_path / "foreign")
+    else:
+        data["generations"][directory.name] = list(hashes)
+        manifest.write_text(json.dumps(data))
+    before = manifest.read_bytes()
+    for action in (lambda: installer.install(payload, prefix, False), lambda: installer.uninstall(prefix)):
+        with pytest.raises(ValueError):
+            action()
+        assert manifest.read_bytes() == before
+        assert (prefix / "bin/l2solver").is_symlink()
+        assert directory.exists()
+    if damage in ("extra_manifest", "extra_file"):
+        assert (directory / "foreign").read_bytes() == b"keep"
+
+
+def test_failed_new_payload_keeps_legacy_generation(installer, payload, tmp_path):
+    prefix = tmp_path / "prefix"
+    old = legacy_installation(installer, payload, prefix)
+    (payload / "NOTICE-JEMALLOC.txt").unlink()
+    with pytest.raises(ValueError, match="invalid payload file"):
+        installer.install(payload, prefix, False)
+    assert (prefix / "bin/l2solver").resolve().parent == old
+    assert set(installer.read_manifest(prefix)["generations"]) == {old.name}
+
+
+def test_fresh_install_needs_no_documentation(installer, payload, tmp_path):
+    prefix = tmp_path / "prefix"
+    installer.install(payload, prefix, False)
+    current = (prefix / "bin/l2solver").resolve().parent
+    assert (current / "NOTICE-JEMALLOC.txt").is_file()
+    assert (current / "receipt.json").is_file()
+    assert not (current / "README.md").exists()
+    assert not (current / "install.md").exists()
+    installer.uninstall(prefix)
 
 
 def test_install_upgrade_and_independent_uninstall(installer, payload, tmp_path):

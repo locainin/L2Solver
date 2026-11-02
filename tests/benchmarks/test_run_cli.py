@@ -1,4 +1,4 @@
-"""Command-line defaults stay independent of catalogue symlink locations."""
+"""Command-line paths and defaults are explicit and predictable."""
 
 import tempfile
 import unittest
@@ -11,32 +11,45 @@ from benchmarks.run import main, parse_arguments
 
 class RunArgumentTests(unittest.TestCase):
     def test_defaults_select_canonical_benchmark_configuration(self):
-        arguments = parse_arguments(["--binary", "target/release/l2solver"])
+        arguments = parse_arguments([
+            "--binary", "target/release/l2solver", "--catalogue", "input/catalogue.json",
+        ])
 
-        self.assertEqual(arguments.catalogue.as_posix(), "pcap_samples/malware-traffic-analysis.json")
+        self.assertEqual(arguments.catalogue.as_posix(), "input/catalogue.json")
         self.assertEqual(arguments.results_directory.as_posix(), "benchmarks/results")
         self.assertEqual(arguments.mode, "case")
+
+    def test_missing_catalogue_is_reported_as_a_required_argument(self):
+        error_output = StringIO()
+        with redirect_stderr(error_output), self.assertRaises(SystemExit) as error:
+            parse_arguments(["--binary", "analyzer"])
+        self.assertEqual(error.exception.code, 2)
+        self.assertIn("--catalogue", error_output.getvalue())
 
     def test_stream_mode_accepts_explicit_paths(self):
         arguments = parse_arguments([
             "--binary", "target/release/l2solver",
-            "--catalogue", "benchmarks/malware-traffic-analysis.json",
+            "--catalogue", "input/catalogue.json",
             "--results-directory", "out/summary",
             "--mode", "stream",
         ])
 
-        self.assertEqual(arguments.catalogue.as_posix(), "benchmarks/malware-traffic-analysis.json")
+        self.assertEqual(arguments.catalogue.as_posix(), "input/catalogue.json")
         self.assertEqual(arguments.results_directory.as_posix(), "out/summary")
         self.assertEqual(arguments.mode, "stream")
 
     def test_index_mode_is_available(self):
-        arguments = parse_arguments(["--binary", "analyzer", "--mode", "index"])
+        arguments = parse_arguments([
+            "--binary", "analyzer", "--catalogue", "catalogue.json", "--mode", "index",
+        ])
 
         self.assertEqual(arguments.mode, "index")
 
     def test_unknown_mode_is_rejected(self):
         with self.assertRaises(SystemExit):
-            parse_arguments(["--binary", "analyzer", "--mode", "automatic"])
+            parse_arguments([
+                "--binary", "analyzer", "--catalogue", "catalogue.json", "--mode", "automatic",
+            ])
 
     def test_invalid_catalogue_reports_cli_error(self):
         with tempfile.TemporaryDirectory() as directory:

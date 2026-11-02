@@ -23,7 +23,18 @@ def test_review_upload_follows_candidate_checks_and_is_labeled_unqualified():
     assert "l2solver-qualification/elf-*/*.txt" in upload_step
     assert "l2solver-qualification/startup/*/stdout.log" in upload_step
     assert "l2solver-qualification/startup/*/stderr.log" in upload_step
-    assert not re.search(r"(?m)^\s*if:\s*", upload_step)
+    assert (
+        "if: github.event_name == 'workflow_dispatch' || "
+        "(github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v'))"
+    ) in upload_step
+
+
+def test_workflow_validates_development_pushes_and_pull_requests():
+    workflow = (ROOT / ".github/workflows/release-linux.yml").read_text()
+    events = workflow.split("\npermissions:", 1)[0]
+    assert re.search(r'(?m)^  push:\n    branches:\n      - "dev"\n    tags:\n      - "v\*"$', events)
+    assert re.search(r'(?m)^  pull_request:\n    branches:\n      - "dev"$', events)
+    assert re.search(r"(?m)^  workflow_dispatch:$", events)
 
 
 def test_review_workflow_runs_python_doctests_and_warning_checked_rustdoc():
@@ -37,5 +48,6 @@ def test_review_workflow_runs_python_doctests_and_warning_checked_rustdoc():
     assert "-p Delegate=yes -p CPUQuota=100%" in workflow
     assert "L2_TEST_DELEGATED_SCOPE=1" in workflow
     assert "cargo test --workspace --doc --all-features --locked" in workflow
+    assert workflow.index("cargo nextest run") < workflow.index("cargo test --workspace --doc")
     assert "cargo doc --workspace --all-features --no-deps --locked" in workflow
     assert workflow.count("RUSTDOCFLAGS: -D warnings") >= 2

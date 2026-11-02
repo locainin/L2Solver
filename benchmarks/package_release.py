@@ -21,10 +21,8 @@ ROOT = Path(__file__).resolve().parents[1]
 ARCHIVE_NAME = f"l2solver-{TARGET}.tar.gz"
 PROVENANCE_NAME = "PROVENANCE.json"
 NOTICE_PATH = ROOT / "NOTICE-JEMALLOC.txt"
-INSTALL_PATH = ROOT / "docs/active/portable-release.md"
 HELPER_NAME = "l2solver-active-helper"
 ACTIVE_NAME = "l2solver-active"
-INSTALL_NAME = "INSTALL-ACTIVE.md"
 
 
 def _regular_file(path, description, *, executable=False):
@@ -126,22 +124,16 @@ def _tar_entry(name, size, mode):
     return entry
 
 
-def _bounded_document(path, description):
-    document, _ = _regular_file(path, description)
-    with document.open("rb") as source:
-        contents = source.read(64 * 1024 + 1)
-    if not contents or len(contents) > 64 * 1024:
-        raise ValueError(f"{description} must contain between 1 and 65536 bytes")
-    return contents
-
-
 def _write_archive(binary, active, helper, provenance, archive):
     provenance_bytes = (json.dumps(provenance, indent=2, sort_keys=True) + "\n").encode(
         "utf-8"
     )
     # Distribute the native allocator and Rust binding notices with the linked executable
-    notices = _bounded_document(NOTICE_PATH, "allocator notices")
-    instructions = _bounded_document(INSTALL_PATH, "portable archive guide")
+    notice_path, _ = _regular_file(NOTICE_PATH, "allocator notices")
+    with notice_path.open("rb") as source:
+        notices = source.read(64 * 1024 + 1)
+    if not notices or len(notices) > 64 * 1024:
+        raise ValueError("allocator notices must contain between 1 and 65536 bytes")
 
     # Fixed gzip and tar metadata make the package bytes independent of the clock
     with (
@@ -168,10 +160,6 @@ def _write_archive(binary, active, helper, provenance, archive):
         package.addfile(
             _tar_entry(NOTICE_PATH.name, len(notices), 0o644),
             io.BytesIO(notices),
-        )
-        package.addfile(
-            _tar_entry(INSTALL_NAME, len(instructions), 0o644),
-            io.BytesIO(instructions),
         )
 
 

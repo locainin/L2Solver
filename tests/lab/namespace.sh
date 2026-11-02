@@ -172,4 +172,4 @@ ip link set br0 type bridge stp_state 1
 wait "$capture_pid"
 capture_pid=
 "$binary" observe "$output/linux-stp.pcap" > "$output/namespace-stp-observation.txt"
-printf '%s\n' 'Namespace VLAN and STP capture regression passed' 
+printf '%s\n' 'Namespace VLAN and STP capture regression passed'

@@ -50,3 +50,18 @@
 /docs/screenshots/
 /docs/reports/*.html
 __pycache__/
+
+# Keep this development snapshot limited to reviewed source and required notices
+*.md
+*.rst
+*.log
+.env
+.env.*
+/notes/
+/reports/
+/pcap_samples/
+/benchmarks/malware-traffic-analysis.json
+/*.zip
+/*.bundle
+/.pytest_cache/
+/.ruff_cache/

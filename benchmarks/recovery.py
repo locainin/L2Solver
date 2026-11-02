@@ -605,7 +605,7 @@ def parse_arguments(arguments=None):
     parser.add_argument(
         "--catalogue",
         type=Path,
-        default=Path("pcap_samples/malware-traffic-analysis.json"),
+        required=True,
     )
     parser.add_argument("--sample", required=True)
     parser.add_argument("--binary", type=Path, required=True)

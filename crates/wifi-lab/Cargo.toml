@@ -9,4 +9,3 @@ workspace = true
 
 [dependencies]
 wifi-discovery = { version = "=0.1.0", path = "../wifi-discovery" }
-

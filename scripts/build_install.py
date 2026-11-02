@@ -109,9 +109,7 @@ def main():
         binary = artifacts["l2solver"]
         for shell in ("bash", "zsh", "fish"):
             (payload / shell).write_text(output(str(binary), "completions", shell) + "\n")
-        for name in ("README.md", "NOTICE-JEMALLOC.txt"):
-            shutil.copyfile(ROOT / name, payload / name)
-        shutil.copyfile(ROOT / "docs/active/install.md", payload / "install.md")
+        shutil.copyfile(ROOT / "NOTICE-JEMALLOC.txt", payload / "NOTICE-JEMALLOC.txt")
         receipt = {
             **after,
             "source_dirty": before["source_dirty"] or after["source_dirty"],

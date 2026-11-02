@@ -1,0 +1,203 @@
+{
+  "label": "synthetic checkpoint v4",
+  "created_at_unix_ms": 0,
+  "elapsed_ms": 3010,
+  "current_phase": "reconstruction",
+  "phases": [
+    {
+      "phase": "preparation",
+      "state": "completed",
+      "completed": 1,
+      "total": 1,
+      "message": null,
+      "elapsed_ms": 10,
+      "progress_percent": 100,
+      "rate_per_second": 100,
+      "eta_seconds": null
+    },
+    {
+      "phase": "ingestion",
+      "state": "completed",
+      "completed": 2,
+      "total": 2,
+      "message": null,
+      "elapsed_ms": 1000,
+      "progress_percent": 100,
+      "rate_per_second": 2,
+      "eta_seconds": null
+    },
+    {
+      "phase": "reconstruction",
+      "state": "in_progress",
+      "completed": 3,
+      "total": 8,
+      "message": "synthetic work in progress",
+      "elapsed_ms": 2000,
+      "progress_percent": 37,
+      "rate_per_second": 1,
+      "eta_seconds": 4
+    },
+    {
+      "phase": "native_extraction",
+      "state": "pending",
+      "completed": 0,
+      "total": null,
+      "message": null,
+      "elapsed_ms": 0,
+      "progress_percent": null,
+      "rate_per_second": null,
+      "eta_seconds": null
+    },
+    {
+      "phase": "framing_record_discovery",
+      "state": "pending",
+      "completed": 0,
+      "total": null,
+      "message": null,
+      "elapsed_ms": 0,
+      "progress_percent": null,
+      "rate_per_second": null,
+      "eta_seconds": null
+    },
+    {
+      "phase": "transform_discovery",
+      "state": "pending",
+      "completed": 0,
+      "total": null,
+      "message": null,
+      "elapsed_ms": 0,
+      "progress_percent": null,
+      "rate_per_second": null,
+      "eta_seconds": null
+    },
+    {
+      "phase": "assembly_validation",
+      "state": "pending",
+      "completed": 0,
+      "total": null,
+      "message": null,
+      "elapsed_ms": 0,
+      "progress_percent": null,
+      "rate_per_second": null,
+      "eta_seconds": null
+    },
+    {
+      "phase": "expansion",
+      "state": "pending",
+      "completed": 0,
+      "total": null,
+      "message": null,
+      "elapsed_ms": 0,
+      "progress_percent": null,
+      "rate_per_second": null,
+      "eta_seconds": null
+    },
+    {
+      "phase": "reports",
+      "state": "pending",
+      "completed": 0,
+      "total": null,
+      "message": null,
+      "elapsed_ms": 0,
+      "progress_percent": null,
+      "rate_per_second": null,
+      "eta_seconds": null
+    },
+    {
+      "phase": "publication",
+      "state": "pending",
+      "completed": 0,
+      "total": null,
+      "message": null,
+      "elapsed_ms": 0,
+      "progress_percent": null,
+      "rate_per_second": null,
+      "eta_seconds": null
+    }
+  ],
+  "counters": {
+    "files": 2,
+    "bytes": 240,
+    "packets": 6,
+    "flows": 7,
+    "cohorts": 1,
+    "candidates_examined": 3,
+    "candidates_rejected": 1,
+    "validated_artifacts": 1,
+    "expanded_members": 0,
+    "cache_hits": 1,
+    "cache_misses": 1,
+    "records": 2,
+    "transforms": 1,
+    "reports": 1,
+    "record_input_applications": 11,
+    "source_read_bytes": 50,
+    "prior_source_read_bytes": 10
+  },
+  "cache_fallbacks": {
+    "records": []
+  },
+  "recovery_transitions": {
+    "records": [
+      {
+        "stage": "cohort",
+        "outcome": "cohort_admitted",
+        "count": 1,
+        "sample": {
+          "kind": "cohort",
+          "detail": {
+            "source_sha256": "1111111111111111111111111111111111111111111111111111111111111111",
+            "input_node_id": 7,
+            "input_blob_sha256": "2222222222222222222222222222222222222222222222222222222222222222",
+            "input_count": 2,
+            "candidate_index": 3,
+            "input_batch_sha256": "3333333333333333333333333333333333333333333333333333333333333333",
+            "task_sha256": "4444444444444444444444444444444444444444444444444444444444444444",
+            "reason": "admitted"
+          }
+        }
+      },
+      {
+        "stage": "framing",
+        "outcome": "derived",
+        "count": 2,
+        "sample": {
+          "kind": "candidate",
+          "detail": {
+            "candidate_index": 3,
+            "input_node_id": 7,
+            "input_blob_sha256": "2222222222222222222222222222222222222222222222222222222222222222",
+            "input_batch_sha256": "3333333333333333333333333333333333333333333333333333333333333333",
+            "task_sha256": "4444444444444444444444444444444444444444444444444444444444444444",
+            "source_range": {
+              "source_sha256": "1111111111111111111111111111111111111111111111111111111111111111",
+              "packet": 1,
+              "offset": 24,
+              "length": 8
+            },
+            "input_count": 2,
+            "evidence_node_id": 9
+          }
+        }
+      },
+      {
+        "stage": "publication",
+        "outcome": "published",
+        "count": 1,
+        "sample": {
+          "kind": "publication",
+          "detail": {
+            "source_set_sha256": "5555555555555555555555555555555555555555555555555555555555555555",
+            "source_basis": "staged_manifest",
+            "artifact": {
+              "sha256": "6666666666666666666666666666666666666666666666666666666666666666",
+              "byte_length": 12
+            },
+            "artifact_count": 1
+          }
+        }
+      }
+    ]
+  },
+  "cancel_requested": false
+}

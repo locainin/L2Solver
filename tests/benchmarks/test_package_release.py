@@ -3,6 +3,8 @@
 import hashlib
 import json
 import platform
+import runpy
+import shutil
 import subprocess
 import tarfile
 import zlib
@@ -50,7 +52,7 @@ def test_package_records_provenance_and_one_checksum_per_deliverable(tmp_path):
     with tarfile.open(archive, "r:gz") as package:
         assert package.getnames() == [
             "l2solver", "l2solver-active", "l2solver-active-helper", "PROVENANCE.json",
-            "NOTICE-JEMALLOC.txt", "INSTALL-ACTIVE.md",
+            "NOTICE-JEMALLOC.txt",
         ]
         binary_info = package.getmember("l2solver")
         assert binary_info.mode == 0o755
@@ -72,18 +74,6 @@ def test_package_records_provenance_and_one_checksum_per_deliverable(tmp_path):
         packaged_helper = package.extractfile(helper_info)
         assert packaged_helper is not None
         assert packaged_helper.read() == helper.read_bytes()
-        guide = package.extractfile("INSTALL-ACTIVE.md")
-        assert guide is not None
-        instructions = guide.read().decode("utf-8")
-        assert "cap_net_raw=ep" in instructions
-        assert "upgrade" in instructions.lower()
-        assert "authorized operators" in instructions
-        assert "sha256sum --check" in instructions
-        assert "tar -xzf" in instructions
-        assert "./l2solver --version" in instructions
-        assert "\n./scripts/install.sh" not in instructions
-        assert "\nsudo /usr/local/bin/l2solver-uninstall" not in instructions
-
         provenance_file = package.extractfile("PROVENANCE.json")
         assert provenance_file is not None
         provenance = json.load(provenance_file)
@@ -144,6 +134,28 @@ def test_package_records_provenance_and_one_checksum_per_deliverable(tmp_path):
             "required_capability": "cap_net_raw",
         },
     }
+
+
+def test_package_succeeds_from_a_checkout_without_documentation(tmp_path):
+    source = tmp_path / "source"
+    (source / "benchmarks").mkdir(parents=True)
+    # Load the actual packager from a tree containing only its required notice
+    shutil.copyfile(packager.__file__, source / "benchmarks/package_release.py")
+    shutil.copyfile(packager.NOTICE_PATH, source / "NOTICE-JEMALLOC.txt")
+    isolated_packager = runpy.run_path(str(source / "benchmarks/package_release.py"))
+    binary, lockfile = create_inputs(tmp_path)
+
+    archive, _ = isolated_packager["package_release"](
+        binary, lockfile, tmp_path / "dist", source_commit="a" * 40,
+        source_tree="b" * 40, rustc_version="rustc sample", cargo_version="cargo sample",
+    )
+
+    assert not (source / "docs").exists()
+    with tarfile.open(archive, "r:gz") as package:
+        assert set(package.getnames()) == {
+            "l2solver", "l2solver-active", "l2solver-active-helper",
+            "PROVENANCE.json", "NOTICE-JEMALLOC.txt",
+        }
 
 
 def test_package_archive_is_byte_for_byte_repeatable(tmp_path):

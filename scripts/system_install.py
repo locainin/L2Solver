@@ -15,7 +15,12 @@ import sys
 import tempfile
 
 BINARIES = ("l2solver", "l2solver-active", "l2solver-active-helper")
-FILES = (*BINARIES, "l2solver-uninstall", "bash", "zsh", "fish", "README.md", "install.md", "NOTICE-JEMALLOC.txt", "receipt.json")
+FILES = (*BINARIES, "l2solver-uninstall", "bash", "zsh", "fish", "NOTICE-JEMALLOC.txt", "receipt.json")
+# Keep the original schema-1 file set fixed across later payload changes
+LEGACY_FILES = frozenset((
+    "l2solver", "l2solver-active", "l2solver-active-helper", "l2solver-uninstall",
+    "bash", "zsh", "fish", "README.md", "install.md", "NOTICE-JEMALLOC.txt", "receipt.json",
+))
 COMPLETION_NAMES = {"bash": "l2solver", "zsh": "_l2solver", "fish": "l2solver.fish"}
 COMPLETION_CANDIDATES = {
     "bash": ("share/bash-completion/completions", "etc/bash_completion.d"),
@@ -106,11 +111,14 @@ def read_manifest(prefix):
         raise ValueError("unrecognized installation manifest")
     validate_links(prefix, data["links"])
     for generation, hashes in data["generations"].items():
-        if not re.fullmatch(r"[0-9a-f]{64}", generation) or set(hashes) != set(FILES):
+        # Earlier schema-1 generations included two extra files
+        if (not re.fullmatch(r"[0-9a-f]{64}", generation)
+                or not isinstance(hashes, dict)
+                or frozenset(hashes) not in (frozenset(FILES), LEGACY_FILES)):
             raise ValueError("unsafe manifest generation")
         directory = base / generation
         safe_parents(directory)
-        if set(item.name for item in directory.iterdir()) != set(FILES):
+        if set(item.name for item in directory.iterdir()) != set(hashes):
             raise ValueError(f"modified installation directory: {directory}")
         for name, expected in hashes.items():
             entry = directory / name
@@ -369,12 +377,12 @@ def uninstall(prefix):
     # Revoke authority even if another process holds an open helper file
     for generation in data["generations"]:
         disable_capability(base / generation / "l2solver-active-helper")
-    # Validate everything before removing any command or documentation
+    # Validate all generations and links before removing anything
     for relative in data["links"]:
         (prefix / relative).unlink()
     (base / "current").unlink()
-    for generation in data["generations"]:
-        for name in FILES:
+    for generation, hashes in data["generations"].items():
+        for name in hashes:
             (base / generation / name).unlink()
         (base / generation).rmdir()
     (base / "manifest.json").unlink()

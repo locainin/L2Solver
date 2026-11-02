@@ -10,7 +10,6 @@ from benchmarks.package_release import (
     ARCHIVE_NAME,
     ACTIVE_NAME,
     HELPER_NAME,
-    INSTALL_NAME,
     NOTICE_PATH,
     PROVENANCE_NAME,
     TARGET,
@@ -66,7 +65,7 @@ def unpack_package(
     helper = destination / HELPER_NAME
     executables = {"l2solver": binary, ACTIVE_NAME: active, HELPER_NAME: helper}
     with tarfile.open(archive, "r:gz") as package:
-        expected = {*executables, PROVENANCE_NAME, NOTICE_PATH.name, INSTALL_NAME}
+        expected = {*executables, PROVENANCE_NAME, NOTICE_PATH.name}
         entries = []
         # Stop as soon as the archive has more entries than the package format
         for item in package:

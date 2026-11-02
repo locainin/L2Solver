@@ -130,6 +130,37 @@ def test_unpack_rejects_archive_with_unexpected_member(candidate, tmp_path):
     assert not (tmp_path / "outside").exists()
 
 
+@pytest.mark.parametrize("change", ["missing", "duplicate", "symlink", "legacy-guide"])
+def test_unpack_requires_exact_regular_archive_members(candidate, tmp_path, change):
+    archive, checksum, _, _ = candidate
+    with tarfile.open(archive, "r:gz") as package:
+        members = [(item, package.extractfile(item).read()) for item in package]
+
+    # Re-sign each changed archive so member checks cannot rely on its checksum
+    with tarfile.open(archive, "w:gz") as package:
+        for info, data in members:
+            if info.name == "NOTICE-JEMALLOC.txt":
+                if change == "missing":
+                    continue
+                if change == "duplicate":
+                    info.name = "l2solver"
+                if change == "symlink":
+                    info.type = tarfile.SYMTYPE
+                    info.linkname = "l2solver"
+                    info.size = 0
+                    data = b""
+            package.addfile(info, io.BytesIO(data))
+        if change == "legacy-guide":
+            guide = tarfile.TarInfo("INSTALL-ACTIVE.md")
+            guide.size = 1
+            package.addfile(guide, io.BytesIO(b"x"))
+
+    digest = hashlib.sha256(archive.read_bytes()).hexdigest()
+    checksum.write_text(f"{digest}  {archive.name}\n")
+    with pytest.raises(ValueError, match="members"):
+        unpack(candidate, tmp_path)
+
+
 @pytest.mark.parametrize("name", ["l2solver", "l2solver-active", "l2solver-active-helper"])
 def test_unpack_rejects_an_executable_that_differs_from_provenance(candidate, tmp_path, name):
     archive, checksum, _, _ = candidate

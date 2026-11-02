@@ -7,4 +7,3 @@ need_stdout = false
 [jobs.test]
 command = ["cargo", "test", "--workspace", "--all-features"]
 need_stdout = true
-

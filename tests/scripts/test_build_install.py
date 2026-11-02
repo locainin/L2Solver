@@ -42,6 +42,8 @@ elif name == "cargo" and "--version" not in args:
 elif name == "sudo" and "--payload" in args:
     payload = Path(args[args.index("--payload") + 1])
     shutil.copyfile(payload / "receipt.json", base / "receipt.json")
+    (base / "payload-files.json").write_text(json.dumps(sorted(path.name for path in payload.iterdir())))
+    shutil.copyfile(payload / "NOTICE-JEMALLOC.txt", base / "NOTICE-JEMALLOC.txt")
 elif name in ("cargo", "rustc"):
     print(f"{name} fixture")
 elif name == "git" and "rev-parse" in args:
@@ -77,6 +79,19 @@ def invoke_installer(fake_tools, *options, no_pcap=False, extra_env=None):
 def calls(base):
     path = base / "calls.jsonl"
     return [json.loads(line) for line in path.read_text().splitlines()] if path.exists() else []
+
+
+def test_installer_builds_payload_without_documentation_and_keeps_notice(fake_tools):
+    if os.geteuid() == 0:
+        pytest.skip("source installer must be invoked as an unprivileged user")
+    base, _ = fake_tools
+    result = invoke_installer(fake_tools)
+    assert result.returncode == 0, result.stderr
+    assert json.loads((base / "payload-files.json").read_text()) == sorted([
+        "l2solver", "l2solver-active", "l2solver-active-helper",
+        "bash", "zsh", "fish", "NOTICE-JEMALLOC.txt", "receipt.json",
+    ])
+    assert (base / "NOTICE-JEMALLOC.txt").read_bytes() == (ROOT / "NOTICE-JEMALLOC.txt").read_bytes()
 
 
 @pytest.mark.parametrize("live", [False, True])

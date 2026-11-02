@@ -147,7 +147,7 @@ def main():
             (payload / name).write_text("#!/bin/sh\nprintf 'first fixture\\n'\n")
         # An actual ELF inode allows the kernel to enforce file capability settings
         shutil.copyfile("/usr/bin/true", payload / "l2solver-active-helper")
-    for name in ("bash", "zsh", "fish", "README.md", "install.md", "NOTICE-JEMALLOC.txt", "receipt.json"):
+    for name in ("bash", "zsh", "fish", "NOTICE-JEMALLOC.txt", "receipt.json"):
         (payload / name).write_text("{}" if name == "receipt.json" else name)
     prefix = "/local"
     selection = [
@@ -246,7 +246,7 @@ print(json.dumps({"helper": str(helper)}))
 
     publish("--payload", "/stage/payload", "--prefix", "/revoke-upgrade", "--enable-active")
     old_upgrade_helper = resolved("/revoke-upgrade/bin/l2solver-active-helper")
-    (payload / "README.md").write_text("changed upgrade receipt")
+    (payload / "receipt.json").write_text('{"release":"changed"}')
     failed_upgrade = json.loads(execute(
         "/usr/bin/python3", "-I", "/stage/fail_capability_cleanup.py", "/revoke-upgrade",
     ).stdout)
@@ -274,7 +274,7 @@ print(json.dumps({"helper": str(helper)}))
     finally:
         os.close(helper_fd)
     assert not (root / "revoke-upgrade/share/l2solver").exists()
-    (payload / "README.md").write_text("README.md")
+    (payload / "receipt.json").write_text("{}")
 
     (payload / "l2solver").write_text("#!/bin/sh\nprintf 'upgraded fixture\\n'\n")
     publish("--payload", "/stage/payload", "--prefix", prefix, *selection, "--enable-active")
@@ -284,13 +284,13 @@ print(json.dumps({"helper": str(helper)}))
     assert not cap(resolved("/local/bin/l2solver"))
     assert not cap(resolved("/local/bin/l2solver-active"))
     # A failed staged upgrade retains the prior executable and its authority
-    (payload / "README.md").unlink()
+    (payload / "receipt.json").unlink()
     publish("--payload", "/stage/payload", "--prefix", prefix, *selection, success=False)
     assert resolved("/local/bin/l2solver-active-helper") == helper
     assert cap(helper) == f"{helper} cap_net_raw=ep"
     assert execute("/local/bin/l2solver").stdout == "upgraded fixture\n"
     assert not list((root / "local/share").glob(".l2solver-*"))
-    (payload / "README.md").write_text("README.md")
+    (payload / "receipt.json").write_text("{}")
     # A failed pointer switch must restore the old helper's real capability
     switch_failure = root / "stage/fail_switch.py"
     switch_failure.write_text('''\
