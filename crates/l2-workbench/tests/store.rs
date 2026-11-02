@@ -40,6 +40,9 @@ mod memory;
 #[path = "store/scopes.rs"]
 mod scopes;
 
+#[path = "store/selection_budget.rs"]
+mod selection_budget;
+
 #[path = "store/support.rs"]
 mod support;
 
