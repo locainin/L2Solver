@@ -1,14 +1,15 @@
 use super::{
     classify::PacketMatch,
     model::{
-        CaptureTcpReport, FlowSelection, FrameSource, LIMITATIONS, MAX_UNRESOLVED_SOURCES,
-        UnresolvedSource,
+        COOKED_LIMITATION, CaptureTcpReport, FlowSelection, FrameSource, LIMITATIONS,
+        MAX_UNRESOLVED_SOURCES, UnresolvedSource,
     },
 };
 use crate::arguments::CaptureTcpOptions;
 use l2_audit::ForensicScope;
 use l2_capture::{CapturedFrame, LinkType};
-use l2_discovery::{TransportHeader, ip_packet};
+use l2_core::FrameField;
+use l2_discovery::{TransportHeader, ip_packet_from_payload, link::decode_network_frame};
 use l2_workbench::tcp_range::TcpRange;
 use std::error::Error;
 
@@ -26,12 +27,16 @@ impl Selection {
         packet: &CapturedFrame,
         options: &CaptureTcpOptions,
     ) -> Result<Self, Box<dyn Error>> {
-        if packet.metadata().link_type() != LinkType::Ethernet || packet.is_truncated() {
-            return Err("selected packet must be a complete Ethernet TCP packet".into());
+        if packet.is_truncated() {
+            return Err("selected packet must be a complete TCP packet".into());
         }
-        let frame = l2_core::decode(packet.bytes())?;
-        let ip =
-            ip_packet(&frame).ok_or("selected packet has no supported complete IP envelope")?;
+        let frame = decode_network_frame(packet.metadata().link_type(), packet.bytes())
+            .ok_or("selected packet has an unsupported or malformed link header")?;
+        let Some(FrameField::EtherType(protocol @ (0x0800 | 0x86dd))) = frame.field() else {
+            return Err("selected packet has no supported complete IP envelope".into());
+        };
+        let ip = ip_packet_from_payload(protocol, frame.payload())
+            .ok_or("selected packet has no supported complete IP envelope")?;
         let transport = ip
             .transport
             .ok_or("selected packet has no complete unfragmented TCP envelope")?;
@@ -49,7 +54,8 @@ impl Selection {
             .unwrap_or_else(|| sequence.wrapping_add(u32::from(flags & 0x02 != 0)));
         Ok(Self {
             flow: FlowSelection {
-                scope: ForensicScope::new(packet.metadata(), &frame),
+                link_type: packet.metadata().link_type(),
+                scope: ForensicScope::from_network_frame(packet.metadata(), &frame),
                 source: ip.source,
                 destination: ip.destination,
                 ports: transport.ports,
@@ -98,6 +104,14 @@ impl Selection {
         capture_packets: u32,
     ) -> CaptureTcpReport {
         let range = self.range.finish();
+        let mut limitations = LIMITATIONS.to_vec();
+        if matches!(
+            self.flow.link_type,
+            LinkType::LinuxSll | LinkType::LinuxSll2
+        ) {
+            // Cooked headers do not prove physical interface or VLAN membership
+            limitations.push(COOKED_LIMITATION);
+        }
         CaptureTcpReport {
             schema_version: 1,
             tool_version: env!("CARGO_PKG_VERSION"),
@@ -111,7 +125,7 @@ impl Selection {
             flow: self.flow,
             sources: self.sources,
             range,
-            limitations: LIMITATIONS,
+            limitations,
         }
     }
 }

@@ -5,6 +5,7 @@ mod ip;
 
 use crate::report;
 use l2_capture::{CaptureMetadata, CaptureTimestamp, CapturedFrame};
+use l2_discovery::link::{CookedFrame, CookedPacketType, CookedVersion};
 use l2_io::LinkIo;
 use serde::Serialize;
 use std::{error::Error, io::Write};
@@ -47,9 +48,36 @@ struct Record<'input> {
     vlan_aux: Option<(u16, u16)>,
     status: report::Status,
     diagnostic: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    cooked: Option<CookedRecord<'input>>,
     ip: Option<ip::IpRecord>,
     // A failed protocol assessment still exports the original captured bytes
     raw_bytes: &'input [u8],
+}
+
+#[derive(Serialize)]
+struct CookedRecord<'input> {
+    version: CookedVersion,
+    packet_type: CookedPacketType,
+    hardware_type: u16,
+    protocol: u16,
+    address_length: u16,
+    address: &'input [u8],
+    interface_index: Option<u32>,
+}
+
+impl<'input> CookedRecord<'input> {
+    const fn new(frame: &CookedFrame<'input>, protocol: u16) -> Self {
+        Self {
+            version: frame.version(),
+            packet_type: frame.packet_type(),
+            hardware_type: frame.hardware_type(),
+            protocol,
+            address_length: frame.address_length(),
+            address: frame.address(),
+            interface_index: frame.interface_index(),
+        }
+    }
 }
 
 fn record(sequence: u64, packet: &CapturedFrame) -> Record<'_> {
@@ -66,13 +94,18 @@ fn record(sequence: u64, packet: &CapturedFrame) -> Record<'_> {
     let ip = if packet.is_truncated() {
         None
     } else {
-        assessment.ethernet.as_ref().and_then(|frame| {
-            assessment.ip.map(|packet_ip| {
-                // VLAN depth and IP extensions change offsets, so use the decoded boundary
-                ip::record(packet_ip, packet.captured_len() - frame.payload.len())
-            })
+        assessment.network.as_ref().and_then(|frame| {
+            // The link decoder provides the exact boundary for each supported layout
+            assessment
+                .ip
+                .map(|packet_ip| ip::record(packet_ip, frame.payload_offset()))
         })
     };
+    let cooked = assessment.network.as_ref().and_then(|frame| {
+        frame
+            .cooked()
+            .map(|cooked| CookedRecord::new(cooked, frame.protocol()))
+    });
     Record {
         sequence,
         section: interface.section,
@@ -88,6 +121,7 @@ fn record(sequence: u64, packet: &CapturedFrame) -> Record<'_> {
         vlan_aux: vlan.map(|tag| (tag.tpid, tag.tci)),
         status: assessment.status,
         diagnostic: assessment.diagnostic,
+        cooked,
         ip,
         raw_bytes: packet.bytes(),
     }

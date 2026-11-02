@@ -1,8 +1,12 @@
 //! The receive loop preserves capture metadata independently from protocol validity
 
 use crate::{render, report};
+use l2_discovery::link::NetworkEnvelope;
 use l2_io::LinkIo;
-use std::{error::Error, io::Write};
+use std::{
+    error::Error,
+    io::{self, Write},
+};
 
 #[derive(Default)]
 pub struct Summary {
@@ -43,15 +47,8 @@ pub fn inspect<L: LinkIo>(
             }
             _ => {}
         }
-        if let Some(ethernet) = assessment.ethernet {
-            render::mac(output, ethernet.source)?;
-            write!(output, " -> ")?;
-            render::mac(output, ethernet.destination)?;
-            writeln!(
-                output,
-                " {:?} tags={:?}",
-                ethernet.field, ethernet.vlan_tags
-            )?;
+        if let Some(network) = assessment.network.as_ref() {
+            write_network(network, output)?;
         }
         if let Some(ip) = assessment.ip {
             writeln!(
@@ -92,4 +89,39 @@ pub fn inspect<L: LinkIo>(
     summary.collection = link.collection_summary();
     crate::source_collection::text(summary.collection, output)?;
     Ok(summary)
+}
+
+fn write_network(network: &NetworkEnvelope<'_>, output: &mut impl Write) -> io::Result<()> {
+    if let Some(ethernet) = network.ethernet() {
+        render::mac(output, ethernet.source)?;
+        write!(output, " -> ")?;
+        render::mac(output, ethernet.destination)?;
+        writeln!(
+            output,
+            " {:?} tags={:?}",
+            ethernet.field, ethernet.vlan_tags
+        )?;
+    }
+    if let Some(cooked) = network.cooked() {
+        write!(
+            output,
+            "Linux cooked version={:?} packet_type={:?} hardware_type={} protocol=0x{:04x} address_length={} address=",
+            cooked.version(),
+            cooked.packet_type(),
+            cooked.hardware_type(),
+            network.protocol(),
+            cooked.address_length()
+        )?;
+        for (index, byte) in cooked.address().iter().enumerate() {
+            if index != 0 {
+                write!(output, ":")?;
+            }
+            write!(output, "{byte:02x}")?;
+        }
+        if let Some(ifindex) = cooked.interface_index() {
+            write!(output, " ifindex={ifindex}")?;
+        }
+        writeln!(output)?;
+    }
+    Ok(())
 }
