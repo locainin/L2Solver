@@ -21,7 +21,7 @@ pub(super) fn run(root: &Path) -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-fn specifications() -> [CommandSpec; 10] {
+fn specifications() -> [CommandSpec; 9] {
     [
         CommandSpec::new("cargo").args(["fmt", "--all", "--", "--check"]),
         // Frozen audits cover both independently resolved lockfiles without network access
@@ -54,14 +54,11 @@ fn specifications() -> [CommandSpec; 10] {
             "--offline",
             "--locked",
         ]),
-        // Nextest runs the normal suite; Cargo remains an independent reference gate
+        // Nextest runs the normal suite once; doctests remain a separate gate
         CommandSpec::new("cargo")
             .args(["nextest", "run"])
             .args(WORKSPACE_OPTIONS.iter().copied())
             .args(["--status-level", "skip", "--final-status-level", "skip"]),
-        CommandSpec::new("cargo")
-            .arg("test")
-            .args(WORKSPACE_OPTIONS.iter().copied()),
         // Nextest does not execute documentation examples
         CommandSpec::new("cargo").args([
             "test",

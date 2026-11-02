@@ -53,10 +53,6 @@ jobs:
           cargo nextest run --workspace --all-targets --all-features --locked
           --status-level skip --final-status-level skip
 
-      - name: Run independent Cargo reference tests
-        run: >-
-          cargo test --workspace --all-targets --all-features --locked
-
       - name: Run documentation tests
         env:
           RUSTDOCFLAGS: -D warnings
