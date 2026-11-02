@@ -70,7 +70,7 @@ fn exercise_strace(input: &[u8], source: &str) {
             if let Some(range) = &event.data_source_range {
                 check_range(range, source, input);
             } else {
-                assert!(event.bytes.is_empty());
+                assert_eq!(event.bytes.len(), 0);
             }
             if event.bytes_complete {
                 assert_eq!(

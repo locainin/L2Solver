@@ -141,7 +141,7 @@ fn exercise_gaps_and_overlapping_origins(input: &[u8]) {
     let mut covered = vec![false; input.len()];
     for transition in &report.transitions {
         if transition.state == StreamTransitionState::SequenceGap {
-            assert!(transition.origins.is_empty());
+            assert_eq!(transition.origins.len(), 0);
             assert!(transition.evidence_sha256.is_none());
             continue;
         }
