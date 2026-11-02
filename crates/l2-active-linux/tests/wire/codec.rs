@@ -148,3 +148,50 @@ fn incomplete_or_trailing_wire_values_are_rejected() -> io::Result<()> {
     );
     Ok(())
 }
+
+#[test]
+fn helper_error_codes_preserve_their_meaning() -> io::Result<()> {
+    for (code, kind) in [
+        (0, io::ErrorKind::Other),
+        (1, io::ErrorKind::InvalidInput),
+        (2, io::ErrorKind::PermissionDenied),
+        (3, io::ErrorKind::NotFound),
+        (4, io::ErrorKind::Unsupported),
+        (5, io::ErrorKind::Interrupted),
+        (6, io::ErrorKind::TimedOut),
+        (7, io::ErrorKind::NotConnected),
+        (8, io::ErrorKind::NetworkUnreachable),
+        (9, io::ErrorKind::HostUnreachable),
+    ] {
+        let decoded = read_error(&mut Reader::new(&[code, b'x']))?;
+        assert_eq!(decoded.kind(), kind, "error code {code}");
+        assert_eq!(decoded.to_string(), "x", "error code {code}");
+    }
+    Ok(())
+}
+
+#[test]
+fn helper_error_rejects_unknown_codes_invalid_text_and_oversized_messages() -> io::Result<()> {
+    for record in [vec![11], vec![2, 0xff], {
+        let mut bytes = vec![2];
+        bytes.extend(vec![b'x'; 513]);
+        bytes
+    }] {
+        assert_eq!(
+            read_error(&mut Reader::new(&record))
+                .err()
+                .map(|error| error.kind()),
+            Some(io::ErrorKind::InvalidData),
+            "record length {}",
+            record.len()
+        );
+    }
+
+    // The largest valid message remains usable at the wire boundary
+    let mut record = vec![2];
+    record.extend(vec![b'x'; 512]);
+    let decoded = read_error(&mut Reader::new(&record))?;
+    assert_eq!(decoded.kind(), io::ErrorKind::PermissionDenied);
+    assert_eq!(decoded.to_string().len(), 512);
+    Ok(())
+}

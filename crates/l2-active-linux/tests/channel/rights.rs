@@ -7,6 +7,9 @@ use std::{
     path::Path,
 };
 
+#[path = "records.rs"]
+mod records;
+
 fn count_open_identity(device: u64, inode: u64) -> io::Result<usize> {
     let mut count = 0;
     for entry in fs::read_dir("/proc/self/fd")? {
@@ -22,7 +25,7 @@ fn count_open_identity(device: u64, inode: u64) -> io::Result<usize> {
 }
 
 #[test]
-fn zero_length_record_closes_received_descriptors_before_reporting_eof() -> io::Result<()> {
+fn records_close_received_descriptors_before_reporting_the_error() -> io::Result<()> {
     let path = std::env::temp_dir().join(format!("l2-rights-test-{}", std::process::id()));
     let file = OpenOptions::new()
         .read(true)
@@ -36,26 +39,33 @@ fn zero_length_record_closes_received_descriptors_before_reporting_eof() -> io::
         pid: std::process::id(),
         uid: nix::unistd::getuid().as_raw(),
     };
-    let (channel, remote) = Channel::pair(peer)?;
-    let rights = [file.as_raw_fd()];
-    let controls = [ControlMessage::ScmRights(&rights)];
-    let payload: [IoSlice<'_>; 0] = [];
-    sendmsg::<()>(
-        remote.as_raw_fd(),
-        &payload,
-        &controls,
-        MsgFlags::empty(),
-        None,
-    )
-    .map_err(io::Error::other)?;
-    assert_eq!(
-        channel.try_receive().err().map(|error| error.kind()),
-        Some(io::ErrorKind::BrokenPipe)
-    );
-    assert_eq!(
-        count_open_identity(metadata.dev(), metadata.ino())?,
-        before,
-        "received descriptor leaked into the frontend process"
-    );
+    for (data, expected) in [
+        (&[][..], io::ErrorKind::BrokenPipe),
+        (&[1][..], io::ErrorKind::InvalidData),
+    ] {
+        let (channel, remote) = Channel::pair(peer)?;
+        let rights = [file.as_raw_fd()];
+        let controls = [ControlMessage::ScmRights(&rights)];
+        let payload = [IoSlice::new(data)];
+        sendmsg::<()>(
+            remote.as_raw_fd(),
+            &payload,
+            &controls,
+            MsgFlags::empty(),
+            None,
+        )
+        .map_err(io::Error::other)?;
+        assert_eq!(
+            channel.try_receive().err().map(|error| error.kind()),
+            Some(expected),
+            "payload length {}",
+            data.len()
+        );
+        assert_eq!(
+            count_open_identity(metadata.dev(), metadata.ino())?,
+            before,
+            "received descriptor leaked into the frontend process"
+        );
+    }
     Ok(())
 }
