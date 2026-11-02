@@ -32,7 +32,7 @@ impl Piece {
     pub(super) fn new(
         scope: ForensicScope,
         packet: u32,
-        ethernet_length: usize,
+        link_header_length: usize,
         fragment: FragmentPacket<'_>,
     ) -> Self {
         Self {
@@ -53,7 +53,7 @@ impl Piece {
             header_length: fragment.payload_offset,
             origin: Origin {
                 packet,
-                frame_offset: ethernet_length + fragment.payload_offset,
+                frame_offset: link_header_length + fragment.payload_offset,
                 offset: fragment.offset,
                 length: fragment.payload.len(),
             },

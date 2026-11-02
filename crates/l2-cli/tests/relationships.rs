@@ -72,6 +72,7 @@ fn renders_capture_facts() -> Result<(), Box<dyn std::error::Error>> {
         interface: 1,
         vlan_ids: vec![(0x8100, 20)],
         vlan_aux: None,
+        cooked_ifindex: None,
     };
     report.forensics.communications.push(IpCommunication {
         scope: scope.clone(),

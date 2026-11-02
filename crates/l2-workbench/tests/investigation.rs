@@ -6,6 +6,8 @@ mod artifacts;
 mod carrier_cohorts;
 #[path = "investigation/support.rs"]
 mod case_support;
+#[path = "investigation/cooked.rs"]
+mod cooked;
 #[path = "investigation/fragments.rs"]
 mod fragments;
 #[path = "investigation/ftp.rs"]
