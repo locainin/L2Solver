@@ -68,6 +68,11 @@ def test_package_records_provenance_and_one_checksum_per_deliverable(tmp_path):
         assert "cap_net_raw=ep" in instructions
         assert "upgrade" in instructions.lower()
         assert "authorized operators" in instructions
+        assert "sha256sum --check" in instructions
+        assert "tar -xzf" in instructions
+        assert "./l2solver --version" in instructions
+        assert "\n./scripts/install.sh" not in instructions
+        assert "\nsudo /usr/local/bin/l2solver-uninstall" not in instructions
 
         provenance_file = package.extractfile("PROVENANCE.json")
         assert provenance_file is not None
@@ -81,6 +86,15 @@ def test_package_records_provenance_and_one_checksum_per_deliverable(tmp_path):
         assert notices.read() == (
             Path(__file__).resolve().parents[2] / "NOTICE-JEMALLOC.txt"
         ).read_bytes()
+
+    # Compare with the actual release workflow so its recipe cannot silently drift
+    workflow = (
+        Path(__file__).resolve().parents[2] / ".github/workflows/release-linux.yml"
+    ).read_text()
+    build_step = workflow.split("      - name: Build Linux release candidate\n", 1)[
+        1
+    ].split("\n\n", 1)[0]
+    build_recipe = " ".join(line.strip() for line in build_step.splitlines()[1:])
 
     assert provenance == {
         "schema_version": 2,
@@ -99,7 +113,7 @@ def test_package_records_provenance_and_one_checksum_per_deliverable(tmp_path):
             "sha256": hashlib.sha256(lockfile.read_bytes()).hexdigest(),
         },
         "build": {
-            "command": "cargo build --locked --release --package l2-cli --package l2-active-linux --bin l2solver --bin l2solver-active-helper --target x86_64-unknown-linux-gnu"
+            "command": build_recipe
         },
         "binary": {
             "name": "l2solver",

@@ -21,17 +21,14 @@ export L2_TEST_ACTIVE_HELPER="$qualified/l2solver-active-helper"
 
 run_selected() {
     local target="$1"
+    local case_name
     shift
-    local available
-    available=$(cargo test --locked --package l2-active-cli --test "$target" -- --ignored --list)
     for case_name in "$@"; do
-        # Rust accepts a filter that matches no tests, so check registration first
-        if ! grep --fixed-strings --line-regexp --quiet -- "$case_name: test" <<< "$available"; then
-            printf 'required packet test is not registered: %s\n' "$case_name" >&2
-            return 1
-        fi
+        # Run each exact parent separately so an absent test fails the gate
+        CARGO_BUILD_JOBS=1 cargo nextest run --locked --package l2-active-cli \
+            --test "$target" --no-tests fail --test-threads 1 \
+            -E "test(=$case_name)"
     done
-    cargo test --locked --package l2-active-cli --test "$target" -- --ignored --exact "$@"
 }
 
 # Each fixture proves namespace ownership before creating or changing interfaces

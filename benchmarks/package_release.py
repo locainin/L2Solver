@@ -20,7 +20,7 @@ TARGET = "x86_64-unknown-linux-gnu"
 ARCHIVE_NAME = f"l2solver-{TARGET}.tar.gz"
 PROVENANCE_NAME = "PROVENANCE.json"
 NOTICE_PATH = Path(__file__).resolve().parents[1] / "NOTICE-JEMALLOC.txt"
-INSTALL_PATH = Path(__file__).resolve().parents[1] / "docs/active/install.md"
+INSTALL_PATH = Path(__file__).resolve().parents[1] / "docs/active/portable-release.md"
 HELPER_NAME = "l2solver-active-helper"
 INSTALL_NAME = "INSTALL-ACTIVE.md"
 
@@ -80,7 +80,8 @@ def _provenance(binary, binary_information, helper, helper_information, lockfile
         "build": {
             "command": (
                 "cargo build --locked --release --package l2-cli "
-                "--package l2-active-linux --bin l2solver "
+                "--package l2-active-cli --package l2-active-linux "
+                "--bin l2solver --bin l2solver-active "
                 f"--bin {HELPER_NAME} --target {TARGET}"
             )
         },
@@ -126,7 +127,7 @@ def _write_archive(binary, helper, provenance, archive):
     )
     # Distribute the native allocator and Rust binding notices with the linked executable
     notices = _bounded_document(NOTICE_PATH, "allocator notices")
-    instructions = _bounded_document(INSTALL_PATH, "active helper installation guide")
+    instructions = _bounded_document(INSTALL_PATH, "portable archive guide")
 
     # Fixed gzip and tar metadata make the package bytes independent of the clock
     with (
