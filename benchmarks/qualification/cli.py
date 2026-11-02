@@ -14,6 +14,29 @@ MAX_LOG_BYTES = 1024 * 1024
 TIMEOUT_SECONDS = 120
 
 
+def check_packaged_startup(binary, active, helper, directory):
+    """Start both CLIs and confirm the helper refuses an unconnected invocation."""
+    directory = Path(directory)
+    directory.mkdir(parents=True, exist_ok=False)
+    observed = {}
+    for executable, arguments, expected in (
+        (binary, ["--version"], 0),
+        (active, ["--version"], 0),
+        (helper, [], 1),
+    ):
+        name = Path(executable).name
+        logs = directory / name
+        logs.mkdir()
+        code, status, message, metrics = run_child(
+            [str(executable), *arguments], logs, TIMEOUT_SECONDS, max_log_bytes=MAX_LOG_BYTES
+        )
+        # With no inherited socket, a launched helper must reject the request
+        if status is not None or not metrics["log_capture_complete"] or code != expected:
+            raise ValueError(f"{name} startup failed: exit {code}, {status}: {message}")
+        observed[name] = {"exit_code": code}
+    return {"status": "passed", "executables": observed}
+
+
 def check_export(output, manifest, exit_code, *, required, tshark):
     expected_exit = 3 if required and tshark == "partial" else 0
     if exit_code != expected_exit:

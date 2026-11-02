@@ -93,5 +93,6 @@ def test_namespace_suite_has_runtime_tools_and_user_manager_before_execution():
     setup = workflow.index("      - name: Prepare isolated-test user services")
     assert tools < setup < suite
     requirements = workflow[tools:setup]
-    for package in ("iproute2", "python3-scapy", "tcpdump", "iputils-ping", "ethtool", "libcap2-bin", "libpcap-dev", "libsqlite3-dev", "dbus-user-session"):
+    for package in ("iproute2", "python3-scapy", "tcpdump", "iputils-ping", "ethtool", "libcap2-bin", "libpcap-dev", "dbus-user-session"):
         assert package in requirements, f"missing namespace/runtime dependency: {package}"
+    assert "libsqlite3-dev" not in requirements

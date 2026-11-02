@@ -9,7 +9,7 @@ import pytest
 
 from benchmarks.package_release import package_release
 from benchmarks.qualification import package as package_checks
-from benchmarks.qualification.elf import parse_elf_inspection
+from benchmarks.qualification.elf import inspect_elf, parse_elf_inspection
 from benchmarks.qualification.package import unpack_package
 
 COMMIT = "a" * 40
@@ -22,6 +22,9 @@ def candidate(tmp_path):
     binary = tmp_path / "l2solver"
     binary.write_bytes(b"sample executable")
     binary.chmod(0o755)
+    active = tmp_path / "l2solver-active"
+    active.write_bytes(b"sample active executable")
+    active.chmod(0o755)
     helper = tmp_path / "l2solver-active-helper"
     helper.write_bytes(b"matching active helper")
     helper.chmod(0o750)
@@ -32,6 +35,7 @@ def candidate(tmp_path):
         lock,
         tmp_path / "dist",
         source_commit=COMMIT,
+        source_tree="d" * 40,
         rustc_version=RUSTC,
         cargo_version=CARGO,
     )
@@ -42,6 +46,7 @@ def unpack(candidate, tmp_path, **overrides):
     archive, checksum, _, lock = candidate
     expected = {
         "source_commit": COMMIT,
+        "source_tree": "d" * 40,
         "lock_sha256": hashlib.sha256(lock.read_bytes()).hexdigest(),
         "rustc_version": RUSTC,
         "cargo_version": CARGO,
@@ -54,6 +59,7 @@ def test_unpack_checks_the_archive_and_the_actual_executable(candidate, tmp_path
     archive, _, binary, _ = candidate
     result = unpack(candidate, tmp_path)
     assert result["binary"].read_bytes() == binary.read_bytes()
+    assert result["active_binary"].read_bytes() == binary.with_name("l2solver-active").read_bytes()
     assert result["binary"].stat().st_mode & 0o111
     helper = binary.with_name("l2solver-active-helper")
     assert result["active_helper"].read_bytes() == helper.read_bytes()
@@ -69,6 +75,7 @@ def test_unpack_checks_the_archive_and_the_actual_executable(candidate, tmp_path
     ("field", "wrong"),
     [
         ("source_commit", "b" * 40),
+        ("source_tree", "e" * 40),
         ("lock_sha256", "c" * 64),
         ("rustc_version", "rustc another"),
         ("cargo_version", "cargo another"),
@@ -123,7 +130,7 @@ def test_unpack_rejects_archive_with_unexpected_member(candidate, tmp_path):
     assert not (tmp_path / "outside").exists()
 
 
-@pytest.mark.parametrize("name", ["l2solver", "l2solver-active-helper"])
+@pytest.mark.parametrize("name", ["l2solver", "l2solver-active", "l2solver-active-helper"])
 def test_unpack_rejects_an_executable_that_differs_from_provenance(candidate, tmp_path, name):
     archive, checksum, _, _ = candidate
     with tarfile.open(archive, "r:gz") as package:
@@ -140,7 +147,11 @@ def test_unpack_rejects_an_executable_that_differs_from_provenance(candidate, tm
         unpack(candidate, tmp_path)
 
 
-def test_unpack_rejects_boolean_schema_version(candidate, tmp_path):
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [("schema_version", True), ("command_kind", None), ("command_kind", "observed")],
+)
+def test_unpack_rejects_invalid_schema_or_build_command_kind(candidate, tmp_path, field, value):
     archive, checksum, _, _ = candidate
     with tarfile.open(archive, "r:gz") as package:
         members = [(item, package.extractfile(item).read()) for item in package]
@@ -148,7 +159,12 @@ def test_unpack_rejects_boolean_schema_version(candidate, tmp_path):
         for info, data in members:
             if info.name == "PROVENANCE.json":
                 metadata = json.loads(data)
-                metadata["schema_version"] = True
+                if field == "schema_version":
+                    metadata[field] = value
+                elif value is None:
+                    del metadata["build"][field]
+                else:
+                    metadata["build"][field] = value
                 data = json.dumps(metadata).encode()
                 info.size = len(data)
             package.addfile(info, io.BytesIO(data))
@@ -199,3 +215,31 @@ def test_elf_inspection_rejects_wrong_machine_and_unparseable_headers():
         parse_elf_inspection(HEADER.replace("X86-64", "AArch64"), "", "", "")
     with pytest.raises(ValueError, match="ELF64 x86-64"):
         parse_elf_inspection("not an ELF header", "", "", "")
+
+
+def test_elf_inspection_rejects_missing_library_with_successful_ldd(tmp_path, monkeypatch):
+    import subprocess
+    outputs = {"-hW": HEADER, "-lW": PROGRAM, "-dW": DYNAMIC, "-VW": VERSIONS}
+
+    def run(command, **kwargs):
+        if command[0] == "ldd":
+            assert kwargs["env"]["LC_ALL"] == "C"
+        output = "libsqlite3.so.0 => not found\n" if command[0] == "ldd" else outputs[command[1]]
+        return subprocess.CompletedProcess(command, 0, stdout=output, stderr="")
+
+    monkeypatch.setattr("benchmarks.qualification.elf.subprocess.run", run)
+    with pytest.raises(ValueError, match="libsqlite3.so.0 => not found"):
+        inspect_elf(tmp_path / "binary", tmp_path)
+
+
+def test_elf_inspection_rejects_linked_system_sqlite_even_if_available(tmp_path, monkeypatch):
+    import subprocess
+    outputs = {"-hW": HEADER, "-lW": PROGRAM, "-dW": DYNAMIC, "-VW": VERSIONS}
+
+    def run(command, **kwargs):
+        output = "libsqlite3.so.0 => /usr/lib/libsqlite3.so.0 (0x0001)\n" if command[0] == "ldd" else outputs[command[1]]
+        return subprocess.CompletedProcess(command, 0, stdout=output, stderr="")
+
+    monkeypatch.setattr("benchmarks.qualification.elf.subprocess.run", run)
+    with pytest.raises(ValueError, match="libsqlite3.so.0"):
+        inspect_elf(tmp_path / "binary", tmp_path)

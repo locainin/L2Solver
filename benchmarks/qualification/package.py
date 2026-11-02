@@ -1,4 +1,4 @@
-"""Validate and unpack the matching candidate executable pair for qualification."""
+"""Validate and unpack the matching candidate executables for qualification."""
 
 import json
 import shutil
@@ -8,6 +8,7 @@ from pathlib import Path
 
 from benchmarks.package_release import (
     ARCHIVE_NAME,
+    ACTIVE_NAME,
     HELPER_NAME,
     INSTALL_NAME,
     NOTICE_PATH,
@@ -42,6 +43,7 @@ def unpack_package(
     destination,
     *,
     source_commit,
+    source_tree,
     lock_sha256,
     rustc_version,
     cargo_version,
@@ -51,7 +53,7 @@ def unpack_package(
     if archive.name != ARCHIVE_NAME:
         raise ValueError("unexpected package name")
     archive_size = archive.stat().st_size
-    if not 0 < archive_size <= 2 * MAX_BINARY_BYTES + 4 * 1024 * 1024:
+    if not 0 < archive_size <= 3 * MAX_BINARY_BYTES + 4 * 1024 * 1024:
         raise ValueError("package archive exceeds its size limit")
     # A growing file cannot extend the approved hash read
     digest = hash_file(archive, expected_bytes=archive_size)
@@ -60,8 +62,9 @@ def unpack_package(
     destination = Path(destination)
     destination.mkdir(parents=True, exist_ok=False)
     binary = destination / "l2solver"
+    active = destination / ACTIVE_NAME
     helper = destination / HELPER_NAME
-    executables = {"l2solver": binary, HELPER_NAME: helper}
+    executables = {"l2solver": binary, ACTIVE_NAME: active, HELPER_NAME: helper}
     with tarfile.open(archive, "r:gz") as package:
         expected = {*executables, PROVENANCE_NAME, NOTICE_PATH.name, INSTALL_NAME}
         entries = []
@@ -105,12 +108,16 @@ def unpack_package(
         isinstance(provenance, dict)
         and isinstance(provenance.get("dependency_lock"), dict)
         and isinstance(provenance.get("toolchain"), dict)
+        and isinstance(provenance.get("build"), dict)
         and isinstance(provenance.get("binary"), dict)
+        and isinstance(provenance.get("active_binary"), dict)
         and isinstance(provenance.get("active_helper"), dict)
         and type(provenance.get("schema_version")) is int
-        and provenance.get("schema_version") == 2
+        and provenance.get("schema_version") == 3
         and provenance.get("target") == TARGET
         and provenance.get("source_commit") == source_commit
+        and provenance.get("source_tree") == source_tree
+        and provenance.get("build", {}).get("command_kind") == "rebuild_recipe"
         and provenance.get("dependency_lock", {}).get("sha256") == lock_sha256
         and provenance.get("toolchain", {}).get("rustc") == rustc_version
         and provenance.get("toolchain", {}).get("cargo") == cargo_version
@@ -119,7 +126,11 @@ def unpack_package(
         raise ValueError(
             "package provenance differs from the current source or toolchain"
         )
-    for name, key in (("l2solver", "binary"), (HELPER_NAME, "active_helper")):
+    for name, key in (
+        ("l2solver", "binary"),
+        (ACTIVE_NAME, "active_binary"),
+        (HELPER_NAME, "active_helper"),
+    ):
         executable = executables[name]
         metadata = provenance[key]
         if (
@@ -137,6 +148,7 @@ def unpack_package(
     check_checksum(checksum, archive.name, digest)
     return {
         "binary": binary,
+        "active_binary": active,
         "active_helper": helper,
         "archive_sha256": digest,
         "archive_bytes": archive_size,

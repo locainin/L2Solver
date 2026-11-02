@@ -43,7 +43,7 @@ jobs:
           sudo apt-get update
           sudo DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
             binutils dbus-user-session ethtool fish iproute2 iputils-ping libcap2-bin libpcap-dev \
-            libsqlite3-dev python3-pytest python3-pytest-subtests python3-scapy tcpdump tshark zsh
+            python3-pytest python3-pytest-subtests python3-scapy tcpdump tshark zsh
 
       - name: Prepare isolated-test user services
         shell: bash
@@ -136,6 +136,7 @@ jobs:
         run: >-
           /usr/bin/python3 -m benchmarks.package_release
           --binary target/x86_64-unknown-linux-gnu/release/l2solver
+          --active-binary target/x86_64-unknown-linux-gnu/release/l2solver-active
           --helper-binary target/x86_64-unknown-linux-gnu/release/l2solver-active-helper
           --lockfile Cargo.lock
           --output-directory "$RUNNER_TEMP/l2solver-dist"
@@ -160,7 +161,9 @@ jobs:
           path: |
             ${{ runner.temp }}/l2solver-dist/
             ${{ runner.temp }}/l2solver-qualification/qualification.json
-            ${{ runner.temp }}/l2solver-qualification/elf-*.txt
+            ${{ runner.temp }}/l2solver-qualification/elf-*/*.txt
+            ${{ runner.temp }}/l2solver-qualification/startup/*/stdout.log
+            ${{ runner.temp }}/l2solver-qualification/startup/*/stderr.log
             ${{ runner.temp }}/l2solver-qualification/cli/*/stdout.log
             ${{ runner.temp }}/l2solver-qualification/cli/*/stderr.log
             ${{ runner.temp }}/l2solver-qualification/cli/*-output/manifest.json

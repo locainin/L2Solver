@@ -4,9 +4,33 @@ import hashlib
 
 import pytest
 
-from benchmarks.qualification.cli import check_export, check_progress, check_stdout
+from benchmarks.qualification.cli import check_export, check_progress, check_stdout, check_packaged_startup
 from benchmarks.qualification.fixture import BODY, http_capture
 from benchmarks.runner.capture import packet_index
+
+
+def test_packaged_startup_runs_both_clis_and_the_helper(tmp_path):
+    binaries = []
+    for name, code in (("l2solver", 0), ("l2solver-active", 0), ("l2solver-active-helper", 1)):
+        binary = tmp_path / name
+        binary.write_text(f"#!/bin/sh\nprintf '%s\\n' '{name} started'\nexit {code}\n")
+        binary.chmod(0o755)
+        binaries.append(binary)
+    result = check_packaged_startup(*binaries, tmp_path / "logs")
+    assert result["status"] == "passed"
+    assert set(result["executables"]) == {binary.name for binary in binaries}
+
+
+@pytest.mark.parametrize("failed", ["l2solver", "l2solver-active", "l2solver-active-helper"])
+def test_packaged_startup_rejects_loader_failure_for_each_executable(tmp_path, failed):
+    binaries = []
+    for name, code in (("l2solver", 0), ("l2solver-active", 0), ("l2solver-active-helper", 1)):
+        binary = tmp_path / name
+        binary.write_text(f"#!/bin/sh\nexit {127 if name == failed else code}\n")
+        binary.chmod(0o755)
+        binaries.append(binary)
+    with pytest.raises(ValueError, match=failed):
+        check_packaged_startup(*binaries, tmp_path / "logs")
 
 
 def test_http_fixture_contains_two_independently_readable_packets():

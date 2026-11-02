@@ -3,6 +3,7 @@
 import hashlib
 import json
 import platform
+import subprocess
 import tarfile
 import zlib
 from pathlib import Path
@@ -17,6 +18,9 @@ def create_inputs(directory):
     binary = directory / "l2solver"
     binary.write_bytes(b"#!/bin/sh\nexit 0\n")
     binary.chmod(0o755)
+    active = directory / "l2solver-active"
+    active.write_bytes(b"#!/bin/sh\nexit 0\n")
+    active.chmod(0o755)
     helper = directory / "l2solver-active-helper"
     helper.write_bytes(b"#!/bin/sh\nexit 0\n")
     helper.chmod(0o750)
@@ -34,6 +38,7 @@ def test_package_records_provenance_and_one_checksum_per_deliverable(tmp_path):
         lockfile,
         output,
         source_commit="a" * 40,
+        source_tree="b" * 40,
         rustc_version="rustc 1.99.1 (sample)",
         cargo_version="cargo 1.99.1 (sample)",
     )
@@ -44,7 +49,7 @@ def test_package_records_provenance_and_one_checksum_per_deliverable(tmp_path):
 
     with tarfile.open(archive, "r:gz") as package:
         assert package.getnames() == [
-            "l2solver", "l2solver-active-helper", "PROVENANCE.json",
+            "l2solver", "l2solver-active", "l2solver-active-helper", "PROVENANCE.json",
             "NOTICE-JEMALLOC.txt", "INSTALL-ACTIVE.md",
         ]
         binary_info = package.getmember("l2solver")
@@ -53,6 +58,11 @@ def test_package_records_provenance_and_one_checksum_per_deliverable(tmp_path):
         packaged_binary = package.extractfile(binary_info)
         assert packaged_binary is not None
         assert packaged_binary.read() == binary.read_bytes()
+
+        active = binary.with_name("l2solver-active")
+        active_info = package.getmember(active.name)
+        assert active_info.mode == 0o755
+        assert package.extractfile(active_info).read() == active.read_bytes()
 
         helper = binary.with_name("l2solver-active-helper")
         helper_info = package.getmember(helper.name)
@@ -97,8 +107,9 @@ def test_package_records_provenance_and_one_checksum_per_deliverable(tmp_path):
     build_recipe = " ".join(line.strip() for line in build_step.splitlines()[1:])
 
     assert provenance == {
-        "schema_version": 2,
+        "schema_version": 3,
         "source_commit": "a" * 40,
+        "source_tree": "b" * 40,
         "toolchain": {
             "rustc": "rustc 1.99.1 (sample)",
             "cargo": "cargo 1.99.1 (sample)",
@@ -113,12 +124,18 @@ def test_package_records_provenance_and_one_checksum_per_deliverable(tmp_path):
             "sha256": hashlib.sha256(lockfile.read_bytes()).hexdigest(),
         },
         "build": {
-            "command": build_recipe
+            "command": build_recipe,
+            "command_kind": "rebuild_recipe",
         },
         "binary": {
             "name": "l2solver",
             "bytes": binary.stat().st_size,
             "sha256": hashlib.sha256(binary.read_bytes()).hexdigest(),
+        },
+        "active_binary": {
+            "name": "l2solver-active",
+            "bytes": active.stat().st_size,
+            "sha256": hashlib.sha256(active.read_bytes()).hexdigest(),
         },
         "active_helper": {
             "name": "l2solver-active-helper",
@@ -133,6 +150,7 @@ def test_package_archive_is_byte_for_byte_repeatable(tmp_path):
     binary, lockfile = create_inputs(tmp_path)
     metadata = {
         "source_commit": "b" * 40,
+        "source_tree": "c" * 40,
         "rustc_version": "rustc 1.99.1 (sample)",
         "cargo_version": "cargo 1.99.1 (sample)",
     }
@@ -156,6 +174,7 @@ def test_package_refuses_existing_output_and_symlinked_binary(tmp_path):
             lockfile,
             output,
             source_commit="c" * 40,
+            source_tree="b" * 40,
             rustc_version="rustc sample",
             cargo_version="cargo sample",
         )
@@ -169,6 +188,7 @@ def test_package_refuses_existing_output_and_symlinked_binary(tmp_path):
             lockfile,
             tmp_path / "linked-output",
             source_commit="c" * 40,
+            source_tree="b" * 40,
             rustc_version="rustc sample",
             cargo_version="cargo sample",
         )
@@ -181,8 +201,8 @@ def test_package_removes_partial_artifact_when_input_changes_during_write(
     output = tmp_path / "changed-input"
     write_archive = packager._write_archive
 
-    def write_then_change_binary(source, helper, provenance, archive):
-        write_archive(source, helper, provenance, archive)
+    def write_then_change_binary(source, active, helper, provenance, archive):
+        write_archive(source, active, helper, provenance, archive)
         source.write_bytes(b"changed after archiving")
         source.chmod(0o755)
 
@@ -193,6 +213,7 @@ def test_package_removes_partial_artifact_when_input_changes_during_write(
             lockfile,
             output,
             source_commit="d" * 40,
+            source_tree="b" * 40,
             rustc_version="rustc sample",
             cargo_version="cargo sample",
         )
@@ -212,7 +233,7 @@ def test_package_requires_a_regular_executable_active_helper(tmp_path, kind):
     output = tmp_path / "dist"
     expected = FileNotFoundError if kind == "missing" else ValueError
     with pytest.raises(expected):
-        package_release(binary, lockfile, output, source_commit="a" * 40,
+        package_release(binary, lockfile, output, source_commit="a" * 40, source_tree="b" * 40,
                         rustc_version="rustc sample", cargo_version="cargo sample")
     assert not output.exists()
 
@@ -222,17 +243,97 @@ def test_package_refuses_helper_changes_during_write(tmp_path, monkeypatch):
     helper = binary.with_name("l2solver-active-helper")
     write_archive = packager._write_archive
 
-    def write_then_change_helper(source, active_helper, provenance, archive):
-        write_archive(source, active_helper, provenance, archive)
+    def write_then_change_helper(source, active, active_helper, provenance, archive):
+        write_archive(source, active, active_helper, provenance, archive)
         active_helper.write_bytes(b"changed helper")
 
     monkeypatch.setattr(packager, "_write_archive", write_then_change_helper)
     output = tmp_path / "dist"
     with pytest.raises(ValueError, match="inputs changed"):
-        package_release(binary, lockfile, output, source_commit="a" * 40,
+        package_release(binary, lockfile, output, source_commit="a" * 40, source_tree="b" * 40,
                         rustc_version="rustc sample", cargo_version="cargo sample")
     assert helper.read_bytes() == b"changed helper"
     assert not output.exists()
+
+
+@pytest.mark.parametrize("kind", ["missing", "symlink", "not_executable"])
+def test_package_requires_a_regular_executable_active_binary(tmp_path, kind):
+    binary, lockfile = create_inputs(tmp_path)
+    active = binary.with_name("l2solver-active")
+    active.unlink()
+    if kind == "symlink":
+        active.symlink_to(binary)
+    elif kind == "not_executable":
+        active.write_bytes(b"active")
+    with pytest.raises(FileNotFoundError if kind == "missing" else ValueError):
+        package_release(binary, lockfile, tmp_path / "dist", source_commit="a" * 40,
+                        source_tree="b" * 40, rustc_version="rustc sample", cargo_version="cargo sample")
+    assert not (tmp_path / "dist").exists()
+
+
+def test_package_refuses_active_binary_changes_during_write(tmp_path, monkeypatch):
+    binary, lockfile = create_inputs(tmp_path)
+    write_archive = packager._write_archive
+
+    def write_then_change_active(source, active, helper, provenance, archive):
+        write_archive(source, active, helper, provenance, archive)
+        active.write_bytes(b"changed active binary")
+
+    monkeypatch.setattr(packager, "_write_archive", write_then_change_active)
+    with pytest.raises(ValueError, match="inputs changed"):
+        package_release(binary, lockfile, tmp_path / "dist", source_commit="a" * 40,
+                        source_tree="b" * 40, rustc_version="rustc sample", cargo_version="cargo sample")
+    assert not (tmp_path / "dist").exists()
+
+
+def test_cli_refuses_to_publish_if_source_identity_changes_while_archiving(tmp_path, monkeypatch):
+    binary, lockfile = create_inputs(tmp_path)
+    states = iter([
+        {"source_commit": "a" * 40, "source_tree": "b" * 40, "rustc_version": "rustc", "cargo_version": "cargo"},
+        {"source_commit": "a" * 40, "source_tree": "c" * 40, "rustc_version": "rustc", "cargo_version": "cargo"},
+    ])
+    monkeypatch.setattr(packager, "_release_metadata", lambda: next(states))
+    output = tmp_path / "dist"
+    result = packager.main([
+        "--binary", str(binary), "--active-binary", str(binary.with_name("l2solver-active")),
+        "--helper-binary", str(binary.with_name("l2solver-active-helper")),
+        "--lockfile", str(lockfile), "--output-directory", str(output),
+    ])
+    assert result != 0
+    assert not output.exists()
+
+
+def test_release_metadata_records_clean_commit_and_tree_and_rejects_untracked_source(tmp_path, monkeypatch):
+    subprocess.run(["git", "init", "-q", str(tmp_path)], check=True)
+    (tmp_path / "main.rs").write_text("fn main() {}\n")
+    subprocess.run(["git", "add", "main.rs"], cwd=tmp_path, check=True)
+    subprocess.run(["git", "-c", "user.name=Fixture", "-c", "user.email=fixture@example.invalid",
+                    "commit", "-qm", "fixture"], cwd=tmp_path, check=True)
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(packager, "ROOT", tmp_path)
+    metadata = packager._release_metadata()
+    commit = subprocess.check_output(["git", "rev-parse", "HEAD"], text=True).strip()
+    tree = subprocess.check_output(["git", "rev-parse", "HEAD^{tree}"], text=True).strip()
+    assert metadata["source_commit"] == commit
+    assert metadata["source_tree"] == tree
+    (tmp_path / "extra.rs").write_text("fn extra() {}\n")
+    with pytest.raises(ValueError, match="clean working tree"):
+        packager._release_metadata()
+
+
+def test_release_metadata_rejects_a_different_working_directory(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(packager, "ROOT", tmp_path / "expected-checkout")
+    with pytest.raises(ValueError, match="repository root"):
+        packager._release_metadata()
+
+
+@pytest.mark.parametrize("source_tree", ["", "abc", "A" * 40, "a" * 39, "a" * 64])
+def test_package_requires_full_lowercase_source_tree_identity(tmp_path, source_tree):
+    binary, lockfile = create_inputs(tmp_path)
+    with pytest.raises(ValueError, match="source tree"):
+        package_release(binary, lockfile, tmp_path / "dist", source_commit="a" * 40,
+                        source_tree=source_tree, rustc_version="rustc sample", cargo_version="cargo sample")
 
 
 @pytest.mark.parametrize("kind", ["missing", "symlink"])
@@ -251,6 +352,7 @@ def test_package_requires_regular_allocator_notices(tmp_path, monkeypatch, kind)
             lockfile,
             output,
             source_commit="e" * 40,
+            source_tree="b" * 40,
             rustc_version="rustc sample",
             cargo_version="cargo sample",
         )
@@ -274,6 +376,7 @@ def test_package_rejects_empty_or_oversized_allocator_notices(
             lockfile,
             output,
             source_commit="f" * 40,
+            source_tree="b" * 40,
             rustc_version="rustc sample",
             cargo_version="cargo sample",
         )

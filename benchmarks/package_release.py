@@ -17,11 +17,13 @@ import zlib
 from pathlib import Path
 
 TARGET = "x86_64-unknown-linux-gnu"
+ROOT = Path(__file__).resolve().parents[1]
 ARCHIVE_NAME = f"l2solver-{TARGET}.tar.gz"
 PROVENANCE_NAME = "PROVENANCE.json"
-NOTICE_PATH = Path(__file__).resolve().parents[1] / "NOTICE-JEMALLOC.txt"
-INSTALL_PATH = Path(__file__).resolve().parents[1] / "docs/active/portable-release.md"
+NOTICE_PATH = ROOT / "NOTICE-JEMALLOC.txt"
+INSTALL_PATH = ROOT / "docs/active/portable-release.md"
 HELPER_NAME = "l2solver-active-helper"
+ACTIVE_NAME = "l2solver-active"
 INSTALL_NAME = "INSTALL-ACTIVE.md"
 
 
@@ -46,14 +48,19 @@ def _hash_file(path):
     return digest.hexdigest()
 
 
-def _provenance(binary, binary_information, helper, helper_information, lockfile, metadata):
+def _provenance(
+    binary, binary_information, active, active_information, helper, helper_information,
+    lockfile, metadata,
+):
     # Keep the target fixed to the release workflow's only supported artifact
-    source_commit = metadata["source_commit"]
-    if (
-        not isinstance(source_commit, str)
-        or re.fullmatch(r"(?:[0-9a-f]{40}|[0-9a-f]{64})", source_commit) is None
-    ):
-        raise ValueError("source commit must be a full lowercase Git object id")
+    for name in ("source_commit", "source_tree"):
+        value = metadata[name]
+        if not isinstance(value, str) or re.fullmatch(
+            r"(?:[0-9a-f]{40}|[0-9a-f]{64})", value
+        ) is None:
+            raise ValueError(f"{name.replace('_', ' ')} must be a full lowercase Git object id")
+    if len(metadata["source_tree"]) != len(metadata["source_commit"]):
+        raise ValueError("source tree and commit must use the same Git object format")
 
     for name in ("rustc_version", "cargo_version"):
         value = metadata[name]
@@ -62,8 +69,9 @@ def _provenance(binary, binary_information, helper, helper_information, lockfile
 
     # Record only portable identifiers and digests, never local filesystem paths
     return {
-        "schema_version": 2,
-        "source_commit": source_commit,
+        "schema_version": 3,
+        "source_commit": metadata["source_commit"],
+        "source_tree": metadata["source_tree"],
         "toolchain": {
             "rustc": metadata["rustc_version"],
             "cargo": metadata["cargo_version"],
@@ -78,6 +86,7 @@ def _provenance(binary, binary_information, helper, helper_information, lockfile
             "sha256": _hash_file(lockfile),
         },
         "build": {
+            "command_kind": "rebuild_recipe",
             "command": (
                 "cargo build --locked --release --package l2-cli "
                 "--package l2-active-cli --package l2-active-linux "
@@ -89,6 +98,11 @@ def _provenance(binary, binary_information, helper, helper_information, lockfile
             "name": "l2solver",
             "bytes": binary_information.st_size,
             "sha256": _hash_file(binary),
+        },
+        "active_binary": {
+            "name": ACTIVE_NAME,
+            "bytes": active_information.st_size,
+            "sha256": _hash_file(active),
         },
         "active_helper": {
             "name": HELPER_NAME,
@@ -121,7 +135,7 @@ def _bounded_document(path, description):
     return contents
 
 
-def _write_archive(binary, helper, provenance, archive):
+def _write_archive(binary, active, helper, provenance, archive):
     provenance_bytes = (json.dumps(provenance, indent=2, sort_keys=True) + "\n").encode(
         "utf-8"
     )
@@ -140,7 +154,11 @@ def _write_archive(binary, helper, provenance, archive):
         ) as package,
     ):
         # Archive permissions grant no capabilities and restrict helper execution
-        for name, path, mode in (("l2solver", binary, 0o755), (HELPER_NAME, helper, 0o750)):
+        for name, path, mode in (
+            ("l2solver", binary, 0o755),
+            (ACTIVE_NAME, active, 0o755),
+            (HELPER_NAME, helper, 0o750),
+        ):
             with path.open("rb") as source:
                 package.addfile(_tar_entry(name, path.stat().st_size, mode), source)
         package.addfile(
@@ -162,13 +180,20 @@ def package_release(
     lockfile,
     output_directory,
     *,
+    active_binary=None,
     helper_binary=None,
     source_commit,
+    source_tree,
     rustc_version,
     cargo_version,
+    check_source=None,
 ):
     """Package matching Linux executables with provenance and a SHA-256 sidecar."""
     binary, binary_information = _regular_file(binary, "binary", executable=True)
+    active, active_information = _regular_file(
+        binary.with_name(ACTIVE_NAME) if active_binary is None else active_binary,
+        "active binary", executable=True,
+    )
     helper, helper_information = _regular_file(
         binary.with_name(HELPER_NAME) if helper_binary is None else helper_binary,
         "active helper", executable=True,
@@ -183,11 +208,14 @@ def package_release(
     provenance = _provenance(
         binary,
         binary_information,
+        active,
+        active_information,
         helper,
         helper_information,
         lockfile,
         {
             "source_commit": source_commit,
+            "source_tree": source_tree,
             "rustc_version": rustc_version,
             "cargo_version": cargo_version,
         },
@@ -198,11 +226,13 @@ def package_release(
         staging = Path(staging_name)
         archive = staging / ARCHIVE_NAME
         checksum = staging / f"{ARCHIVE_NAME}.sha256"
-        _write_archive(binary, helper, provenance, archive)
+        _write_archive(binary, active, helper, provenance, archive)
 
         if (
             _hash_file(binary) != provenance["binary"]["sha256"]
             or binary.stat().st_size != binary_information.st_size
+            or _hash_file(active) != provenance["active_binary"]["sha256"]
+            or active.stat().st_size != active_information.st_size
             or _hash_file(helper) != provenance["active_helper"]["sha256"]
             or helper.stat().st_size != helper_information.st_size
             or _hash_file(lockfile) != provenance["dependency_lock"]["sha256"]
@@ -211,6 +241,8 @@ def package_release(
             raise ValueError(
                 "release inputs changed while the package was being written"
             )
+        if check_source is not None:
+            check_source()
 
         # The archive is the single downloadable artifact covered by this sidecar
         checksum.write_text(
@@ -248,7 +280,11 @@ def _command_output(arguments):
 
 
 def _release_metadata():
-    # A release package must map to one committed and reproducible source state
+    # Reject untracked files before recording this committed checkout
+    if Path.cwd().resolve() != ROOT or Path(
+        _command_output(["git", "rev-parse", "--show-toplevel"])
+    ).resolve() != ROOT:
+        raise ValueError("run release packaging from the repository root")
     if _command_output(["git", "status", "--porcelain", "--untracked-files=all"]):
         raise ValueError("release packaging requires a clean working tree")
 
@@ -266,6 +302,7 @@ def _release_metadata():
 
     return {
         "source_commit": _command_output(["git", "rev-parse", "HEAD"]),
+        "source_tree": _command_output(["git", "rev-parse", "HEAD^{tree}"]),
         "rustc_version": _command_output(["rustc", "--version"]),
         "cargo_version": _command_output(["cargo", "--version"]),
     }
@@ -274,18 +311,27 @@ def _release_metadata():
 def main(arguments=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--binary", type=Path, required=True)
+    parser.add_argument("--active-binary", type=Path, required=True)
     parser.add_argument("--helper-binary", type=Path, required=True)
     parser.add_argument("--lockfile", type=Path, default=Path("Cargo.lock"))
     parser.add_argument("--output-directory", type=Path, required=True)
     options = parser.parse_args(arguments)
 
     try:
+        metadata = _release_metadata()
+
+        def check_source():
+            if _release_metadata() != metadata:
+                raise ValueError("source or toolchain changed during packaging")
+
         archive, checksum = package_release(
             options.binary,
             options.lockfile,
             options.output_directory,
+            active_binary=options.active_binary,
             helper_binary=options.helper_binary,
-            **_release_metadata(),
+            check_source=check_source,
+            **metadata,
         )
     except (OSError, ValueError, subprocess.CalledProcessError) as error:
         print(f"release package: {error}", file=sys.stderr)

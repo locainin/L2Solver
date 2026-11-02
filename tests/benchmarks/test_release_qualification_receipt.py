@@ -18,6 +18,7 @@ def test_passed_candidate_checks_do_not_claim_unrun_release_scenarios():
                 "runner_identity",
                 "package",
                 "elf",
+                "packaged_startup",
                 "packaged_cli",
             )
         },
@@ -50,6 +51,7 @@ def test_blocked_or_failed_candidate_checks_cannot_pass_the_candidate_gate():
                 "runner_identity",
                 "package",
                 "elf",
+                "packaged_startup",
                 "packaged_cli",
             )
         }
@@ -116,7 +118,7 @@ def test_missing_identity_tool_writes_a_blocked_receipt(tmp_path, monkeypatch):
     assert (tmp_path / "receipt/qualification.json").is_file()
 
 
-@pytest.mark.parametrize("changed_input", ["checksum", "binary", "helper"])
+@pytest.mark.parametrize("changed_input", ["checksum", "binary", "active", "helper", "elf"])
 def test_changed_release_input_during_candidate_checks_fails_the_receipt(
     tmp_path, monkeypatch, changed_input
 ):
@@ -132,11 +134,15 @@ def test_changed_release_input_during_candidate_checks_fails_the_receipt(
     binary = tmp_path / "candidate"
     binary.write_bytes(b"executable")
     binary_digest = hashlib.sha256(binary.read_bytes()).hexdigest()
+    active = tmp_path / "active"
+    active.write_bytes(b"active executable")
+    active_digest = hashlib.sha256(active.read_bytes()).hexdigest()
     helper = tmp_path / "helper"
     helper.write_bytes(b"matching helper")
     helper_digest = hashlib.sha256(helper.read_bytes()).hexdigest()
     identity = {
         "source_commit": "a" * 40,
+        "source_tree": "c" * 40,
         "lock_sha256": "b" * 64,
         "rustc_version": "rustc sample",
         "cargo_version": "cargo sample",
@@ -149,23 +155,40 @@ def test_changed_release_input_during_candidate_checks_fails_the_receipt(
         "unpack_package",
         lambda *args, **kwargs: {
             "binary": binary,
+            "active_binary": active,
             "active_helper": helper,
             "archive_sha256": archive_digest,
             "archive_bytes": archive.stat().st_size,
             "provenance": {
                 "binary": {"sha256": binary_digest, "bytes": binary.stat().st_size},
+                "active_binary": {"sha256": active_digest, "bytes": active.stat().st_size},
                 "active_helper": {"sha256": helper_digest, "bytes": helper.stat().st_size},
             },
         },
     )
-    monkeypatch.setattr(qualification, "inspect_elf", lambda *args: {})
+    inspected = []
+
+    def inspect(executable, directory):
+        inspected.append(executable)
+        if changed_input == "elf" and executable == binary:
+            raise ValueError("missing library")
+        return {}
+
+    monkeypatch.setattr(qualification, "inspect_elf", inspect)
+    monkeypatch.setattr(qualification, "check_packaged_startup", lambda *args: {"status": "passed"})
 
     def change_input(*args):
-        selected = {"checksum": checksum, "binary": binary, "helper": helper}[changed_input]
-        selected.write_bytes(b"changed\n")
+        if changed_input != "elf":
+            selected = {"checksum": checksum, "binary": binary, "active": active, "helper": helper}[changed_input]
+            selected.write_bytes(b"changed\n")
         return {"status": "passed"}
 
     monkeypatch.setattr(qualification, "run_packaged_cli", change_input)
     receipt = qualification.execute(package, tmp_path / "receipt")
-    assert receipt["candidate_checks"]["package"]["status"] == "failed"
+    assert inspected == [binary, active, helper]
+    if changed_input == "elf":
+        assert receipt["candidate_checks"]["elf"]["status"] == "failed"
+        assert receipt["candidate_checks"]["package"]["status"] == "passed"
+    else:
+        assert receipt["candidate_checks"]["package"]["status"] == "failed"
     assert receipt["candidate_checks_passed"] is False

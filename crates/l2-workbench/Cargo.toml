@@ -21,7 +21,7 @@ serde_json = { version = "1", features = ["raw_value"] }
 sha2 = "0.10.9"
 base64 = { version = "0.23", default-features = false, features = ["std"] }
 flate2 = { version = "1.1", default-features = false, features = ["rust_backend"] }
-rusqlite = { version = "0.40.2", features = ["fallible_uint","limits","hooks","blob","backup"] }
+rusqlite = { version = "0.40.2", features = ["bundled", "fallible_uint", "limits", "hooks", "blob", "backup"] }
 tempfile = "3"
 crc32fast = "1.5"
 png = "=0.18.1"

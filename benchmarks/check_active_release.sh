@@ -11,10 +11,11 @@ archive=$(realpath -- "$1")
 qualified=$(mktemp -d "${TMPDIR:-/tmp}/l2solver-release-check.XXXXXX")
 trap 'rm -rf -- "$qualified"' EXIT
 
-# Extract only the two fixed executable names and preserve their restricted modes
+# Extract only the fixed executable names and preserve their restricted modes
 tar --extract --gzip --file "$archive" --directory "$qualified" \
-    --no-same-owner -- l2solver l2solver-active-helper
+    --no-same-owner -- l2solver l2solver-active l2solver-active-helper
 test -x "$qualified/l2solver"
+test -x "$qualified/l2solver-active"
 test -x "$qualified/l2solver-active-helper"
 export L2_TEST_MAIN_BINARY="$qualified/l2solver"
 export L2_TEST_ACTIVE_HELPER="$qualified/l2solver-active-helper"
@@ -49,3 +50,9 @@ run_selected cli \
     mpls::owned_veth_mpls_cli_observes_scoped_frames_and_honors_raw_opt_in
 run_selected vlan_assessment \
     namespace_tests::real_vlan_canary_assessment_observes_forwarding_and_keeps_silence_inconclusive
+
+# Exercise the standalone CLI and packaged helper against the same owned DHCP fixture
+unset L2_TEST_MAIN_BINARY L2_TEST_ACTIVE_MAIN
+export L2_TEST_ACTIVE_BINARY="$qualified/l2solver-active"
+run_selected cli \
+    dhcp::dhcp_cli_observes_owned_veth_offer_and_confirms_helper_cleanup

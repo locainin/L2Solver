@@ -22,6 +22,15 @@ def output(*command):
     return subprocess.check_output(command, cwd=ROOT, text=True).strip()
 
 
+def source_state():
+    # Include untracked files since a Rust module can compile before it is added to Git
+    return {
+        "source": output("git", "rev-parse", "HEAD"),
+        "source_tree": output("git", "rev-parse", "HEAD^{tree}"),
+        "source_dirty": bool(output("git", "status", "--porcelain", "--untracked-files=all")),
+    }
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--enable-active", action="store_true", help="explicitly grant CAP_NET_RAW only to the matching helper")
@@ -64,6 +73,7 @@ def main():
     command = ["cargo", "build", "--release", "--locked", "-p", "l2-cli", "-p", "l2-active-cli", "-p", "l2-active-linux", "--bins", "--message-format=json-render-diagnostics"]
     if args.live:
         command.extend(["--features", "l2-cli/live"])
+    before = source_state()
     artifacts = {}
     # Cargo supplies exact artifact paths, including configured target directories
     with subprocess.Popen(command, cwd=ROOT, stdout=subprocess.PIPE, text=True) as process:
@@ -77,10 +87,24 @@ def main():
             raise ValueError("locked release build failed; nothing installed")
     if set(artifacts) != set(BINARIES):
         raise ValueError("Cargo did not produce the complete executable set")
+    after = source_state()
+    if (before["source"], before["source_tree"]) != (after["source"], after["source_tree"]):
+        raise ValueError("source commit changed during build; nothing installed")
     with tempfile.TemporaryDirectory(prefix="l2solver-install-") as directory:
         payload = Path(directory)
         for name, binary in artifacts.items():
-            subprocess.run(["ldd", str(binary)], check=True, stdout=subprocess.DEVNULL)
+            dependencies = subprocess.run(
+                ["ldd", str(binary)], check=True, capture_output=True, text=True,
+                env={**os.environ, "LC_ALL": "C"},
+            )
+            # ldd may return success while reporting a missing shared library
+            lines = (dependencies.stdout + dependencies.stderr).splitlines()
+            missing = [line.strip() for line in lines if "=> not found" in line]
+            if missing:
+                raise ValueError(f"{name} has missing runtime dependencies: {', '.join(missing)}")
+            sqlite = [line.strip() for line in lines if line.strip().startswith("libsqlite3.so")]
+            if sqlite:
+                raise ValueError(f"{name} unexpectedly depends on system SQLite: {', '.join(sqlite)}")
             shutil.copyfile(binary, payload / name)
         binary = artifacts["l2solver"]
         for shell in ("bash", "zsh", "fish"):
@@ -89,7 +113,8 @@ def main():
             shutil.copyfile(ROOT / name, payload / name)
         shutil.copyfile(ROOT / "docs/active/install.md", payload / "install.md")
         receipt = {
-            "source": output("git", "rev-parse", "HEAD"),
+            **after,
+            "source_dirty": before["source_dirty"] or after["source_dirty"],
             "tracked_changes": output("git", "diff", "HEAD", "--stat"),
             "lock_sha256": hashlib.sha256((ROOT / "Cargo.lock").read_bytes()).hexdigest(),
             "cargo": output("cargo", "--version"), "rustc": output("rustc", "--version"),

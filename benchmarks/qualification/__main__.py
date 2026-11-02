@@ -9,7 +9,7 @@ import tarfile
 from pathlib import Path
 
 from benchmarks.package_release import ARCHIVE_NAME, _command_output, _release_metadata
-from benchmarks.qualification.cli import run_packaged_cli
+from benchmarks.qualification.cli import check_packaged_startup, run_packaged_cli
 from benchmarks.qualification.elf import inspect_elf
 from benchmarks.qualification.package import check_checksum, unpack_package
 from benchmarks.qualification.receipt import build_receipt, runner_identity_status
@@ -61,6 +61,7 @@ def execute(package_directory, output_directory):
             "source_identity": {"status": "blocked", "reason": str(error)},
             "package": {"status": "blocked", "reason": "source identity unavailable"},
             "elf": {"status": "blocked", "reason": "package validation did not pass"},
+            "packaged_startup": {"status": "blocked", "reason": "package validation did not pass"},
             "packaged_cli": {
                 "status": "blocked",
                 "reason": "package validation did not pass",
@@ -84,6 +85,7 @@ def execute(package_directory, output_directory):
             checksum,
             output_directory / "unpacked",
             source_commit=identity["source_commit"],
+            source_tree=identity["source_tree"],
             lock_sha256=identity["lock_sha256"],
             rustc_version=identity["rustc_version"],
             cargo_version=identity["cargo_version"],
@@ -92,6 +94,7 @@ def execute(package_directory, output_directory):
             "status": "passed",
             "archive_sha256": package["archive_sha256"],
             "binary_sha256": package["provenance"]["binary"]["sha256"],
+            "active_binary_sha256": package["provenance"]["active_binary"]["sha256"],
             "active_helper_sha256": package["provenance"]["active_helper"]["sha256"],
         }
     except FileNotFoundError as error:
@@ -108,21 +111,37 @@ def execute(package_directory, output_directory):
 
     if package is None:
         # Later checks cannot safely inspect a package that did not validate
-        for name in ("elf", "packaged_cli"):
+        for name in ("elf", "packaged_startup", "packaged_cli"):
             checks[name] = {
                 "status": "blocked",
                 "reason": "package validation did not pass",
             }
     else:
+        inspected = {}
+        for key in ("binary", "active_binary", "active_helper"):
+            try:
+                executable = package[key]
+                directory = output_directory / f"elf-{executable.name}"
+                directory.mkdir()
+                inspected[executable.name] = {
+                    "status": "passed", **inspect_elf(executable, directory)
+                }
+            except FileNotFoundError as error:
+                inspected[package[key].name] = {"status": "blocked", "reason": str(error)}
+            except (OSError, ValueError, subprocess.SubprocessError) as error:
+                inspected[package[key].name] = {"status": "failed", "reason": str(error)}
+        statuses = {result["status"] for result in inspected.values()}
+        checks["elf"] = {
+            "status": "failed" if "failed" in statuses else "blocked" if "blocked" in statuses else "passed",
+            "executables": inspected,
+        }
         try:
-            checks["elf"] = {
-                "status": "passed",
-                **inspect_elf(package["binary"], output_directory),
-            }
-        except FileNotFoundError as error:
-            checks["elf"] = {"status": "blocked", "reason": str(error)}
+            checks["packaged_startup"] = check_packaged_startup(
+                package["binary"], package["active_binary"], package["active_helper"],
+                output_directory / "startup",
+            )
         except (OSError, ValueError, subprocess.SubprocessError) as error:
-            checks["elf"] = {"status": "failed", "reason": str(error)}
+            checks["packaged_startup"] = {"status": "failed", "reason": str(error)}
         try:
             checks["packaged_cli"] = run_packaged_cli(
                 package["binary"], output_directory / "cli"
@@ -147,6 +166,11 @@ def execute(package_directory, output_directory):
                     expected_bytes=package["provenance"]["binary"]["bytes"],
                 )
                 == package["provenance"]["binary"]["sha256"]
+                and hash_file(
+                    package["active_binary"],
+                    expected_bytes=package["provenance"]["active_binary"]["bytes"],
+                )
+                == package["provenance"]["active_binary"]["sha256"]
                 and hash_file(
                     package["active_helper"],
                     expected_bytes=package["provenance"]["active_helper"]["bytes"],

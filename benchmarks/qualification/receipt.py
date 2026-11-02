@@ -46,7 +46,7 @@ EXTERNAL_SCENARIOS = (
 )
 
 REQUIRED_CANDIDATE_CHECKS = frozenset(
-    ("source_identity", "runner_identity", "package", "elf", "packaged_cli")
+    ("source_identity", "runner_identity", "package", "elf", "packaged_startup", "packaged_cli")
 )
 
 

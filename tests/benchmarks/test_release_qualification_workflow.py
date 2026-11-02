@@ -20,6 +20,9 @@ def test_review_upload_follows_candidate_checks_and_is_labeled_unqualified():
     upload_step = workflow[upload:]
     assert "unqualified-review" in upload_step
     assert "qualification.json" in upload_step
+    assert "l2solver-qualification/elf-*/*.txt" in upload_step
+    assert "l2solver-qualification/startup/*/stdout.log" in upload_step
+    assert "l2solver-qualification/startup/*/stderr.log" in upload_step
     assert not re.search(r"(?m)^\s*if:\s*", upload_step)
 
 

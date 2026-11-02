@@ -29,6 +29,7 @@ def test_release_build_and_package_include_the_matching_helper():
     workflow = (ROOT / ".github/workflows/release-linux.yml").read_text()
     assert "--package l2-active-linux" in workflow
     assert "--bin l2solver-active-helper" in workflow
+    assert "--active-binary target/x86_64-unknown-linux-gnu/release/l2solver-active" in workflow
     assert "--helper-binary target/x86_64-unknown-linux-gnu/release/l2solver-active-helper" in workflow
 
 
@@ -80,7 +81,7 @@ def test_release_gate_rejects_missing_archive_argument():
 def create_candidate_archive(tmp_path):
     archive = tmp_path / "candidate.tar.gz"
     with tarfile.open(archive, "w:gz") as package:
-        for name in ("l2solver", "l2solver-active-helper"):
+        for name in ("l2solver", "l2solver-active", "l2solver-active-helper"):
             contents = b"#!/bin/sh\nexit 99\n"
             entry = tarfile.TarInfo(name)
             entry.mode = 0o750
@@ -96,7 +97,7 @@ def create_nextest_stubs(tmp_path):
     cargo = commands / "cargo"
     cargo.write_text(
         "#!/bin/sh\n"
-        "printf '%s|%s|%s|%s\\n' \"$L2_TEST_MAIN_BINARY\" \"$L2_TEST_ACTIVE_HELPER\" \"$CARGO_BUILD_JOBS\" \"$*\" >> \"$CARGO_CALLS\"\n"
+        "printf '%s|%s|%s|%s|%s\\n' \"${L2_TEST_MAIN_BINARY:-}\" \"${L2_TEST_ACTIVE_BINARY:-}\" \"$L2_TEST_ACTIVE_HELPER\" \"$CARGO_BUILD_JOBS\" \"$*\" >> \"$CARGO_CALLS\"\n"
         "[ \"$1 $2\" = 'nextest run' ] || exit 91\n"
         "case \" $* \" in *' --no-tests fail '*) ;; *) exit 92;; esac\n"
         "if [ -n \"${MISSING_PARENT:-}\" ]; then\n"
@@ -130,12 +131,13 @@ def test_release_gate_runs_every_exact_parent_with_the_archived_pair(tmp_path):
     )
     assert result.returncode == 0, result.stderr
     entries = calls.read_text().splitlines()
-    assert len(entries) == len(REQUIRED_PARENTS)
+    assert len(entries) == len(REQUIRED_PARENTS) + 1
     python_args = (tmp_path / "python.log").read_text().strip().split("|")
     assert python_args[0] == "crates/l2-active-cli/tests/vlan/namespace.py"
-    for parent, entry in zip(REQUIRED_PARENTS, entries, strict=True):
-        main, helper, jobs, args = entry.split("|", 3)
+    for parent, entry in zip(REQUIRED_PARENTS, entries[:-1], strict=True):
+        main, active, helper, jobs, args = entry.split("|", 4)
         assert Path(main).name == "l2solver"
+        assert not active
         assert Path(helper).name == "l2solver-active-helper"
         assert Path(main).parent == Path(helper).parent
         assert python_args[1:] == [main, helper]
@@ -143,6 +145,12 @@ def test_release_gate_runs_every_exact_parent_with_the_archived_pair(tmp_path):
         assert "--test-threads 1" in args
         assert "--run-ignored" not in args
         assert f"test(={parent})" in args
+    main, active, helper, jobs, args = entries[-1].split("|", 4)
+    assert not main
+    assert Path(active).name == "l2solver-active"
+    assert Path(helper).name == "l2solver-active-helper"
+    assert Path(active).parent == Path(helper).parent
+    assert f"test(={REQUIRED_PARENTS[0]})" in args
 
 
 def test_release_gate_stops_when_any_exact_parent_is_missing(tmp_path):

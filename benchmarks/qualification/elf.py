@@ -1,5 +1,6 @@
 """Inspect Linux runtime requirements without executing the inspected binary."""
 
+import os
 import re
 import subprocess
 from pathlib import Path
@@ -62,9 +63,28 @@ def inspect_elf(binary, directory):
             text=True,
             check=True,
             timeout=30,
+            env={**os.environ, "LC_ALL": "C"},
         )
         (Path(directory) / f"elf-{name}.txt").write_text(
             result.stdout, encoding="utf-8"
         )
         reports[name] = result.stdout
-    return parse_elf_inspection(**reports)
+    inspection = parse_elf_inspection(**reports)
+    # ldd also resolves transitive dependencies on the qualification host
+    result = subprocess.run(
+        ["ldd", str(binary)], capture_output=True, text=True, check=False, timeout=30,
+        env={**os.environ, "LC_ALL": "C"},
+    )
+    (Path(directory) / "ldd.txt").write_text(result.stdout + result.stderr, encoding="utf-8")
+    lines = (result.stdout + result.stderr).splitlines()
+    missing = [line.strip() for line in lines if "=> not found" in line]
+    if missing:
+        raise ValueError(f"missing runtime dependencies: {', '.join(missing)}")
+    if result.returncode and (inspection["needed"] or inspection["interpreter"]):
+        raise ValueError(f"ldd failed with exit status {result.returncode}: {result.stderr.strip()}")
+    sqlite = [line.strip() for line in lines if line.strip().startswith("libsqlite3.so")]
+    if not sqlite:
+        sqlite = [name for name in inspection["needed"] if name.startswith("libsqlite3.so")]
+    if sqlite:
+        raise ValueError(f"unexpected system SQLite dependency: {', '.join(sqlite)}")
+    return inspection
