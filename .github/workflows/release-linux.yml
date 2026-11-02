@@ -48,7 +48,7 @@ jobs:
           sudo apt-get update
           sudo DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
             apparmor binutils dbus-user-session ethtool fish iproute2 iputils-ping libcap2-bin libpcap-dev \
-            python3-pytest python3-pytest-subtests python3-scapy tcpdump tshark zsh
+            python3-pytest python3-pytest-subtests python3-scapy ripgrep tcpdump tshark zsh
 
       - name: Permit isolated test namespaces
         shell: bash
@@ -88,6 +88,7 @@ jobs:
       - name: Run workspace tests with Nextest
         run: >-
           cargo nextest run --workspace --all-targets --all-features --locked
+          --no-fail-fast
           --status-level skip --final-status-level skip
 
       - name: Run documentation tests
