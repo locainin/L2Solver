@@ -35,6 +35,9 @@ jobs:
         with:
           persist-credentials: false
 
+      - name: Check public source inventory
+        run: python3 scripts/check_public_source.py
+
       - name: Install stable Rust components
         run: |
           rustup toolchain install stable --profile minimal \
