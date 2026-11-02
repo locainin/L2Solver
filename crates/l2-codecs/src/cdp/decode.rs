@@ -128,14 +128,12 @@ const fn record_identity<'a>(
 }
 
 fn checksum_valid(input: &[u8]) -> bool {
-    let mut pairs = input.chunks_exact(2);
+    let (pairs, remainder) = input.as_chunks::<2>();
     let mut sum = 0_u32;
-    for pair in &mut pairs {
-        if let [high, low] = *pair {
-            sum += u32::from(u16::from_be_bytes([high, low]));
-        }
+    for pair in pairs {
+        sum += u32::from(u16::from_be_bytes(*pair));
     }
-    if let [last] = pairs.remainder() {
+    if let [last] = remainder {
         // The CDP odd-byte rule sign-extends the final octet before reduction
         sum += if *last >= 0x80 {
             0xff00 | u32::from(*last - 1)

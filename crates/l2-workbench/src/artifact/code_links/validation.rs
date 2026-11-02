@@ -277,12 +277,11 @@ fn decode_hex(value: &str) -> Option<Vec<u8>> {
     }
     value
         .as_bytes()
-        .chunks_exact(2)
-        .map(|pair| {
-            Some(
-                crate::hex::decode_nibble(*pair.first()?)? * 16
-                    + crate::hex::decode_nibble(*pair.get(1)?)?,
-            )
+        .as_chunks::<2>()
+        .0
+        .iter()
+        .map(|&[high, low]| {
+            Some(crate::hex::decode_nibble(high)? * 16 + crate::hex::decode_nibble(low)?)
         })
         .collect()
 }
