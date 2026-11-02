@@ -2,6 +2,7 @@
 name = "l2-cli"
 version = "0.2.0"
 edition = "2024"
+rust-version.workspace = true
 publish = false
 
 [[bin]]
