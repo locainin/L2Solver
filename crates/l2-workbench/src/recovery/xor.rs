@@ -10,7 +10,7 @@ use crate::{
 use serde::{Deserialize, Serialize};
 use std::{error::Error, fmt};
 
-/// Version of the scoring, search limits, and evidence format
+/// Version of XOR scoring, search limits, message normalization, and evidence format
 pub const XOR_PROPOSAL_FORMAT_VERSION: u16 = 1;
 /// Maximum number of prefix bytes inspected from one source
 pub const XOR_SAMPLE_BYTES: usize = 4096;
