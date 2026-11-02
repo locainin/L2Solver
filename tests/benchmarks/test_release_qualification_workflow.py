@@ -28,8 +28,11 @@ def test_review_workflow_runs_python_doctests_and_warning_checked_rustdoc():
     assert "pytest -q tests/benchmarks" in workflow
     assert "python3-pytest-subtests" in workflow
     assert "-p subtests" in workflow
-    assert "--ignore=tests/benchmarks/test_cgroup_enforcement.py" in workflow
-    assert "--ignore=tests/benchmarks/test_filesystem_fault_runner.py" in workflow
+    assert "--ignore=tests/benchmarks/test_cgroup_enforcement.py" not in workflow
+    assert "--ignore=tests/benchmarks/test_filesystem_fault_runner.py" not in workflow
+    assert "Qualify delegated-scope Python cases" in workflow
+    assert "-p Delegate=yes -p CPUQuota=100%" in workflow
+    assert "L2_TEST_DELEGATED_SCOPE=1" in workflow
     assert "cargo test --workspace --doc --all-features --locked" in workflow
     assert "cargo doc --workspace --all-features --no-deps --locked" in workflow
     assert workflow.count("RUSTDOCFLAGS: -D warnings") >= 2
