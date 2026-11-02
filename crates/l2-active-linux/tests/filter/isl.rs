@@ -7,7 +7,7 @@ fn isl_program_is_bounded_and_finishes_successfully() -> Result<(), Box<dyn Erro
     let mut program = Program::new()?;
     super::isl(&mut program);
     let code = program.finish()?;
-    assert!(!code.is_empty());
+    assert_ne!(code, [] as [rscap::filter::BpfInstruction; 0]);
     assert!(code.len() <= MAX_INSTRUCTIONS);
     Ok(())
 }

@@ -22,7 +22,10 @@ fn link_query_names_only_the_selected_interface_index() -> Result<(), Box<dyn Er
         return Err("query is not RTM_GETLINK".into());
     };
     assert_eq!(link.header.index, 7);
-    assert!(link.attributes.is_empty());
+    assert_eq!(
+        link.attributes,
+        [] as [netlink_packet_route::link::LinkAttribute; 0]
+    );
     Ok(())
 }
 

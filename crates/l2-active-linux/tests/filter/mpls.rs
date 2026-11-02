@@ -9,7 +9,7 @@ fn program() -> std::io::Result<Vec<rscap::filter::BpfInstruction>> {
 #[test]
 fn mpls_filter_produces_a_bounded_forward_only_program() -> Result<(), Box<dyn Error>> {
     let instructions = program()?;
-    assert!(!instructions.is_empty());
+    assert_ne!(instructions, [] as [rscap::filter::BpfInstruction; 0]);
     assert!(instructions.len() <= super::super::MAX_INSTRUCTIONS);
     Ok(())
 }

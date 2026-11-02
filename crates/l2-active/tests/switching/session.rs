@@ -42,7 +42,7 @@ fn filters_scope_and_accounts_unrelated_truncated_and_unscoped_frames() -> Resul
     assert_eq!(report.summary().unscoped_packets(), 1);
     assert_eq!(report.summary().stop_reason(), StopReason::PacketLimit);
     assert_eq!(report.observations().len(), 1);
-    assert!(link.sent.is_empty());
+    assert_eq!(link.sent, [] as [std::vec::Vec<u8>; 0]);
     Ok(())
 }
 
@@ -181,6 +181,6 @@ fn observed_message_retains_loss_and_interface_failure_qualification() -> Result
             .linux_interface(),
         Some(crate::support::identity()?)
     );
-    assert!(link.sent.is_empty());
+    assert_eq!(link.sent, [] as [std::vec::Vec<u8>; 0]);
     Ok(())
 }

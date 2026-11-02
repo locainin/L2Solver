@@ -13,7 +13,7 @@ fn dtp_and_vtp_programs_are_bounded_and_finish_successfully() -> Result<(), Box<
         let mut program = Program::new()?;
         populate(&mut program);
         let code = program.finish()?;
-        assert!(!code.is_empty());
+        assert_ne!(code, [] as [rscap::filter::BpfInstruction; 0]);
         assert!(code.len() <= MAX_INSTRUCTIONS);
     }
     Ok(())

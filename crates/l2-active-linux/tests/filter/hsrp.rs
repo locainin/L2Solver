@@ -31,7 +31,7 @@ const PARENT_TEST: &str = "filter::hsrp::tests::kernel_hsrp_filters_apply_profil
 fn hsrp_groups_produce_bounded_forward_only_programs() -> Result<(), Box<dyn Error>> {
     for group in [None, Some(0), Some(255)] {
         let instructions = instructions(group)?;
-        assert!(!instructions.is_empty());
+        assert_ne!(instructions, [] as [rscap::filter::BpfInstruction; 0]);
         assert!(instructions.len() <= MAX_INSTRUCTIONS);
     }
     Ok(())

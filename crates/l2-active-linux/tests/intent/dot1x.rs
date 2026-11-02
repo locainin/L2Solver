@@ -29,7 +29,7 @@ fn intent() -> Result<Intent, Box<dyn Error>> {
 fn start_admission_accepts_the_selected_mac_without_any_ip_assignment() -> Result<(), Box<dyn Error>>
 {
     let info = interface()?;
-    assert!(info.ipv4_assignments().is_empty());
+    assert_eq!(info.ipv4_assignments(), []);
     intent()?.validate(&info)?;
     Ok(())
 }

@@ -27,7 +27,7 @@ fn independently_encoded_hsrp_claim_is_observed_without_sending() -> Result<(), 
     )?;
     let report =
         HsrpMonitor::new(Some(0), fixture::limits()?).run(&mut link, &AtomicBool::new(false))?;
-    assert!(link.sent.is_empty());
+    assert_eq!(link.sent, [] as [std::vec::Vec<u8>; 0]);
     assert_eq!(report.summary().sent_packets(), 0);
     assert_eq!(report.status(), HsrpStatus::Observed);
     let observation = report.observations().first().ok_or("missing HSRP claim")?;
@@ -475,7 +475,7 @@ fn expired_deadline_never_sends_or_claims_a_router() -> Result<(), Box<dyn Error
     )?;
     assert_eq!(report.summary().stop_reason(), StopReason::Deadline);
     assert_eq!(report.status(), HsrpStatus::Inconclusive);
-    assert!(link.sent.is_empty());
+    assert_eq!(link.sent, [] as [std::vec::Vec<u8>; 0]);
     Ok(())
 }
 
@@ -572,7 +572,7 @@ fn cancellation_and_capture_loss_remain_separate_from_observed_claims() -> Resul
         HsrpMonitor::new(None, fixture::limits()?).run(&mut lossy, &AtomicBool::new(false))?;
     assert_eq!(report.status(), HsrpStatus::Observed);
     assert_eq!(report.summary().capture_loss(), Some(4));
-    assert!(lossy.sent.is_empty());
+    assert_eq!(lossy.sent, [] as [std::vec::Vec<u8>; 0]);
     Ok(())
 }
 
@@ -615,6 +615,6 @@ fn backend_deadline_is_reported_separately_from_an_observed_claim() -> Result<()
         HsrpMonitor::new(None, fixture::limits()?).run(&mut link, &AtomicBool::new(false))?;
     assert_eq!(report.status(), HsrpStatus::Observed);
     assert_eq!(report.summary().stop_reason(), StopReason::BackendDeadline);
-    assert!(link.sent.is_empty());
+    assert_eq!(link.sent, [] as [std::vec::Vec<u8>; 0]);
     Ok(())
 }

@@ -44,6 +44,6 @@ fn isl_default_report_debug_does_not_print_backend_error_contents() -> Result<()
     assert_eq!(report.summary().stop_reason(), StopReason::TransportError);
     assert!(report.summary().transport_error().is_some());
     assert!(!format!("{report:?}").contains("PRIVATE-BACKEND-ERROR"));
-    assert!(link.0.sent.is_empty());
+    assert_eq!(link.0.sent, [] as [std::vec::Vec<u8>; 0]);
     Ok(())
 }

@@ -136,7 +136,7 @@ fn silence_loss_and_presend_cancellation_are_inconclusive() -> Result<(), Box<dy
     assert_eq!(report.status(), DhcpStatus::Inconclusive);
     assert_eq!(report.summary().stop_reason(), StopReason::Cancelled);
     assert_eq!(report.summary().sent_packets(), 0);
-    assert!(link.sent.is_empty());
+    assert_eq!(link.sent, [] as [std::vec::Vec<u8>; 0]);
     Ok(())
 }
 
@@ -389,6 +389,6 @@ fn expired_operation_deadline_prevents_dhcp_send() -> Result<(), Box<dyn Error>>
     assert_eq!(report.summary().stop_reason(), StopReason::Deadline);
     assert!(!report.summary().send_attempted());
     assert_eq!(report.summary().sent_packets(), 0);
-    assert!(link.sent.is_empty());
+    assert_eq!(link.sent, [] as [std::vec::Vec<u8>; 0]);
     Ok(())
 }

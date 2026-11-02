@@ -182,7 +182,7 @@ fn verify_observations(protocol: &str, report: &serde_json::Value) -> Result<(),
         .get("observations")
         .and_then(serde_json::Value::as_array)
         .ok_or("missing observations")?;
-    assert!(!observations.is_empty());
+    assert_ne!(observations.as_slice(), [] as [serde_json::Value; 0]);
     if protocol == "discovery" {
         assert!(
             observations
