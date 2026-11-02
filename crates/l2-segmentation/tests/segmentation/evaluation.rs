@@ -54,6 +54,68 @@ fn deny_receipt_confirmed_failure() -> Result<(), Box<dyn Error>> {
 }
 
 #[test]
+fn observed_deny_failure_survives_cancellation() -> Result<(), Box<dyn Error>> {
+    let planned = l2_segmentation::plan(&input_with_rule(RuleExpectation::Deny, 2)?)?;
+    let mut evaluator = Evaluator::new(&planned);
+    let first = planned.probes().first().ok_or("missing probe")?.canary()?;
+
+    assert_eq!(
+        observe(&mut evaluator, &first, 42)?,
+        ObservationDisposition::Accepted
+    );
+    let cancelled =
+        EvaluationContext::new(true, true, l2_segmentation::CaptureQuality::Complete, true);
+    let report = evaluator.evaluate(&cancelled);
+    let result = report.results().first().ok_or("missing result")?;
+    assert_eq!(report.overall_status(), EvaluationStatus::Fail);
+    assert_eq!(result.status(), EvaluationStatus::Fail);
+    assert_eq!(result.matching_receipts(), 1);
+    assert_eq!(result.missing_attempts(), 1);
+    assert_eq!(
+        result
+            .evidence()
+            .first()
+            .map(|item| item.packet_reference()),
+        Some(packet_ref(0x88, 42)?)
+    );
+    Ok(())
+}
+
+#[test]
+fn absence_receipt_requires_complete_uncancelled_deny_to_pass() -> Result<(), Box<dyn Error>> {
+    for (expectation, attempts, healthy_status) in [
+        (RuleExpectation::Deny, 1, EvaluationStatus::Pass),
+        (RuleExpectation::Deny, 2, EvaluationStatus::Inconclusive),
+        (RuleExpectation::Allow, 1, EvaluationStatus::Inconclusive),
+    ] {
+        let planned = l2_segmentation::plan(&input_with_rule(expectation, attempts)?)?;
+        let mut evaluator = Evaluator::new(&planned);
+        let first = planned.probes().first().ok_or("missing probe")?.canary()?;
+        let key = key_for(&first)?;
+        let wire = encode(&first, &key)?;
+        record_transmit(&mut evaluator, &first, &key, &wire)?;
+        let (window, _, _) = observation_claim(&first)?;
+        evaluator.record_window(window)?;
+
+        // A complete first window must not imply that later attempts completed
+        let report = evaluator.evaluate(&healthy());
+        let result = report.results().first().ok_or("missing result")?;
+        assert_eq!(result.status(), healthy_status);
+        assert_eq!(result.absence_evidence().len(), 1);
+        assert_eq!(result.matching_receipts(), 0);
+
+        // Cancellation prevents a deny pass even when all receipts are present
+        let cancelled =
+            EvaluationContext::new(true, true, l2_segmentation::CaptureQuality::Complete, true);
+        let report = evaluator.evaluate(&cancelled);
+        let result = report.results().first().ok_or("missing result")?;
+        assert_eq!(result.status(), EvaluationStatus::Inconclusive);
+        assert_eq!(result.absence_evidence().len(), 1);
+    }
+    Ok(())
+}
+
+#[test]
 fn cross_source_packet_identity() -> Result<(), Box<dyn Error>> {
     let planned = l2_segmentation::plan(&input_with_rule(RuleExpectation::Deny, 2)?)?;
     let mut evaluator = Evaluator::new(&planned);

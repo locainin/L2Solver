@@ -37,6 +37,24 @@ fn accepts_independent_cdp_fixture_and_exposes_exact_identity_offsets() -> Resul
 }
 
 #[test]
+fn accepts_cdp_v1_and_rejects_unsupported_version() -> Result<(), Box<dyn Error>> {
+    // This former lab fixture has a one-second hold time and a valid checksum
+    let version_one = hex("0101e8350001000c7377697463682d610003000b4769312f302f31")?;
+    let decoded = decode_cdp(&version_one, LIMITS)?;
+    assert_eq!(decoded.version, 1);
+    assert_eq!(decoded.hold_seconds, 1);
+    assert_eq!(decoded.device.value, b"switch-a");
+    assert_eq!(decoded.port.value, b"Gi1/0/1");
+
+    let version_three = hex("037898920001000664650003000581")?;
+    assert_eq!(
+        decode_cdp(&version_three, LIMITS),
+        Err(CdpError::UnsupportedVersion { version: 3 })
+    );
+    Ok(())
+}
+
+#[test]
 fn rejects_truncated_checksum_corrupt_and_bad_tlv_frames() -> Result<(), Box<dyn Error>> {
     for length in 0..GOLDEN.len() {
         let prefix = GOLDEN.get(..length).ok_or("missing prefix")?;
@@ -81,11 +99,50 @@ fn caller_controls_tlv_and_identity_budgets() {
 }
 
 #[test]
+fn cdp_tlv_limit_accepts_128_and_rejects_129() -> Result<(), Box<dyn Error>> {
+    // Fixed checksums keep the limit fixtures independent of the decoder
+    for (extra, checksum) in [(126, [0xc1, 0x6b]), (127, [0xbd, 0x6a])] {
+        let mut packet = GOLDEN.to_vec();
+        for _ in 0..extra {
+            packet.extend_from_slice(&[1, 0, 0, 4]);
+        }
+        packet
+            .get_mut(2..4)
+            .ok_or("missing checksum field")?
+            .copy_from_slice(&checksum);
+
+        // Both packets must be valid when the caller allows their full TLV count
+        assert_eq!(
+            decode_cdp(&packet, CdpLimits::new(129, 255))?.tlv_count,
+            extra + 2
+        );
+        if extra == 126 {
+            assert_eq!(decode_cdp(&packet, LIMITS)?.tlv_count, 128);
+        } else {
+            assert_eq!(
+                decode_cdp(&packet, LIMITS),
+                Err(CdpError::TooManyTlvs { max: 128 })
+            );
+        }
+    }
+    Ok(())
+}
+
+#[test]
 fn odd_signed_checksum_matches_wireshark_at_0x80_boundary() -> Result<(), Box<dyn Error>> {
     let valid = hex("027899930001000664650003000580")?;
     let scapy = hex("027898930001000664650003000580")?;
     assert_eq!(decode_cdp(&valid, LIMITS)?.port.value, &[0x80]);
     assert_eq!(decode_cdp(&scapy, LIMITS), Err(CdpError::InvalidChecksum));
+
+    // Keep the former lab vectors around the signed-octet boundary
+    for (packet, last) in [
+        ("02789894000100066465000300057f", 0x7f),
+        ("027899920001000664650003000581", 0x81),
+        ("0278991400010006646500030005ff", 0xff),
+    ] {
+        assert_eq!(decode_cdp(&hex(packet)?, LIMITS)?.port.value, &[last]);
+    }
     Ok(())
 }
 
