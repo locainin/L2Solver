@@ -82,3 +82,16 @@ def test_release_completion_check_rejects_each_empty_script(
 ):
     result = run_check(completion_check, tmp_path, shell=shell, mode="empty")
     assert result.returncode != 0, f"{shell} completion script was empty"
+
+
+def test_namespace_suite_has_runtime_tools_and_user_manager_before_execution():
+    workflow = (ROOT / ".github/workflows/release-linux.yml").read_text()
+    tools = workflow.index("      - name: Install candidate check tools")
+    build_check = workflow.index("      - name: Check workspace Clippy")
+    suite = workflow.index("      - name: Run workspace tests with Nextest")
+    assert tools < build_check < suite
+    setup = workflow.index("      - name: Prepare isolated-test user services")
+    assert tools < setup < suite
+    requirements = workflow[tools:setup]
+    for package in ("iproute2", "python3-scapy", "tcpdump", "iputils-ping", "ethtool", "libcap2-bin", "libpcap-dev", "libsqlite3-dev", "dbus-user-session"):
+        assert package in requirements, f"missing namespace/runtime dependency: {package}"

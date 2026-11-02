@@ -390,11 +390,7 @@ impl ActiveLink for DirectLink {
     }
 }
 
-pub fn deadline_status(
-    now: Instant,
-    deadline: Instant,
-    backend: Instant,
-) -> Option<ReceiveEvent> {
+pub fn deadline_status(now: Instant, deadline: Instant, backend: Instant) -> Option<ReceiveEvent> {
     // When both are past, preserve the deadline that actually ended first
     if now >= backend && backend < deadline {
         Some(ReceiveEvent::BackendTimedOut)

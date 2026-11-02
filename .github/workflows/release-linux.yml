@@ -37,6 +37,24 @@ jobs:
             --target x86_64-unknown-linux-gnu
           rustup default stable
 
+      - name: Install candidate check tools
+        shell: bash
+        run: |
+          sudo apt-get update
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+            binutils dbus-user-session ethtool fish iproute2 iputils-ping libcap2-bin libpcap-dev \
+            libsqlite3-dev python3-pytest python3-pytest-subtests python3-scapy tcpdump tshark zsh
+
+      - name: Prepare isolated-test user services
+        shell: bash
+        run: |
+          test_uid=$(id -u)
+          test_runtime="/run/user/$test_uid"
+          sudo loginctl enable-linger "$(id -un)"
+          sudo systemctl start "user@$test_uid.service"
+          printf 'XDG_RUNTIME_DIR=%s\nDBUS_SESSION_BUS_ADDRESS=unix:path=%s/bus\n' \
+            "$test_runtime" "$test_runtime" >> "$GITHUB_ENV"
+
       - name: Check formatting
         run: cargo fmt --all -- --check
 
@@ -69,19 +87,22 @@ jobs:
           --bin l2solver --bin l2solver-active --bin l2solver-active-helper
           --target x86_64-unknown-linux-gnu
 
-      - name: Install candidate check tools
-        shell: bash
-        run: |
-          sudo apt-get update
-          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
-            binutils fish iproute2 python3-pytest python3-pytest-subtests python3-scapy tshark zsh
-
       - name: Run Python benchmark regressions
         run: >-
           /usr/bin/python3 -m pytest -q tests/benchmarks tests/scripts tests/crates
           -p subtests
-          --ignore=tests/benchmarks/test_cgroup_enforcement.py
-          --ignore=tests/benchmarks/test_filesystem_fault_runner.py
+
+      - name: Qualify delegated-scope Python cases
+        shell: bash
+        run: |
+          for variant in explicit default; do
+            systemd-run --user --scope --quiet -p Delegate=yes \
+              /usr/bin/python3 -m pytest -q \
+              "tests/benchmarks/test_cgroup_enforcement.py::test_owned_scope_records_resolved_working_directory[$variant]"
+          done
+          systemd-run --user --scope --quiet -p Delegate=yes -p CPUQuota=100% \
+            env L2_TEST_DELEGATED_SCOPE=1 /usr/bin/python3 -m pytest -q \
+            tests/benchmarks/test_refine_cgroup_integration.py::RefineCgroupIntegrationTests::test_real_runner_samples_live_unlinked_spool_and_process
 
       - name: Check generated completion syntax
         shell: bash
