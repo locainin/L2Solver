@@ -57,6 +57,49 @@ fn reconstructed_tcp_run_keeps_all_identical_retransmission_sources() -> Result<
 }
 
 #[test]
+fn conflicting_retransmissions_never_gain_exact_coverage_from_supporting_witnesses()
+-> Result<(), Box<dyn Error>> {
+    for reverse_order in [false, true] {
+        let first = tcp(false, 101, 0x18, b"abcdef")?;
+        let conflicting = tcp(false, 103, 0x18, b"XY")?;
+        let packets = if reverse_order {
+            vec![conflicting, first]
+        } else {
+            vec![first, conflicting]
+        };
+        let (records, length) = located_records(
+            std::iter::once(tcp(false, 100, 0x02, b"")?)
+                .chain(packets)
+                .chain(std::iter::once(tcp(false, 101, 0x18, b"abcdef")?))
+                .collect(),
+        )?;
+        let result = build(BuildInput {
+            label: "generated conflicting retransmissions",
+            length,
+            sha256_hex: &sha256(b"generated conflicting retransmissions"),
+            records: &records,
+            frames_seen: u64::try_from(records.len())?,
+        })?;
+        let mut runs = Vec::new();
+        for node in result.case.nodes().iter().filter(|node| node.kind == "tcp_byte_run") {
+            let mapped = mapped_node_with_supporting_mappings(&result.case, node.id)?;
+            // Each retained witness must match the actual source bytes even after overlap
+            let encoded = serde_json::to_value(&mapped.mappings)?;
+            compare_mappings(
+                encoded.as_array().ok_or("mappings are not an array")?,
+                mapped.bytes,
+                &records,
+                node.id,
+            )?;
+            runs.push(mapped.bytes.to_vec());
+        }
+        runs.sort();
+        assert_eq!(runs, [b"ab".to_vec(), b"ef".to_vec()]);
+    }
+    Ok(())
+}
+
+#[test]
 fn byte_mapping_literal_recovered_bytes() -> Result<(), Box<dyn Error>> {
     let mut payload = b"POST / HTTP/1.1\r\nTransfer-Encoding: chunked\r\n".to_vec();
     for _ in 0..80 {

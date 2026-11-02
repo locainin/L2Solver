@@ -1,14 +1,12 @@
 use super::{DnsObservation, DnsPlan, DnsResponseMatch, PendingAddress, matching};
 use crate::{ForensicScope, ResourceLimit, ResourceLimitStatus, forensics::ForensicTracker};
-use l2_capture::CapturedFrame;
-use l2_core::EthernetFrame;
 use l2_discovery::{IpPacket, dns::DnsDecoding};
 
 impl ForensicTracker {
     pub(in crate::forensics) fn dns_observe(
         &mut self,
         scope: &ForensicScope,
-        context: (&CapturedFrame, &EthernetFrame<'_>, u64),
+        context: (usize, u64),
         ip: IpPacket<'_>,
         decoding: DnsDecoding,
         status: &mut ResourceLimitStatus,
@@ -33,14 +31,14 @@ impl ForensicTracker {
             DnsDecoding::Decoded { message } => matching::plan(scope, ip, message),
             DnsDecoding::Unresolved { .. } => None,
         };
-        let (source, frame, packet) = context;
+        let (payload_offset, packet) = context;
         self.dns.observations.push(DnsObservation {
             scope: scope.clone(),
             source: ip.source,
             destination: ip.destination,
             ports: transport.ports,
             packet,
-            payload_offset: source.captured_len() - frame.payload.len() + transport.payload_offset,
+            payload_offset: payload_offset + transport.payload_offset,
             payload_length: transport.payload.len(),
             decoding,
         });

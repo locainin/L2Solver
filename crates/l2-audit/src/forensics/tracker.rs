@@ -7,13 +7,23 @@ use super::{
 use crate::{ResourceLimit, ResourceLimitStatus};
 use l2_capture::CapturedFrame;
 use l2_core::{EthernetFrame, FrameField};
-use l2_discovery::{IpPacket, NetworkAddress, arp_packet, dns, ip_packet};
+use l2_discovery::{
+    IpPacket, NetworkAddress, arp_packet, dns, ip_packet_from_payload, link::NetworkEnvelope,
+};
 use std::collections::BTreeMap;
 
 #[derive(Clone, Copy)]
 pub(super) struct PacketCount {
     pub frames: u64,
     pub packet: u64,
+}
+
+#[derive(Clone, Copy)]
+struct IpContext<'a, 'frame> {
+    source: &'a CapturedFrame,
+    ethernet: Option<&'a EthernetFrame<'frame>>,
+    payload_offset: usize,
+    packet: u64,
 }
 
 pub struct ForensicTracker {
@@ -67,21 +77,26 @@ impl ForensicTracker {
         can_reference: bool,
         status: &mut ResourceLimitStatus,
     ) -> bool {
-        let ip = if matches!(frame.field, FrameField::EtherType(0x0800 | 0x86dd)) {
-            self.ip_frames_seen += 1;
-            let ip = ip_packet(frame);
-            self.ip_frames_parsed += u64::from(ip.is_some());
-            ip
-        } else {
-            None
-        };
-        let dns = ip.and_then(dns::udp_message);
-        if let Some(decoding) = &dns {
-            self.dns.count(decoding);
+        if let FrameField::EtherType(protocol @ (0x0800 | 0x86dd)) = frame.field {
+            let scope = ForensicScope::new(source.metadata(), frame);
+            let context = IpContext {
+                source,
+                ethernet: Some(frame),
+                payload_offset: 14 + frame.vlan_tags.len() * 4,
+                packet,
+            };
+            return self.observe_ip_frame(
+                &scope,
+                context,
+                protocol,
+                frame.payload,
+                can_reference,
+                status,
+            );
         }
         // Later facts cannot cite an unindexed packet, even if the frame parses correctly
         if !can_reference {
-            if ip.is_some() || arp_packet(frame).is_some() || !frame.padding.is_empty() {
+            if arp_packet(frame).is_some() || !frame.padding.is_empty() {
                 status.mark(ResourceLimit::EvidenceReferences);
             }
             return false;
@@ -91,14 +106,6 @@ impl ForensicTracker {
             return false;
         }
         let scope = ForensicScope::new(source.metadata(), frame);
-        if let Some(ip) = ip {
-            let mut changed = false;
-            if let Some(decoding) = dns {
-                changed |= self.dns_observe(&scope, (source, frame, packet), ip, decoding, status);
-            }
-            changed |= self.observe_ip(&scope, source, frame, ip, packet, status);
-            return changed;
-        }
         if let Some(arp) = arp_packet(frame) {
             let mut changed = self.arp(&scope, frame, arp, packet, status);
             if !status.is_reached(ResourceLimit::ForensicRecords) {
@@ -125,37 +132,114 @@ impl ForensicTracker {
         )
     }
 
+    /// Observe decoded network facts while reserving Ethernet-only claims for Ethernet frames
+    ///
+    /// Cooked frames can contribute DNS and bounded trailing-byte facts, but not
+    /// Ethernet communication pairs or Ethernet-dependent ARP correlations
+    pub fn observe_network(
+        &mut self,
+        source: &CapturedFrame,
+        frame: &NetworkEnvelope<'_>,
+        packet: u64,
+        can_reference: bool,
+        status: &mut ResourceLimitStatus,
+    ) -> bool {
+        if let Some(ethernet) = frame.ethernet() {
+            return self.observe(source, ethernet, packet, can_reference, status);
+        }
+        let Some(FrameField::EtherType(protocol @ (0x0800 | 0x86dd))) = frame.field() else {
+            return false;
+        };
+        let scope = ForensicScope::from_network_frame(source.metadata(), frame);
+        let context = IpContext {
+            source,
+            ethernet: None,
+            payload_offset: frame.payload_offset(),
+            packet,
+        };
+        self.observe_ip_frame(
+            &scope,
+            context,
+            protocol,
+            frame.payload(),
+            can_reference,
+            status,
+        )
+    }
+
+    fn observe_ip_frame(
+        &mut self,
+        scope: &ForensicScope,
+        context: IpContext<'_, '_>,
+        protocol: u16,
+        payload: &[u8],
+        can_reference: bool,
+        status: &mut ResourceLimitStatus,
+    ) -> bool {
+        // Coverage includes valid headers whose facts cannot be retained
+        self.ip_frames_seen += 1;
+        let ip = ip_packet_from_payload(protocol, payload);
+        self.ip_frames_parsed += u64::from(ip.is_some());
+        let dns = ip.and_then(dns::udp_message);
+        if let Some(decoding) = &dns {
+            self.dns.count(decoding);
+        }
+        if !can_reference {
+            if ip.is_some() {
+                status.mark(ResourceLimit::EvidenceReferences);
+            }
+            return false;
+        }
+        if status.is_reached(ResourceLimit::ForensicRecords) {
+            return false;
+        }
+        let Some(ip) = ip else {
+            return false;
+        };
+        let mut changed = false;
+        if let Some(decoding) = dns {
+            changed |= self.dns_observe(
+                scope,
+                (context.payload_offset, context.packet),
+                ip,
+                decoding,
+                status,
+            );
+        }
+        changed | self.observe_ip(scope, context, ip, status)
+    }
+
     fn observe_ip(
         &mut self,
         scope: &ForensicScope,
-        source: &CapturedFrame,
-        frame: &EthernetFrame<'_>,
+        context: IpContext<'_, '_>,
         ip: IpPacket<'_>,
-        packet: u64,
         status: &mut ResourceLimitStatus,
     ) -> bool {
         if status.is_reached(ResourceLimit::ForensicRecords) {
             return false;
         }
-        let mut changed = self.communication(scope, frame, ip, packet, status);
-        changed |= self.followup(scope, frame, ip, packet, status);
+        let mut changed = false;
+        if let Some(frame) = context.ethernet {
+            changed |= self.communication(scope, frame, ip, context.packet, status);
+            changed |= self.followup(scope, frame, ip, context.packet, status);
+        }
         if status.is_reached(ResourceLimit::ForensicRecords) {
             return changed;
         }
-        changed |= self.dns_followup(scope, ip, packet, status);
+        changed |= self.dns_followup(scope, ip, context.packet, status);
         if status.is_reached(ResourceLimit::ForensicRecords) {
             return changed;
         }
         if let Some(transport) = ip.transport {
             // These bytes lie inside the declared IP envelope, before any possible FCS
-            let offset = source.captured_len() - frame.payload.len()
-                + transport.payload_offset
-                + transport.payload.len();
+            let offset =
+                context.payload_offset + transport.payload_offset + transport.payload.len();
             changed |= self.record_trailer(
                 scope,
                 TrailingProtocol::Udp,
                 (offset, transport.trailing_bytes),
-                packet,
+                context.packet,
                 status,
             );
         }
@@ -164,7 +248,14 @@ impl ForensicTracker {
                 NetworkAddress::Ipv4(_) => TrailingProtocol::Ipv4,
                 NetworkAddress::Ipv6(_) => TrailingProtocol::Ipv6,
             };
-            changed |= self.trailer(scope, source, protocol, ip.trailing_bytes, packet, status);
+            changed |= self.trailer(
+                scope,
+                context.source,
+                protocol,
+                ip.trailing_bytes,
+                context.packet,
+                status,
+            );
         }
         changed
     }
