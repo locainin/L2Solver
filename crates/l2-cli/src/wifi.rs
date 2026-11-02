@@ -247,6 +247,8 @@ fn wireless_input(frame: &CapturedFrame) -> SelectedInput<'_> {
         LinkType::Ieee80211Radiotap => {
             SelectedInput::Supported(WirelessInput::Radiotap(frame.bytes()))
         }
-        LinkType::Ethernet | LinkType::Unknown(_) => SelectedInput::Unsupported,
+        LinkType::Ethernet | LinkType::LinuxSll | LinkType::LinuxSll2 | LinkType::Unknown(_) => {
+            SelectedInput::Unsupported
+        }
     }
 }
