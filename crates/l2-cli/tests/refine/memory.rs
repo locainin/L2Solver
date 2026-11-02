@@ -40,7 +40,7 @@ fn cached_refinement_preserves_memory_pressure_in_optional_and_strict_modes()
             crate::memory_error::find(error.as_ref()),
             Some(MemoryError::Limit { .. })
         ));
-        assert!(job.snapshot()?.cache_fallbacks.records().is_empty());
+        assert_eq!(job.snapshot()?.cache_fallbacks.records().len(), 0);
         assert_eq!(budget.snapshot()?.used_bytes, 0);
     }
     Ok(())
@@ -120,7 +120,7 @@ fn cached_analysis_memory_denial_is_not_treated_as_a_corrupt_cache() -> Result<(
         crate::memory_error::find(error.as_ref()),
         Some(MemoryError::Limit { .. })
     ));
-    assert!(job.snapshot()?.cache_fallbacks.records().is_empty());
+    assert_eq!(job.snapshot()?.cache_fallbacks.records().len(), 0);
     assert_eq!(constrained.snapshot()?.used_bytes, 0);
     Ok(())
 }
@@ -356,7 +356,7 @@ fn range_zip_expansion_is_admitted_before_member_reads_and_retries_without_omiss
         Some(MemoryError::Limit { .. })
     ));
     assert_eq!(report.zip_expanded_work_bytes, 0);
-    assert!(report.omissions.is_empty());
+    assert_eq!(report.omissions.len(), 0);
     let reads = job
         .snapshot()?
         .counters
@@ -476,7 +476,7 @@ fn zip_member_analysis_requires_memory_before_copying_the_member() -> Result<(),
         crate::memory_error::find(error.as_ref()),
         Some(MemoryError::Limit { .. })
     ));
-    assert!(report.artifacts.is_empty());
+    assert_eq!(report.artifacts.len(), 0);
     drop(blocker);
     Ok(())
 }

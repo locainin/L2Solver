@@ -888,7 +888,7 @@ fn refine_result_identity_uses_the_ordered_manifest_source_set() -> TestResult {
         .reuse(&identity, None, true, &Job::new("reuse"))?
         .ok_or("an owned refine result should be available")?;
     assert!(reused.complete);
-    assert!(reused.artifacts.is_empty());
+    assert_eq!(reused.artifacts.len(), 0);
     Ok(())
 }
 

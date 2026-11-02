@@ -138,7 +138,7 @@ fn streaming_omissions_require_memory_before_allocation() -> Result<(), Box<dyn 
             error.downcast_ref::<MemoryError>(),
             Some(MemoryError::Limit { .. })
         ));
-        assert!(context.report.omissions.is_empty());
+        assert_eq!(context.report.omissions.len(), 0);
         drop(competing);
 
         for _ in 0..100 {
@@ -394,7 +394,7 @@ fn transform_workspace_pressure_remains_typed_and_reads_no_source_bytes()
             error.downcast_ref::<MemoryError>(),
             Some(MemoryError::Limit { .. })
         ));
-        assert!(context.report.omissions.is_empty());
+        assert_eq!(context.report.omissions.len(), 0);
         Ok(())
     })?;
     assert_eq!(
@@ -496,7 +496,7 @@ fn cancelled_transform_closes_its_private_spool_without_publishing() -> Result<(
             .err()
             .ok_or("cancelled stream completed")?;
         assert!(error.to_string().contains("cancel"), "{error}");
-        assert!(context.report.omissions.is_empty());
+        assert_eq!(context.report.omissions.len(), 0);
         assert!(context.analysis.file_artifacts.is_empty());
         let open_after = std::fs::read_dir("/proc/self/fd")?.count();
         assert_eq!(open_before, open_after, "private spool remained open");

@@ -81,7 +81,7 @@ fn cache_fallback_summary_is_silent_for_empty_quiet_and_json_states() -> Result<
     for options in cases {
         let mut output = Vec::new();
         write_cache_fallback_summary(&mut output, &snapshot, &options)?;
-        assert!(output.is_empty());
+        assert_eq!(output.len(), 0);
     }
 
     let mut empty_output = Vec::new();
@@ -90,6 +90,6 @@ fn cache_fallback_summary_is_silent_for_empty_quiet_and_json_states() -> Result<
         &Job::new("no cache fallbacks").snapshot()?,
         &RecoveryOptions::default(),
     )?;
-    assert!(empty_output.is_empty());
+    assert_eq!(empty_output.len(), 0);
     Ok(())
 }

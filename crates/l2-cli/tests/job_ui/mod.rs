@@ -68,7 +68,7 @@ fn quiet_verbosity_suppresses_human_status() -> Result<(), Box<dyn Error>> {
     let job = Job::new("quiet run");
     let snapshot = job.snapshot()?;
 
-    assert!(render_human_line(&snapshot, RenderVerbosity::Quiet).is_empty());
+    assert_eq!(render_human_line(&snapshot, RenderVerbosity::Quiet), "");
     Ok(())
 }
 
@@ -207,7 +207,10 @@ fn quiet_json_filters_routine_progress_but_keeps_cancellation_ndjson() -> Result
     let mut events = JsonEventTracker::default();
 
     assert_eq!(events.pending_event(&running_snapshot), None);
-    assert!(capture_json_lines(&running_job, LinePolicy::QuietJsonEvents)?.is_empty());
+    assert_eq!(
+        capture_json_lines(&running_job, LinePolicy::QuietJsonEvents)?,
+        [] as [std::string::String; 0]
+    );
 
     running_job.request_cancel();
     let cancellation_snapshot = running_job.snapshot()?;
