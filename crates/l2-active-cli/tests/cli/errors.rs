@@ -101,6 +101,6 @@ fn missing_interface_produces_a_structured_not_found_error_without_transmitting(
             .and_then(serde_json::Value::as_str)
             .is_some()
     );
-    assert!(output.stdout.is_empty());
+    assert_eq!(output.stdout, [] as [u8; 0]);
     Ok(())
 }

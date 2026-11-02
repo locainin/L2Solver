@@ -56,7 +56,7 @@ fn owned_namespace_child_performs_one_eapol_start() -> Result<(), Box<dyn Error>
     require_private_namespace()?;
     let selector = InterfaceSelector::new(&std::env::var("L2_TEST_DOT1X_INTERFACE")?)?;
     let info = discover(&selector)?;
-    assert!(info.ipv4_assignments().is_empty());
+    assert_eq!(info.ipv4_assignments(), []);
     let limits = Limits::new(Duration::from_millis(900), 256, 65_536)?;
     let probe = Dot1xProbe::new(MacAddress::new(info.mac())?, limits)?;
     let helper = std::env::var_os("L2_TEST_ACTIVE_HELPER").ok_or("missing helper")?;

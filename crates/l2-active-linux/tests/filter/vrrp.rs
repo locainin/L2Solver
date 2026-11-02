@@ -13,7 +13,7 @@ const PARENT_TEST: &str =
 fn vrrp_filters_produce_bounded_forward_only_programs() -> Result<(), Box<dyn Error>> {
     for selected in [None, NonZeroU8::new(42)] {
         let instructions = program(selected)?;
-        assert!(!instructions.is_empty());
+        assert_ne!(instructions, [] as [rscap::filter::BpfInstruction; 0]);
         assert!(instructions.len() <= super::super::MAX_INSTRUCTIONS);
     }
     Ok(())

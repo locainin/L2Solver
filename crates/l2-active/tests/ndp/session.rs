@@ -151,7 +151,7 @@ fn cancellation_and_packet_budget_stop_actual_dispatch_or_collection() -> Result
 {
     let mut cancelled_link = Link::new(Vec::new(), None)?;
     let report = probe(None, 1, 4096)?.run(&mut cancelled_link, &AtomicBool::new(true))?;
-    assert!(cancelled_link.sent.is_empty());
+    assert_eq!(cancelled_link.sent, [] as [std::vec::Vec<u8>; 0]);
     assert_eq!(report.summary().stop_reason(), StopReason::Cancelled);
     assert_eq!(report.status(), NeighborStatus::Inconclusive);
 
@@ -172,7 +172,7 @@ fn expired_shared_deadline_prevents_ndp_send() -> Result<(), Box<dyn Error>> {
     let mut link = Link::new(Vec::new(), None)?;
     let report =
         probe(None, 10, 4096)?.run_until(&mut link, &AtomicBool::new(false), Instant::now())?;
-    assert!(link.sent.is_empty());
+    assert_eq!(link.sent, [] as [std::vec::Vec<u8>; 0]);
     assert_eq!(report.summary().stop_reason(), StopReason::Deadline);
     assert_eq!(report.status(), NeighborStatus::Inconclusive);
     Ok(())

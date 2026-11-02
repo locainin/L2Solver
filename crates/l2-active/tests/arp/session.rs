@@ -80,7 +80,7 @@ fn silence_loss_and_cancellation_never_establish_a_success() -> Result<(), Box<d
     assert_eq!(report.status(), NeighborStatus::Inconclusive);
     assert_eq!(report.summary().stop_reason(), StopReason::Cancelled);
     assert_eq!(report.summary().sent_packets(), 0);
-    assert!(link.sent.is_empty());
+    assert_eq!(link.sent, [] as [std::vec::Vec<u8>; 0]);
     Ok(())
 }
 
@@ -93,7 +93,7 @@ fn cancellation_during_send_keeps_the_attempt_and_does_not_claim_transmission()
     assert_eq!(report.summary().stop_reason(), StopReason::Cancelled);
     assert!(report.summary().send_attempted());
     assert_eq!(report.summary().sent_packets(), 0);
-    assert!(link.sent.is_empty());
+    assert_eq!(link.sent, [] as [std::vec::Vec<u8>; 0]);
     Ok(())
 }
 
@@ -540,7 +540,7 @@ fn expired_shared_deadline_prevents_any_send() -> Result<(), Box<dyn Error>> {
     assert_eq!(report.summary().stop_reason(), StopReason::Deadline);
     assert!(!report.summary().send_attempted());
     assert_eq!(report.summary().sent_packets(), 0);
-    assert!(link.sent.is_empty());
+    assert_eq!(link.sent, [] as [std::vec::Vec<u8>; 0]);
     Ok(())
 }
 

@@ -182,7 +182,7 @@ fn verify_disclosure(
         .get("observations")
         .and_then(serde_json::Value::as_array)
         .ok_or("missing observations")?;
-    assert!(!observations.is_empty());
+    assert_ne!(observations.as_slice(), [] as [serde_json::Value; 0]);
     let mut hex = String::new();
     for byte in expected {
         write!(&mut hex, "{byte:02x}")?;

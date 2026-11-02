@@ -21,7 +21,7 @@ fn independently_encoded_stack_exposes_labels_without_sending_or_payload()
     assert_eq!(report.status(), MplsStatus::Observed);
     assert!(!report.has_unexpected_top_label());
     assert_eq!(report.summary().sent_packets(), 0);
-    assert!(link.sent.is_empty());
+    assert_eq!(link.sent, [] as [std::vec::Vec<u8>; 0]);
     let item = report.observations().first().ok_or("missing MPLS stack")?;
     assert_eq!(item.evidence(), MplsEvidence::Stack);
     assert_eq!(
@@ -317,7 +317,7 @@ fn receive_budgets_and_observation_capacity_bound_work_without_sending()
     let report = monitor(None, 80, 8_192)?.run(&mut link, &AtomicBool::new(false))?;
     assert_eq!(report.observations().len(), 64);
     assert_eq!(report.summary().stop_reason(), StopReason::ObservationLimit);
-    assert!(link.sent.is_empty());
+    assert_eq!(link.sent, [] as [std::vec::Vec<u8>; 0]);
     let mut link = Link::new(
         vec![
             ReceiveEvent::Frame(capture(VALID)?),

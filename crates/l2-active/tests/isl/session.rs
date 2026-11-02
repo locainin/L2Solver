@@ -37,7 +37,7 @@ fn independent_isl_frame_exposes_bounded_header_claims_without_a_send() -> Resul
         Some(crate::support::identity()?)
     );
     assert!(!report.summary().send_attempted());
-    assert!(link.sent.is_empty());
+    assert_eq!(link.sent, [] as [std::vec::Vec<u8>; 0]);
     Ok(())
 }
 
@@ -72,7 +72,7 @@ fn isl_all_ethernet_user_nibbles_and_both_multicast_prefixes_are_supported()
             .iter()
             .all(|item| matches!(item.evidence(), IslEvidence::Frame(_)))
     );
-    assert!(link.sent.is_empty());
+    assert_eq!(link.sent, [] as [std::vec::Vec<u8>; 0]);
     Ok(())
 }
 
