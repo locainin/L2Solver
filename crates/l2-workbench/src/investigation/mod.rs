@@ -129,17 +129,40 @@ pub fn build_selected_with_limits_and_memory(
     )
 }
 
+pub(crate) fn build_selected_with_case(
+    input: BuildInput<'_>,
+    selected_frames: u64,
+    limits: Limits,
+    case: Case,
+) -> Result<BuildResult, Box<dyn Error>> {
+    build_scoped_case(
+        input,
+        Scope::selection(input, selected_frames)?,
+        limits,
+        case,
+    )
+}
+
 fn build_scoped(
     input: BuildInput<'_>,
     scope: Scope,
     limits: Limits,
     budget: Option<&MemoryBudget>,
 ) -> Result<BuildResult, Box<dyn Error>> {
-    let mut case = if let Some(budget) = budget {
+    let case = if let Some(budget) = budget {
         Case::with_memory_budget(budget)?
     } else {
         Case::new()
     };
+    build_scoped_case(input, scope, limits, case)
+}
+
+fn build_scoped_case(
+    input: BuildInput<'_>,
+    scope: Scope,
+    limits: Limits,
+    mut case: Case,
+) -> Result<BuildResult, Box<dyn Error>> {
     let source = case.add_source(input.label, "capture", input.length, input.sha256_hex, None)?;
     let mut reconstruction = Reconstructor::with_limits_at(limits, scope.first)?;
     let mut records = BTreeMap::new();
@@ -162,7 +185,7 @@ fn build_scoped(
     }
     let report = reconstruction.finish()?;
     let omitted = scope.selected - u64::try_from(records.len())?;
-    let mut complete = report.complete && omitted == 0;
+    let mut complete = report.complete && omitted == 0 && case.collection_complete();
     if omitted != 0 {
         case.add_limitation(&format!("{omitted} capture records were omitted after the retention budget; later absence and event chains are unresolved"))?;
     }

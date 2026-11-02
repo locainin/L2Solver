@@ -1,10 +1,7 @@
 use super::{Result, Store, invalid, packets};
 use crate::{
     evidence::{FLOW_SELECTION_KIND, FLOW_SELECTION_PREDICATE},
-    investigation::{
-        BuildInput, BuildResult, Record, build_selected_with_limits,
-        build_selected_with_limits_and_memory,
-    },
+    investigation::{BuildInput, BuildResult, Record, build_selected_with_case},
     reconstruction::{Limits, Reconstructor, RecordRetentionLimit, RecordRetentionStatus},
 };
 use serde::Serialize;
@@ -75,15 +72,10 @@ impl Store {
             records: &records,
             frames_seen: selection.source.packets,
         };
-        let mut result = build_selected_for_store(input, total, limits, self.memory_budget())?;
-        crate::capture_collection::apply_to_case(
-            &mut result,
-            &selection.source.source_id,
-            selection.source.collection_summary,
-        )?;
-        result.case.add_limitation("This indexed flow selection includes complete unfragmented transport envelopes only; raw fragments remain in the source and may require separate reconstruction")?;
+        // Preserve required scope and collection receipts before optional packet analysis
+        let mut initial = initial_store_case(&selection.source, self.memory_budget())?;
         add_flow_evidence(
-            &mut result,
+            &mut initial,
             &FlowEvidence {
                 requested_flows: flow_ids,
                 selected_flows: &selection.flow_ids,
@@ -95,6 +87,8 @@ impl Store {
                 retention_limits: &retention_limits,
             },
         )?;
+        let mut result = build_selected_with_case(input, total, limits, initial.case)?;
+        result.case.add_limitation("This indexed flow selection includes complete unfragmented transport envelopes only; raw fragments remain in the source and may require separate reconstruction")?;
         Ok(result)
     }
 
@@ -479,21 +473,6 @@ fn build_flow_page(
         records,
         frames_seen: source.packets,
     };
-    let mut result = build_selected_for_store(input, selected_records, request.limits, budget)?;
-    crate::capture_collection::apply_to_case(
-        &mut result,
-        &source.source_id,
-        source.collection_summary,
-    )?;
-    let retained_records = capture_summary_retained_records(&result)?;
-    if retained_records != selected_records {
-        return Err(invalid(
-            "bounded flow page did not retain every selected record",
-        ));
-    }
-    let omitted_records = selected_records
-        .checked_sub(retained_records)
-        .ok_or_else(|| invalid("flow page retained more records than selected"))?;
     let metadata = FlowPageMetadata {
         flow: request.flow,
         page_index,
@@ -502,10 +481,20 @@ fn build_flow_page(
         flow_selected_records: request.total_records,
         prefix_records_skipped: request.prefix_records,
         selected_records,
-        retained_records,
-        omitted_records,
+        retained_records: selected_records,
+        omitted_records: 0,
     };
-    add_flow_page_evidence(&mut result, source, metadata)?;
+    // Keep page and selection receipts before optional analysis can exhaust Case quotas
+    let mut initial = initial_store_case(source, budget)?;
+    add_flow_page_evidence(&mut initial, source, metadata)?;
+    let mut result =
+        build_selected_with_case(input, selected_records, request.limits, initial.case)?;
+    let retained_records = capture_summary_retained_records(&result)?;
+    if retained_records != selected_records {
+        return Err(invalid(
+            "bounded flow page did not retain every selected record",
+        ));
+    }
     result.case.add_limitation("This indexed flow page includes complete unfragmented transport envelopes only; raw fragments remain in the source and may require separate reconstruction")?;
     result.case.mark_incomplete(
         "This bounded flow page is an independent selected-record analysis; TCP/session/application state was not joined across page boundaries, so objects split across pages remain unresolved",
@@ -518,21 +507,33 @@ fn build_flow_page(
         last_packet,
         selected_records,
         retained_records,
-        omitted_records,
+        omitted_records: 0,
         result,
     })
 }
 
-fn build_selected_for_store(
-    input: BuildInput<'_>,
-    selected_records: u64,
-    limits: Limits,
+fn initial_store_case(
+    source: &super::Source,
     budget: Option<&crate::job::MemoryBudget>,
 ) -> Result<BuildResult> {
-    budget.map_or_else(
-        || build_selected_with_limits(input, selected_records, limits),
-        |budget| build_selected_with_limits_and_memory(input, selected_records, limits, budget),
-    )
+    let case = if let Some(budget) = budget {
+        crate::evidence::Case::with_memory_budget(budget)?
+    } else {
+        crate::evidence::Case::new()
+    };
+    let mut result = BuildResult {
+        case,
+        complete: true,
+    };
+    let hash = source
+        .source_id
+        .strip_prefix("sha256:")
+        .ok_or_else(|| invalid("invalid indexed source hash"))?;
+    let source_id = result
+        .case
+        .add_source(&source.label, "capture", source.bytes, hash, None)?;
+    crate::capture_collection::apply_to_case(&mut result, &source_id, source.collection_summary)?;
+    Ok(result)
 }
 
 fn flow_page_bounds(records: &[Record]) -> Result<(u32, u32)> {
