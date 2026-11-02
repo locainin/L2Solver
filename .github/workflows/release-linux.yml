@@ -162,8 +162,8 @@ jobs:
           --candidate-only
 
       - name: Upload unqualified review candidate
-        # Upload only on a manual run or version tag
-        if: github.event_name == 'workflow_dispatch' || (github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v'))
+        # Keep branch and manual validation runs free of published binaries
+        if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
         # Pin the upload implementation to the reviewed v7.0.0 commit
         uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f
         with:
