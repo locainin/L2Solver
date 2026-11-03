@@ -1,7 +1,10 @@
 use crate::evidence::{Case, Node, SourceRange};
-use l2_capture::CapturedFrame;
-use l2_core::{EthernetFrame, FrameField};
-use l2_discovery::{NetworkAddress, TransportHeader, ip_header, ip_packet};
+use l2_capture::{CapturedFrame, LinkType};
+use l2_core::FrameField;
+use l2_discovery::{
+    NetworkAddress, TransportHeader, ip_header_from_payload, ip_packet_from_payload,
+    link::{NetworkEnvelope, decode_network_frame},
+};
 use serde_json::Value;
 use std::{
     collections::{HashMap, HashSet},
@@ -89,14 +92,14 @@ pub fn packet_facts(case: &Case) -> Vec<PacketFacts> {
 pub fn frame_facts(frame: &CapturedFrame, range: SourceRange) -> PacketFacts {
     let packet_number = range.packet.unwrap_or_default();
     let metadata = frame.metadata();
-    let ethernet = metadata
-        .link_type()
-        .is_ethernet()
-        .then(|| l2_core::decode(frame.bytes()).ok())
-        .flatten();
-    let scope = ethernet.as_ref().map_or_else(
+    let network = decode_network_frame(metadata.link_type(), frame.bytes());
+    let scope = network.as_ref().map_or_else(
         || metadata_scope(frame),
-        |decoded| serde_json::json!(l2_audit::ForensicScope::new(metadata, decoded)),
+        |decoded| {
+            serde_json::json!(l2_audit::ForensicScope::from_network_frame(
+                metadata, decoded
+            ))
+        },
     );
     let mut facts = empty_facts(0, packet_number);
     facts.scope = scope;
@@ -112,8 +115,8 @@ pub fn frame_facts(frame: &CapturedFrame, range: SourceRange) -> PacketFacts {
     });
     facts.source_id = Some(range.source.clone());
     facts.ranges.push(range);
-    if let Some(ethernet) = ethernet.as_ref() {
-        decode_frame(&mut facts, ethernet);
+    if let Some(network) = network.as_ref() {
+        decode_frame(&mut facts, network);
     }
     facts
 }
@@ -194,11 +197,31 @@ fn facts_for_node(
     let mut facts = facts_from_details(node, packet_number, source_lengths);
     facts.source_id = node.ranges.first().map(|range| range.source.clone());
     facts.tcp_episode = tcp_episode;
-    if node.details.get("link_type").and_then(Value::as_u64) == Some(1)
+    // Decode facts from retained bytes, not address claims in node details
+    if let Some(link_type) = node
+        .details
+        .get("link_type")
+        .and_then(Value::as_u64)
+        .and_then(|raw| u16::try_from(raw).ok())
         && let Some(blob_id) = node.blob.as_deref()
         && let Some(bytes) = blobs.get(blob_id)
-        && let Ok(frame) = l2_core::decode(bytes)
+        && let Some(frame) = decode_network_frame(LinkType::from_raw(link_type), bytes)
     {
+        // The SLL2 interface index comes from frame bytes, not saved detail claims
+        if let Some(cooked) = frame.cooked() {
+            if let Some(ifindex) = cooked.interface_index() {
+                if let Some(scope) = facts.scope.as_object_mut() {
+                    scope.insert("cooked_ifindex".to_owned(), Value::from(ifindex));
+                } else {
+                    facts.scope = serde_json::json!({
+                        "declared_scope": std::mem::take(&mut facts.scope),
+                        "cooked_ifindex": ifindex,
+                    });
+                }
+            } else if let Some(scope) = facts.scope.as_object_mut() {
+                scope.remove("cooked_ifindex");
+            }
+        }
         decode_frame(&mut facts, &frame);
     }
     facts
@@ -228,27 +251,38 @@ fn facts_from_details(
     facts
 }
 
-fn decode_frame(facts: &mut PacketFacts, frame: &EthernetFrame<'_>) {
-    facts.source_mac = Some(frame.source);
-    facts.destination_mac = Some(frame.destination);
-    facts.eth_type = match frame.field {
-        FrameField::EtherType(value) => Some(value),
-        FrameField::Length(_) => None,
-    };
-    facts.vlan_ids = frame.vlan_tags.iter().map(|tag| tag.tci & 0x0fff).collect();
-    if let Some(arp) = l2_discovery::arp_packet(frame) {
-        facts.protocol = Some("arp");
-        facts.arp_operation = Some(arp.operation);
-        facts.arp_source_ip = Some(IpAddr::from(arp.sender_ip));
-        facts.arp_destination_ip = Some(IpAddr::from(arp.target_ip));
+fn decode_frame(facts: &mut PacketFacts, frame: &NetworkEnvelope<'_>) {
+    if let Some(ethernet) = frame.ethernet() {
+        facts.source_mac = Some(ethernet.source);
+        facts.destination_mac = Some(ethernet.destination);
+        facts.eth_type = match ethernet.field {
+            FrameField::EtherType(value) => Some(value),
+            FrameField::Length(_) => None,
+        };
+        facts.vlan_ids = ethernet
+            .vlan_tags
+            .iter()
+            .map(|tag| tag.tci & 0x0fff)
+            .collect();
+        if let Some(arp) = l2_discovery::arp_packet(ethernet) {
+            facts.protocol = Some("arp");
+            facts.arp_operation = Some(arp.operation);
+            facts.arp_source_ip = Some(IpAddr::from(arp.sender_ip));
+            facts.arp_destination_ip = Some(IpAddr::from(arp.target_ip));
+        }
     }
-    if let Some(header) = ip_header(frame) {
+    // Opaque cooked protocol layouts cannot select an IP decoder
+    let Some(FrameField::EtherType(protocol)) = frame.field() else {
+        return;
+    };
+    let payload = frame.payload();
+    if let Some(header) = ip_header_from_payload(protocol, payload) {
         facts.source_ip = Some(to_ip_address(header.source));
         facts.destination_ip = Some(to_ip_address(header.destination));
         facts.protocol_number = Some(header.protocol);
         facts.protocol = protocol_name(header.protocol, header.source);
         let message_type = (!header.fragmented && header.header_len < header.total_len)
-            .then(|| frame.payload.get(header.header_len))
+            .then(|| payload.get(header.header_len))
             .flatten();
         match (header.source, header.protocol, message_type) {
             (NetworkAddress::Ipv4(_), 1, Some(message_type)) => {
@@ -260,7 +294,7 @@ fn decode_frame(facts: &mut PacketFacts, frame: &EthernetFrame<'_>) {
             _ => {}
         }
     }
-    let Some(packet) = ip_packet(frame) else {
+    let Some(packet) = ip_packet_from_payload(protocol, payload) else {
         return;
     };
     let Some(transport) = packet.transport else {
