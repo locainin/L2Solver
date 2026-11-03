@@ -72,11 +72,13 @@ impl Channel {
             return Err(wire::invalid_record());
         }
         loop {
-            match send(
-                self.fd.as_raw_fd(),
-                record,
-                MsgFlags::MSG_DONTWAIT | MsgFlags::MSG_NOSIGNAL,
-            ) {
+            match retry_interrupted(deadline, || {
+                send(
+                    self.fd.as_raw_fd(),
+                    record,
+                    MsgFlags::MSG_DONTWAIT | MsgFlags::MSG_NOSIGNAL,
+                )
+            }) {
                 Ok(length) if length == record.len() => return Ok(()),
                 Ok(_) => {
                     return Err(io::Error::new(
@@ -84,19 +86,24 @@ impl Channel {
                         "partial helper record",
                     ));
                 }
-                Err(Errno::EAGAIN) => self.wait(PollFlags::POLLOUT, deadline)?,
-                Err(Errno::EINTR) => {}
-                Err(error) => return Err(errno(error)),
+                Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                    self.wait(PollFlags::POLLOUT, deadline)?;
+                }
+                Err(error) => return Err(error),
             }
         }
     }
 
-    pub fn try_receive(&self) -> io::Result<Option<Vec<u8>>> {
+    pub fn try_receive(&self, deadline: Instant) -> io::Result<Option<Vec<u8>>> {
+        // Avoid allocating receive buffers when the deadline already passed
+        crate::deadline::ensure_before(deadline)?;
         let mut bytes = crate::buffer::zeroed(wire::MAX_RECORD)?;
         let mut iov = [IoSliceMut::new(&mut bytes)];
         // Linux emits credentials first and closes descriptors that do not fit
         let space = nix::sys::socket::cmsg_space::<nix::libc::ucred>();
         let mut ancillary = crate::buffer::zeroed(space)?;
+        // Reject an elapsed deadline after allocation and before receiving anything
+        crate::deadline::ensure_before(deadline)?;
         let message = match recvmsg::<()>(
             self.fd.as_raw_fd(),
             &mut iov,
@@ -183,10 +190,25 @@ impl Channel {
 
     pub fn receive(&self, deadline: Instant) -> io::Result<Vec<u8>> {
         loop {
-            if let Some(record) = self.try_receive()? {
+            if let Some(record) = self.try_receive(deadline)? {
                 return Ok(record);
             }
             self.wait(PollFlags::POLLIN, deadline)?;
+        }
+    }
+}
+
+fn retry_interrupted<T>(
+    deadline: Instant,
+    mut attempt: impl FnMut() -> nix::Result<T>,
+) -> io::Result<T> {
+    loop {
+        // Require a fresh, strictly early clock sample before each attempt
+        // Scheduling can delay the syscall or its completion past the deadline
+        crate::deadline::ensure_before(deadline)?;
+        match attempt() {
+            Err(Errno::EINTR) => {}
+            result => return result.map_err(errno),
         }
     }
 }

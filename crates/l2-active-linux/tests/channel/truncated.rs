@@ -1,4 +1,4 @@
-use super::{Channel, Peer, count_open_identity};
+use super::{Channel, Peer, count_open_identity, future_deadline};
 use nix::sys::socket::{ControlMessage, MsgFlags, sendmsg};
 use std::{
     fs::{self, OpenOptions},
@@ -54,7 +54,7 @@ fn truncated_ancillary_data_does_not_leak_descriptors() -> io::Result<()> {
         None,
     )
     .map_err(io::Error::other)?;
-    let result = channel.try_receive();
+    let result = channel.try_receive(future_deadline());
 
     // Free one slot so the descriptor directory can be inspected at the limit
     drop(remote);

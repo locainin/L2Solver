@@ -5,12 +5,19 @@ use std::{
     io::{self, IoSlice},
     os::{fd::AsRawFd, unix::fs::MetadataExt},
     path::Path,
+    time::{Duration, Instant},
 };
 
+#[path = "deadline.rs"]
+mod deadline;
 #[path = "records.rs"]
 mod records;
 #[path = "truncated.rs"]
 mod truncated;
+
+fn future_deadline() -> Instant {
+    Instant::now() + Duration::from_secs(5)
+}
 
 fn count_open_identity(device: u64, inode: u64) -> io::Result<usize> {
     let mut count = 0;
@@ -59,7 +66,19 @@ fn records_close_received_descriptors_before_reporting_the_error() -> io::Result
         )
         .map_err(io::Error::other)?;
         assert_eq!(
-            channel.try_receive().err().map(|error| error.kind()),
+            channel
+                .receive(Instant::now())
+                .err()
+                .map(|error| error.kind()),
+            Some(io::ErrorKind::TimedOut),
+            "payload length {}",
+            data.len()
+        );
+        assert_eq!(
+            channel
+                .try_receive(future_deadline())
+                .err()
+                .map(|error| error.kind()),
             Some(expected),
             "payload length {}, descriptor count {descriptor_count}",
             data.len(),
