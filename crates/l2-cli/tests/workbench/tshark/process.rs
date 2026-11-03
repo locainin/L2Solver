@@ -10,6 +10,10 @@ use std::{
     time::{Duration, Instant},
 };
 
+#[cfg(target_os = "linux")]
+#[path = "process/spawn_failure.rs"]
+mod spawn_failure;
+
 fn empty_object_root(directory: &Path) -> Result<(), Box<dyn Error>> {
     std::fs::create_dir(directory)?;
     Ok(())
