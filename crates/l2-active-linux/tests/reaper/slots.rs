@@ -37,7 +37,7 @@ thread_local! {
 }
 
 pub(super) fn record_handoff() {
-    OBSERVED_HANDOFFS.update(|count| count.map(|value| value + 1));
+    OBSERVED_HANDOFFS.with(|handoffs| handoffs.update(|count| count.map(|value| value + 1)));
 }
 
 pub fn start_handoff_observation() {
@@ -74,11 +74,11 @@ pub fn take_drop_unknown() -> io::Result<(Child, Lease)> {
 }
 
 pub(super) fn record_wait() {
-    REAP_OPERATIONS.update(|(waits, kills)| (waits + 1, kills));
+    REAP_OPERATIONS.with(|counts| counts.update(|(waits, kills)| (waits + 1, kills)));
 }
 
 pub(super) fn record_kill() {
-    REAP_OPERATIONS.update(|(waits, kills)| (waits, kills + 1));
+    REAP_OPERATIONS.with(|counts| counts.update(|(waits, kills)| (waits, kills + 1)));
 }
 
 #[test]

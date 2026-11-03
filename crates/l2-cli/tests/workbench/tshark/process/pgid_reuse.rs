@@ -422,11 +422,11 @@ fn ignored_sigchld_rejects_capture_before_launching_tshark() -> Result<(), Box<d
     if !in_private_namespace(name)? {
         return Ok(());
     }
-    let output = Command::new("sh")
+    // Set SIGCHLD directly because shells may change it before exec
+    let output = Command::new("python3")
         .args([
             "-c",
-            "trap '' CHLD; exec \"$1\" --exact \"$2\" --nocapture",
-            "sh",
+            "import os, signal, sys; signal.signal(signal.SIGCHLD, signal.SIG_IGN); os.execv(sys.argv[1], [sys.argv[1], '--exact', sys.argv[2], '--nocapture'])",
         ])
         .arg(std::env::current_exe()?)
         .arg(name)
