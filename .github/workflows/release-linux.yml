@@ -10,6 +10,7 @@ name: Linux release candidate
   pull_request:
     branches:
       - "dev"
+      - "master"
   workflow_dispatch:
 
 permissions:

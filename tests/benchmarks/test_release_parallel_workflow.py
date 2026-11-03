@@ -17,6 +17,24 @@ def job(name):
     return match.group(1)
 
 
+def test_integration_pull_requests_trigger_checks_on_the_merge_revision():
+    workflow = WORKFLOW.read_text()
+    pull_request = re.search(
+        r"(?ms)^  pull_request:\n(.*?)(?=^  [a-z_]+:|^permissions:)",
+        workflow,
+    )
+    assert pull_request, "integration checks require the pull_request event"
+    targets = re.findall(r'^      - "([^"]+)"$', pull_request.group(1), re.MULTILINE)
+    assert set(targets) == {"dev", "master"}
+    # The checkout default uses GitHub's synthetic merge revision for pull requests
+    for checkout in re.finditer(
+        r"(?ms)^      - name: Check out the requested commit\n(.*?)(?=^      -|\Z)",
+        workflow,
+    ):
+        assert not re.search(r"(?m)^\s+ref:", checkout.group(1))
+    assert "permissions:\n  contents: read" in workflow
+
+
 def test_test_shards_reuse_the_same_complete_archived_build():
     build = job("prepare_tests")
     tests = job("tests")
