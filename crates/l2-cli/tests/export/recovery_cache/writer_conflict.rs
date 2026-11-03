@@ -72,7 +72,7 @@ fn assert_writer_does_not_force_recovery(strict_cache: bool) -> Result<(), Box<d
 fn assert_reused_without_work(job: &Job) -> Result<(), Box<dyn Error>> {
     let snapshot = job.snapshot()?;
     assert_eq!(snapshot.counters.get(&Counter::CacheHits), Some(&1));
-    assert!(snapshot.cache_fallbacks.records().is_empty());
+    assert_eq!(snapshot.cache_fallbacks.records().len(), 0);
     for counter in [
         Counter::CacheMisses,
         Counter::CandidatesExamined,

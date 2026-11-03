@@ -29,6 +29,10 @@ mod lifecycle;
 #[path = "recovery_cache/writer_conflict.rs"]
 mod writer_conflict;
 
+#[cfg(target_os = "linux")]
+#[path = "recovery_cache/maintenance_contention.rs"]
+mod maintenance_contention;
+
 #[test]
 fn warm_cache_restores_the_case_and_local_coverage() -> Result<(), Box<dyn Error>> {
     let temporary = tempfile::tempdir()?;
