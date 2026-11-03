@@ -141,6 +141,13 @@ fn version_identity(executable: &Path, job: Option<&Job>) -> Value {
                 "error_kind": format!("{:?}", error.kind())
             });
         }
+        Err(process::ProcessError::WorkerSpawn { source, .. }) => {
+            return json!({
+                "status": "unavailable",
+                "reason": "worker_spawn_failed",
+                "error_kind": format!("{:?}", source.kind())
+            });
+        }
         Err(process::ProcessError::Read(error)) => {
             return json!({
                 "status": "unavailable",

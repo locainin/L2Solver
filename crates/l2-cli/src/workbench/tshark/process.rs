@@ -99,10 +99,41 @@ pub(super) struct StreamingPolicy<'a> {
     pub job: Option<&'a Job>,
 }
 
+#[derive(Clone, Copy)]
+struct CapturePolicy<'a> {
+    timeout: Duration,
+    stdout_maximum: usize,
+    stderr_maximum: usize,
+    job: Option<&'a Job>,
+}
+
+trait WorkerSpawner {
+    fn spawn<F>(&mut self, name: &'static str, worker: F) -> io::Result<JoinHandle<()>>
+    where
+        F: FnOnce() + Send + 'static;
+}
+
+struct ThreadSpawner;
+
+impl WorkerSpawner for ThreadSpawner {
+    fn spawn<F>(&mut self, name: &'static str, worker: F) -> io::Result<JoinHandle<()>>
+    where
+        F: FnOnce() + Send + 'static,
+    {
+        thread::Builder::new()
+            .name(format!("tshark-{name}"))
+            .spawn(worker)
+    }
+}
+
 /// Process failure that cannot be represented by a successful receipt
 #[derive(Debug)]
 pub(super) enum ProcessError {
     Spawn(io::Error),
+    WorkerSpawn {
+        worker: &'static str,
+        source: io::Error,
+    },
     Read(io::Error),
     Cancelled,
     TimedOut,
@@ -115,6 +146,12 @@ impl fmt::Display for ProcessError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Spawn(error) => write!(formatter, "could not start TShark: {error}"),
+            Self::WorkerSpawn { worker, source } => {
+                write!(
+                    formatter,
+                    "could not start TShark {worker} reader: {source}"
+                )
+            }
             Self::Read(error) => write!(formatter, "could not capture TShark output: {error}"),
             Self::Cancelled => formatter.write_str("TShark object export was cancelled"),
             Self::TimedOut => formatter.write_str("TShark exceeded its time budget"),
@@ -125,7 +162,29 @@ impl fmt::Display for ProcessError {
     }
 }
 
-impl Error for ProcessError {}
+impl Error for ProcessError {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        match self {
+            Self::Spawn(error) | Self::Read(error) | Self::WorkerSpawn { source: error, .. } => {
+                Some(error)
+            }
+            _ => None,
+        }
+    }
+}
+
+fn start_worker(
+    spawner: &mut impl WorkerSpawner,
+    name: &'static str,
+    worker: impl FnOnce() + Send + 'static,
+) -> Result<JoinHandle<()>, ProcessError> {
+    spawner
+        .spawn(name, worker)
+        .map_err(|source| ProcessError::WorkerSpawn {
+            worker: name,
+            source,
+        })
+}
 
 /// Run an offline `TShark` process while draining both pipes and enforcing hard budgets
 pub(super) fn run(
@@ -157,6 +216,33 @@ pub(super) fn run_with_job(
     stderr_maximum: usize,
     job: Option<&Job>,
 ) -> Result<Output, ProcessError> {
+    run_with_job_and_spawner(
+        executable,
+        arguments,
+        environment,
+        CapturePolicy {
+            timeout,
+            stdout_maximum,
+            stderr_maximum,
+            job,
+        },
+        &mut ThreadSpawner,
+    )
+}
+
+fn run_with_job_and_spawner(
+    executable: &Path,
+    arguments: &[OsString],
+    environment: &[(OsString, OsString)],
+    policy: CapturePolicy<'_>,
+    spawner: &mut impl WorkerSpawner,
+) -> Result<Output, ProcessError> {
+    let CapturePolicy {
+        timeout,
+        stdout_maximum,
+        stderr_maximum,
+        job,
+    } = policy;
     if job.is_some_and(Job::is_cancelled) {
         return Err(ProcessError::Cancelled);
     }
@@ -178,19 +264,52 @@ pub(super) fn run_with_job(
     };
     let (sender, receiver) = mpsc::channel();
     let stdout_sender = sender.clone();
-    let stdout_worker = thread::spawn(move || {
+    let stdout_worker = match start_worker(spawner, "stdout", move || {
         let _ = stdout_sender.send((true, capture(stdout, stdout_maximum)));
-    });
-    let stderr_worker = thread::spawn(move || {
+    }) {
+        Ok(worker) => worker,
+        Err(error) => {
+            // No reader owns stderr yet, so close it before stopping the process
+            drop(stderr);
+            stop_and_reap(&mut child);
+            return Err(error);
+        }
+    };
+    let stderr_worker = match start_worker(spawner, "stderr", move || {
         let _ = sender.send((false, capture(stderr, stderr_maximum)));
-    });
+    }) {
+        Ok(worker) => worker,
+        Err(error) => {
+            // Stop the process group so the first reader can finish before joining
+            stop_and_reap(&mut child);
+            join_workers_after_stop([stdout_worker]);
+            return Err(error);
+        }
+    };
+    wait_for_capture(
+        &mut child,
+        &receiver,
+        [stdout_worker, stderr_worker],
+        deadline,
+        job,
+    )
+}
+
+fn wait_for_capture(
+    child: &mut Child,
+    receiver: &mpsc::Receiver<(bool, Result<Vec<u8>, ProcessError>)>,
+    workers: [JoinHandle<()>; 2],
+    deadline: Instant,
+    job: Option<&Job>,
+) -> Result<Output, ProcessError> {
+    let [stdout_worker, stderr_worker] = workers;
     let mut stdout_result = None;
     let mut stderr_result = None;
     let mut status = None;
 
     loop {
         if job.is_some_and(Job::is_cancelled) {
-            stop_and_reap(&mut child);
+            stop_and_reap(child);
             join_workers_after_stop([stdout_worker, stderr_worker]);
             return Err(ProcessError::Cancelled);
         }
@@ -199,7 +318,7 @@ pub(super) fn run_with_job(
                 Ok(bytes) if is_stdout => stdout_result = Some(bytes),
                 Ok(bytes) => stderr_result = Some(bytes),
                 Err(error) => {
-                    stop_and_reap(&mut child);
+                    stop_and_reap(child);
                     join_workers_after_stop([stdout_worker, stderr_worker]);
                     return Err(error);
                 }
@@ -209,7 +328,7 @@ pub(super) fn run_with_job(
             status = match child.try_wait() {
                 Ok(status) => status,
                 Err(error) => {
-                    stop_and_reap(&mut child);
+                    stop_and_reap(child);
                     join_workers_after_stop([stdout_worker, stderr_worker]);
                     return Err(ProcessError::Read(error));
                 }
@@ -227,7 +346,7 @@ pub(super) fn run_with_job(
             });
         }
         if Instant::now() >= deadline {
-            stop_and_reap(&mut child);
+            stop_and_reap(child);
             join_workers_after_stop([stdout_worker, stderr_worker]);
             return Err(ProcessError::TimedOut);
         }
@@ -243,6 +362,22 @@ pub(super) fn run_streaming(
     arguments: &[OsString],
     environment: &[(OsString, OsString)],
     policy: StreamingPolicy<'_>,
+) -> Result<StreamOutput, ProcessError> {
+    run_streaming_with_spawner(
+        executable,
+        arguments,
+        environment,
+        policy,
+        &mut ThreadSpawner,
+    )
+}
+
+fn run_streaming_with_spawner(
+    executable: &Path,
+    arguments: &[OsString],
+    environment: &[(OsString, OsString)],
+    policy: StreamingPolicy<'_>,
+    spawner: &mut impl WorkerSpawner,
 ) -> Result<StreamOutput, ProcessError> {
     if policy.job.is_some_and(Job::is_cancelled) {
         return Err(ProcessError::Cancelled);
@@ -275,14 +410,20 @@ pub(super) fn run_streaming(
     };
     let diagnostics = Arc::new(Mutex::new(DiagnosticState::default()));
     let worker_diagnostics = Arc::clone(&diagnostics);
-    let worker = thread::spawn(move || {
+    let worker = match start_worker(spawner, "stderr", move || {
         let result = drain_tail(stderr, policy.stderr_maximum, &worker_diagnostics);
         let mut state = lock_diagnostics(&worker_diagnostics);
         state.complete = true;
         if let Err(error) = result {
             state.error = Some(error.to_string());
         }
-    });
+    }) {
+        Ok(worker) => worker,
+        Err(error) => {
+            stop_and_reap(&mut child);
+            return Err(error);
+        }
+    };
     let mut monitor = StreamingMonitor::new(policy, Arc::clone(&diagnostics));
 
     loop {
