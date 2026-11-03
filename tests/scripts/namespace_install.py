@@ -327,6 +327,10 @@ else:
     publish("--payload", "/stage/payload", "--prefix", prefix, *selection)
     assert not cap(helper)
     assert not cap(resolved("/local/bin/l2solver-active-helper"))
+    denied = publish("--payload", "/stage/payload", "--prefix", prefix, *selection, "--enable-active", success=False)
+    assert "--retire-inactive" in denied.stderr
+    assert not cap(helper)
+    publish("--retire-inactive", "--prefix", prefix)
     publish("--payload", "/stage/payload", "--prefix", prefix, *selection, "--enable-active")
     helper = resolved("/local/bin/l2solver-active-helper")
     assert cap(helper) == f"{helper} cap_net_raw=ep"
