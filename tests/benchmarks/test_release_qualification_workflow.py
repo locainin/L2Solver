@@ -84,13 +84,15 @@ def test_namespace_labs_have_required_tools_and_nextest_collects_all_failures():
     assert "--no-fail-fast" in nextest.split()
 
 
-def test_runner_prerequisites_and_python_are_required_for_the_candidate():
+def test_runner_prerequisites_precede_delegated_and_python_checks():
     workflow = (ROOT / ".github/workflows/release-linux.yml").read_text()
     setup = workflow.index("uses: ./.github/actions/prepare-test-runner", workflow.index("  package:\n"))
     scopes = workflow.index("- name: Qualify delegated-scope Python cases")
     release = workflow.index("- name: Build Linux release candidate")
+    python_setup = workflow.index("uses: ./.github/actions/prepare-test-runner", workflow.index("  python:\n"))
     python = workflow.index("- name: Run Python benchmark regressions")
-    assert setup < scopes < release < python
+    assert setup < scopes < release
+    assert python_setup < python
 
 
 def test_review_workflow_runs_python_doctests_and_warning_checked_rustdoc():

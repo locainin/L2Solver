@@ -102,7 +102,7 @@ jobs:
           cargo nextest run --archive-file "$RUNNER_TEMP/l2solver-tests.tar.zst"
           --extract-to "$GITHUB_WORKSPACE" --profile ci
           --partition hash:${{ matrix.shard }}/8 --test-threads 2 --no-tests fail
-          --no-fail-fast --status-level skip --final-status-level skip
+          --no-fail-fast --status-level slow --final-status-level slow
 
       - name: Upload test results
         if: always()
@@ -110,6 +110,41 @@ jobs:
         with:
           name: rust-tests-${{ matrix.shard }}-results
           path: target/nextest/ci/junit.xml
+          if-no-files-found: ignore
+          retention-days: 30
+
+  # The Python suite builds its own benchmark without using release binaries
+  python:
+    name: Python regressions
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    env:
+      # Match the nonincremental build used before the suite moved jobs
+      CARGO_INCREMENTAL: "0"
+    steps:
+      - name: Check out the requested commit
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+
+      - name: Install the qualified compiler
+        run: |
+          rustup toolchain install 1.99.1 --profile minimal
+          rustup default 1.99.1
+
+      - uses: ./.github/actions/prepare-test-runner
+
+      - name: Run Python benchmark regressions
+        run: >-
+          /usr/bin/python3 -m pytest -q tests/benchmarks tests/scripts tests/crates
+          -p subtests --junitxml="$RUNNER_TEMP/python-regressions.xml"
+
+      - name: Upload Python test results
+        if: always()
+        uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f
+        with:
+          name: python-regression-results
+          path: ${{ runner.temp }}/python-regressions.xml
           if-no-files-found: ignore
           retention-days: 30
 
@@ -287,11 +322,6 @@ jobs:
           --bin l2solver --bin l2solver-active --bin l2solver-active-helper
           --target x86_64-unknown-linux-gnu
 
-      - name: Run Python benchmark regressions
-        run: >-
-          /usr/bin/python3 -m pytest -q tests/benchmarks tests/scripts tests/crates
-          -p subtests --junitxml="$RUNNER_TEMP/python-regressions.xml"
-
       - name: Check generated completion syntax
         shell: bash
         run: |
@@ -331,7 +361,6 @@ jobs:
         with:
           name: linux-candidate-diagnostics
           path: |
-            ${{ runner.temp }}/python-regressions.xml
             ${{ runner.temp }}/l2solver-qualification/qualification.json
             ${{ runner.temp }}/l2solver-qualification/elf-*/*.txt
             ${{ runner.temp }}/l2solver-qualification/startup/*/stdout.log
@@ -354,7 +383,7 @@ jobs:
 
   review:
     name: Upload the unqualified tag candidate
-    needs: [tests, quality, compatibility, dependencies, fuzz, package]
+    needs: [tests, python, quality, compatibility, dependencies, fuzz, package]
     if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-24.04
     timeout-minutes: 20
