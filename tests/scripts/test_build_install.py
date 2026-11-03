@@ -46,6 +46,9 @@ elif name == "sudo" and "--payload" in args:
     shutil.copyfile(payload / "NOTICE-JEMALLOC.txt", base / "NOTICE-JEMALLOC.txt")
 elif name in ("cargo", "rustc"):
     print(f"{name} fixture")
+elif name == "git" and os.environ.get("L2_TEST_NO_CHECKOUT"):
+    print("fatal: not a git repository", file=sys.stderr)
+    sys.exit(128)
 elif name == "git" and "rev-parse" in args:
     print("fixture-tree" if "HEAD^{tree}" in args else "fixture-source")
 elif name == "git" and "status" in args:
@@ -186,3 +189,16 @@ def test_live_install_reports_missing_pkg_config_before_build(fake_tools):
     assert "missing dependency: pkg-config" in result.stderr
     assert not any(command[:2] == ["cargo", "build"] for command in calls(base))
     assert not any(command[0] == "sudo" for command in calls(base))
+
+
+def test_installer_requires_a_checkout_before_privileged_checks_or_build(fake_tools):
+    if os.geteuid() == 0:
+        pytest.skip("source installer must be invoked as an unprivileged user")
+    base, _ = fake_tools
+    result = invoke_installer(fake_tools, extra_env={"L2_TEST_NO_CHECKOUT": "1"})
+    assert result.returncode != 0
+    assert "Git checkout" in result.stderr
+    assert "clone" in result.stderr
+    recorded = calls(base)
+    assert not any(command[0] == "sudo" for command in recorded)
+    assert not any(command[:2] == ["cargo", "build"] for command in recorded)
