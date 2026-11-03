@@ -12,6 +12,8 @@ mod cooked;
 mod fragments;
 #[path = "investigation/ftp.rs"]
 mod ftp;
+#[path = "investigation/http_chunks.rs"]
+mod http_chunks;
 #[path = "investigation/large_runs.rs"]
 mod large_runs;
 #[path = "investigation/link_type.rs"]
