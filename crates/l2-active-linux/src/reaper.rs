@@ -6,22 +6,29 @@ use std::{
     io,
     process::Child,
     sync::{
-        OnceLock,
+        Mutex, OnceLock,
         atomic::{AtomicUsize, Ordering},
-        mpsc::{self, RecvTimeoutError, SyncSender, TrySendError},
+        mpsc::{self, Receiver, RecvTimeoutError, SyncSender, TrySendError},
     },
     thread,
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 const MAX_ACTIVE_HELPERS: usize = 16;
+const FAILED_HANDOFF_ATTEMPTS: usize = 20;
+const FAILED_HANDOFF_DELAY: Duration = Duration::from_millis(1);
+const FAILED_HANDOFF_TIMEOUT: Duration = Duration::from_millis(20);
 static ACTIVE_HELPERS: AtomicUsize = AtomicUsize::new(0);
 static REAPER: OnceLock<Option<SyncSender<Task>>> = OnceLock::new();
+static RETAINED: OnceLock<Retention> = OnceLock::new();
 
-pub struct Lease(&'static AtomicUsize);
+pub struct Lease {
+    slots: &'static AtomicUsize,
+    retention: &'static Retention,
+}
 
 impl Lease {
-    fn acquire(slots: &'static AtomicUsize) -> io::Result<Self> {
+    fn acquire(slots: &'static AtomicUsize, retention: &'static Retention) -> io::Result<Self> {
         slots
             .try_update(Ordering::AcqRel, Ordering::Acquire, |count| {
                 (count < MAX_ACTIVE_HELPERS).then_some(count + 1)
@@ -32,13 +39,13 @@ impl Lease {
                     "active helper process limit reached",
                 )
             })?;
-        Ok(Self(slots))
+        Ok(Self { slots, retention })
     }
 }
 
 impl Drop for Lease {
     fn drop(&mut self) {
-        self.0.fetch_sub(1, Ordering::AcqRel);
+        self.slots.fetch_sub(1, Ordering::AcqRel);
     }
 }
 
@@ -47,27 +54,88 @@ struct Task {
     lease: Lease,
 }
 
+struct Retention {
+    sender: SyncSender<Task>,
+    // Holding the receiver keeps the queued children owned and retrievable
+    _receiver: Mutex<Receiver<Task>>,
+}
+
+impl Retention {
+    fn new() -> Self {
+        let (sender, receiver) = mpsc::sync_channel(MAX_ACTIVE_HELPERS);
+        Self {
+            sender,
+            _receiver: Mutex::new(receiver),
+        }
+    }
+}
+
 pub fn reserve() -> io::Result<Lease> {
     sender()?;
-    Lease::acquire(&ACTIVE_HELPERS)
+    // Allocate fallback storage before a lease can be used to launch a child
+    let retention = RETAINED.get_or_init(Retention::new);
+    Lease::acquire(&ACTIVE_HELPERS, retention)
+}
+
+pub fn submit(child: Child, lease: Lease) {
+    submit_with_sender(child, lease, REAPER.get().and_then(Option::as_ref));
+}
+
+fn submit_with_sender(child: Child, lease: Lease, sender: Option<&SyncSender<Task>>) {
+    let task = Task { child, lease };
+    let task = if let Some(sender) = sender {
+        match sender.try_send(task) {
+            Ok(()) => return,
+            Err(TrySendError::Full(task) | TrySendError::Disconnected(task)) => task,
+        }
+    } else {
+        task
+    };
+    reap_after_failed_handoff(task);
 }
 
 #[expect(
     clippy::mem_forget,
-    reason = "A failed handoff must retain the helper slot until process exit"
+    reason = "The unreachable retention queue failure must still preserve both resources"
 )]
-pub fn submit(child: Child, lease: Lease) {
-    let task = Task { child, lease };
-    if let Some(sender) = REAPER.get().and_then(Option::as_ref) {
-        match sender.try_send(task) {
-            Ok(()) => (),
-            Err(TrySendError::Full(task) | TrySendError::Disconnected(task)) => {
-                // Never free a slot when the child could not be handed to the reaper
-                std::mem::forget(task.lease);
-            }
+fn reap_after_failed_handoff(mut task: Task) {
+    let deadline = Instant::now() + FAILED_HANDOFF_TIMEOUT;
+    for attempt in 0..FAILED_HANDOFF_ATTEMPTS {
+        match reap_attempt(&mut task) {
+            Ok(true) => return,
+            // A missing wait status does not prove that the process has exited
+            Err(_) => break,
+            Ok(false) => {}
         }
-    } else {
-        std::mem::forget(task.lease);
+        let now = Instant::now();
+        if attempt + 1 == FAILED_HANDOFF_ATTEMPTS || now >= deadline {
+            break;
+        }
+        thread::sleep(FAILED_HANDOFF_DELAY.min(deadline.saturating_duration_since(now)));
+    }
+    // Every queued or incoming task owns one of the same 16 leases, so this
+    // live queue has room for every task that can reach it
+    let retention = task.lease.retention;
+    if let Err(TrySendError::Full(task) | TrySendError::Disconnected(task)) =
+        retention.sender.try_send(task)
+    {
+        // Preserve both resources if the queue invariant is ever violated
+        std::mem::forget(task);
+    }
+}
+
+fn reap_attempt(task: &mut Task) -> io::Result<bool> {
+    #[cfg(test)]
+    tests::record_wait();
+    match task.child.try_wait() {
+        Ok(Some(_)) => Ok(true),
+        Err(error) if error.raw_os_error() == Some(nix::libc::ECHILD) => Err(error),
+        _ => {
+            #[cfg(test)]
+            tests::record_kill();
+            let _ignored = task.child.kill();
+            Ok(false)
+        }
     }
 }
 
@@ -94,14 +162,7 @@ fn start() -> io::Result<SyncSender<Task>> {
                     Err(RecvTimeoutError::Disconnected) if pending.is_empty() => break,
                     Err(RecvTimeoutError::Timeout | RecvTimeoutError::Disconnected) => {}
                 }
-                pending.retain_mut(|task| match task.child.try_wait() {
-                    Ok(Some(_)) => false,
-                    Err(error) if error.raw_os_error() == Some(nix::libc::ECHILD) => false,
-                    _ => {
-                        let _ignored = task.child.kill();
-                        true
-                    }
-                });
+                pending.retain_mut(|task| matches!(reap_attempt(task), Ok(false)));
             }
         })?;
     Ok(sender)

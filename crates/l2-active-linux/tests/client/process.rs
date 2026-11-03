@@ -9,6 +9,7 @@ use l2_onpath::MacAddress;
 use nix::unistd::{Pid, getpgid, getpgrp};
 use nix::{fcntl::OFlag, unistd::pipe2};
 use std::{
+    cell::Cell,
     io,
     net::Ipv4Addr,
     path::Path,
@@ -18,6 +19,24 @@ use std::{
     },
     time::{Duration, Instant},
 };
+
+thread_local! {
+    static OBSERVED_DROP_KILLS: Cell<Option<usize>> = const { Cell::new(None) };
+}
+
+pub(super) fn kill_during_drop(child: &mut std::process::Child) -> io::Result<()> {
+    if OBSERVED_DROP_KILLS.with(|counter| {
+        counter.get().is_some_and(|count| {
+            counter.set(Some(count + 1));
+            true
+        })
+    }) {
+        // Count the attempt without risking a signal to a reused PID
+        Ok(())
+    } else {
+        child.kill()
+    }
+}
 
 fn test_bound() -> io::Result<u64> {
     crate::deadline::encode_deadline(
@@ -66,6 +85,67 @@ fn helper_runs_in_a_different_process_group_from_the_terminal_frontend() -> io::
     assert_ne!(group, parent_group);
     kill?;
     wait?;
+    Ok(())
+}
+
+#[test]
+fn dropping_an_externally_reaped_child_never_signals_its_reusable_pid()
+-> Result<(), Box<dyn std::error::Error>> {
+    let mut child = std::process::Command::new("sleep").arg("60").spawn()?;
+    let pid = Pid::from_raw(i32::try_from(child.id())?);
+    child.kill()?;
+    nix::sys::wait::waitpid(pid, None)?;
+    let deadline = Instant::now() + Duration::from_secs(1);
+    let mut link = link_for_deadline(deadline)?;
+    link.child = Some(child);
+    link.lease = Some(crate::reaper::reserve()?);
+
+    OBSERVED_DROP_KILLS.set(Some(0));
+    let start = Instant::now();
+    drop(link);
+    let elapsed = start.elapsed();
+    let attempted_kills = OBSERVED_DROP_KILLS.replace(None);
+    assert_eq!(
+        attempted_kills,
+        Some(0),
+        "drop tried to signal an externally reaped PID"
+    );
+    assert!(
+        elapsed < Duration::from_millis(500),
+        "drop exceeded its bound: {elapsed:?}"
+    );
+    Ok(())
+}
+
+#[test]
+fn dropping_a_live_child_still_attempts_to_kill_it() -> Result<(), Box<dyn std::error::Error>> {
+    // The input pipe also releases the child if its owner is dropped
+    let child = std::process::Command::new("sh")
+        .args(["-c", "read -r line"])
+        .stdin(std::process::Stdio::piped())
+        .spawn()?;
+    let pid = child.id();
+    let mut link = link_for_deadline(Instant::now() + Duration::from_secs(1))?;
+    link.child = Some(child);
+    link.lease = Some(crate::reaper::reserve()?);
+
+    OBSERVED_DROP_KILLS.set(Some(0));
+    drop(link);
+    let attempted_kills = OBSERVED_DROP_KILLS.replace(None);
+    let deadline = Instant::now() + Duration::from_secs(3);
+    let path = std::path::Path::new("/proc").join(pid.to_string());
+    while path.exists() && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    assert_eq!(
+        attempted_kills,
+        Some(1),
+        "drop did not try to terminate the live child"
+    );
+    assert!(
+        !path.exists(),
+        "the reaper did not terminate and reap the live child"
+    );
     Ok(())
 }
 
@@ -436,6 +516,74 @@ fn cancellation_interrupts_a_silent_helper_during_open() -> Result<(), Box<dyn s
     assert!(
         start.elapsed() < Duration::from_millis(500),
         "cancellation waited for startup deadline"
+    );
+    Ok(())
+}
+
+#[test]
+fn interrupted_receive_keeps_the_client_usable() -> Result<(), Box<dyn std::error::Error>> {
+    use nix::sys::socket::{MsgFlags, send};
+    use std::os::fd::AsRawFd;
+
+    let deadline = Instant::now() + Duration::from_secs(3);
+    let mut link = link_for_deadline(deadline)?;
+    let peer = Peer {
+        pid: std::process::id(),
+        uid: nix::unistd::getuid().as_raw(),
+    };
+    let (channel, remote) = Channel::pair(peer)?;
+    link.channel = channel;
+    send(remote.as_raw_fd(), b"first", MsgFlags::empty())?;
+    send(remote.as_raw_fd(), b"second", MsgFlags::empty())?;
+
+    let interrupted = crate::channel::fault::InterruptedReceive::once();
+    assert_eq!(link.exchange(&[wire::OPEN], deadline, None)?, b"first");
+    assert_eq!(crate::channel::fault::InterruptedReceive::attempts(), 2);
+    assert!(!link.poisoned, "an interrupted receive poisoned the client");
+    drop(interrupted);
+    assert_eq!(link.exchange(&[wire::OPEN], deadline, None)?, b"second");
+    Ok(())
+}
+
+#[test]
+fn repeated_receive_interruptions_leave_startup_cancellable()
+-> Result<(), Box<dyn std::error::Error>> {
+    let deadline = Instant::now() + Duration::from_secs(3);
+    let mut link = link_for_deadline(deadline)?;
+    let peer = Peer {
+        pid: std::process::id(),
+        uid: nix::unistd::getuid().as_raw(),
+    };
+    let (channel, _remote) = Channel::pair(peer)?;
+    link.channel = channel;
+    let cancelled = Arc::new(AtomicBool::new(false));
+    let signal = Arc::clone(&cancelled);
+    let worker = std::thread::spawn(move || {
+        std::thread::sleep(Duration::from_millis(20));
+        signal.store(true, Ordering::Release);
+    });
+    let _interrupted =
+        crate::channel::fault::InterruptedReceive::repeated(Duration::from_millis(1));
+    let start = Instant::now();
+    let result = link.exchange(&[wire::OPEN], deadline, Some(&cancelled));
+    worker
+        .join()
+        .map_err(|_| io::Error::other("cancellation thread failed"))?;
+    assert_eq!(
+        result.err().map(|error| error.kind()),
+        Some(io::ErrorKind::Interrupted)
+    );
+    assert!(
+        link.signalled,
+        "the cancellation was not observed by the client"
+    );
+    assert!(
+        crate::channel::fault::InterruptedReceive::attempts() > 1,
+        "receive did not retry interrupted calls"
+    );
+    assert!(
+        start.elapsed() < Duration::from_millis(500),
+        "retries delayed cancellation until the operation deadline"
     );
     Ok(())
 }
