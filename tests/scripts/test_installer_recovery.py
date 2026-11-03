@@ -25,6 +25,18 @@ def payload(tmp_path):
     return result
 
 
+@pytest.fixture
+def damaged_inactive_installation(installer, payload, tmp_path):
+    prefix = tmp_path / "prefix"
+    installer.install(payload, prefix, False)
+    old = (prefix / "bin/l2solver").resolve().parent
+    (payload / "l2solver").write_text("new client")
+    installer.install(payload, prefix, False)
+    # Leave the current generation intact while the older one needs quarantine
+    (old / "l2solver").write_text("modified old client")
+    return prefix, old
+
+
 # Exit immediately after a real filesystem mutation, leaving no exception cleanup
 CRASH_SCRIPT = r'''
 import importlib.util
@@ -37,6 +49,18 @@ installer = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(installer)
 payload, prefix, action, point = Path(sys.argv[2]), Path(sys.argv[3]), sys.argv[4], sys.argv[5]
 replace, symlink, unlink, copyfile = os.replace, Path.symlink_to, Path.unlink, installer.copy_payload
+open_file, fsync = os.open, os.fsync
+
+def fail_after_open(path, flags, *args, **kwargs):
+    fd = open_file(path, flags, *args, **kwargs)
+    if point == "transaction-temp" and Path(path) == prefix / "share/.l2solver-transaction-new" and flags & os.O_CREAT:
+        os._exit(91)
+    return fd
+
+def fail_after_sync(fd):
+    fsync(fd)
+    if point == "transaction-temp-written" and Path(os.readlink(f"/proc/self/fd/{fd}")) == prefix / "share/.l2solver-transaction-new":
+        os._exit(91)
 
 def fail_after_replace(source, destination):
     replace(source, destination)
@@ -60,20 +84,27 @@ def fail_after_copy(source, destination, *args, **kwargs):
     return result
 
 installer.os.replace = fail_after_replace
+installer.os.open = fail_after_open
+installer.os.fsync = fail_after_sync
 Path.symlink_to = fail_after_link
 Path.unlink = fail_after_unlink
 installer.copy_payload = fail_after_copy
 if action == "install":
     installer.install(payload, prefix, False)
-else:
+elif action == "uninstall":
     installer.uninstall(prefix)
+else:
+    installer.quarantine_inactive(prefix, sys.argv[6])
 raise SystemExit("fault did not occur")
 '''
 
 
-def crash(payload, prefix, action, point):
+def crash(payload, prefix, action, point, generation=None):
+    command = [sys.executable, "-c", CRASH_SCRIPT, str(PUBLISHER), str(payload), str(prefix), action, point]
+    if generation is not None:
+        command.append(generation)
     result = subprocess.run(
-        [sys.executable, "-c", CRASH_SCRIPT, str(PUBLISHER), str(payload), str(prefix), action, point],
+        command,
         text=True, capture_output=True, check=False, timeout=20,
     )
     assert result.returncode == 91, result.stderr
@@ -214,13 +245,118 @@ def test_upgrade_restores_old_capability_after_abrupt_exit(installer, payload, t
     installer.uninstall(prefix)
 
 
-def test_quarantine_recovers_after_generation_move(installer, payload, tmp_path):
+@pytest.mark.parametrize("point", ["transaction-temp", "transaction-temp-written"])
+def test_quarantine_retries_after_exit_during_initial_journal_creation(
+    installer, payload, damaged_inactive_installation, point,
+):
+    prefix, old = damaged_inactive_installation
+    crash(payload, prefix, "quarantine", point, old.name)
+
+    temporary = prefix / "share/.l2solver-transaction-new"
+    assert temporary.is_file()
+    assert (temporary.stat().st_size == 0) == (point == "transaction-temp")
+    assert not (prefix / "share/.l2solver-transaction").exists()
+    installer.quarantine_inactive(prefix, old.name)
+    saved = prefix / "share/.l2solver-quarantine" / old.name
+    assert (saved / "l2solver").read_text() == "modified old client"
+    assert not temporary.exists()
+    assert old.name not in installer.read_manifest(prefix)["generations"]
+    installer.uninstall(prefix)
+
+
+@pytest.mark.parametrize("kind", ["symlink", "hardlink", "directory", "wrong_mode"])
+def test_quarantine_refuses_untrusted_initial_journal_temporary(
+    installer, tmp_path, damaged_inactive_installation, kind,
+):
+    prefix, old = damaged_inactive_installation
+    current = (prefix / "bin/l2solver").resolve()
+    temporary = prefix / "share/.l2solver-transaction-new"
+    foreign = tmp_path / "foreign"
+    foreign.write_text("keep")
+    foreign.chmod(0o600)
+    if kind == "symlink":
+        temporary.symlink_to(foreign)
+    elif kind == "hardlink":
+        os.link(foreign, temporary)
+    elif kind == "directory":
+        temporary.mkdir()
+    else:
+        temporary.write_text("foreign journal")
+        temporary.chmod(0o644)
+
+    with pytest.raises(ValueError, match="modified installed file: .*l2solver-transaction-new"):
+        installer.quarantine_inactive(prefix, old.name)
+
+    assert os.path.lexists(temporary)
+    assert foreign.read_text() == "keep"
+    assert old.is_dir()
+    assert (prefix / "bin/l2solver").resolve() == current
+    assert not (prefix / "share/.l2solver-transaction").exists()
+
+
+def test_initial_journal_cleanup_refuses_an_invalid_manifest(installer, payload, tmp_path):
     prefix = tmp_path / "prefix"
     installer.install(payload, prefix, False)
-    old = (prefix / "bin/l2solver").resolve().parent
-    (payload / "l2solver").write_text("new client")
-    installer.install(payload, prefix, False)
-    (old / "l2solver").write_text("modified old client")
+    temporary = prefix / "share/.l2solver-transaction-new"
+    temporary.write_text("unfinished journal")
+    temporary.chmod(0o600)
+    manifest = prefix / "share/l2solver/manifest.json"
+    manifest.write_text("{}")
+
+    with pytest.raises(ValueError, match="unrecognized installation manifest"):
+        installer.recover(prefix)
+
+    assert temporary.read_text() == "unfinished journal"
+    assert manifest.read_text() == "{}"
+
+
+def test_quarantine_after_journal_cleanup_still_rejects_foreign_link(installer, damaged_inactive_installation):
+    prefix, old = damaged_inactive_installation
+    temporary = prefix / "share/.l2solver-transaction-new"
+    temporary.write_text("unfinished journal")
+    temporary.chmod(0o600)
+    link = prefix / "bin/l2solver"
+    link.unlink()
+    link.write_text("foreign file")
+    original_mode = old.stat().st_mode
+
+    with pytest.raises(ValueError, match="modified installation link"):
+        installer.quarantine_inactive(prefix, old.name)
+
+    assert not temporary.exists()
+    assert link.read_text() == "foreign file"
+    assert old.stat().st_mode == original_mode
+    assert not (prefix / "share/.l2solver-transaction").exists()
+
+
+def test_quarantine_after_journal_cleanup_retries_failed_capability_revocation(
+    installer, damaged_inactive_installation, monkeypatch,
+):
+    prefix, old = damaged_inactive_installation
+    current = (prefix / "bin/l2solver").resolve()
+    temporary = prefix / "share/.l2solver-transaction-new"
+    temporary.write_text("unfinished journal")
+    temporary.chmod(0o600)
+
+    def refuse_revocation(_helper):
+        raise PermissionError("capability revocation denied")
+
+    with monkeypatch.context() as fault:
+        fault.setattr(installer, "disable_capability", refuse_revocation)
+        with pytest.raises(PermissionError, match="capability revocation denied"):
+            installer.quarantine_inactive(prefix, old.name)
+
+    assert not temporary.exists()
+    assert (prefix / "share/.l2solver-transaction").is_file()
+    assert old.is_dir() and old.stat().st_mode & 0o777 == 0o700
+    assert (prefix / "bin/l2solver").resolve() == current
+    installer.quarantine_inactive(prefix, old.name)
+    assert (prefix / "share/.l2solver-quarantine" / old.name / "l2solver").read_text() == "modified old client"
+    assert installer.read_manifest(prefix) is not None
+
+
+def test_quarantine_recovers_after_generation_move(installer, damaged_inactive_installation):
+    prefix, old = damaged_inactive_installation
     script = r'''
 import importlib.util
 import os
