@@ -2,7 +2,7 @@ use std::{
     env, fs, io,
     path::{Path, PathBuf},
     sync::{Arc, OnceLock},
-    time::{SystemTime, UNIX_EPOCH},
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
 use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
@@ -429,6 +429,7 @@ impl Cache {
     ///
     /// Complete-only lookups never expose partial results, so an incomplete search cannot be
     /// replayed as a complete negative result
+    /// A concurrent `SQLite` writer may prevent this hit from refreshing its LRU position
     ///
     /// # Errors
     /// Returns an error when a writer holds the key, a path was replaced, or the entry is corrupt
@@ -492,10 +493,21 @@ impl Cache {
         drop(record);
         drop(transient);
         transaction.commit()?;
-        connection.execute(
+        // This connection is dropped after the optional recency write
+        connection.busy_timeout(Duration::ZERO)?;
+        match connection.execute(
             "UPDATE entries SET accessed_ns = MAX(?1, accessed_ns + 1) WHERE key = ?2",
             params![now_ns(), key.as_str()],
-        )?;
+        ) {
+            Ok(_) => {}
+            // A busy writer cannot invalidate the already checked and pinned entry
+            Err(rusqlite::Error::SqliteFailure(code, _))
+                if matches!(
+                    code.code,
+                    rusqlite::ErrorCode::DatabaseBusy | rusqlite::ErrorCode::DatabaseLocked
+                ) => {}
+            Err(error) => return Err(error.into()),
+        }
         Ok(Some(entry))
     }
 
