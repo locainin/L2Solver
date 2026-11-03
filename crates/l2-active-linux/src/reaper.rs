@@ -199,7 +199,14 @@ fn start() -> io::Result<SyncSender<Task>> {
                     Err(RecvTimeoutError::Disconnected) if pending.is_empty() => break,
                     Err(RecvTimeoutError::Timeout | RecvTimeoutError::Disconnected) => {}
                 }
-                pending.retain_mut(|task| matches!(reap_attempt(task), Ok(false)));
+                let mut index = 0;
+                while let Some(task) = pending.get_mut(index) {
+                    match reap_attempt(task) {
+                        Ok(false) => index += 1,
+                        Ok(true) => drop(pending.remove(index)),
+                        Err(_) => retain_task(pending.remove(index)),
+                    }
+                }
             }
         })?;
     Ok(sender)
