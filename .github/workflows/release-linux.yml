@@ -27,6 +27,11 @@ jobs:
     name: Build the shared Rust test archive
     runs-on: ubuntu-24.04
     timeout-minutes: 20
+    env:
+      # Keep test archives small while retaining debug assertions
+      CARGO_PROFILE_DEV_DEBUG: "0"
+      CARGO_PROFILE_TEST_DEBUG: "0"
+      CARGO_INCREMENTAL: "0"
     steps:
       - name: Check out the requested commit
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
@@ -64,6 +69,10 @@ jobs:
     needs: prepare_tests
     runs-on: ubuntu-24.04
     timeout-minutes: 20
+    env:
+      CARGO_PROFILE_DEV_DEBUG: "0"
+      CARGO_PROFILE_TEST_DEBUG: "0"
+      CARGO_INCREMENTAL: "0"
     strategy:
       fail-fast: false
       matrix:
@@ -107,6 +116,10 @@ jobs:
     name: Source, formatting, Clippy and documentation
     runs-on: ubuntu-24.04
     timeout-minutes: 20
+    env:
+      CARGO_PROFILE_DEV_DEBUG: "0"
+      CARGO_PROFILE_TEST_DEBUG: "0"
+      CARGO_INCREMENTAL: "0"
     steps:
       - name: Check out the requested commit
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1

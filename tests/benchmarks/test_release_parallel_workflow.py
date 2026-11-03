@@ -85,6 +85,17 @@ def test_registry_cache_and_job_timeouts_have_scoped_keys():
         assert "timeout-minutes: 20" in job(name)
 
 
+def test_test_and_quality_jobs_use_small_nonincremental_debug_artifacts():
+    for name in ("prepare_tests", "tests", "quality"):
+        selected_job = job(name)
+        assert 'CARGO_PROFILE_DEV_DEBUG: "0"' in selected_job
+        assert 'CARGO_PROFILE_TEST_DEBUG: "0"' in selected_job
+        assert 'CARGO_INCREMENTAL: "0"' in selected_job
+    # The shipping build keeps the release profile declared by the workspace
+    assert "CARGO_PROFILE_RELEASE_DEBUG" not in WORKFLOW.read_text()
+    assert "CARGO_PROFILE_DEV_DEBUG" not in job("package")
+
+
 def test_shared_runner_setup_keeps_namespace_and_user_service_preflight():
     setup = RUNNER_SETUP.read_text()
     for name in ("tests", "package"):
