@@ -92,8 +92,21 @@ impl SourceFingerprint {
     /// # Errors
     /// Returns an error for non-regular, symlinked, unreadable, or changing files
     pub fn fast(path: impl AsRef<Path>) -> Result<Self> {
+        Self::fast_with_observer(path, |_| Ok(()))
+    }
+
+    /// Fingerprint a protected source path and observe each completed content read
+    ///
+    /// The observer runs after a read returns and cannot interrupt a blocked read
+    ///
+    /// # Errors
+    /// Returns an error for an unsafe, unreadable, changing, or cancelled source
+    pub fn fast_with_observer(
+        path: impl AsRef<Path>,
+        observe: impl FnMut(usize) -> std::io::Result<()>,
+    ) -> Result<Self> {
         let mut file = open_source(path.as_ref())?;
-        Self::fast_open_file(&mut file)
+        Self::fast_open_file_inner(&mut file, None, observe)
     }
 
     /// Fingerprint an already opened regular file using bounded content samples
@@ -193,8 +206,23 @@ impl SourceIdentity {
     /// # Errors
     /// Returns an error for non-regular, symlinked, unreadable, or changing files
     pub fn sha256_file(path: impl AsRef<Path>) -> Result<Self> {
+        Self::sha256_file_with_check_and_observer(path, || Ok(()), |_| Ok(()))
+    }
+
+    /// Hash a protected source path while checking cancellation and observing reads
+    ///
+    /// The check runs before every bounded read and the observer receives the bytes read
+    /// Neither callback can interrupt a read that is already blocked in the filesystem
+    ///
+    /// # Errors
+    /// Returns an error for an unsafe, unreadable, changing, or cancelled source
+    pub fn sha256_file_with_check_and_observer(
+        path: impl AsRef<Path>,
+        check: impl FnMut() -> std::io::Result<()>,
+        observe: impl FnMut(usize) -> std::io::Result<()>,
+    ) -> Result<Self> {
         let mut file = open_source(path.as_ref())?;
-        Self::sha256_open_file(&mut file)
+        Self::sha256_open_file_inner(&mut file, None, check, observe)
     }
 
     /// Calculate the full digest of an already opened regular file

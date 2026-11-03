@@ -967,3 +967,7 @@ fn is_sha256(value: &str) -> bool {
             .bytes()
             .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
 }
+
+#[cfg(test)]
+#[path = "../../tests/result_directory/manifest_validation.rs"]
+mod tests;
