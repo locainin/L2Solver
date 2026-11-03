@@ -22,6 +22,7 @@ mod pgid_reuse;
 thread_local! {
     static OBSERVED_POLLS: std::cell::Cell<Option<usize>> = const { std::cell::Cell::new(None) };
     static NEXT_POLL_ERROR: std::cell::Cell<Option<nix::errno::Errno>> = const { std::cell::Cell::new(None) };
+    static PERSISTENT_POLL_ERROR: std::cell::Cell<Option<nix::errno::Errno>> = const { std::cell::Cell::new(None) };
 }
 
 #[cfg(all(target_os = "linux", not(target_env = "uclibc")))]
@@ -38,6 +39,7 @@ pub(super) fn waitid_with_fault(
 ) -> nix::Result<nix::sys::wait::WaitStatus> {
     NEXT_POLL_ERROR
         .take()
+        .or_else(|| PERSISTENT_POLL_ERROR.get())
         .map_or_else(|| super::waitid(super::Id::Pid(pid), flags), Err)
 }
 

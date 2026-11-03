@@ -1003,7 +1003,12 @@ fn lock_diagnostics(diagnostics: &SharedDiagnostics) -> MutexGuard<'_, Diagnosti
 fn stop_process_group(child: &std::process::Child) -> io::Result<bool> {
     // A lost child cannot safely identify a group by its old PID
     #[cfg(all(target_os = "linux", not(target_env = "uclibc")))]
-    let exited = observe_exit(child)?.is_some();
+    let exited = match observe_exit(child) {
+        Ok(status) => status.is_some(),
+        Err(error) if lost_child(&error) => return Err(error),
+        // Other observation errors do not release the owned child
+        Err(_) => false,
+    };
     #[cfg(not(all(target_os = "linux", not(target_env = "uclibc"))))]
     let exited = false;
     #[cfg(unix)]
