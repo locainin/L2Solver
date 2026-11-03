@@ -11,6 +11,8 @@ type TestResult = Result<(), Box<dyn Error>>;
 
 #[path = "case_buffer/qualification.rs"]
 mod qualification;
+#[path = "case_buffer/relational_qualification.rs"]
+mod relational_qualification;
 
 fn retained_result(memory: &MemoryBudget) -> Result<BuildResult, Box<dyn Error>> {
     let mut case = Case::with_memory_budget(memory)?;

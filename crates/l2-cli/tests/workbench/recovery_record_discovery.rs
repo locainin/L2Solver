@@ -75,9 +75,9 @@ struct RawDirectionalFixture {
     run_nodes: Vec<u64>,
 }
 
-pub(super) struct SessionRelativeFixture {
-    pub(super) case: Case,
-    pub(super) plaintext: Vec<u8>,
+pub struct SessionRelativeFixture {
+    pub(crate) case: Case,
+    pub(crate) plaintext: Vec<u8>,
     pub(super) episode_nodes: Vec<u64>,
 }
 
@@ -2089,11 +2089,15 @@ fn assert_decoded_frames_feed_record_parser(case: &Case, record_diagnostics: &[V
 }
 
 pub(super) fn build_session_relative_fixture() -> TestResult<SessionRelativeFixture> {
+    build_session_relative_fixture_named("independent-relational-recovery")
+}
+
+pub fn build_session_relative_fixture_named(label: &str) -> TestResult<SessionRelativeFixture> {
     const SPLIT_NUMERATORS: [usize; 4] = [1, 3, 1, 2];
     const ARTIFACT_PART_BY_SESSION: [usize; 4] = [2, 3, 0, 1];
 
     let mut case = Case::new();
-    let source = capture(&mut case, "independent-relational-recovery")?;
+    let source = capture(&mut case, label)?;
     let plaintext = synthetic_png([31, 83, 137])?;
     let part_boundaries = [
         0,
