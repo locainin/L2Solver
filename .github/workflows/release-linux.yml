@@ -19,60 +19,238 @@ concurrency:
   group: linux-release-${{ github.ref }}
   cancel-in-progress: false
 
+env:
+  CARGO_TERM_COLOR: always
+
 jobs:
-  linux-x86_64:
-    name: Validate and package Linux x86_64
+  prepare_tests:
+    name: Build the shared Rust test archive
     runs-on: ubuntu-24.04
-    timeout-minutes: 90
-    permissions:
-      contents: read
-    env:
-      CARGO_TERM_COLOR: always
+    timeout-minutes: 20
     steps:
       - name: Check out the requested commit
-        # Pin the checkout implementation to the reviewed v7.0.1 commit
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
           persist-credentials: false
 
-      - name: Install stable Rust components
+      - name: Install the qualified compiler and build dependencies
         run: |
-          rustup toolchain install stable --profile minimal \
-            --component clippy --component rustfmt \
-            --target x86_64-unknown-linux-gnu
-          rustup default stable
-
-      - name: Install candidate check tools
-        shell: bash
-        run: |
+          rustup toolchain install 1.99.1 --profile minimal
+          rustup default 1.99.1
           sudo apt-get update
-          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
-            apparmor binutils dbus-user-session ethtool fish iproute2 iputils-ping libcap2-bin libpcap-dev \
-            python3-pytest python3-pytest-subtests python3-scapy ripgrep strace tcpdump tshark zsh
+          sudo apt-get install -y --no-install-recommends libpcap-dev
 
-      - name: Permit isolated test namespaces
-        shell: bash
-        run: |
-          # Ubuntu requires an explicit user-namespace permission for this utility
-          namespace_profile="$RUNNER_TEMP/l2solver-ci-unshare.profile"
-          cat > "$namespace_profile" <<'PROFILE'
-          abi <abi/4.0>,
-          profile l2solver-ci-unshare /usr/bin/unshare flags=(unconfined) {
-            userns,
-          }
-          PROFILE
-          sudo apparmor_parser --replace "$namespace_profile"
-          unshare --user --map-root-user --net --mount --pid --mount-proc --fork true
+      - uses: ./.github/actions/cache-rust-build
+        with:
+          role: tests
 
-      - name: Prepare isolated-test user services
-        shell: bash
+      - name: Install pinned Nextest
+        run: bash scripts/ci/install-cargo-tool.sh nextest
+
+      - name: Archive all workspace test targets
+        run: >-
+          cargo nextest archive --workspace --all-targets --all-features --locked
+          --build-jobs 2 --archive-file "$RUNNER_TEMP/l2solver-tests.tar.zst"
+
+      # A run-specific cache shares the build without publishing a candidate
+      - name: Save the shared test archive
+        uses: actions/cache/save@0057852bfaa89a56745cba8c7296529d2fc39830
+        with:
+          path: ${{ runner.temp }}/l2solver-tests.tar.zst
+          key: nextest-${{ runner.os }}-${{ github.run_id }}
+
+  tests:
+    name: Rust tests, shard ${{ matrix.shard }} of 8
+    needs: prepare_tests
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [1, 2, 3, 4, 5, 6, 7, 8]
+    steps:
+      - name: Check out the requested commit
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+
+      - uses: ./.github/actions/prepare-test-runner
+
+      - name: Install pinned Nextest
+        run: bash scripts/ci/install-cargo-tool.sh nextest
+
+      - name: Restore the shared test archive
+        uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830
+        with:
+          path: ${{ runner.temp }}/l2solver-tests.tar.zst
+          key: nextest-${{ runner.os }}-${{ github.run_id }}
+          fail-on-cache-miss: true
+
+      # Tests contain paths embedded at build time, so recreate target in the checkout
+      - name: Run workspace tests with Nextest
+        run: >-
+          cargo nextest run --archive-file "$RUNNER_TEMP/l2solver-tests.tar.zst"
+          --extract-to "$GITHUB_WORKSPACE" --profile ci
+          --partition hash:${{ matrix.shard }}/8 --test-threads 2 --no-tests fail
+          --no-fail-fast --status-level skip --final-status-level skip
+
+      - name: Upload test results
+        if: always()
+        uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f
+        with:
+          name: rust-tests-${{ matrix.shard }}-results
+          path: target/nextest/ci/junit.xml
+          if-no-files-found: ignore
+          retention-days: 30
+
+  quality:
+    name: Source, formatting, Clippy and documentation
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - name: Check out the requested commit
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+
+      - name: Install the qualified compiler and build dependencies
         run: |
-          test_uid=$(id -u)
-          test_runtime="/run/user/$test_uid"
-          sudo loginctl enable-linger "$(id -un)"
-          sudo systemctl start "user@$test_uid.service"
-          printf 'XDG_RUNTIME_DIR=%s\nDBUS_SESSION_BUS_ADDRESS=unix:path=%s/bus\n' \
-            "$test_runtime" "$test_runtime" >> "$GITHUB_ENV"
+          rustup toolchain install 1.99.1 --profile minimal --component clippy --component rustfmt
+          rustup default 1.99.1
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends libpcap-dev
+
+      - uses: ./.github/actions/cache-rust-build
+        with:
+          role: quality
+
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+
+      - name: Check workspace Clippy
+        run: >-
+          cargo clippy --workspace --all-targets --all-features --locked --
+          -D warnings
+
+      - name: Run documentation tests
+        env:
+          RUSTDOCFLAGS: -D warnings
+        run: cargo test --workspace --doc --all-features --locked
+
+      - name: Check Rust documentation warnings
+        env:
+          RUSTDOCFLAGS: -D warnings
+        run: cargo doc --workspace --all-features --no-deps --locked
+
+  compatibility:
+    name: Rust ${{ matrix.toolchain }} compatibility
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        toolchain: [1.96.0, stable]
+    steps:
+      - name: Check out the requested commit
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+
+      - name: Install the selected compiler and build dependencies
+        run: |
+          rustup toolchain install "${{ matrix.toolchain }}" --profile minimal
+          rustup default "${{ matrix.toolchain }}"
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends libpcap-dev
+
+      - uses: ./.github/actions/cache-rust-build
+        with:
+          role: compatibility-${{ matrix.toolchain }}
+
+      - name: Check the complete workspace with the selected compiler
+        run: cargo check --workspace --all-targets --all-features --locked
+
+  dependencies:
+    name: Dependency policy and advisories
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - name: Check out the requested commit
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+
+      - name: Install the qualified compiler
+        run: |
+          rustup toolchain install 1.99.1 --profile minimal
+          rustup default 1.99.1
+
+      - name: Install pinned dependency tools
+        run: |
+          bash scripts/ci/install-cargo-tool.sh deny
+          bash scripts/ci/install-cargo-tool.sh audit
+
+      - name: Check dependency policy
+        run: |
+          # Frozen policy checks require both locked dependency graphs locally
+          cargo fetch --locked
+          cargo fetch --locked --manifest-path fuzz/Cargo.toml
+          cargo deny --frozen check
+          cargo deny --frozen --manifest-path fuzz/Cargo.toml check
+
+      - name: Check security advisories
+        run: |
+          cargo audit --file Cargo.lock
+          cargo audit --file fuzz/Cargo.lock
+
+  fuzz:
+    name: Excluded fuzz workspace regressions
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - name: Check out the requested commit
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+
+      - name: Install the pinned nightly compiler and build dependencies
+        run: |
+          rustup toolchain install nightly-2026-08-01 --profile minimal
+          rustup default nightly-2026-08-01
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends libpcap-dev
+
+      - uses: ./.github/actions/cache-rust-build
+        with:
+          role: fuzz
+          workspace: "fuzz -> target"
+
+      - name: Run excluded-workspace regression tests
+        run: cargo test --manifest-path fuzz/Cargo.toml --tests --locked
+
+  package:
+    name: Build and qualify the Linux candidate
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - name: Check out the requested commit
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+
+      - name: Install the qualified compiler
+        run: |
+          rustup toolchain install 1.99.1 --profile minimal --target x86_64-unknown-linux-gnu
+          rustup default 1.99.1
+
+      - uses: ./.github/actions/cache-rust-build
+        with:
+          role: package
+
+      - uses: ./.github/actions/prepare-test-runner
+
+      - name: Install pinned Nextest
+        run: bash scripts/ci/install-cargo-tool.sh nextest
 
       - name: Qualify delegated-scope Python cases
         shell: bash
@@ -86,17 +264,6 @@ jobs:
             env L2_TEST_DELEGATED_SCOPE=1 /usr/bin/python3 -m pytest -q \
             tests/benchmarks/test_refine_cgroup_integration.py::RefineCgroupIntegrationTests::test_real_runner_samples_live_unlinked_spool_and_process
 
-      - name: Check formatting
-        run: cargo fmt --all -- --check
-
-      - name: Check workspace Clippy
-        run: >-
-          cargo clippy --workspace --all-targets --all-features --locked --
-          -D warnings
-
-      - name: Install pinned Nextest
-        run: cargo install cargo-nextest --locked --version 0.9.138
-
       - name: Build Linux release candidate
         run: >-
           cargo build --locked --release --package l2-cli --package l2-active-cli --package l2-active-linux
@@ -106,7 +273,7 @@ jobs:
       - name: Run Python benchmark regressions
         run: >-
           /usr/bin/python3 -m pytest -q tests/benchmarks tests/scripts tests/crates
-          -p subtests
+          -p subtests --junitxml="$RUNNER_TEMP/python-regressions.xml"
 
       - name: Check generated completion syntax
         shell: bash
@@ -119,41 +286,6 @@ jobs:
             fi
             printf '%s\n' "$completion" | "$shell" -n
           done
-
-      - name: Run workspace tests with Nextest
-        run: >-
-          cargo nextest run --workspace --all-targets --all-features --locked
-          --no-fail-fast
-          --status-level skip --final-status-level skip
-
-      - name: Run documentation tests
-        env:
-          RUSTDOCFLAGS: -D warnings
-        run: cargo test --workspace --doc --all-features --locked
-
-      - name: Check Rust documentation warnings
-        env:
-          RUSTDOCFLAGS: -D warnings
-        run: cargo doc --workspace --all-features --no-deps --locked
-
-      - name: Install pinned cargo-deny
-        run: cargo install cargo-deny --locked --version 0.19.0
-
-      - name: Check dependency policy
-        run: |
-          # Frozen policy checks require both locked dependency graphs locally
-          cargo fetch --locked
-          cargo fetch --locked --manifest-path fuzz/Cargo.toml
-          cargo deny --frozen check
-          cargo deny --frozen --manifest-path fuzz/Cargo.toml check
-
-      - name: Install pinned cargo-audit
-        run: cargo install cargo-audit --locked --version 0.22.0
-
-      - name: Check security advisories
-        run: |
-          cargo audit --file Cargo.lock
-          cargo audit --file fuzz/Cargo.lock
 
       - name: Package build provenance and checksum
         run: >-
@@ -176,9 +308,50 @@ jobs:
           --output-directory "$RUNNER_TEMP/l2solver-qualification"
           --candidate-only
 
-      - name: Upload unqualified review candidate
-        # Keep branch and manual validation runs free of published binaries
+      - name: Upload diagnostic receipts
+        if: always()
+        uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f
+        with:
+          name: linux-candidate-diagnostics
+          path: |
+            ${{ runner.temp }}/python-regressions.xml
+            ${{ runner.temp }}/l2solver-qualification/qualification.json
+            ${{ runner.temp }}/l2solver-qualification/elf-*/*.txt
+            ${{ runner.temp }}/l2solver-qualification/startup/*/stdout.log
+            ${{ runner.temp }}/l2solver-qualification/startup/*/stderr.log
+            ${{ runner.temp }}/l2solver-qualification/cli/*/stdout.log
+            ${{ runner.temp }}/l2solver-qualification/cli/*/stderr.log
+            ${{ runner.temp }}/l2solver-qualification/cli/*-output/manifest.json
+          if-no-files-found: ignore
+          retention-days: 30
+
+      # Use a run-specific key until every required job passes
+      - name: Save the checked tag candidate for final review
         if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
+        uses: actions/cache/save@0057852bfaa89a56745cba8c7296529d2fc39830
+        with:
+          path: |
+            ${{ runner.temp }}/l2solver-dist/
+            ${{ runner.temp }}/l2solver-qualification/
+          key: candidate-${{ runner.os }}-${{ github.run_id }}
+
+  review:
+    name: Upload the unqualified tag candidate
+    needs: [tests, quality, compatibility, dependencies, fuzz, package]
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - name: Restore the checked tag candidate
+        uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830
+        with:
+          path: |
+            ${{ runner.temp }}/l2solver-dist/
+            ${{ runner.temp }}/l2solver-qualification/
+          key: candidate-${{ runner.os }}-${{ github.run_id }}
+          fail-on-cache-miss: true
+
+      - name: Upload unqualified review candidate
         # Pin the upload implementation to the reviewed v7.0.0 commit
         uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f
         with:

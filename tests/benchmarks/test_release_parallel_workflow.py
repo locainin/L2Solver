@@ -1,0 +1,98 @@
+"""Check the release workflow's parallel gates and evidence handling."""
+
+import re
+from pathlib import Path
+
+
+ROOT = Path(__file__).resolve().parents[2]
+WORKFLOW = ROOT / ".github/workflows/release-linux.yml"
+RUNNER_SETUP = ROOT / ".github/actions/prepare-test-runner/action.yml"
+CACHE_SETUP = ROOT / ".github/actions/cache-rust-build/action.yml"
+
+
+def job(name):
+    workflow = WORKFLOW.read_text()
+    match = re.search(rf"(?ms)^  {name}:\n(.*?)(?=^  [a-z_]+:\n|\Z)", workflow)
+    assert match, f"missing {name} job"
+    return match.group(1)
+
+
+def test_test_shards_reuse_the_same_complete_archived_build():
+    build = job("prepare_tests")
+    tests = job("tests")
+    assert "cargo nextest archive --workspace --all-targets --all-features --locked" in build
+    assert "actions/cache/save@" in build
+    # Rerunning only failed jobs must still find the successful build's cache
+    assert "github.run_attempt" not in build
+    assert "needs: prepare_tests" in tests
+    assert "shard: [1, 2, 3, 4, 5, 6, 7, 8]" in tests
+    assert "fail-fast: false" in tests
+    assert "actions/cache/restore@" in tests
+    assert "github.run_attempt" not in tests
+    assert "fail-on-cache-miss: true" in tests
+    assert "--archive-file" in tests
+    assert '--extract-to "$GITHUB_WORKSPACE"' in tests
+    assert "--partition hash:${{ matrix.shard }}/8" in tests
+    assert "--test-threads 2" in tests
+    assert "--no-fail-fast" in tests
+    assert "--no-tests fail" in tests
+    assert "if: always()" in tests
+    assert "junit.xml" in tests
+
+
+def test_all_validation_jobs_are_required_before_a_tag_candidate_is_uploaded():
+    review = job("review")
+    assert "needs: [tests, quality, compatibility, dependencies, fuzz, package]" in review
+    assert "github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')" in review
+    assert "Upload unqualified review candidate" in review
+    assert "actions/cache/restore@" in review
+    assert "github.run_attempt" not in review
+    assert "fail-on-cache-miss: true" in review
+    assert "unqualified-review" in review
+    # Failed package checks must still leave any reports already produced
+    package = job("package")
+    receipt_step = package.split("- name: Upload diagnostic receipts", 1)[1].split("\n      - name:", 1)[0]
+    assert "if: always()" in receipt_step
+    assert "qualification.json" in receipt_step
+    assert "python-regressions.xml" in receipt_step
+    assert not re.search(r"(?m)^\s*\$\{\{ runner.temp \}\}/l2solver-qualification/$", receipt_step)
+    assert "if-no-files-found: ignore" in receipt_step
+
+
+def test_qualified_and_compatible_compilers_and_excluded_fuzz_tests_are_checked():
+    for name in ("prepare_tests", "quality", "dependencies", "package"):
+        assert "rustup toolchain install 1.99.1" in job(name)
+    compatibility = job("compatibility")
+    assert "toolchain: [1.96.0, stable]" in compatibility
+    assert "cargo check --workspace --all-targets --all-features --locked" in compatibility
+    fuzz = job("fuzz")
+    assert "nightly-2026-08-01" in fuzz
+    assert "cargo test --manifest-path fuzz/Cargo.toml --tests --locked" in fuzz
+
+
+def test_registry_cache_and_job_timeouts_have_scoped_keys():
+    cache = CACHE_SETUP.read_text()
+    # The pinned action keys by compiler, host, manifests and both lockfiles
+    assert "Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0" in cache
+    assert "shared-key: ${{ inputs.role }}" in cache
+    assert 'cache-targets: "true"' in cache
+    assert 'cache-bin: "false"' in cache
+    assert "save-if: ${{ github.ref == 'refs/heads/dev' }}" in cache
+    for name in ("prepare_tests", "quality", "compatibility", "fuzz", "package"):
+        assert "uses: ./.github/actions/cache-rust-build" in job(name)
+    assert 'workspace: "fuzz -> target"' in job("fuzz")
+    for name in ("prepare_tests", "tests", "quality", "compatibility", "dependencies", "fuzz", "package", "review"):
+        assert "timeout-minutes: 20" in job(name)
+
+
+def test_shared_runner_setup_keeps_namespace_and_user_service_preflight():
+    setup = RUNNER_SETUP.read_text()
+    for name in ("tests", "package"):
+        assert "uses: ./.github/actions/prepare-test-runner" in job(name)
+    for package in ("apparmor", "dbus-user-session", "ethtool", "fish", "iproute2", "iputils-ping", "libcap2-bin", "libpcap-dev", "python3-pytest-subtests", "python3-scapy", "ripgrep", "strace", "tcpdump", "tshark", "zsh"):
+        assert package in setup.split()
+    assert "profile l2solver-ci-unshare /usr/bin/unshare flags=(unconfined)" in setup
+    assert "sudo apparmor_parser --replace" in setup
+    assert "unshare --user --map-root-user --net --mount --pid --mount-proc --fork true" in setup
+    assert "sudo systemctl start" in setup
+    assert "apparmor_restrict_unprivileged_userns" not in setup
