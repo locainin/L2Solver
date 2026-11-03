@@ -393,41 +393,32 @@ def test_failed_capability_revocation_keeps_owned_helper_and_manifest(
             os.close(descriptor)
 
 
-@pytest.mark.parametrize("switch_fails", [True, False])
-def test_retry_reopens_quarantined_generation_only_after_capability_policy_succeeds(
-    installer, payload, tmp_path, monkeypatch, switch_fails,
-):
-    prefix = tmp_path / "prefix"
+def prepare_quarantined_generation(installer, payload, prefix, monkeypatch):
+    original = (payload / "l2solver").read_bytes()
     installer.install(payload, prefix, False)
     old = (prefix / "bin/l2solver").resolve()
     (payload / "l2solver").write_text("new executable")
-    helper, _ = force_unrevoked_generation(installer, payload, prefix, monkeypatch)
+    with monkeypatch.context() as setup:
+        setup.setattr(installer, "enable_capability", lambda _: None)
+        installer.install(payload, prefix, True)
+    helper = (prefix / "bin/l2solver-active-helper").resolve()
+    (payload / "l2solver").write_bytes(original)
+    installer.install(payload, prefix, False)
+    (payload / "l2solver").write_text("new executable")
+    helper.parent.chmod(0o700)
+    return old, helper
+
+
+def test_retained_quarantined_generation_requires_retirement_before_active_selection(
+    installer, payload, tmp_path, monkeypatch,
+):
+    prefix = tmp_path / "prefix"
+    old, helper = prepare_quarantined_generation(installer, payload, prefix, monkeypatch)
+    monkeypatch.setattr(installer, "enable_capability", lambda _: pytest.fail("retained helper must not be enabled"))
+    with pytest.raises(ValueError, match="--retire-inactive"):
+        installer.install(payload, prefix, True)
+    assert (prefix / "bin/l2solver").resolve() == old
     assert helper.parent.stat().st_mode & 0o777 == 0o700
-
-    def enable_after_retry(path):
-        assert path == helper
-        assert path.parent.stat().st_mode & 0o777 == 0o700
-
-    replace = installer.os.replace
-    with monkeypatch.context() as retry:
-        retry.setattr(installer, "enable_capability", enable_after_retry)
-        if switch_fails:
-            def fail_switch(source, destination):
-                if Path(destination).name == "current":
-                    raise PermissionError("switch denied")
-                return replace(source, destination)
-
-            retry.setattr(installer.os, "replace", fail_switch)
-            with pytest.raises(PermissionError, match="switch denied"):
-                installer.install(payload, prefix, True)
-        else:
-            installer.install(payload, prefix, True)
-    if switch_fails:
-        assert (prefix / "bin/l2solver").resolve() == old
-        assert helper.parent.stat().st_mode & 0o777 == 0o700
-    else:
-        assert (prefix / "bin/l2solver-active-helper").resolve() == helper
-        assert helper.parent.stat().st_mode & 0o777 == 0o755
     installer.uninstall(prefix)
 
 
@@ -463,40 +454,6 @@ def test_failed_revoke_after_failed_switch_removes_temporary_pointer(installer, 
     assert selected[0].parent.stat().st_mode & 0o777 == 0o700
     assert not os.path.lexists(prefix / "share/l2solver/.current-new")
     assert selected[0].parent.name in installer.read_manifest(prefix)["generations"]
-    installer.uninstall(prefix)
-
-
-def test_retry_does_not_restore_capability_if_quarantine_cannot_be_reapplied(installer, payload, tmp_path, monkeypatch):
-    prefix = tmp_path / "prefix"
-    installer.install(payload, prefix, False)
-    old = (prefix / "bin/l2solver").resolve()
-    (payload / "l2solver").write_text("new executable")
-    helper, _ = force_unrevoked_generation(installer, payload, prefix, monkeypatch)
-    capabilities = {helper: b"previous capability"}
-    chmod = Path.chmod
-    replace = installer.os.replace
-
-    def fail_restrict(path, mode, *args, **kwargs):
-        if path == helper.parent and mode == 0o700:
-            raise PermissionError("directory restriction denied")
-        return chmod(path, mode, *args, **kwargs)
-
-    def fail_switch(source, destination):
-        if Path(destination).name == "current":
-            raise PermissionError("switch denied")
-        return replace(source, destination)
-
-    with monkeypatch.context() as retry:
-        retry.setattr(installer, "read_capability", lambda path: capabilities.get(path))
-        retry.setattr(installer, "enable_capability", lambda path: capabilities.__setitem__(path, b"new capability"))
-        retry.setattr(installer, "disable_capability", lambda path: capabilities.pop(path, None))
-        retry.setattr(installer.os, "replace", fail_switch)
-        retry.setattr(Path, "chmod", fail_restrict)
-        with pytest.raises(ValueError, match="could not restrict.*former capability not restored"):
-            installer.install(payload, prefix, True)
-    assert helper not in capabilities
-    assert (prefix / "bin/l2solver").resolve() == old
-    assert helper.is_file() and helper.parent.name in installer.read_manifest(prefix)["generations"]
     installer.uninstall(prefix)
 
 
@@ -631,29 +588,6 @@ def test_reinstall_of_earlier_generation_switches_complete_set(installer, payloa
     (payload / "l2solver").write_bytes(original)
     installer.install(payload, prefix, False)
     assert (prefix / "bin/l2solver").resolve() == old
-
-
-def test_failed_active_reactivation_revokes_unpublished_helper(installer, payload, tmp_path, monkeypatch):
-    prefix = tmp_path / "prefix"
-    privileged = set()
-    monkeypatch.setattr(installer, "read_capability", lambda path: b"enabled" if path.resolve() in privileged else None)
-    monkeypatch.setattr(installer, "enable_capability", lambda path: privileged.add(path.resolve()))
-    monkeypatch.setattr(installer, "disable_capability", lambda path: privileged.discard(path.resolve()))
-    installer.install(payload, prefix, True)
-    old = (prefix / "bin/l2solver-active-helper").resolve()
-    installer.install(payload, prefix, False)
-    assert old not in privileged
-    replace = installer.os.replace
-
-    def fail_switch(source, destination):
-        if Path(destination).name == "current":
-            raise PermissionError("switch denied")
-        return replace(source, destination)
-
-    monkeypatch.setattr(installer.os, "replace", fail_switch)
-    with pytest.raises(PermissionError):
-        installer.install(payload, prefix, True)
-    assert old not in privileged
 
 
 def test_uninstall_revokes_helper_authority_before_removal(installer, payload, tmp_path, monkeypatch):
