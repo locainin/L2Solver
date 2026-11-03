@@ -652,3 +652,137 @@ fn buffered_failure_stops_descendant_after_it_closes_capture_pipes() -> Result<(
     );
     Ok(())
 }
+
+struct PersistentPollError;
+
+impl Drop for PersistentPollError {
+    fn drop(&mut self) {
+        super::PERSISTENT_POLL_ERROR.set(None);
+    }
+}
+
+#[test]
+fn persistent_waitid_error_does_not_abandon_a_live_owned_child() -> Result<(), Box<dyn Error>> {
+    let mut child = Victim(Command::new("sleep").arg("30").process_group(0).spawn()?);
+    super::OBSERVED_POLLS.set(Some(0));
+    super::PERSISTENT_POLL_ERROR.set(Some(Errno::EPERM));
+    let _fault = PersistentPollError;
+    super::super::stop_and_reap(&mut child.0);
+    let status = child.0.try_wait()?;
+    let polls = super::OBSERVED_POLLS.replace(None);
+    assert_eq!(
+        polls,
+        Some(1),
+        "the waitid fault was not observed during cleanup"
+    );
+    assert!(
+        status.is_some(),
+        "persistent waitid failure abandoned the owned child"
+    );
+    Ok(())
+}
+
+struct ReadySpawner {
+    pid_path: PathBuf,
+}
+
+impl super::super::WorkerSpawner for ReadySpawner {
+    fn spawn<F>(&mut self, name: &'static str, worker: F) -> io::Result<thread::JoinHandle<()>>
+    where
+        F: FnOnce() + Send + 'static,
+    {
+        read_pid(&self.pid_path)?;
+        thread::Builder::new().name(name.into()).spawn(worker)
+    }
+}
+
+fn check_persistent_waitid_failure(mode: Mode) -> Result<(), Box<dyn Error>> {
+    let temporary = tempfile::tempdir()?;
+    let pid_path = temporary.path().join("child.pid");
+    let release = temporary.path().join("release");
+    let _release = ReleaseOnDrop(release.clone());
+    let object_root = temporary.path().join("objects");
+    empty_object_root(&object_root)?;
+    let arguments = [
+        OsString::from("-c"),
+        OsString::from(
+            "printf '%s\\n' \"$$\" > \"$PID_FILE\"; i=0; while [ ! -f \"$RELEASE\" ] && [ \"$i\" -lt 100 ]; do i=$((i + 1)); sleep 0.02; done",
+        ),
+    ];
+    let environment = [
+        (OsString::from("PID_FILE"), pid_path.as_os_str().to_owned()),
+        (OsString::from("RELEASE"), release.as_os_str().to_owned()),
+    ];
+    let mut spawner = ReadySpawner {
+        pid_path: pid_path.clone(),
+    };
+    super::OBSERVED_POLLS.set(Some(0));
+    super::PERSISTENT_POLL_ERROR.set(Some(Errno::EPERM));
+    let _fault = PersistentPollError;
+    let result = match mode {
+        Mode::Buffered => super::super::run_with_job_and_spawner(
+            Path::new("sh"),
+            &arguments,
+            &environment,
+            super::super::CapturePolicy {
+                timeout: Duration::from_secs(2),
+                stdout_maximum: 1024,
+                stderr_maximum: 1024,
+                job: None,
+            },
+            &mut spawner,
+        )
+        .map(|_| ()),
+        Mode::Streaming => super::super::run_streaming_with_spawner(
+            Path::new("sh"),
+            &arguments,
+            &environment,
+            policy(
+                Instant::now() + Duration::from_secs(2),
+                &object_root,
+                0,
+                ObjectExportBudget::default(),
+            ),
+            &mut spawner,
+        )
+        .map(|_| ()),
+    };
+    let polls = super::OBSERVED_POLLS.replace(None);
+    let pid = Pid::from_raw(read_pid(&pid_path)?);
+    let outcome = nix::sys::wait::waitpid(pid, Some(WaitPidFlag::WNOHANG));
+    if matches!(outcome, Ok(WaitStatus::StillAlive)) {
+        fs::write(&release, b"release")?;
+        wait_for(|| {
+            !matches!(
+                nix::sys::wait::waitpid(pid, Some(WaitPidFlag::WNOHANG)),
+                Ok(WaitStatus::StillAlive)
+            )
+        })?;
+    }
+    assert!(
+        matches!(result, Err(ProcessError::Read(error)) if error.raw_os_error() == Some(Errno::EPERM as i32)),
+        "the original waitid error was not reported"
+    );
+    assert_eq!(
+        polls,
+        Some(2),
+        "monitor and cleanup must both encounter the persistent failure"
+    );
+    assert_eq!(
+        outcome,
+        Err(Errno::ECHILD),
+        "the runner left the owned child unreaped"
+    );
+    Ok(())
+}
+
+#[test]
+fn persistent_waitid_error_keeps_the_runner_error_and_reaps_the_child() -> Result<(), Box<dyn Error>>
+{
+    let name = "workbench::tshark::process::tests::pgid_reuse::persistent_waitid_error_keeps_the_runner_error_and_reaps_the_child";
+    if !in_private_namespace(name)? {
+        return Ok(());
+    }
+    check_persistent_waitid_failure(Mode::Buffered)?;
+    check_persistent_waitid_failure(Mode::Streaming)
+}
