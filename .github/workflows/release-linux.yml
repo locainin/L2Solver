@@ -322,6 +322,28 @@ jobs:
           --bin l2solver --bin l2solver-active --bin l2solver-active-helper
           --target x86_64-unknown-linux-gnu
 
+      - name: Qualify real executable installation privately
+        env:
+          L2_TEST_INSTALL_BINARIES: ${{ github.workspace }}/target/x86_64-unknown-linux-gnu/release
+          INSTALLER_JUNIT: ${{ runner.temp }}/real-installer.xml
+        run: |
+          /usr/bin/python3 -m pytest -q \
+            tests/scripts/test_system_install_namespace.py::test_real_binaries_install_run_upgrade_and_uninstall_in_private_namespace \
+            --junitxml="$INSTALLER_JUNIT"
+          /usr/bin/python3 - <<'PY'
+          import os
+          import xml.etree.ElementTree as ET
+
+          cases = ET.parse(os.environ["INSTALLER_JUNIT"]).findall(".//testcase")
+          if len(cases) != 1 or any(
+              case.find("skipped") is not None
+              or case.find("failure") is not None
+              or case.find("error") is not None
+              for case in cases
+          ):
+              raise SystemExit("installer qualification must execute exactly one passing case")
+          PY
+
       - name: Check generated completion syntax
         shell: bash
         run: |
@@ -361,6 +383,7 @@ jobs:
         with:
           name: linux-candidate-diagnostics
           path: |
+            ${{ runner.temp }}/real-installer.xml
             ${{ runner.temp }}/l2solver-qualification/qualification.json
             ${{ runner.temp }}/l2solver-qualification/elf-*/*.txt
             ${{ runner.temp }}/l2solver-qualification/startup/*/stdout.log
