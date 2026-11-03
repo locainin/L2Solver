@@ -1,6 +1,6 @@
 #[cfg(test)]
 #[path = "../tests/reaper/slots.rs"]
-mod tests;
+pub mod tests;
 
 use std::{
     io,
@@ -78,7 +78,13 @@ pub fn reserve() -> io::Result<Lease> {
 }
 
 pub fn submit(child: Child, lease: Lease) {
+    #[cfg(test)]
+    tests::record_handoff();
     submit_with_sender(child, lease, REAPER.get().and_then(Option::as_ref));
+}
+
+pub fn retain_unwaitable(child: Child, lease: Lease) {
+    retain_task(Task { child, lease });
 }
 
 fn submit_with_sender(child: Child, lease: Lease, sender: Option<&SyncSender<Task>>) {
@@ -94,10 +100,6 @@ fn submit_with_sender(child: Child, lease: Lease, sender: Option<&SyncSender<Tas
     reap_after_failed_handoff(task);
 }
 
-#[expect(
-    clippy::mem_forget,
-    reason = "The unreachable retention queue failure must still preserve both resources"
-)]
 fn reap_after_failed_handoff(mut task: Task) {
     let deadline = Instant::now() + FAILED_HANDOFF_TIMEOUT;
     for attempt in 0..FAILED_HANDOFF_ATTEMPTS {
@@ -113,6 +115,14 @@ fn reap_after_failed_handoff(mut task: Task) {
         }
         thread::sleep(FAILED_HANDOFF_DELAY.min(deadline.saturating_duration_since(now)));
     }
+    retain_task(task);
+}
+
+#[expect(
+    clippy::mem_forget,
+    reason = "The unreachable retention queue failure must still preserve both resources"
+)]
+fn retain_task(task: Task) {
     // Every queued or incoming task owns one of the same 16 leases, so this
     // live queue has room for every task that can reach it
     let retention = task.lease.retention;

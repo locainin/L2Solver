@@ -763,8 +763,13 @@ impl Drop for HelperLink {
         if let Some(mut child) = self.child.take() {
             match child.try_wait() {
                 Ok(Some(_)) => return,
-                // Another waiter may have reaped it and the PID may be reused
-                Err(error) if error.raw_os_error() == Some(nix::libc::ECHILD) => {}
+                Err(error) if error.raw_os_error() == Some(nix::libc::ECHILD) => {
+                    // The PID may be reused, so retain the handle without probing it again
+                    if let Some(lease) = self.lease.take() {
+                        crate::reaper::retain_unwaitable(child, lease);
+                    }
+                    return;
+                }
                 _ => {
                     #[cfg(not(test))]
                     let _ignored = child.kill();

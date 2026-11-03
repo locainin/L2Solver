@@ -22,13 +22,53 @@ static CHILD_SLOTS: AtomicUsize = AtomicUsize::new(0);
 static KILLED_SLOTS: AtomicUsize = AtomicUsize::new(0);
 static LIVE_SLOTS: AtomicUsize = AtomicUsize::new(0);
 static UNKNOWN_SLOTS: AtomicUsize = AtomicUsize::new(0);
+static DROP_UNKNOWN_SLOTS: AtomicUsize = AtomicUsize::new(0);
 static TEST_RETENTION: OnceLock<Retention> = OnceLock::new();
 static KILLED_RETENTION: OnceLock<Retention> = OnceLock::new();
 static LIVE_RETENTION: OnceLock<Retention> = OnceLock::new();
 static UNKNOWN_RETENTION: OnceLock<Retention> = OnceLock::new();
+static DROP_UNKNOWN_RETENTION: OnceLock<Retention> = OnceLock::new();
 
 thread_local! {
     static REAP_OPERATIONS: Cell<(usize, usize)> = const { Cell::new((0, 0)) };
+    static OBSERVED_HANDOFFS: Cell<Option<usize>> = const { Cell::new(None) };
+}
+
+pub(super) fn record_handoff() {
+    OBSERVED_HANDOFFS.update(|count| count.map(|value| value + 1));
+}
+
+pub fn start_handoff_observation() {
+    OBSERVED_HANDOFFS.set(Some(0));
+}
+
+pub fn finish_handoff_observation() -> Option<usize> {
+    OBSERVED_HANDOFFS.replace(None)
+}
+
+pub fn drop_unknown_lease() -> io::Result<Lease> {
+    Lease::acquire(
+        &DROP_UNKNOWN_SLOTS,
+        DROP_UNKNOWN_RETENTION.get_or_init(Retention::new),
+    )
+}
+
+pub fn drop_unknown_slots() -> usize {
+    DROP_UNKNOWN_SLOTS.load(Ordering::Acquire)
+}
+
+pub fn take_drop_unknown() -> io::Result<(Child, Lease)> {
+    let retention = DROP_UNKNOWN_RETENTION.get_or_init(Retention::new);
+    let Retention {
+        _receiver: receiver,
+        ..
+    } = retention;
+    let task = receiver
+        .lock()
+        .map_err(|_| io::Error::other("retention lock poisoned"))?
+        .try_recv()
+        .map_err(io::Error::other)?;
+    Ok((task.child, task.lease))
 }
 
 pub(super) fn record_wait() {
