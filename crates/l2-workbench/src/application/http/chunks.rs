@@ -203,10 +203,11 @@ struct ChunkError {
 }
 
 fn parse_chunk_size(line: &[u8]) -> Option<usize> {
+    // Whitespace before an extension belongs to the extension, not the size
     let size_end = line
         .iter()
-        .position(|byte| *byte == b';')
-        .unwrap_or(line.len());
+        .take_while(|byte| byte.is_ascii_hexdigit())
+        .count();
     let digits = line.get(..size_end)?;
     if digits.is_empty() || !valid_chunk_extension(line.get(size_end..)?) {
         return None;
