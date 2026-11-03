@@ -93,6 +93,23 @@ def test_delegated_cgroup_cases_remain_required_during_package_qualification():
     assert "test_real_runner_samples_live_unlinked_spool_and_process" in package
 
 
+def test_package_runs_the_real_binary_installer_after_build_and_rejects_skips():
+    package = job("package")
+    build = package.index("- name: Build Linux release candidate")
+    install = package.index("- name: Qualify real executable installation privately")
+    provenance = package.index("- name: Package build provenance and checksum")
+    assert build < install < provenance
+    step = package[install:provenance]
+    assert "L2_TEST_INSTALL_BINARIES:" in step
+    assert "target/x86_64-unknown-linux-gnu/release" in step
+    assert "test_real_binaries_install_run_upgrade_and_uninstall_in_private_namespace" in step
+    assert '--junitxml="$INSTALLER_JUNIT"' in step
+    assert 'case.find("skipped")' in step
+    assert "installer qualification must execute exactly one passing case" in step
+    receipts = package.split("- name: Upload diagnostic receipts", 1)[1]
+    assert "real-installer.xml" in receipts
+
+
 def test_all_validation_jobs_are_required_before_a_tag_candidate_is_uploaded():
     review = job("review")
     assert "needs: [tests, python, quality, compatibility, dependencies, fuzz, package]" in review
