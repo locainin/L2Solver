@@ -9,8 +9,9 @@ fi
 
 case "$1" in
   nextest)
-    url='https://github.com/nextest-rs/nextest/releases/download/cargo-nextest-0.9.138/cargo-nextest-0.9.138-x86_64-unknown-linux-gnu.tar.gz'
-    checksum='3793bf0c27607b196f502c39b2108f571de89fcda7586ae6beefa11ee177b216'
+    nextest_version='0.9.150'
+    url="https://github.com/nextest-rs/nextest/releases/download/cargo-nextest-${nextest_version}/cargo-nextest-${nextest_version}-x86_64-unknown-linux-gnu.tar.gz"
+    checksum='b0959bc64232974224cf9fb22c915845398c0e8668fa7831eb5b43fb1eef781f'
     member='cargo-nextest'
     binary='cargo-nextest'
     ;;
@@ -40,6 +41,19 @@ curl --fail --silent --show-error --location --retry 3 \
   --proto '=https' --proto-redir '=https' --output "$archive" "$url"
 printf '%s  %s\n' "$checksum" "$archive" | sha256sum --check
 tar -xOzf "$archive" "$member" > "$scratch_dir/$binary"
+
+# Check the verified Nextest executable before replacing an installed copy
+if [[ $1 == nextest ]]; then
+  chmod 755 "$scratch_dir/$binary"
+  if ! version_output=$("$scratch_dir/$binary" --version); then
+    printf 'failed to check %s version\n' "$binary" >&2
+    exit 1
+  fi
+  if [[ $version_output != "cargo-nextest $nextest_version ("* ]]; then
+    printf 'unexpected %s version; expected %s\n' "$binary" "$nextest_version" >&2
+    exit 1
+  fi
+fi
 
 # Publish the verified executable only after extraction succeeds
 mkdir -p "$HOME/.cargo/bin"
