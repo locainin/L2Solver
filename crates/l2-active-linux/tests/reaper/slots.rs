@@ -1,4 +1,4 @@
-use super::{Lease, MAX_ACTIVE_HELPERS, Retention, sender, submit, submit_with_sender};
+use super::{Lease, MAX_ACTIVE_HELPERS, Retention, sender, start, submit, submit_with_sender};
 use nix::{
     errno::Errno,
     sys::wait::{WaitPidFlag, WaitStatus, waitpid},
@@ -22,11 +22,13 @@ static CHILD_SLOTS: AtomicUsize = AtomicUsize::new(0);
 static KILLED_SLOTS: AtomicUsize = AtomicUsize::new(0);
 static LIVE_SLOTS: AtomicUsize = AtomicUsize::new(0);
 static UNKNOWN_SLOTS: AtomicUsize = AtomicUsize::new(0);
+static BACKGROUND_UNKNOWN_SLOTS: AtomicUsize = AtomicUsize::new(0);
 static DROP_UNKNOWN_SLOTS: AtomicUsize = AtomicUsize::new(0);
 static TEST_RETENTION: OnceLock<Retention> = OnceLock::new();
 static KILLED_RETENTION: OnceLock<Retention> = OnceLock::new();
 static LIVE_RETENTION: OnceLock<Retention> = OnceLock::new();
 static UNKNOWN_RETENTION: OnceLock<Retention> = OnceLock::new();
+static BACKGROUND_UNKNOWN_RETENTION: OnceLock<Retention> = OnceLock::new();
 static DROP_UNKNOWN_RETENTION: OnceLock<Retention> = OnceLock::new();
 
 thread_local! {
@@ -275,6 +277,69 @@ fn disconnected_handoff_retains_child_and_slot_when_wait_status_is_unavailable()
     drop(task);
     assert_eq!(
         UNKNOWN_SLOTS.load(Ordering::Acquire),
+        0,
+        "retrieved task did not release its slot"
+    );
+    Ok(())
+}
+
+#[test]
+fn background_reaper_retains_child_and_slot_when_wait_status_is_unavailable() -> io::Result<()> {
+    let reaper = start()?;
+    let retention = BACKGROUND_UNKNOWN_RETENTION.get_or_init(Retention::new);
+    let lease = Lease::acquire(&BACKGROUND_UNKNOWN_SLOTS, retention)?;
+    let mut child = Command::new("sleep")
+        .arg("60")
+        .stdout(Stdio::piped())
+        .spawn()?;
+    let descriptor = child
+        .stdout
+        .as_ref()
+        .ok_or_else(|| io::Error::other("missing child stdout"))?
+        .as_raw_fd();
+    let descriptor_path = std::path::Path::new("/proc/self/fd").join(descriptor.to_string());
+    let identity = std::fs::read_link(&descriptor_path)?;
+    let pid = Pid::from_raw(i32::try_from(child.id()).map_err(io::Error::other)?);
+    child.kill()?;
+    waitpid(pid, None).map_err(io::Error::other)?;
+
+    // The real worker must transfer an unavailable status to retained ownership
+    submit_with_sender(child, lease, Some(&reaper));
+    let Retention {
+        _receiver: receiver,
+        ..
+    } = retention;
+    let deadline = Instant::now() + Duration::from_secs(3);
+    let task = loop {
+        let queued = receiver
+            .lock()
+            .map_err(|_| io::Error::other("retention lock poisoned"))?
+            .try_recv();
+        match queued {
+            Ok(task) => break Some(task),
+            Err(mpsc::TryRecvError::Empty)
+                if BACKGROUND_UNKNOWN_SLOTS.load(Ordering::Acquire) != 0
+                    && Instant::now() < deadline =>
+            {
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            Err(mpsc::TryRecvError::Empty | mpsc::TryRecvError::Disconnected) => break None,
+        }
+    };
+    assert_eq!(
+        BACKGROUND_UNKNOWN_SLOTS.load(Ordering::Acquire),
+        1,
+        "unconfirmed termination released the slot"
+    );
+    assert_eq!(
+        std::fs::read_link(descriptor_path).ok().as_ref(),
+        Some(&identity),
+        "unconfirmed termination dropped the child handle"
+    );
+    let task = task.ok_or_else(|| io::Error::other("background reaper did not retain the task"))?;
+    drop(task);
+    assert_eq!(
+        BACKGROUND_UNKNOWN_SLOTS.load(Ordering::Acquire),
         0,
         "retrieved task did not release its slot"
     );
