@@ -741,7 +741,8 @@ def recover(prefix, *, resume=()):
     if not os.path.lexists(path):
         if os.path.lexists(temporary):
             # No action can start before the initial journal is published
-            read_manifest(prefix)
+            # Check the record without blocking quarantine of a damaged generation
+            read_manifest_structure(prefix)
             remove_private_file(temporary)
             sync_directory(temporary.parent)
         return None
