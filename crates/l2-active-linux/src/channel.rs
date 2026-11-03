@@ -3,15 +3,29 @@ use nix::{
     errno::Errno,
     poll::{PollFd, PollFlags, poll},
     sys::socket::{
-        AddressFamily, ControlMessageOwned, MsgFlags, SockFlag, SockType, UnixCredentials, recvmsg,
-        send, setsockopt, socketpair, sockopt::PassCred,
+        AddressFamily, ControlMessageOwned, MsgFlags, SockFlag, SockType, UnixCredentials, send,
+        setsockopt, socketpair, sockopt::PassCred,
     },
 };
+
+#[cfg(not(test))]
+use nix::sys::socket::recvmsg;
+
+#[cfg(test)]
+#[path = "../tests/channel/fault.rs"]
+pub mod fault;
+
+#[cfg(test)]
+use fault::recvmsg;
+
 use std::{
     io::{self, IoSliceMut},
     os::fd::{AsFd, AsRawFd, OwnedFd},
     time::{Duration, Instant},
 };
+
+// Return to the caller regularly so it can observe cancellation
+const CONTROL_SLICE: Duration = Duration::from_millis(20);
 
 #[cfg(test)]
 #[path = "../tests/channel/rights.rs"]
@@ -102,65 +116,25 @@ impl Channel {
         // Linux emits credentials first and closes descriptors that do not fit
         let space = nix::sys::socket::cmsg_space::<nix::libc::ucred>();
         let mut ancillary = crate::buffer::zeroed(space)?;
-        // Reject an elapsed deadline after allocation and before receiving anything
-        crate::deadline::ensure_before(deadline)?;
-        let message = match recvmsg::<()>(
-            self.fd.as_raw_fd(),
-            &mut iov,
-            Some(&mut ancillary),
-            MsgFlags::MSG_DONTWAIT | MsgFlags::MSG_TRUNC | MsgFlags::MSG_CMSG_CLOEXEC,
-        ) {
-            Ok(message) => message,
-            Err(Errno::EAGAIN) => return Ok(None),
-            Err(error) => return Err(errno(error)),
-        };
-        let count = message.bytes;
-        let truncated = message.flags.contains(MsgFlags::MSG_CTRUNC);
-        let mut verified = false;
-        let mut extra = false;
-        let mut wrong_peer = false;
-        let mut close_error = None;
-        if !truncated {
-            for control in message.cmsgs().map_err(errno)? {
-                match control {
-                    ControlMessageOwned::ScmCredentials(credential) => {
-                        wrong_peer |= verified || !self.peer.matches(&credential);
-                        verified = true;
-                    }
-                    ControlMessageOwned::ScmRights(fds) => {
-                        // A helper record never transfers authority via descriptors
-                        for fd in fds {
-                            if let Err(error) = nix::unistd::close(fd) {
-                                close_error.get_or_insert_with(|| errno(error));
-                            }
-                        }
-                        extra = true;
-                    }
-                    _ => extra = true,
-                }
+        let retry_deadline = deadline.min(Instant::now() + CONTROL_SLICE);
+        let received = retry_interrupted(retry_deadline, || {
+            recvmsg::<()>(
+                self.fd.as_raw_fd(),
+                &mut iov,
+                Some(&mut ancillary),
+                MsgFlags::MSG_DONTWAIT | MsgFlags::MSG_TRUNC | MsgFlags::MSG_CMSG_CLOEXEC,
+            )
+            .map(|message| check_message(&message, self.peer))
+        });
+        let count = match received {
+            Ok(result) => result?,
+            Err(error) if error.kind() == io::ErrorKind::WouldBlock => return Ok(None),
+            // A retry slice may end before the operation's actual deadline
+            Err(error) if error.kind() == io::ErrorKind::TimedOut && Instant::now() < deadline => {
+                return Ok(None);
             }
-        }
-        if let Some(error) = close_error {
-            return Err(error);
-        }
-        if count == 0 {
-            return Err(io::Error::new(
-                io::ErrorKind::BrokenPipe,
-                "active helper closed its channel",
-            ));
-        }
-        if wrong_peer {
-            return Err(io::Error::new(
-                io::ErrorKind::PermissionDenied,
-                "unexpected helper peer credentials",
-            ));
-        }
-        if truncated || !verified || extra || count > wire::MAX_RECORD {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "invalid helper record or ancillary data",
-            ));
-        }
+            Err(error) => return Err(error),
+        };
         bytes.truncate(count);
         Ok(Some(bytes))
     }
@@ -176,7 +150,7 @@ impl Channel {
         let millis = u16::try_from(
             deadline
                 .saturating_duration_since(now)
-                .min(Duration::from_millis(20))
+                .min(CONTROL_SLICE)
                 .as_millis()
                 .max(1),
         )
@@ -196,6 +170,57 @@ impl Channel {
             self.wait(PollFlags::POLLIN, deadline)?;
         }
     }
+}
+
+fn check_message(message: &nix::sys::socket::RecvMsg<'_, '_, ()>, peer: Peer) -> io::Result<usize> {
+    let count = message.bytes;
+    let truncated = message.flags.contains(MsgFlags::MSG_CTRUNC);
+    let mut verified = false;
+    let mut extra = false;
+    let mut wrong_peer = false;
+    let mut close_error = None;
+    if !truncated {
+        for control in message.cmsgs().map_err(errno)? {
+            match control {
+                ControlMessageOwned::ScmCredentials(credential) => {
+                    wrong_peer |= verified || !peer.matches(&credential);
+                    verified = true;
+                }
+                ControlMessageOwned::ScmRights(fds) => {
+                    // A helper record never transfers authority via descriptors
+                    for fd in fds {
+                        if let Err(error) = nix::unistd::close(fd) {
+                            close_error.get_or_insert_with(|| errno(error));
+                        }
+                    }
+                    extra = true;
+                }
+                _ => extra = true,
+            }
+        }
+    }
+    if let Some(error) = close_error {
+        return Err(error);
+    }
+    if count == 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::BrokenPipe,
+            "active helper closed its channel",
+        ));
+    }
+    if wrong_peer {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "unexpected helper peer credentials",
+        ));
+    }
+    if truncated || !verified || extra || count > wire::MAX_RECORD {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "invalid helper record or ancillary data",
+        ));
+    }
+    Ok(count)
 }
 
 fn retry_interrupted<T>(

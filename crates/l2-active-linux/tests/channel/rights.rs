@@ -10,6 +10,8 @@ use std::{
 
 #[path = "deadline.rs"]
 mod deadline;
+#[path = "interrupt.rs"]
+mod interrupt;
 #[path = "records.rs"]
 mod records;
 #[path = "truncated.rs"]
@@ -74,6 +76,7 @@ fn records_close_received_descriptors_before_reporting_the_error() -> io::Result
             "payload length {}",
             data.len()
         );
+        let _interrupted = super::fault::InterruptedReceive::once();
         assert_eq!(
             channel
                 .try_receive(future_deadline())
@@ -82,6 +85,11 @@ fn records_close_received_descriptors_before_reporting_the_error() -> io::Result
             Some(expected),
             "payload length {}, descriptor count {descriptor_count}",
             data.len(),
+        );
+        assert_eq!(
+            super::fault::InterruptedReceive::attempts(),
+            2,
+            "receive did not retry once"
         );
         assert_eq!(
             count_open_identity(metadata.dev(), metadata.ino())?,
