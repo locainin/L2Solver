@@ -7,7 +7,7 @@ use l2_workbench::job::{
     RecoveryArtifactSample, RecoveryPublicationSample, RecoveryPublicationSourceBasis,
     RecoveryTransitionOutcome,
 };
-use std::{cell::Cell, error::Error, io, path::Path};
+use std::{cell::Cell, collections::BTreeMap, error::Error, io, path::Path};
 
 pub(super) fn publish<T>(
     directory: ResultDirectory,
@@ -109,17 +109,19 @@ fn write_result_stage<T>(
     let file_names = manifest::staged_output_files(staging, kind, &parsed)?;
     let output_files = {
         let mut hasher = OutputHasher::new(job);
+        // Index the validated names once instead of scanning every artifact for each file
+        let artifact_digests = parsed
+            .artifacts
+            .iter()
+            .map(|artifact| (artifact.file.as_str(), artifact.sha256.as_deref()))
+            .collect::<BTreeMap<_, _>>();
         file_names
             .iter()
             .map(|file| {
-                let artifact = parsed
-                    .artifacts
-                    .iter()
-                    .find(|artifact| artifact.file == *file);
                 OutputFileStamp::capture_path(
                     staging,
                     file,
-                    artifact.and_then(|artifact| artifact.sha256.as_deref()),
+                    artifact_digests.get(file.as_str()).copied().flatten(),
                     &mut hasher,
                 )
             })

@@ -258,3 +258,88 @@ fn larger_file_fingerprints_keep_the_existing_three_range_identity() -> Result<(
     }
     Ok(())
 }
+
+#[test]
+fn path_source_hash_checks_cancellation_and_reports_completed_reads() -> Result<(), Box<dyn Error>>
+{
+    use l2_workbench::job::cache::SourceIdentity;
+    use std::{cell::Cell, io};
+
+    let directory = tempfile::tempdir()?;
+    let source = directory.path().join("source.bin");
+    fs::write(&source, vec![42_u8; 256 * 1024])?;
+    let cancelled = Cell::new(false);
+    let mut observed = 0_usize;
+    let result = SourceIdentity::sha256_file_with_check_and_observer(
+        &source,
+        || {
+            if cancelled.get() {
+                Err(io::Error::other("cancelled during source hashing"))
+            } else {
+                Ok(())
+            }
+        },
+        |count| {
+            observed += count;
+            cancelled.set(true);
+            Ok(())
+        },
+    );
+    assert!(result.is_err());
+    assert_eq!(observed, 64 * 1024);
+    Ok(())
+}
+
+#[test]
+fn path_source_hash_keeps_its_digest_and_reports_actual_bytes() -> Result<(), Box<dyn Error>> {
+    use l2_workbench::job::cache::SourceIdentity;
+
+    let directory = tempfile::tempdir()?;
+    let source = directory.path().join("source.bin");
+    let bytes = vec![17_u8; 256 * 1024 + 7];
+    fs::write(&source, &bytes)?;
+    let mut observed = 0_usize;
+    let actual = SourceIdentity::sha256_file_with_check_and_observer(
+        &source,
+        || Ok(()),
+        |count| {
+            observed += count;
+            Ok(())
+        },
+    )?;
+    assert_eq!(actual, SourceIdentity::from_sha256(sha256(&bytes))?);
+    assert_eq!(observed, bytes.len());
+    Ok(())
+}
+
+#[test]
+fn path_fingerprint_observer_reports_each_sample_read() -> Result<(), Box<dyn Error>> {
+    let directory = tempfile::tempdir()?;
+    let source = directory.path().join("source.bin");
+    fs::write(&source, vec![17_u8; 256 * 1024])?;
+    let mut observed = 0_usize;
+    let actual = SourceFingerprint::fast_with_observer(&source, |count| {
+        observed += count;
+        Ok(())
+    })?;
+    assert_eq!(actual, SourceFingerprint::fast(&source)?);
+    assert_eq!(observed, 3 * 64 * 1024);
+    Ok(())
+}
+
+#[cfg(unix)]
+#[test]
+fn observed_source_identities_reject_symlink_paths() -> Result<(), Box<dyn Error>> {
+    use l2_workbench::job::cache::SourceIdentity;
+
+    let directory = tempfile::tempdir()?;
+    let source = directory.path().join("source.bin");
+    let link = directory.path().join("linked.bin");
+    fs::write(&source, b"source")?;
+    std::os::unix::fs::symlink(source, &link)?;
+    assert!(SourceFingerprint::fast_with_observer(&link, |_| Ok(())).is_err());
+    assert!(
+        SourceIdentity::sha256_file_with_check_and_observer(&link, || Ok(()), |_| Ok(())).is_err()
+    );
+    Ok(())
+}

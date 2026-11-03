@@ -199,7 +199,7 @@ fn try_reuse<W: Write>(context: ReuseContext<'_, W>) -> Result<Option<bool>, Box
             output,
             destination,
             reused.complete,
-            reused.artifacts.len(),
+            reused.artifact_count,
             options.dry_run,
         )?;
     }

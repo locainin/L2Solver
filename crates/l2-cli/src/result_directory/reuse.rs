@@ -3,7 +3,7 @@ use super::{
     manifest::{DirectoryState, actionable_conflict},
 };
 use l2_workbench::job::{
-    Job,
+    Counter, Job,
     cache::{SourceFingerprint, SourceIdentity},
 };
 use std::{error::Error, io, path::Path};
@@ -14,6 +14,17 @@ pub(super) fn reuse(
     current_input: Option<&Path>,
     strict: bool,
     job: &Job,
+) -> Result<Option<ReusedResult>, Box<dyn Error>> {
+    reuse_with_source_observer(directory, identity, current_input, strict, job, |_| {})
+}
+
+pub(super) fn reuse_with_source_observer(
+    directory: &ResultDirectory,
+    identity: &ResultIdentity,
+    current_input: Option<&Path>,
+    strict: bool,
+    job: &Job,
+    mut observe: impl FnMut(usize),
 ) -> Result<Option<ReusedResult>, Box<dyn Error>> {
     job.check_cancelled()?;
     let (prepared, manifest, receipt) = match &directory.state {
@@ -38,7 +49,14 @@ pub(super) fn reuse(
         )
         .into());
     }
-    verify_source(identity, receipt, current_input, strict)?;
+    verify_source(
+        &identity.source,
+        receipt,
+        current_input,
+        strict,
+        job,
+        &mut observe,
+    )?;
 
     verified_result(prepared, manifest, receipt, strict, job).map(Some)
 }
@@ -92,9 +110,8 @@ pub(super) fn reuse_refinement(
     }
     if strict || identity.source != receipt.identity.source {
         // Old strong receipts and changed metadata require the full ordered source digest
-        let mut strong_identity = identity.clone();
-        strong_identity.source = strong_source()?;
-        verify_source(&strong_identity, receipt, None, true)?;
+        let strong_identity = strong_source()?;
+        verify_source(&strong_identity, receipt, None, true, job, &mut |_| {})?;
     }
     verified_result(prepared, manifest, receipt, strict, job).map(Some)
 }
@@ -113,17 +130,8 @@ fn verified_result(
     prepared.check_location()?;
     Ok(ReusedResult {
         complete: manifest.complete,
-        artifacts: manifest
-            .artifacts
-            .iter()
-            .filter_map(|artifact| {
-                receipt
-                    .output_files
-                    .iter()
-                    .find(|stamp| stamp.file == artifact.file)
-                    .cloned()
-            })
-            .collect(),
+        // Inspection already matched every declared artifact to one validated receipt
+        artifact_count: manifest.artifacts.len(),
     })
 }
 
@@ -146,28 +154,28 @@ fn ensure_policy_matches(
 }
 
 fn verify_source(
-    identity: &ResultIdentity,
+    source: &SourceIdentity,
     receipt: &super::manifest::ResultReceipt,
     current_input: Option<&Path>,
     strict: bool,
+    job: &Job,
+    observe: &mut impl FnMut(usize),
 ) -> Result<(), Box<dyn Error>> {
     if strict {
         let digest = if let Some(input) = current_input {
-            let actual = SourceIdentity::sha256_file(input)?;
+            let actual = hash_source(input, job, observe)?;
             source_digest(&actual)
                 .map(str::to_owned)
                 .ok_or_else(|| invalid_source("current input has no strong SHA-256 identity"))?
         } else {
-            source_digest(&identity.source)
-                .map(str::to_owned)
-                .ok_or_else(|| {
-                    io::Error::new(
-                        io::ErrorKind::InvalidInput,
-                        "strict result reuse needs an input path or a strong source identity",
-                    )
-                })?
+            source_digest(source).map(str::to_owned).ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "strict result reuse needs an input path or a strong source identity",
+                )
+            })?
         };
-        if source_digest(&identity.source).is_some_and(|expected| expected != digest) {
+        if source_digest(source).is_some_and(|expected| expected != digest) {
             return Err(actionable_conflict(
                 "source identity differs from the current input bytes",
             )
@@ -179,23 +187,25 @@ fn verify_source(
         return Ok(());
     }
 
-    if identity.source == receipt.identity.source {
-        if let (SourceIdentity::Fast(expected), Some(input)) = (&identity.source, current_input) {
-            let current = SourceFingerprint::fast(input)?;
+    if *source == receipt.identity.source {
+        if let (SourceIdentity::Fast(expected), Some(input)) = (source, current_input) {
+            let current = SourceFingerprint::fast_with_observer(input, |count| {
+                observe_source_read(job, count, observe)
+            })?;
             if &current != expected {
-                return verify_source_by_digest(input, receipt);
+                return verify_source_by_digest(input, receipt, job, observe);
             }
         }
         return Ok(());
     }
 
-    if let Some(digest) = source_digest(&identity.source)
+    if let Some(digest) = source_digest(source)
         && receipt.source_identity_sha256.as_deref() == Some(digest)
     {
         return Ok(());
     }
     if let Some(input) = current_input {
-        return verify_source_by_digest(input, receipt);
+        return verify_source_by_digest(input, receipt, job, observe);
     }
     Err(actionable_conflict("source identity differs from the existing result").into())
 }
@@ -203,8 +213,10 @@ fn verify_source(
 fn verify_source_by_digest(
     input: &Path,
     receipt: &super::manifest::ResultReceipt,
+    job: &Job,
+    observe: &mut impl FnMut(usize),
 ) -> Result<(), Box<dyn Error>> {
-    let actual = SourceIdentity::sha256_file(input)?;
+    let actual = hash_source(input, job, observe)?;
     let digest = source_digest(&actual)
         .ok_or_else(|| invalid_source("current input has no strong SHA-256 identity"))?;
     if receipt.source_identity_sha256.as_deref() == Some(digest) {
@@ -212,6 +224,29 @@ fn verify_source_by_digest(
     } else {
         Err(actionable_conflict("source bytes differ from the existing result").into())
     }
+}
+
+fn hash_source(
+    input: &Path,
+    job: &Job,
+    observe: &mut impl FnMut(usize),
+) -> Result<SourceIdentity, Box<dyn Error>> {
+    Ok(SourceIdentity::sha256_file_with_check_and_observer(
+        input,
+        || job.check_cancelled().map_err(io::Error::other),
+        |count| observe_source_read(job, count, observe),
+    )?)
+}
+
+fn observe_source_read(job: &Job, count: usize, observe: &mut impl FnMut(usize)) -> io::Result<()> {
+    // Count bytes that were actually read before honoring a new cancellation request
+    job.increment(
+        Counter::SourceReadBytes,
+        u64::try_from(count).map_err(io::Error::other)?,
+    )
+    .map_err(io::Error::other)?;
+    observe(count);
+    job.check_cancelled().map_err(io::Error::other)
 }
 
 fn source_digest(identity: &SourceIdentity) -> Option<&str> {
