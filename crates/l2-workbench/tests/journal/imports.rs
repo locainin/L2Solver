@@ -1,10 +1,4 @@
-#[path = "../reconstruction/ipv4.rs"]
-mod ipv4;
-
-#[path = "../store/support.rs"]
-mod captures;
-#[path = "../reconstruction/tcp.rs"]
-mod frames;
+use crate::{captures, tcp as frames};
 use l2_workbench::{
     evidence::Case,
     journal::{Journal, JournalOptions},
