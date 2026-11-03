@@ -557,10 +557,13 @@ impl HelperLink {
                     ));
                 }
             }
-            match self.channel.try_receive() {
+            match self.channel.try_receive(deadline) {
                 Ok(Some(record)) => return Ok(record),
                 Ok(None) => {}
                 Err(error) => {
+                    if error.kind() == io::ErrorKind::TimedOut {
+                        self.cancel();
+                    }
                     self.poisoned = true;
                     return Err(error);
                 }

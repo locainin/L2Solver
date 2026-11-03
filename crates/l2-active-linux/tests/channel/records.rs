@@ -1,4 +1,7 @@
-use super::super::{Channel, Peer};
+use super::{
+    super::{Channel, Peer},
+    future_deadline,
+};
 use crate::wire::MAX_RECORD;
 use nix::sys::socket::{
     AddressFamily, MsgFlags, SockFlag, SockType, UnixCredentials, recv, send, socketpair,
@@ -11,7 +14,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-fn own_peer() -> Peer {
+pub(super) fn own_peer() -> Peer {
     Peer {
         pid: std::process::id(),
         uid: nix::unistd::getuid().as_raw(),
@@ -54,7 +57,7 @@ fn empty_channel_receive_returns_without_waiting_for_a_peer() -> io::Result<()> 
     let (channel, remote) = blocking_channel()?;
     let (sender, receiver) = mpsc::channel();
     let reader = thread::spawn(move || {
-        let _ = sender.send(channel.try_receive());
+        let _ = sender.send(channel.try_receive(future_deadline()));
     });
     let result = receiver.recv_timeout(Duration::from_secs(3));
 
@@ -128,7 +131,7 @@ fn channel_accepts_the_expected_peer_and_the_maximum_record() -> io::Result<()> 
     let (channel, remote) = Channel::pair(own_peer())?;
     let record = vec![42; MAX_RECORD];
     send(remote.as_raw_fd(), &record, MsgFlags::empty()).map_err(io::Error::other)?;
-    assert_eq!(channel.try_receive()?, Some(record));
+    assert_eq!(channel.try_receive(future_deadline())?, Some(record));
     Ok(())
 }
 
@@ -138,7 +141,10 @@ fn channel_rejects_a_record_that_exceeds_the_limit() -> io::Result<()> {
     let record = vec![42; MAX_RECORD + 1];
     send(remote.as_raw_fd(), &record, MsgFlags::empty()).map_err(io::Error::other)?;
     assert_eq!(
-        channel.try_receive().err().map(|error| error.kind()),
+        channel
+            .try_receive(future_deadline())
+            .err()
+            .map(|error| error.kind()),
         Some(io::ErrorKind::InvalidData)
     );
     Ok(())
@@ -160,7 +166,10 @@ fn channel_rejects_wrong_process_and_user_credentials() -> io::Result<()> {
         let (channel, remote) = Channel::pair(peer)?;
         send(remote.as_raw_fd(), &[1], MsgFlags::empty()).map_err(io::Error::other)?;
         assert_eq!(
-            channel.try_receive().err().map(|error| error.kind()),
+            channel
+                .try_receive(future_deadline())
+                .err()
+                .map(|error| error.kind()),
             Some(io::ErrorKind::PermissionDenied),
             "expected pid {} and uid {}",
             peer.pid,
