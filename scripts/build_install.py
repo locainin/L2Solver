@@ -49,6 +49,11 @@ def main():
     for name in ("cargo", "rustc", "cc", "git", "sudo", "ldd"):
         if not shutil.which(name):
             parser.error(f"missing dependency: {name}; install it and retry")
+    # Confirm provenance before inspecting a protected prefix or starting a build
+    try:
+        before = source_state()
+    except subprocess.CalledProcessError:
+        parser.error("source installation requires a Git checkout with a committed HEAD; clone the repository and run this script from that checkout")
     if args.enable_active:
         for name in ("setcap", "getcap"):
             if not shutil.which(name):
@@ -73,7 +78,6 @@ def main():
     command = ["cargo", "build", "--release", "--locked", "-p", "l2-cli", "-p", "l2-active-cli", "-p", "l2-active-linux", "--bins", "--message-format=json-render-diagnostics"]
     if args.live:
         command.extend(["--features", "l2-cli/live"])
-    before = source_state()
     artifacts = {}
     # Cargo supplies exact artifact paths, including configured target directories
     with subprocess.Popen(command, cwd=ROOT, stdout=subprocess.PIPE, text=True) as process:
