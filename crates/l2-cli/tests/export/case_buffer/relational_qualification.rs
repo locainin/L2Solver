@@ -74,7 +74,12 @@ fn run_qualification(action: &str, output: &Path) -> TestResult {
         PathBuf::from(std::env::var_os("L2_QUAL_EXPECTED").ok_or("missing expected artifact")?);
     let expected = fs::read(expected_path)?;
     let oracle = std::env::var_os("L2_QUAL_ORACLE").map(PathBuf::from);
-    if action != "no-cache" && oracle.is_none() {
+    // A refused reference run can leave only an explicitly requested measurement
+    // Artifact checks remain active and the receipt marks the absent comparison
+    if action != "no-cache"
+        && oracle.is_none()
+        && !matches!(std::env::var("L2_QUAL_ALLOW_NO_ORACLE").as_deref(), Ok("1"))
+    {
         return Err("cached runs require a fresh no-cache reference".into());
     }
     let cache_root = PathBuf::from(std::env::var_os("L2_QUAL_CACHE").ok_or("missing cache root")?);
@@ -86,16 +91,7 @@ fn run_qualification(action: &str, output: &Path) -> TestResult {
         oracle: oracle.as_deref(),
         cases,
     };
-    let options = RecoveryOptions {
-        profile: RecoveryProfile::Normal,
-        memory_limit: limit,
-        cache_max_bytes: CACHE_LIMIT,
-        jobs: Some(workers),
-        no_cache: action == "no-cache",
-        strict_cache: action == "strict",
-        quiet: true,
-        ..RecoveryOptions::default()
-    };
+    let options = qualification_options(action, limit, workers)?;
 
     // Use the real job monitor so kernel pressure participates in admission
     let result = crate::recovery_job::run(&options, "relational qualification", |job| {
@@ -110,6 +106,8 @@ fn run_qualification(action: &str, output: &Path) -> TestResult {
         let snapshot = job.snapshot()?;
         let receipt = json!({
             "action": action,
+            "profile": format!("{:?}", options.profile),
+            "compared_to_reference": qualification.oracle.is_some(),
             "workers": workers,
             "replica_cases": cases,
             "result": if result.is_ok() { "complete" } else if denial.is_some_and(|error| bounded_refusal(limit, error)) { "bounded_refusal" } else { "failed" },
@@ -138,6 +136,24 @@ fn run_qualification(action: &str, output: &Path) -> TestResult {
     })?;
     assert_eq!(result, crate::outcome::RunOutcome::Completed);
     Ok(())
+}
+
+fn qualification_options(action: &str, limit: u64, workers: usize) -> TestResult<RecoveryOptions> {
+    let profile = match std::env::var("L2_QUAL_PROFILE").as_deref() {
+        Ok("deep") => RecoveryProfile::Deep,
+        Ok("normal") | Err(std::env::VarError::NotPresent) => RecoveryProfile::Normal,
+        _ => return Err("unsupported qualification profile".into()),
+    };
+    Ok(RecoveryOptions {
+        profile,
+        memory_limit: limit,
+        cache_max_bytes: CACHE_LIMIT,
+        jobs: Some(workers),
+        no_cache: action == "no-cache",
+        strict_cache: action == "strict",
+        quiet: true,
+        ..RecoveryOptions::default()
+    })
 }
 
 fn pending_case(
