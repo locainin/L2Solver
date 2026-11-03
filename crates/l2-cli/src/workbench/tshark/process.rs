@@ -3,6 +3,8 @@ use super::budget::{
     ObjectFileSnapshot, StableObject,
 };
 use l2_workbench::job::Job;
+#[cfg(all(target_os = "linux", not(target_env = "uclibc")))]
+use nix::sys::wait::{Id, WaitPidFlag, WaitStatus, waitid};
 #[cfg(unix)]
 use nix::{
     sys::signal::{Signal, killpg},
@@ -325,10 +327,12 @@ fn wait_for_capture(
             }
         }
         if status.is_none() {
-            status = match child.try_wait() {
+            status = match observe_exit(child) {
                 Ok(status) => status,
                 Err(error) => {
-                    stop_and_reap(child);
+                    if !lost_child(&error) {
+                        stop_and_reap(child);
+                    }
                     join_workers_after_stop([stdout_worker, stderr_worker]);
                     return Err(ProcessError::Read(error));
                 }
@@ -337,12 +341,21 @@ fn wait_for_capture(
         if status.is_some() && stdout_result.is_some() && stderr_result.is_some() {
             let _ = stdout_worker.join();
             let _ = stderr_worker.join();
+            // A failed child can leave group members running after closing both pipes
+            #[cfg(all(target_os = "linux", not(target_env = "uclibc")))]
+            if status.as_ref().is_some_and(|status| !status.success()) {
+                stop_process_group(child).map_err(ProcessError::Read)?;
+            }
+            #[cfg(not(all(target_os = "linux", not(target_env = "uclibc"))))]
+            let status = status.ok_or_else(|| {
+                ProcessError::Read(io::Error::other("TShark exit status unavailable"))
+            })?;
+            #[cfg(all(target_os = "linux", not(target_env = "uclibc")))]
+            let status = child.wait().map_err(ProcessError::Read)?;
             return Ok(Output {
                 stdout: stdout_result.unwrap_or_default(),
                 stderr: stderr_result.unwrap_or_default(),
-                status: status.ok_or_else(|| {
-                    ProcessError::Read(io::Error::other("TShark exit status unavailable"))
-                })?,
+                status,
             });
         }
         if Instant::now() >= deadline {
@@ -437,13 +450,20 @@ fn run_streaming_with_spawner(
                 let _ = worker.join();
                 if !output.status.success() {
                     // A failed direct child can leave helpers alive after closing stderr
-                    stop_process_group(&child);
+                    stop_process_group(&child).map_err(ProcessError::Read)?;
                 }
+                #[cfg(all(target_os = "linux", not(target_env = "uclibc")))]
+                let output = StreamOutput {
+                    status: child.wait().map_err(ProcessError::Read)?,
+                    ..output
+                };
                 return Ok(output);
             }
             Ok(None) => thread::sleep(Duration::from_millis(3)),
             Err(error) => {
-                stop_and_reap(&mut child);
+                if !matches!(&error, ProcessError::Read(source) if lost_child(source)) {
+                    stop_and_reap(&mut child);
+                }
                 join_workers_after_stop([worker]);
                 if matches!(error, ProcessError::TimedOut) {
                     return Err(ProcessError::ObjectExportTimeout(monitor.timeout_receipt()));
@@ -523,9 +543,16 @@ impl StreamingMonitor {
         Ok(())
     }
 
+    #[cfg_attr(
+        all(target_os = "linux", not(target_env = "uclibc")),
+        expect(
+            clippy::needless_pass_by_ref_mut,
+            reason = "Other targets use Child::try_wait to observe the child"
+        )
+    )]
     fn poll_child(&mut self, child: &mut Child) -> Result<(), ProcessError> {
         if self.status.is_none() {
-            self.status = child.try_wait().map_err(ProcessError::Read)?;
+            self.status = observe_exit(child).map_err(ProcessError::Read)?;
         }
         Ok(())
     }
@@ -817,6 +844,9 @@ fn spawn_with_output(
     stdout: Stdio,
     stderr: Stdio,
 ) -> Result<Child, ProcessError> {
+    // Auto-reaped children cannot reserve their process group during cleanup
+    #[cfg(target_os = "linux")]
+    ensure_waitable_children().map_err(ProcessError::Spawn)?;
     let mut command = Command::new(executable);
     // Retain only command lookup and the Windows system root from the caller environment
     let path = std::env::var_os("PATH");
@@ -844,6 +874,33 @@ fn spawn_with_output(
         .map_err(ProcessError::Spawn)
 }
 
+#[cfg(target_os = "linux")]
+fn ensure_waitable_children() -> io::Result<()> {
+    let status = fs::read_to_string("/proc/self/status").map_err(|error| {
+        io::Error::new(
+            error.kind(),
+            format!("cannot inspect SIGCHLD policy: {error}"),
+        )
+    })?;
+    check_sigchld_policy(&status)
+}
+
+#[cfg(target_os = "linux")]
+fn check_sigchld_policy(status: &str) -> io::Result<()> {
+    let mask = status
+        .lines()
+        .find_map(|line| line.strip_prefix("SigIgn:"))
+        .and_then(|value| u128::from_str_radix(value.trim(), 16).ok())
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "cannot read SIGCHLD policy"))?;
+    if mask & (1_u128 << (nix::libc::SIGCHLD - 1)) != 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "TShark cannot start while SIGCHLD is ignored",
+        ));
+    }
+    Ok(())
+}
+
 fn capture(mut reader: impl Read, maximum: usize) -> Result<Vec<u8>, ProcessError> {
     let limit = u64::try_from(maximum)
         .ok()
@@ -861,10 +918,61 @@ fn capture(mut reader: impl Read, maximum: usize) -> Result<Vec<u8>, ProcessErro
     Ok(bytes)
 }
 
+#[cfg(all(target_os = "linux", not(target_env = "uclibc")))]
+fn observe_exit(child: &Child) -> io::Result<Option<ExitStatus>> {
+    use std::os::unix::process::ExitStatusExt;
+
+    #[cfg(test)]
+    tests::record_observe();
+    let pid = Pid::from_raw(i32::try_from(child.id()).map_err(io::Error::other)?);
+    let flags = WaitPidFlag::WEXITED | WaitPidFlag::WNOHANG | WaitPidFlag::WNOWAIT;
+    #[cfg(test)]
+    let status = tests::waitid_with_fault(pid, flags);
+    #[cfg(not(test))]
+    let status = waitid(Id::Pid(pid), flags);
+    let status = match status {
+        Ok(status) => status,
+        // Returning to the caller keeps cancellation and deadlines observable
+        Err(nix::errno::Errno::EINTR) => return Ok(None),
+        Err(error) => return Err(io::Error::from_raw_os_error(error as i32)),
+    };
+    let raw = match status {
+        WaitStatus::StillAlive => return Ok(None),
+        WaitStatus::Exited(_, code) => code << 8,
+        WaitStatus::Signaled(_, signal, core_dumped) => {
+            signal as i32 | if core_dumped { 0x80 } else { 0 }
+        }
+        _ => return Err(io::Error::other("unexpected TShark child status")),
+    };
+    // This owner keeps the exit status waitable until group cleanup finishes
+    Ok(Some(ExitStatus::from_raw(raw)))
+}
+
+#[cfg(not(all(target_os = "linux", not(target_env = "uclibc"))))]
+fn observe_exit(child: &mut Child) -> io::Result<Option<ExitStatus>> {
+    child.try_wait()
+}
+
+fn lost_child(error: &io::Error) -> bool {
+    #[cfg(all(target_os = "linux", not(target_env = "uclibc")))]
+    {
+        error.raw_os_error() == Some(nix::libc::ECHILD)
+    }
+    #[cfg(not(all(target_os = "linux", not(target_env = "uclibc"))))]
+    {
+        let _ = error;
+        false
+    }
+}
+
 fn stop_and_reap(child: &mut std::process::Child) {
     // A helper can keep stdout or stderr open after the direct child exits
-    stop_process_group(child);
-    let _ = child.kill();
+    let Ok(exited) = stop_process_group(child) else {
+        return;
+    };
+    if !exited {
+        let _ = child.kill();
+    }
     let _ = child.wait();
 }
 
@@ -892,7 +1000,12 @@ fn lock_diagnostics(diagnostics: &SharedDiagnostics) -> MutexGuard<'_, Diagnosti
         .unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
-fn stop_process_group(child: &std::process::Child) {
+fn stop_process_group(child: &std::process::Child) -> io::Result<bool> {
+    // A lost child cannot safely identify a group by its old PID
+    #[cfg(all(target_os = "linux", not(target_env = "uclibc")))]
+    let exited = observe_exit(child)?.is_some();
+    #[cfg(not(all(target_os = "linux", not(target_env = "uclibc"))))]
+    let exited = false;
     #[cfg(unix)]
     if let Ok(process_group) = i32::try_from(child.id())
         && process_group > 1
@@ -902,4 +1015,5 @@ fn stop_process_group(child: &std::process::Child) {
     }
     #[cfg(not(unix))]
     let _ = child;
+    Ok(exited)
 }
