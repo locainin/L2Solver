@@ -1,0 +1,23 @@
+name: Cache Rust build dependencies
+description: Reuse Cargo sources and compiled dependencies for a job role
+inputs:
+  role:
+    description: Build role kept separate from other cache layouts
+    required: true
+  workspace:
+    description: Cargo workspace and target directory
+    default: ". -> target"
+    required: false
+runs:
+  using: composite
+  steps:
+    - name: Cache Cargo dependencies
+      # This action includes the host, compiler, manifests and lockfiles in its key
+      uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0
+      with:
+        shared-key: ${{ inputs.role }}
+        workspaces: ${{ inputs.workspace }}
+        cache-targets: "true"
+        cache-bin: "false"
+        # Pull requests restore the trusted default-branch cache without saving one
+        save-if: ${{ github.ref == 'refs/heads/dev' }}

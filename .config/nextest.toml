@@ -1,0 +1,3 @@
+# Keep each shard's test outcomes even when a test fails
+[profile.ci.junit]
+path = "junit.xml"
