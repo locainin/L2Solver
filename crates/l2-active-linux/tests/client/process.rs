@@ -12,6 +12,7 @@ use std::{
     cell::Cell,
     io,
     net::Ipv4Addr,
+    os::fd::AsRawFd,
     path::Path,
     sync::{
         Arc,
@@ -89,27 +90,49 @@ fn helper_runs_in_a_different_process_group_from_the_terminal_frontend() -> io::
 }
 
 #[test]
-fn dropping_an_externally_reaped_child_never_signals_its_reusable_pid()
+fn dropping_an_externally_reaped_child_retains_ownership_without_reusing_its_pid()
 -> Result<(), Box<dyn std::error::Error>> {
-    let mut child = std::process::Command::new("sleep").arg("60").spawn()?;
+    let mut child = std::process::Command::new("sleep")
+        .arg("60")
+        .stdout(std::process::Stdio::piped())
+        .spawn()?;
+    let descriptor = child
+        .stdout
+        .as_ref()
+        .ok_or("missing child stdout")?
+        .as_raw_fd();
+    let descriptor_path = std::path::Path::new("/proc/self/fd").join(descriptor.to_string());
+    let identity = std::fs::read_link(&descriptor_path)?;
     let pid = Pid::from_raw(i32::try_from(child.id())?);
     child.kill()?;
     nix::sys::wait::waitpid(pid, None)?;
     let deadline = Instant::now() + Duration::from_secs(1);
     let mut link = link_for_deadline(deadline)?;
+    // Keep the real background reaper ready while this fixture uses isolated storage
+    drop(crate::reaper::reserve()?);
     link.child = Some(child);
-    link.lease = Some(crate::reaper::reserve()?);
+    link.lease = Some(crate::reaper::tests::drop_unknown_lease()?);
 
     OBSERVED_DROP_KILLS.set(Some(0));
+    crate::reaper::tests::start_handoff_observation();
     let start = Instant::now();
     drop(link);
     let elapsed = start.elapsed();
     let attempted_kills = OBSERVED_DROP_KILLS.replace(None);
+    let handoffs = crate::reaper::tests::finish_handoff_observation();
     assert_eq!(
         attempted_kills,
         Some(0),
         "drop tried to signal an externally reaped PID"
     );
+    assert_eq!(handoffs, Some(0), "drop handed the stale PID to the reaper");
+    assert_eq!(crate::reaper::tests::drop_unknown_slots(), 1);
+    assert_eq!(std::fs::read_link(&descriptor_path)?, identity);
+    let (retained_child, retained_lease) = crate::reaper::tests::take_drop_unknown()?;
+    assert_eq!(std::fs::read_link(&descriptor_path)?, identity);
+    drop(retained_child);
+    drop(retained_lease);
+    assert_eq!(crate::reaper::tests::drop_unknown_slots(), 0);
     assert!(
         elapsed < Duration::from_millis(500),
         "drop exceeded its bound: {elapsed:?}"
