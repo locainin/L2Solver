@@ -38,6 +38,8 @@ mod commit;
 #[path = "cache/scoped_memory.rs"]
 mod scoped_memory;
 
+#[path = "cache/lookup.rs"]
+mod lookup;
 #[path = "cache/maintenance.rs"]
 mod maintenance;
 #[path = "cache/snapshot_version.rs"]
