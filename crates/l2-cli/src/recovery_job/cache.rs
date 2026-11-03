@@ -1,12 +1,15 @@
 //! Apply the same optional cache and checkpoint policy to recovery commands
 
-use super::checkpoint::{CheckpointError, CheckpointWriter};
+use super::{
+    checkpoint::{CheckpointError, CheckpointWriter},
+    retain_cleanup_error,
+};
 use crate::{arguments::RecoveryOptions, result_directory::ResultIdentity};
 use l2_workbench::job::{
     CacheFallbackKind, CacheStage, Job, MemoryBudget,
     cache::{Cache, CacheError},
 };
-use std::{error::Error, fmt};
+use std::error::Error;
 
 pub struct RecoveryCache {
     active: Option<ActiveCache>,
@@ -93,11 +96,7 @@ impl RecoveryCache {
         result: Result<T, Box<dyn Error>>,
         job: &Job,
     ) -> Result<T, Box<dyn Error>> {
-        // A late cancellation must not become a successful cache fallback
-        let result = result.and_then(|value| {
-            job.check_cancelled()?;
-            Ok(value)
-        });
+        // The operation result is fixed before checkpoint cleanup starts
         let Some(active) = self.active else {
             return result;
         };
@@ -108,10 +107,12 @@ impl RecoveryCache {
             Err(error) if !active.strict && error.is_cache_failure() => {
                 match record_checkpoint_fallback(job, "checkpoint could not be finished") {
                     Ok(()) => result,
-                    Err(fallback_error) => combine_errors(result, fallback_error.into()),
+                    Err(fallback_error) => {
+                        retain_cleanup_error(result, Err(fallback_error.into()), "checkpoint")
+                    }
                 }
             }
-            Err(error) => combine_errors(result, checkpoint_error(error)),
+            Err(error) => retain_cleanup_error(result, Err(checkpoint_error(error)), "checkpoint"),
         }
     }
 }
@@ -131,39 +132,6 @@ fn checkpoint_error(error: CheckpointError) -> Box<dyn Error> {
     match error {
         CheckpointError::Job(error) => error.into(),
         error => error.into(),
-    }
-}
-
-fn combine_errors<T>(
-    result: Result<T, Box<dyn Error>>,
-    secondary: Box<dyn Error>,
-) -> Result<T, Box<dyn Error>> {
-    match result {
-        Ok(_) => Err(secondary),
-        // Preserve the original error as the source when cleanup also fails
-        Err(primary) => Err(Box::new(OperationAndCheckpointError { primary, secondary })),
-    }
-}
-
-#[derive(Debug)]
-struct OperationAndCheckpointError {
-    primary: Box<dyn Error>,
-    secondary: Box<dyn Error>,
-}
-
-impl fmt::Display for OperationAndCheckpointError {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(
-            formatter,
-            "{}; checkpoint failure: {}",
-            self.primary, self.secondary
-        )
-    }
-}
-
-impl Error for OperationAndCheckpointError {
-    fn source(&self) -> Option<&(dyn Error + 'static)> {
-        Some(self.primary.as_ref())
     }
 }
 

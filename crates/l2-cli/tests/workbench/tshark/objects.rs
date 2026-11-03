@@ -6,6 +6,23 @@ use std::{
     path::{Path, PathBuf},
 };
 
+#[test]
+fn cancelled_object_export_preserves_the_job_cancellation_type() -> Result<(), Box<dyn Error>> {
+    let error = super::resolve_object_export(
+        Err(super::process::ProcessError::Cancelled),
+        Path::new("unused-object-root"),
+        Path::new("unused-partial-root"),
+        Vec::new(),
+    )
+    .err()
+    .ok_or("cancelled object export unexpectedly succeeded")?;
+    assert_eq!(
+        error.downcast_ref::<l2_workbench::job::JobError>(),
+        Some(&l2_workbench::job::JobError::Cancelled)
+    );
+    Ok(())
+}
+
 #[cfg(unix)]
 #[test]
 fn partial_snapshot_keeps_only_unchanged_regular_files() -> Result<(), Box<dyn Error>> {

@@ -11,9 +11,10 @@ use crate::{
     outcome::RunOutcome,
 };
 use l2_cli::job_ui::{CancellationHandler, Renderer, RendererOptions};
-use l2_workbench::job::{Job, JobSnapshot, MemoryBudget, MemoryError};
+use l2_workbench::job::{Job, JobError, JobSnapshot, MemoryBudget, MemoryError};
 use std::{
     error::Error,
+    fmt,
     io::{self, Write},
     time::Duration,
 };
@@ -51,43 +52,117 @@ pub fn run(
     let registration = handler.activate(job.clone())?;
     let renderer = Renderer::start(job.clone(), RendererOptions::from(options))?;
     let result = operation(&job);
+    // Only the operation can decide whether cancellation stopped the work
+    let operation_cancelled = result
+        .as_ref()
+        .err()
+        .is_some_and(|error| is_cancellation(error.as_ref()));
     // Cleanup runs for both success and failure before the process reports an outcome
     #[cfg(target_os = "linux")]
     let monitoring = memory_monitor.finish();
     let rendering = renderer.finish();
     let unregistering = registration.finish();
-    if job.is_cancelled() {
-        if options.progress == crate::arguments::ProgressMode::Json {
-            writeln!(
+    let cleanup_failed = rendering.is_err() || unregistering.is_err();
+    #[cfg(target_os = "linux")]
+    let cleanup_failed = cleanup_failed || monitoring.is_err();
+    let result = retain_cleanup_error(
+        result,
+        rendering.map_err(|error| Box::new(error) as Box<dyn Error>),
+        "progress renderer",
+    );
+    #[cfg(target_os = "linux")]
+    let result = retain_cleanup_error(result, monitoring, "memory monitor");
+    let result = retain_cleanup_error(
+        result,
+        unregistering.map_err(|error| Box::new(error) as Box<dyn Error>),
+        "cancellation registration",
+    );
+    if operation_cancelled && !cleanup_failed {
+        if options.progress == ProgressMode::Json {
+            let _ = writeln!(
                 io::stderr().lock(),
                 "{}",
                 serde_json::json!({
                     "type": "interrupted", "exit_status": 130,
                     "message": "Committed cache work remains available"
                 })
-            )?;
+            );
         } else {
-            writeln!(
+            let _ = writeln!(
                 io::stderr().lock(),
                 "Interrupted (exit status 130); committed cache work remains available"
-            )?;
+            );
         }
         return Ok(RunOutcome::Interrupted);
     }
-    rendering?;
-    #[cfg(target_os = "linux")]
-    monitoring?;
-    unregistering?;
+    let complete = result?;
     if !options.quiet && options.progress != ProgressMode::Json {
-        write_cache_fallback_summary(&mut io::stderr().lock(), &job.snapshot()?, options)?;
+        // A failed diagnostic write cannot change the operation's result
+        let _ = write_cache_fallback_summary(&mut io::stderr().lock(), &job.snapshot()?, options);
     }
-    result.map(|complete| {
-        if complete {
-            RunOutcome::Completed
-        } else {
-            RunOutcome::Incomplete
-        }
+    Ok(if complete {
+        RunOutcome::Completed
+    } else {
+        RunOutcome::Incomplete
     })
+}
+
+fn is_cancellation(error: &(dyn Error + 'static)) -> bool {
+    crate::memory_error::find_map(error, |cause| {
+        // A checkpoint failure must remain visible even when cancellation happened first
+        if cause.is::<CleanupFailure>() {
+            return Some(false);
+        }
+        if matches!(cause.downcast_ref::<JobError>(), Some(JobError::Cancelled))
+            || matches!(
+                cause.downcast_ref::<MemoryError>(),
+                Some(MemoryError::Cancelled)
+            )
+        {
+            return Some(true);
+        }
+        None
+    })
+    .unwrap_or(false)
+}
+
+fn retain_cleanup_error<T>(
+    result: Result<T, Box<dyn Error>>,
+    cleanup: Result<(), Box<dyn Error>>,
+    stage: &'static str,
+) -> Result<T, Box<dyn Error>> {
+    match (result, cleanup) {
+        (result, Ok(())) => result,
+        (Ok(_), Err(error)) => Err(error),
+        (Err(primary), Err(secondary)) => Err(Box::new(CleanupFailure {
+            primary,
+            secondary,
+            stage,
+        })),
+    }
+}
+
+#[derive(Debug)]
+struct CleanupFailure {
+    primary: Box<dyn Error>,
+    secondary: Box<dyn Error>,
+    stage: &'static str,
+}
+
+impl fmt::Display for CleanupFailure {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            formatter,
+            "{}; {} failure: {}",
+            self.primary, self.stage, self.secondary
+        )
+    }
+}
+
+impl Error for CleanupFailure {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        Some(self.primary.as_ref())
+    }
 }
 
 fn write_cache_fallback_summary(
@@ -126,3 +201,7 @@ fn write_cache_fallback_summary(
 #[cfg(test)]
 #[path = "../tests/recovery_job/observability.rs"]
 mod observability_tests;
+
+#[cfg(test)]
+#[path = "../tests/recovery_job/outcome.rs"]
+mod outcome_tests;

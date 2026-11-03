@@ -16,7 +16,7 @@ use case_buffer::BufferedResult;
 use l2_workbench::{
     evidence::{Case, CaseSnapshotLimits},
     investigation::BuildResult,
-    job::{Counter, Job, MemoryBudget, MemoryClass, MemoryError, Phase, PhaseOutcome},
+    job::{Counter, Job, JobError, MemoryBudget, MemoryClass, MemoryError, Phase, PhaseOutcome},
 };
 use std::{
     error::Error,
@@ -314,7 +314,13 @@ pub(super) fn process_case_batch(
 #[derive(Debug)]
 pub(super) struct WorkerFailure {
     message: String,
-    memory: Option<MemoryError>,
+    cause: Option<WorkerCause>,
+}
+
+#[derive(Debug)]
+enum WorkerCause {
+    Memory(MemoryError),
+    Job(JobError),
 }
 
 impl fmt::Display for WorkerFailure {
@@ -325,14 +331,30 @@ impl fmt::Display for WorkerFailure {
 
 impl Error for WorkerFailure {
     fn source(&self) -> Option<&(dyn Error + 'static)> {
-        self.memory.as_ref().map(|error| error as &dyn Error)
+        match &self.cause {
+            Some(WorkerCause::Memory(error)) => Some(error),
+            Some(WorkerCause::Job(error)) => Some(error),
+            None => None,
+        }
     }
 }
 
 pub(super) fn classify_worker_error(error: &(dyn Error + 'static)) -> WorkerFailure {
     WorkerFailure {
         message: error.to_string(),
-        memory: crate::memory_error::find(error),
+        // Workers need a sendable cause without flattening cancellation into text
+        cause: crate::memory_error::find_map(error, |cause| {
+            cause
+                .downcast_ref::<MemoryError>()
+                .copied()
+                .map(WorkerCause::Memory)
+                .or_else(|| {
+                    cause
+                        .downcast_ref::<JobError>()
+                        .copied()
+                        .map(WorkerCause::Job)
+                })
+        }),
     }
 }
 

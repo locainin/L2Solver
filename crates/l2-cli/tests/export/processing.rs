@@ -166,6 +166,23 @@ fn memory_cancellation_remains_distinct_from_a_limit_failure() -> TestResult {
 }
 
 #[test]
+fn worker_error_keeps_wrapped_job_failures_typed() {
+    for expected in [
+        l2_workbench::job::JobError::Cancelled,
+        l2_workbench::job::JobError::LockPoisoned,
+    ] {
+        let nested = std::io::Error::other(expected);
+        let classified = classify_worker_error(&nested);
+        assert_eq!(
+            classified
+                .source()
+                .and_then(|error| error.downcast_ref::<l2_workbench::job::JobError>()),
+            Some(&expected)
+        );
+    }
+}
+
+#[test]
 fn ordered_collection_preserves_typed_worker_failures() -> TestResult {
     let pool = rayon::ThreadPoolBuilder::new().num_threads(2).build()?;
     let expected = MemoryError::Limit {
