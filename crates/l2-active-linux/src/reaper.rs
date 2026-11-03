@@ -2,6 +2,10 @@
 #[path = "../tests/reaper/slots.rs"]
 pub mod tests;
 
+#[cfg(test)]
+#[path = "../tests/reaper/startup_signal.rs"]
+mod startup_signal;
+
 use std::{
     io,
     process::Child,
@@ -71,10 +75,33 @@ impl Retention {
 }
 
 pub fn reserve() -> io::Result<Lease> {
+    // Automatic child reaping can make a numeric PID refer to another process
+    let status = std::fs::read_to_string("/proc/self/status").map_err(|error| {
+        io::Error::new(
+            error.kind(),
+            format!("could not inspect SIGCHLD disposition: {error}"),
+        )
+    })?;
+    if sigchld_ignored(&status)? {
+        return Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "active helpers require SIGCHLD not to be ignored",
+        ));
+    }
     sender()?;
     // Allocate fallback storage before a lease can be used to launch a child
     let retention = RETAINED.get_or_init(Retention::new);
     Lease::acquire(&ACTIVE_HELPERS, retention)
+}
+
+fn sigchld_ignored(status: &str) -> io::Result<bool> {
+    let mask = status
+        .lines()
+        .find_map(|line| line.strip_prefix("SigIgn:"))
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "SIGCHLD status is missing"))?;
+    let mask = u128::from_str_radix(mask.trim(), 16)
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "SIGCHLD status is malformed"))?;
+    Ok(mask & (1_u128 << (nix::libc::SIGCHLD - 1)) != 0)
 }
 
 pub fn submit(child: Child, lease: Lease) {
