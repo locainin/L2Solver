@@ -54,13 +54,48 @@ def test_test_shards_reuse_the_same_complete_archived_build():
     assert "--test-threads 2" in tests
     assert "--no-fail-fast" in tests
     assert "--no-tests fail" in tests
+    assert "--status-level slow" in tests
+    assert "--final-status-level slow" in tests
     assert "if: always()" in tests
     assert "junit.xml" in tests
 
 
+def test_python_regressions_run_once_without_waiting_for_the_release_build():
+    python = job("python")
+    assert "needs:" not in python
+    assert "runs-on: ubuntu-24.04" in python
+    assert "Check out the requested commit" in python
+    assert "persist-credentials: false" in python
+    assert "rustup toolchain install 1.99.1 --profile minimal" in python
+    assert "rustup default 1.99.1" in python
+    assert "uses: ./.github/actions/prepare-test-runner" in python
+    assert 'CARGO_INCREMENTAL: "0"' in python
+
+    command = (
+        "/usr/bin/python3 -m pytest -q tests/benchmarks tests/scripts tests/crates "
+        '-p subtests --junitxml="$RUNNER_TEMP/python-regressions.xml"'
+    )
+    assert command in " ".join(python.split())
+    assert " ".join(WORKFLOW.read_text().split()).count(command) == 1
+
+    receipt_step = python.split("- name: Upload Python test results", 1)[1]
+    assert "if: always()" in receipt_step
+    assert "actions/upload-artifact@" in receipt_step
+    assert "python-regressions.xml" in receipt_step
+    assert "if-no-files-found: ignore" in receipt_step
+
+
+def test_delegated_cgroup_cases_remain_required_during_package_qualification():
+    package = job("package")
+    assert "for variant in explicit default; do" in package
+    assert "test_owned_scope_records_resolved_working_directory[$variant]" in package
+    assert "L2_TEST_DELEGATED_SCOPE=1" in package
+    assert "test_real_runner_samples_live_unlinked_spool_and_process" in package
+
+
 def test_all_validation_jobs_are_required_before_a_tag_candidate_is_uploaded():
     review = job("review")
-    assert "needs: [tests, quality, compatibility, dependencies, fuzz, package]" in review
+    assert "needs: [tests, python, quality, compatibility, dependencies, fuzz, package]" in review
     assert "github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')" in review
     assert "Upload unqualified review candidate" in review
     assert "actions/cache/restore@" in review
@@ -72,13 +107,13 @@ def test_all_validation_jobs_are_required_before_a_tag_candidate_is_uploaded():
     receipt_step = package.split("- name: Upload diagnostic receipts", 1)[1].split("\n      - name:", 1)[0]
     assert "if: always()" in receipt_step
     assert "qualification.json" in receipt_step
-    assert "python-regressions.xml" in receipt_step
+    assert "python-regressions.xml" not in receipt_step
     assert not re.search(r"(?m)^\s*\$\{\{ runner.temp \}\}/l2solver-qualification/$", receipt_step)
     assert "if-no-files-found: ignore" in receipt_step
 
 
 def test_qualified_and_compatible_compilers_and_excluded_fuzz_tests_are_checked():
-    for name in ("prepare_tests", "quality", "dependencies", "package"):
+    for name in ("prepare_tests", "python", "quality", "dependencies", "package"):
         assert "rustup toolchain install 1.99.1" in job(name)
     compatibility = job("compatibility")
     assert "toolchain: [1.96.0, stable]" in compatibility
@@ -99,7 +134,7 @@ def test_registry_cache_and_job_timeouts_have_scoped_keys():
     for name in ("prepare_tests", "quality", "compatibility", "fuzz", "package"):
         assert "uses: ./.github/actions/cache-rust-build" in job(name)
     assert 'workspace: "fuzz -> target"' in job("fuzz")
-    for name in ("prepare_tests", "tests", "quality", "compatibility", "dependencies", "fuzz", "package", "review"):
+    for name in ("prepare_tests", "tests", "python", "quality", "compatibility", "dependencies", "fuzz", "package", "review"):
         assert "timeout-minutes: 20" in job(name)
 
 
