@@ -1,7 +1,7 @@
 //! Update bounded execution metadata without rewriting its immutable Case streams
 
 use super::{
-    CacheError, CheckpointStatus, Component, Durability, ENVELOPE_VERSION, Envelope, EnvelopeRef,
+    CacheError, CheckpointStatus, Component, ENVELOPE_VERSION, Envelope, EnvelopeRef,
     ExecutionCheckpointLimits, JOB_SNAPSHOT_VERSION, JobSnapshot, Lease, MAX_RELATIVE_PATH_BYTES,
     MemoryLease, OptionalExtension, Result, TransactionBehavior, column_length, database,
     encode_sized_envelope, envelope_revision, memory, now_ns, params,
@@ -109,8 +109,7 @@ pub(super) fn read_previous(
     generation: &ExecutionGeneration,
     limits: ExecutionCheckpointLimits,
 ) -> Result<PreviousEnvelope> {
-    let mut connection =
-        database::open_connection(&lease.cache.inner.state_root, Durability::Checkpoint)?;
+    let mut connection = database::open_connection(&lease.cache.inner.state_root)?;
     let transaction = connection.transaction()?;
     let rowid = transaction
         .query_row(
@@ -210,8 +209,7 @@ pub(super) fn commit_metadata(
     snapshot_json: &str,
     change: Change<'_>,
 ) -> Result<()> {
-    let mut connection =
-        database::open_connection(&lease.cache.inner.state_root, Durability::Checkpoint)?;
+    let mut connection = database::open_connection(&lease.cache.inner.state_root)?;
     let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
     let updated = transaction.execute(
             "UPDATE executions SET envelope_json = ?1, bytes = ?2 WHERE key = ?3 AND relative_path = ?4 AND envelope_json = ?5 AND bytes = ?6",

@@ -181,10 +181,8 @@ fn real_full_filesystem_preserves_the_committed_execution_generation() -> Result
     Ok(())
 }
 
-#[cfg(target_os = "linux")]
-struct OwnedCrashChild(std::process::Child);
+pub(super) struct OwnedCrashChild(pub(super) std::process::Child);
 
-#[cfg(target_os = "linux")]
 impl Drop for OwnedCrashChild {
     fn drop(&mut self) {
         if matches!(self.0.try_wait(), Ok(None)) {

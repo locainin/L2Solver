@@ -1,8 +1,8 @@
 //! Reclaim cursor files only after checking the committed execution reference
 
 use super::{
-    Cache, CacheError, Component, Durability, HASH_MEMORY_BYTES, HeldDirectory, OptionalExtension,
-    Result, column_length, database, envelope_revision, generation_directory, memory,
+    Cache, CacheError, Component, HASH_MEMORY_BYTES, HeldDirectory, OptionalExtension, Result,
+    column_length, database, envelope_revision, generation_directory, memory,
     valid_cursor_directory, verified_component,
 };
 use std::{fs, io};
@@ -16,7 +16,7 @@ struct CursorReference {
 }
 
 fn read_reference(cache: &Cache, key: &str) -> Result<Option<CursorReference>> {
-    let connection = database::open_connection(&cache.inner.state_root, Durability::Checkpoint)?;
+    let connection = database::open_connection(&cache.inner.state_root)?;
     let rowid = connection
         .query_row(
             "SELECT rowid FROM executions WHERE key = ?1",

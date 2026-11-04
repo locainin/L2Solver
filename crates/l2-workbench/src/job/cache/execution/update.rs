@@ -1,11 +1,10 @@
 //! Commit a new executor stream while retaining the unchanged immutable Case files
 
 use super::{
-    Budget, Cache, CacheError, Component, ComponentWriter, Durability, ENVELOPE_VERSION,
-    EnvelopeRef, ExecutionCheckpointLimits, ExecutionGeneration, HeldDirectory,
-    JOB_SNAPSHOT_VERSION, JobSnapshot, Lease, Result, STREAM_BUFFER_BYTES, WRITER_MEMORY_BYTES,
-    WrittenFile, cleanup, database, encode_sized_envelope, finish_component, generation_directory,
-    memory,
+    Budget, Cache, CacheError, Component, ComponentWriter, ENVELOPE_VERSION, EnvelopeRef,
+    ExecutionCheckpointLimits, ExecutionGeneration, HeldDirectory, JOB_SNAPSHOT_VERSION,
+    JobSnapshot, Lease, Result, STREAM_BUFFER_BYTES, WRITER_MEMORY_BYTES, WrittenFile, cleanup,
+    database, encode_sized_envelope, finish_component, generation_directory, memory,
     metadata::{Change, commit_metadata, read_previous},
 };
 use serde::Serialize;
@@ -31,9 +30,7 @@ impl Drop for PendingCursor {
         if self.commit_attempted || cleanup::remove_cursor(&self.parent, &self.name).is_err() {
             return;
         }
-        if let Ok(connection) =
-            database::open_connection(&self.cache.inner.state_root, Durability::Checkpoint)
-        {
+        if let Ok(connection) = database::open_connection(&self.cache.inner.state_root) {
             let _ = connection.execute(
                 "DELETE FROM execution_reservations WHERE token = ?1",
                 [&self.token],

@@ -47,6 +47,8 @@ mod snapshot_version;
 #[cfg(target_os = "linux")]
 #[path = "cache/terminal_fsync.rs"]
 mod terminal_fsync;
+#[path = "cache/wal.rs"]
+mod wal;
 
 #[cfg(target_os = "linux")]
 #[path = "cache/terminal_retirement.rs"]
