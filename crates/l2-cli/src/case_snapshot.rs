@@ -6,7 +6,7 @@ use l2_workbench::job::MemorySnapshot;
 use l2_workbench::{
     evidence::{Case, CaseSnapshotLimits, CaseSnapshotUsage},
     job::{
-        Job, JobError, MemoryBudget, MemoryClass, MemoryLease,
+        Job, JobError, MemoryBudget, MemoryClass,
         cache::{CacheEntry, Lease},
     },
 };
@@ -24,8 +24,8 @@ pub const STORAGE_FORMAT: u32 = 1;
 // Reserve a bounded scratch allowance before either stream is opened
 // The reader separately charges its own buffers; library allocations are not measured
 const CODEC_SCRATCH_BYTES: u64 = 2 * 1024 * 1024;
-const FILE_BUFFER_CAPACITY: usize = 16 * 1024;
-const FILE_BUFFER_BYTES: u64 = 2 * FILE_BUFFER_CAPACITY as u64;
+const SNAPSHOT_BUFFER_CAPACITY: usize = 16 * 1024;
+const SNAPSHOT_BUFFER_BYTES: u64 = 2 * SNAPSHOT_BUFFER_CAPACITY as u64;
 // Bound each transfer while a job can request cancellation
 const CANCELLABLE_IO_CHUNK_BYTES: usize = 64 * 1024;
 
@@ -57,6 +57,14 @@ impl Cancellation<'_> {
             self.io_failed.set(true);
         }
         result
+    }
+
+    fn check_write(&self) -> io::Result<()> {
+        // A codec can try to finish during drop after an earlier write failed
+        if self.io_failed.get() {
+            return Err(io::Error::other("snapshot I/O already failed"));
+        }
+        self.check()
     }
 
     pub const fn wrap<T>(&self, inner: T) -> CancellableIo<'_, T> {
@@ -93,13 +101,17 @@ impl<T: Read> Read for CancellableIo<'_, T> {
 
 impl<T: Write> Write for CancellableIo<'_, T> {
     fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
-        self.cancellation.check()?;
+        self.cancellation.check_write()?;
         let (chunk, _) = bytes.split_at(self.length(bytes.len()));
-        self.cancellation.record_io(self.inner.write(chunk))
+        let result = match self.inner.write(chunk) {
+            Ok(0) if !chunk.is_empty() => Err(io::ErrorKind::WriteZero.into()),
+            result => result,
+        };
+        self.cancellation.record_io(result)
     }
 
     fn flush(&mut self) -> io::Result<()> {
-        self.cancellation.check()?;
+        self.cancellation.check_write()?;
         self.cancellation.record_io(self.inner.flush())
     }
 }
@@ -328,84 +340,21 @@ pub fn write_files_cancellable(
     job: Option<&Job>,
 ) -> Result<CaseSnapshotUsage> {
     with_cancellation(job, |cancellation| {
-        let mut buffers = prepare_snapshot_files(graph, blobs, budget)?;
-        let usage = write_buffered_snapshot(
-            graph,
-            blobs,
-            case,
-            limits,
-            budget,
-            &mut buffers,
-            cancellation,
-        )?;
+        prepare_snapshot_files(graph, blobs)?;
+        let usage = write_streams(graph, blobs, case, limits, budget, cancellation)?;
         sync_snapshot_files(graph, blobs, budget, cancellation)?;
         Ok(usage)
     })
 }
 
-fn prepare_snapshot_files(
-    graph: &mut File,
-    blobs: &mut File,
-    budget: Option<&MemoryBudget>,
-) -> Result<Option<MemoryLease>> {
+fn prepare_snapshot_files(graph: &mut File, blobs: &mut File) -> Result<()> {
     if graph.metadata()?.len() != 0 || blobs.metadata()?.len() != 0 {
         return Err(invalid("Case snapshot destination is not empty"));
     }
-    let buffers = budget
-        .map(|budget| budget.try_reserve(MemoryClass::Cache, FILE_BUFFER_BYTES))
-        .transpose()?;
     // Empty files can still have a nonzero seek position
     graph.seek(SeekFrom::Start(0))?;
     blobs.seek(SeekFrom::Start(0))?;
-    Ok(buffers)
-}
-
-fn write_buffered_snapshot(
-    graph: &mut File,
-    blobs: &mut File,
-    case: &Case,
-    limits: CaseSnapshotLimits,
-    budget: Option<&MemoryBudget>,
-    buffers: &mut Option<MemoryLease>,
-    cancellation: &Cancellation<'_>,
-) -> Result<CaseSnapshotUsage> {
-    let mut graph_writer = BufWriter::with_capacity(FILE_BUFFER_CAPACITY, cancellation.wrap(graph));
-    let mut blob_writer = BufWriter::with_capacity(FILE_BUFFER_CAPACITY, cancellation.wrap(blobs));
-    let result = write_snapshot_buffers(
-        &mut graph_writer,
-        &mut blob_writer,
-        case,
-        limits,
-        budget,
-        buffers,
-    );
-    if result.is_err() {
-        // Do not retry buffered writes during cleanup after a failed snapshot
-        let _ = graph_writer.into_parts();
-        let _ = blob_writer.into_parts();
-    }
-    result
-}
-
-fn write_snapshot_buffers(
-    graph: &mut BufWriter<impl Write>,
-    blobs: &mut BufWriter<impl Write>,
-    case: &Case,
-    limits: CaseSnapshotLimits,
-    budget: Option<&MemoryBudget>,
-    buffers: &mut Option<MemoryLease>,
-) -> Result<CaseSnapshotUsage> {
-    if let Some(buffers) = buffers {
-        let actual = graph
-            .capacity()
-            .checked_add(blobs.capacity())
-            .ok_or("snapshot writer buffer size overflow")?;
-        buffers.try_resize(u64::try_from(actual)?)?;
-    }
-    let usage = write_streams(graph, blobs, case, limits, budget)?;
-    graph.flush()?;
-    blobs.flush()?;
-    Ok(usage)
+    Ok(())
 }
 
 fn sync_snapshot_files(
@@ -429,18 +378,50 @@ fn sync_snapshot_files(
     Ok(())
 }
 
-/// Write an exact snapshot to caller-owned bounded streams
+/// Write buffered streams while checking cancellation before encoding and I/O
 pub fn write_streams(
-    mut graph: &mut dyn Write,
-    mut blobs: &mut dyn Write,
+    graph: &mut dyn Write,
+    blobs: &mut dyn Write,
     case: &Case,
     limits: CaseSnapshotLimits,
     budget: Option<&MemoryBudget>,
+    cancellation: &Cancellation<'_>,
 ) -> Result<CaseSnapshotUsage> {
-    let _scratch = budget
-        .map(|budget| budget.try_reserve(MemoryClass::Cache, CODEC_SCRATCH_BYTES))
+    let mut buffers = budget
+        .map(|budget| budget.try_reserve(MemoryClass::Cache, SNAPSHOT_BUFFER_BYTES))
         .transpose()?;
-    Ok(case.write_snapshot(&mut graph, &mut blobs, limits)?)
+    let mut graph_writer =
+        BufWriter::with_capacity(SNAPSHOT_BUFFER_CAPACITY, cancellation.wrap(graph));
+    let mut blob_writer =
+        BufWriter::with_capacity(SNAPSHOT_BUFFER_CAPACITY, cancellation.wrap(blobs));
+    let result = (|| {
+        if let Some(buffers) = &mut buffers {
+            // Account for the actual capacities before any snapshot bytes are written
+            let actual = graph_writer
+                .capacity()
+                .checked_add(blob_writer.capacity())
+                .ok_or("snapshot writer buffer size overflow")?;
+            buffers.try_resize(u64::try_from(actual)?)?;
+        }
+        // Check each codec write as well as each transfer to the underlying writer
+        let mut graph = cancellation.wrap(&mut graph_writer);
+        let mut blobs = cancellation.wrap(&mut blob_writer);
+        let usage = {
+            let _scratch = budget
+                .map(|budget| budget.try_reserve(MemoryClass::Cache, CODEC_SCRATCH_BYTES))
+                .transpose()?;
+            case.write_snapshot(&mut graph, &mut blobs, limits)?
+        };
+        graph.flush()?;
+        blobs.flush()?;
+        Ok(usage)
+    })();
+    if result.is_err() {
+        // Leave pending bytes unwritten after any error or cancellation
+        let _ = graph_writer.into_parts();
+        let _ = blob_writer.into_parts();
+    }
+    result
 }
 
 fn create_file(lease: &Lease, name: &str) -> Result<File> {

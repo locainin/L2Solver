@@ -93,14 +93,13 @@ fn storage_error_is_preserved_when_cancellation_was_not_observed() -> TestResult
     let mut graph = Vec::new();
     let mut blobs = FailAndCancel(&job);
     let result = crate::case_snapshot::with_cancellation(Some(&job), |cancellation| {
-        let mut graph = cancellation.wrap(&mut graph);
-        let mut blobs = cancellation.wrap(&mut blobs);
         crate::case_snapshot::write_streams(
             &mut graph,
             &mut blobs,
             &case.case,
             limits,
             Some(&memory),
+            cancellation,
         )
     });
     let error = result.err().ok_or("storage error was lost")?;
@@ -170,14 +169,13 @@ fn cancellation_during_snapshot_write_keeps_old_output_and_removes_private_files
                 transferred: &transferred,
             };
             crate::case_snapshot::with_cancellation(Some(&job), |cancellation| {
-                let mut graph = cancellation.wrap(&mut graph);
-                let mut writer = cancellation.wrap(&mut writer);
                 crate::case_snapshot::write_streams(
                     &mut graph,
                     &mut writer,
                     &case.case,
                     limits,
                     Some(&memory),
+                    cancellation,
                 )
             })?;
             completed.set(true);

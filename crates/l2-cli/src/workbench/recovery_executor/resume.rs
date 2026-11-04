@@ -301,15 +301,14 @@ impl<'lease> RecoveryResume<'lease> {
             .save_active_generation(&snapshot, self.store_limits, |writer| {
                 let encoded = crate::case_snapshot::with_cancellation(job, |cancellation| {
                     let (graph, blobs, state) = writer.streams();
-                    let mut graph = cancellation.wrap(graph);
-                    let mut blobs = cancellation.wrap(blobs);
                     let mut state = cancellation.wrap(state);
                     let usage = crate::case_snapshot::write_streams(
-                        &mut graph,
-                        &mut blobs,
+                        graph,
+                        blobs,
                         executor.case,
                         self.case_limits,
                         Some(&self.session_memory),
+                        cancellation,
                     )?;
                     #[cfg(test)]
                     if cancel_after_case && let Some(job) = job {

@@ -1,6 +1,8 @@
 #[cfg(target_os = "linux")]
 use crate::case_snapshot::SnapshotFile;
-use crate::case_snapshot::{read_files, read_streams, write_files, write_streams};
+use crate::case_snapshot::{
+    read_files, read_streams, with_cancellation, write_files, write_streams,
+};
 #[cfg(target_os = "linux")]
 use l2_workbench::job::{CgroupMemoryEvents, CgroupMemorySnapshot, SystemMemorySnapshot};
 use l2_workbench::{
@@ -282,7 +284,16 @@ fn verified_generation_streams_restore_exact_charged_case() -> TestResult {
     let usage = {
         let graph_writer: &mut dyn Write = &mut graph;
         let blob_writer: &mut dyn Write = &mut blobs;
-        write_streams(graph_writer, blob_writer, &expected, limits, Some(&budget))?
+        with_cancellation(None, |cancellation| {
+            write_streams(
+                graph_writer,
+                blob_writer,
+                &expected,
+                limits,
+                Some(&budget),
+                cancellation,
+            )
+        })?
     };
     assert_eq!(budget.snapshot()?.used_bytes, 0);
     graph.seek(SeekFrom::Start(0))?;
@@ -314,7 +325,9 @@ fn understated_snapshot_receipt_stops_decoding_before_the_full_graph_is_allocate
     let limits = CaseSnapshotLimits::new(64 * 1024 * 1024, 64 * 1024 * 1024);
     let mut graph = Vec::new();
     let mut blobs = Vec::new();
-    let mut usage = write_streams(&mut graph, &mut blobs, &case, limits, None)?;
+    let mut usage = with_cancellation(None, |cancellation| {
+        write_streams(&mut graph, &mut blobs, &case, limits, None, cancellation)
+    })?;
     assert!(usage.graph_decoded_bytes > 6 * 1024 * 1024);
     usage.graph_decoded_bytes = 1024;
     let budget = MemoryBudget::new(64 * 1024 * 1024);

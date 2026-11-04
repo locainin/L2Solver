@@ -799,14 +799,17 @@ fn save_invalid_generation(
         max_metadata_bytes: 1024 * 1024,
     };
     lease.save_active(&job.checkpoint_snapshot()?, limits, |writer| {
-        let (mut graph, mut blobs, state) = writer.streams();
-        let usage = crate::case_snapshot::write_streams(
-            &mut graph,
-            &mut blobs,
-            poisoned,
-            CaseSnapshotLimits::new(options.cache_max_bytes, options.memory_limit),
-            None,
-        )
+        let (graph, blobs, state) = writer.streams();
+        let usage = crate::case_snapshot::with_cancellation(None, |cancellation| {
+            crate::case_snapshot::write_streams(
+                graph,
+                blobs,
+                poisoned,
+                CaseSnapshotLimits::new(options.cache_max_bytes, options.memory_limit),
+                None,
+                cancellation,
+            )
+        })
         .map_err(|_| l2_workbench::job::cache::CacheError::CorruptCheckpoint)?;
         state.write_all(saved_state)?;
         let work = scoped
