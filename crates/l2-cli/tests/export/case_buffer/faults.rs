@@ -62,13 +62,16 @@ fn injected_enospc_and_edquot_during_snapshot_writes_preserve_previous_output() 
                         errno: (!fail_graph).then_some(errno),
                         observed: &observed,
                     };
-                    crate::case_snapshot::write_streams(
-                        &mut graph_writer,
-                        &mut blob_writer,
-                        &case.case,
-                        limits,
-                        Some(&memory),
-                    )?;
+                    crate::case_snapshot::with_cancellation(None, |cancellation| {
+                        crate::case_snapshot::write_streams(
+                            &mut graph_writer,
+                            &mut blob_writer,
+                            &case.case,
+                            limits,
+                            Some(&memory),
+                            cancellation,
+                        )
+                    })?;
                     Ok(())
                 },
                 || Ok(()),

@@ -15,6 +15,8 @@ mod limits;
 mod memory;
 #[path = "recovery_executor_checkpoint/profile_resume.rs"]
 mod profile_resume;
+#[path = "recovery_executor_checkpoint/stream_buffer.rs"]
+mod stream_buffer;
 
 fn without_cache_hits(mut work: serde_json::Value) -> Result<serde_json::Value, Box<dyn Error>> {
     work.pointer_mut("/counts/counters")
