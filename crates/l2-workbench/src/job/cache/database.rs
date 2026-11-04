@@ -1,6 +1,11 @@
-use std::{fs, path::Path, time::Duration};
+use std::{
+    fs,
+    ops::{Deref, DerefMut},
+    path::Path,
+    time::Duration,
+};
 
-use rusqlite::{Connection, OpenFlags, TransactionBehavior};
+use rusqlite::{Connection, OpenFlags, TransactionBehavior, config::DbConfig};
 
 use super::{
     error::{CacheError, Result},
@@ -11,16 +16,53 @@ pub(super) const DATABASE_NAME: &str = "cache.sqlite3";
 const SCHEMA_VERSION: u32 = 3;
 const APPLICATION_ID: i64 = 0x4c32_5343;
 const INITIALIZATION_LOCK: &str = "cache-init.lock";
+const WAL_CLOSE_CHECKPOINT_BYTES: u64 = 64 * 1024;
 
-#[derive(Clone, Copy)]
-pub(super) enum Durability {
-    Recomputable,
-    Checkpoint,
+pub(super) struct CacheConnection<'state> {
+    connection: Connection,
+    state: &'state HeldDirectory,
+}
+
+impl Deref for CacheConnection<'_> {
+    type Target = Connection;
+
+    fn deref(&self) -> &Self::Target {
+        &self.connection
+    }
+}
+
+impl DerefMut for CacheConnection<'_> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.connection
+    }
+}
+
+impl Drop for CacheConnection<'_> {
+    fn drop(&mut self) {
+        // Committed WAL data stays authoritative until SQLite checkpoints it
+        match validate_sidecar(self.state.path(), "-wal") {
+            Ok(Some(size)) if size < WAL_CLOSE_CHECKPOINT_BYTES => {
+                // A configuration error keeps the normal close checkpoint enabled
+                let _ = self
+                    .connection
+                    .set_db_config(DbConfig::SQLITE_DBCONFIG_NO_CKPT_ON_CLOSE, true);
+            }
+            Ok(Some(_)) => {
+                // Clear large logs even if idle connections keep the database open
+                if self.connection.busy_timeout(Duration::ZERO).is_ok() {
+                    let _ = self
+                        .connection
+                        .execute_batch("PRAGMA wal_checkpoint(TRUNCATE)");
+                }
+            }
+            Ok(None) | Err(_) => {}
+        }
+    }
 }
 
 pub(super) fn initialize(state: &HeldDirectory, locks: &HeldDirectory) -> Result<()> {
     let _lock = locks.lock_with_retry(INITIALIZATION_LOCK, true)?;
-    let mut connection = open_connection(state, Durability::Checkpoint)?;
+    let mut connection = open_connection(state)?;
     // Check ownership and schema before changing another database's journal mode
     let application_id = pragma_i64(&connection, "application_id")?;
     let version = pragma_i64(&connection, "user_version")?;
@@ -57,27 +99,23 @@ pub(super) fn initialize(state: &HeldDirectory, locks: &HeldDirectory) -> Result
     enable_wal(&connection)
 }
 
-pub(super) fn open_connection(state: &HeldDirectory, durability: Durability) -> Result<Connection> {
+pub(super) fn open_connection(state: &HeldDirectory) -> Result<CacheConnection<'_>> {
     let database_path = state.ensure_regular_file(DATABASE_NAME)?;
-    for suffix in ["-wal", "-shm"] {
-        validate_sidecar(state.path(), suffix)?;
-    }
+    let _ = validate_sidecar(state.path(), "-wal")?;
+    let _ = validate_sidecar(state.path(), "-shm")?;
     let connection = Connection::open_with_flags(
         &database_path,
         OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_NOFOLLOW,
     )?;
     connection.busy_timeout(Duration::from_secs(5))?;
     connection.execute_batch("PRAGMA foreign_keys = ON; PRAGMA trusted_schema = OFF;")?;
-    let synchronous = match durability {
-        Durability::Recomputable => 1_i64,
-        Durability::Checkpoint => 2_i64,
-    };
-    connection.pragma_update(None, "synchronous", synchronous)?;
-    Ok(connection)
+    // Sync committed WAL changes before old generation files can be removed
+    connection.pragma_update(None, "synchronous", 2_i64)?;
+    Ok(CacheConnection { connection, state })
 }
 
 pub(super) fn checkpoint_wal(state: &HeldDirectory) -> Result<()> {
-    let connection = open_connection(state, Durability::Checkpoint)?;
+    let connection = open_connection(state)?;
     connection.execute_batch("PRAGMA wal_checkpoint(PASSIVE);")?;
     Ok(())
 }
@@ -240,14 +278,14 @@ fn user_table_count(connection: &Connection) -> Result<u64> {
         .map_err(Into::into)
 }
 
-fn validate_sidecar(state_path: &Path, suffix: &str) -> Result<()> {
+fn validate_sidecar(state_path: &Path, suffix: &str) -> Result<Option<u64>> {
     let path = state_path.join(format!("{DATABASE_NAME}{suffix}"));
     match fs::symlink_metadata(path) {
         Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_file() => Err(
             CacheError::UnsafePath("SQLite sidecar must be a regular file"),
         ),
-        Ok(_) => Ok(()),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Ok(metadata) => Ok(Some(metadata.len())),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
         Err(error) => Err(error.into()),
     }
 }

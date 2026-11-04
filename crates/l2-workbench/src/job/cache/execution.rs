@@ -15,8 +15,7 @@ use sha2::{Digest, Sha256};
 use crate::job::{JobSnapshot, MemoryBudget, MemoryLease};
 
 use super::{
-    Cache, Lease,
-    database::{self, Durability},
+    Cache, Lease, database,
     error::{CacheError, Result},
     filesystem::HeldDirectory,
     key::StageKey,
@@ -306,9 +305,7 @@ impl Drop for PendingGeneration {
             Err(error) if error.kind() == io::ErrorKind::NotFound => {}
             Err(_) => return,
         }
-        if let Ok(connection) =
-            database::open_connection(&self.cache.inner.state_root, Durability::Checkpoint)
-        {
+        if let Ok(connection) = database::open_connection(&self.cache.inner.state_root) {
             let _ = connection.execute(
                 "DELETE FROM execution_reservations WHERE token = ?1",
                 [&self.token],
@@ -432,8 +429,7 @@ impl Lease {
     ) -> Result<Option<ActiveExecution<'_>>> {
         self.cache.inner.check_locations()?;
         let memory_budget = self.cache.memory_budget();
-        let mut connection =
-            database::open_connection(&self.cache.inner.state_root, Durability::Checkpoint)?;
+        let mut connection = database::open_connection(&self.cache.inner.state_root)?;
         let transaction = connection.transaction()?;
         let rowid = transaction
             .query_row(
@@ -748,8 +744,7 @@ fn publish(
     snapshot: &str,
     bytes: u64,
 ) -> Result<Option<String>> {
-    let mut connection =
-        database::open_connection(&lease.cache.inner.state_root, Durability::Checkpoint)?;
+    let mut connection = database::open_connection(&lease.cache.inner.state_root)?;
     let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
     let old = retired::record_current(
         &transaction,
