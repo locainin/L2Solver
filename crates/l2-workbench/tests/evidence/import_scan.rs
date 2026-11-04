@@ -52,7 +52,7 @@ fn finding_free_limited_coverage_visible() -> Result<(), Box<dyn Error>> {
     assert_eq!(report.retained_findings, 0);
     assert!(report.source_complete);
     assert!(report.scan_complete);
-    assert!(!report.limitations.is_empty());
+    assert_ne!(report.limitations.len(), 0);
     assert!(case.collection_complete());
     Ok(())
 }

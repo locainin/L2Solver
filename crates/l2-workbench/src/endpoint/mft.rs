@@ -722,9 +722,11 @@ fn decode_utf16(bytes: &[u8]) -> Result<String, EndpointImportError> {
         return Err(error("MFT filename has an odd byte length"));
     }
     let words = bytes
-        .chunks_exact(2)
-        .map(|pair| read_u16(pair, 0))
-        .collect::<Result<Vec<_>, _>>()?;
+        .as_chunks::<2>()
+        .0
+        .iter()
+        .map(|pair| u16::from_le_bytes(*pair))
+        .collect::<Vec<_>>();
     String::from_utf16(&words).map_err(|_| error("MFT filename has invalid UTF-16"))
 }
 

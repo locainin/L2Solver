@@ -61,7 +61,7 @@ fn empty_parser_respects_report_budget() -> Result<(), Box<dyn Error>> {
     let exact = StreamMessageParser::new(context(), false, false, framing.clone(), exact_limits)?;
     let mut resumed: StreamMessageParser = serde_json::from_value(serde_json::to_value(exact)?)?;
     resumed.finalize()?;
-    assert!(resumed.into_report()?.messages.is_empty());
+    assert_eq!(resumed.into_report()?.messages.len(), 0);
 
     let one_byte_less = ProtocolLimits {
         max_report_bytes: exact_bytes
@@ -214,7 +214,7 @@ fn source_map_covers_supplied_bytes() -> Result<(), Box<dyn Error>> {
     );
 
     assert!(result.is_err());
-    assert!(parser.into_report()?.messages.is_empty());
+    assert_eq!(parser.into_report()?.messages.len(), 0);
     Ok(())
 }
 
@@ -246,7 +246,7 @@ fn source_map_origins_byte_coverage() -> Result<(), Box<dyn Error>> {
         parser.push_chunk(0, b"ab", &origins),
         Err(ProtocolError::StreamOffsetOverflow)
     ));
-    assert!(parser.into_report()?.messages.is_empty());
+    assert_eq!(parser.into_report()?.messages.len(), 0);
     Ok(())
 }
 
@@ -323,7 +323,7 @@ fn byte_limit_source_map_validation() -> Result<(), Box<dyn Error>> {
         parser.push_chunk(0, b"ab", &incomplete),
         Err(ProtocolError::RunTooLarge { .. })
     ));
-    assert!(parser.into_report()?.messages.is_empty());
+    assert_eq!(parser.into_report()?.messages.len(), 0);
     Ok(())
 }
 
@@ -352,7 +352,7 @@ fn byte_limit_malformed_origin_validation() -> Result<(), Box<dyn Error>> {
         parser.push_chunk(0, b"ab", &overflowing),
         Err(ProtocolError::RunTooLarge { .. })
     ));
-    assert!(parser.into_report()?.messages.is_empty());
+    assert_eq!(parser.into_report()?.messages.len(), 0);
     Ok(())
 }
 

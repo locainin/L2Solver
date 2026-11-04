@@ -2,12 +2,14 @@
 name = "l2-discovery"
 version = "0.1.0"
 edition = "2024"
+rust-version.workspace = true
 publish = false
 
 [lints]
 workspace = true
 
 [dependencies]
+l2-capture = { version = "=0.1.0", path = "../l2-capture" }
 l2-core = { version = "=0.1.0", path = "../l2-core" }
 serde = { version = "1", features = ["derive"] }
 

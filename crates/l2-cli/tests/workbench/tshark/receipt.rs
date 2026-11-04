@@ -1,4 +1,4 @@
-use super::super::{PREFERENCES, TsharkOptions, decode_packets, prepare_capture, run};
+use super::super::{TsharkOptions, decode_packets, prepare_capture, run};
 use super::{assert_error_contains, json_field};
 use l2_workbench::{sha256, tshark::TsharkReport};
 use serde_json::{Value, json};
@@ -40,7 +40,6 @@ fn fixture(
     fixture.sync_all()?;
     drop(fixture);
     fs::set_permissions(&executable, fs::Permissions::from_mode(0o700))?;
-    fs::write(directory.join("preferences.txt"), PREFERENCES)?;
     fs::write(directory.join("frames.txt"), frames)?;
     fs::write(directory.join("packets.json"), serde_json::to_vec(packets)?)?;
     let capture = directory.join("capture.pcap");
@@ -131,7 +130,7 @@ fn missing_extra_decoded_packets_written() -> Result<(), Box<dyn Error>> {
 
         assert_error_contains(run(&options, &mut output), "packet count")?;
 
-        assert!(output.is_empty());
+        assert_eq!(output.len(), 0);
     }
     Ok(())
 }
@@ -174,7 +173,7 @@ fn malformed_truncated_cannot_source_completeness() -> Result<(), Box<dyn Error>
 
         assert!(run(&options, &mut output).is_err(), "accepted {frames:?}");
 
-        assert!(output.is_empty());
+        assert_eq!(output.len(), 0);
     }
     Ok(())
 }

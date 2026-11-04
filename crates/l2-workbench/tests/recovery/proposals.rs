@@ -172,10 +172,10 @@ fn rejects_invalid_headers() {
     let zlib = propose_transforms(&invalid_zlib, budget(8, 8));
     let incomplete_name = propose_transforms(&incomplete_gzip_name, budget(8, 8));
     let incomplete_dictionary = propose_transforms(&incomplete_zlib_dictionary, budget(8, 8));
-    assert!(proposed_operations(&gzip).is_empty());
-    assert!(proposed_operations(&zlib).is_empty());
-    assert!(proposed_operations(&incomplete_name).is_empty());
-    assert!(proposed_operations(&incomplete_dictionary).is_empty());
+    assert_eq!(proposed_operations(&gzip).len(), 0);
+    assert_eq!(proposed_operations(&zlib).len(), 0);
+    assert_eq!(proposed_operations(&incomplete_name).len(), 0);
+    assert_eq!(proposed_operations(&incomplete_dictionary).len(), 0);
 }
 
 #[test]
@@ -206,7 +206,7 @@ fn keeps_budgets_independent() {
 fn rejects_empty_input() {
     let report = propose_transforms(b"", budget(8, 8));
 
-    assert!(report.proposals.is_empty());
+    assert_eq!(report.proposals.len(), 0);
     assert_eq!(report.assessments.len(), 7);
     assert_eq!(report.omissions.candidates, 0);
     assert!(report.assessments.iter().all(|item| matches!(
@@ -347,7 +347,7 @@ fn keeps_alphabet_specific_modes_distinct_and_rejects_mixed_alphabets() {
         }]
     );
     assert_eq!(eligible_base64_mode_count(&url_safe), 1);
-    assert!(proposed_operations(&mixed).is_empty());
+    assert_eq!(proposed_operations(&mixed).len(), 0);
     assert_eq!(eligible_base64_mode_count(&mixed), 0);
     assert_eq!(mixed.assessments.len(), 7);
     let mixed_base64_assessments = mixed
@@ -395,7 +395,7 @@ fn zero_candidate_budget_counts_equivalence_classes_and_retains_assessments() {
     let report = propose_transforms(b"TWFu", budget(0, 7));
     let representative = base64_mode(Base64Alphabet::Standard, Base64Padding::Required);
 
-    assert!(report.proposals.is_empty());
+    assert_eq!(report.proposals.len(), 0);
     assert_eq!(report.assessments.len(), 7);
     assert_eq!(report.omissions.candidates, 1);
     assert_eq!(report.omissions.reports, 0);

@@ -261,7 +261,7 @@ fn canonical_dns_variants_unmatched_queries() -> Result<(), Box<dyn Error>> {
         .ok_or("missing canonical DNS question group")?;
     assert_eq!(group.source_count, 2);
     assert_eq!(group.occurrence_count, 2);
-    assert!(group.warnings.is_empty());
+    assert_eq!(group.warnings.len(), 0);
     let mut occurrences = Vec::new();
     store.visit_shared_occurrences(group.kind, &group.key, None, None, |occurrence| {
         occurrences.push(occurrence);

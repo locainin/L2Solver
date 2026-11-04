@@ -75,7 +75,7 @@ fn empty_bit_valid_supported_widths() -> Result<(), Box<dyn Error>> {
                 }],
             )?;
             assert_eq!(report.status, DerivationStatus::Completed);
-            assert!(report.output.is_empty());
+            assert_eq!(report.output.len(), 0);
         }
     }
     Ok(())

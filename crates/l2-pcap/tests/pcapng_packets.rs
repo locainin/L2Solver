@@ -25,7 +25,7 @@ fn preserves_empty_packet_evidence() -> Result<(), Box<dyn std::error::Error>> {
     ));
     let mut enhanced_reader = PcapNgReader::new(Cursor::new(enhanced_capture))?;
     let enhanced = first_frame(&mut enhanced_reader)?;
-    assert!(enhanced.bytes().is_empty());
+    assert_eq!(enhanced.bytes(), []);
     assert_eq!(enhanced.metadata().original_len(), 0);
     assert!(!enhanced.is_truncated());
     let enhanced_payload = [0x5a; 32];
@@ -55,7 +55,7 @@ fn preserves_empty_packet_evidence() -> Result<(), Box<dyn std::error::Error>> {
     ));
     let mut simple_reader = PcapNgReader::new(Cursor::new(simple_capture))?;
     let simple = first_frame(&mut simple_reader)?;
-    assert!(simple.bytes().is_empty());
+    assert_eq!(simple.bytes(), []);
     assert_eq!(simple.metadata().original_len(), 0);
     assert!(!simple.is_truncated());
     let simple_payload_frame = simple_reader

@@ -12,7 +12,12 @@ use crate::{
     reconstruction::{Endpoint, Origin, ReconstructionReport, Stream},
 };
 use l2_audit::{ForensicScope, ForensicTracker, ResourceLimitStatus};
-use l2_discovery::ip_header;
+use l2_capture::{CapturedFrame, LinkType};
+use l2_core::FrameField;
+use l2_discovery::{
+    ip_header_from_payload,
+    link::{CookedVersion, NetworkEnvelope, decode_network_frame},
+};
 use serde::Serialize;
 use serde_json::{Value, json};
 use std::error::Error;
@@ -50,50 +55,20 @@ pub(super) struct RunNodes<'a> {
 
 pub(super) fn packets(context: &mut Context<'_>) -> Result<(), Box<dyn Error>> {
     let mut unsupported_link_type_seen = false;
+    let mut opaque_cooked_seen = false;
+    let mut cooked_seen = false;
     for (&number, frame) in context.records {
-        let ethernet_layout = frame.metadata().link_type().is_ethernet();
-        unsupported_link_type_seen |= !ethernet_layout;
-        let decoded = ethernet_layout
-            .then(|| l2_core::decode(frame.bytes()).ok())
-            .flatten();
-        let ip = decoded.as_ref().and_then(ip_header);
-        let mut details = serde_json::Map::new();
-        details.insert("record".to_owned(), json!(number));
-        details.insert(
-            "link_type".to_owned(),
-            json!(frame.metadata().link_type().raw()),
+        let link_type = frame.metadata().link_type();
+        unsupported_link_type_seen |= !matches!(
+            link_type,
+            LinkType::Ethernet | LinkType::LinuxSll | LinkType::LinuxSll2
         );
-        details.insert("captured_length".to_owned(), json!(frame.bytes().len()));
-        details.insert(
-            "original_length".to_owned(),
-            json!(frame.metadata().original_len()),
-        );
-        details.insert("truncated".to_owned(), json!(frame.is_truncated()));
-        details.insert("timestamp".to_owned(), json!(frame.metadata().timestamp().map(|time| json!({
-            "ticks":time.ticks(),"radix":time.resolution().radix(),"exponent":time.resolution().exponent(),
-            "offset_seconds":time.offset_seconds(),"source":format!("{:?}",time.source()),
-        }))));
-        details.insert(
-            "timestamp_source_ranges".to_owned(),
-            json!(super::timestamps::ranges(context.source, number, frame)?),
-        );
-        if let Some(ethernet) = &decoded {
-            details.insert(
-                "scope".to_owned(),
-                serde_json::to_value(ForensicScope::new(frame.metadata(), ethernet))?,
-            );
-            details.insert("source_mac".to_owned(), json!(ethernet.source));
-            details.insert("destination_mac".to_owned(), json!(ethernet.destination));
+        let decoded = decode_network_frame(link_type, frame.bytes());
+        if matches!(link_type, LinkType::LinuxSll | LinkType::LinuxSll2) {
+            cooked_seen = true;
+            opaque_cooked_seen |= decoded.as_ref().is_none_or(|frame| frame.field().is_none());
         }
-        if let Some(ip) = ip {
-            details.insert("source_ip".to_owned(), json!(ip.source.to_string()));
-            details.insert(
-                "destination_ip".to_owned(),
-                json!(ip.destination.to_string()),
-            );
-            details.insert("protocol".to_owned(), json!(ip.protocol));
-            details.insert("fragmented".to_owned(), json!(ip.fragmented));
-        }
+        let details = packet_details(context.source, number, frame, decoded.as_ref())?;
         let mapping = context.mappings(&[crate::reconstruction::Origin {
             packet: number,
             frame_offset: 0,
@@ -104,19 +79,100 @@ pub(super) fn packets(context: &mut Context<'_>) -> Result<(), Box<dyn Error>> {
             context.incomplete = true;
             context.case.add_limitation("Some retained packets lack file locators; their hashes and bytes are retained but absolute source ranges are unavailable")?;
         }
-        let id = context.case.add_mapped_bytes_node(
-            "packet",
-            frame.bytes(),
-            &mapping,
-            Value::Object(details),
-        )?;
+        let id = context
+            .case
+            .add_mapped_bytes_node("packet", frame.bytes(), &mapping, details)?;
         context.packet_nodes.insert(number, id);
     }
     if unsupported_link_type_seen {
         context.incomplete = true;
         context.case.add_limitation(
-            "Raw non-Ethernet packets are retained, but Ethernet packet and dependent forensic analyses cannot interpret that link type",
+            "Raw packets with unsupported link layouts are retained, but dependent network analyses cannot interpret those layouts",
         )?;
+    }
+    if opaque_cooked_seen {
+        context.incomplete = true;
+        context.case.add_limitation("Some cooked packet headers or protocol layouts could not be interpreted; their raw bytes remain available")?;
+    }
+    if cooked_seen {
+        context.case.add_limitation("Cooked headers do not supply both Ethernet endpoints, so Ethernet-dependent communication and ARP observations are unavailable for those records")?;
+        context.case.add_limitation("Cooked headers do not establish Ethernet VLAN membership; SLL1 does not identify the operating-system interface and may combine records from multiple interfaces")?;
+    }
+    Ok(())
+}
+
+fn packet_details(
+    source: &str,
+    number: u32,
+    frame: &CapturedFrame,
+    envelope: Option<&NetworkEnvelope<'_>>,
+) -> Result<Value, Box<dyn Error>> {
+    let mut details = serde_json::Map::new();
+    details.insert("record".to_owned(), json!(number));
+    details.insert(
+        "link_type".to_owned(),
+        json!(frame.metadata().link_type().raw()),
+    );
+    details.insert("captured_length".to_owned(), json!(frame.bytes().len()));
+    details.insert(
+        "original_length".to_owned(),
+        json!(frame.metadata().original_len()),
+    );
+    details.insert("truncated".to_owned(), json!(frame.is_truncated()));
+    details.insert("timestamp".to_owned(), json!(frame.metadata().timestamp().map(|time| json!({
+        "ticks":time.ticks(),"radix":time.resolution().radix(),"exponent":time.resolution().exponent(),
+        "offset_seconds":time.offset_seconds(),"source":format!("{:?}",time.source()),
+    }))));
+    details.insert(
+        "timestamp_source_ranges".to_owned(),
+        json!(super::timestamps::ranges(source, number, frame)?),
+    );
+    if let Some(envelope) = envelope {
+        network_details(&mut details, frame, envelope)?;
+    }
+    Ok(Value::Object(details))
+}
+
+fn network_details(
+    details: &mut serde_json::Map<String, Value>,
+    frame: &CapturedFrame,
+    envelope: &NetworkEnvelope<'_>,
+) -> Result<(), Box<dyn Error>> {
+    details.insert(
+        "scope".to_owned(),
+        serde_json::to_value(ForensicScope::from_network_frame(
+            frame.metadata(),
+            envelope,
+        ))?,
+    );
+    if let Some(ethernet) = envelope.ethernet() {
+        details.insert("source_mac".to_owned(), json!(ethernet.source));
+        details.insert("destination_mac".to_owned(), json!(ethernet.destination));
+    }
+    // The cooked address is retained as reported, without inventing Ethernet endpoints
+    if let Some(cooked) = envelope.cooked() {
+        details.insert("cooked".to_owned(), json!({
+            "version": match cooked.version() { CookedVersion::V1 => "sll1", CookedVersion::V2 => "sll2" },
+            "packet_type": cooked.packet_type().raw(),
+            "hardware_type": cooked.hardware_type(),
+            "address_length": cooked.address_length(),
+            "address": cooked.address(),
+            "interface_index": cooked.interface_index(),
+            "protocol": envelope.protocol(),
+            "payload_offset": envelope.payload_offset(),
+        }));
+    }
+    // Only fields with EtherType semantics can select an IP decoder
+    if let Some(FrameField::EtherType(protocol)) = envelope.field()
+        && let Some(ip) = ip_header_from_payload(protocol, envelope.payload())
+    {
+        details.insert("source_ip".to_owned(), json!(ip.source.to_string()));
+        details.insert(
+            "destination_ip".to_owned(),
+            json!(ip.destination.to_string()),
+        );
+        details.insert("protocol".to_owned(), json!(ip.protocol));
+        details.insert("fragmented".to_owned(), json!(ip.fragmented));
     }
     Ok(())
 }
@@ -125,11 +181,9 @@ pub(super) fn forensics(context: &mut Context<'_>) -> Result<(), Box<dyn Error>>
     let mut tracker = ForensicTracker::new(4096, 2048);
     let mut status = ResourceLimitStatus::default();
     for (&number, captured) in context.records {
-        if !captured.metadata().link_type().is_ethernet() {
-            continue;
-        }
-        if let Ok(frame) = l2_core::decode(captured.bytes()) {
-            tracker.observe(captured, &frame, u64::from(number), true, &mut status);
+        if let Some(frame) = decode_network_frame(captured.metadata().link_type(), captured.bytes())
+        {
+            tracker.observe_network(captured, &frame, u64::from(number), true, &mut status);
         }
     }
     let report = tracker.finish();

@@ -30,6 +30,13 @@ struct Clock {
 }
 
 impl Context {
+    pub(super) const fn is_linux_cooked(&self) -> bool {
+        matches!(
+            LinkType::from_raw(self.link_type),
+            LinkType::LinuxSll | LinkType::LinuxSll2
+        )
+    }
+
     pub(super) fn from_metadata(metadata: &CaptureMetadata) -> Self {
         Self {
             section: metadata.interface().section,

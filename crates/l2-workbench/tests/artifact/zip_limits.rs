@@ -171,7 +171,7 @@ fn entry_count_limit_aggregate_omission() -> Result<(), Box<dyn Error>> {
     let report = inspect_zip_with_limits(&archive, limits)?;
 
     assert_eq!(report.entry_count, 3);
-    assert!(report.entries.is_empty());
+    assert_eq!(report.entries.len(), 0);
     assert_eq!(report.omitted_entry_count, 3);
     assert!(report.omissions.iter().any(|omission| {
         omission.reason == ZipArtifactOmissionReason::EntryCountLimit && omission.count == 3
@@ -206,7 +206,7 @@ fn excessive_nested_omits_archive_contents() -> Result<(), Box<dyn Error>> {
 
     let report = inspect_zip_at_depth(&archive, limits, 2)?;
 
-    assert!(report.entries.is_empty());
+    assert_eq!(report.entries.len(), 0);
     assert_eq!(report.entry_count, 1);
     assert_eq!(report.omitted_entry_count, 1);
     assert!(report.omissions.iter().any(|omission| {
@@ -228,7 +228,7 @@ fn zero_depth_omits_nested_archives() -> Result<(), Box<dyn Error>> {
     let nested = inspect_zip_at_depth(&archive, limits, 1)?;
 
     assert_eq!(top_level.extracted_entry_count, 1);
-    assert!(nested.entries.is_empty());
+    assert_eq!(nested.entries.len(), 0);
     assert!(nested.omissions.iter().any(|omission| {
         omission.reason == ZipArtifactOmissionReason::DepthLimit && omission.count == 1
     }));
@@ -312,7 +312,7 @@ fn zip64_entry_reported_directory_allocation() -> Result<(), Box<dyn Error>> {
     let report = inspect_zip_with_limits(&archive, ZipArtifactLimits::default())?;
 
     assert_eq!(report.entry_count, count);
-    assert!(report.entries.is_empty());
+    assert_eq!(report.entries.len(), 0);
     assert_eq!(report.omitted_entry_count, count);
     assert!(report.omissions.iter().any(|omission| {
         omission.reason == ZipArtifactOmissionReason::EntryCountLimit && omission.count == count

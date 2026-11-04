@@ -17,6 +17,7 @@ pub fn observe<L: LinkIo>(link: &mut L, output: &mut impl Write) -> Result<bool,
     let mut invalid = 0_u64;
     let mut unsupported_stp = 0_u64;
     let mut unsupported_link = 0_u64;
+    let mut unsupported_protocol = 0_u64;
     let mut truncated = 0_u64;
     writeln!(
         output,
@@ -32,12 +33,7 @@ pub fn observe<L: LinkIo>(link: &mut L, output: &mut impl Write) -> Result<bool,
             &mut regressions,
             &mut missing,
         )?;
-        let update = observer.expire(engine.clock().now())?;
-        if update != StpUpdate::Unchanged {
-            write!(output, "time={} STP ", engine.clock().now())?;
-            stp_render::update(output, update)?;
-            writeln!(output)?;
-        }
+        expire_observations(&mut observer, &engine, output)?;
         engine.enqueue(Event::FrameReceived(packet))?;
         if let Some(envelope) = engine.next_ready()?
             && let Event::FrameReceived(frame) = envelope.event()
@@ -51,6 +47,7 @@ pub fn observe<L: LinkIo>(link: &mut L, output: &mut impl Write) -> Result<bool,
                 &mut invalid,
                 &mut unsupported_stp,
                 &mut unsupported_link,
+                &mut unsupported_protocol,
             );
             if let Some(stp) = assessment.stp {
                 stp_frames += 1;
@@ -74,7 +71,7 @@ pub fn observe<L: LinkIo>(link: &mut L, output: &mut impl Write) -> Result<bool,
     }
     writeln!(
         output,
-        "frames={frames} stp={stp_frames} malformed={malformed} invalid={invalid} unsupported_stp={unsupported_stp} truncated={truncated} advertisement_changes={} timestamp_regressions={regressions} missing_timestamps={missing} unsupported_link={unsupported_link}",
+        "frames={frames} stp={stp_frames} malformed={malformed} invalid={invalid} unsupported_stp={unsupported_stp} truncated={truncated} advertisement_changes={} timestamp_regressions={regressions} missing_timestamps={missing} unsupported_link={unsupported_link} unsupported_protocol={unsupported_protocol}",
         observer.root_changes()
     )?;
     let source_complete = crate::source_collection::text(link.collection_summary(), output)?;
@@ -83,27 +80,53 @@ pub fn observe<L: LinkIo>(link: &mut L, output: &mut impl Write) -> Result<bool,
         && invalid == 0
         && unsupported_stp == 0
         && unsupported_link == 0
+        && unsupported_protocol == 0
         && truncated == 0
         && regressions == 0
         && missing == 0)
 }
 
-const fn count_assessment(
+fn expire_observations(
+    observer: &mut StpObserver,
+    engine: &EventEngine<FakeClock>,
+    output: &mut impl Write,
+) -> Result<(), Box<dyn Error>> {
+    let update = observer.expire(engine.clock().now())?;
+    if update != StpUpdate::Unchanged {
+        write!(output, "time={} STP ", engine.clock().now())?;
+        stp_render::update(output, update)?;
+        writeln!(output)?;
+    }
+    Ok(())
+}
+
+fn count_assessment(
     assessment: &report::Assessment<'_>,
     link_type: l2_capture::LinkType,
     malformed: &mut u64,
     invalid: &mut u64,
     unsupported_stp: &mut u64,
     unsupported_link: &mut u64,
+    unsupported_protocol: &mut u64,
 ) {
     match assessment.status {
         report::Status::Malformed => *malformed += 1,
         report::Status::Invalid => *invalid += 1,
         report::Status::Unsupported if assessment.diagnostic.is_some() => {
-            if link_type.is_ethernet() {
+            if !matches!(
+                link_type,
+                l2_capture::LinkType::Ethernet
+                    | l2_capture::LinkType::LinuxSll
+                    | l2_capture::LinkType::LinuxSll2
+            ) {
+                *unsupported_link += 1;
+            } else if assessment.network.as_ref().is_some_and(|frame| {
+                matches!(frame.field(), Some(l2_core::FrameField::Length(_)))
+                    && frame.payload().starts_with(&[0x42, 0x42, 0x03])
+            }) {
                 *unsupported_stp += 1;
             } else {
-                *unsupported_link += 1;
+                *unsupported_protocol += 1;
             }
         }
         _ => {}

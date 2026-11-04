@@ -136,7 +136,7 @@ fn silence_loss_and_presend_cancellation_are_inconclusive() -> Result<(), Box<dy
     assert_eq!(report.status(), DhcpStatus::Inconclusive);
     assert_eq!(report.summary().stop_reason(), StopReason::Cancelled);
     assert_eq!(report.summary().sent_packets(), 0);
-    assert!(link.sent.is_empty());
+    assert_eq!(link.sent, [] as [std::vec::Vec<u8>; 0]);
     Ok(())
 }
 
@@ -304,7 +304,9 @@ fn invalid_cookie_opcode_and_ambiguous_overloaded_fields_are_not_offers()
 fn distinct_offers_stop_at_the_fixed_observation_cap() -> Result<(), Box<dyn Error>> {
     let bytes = include_bytes!("fixtures/many-offers.bin");
     let frames = bytes
-        .chunks_exact(OFFER.len())
+        .as_chunks::<{ OFFER.len() }>()
+        .0
+        .iter()
         .map(|frame| Ok(ReceiveEvent::Frame(capture(frame)?)))
         .collect::<Result<Vec<_>, Box<dyn Error>>>()?;
     assert_eq!(frames.len(), 65);
@@ -387,6 +389,6 @@ fn expired_operation_deadline_prevents_dhcp_send() -> Result<(), Box<dyn Error>>
     assert_eq!(report.summary().stop_reason(), StopReason::Deadline);
     assert!(!report.summary().send_attempted());
     assert_eq!(report.summary().sent_packets(), 0);
-    assert!(link.sent.is_empty());
+    assert_eq!(link.sent, [] as [std::vec::Vec<u8>; 0]);
     Ok(())
 }

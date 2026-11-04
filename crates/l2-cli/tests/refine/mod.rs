@@ -422,7 +422,7 @@ fn per_input_cache_ignores_previous_algorithm_and_reuses_current() -> Result<(),
             .get(&l2_workbench::job::Counter::CacheHits),
         Some(&1)
     );
-    assert!(snapshot.cache_fallbacks.records().is_empty());
+    assert_eq!(snapshot.cache_fallbacks.records().len(), 0);
     drop(first);
     drop(second);
     drop(first_memory);
@@ -476,7 +476,7 @@ fn cache_receipts_over_work_or_expansion_limits_are_rejected_and_can_fall_back()
             analyze_source_cached(&source, options, &recovery, Some(&cache), &job, &memory)?;
         assert!(actual.work_bytes <= options.limits.max_total_work_bytes);
         assert!(actual.zip_expanded_work_bytes <= options.limits.max_zip_expanded_bytes);
-        assert!(!job.snapshot()?.cache_fallbacks.records().is_empty());
+        assert_ne!(job.snapshot()?.cache_fallbacks.records().len(), 0);
     }
     Ok(())
 }
@@ -863,8 +863,8 @@ fn quiet_mode_suppresses_fresh_and_reused_completion_messages() -> Result<(), Bo
     let mut reused_output = Vec::new();
     assert!(run(&options, &mut reused_output)?);
 
-    assert!(fresh_output.is_empty());
-    assert!(reused_output.is_empty());
+    assert_eq!(fresh_output.len(), 0);
+    assert_eq!(reused_output.len(), 0);
     Ok(())
 }
 

@@ -11,8 +11,6 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::{error::Error, path::Path};
 
-pub use stamp::OutputFileStamp;
-
 /// The result workflow that owns a directory
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -43,8 +41,8 @@ pub struct ResultIdentity {
 pub struct ReusedResult {
     /// Whether the stored run completed every requested component
     pub complete: bool,
-    /// Output file receipts verified against the directory
-    pub artifacts: Vec<OutputFileStamp>,
+    /// Number of declared artifacts whose receipts were verified
+    pub artifact_count: usize,
 }
 
 /// A safely inspected result destination held until reuse or publication

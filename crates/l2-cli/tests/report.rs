@@ -11,7 +11,13 @@ fn capture_evidence_protocol_status_separate() -> Result<(), Box<dyn std::error:
         .ok_or("fixture payload missing")?;
     let parsed = report::assess(bytes);
     assert_eq!(parsed.status, report::Status::Parsed);
-    assert!(parsed.ethernet.is_some());
+    assert!(
+        parsed
+            .network
+            .as_ref()
+            .and_then(|frame| frame.ethernet())
+            .is_some()
+    );
     assert!(parsed.lldp.is_some());
     assert!(parsed.diagnostic.is_none());
     assert_eq!(report::assess(&[]).status, report::Status::Malformed);

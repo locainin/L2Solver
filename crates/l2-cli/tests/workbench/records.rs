@@ -711,7 +711,7 @@ fn command_receipt_exceeds_aggregate_budget() -> Result<(), Box<dyn Error>> {
     )?;
 
     assert!(!output.status.success());
-    assert!(output.stdout.is_empty());
+    assert_eq!(output.stdout.len(), 0);
     assert!(String::from_utf8_lossy(&output.stderr).contains("record metadata needs"));
     Ok(())
 }
@@ -758,7 +758,7 @@ fn command_preflights_exhausted_aggregate_budget() -> Result<(), Box<dyn Error>>
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(stderr.contains("record count 2 exceeds 1"));
     assert!(!stderr.contains("truncated record"));
-    assert!(output.stdout.is_empty());
+    assert_eq!(output.stdout.len(), 0);
     Ok(())
 }
 
@@ -829,7 +829,7 @@ fn command_unconsumed_bytes_independent_part() -> Result<(), Box<dyn Error>> {
 
     assert!(!output.status.success());
     assert!(String::from_utf8_lossy(&output.stderr).contains("unconsumed bytes"));
-    assert!(output.stdout.is_empty());
+    assert_eq!(output.stdout.len(), 0);
     Ok(())
 }
 
@@ -863,7 +863,7 @@ fn command_external_outside_retained_bytes() -> Result<(), Box<dyn Error>> {
     assert!(
         String::from_utf8_lossy(&output.stderr).contains("range 1..2 exceeds its 1 retained bytes")
     );
-    assert!(output.stdout.is_empty());
+    assert_eq!(output.stdout.len(), 0);
     Ok(())
 }
 

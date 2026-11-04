@@ -15,8 +15,8 @@ fn compliant_ap_has_no_findings() -> Result<(), Box<dyn std::error::Error>> {
 
     let assessment = assess(&survey, &policy()?, &[])?;
 
-    assert!(assessment.findings().is_empty());
-    assert!(assessment.exposures().is_empty());
+    assert_eq!(assessment.findings(), []);
+    assert_eq!(assessment.exposures(), []);
     Ok(())
 }
 
@@ -157,7 +157,7 @@ fn protected_advertisement_is_incomplete() -> Result<(), Box<dyn std::error::Err
         ),
         ObservationStatus::Protected
     );
-    assert!(survey.diagnostics().is_empty());
+    assert_eq!(survey.diagnostics(), []);
 
     let assessment = assess(&survey, &WirelessPolicy::default(), &[])?;
     let coverage = assessment

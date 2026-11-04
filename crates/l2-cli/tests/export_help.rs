@@ -7,7 +7,7 @@ fn extract_help_describes_recovery_and_optional_enrichment()
         .args(["extract", "--help"])
         .output()?;
     assert!(output.status.success());
-    assert!(output.stderr.is_empty());
+    assert_eq!(output.stderr.len(), 0);
     let text = String::from_utf8(output.stdout)?
         .split_whitespace()
         .collect::<Vec<_>>()

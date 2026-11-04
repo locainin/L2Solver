@@ -557,10 +557,13 @@ impl HelperLink {
                     ));
                 }
             }
-            match self.channel.try_receive() {
+            match self.channel.try_receive(deadline) {
                 Ok(Some(record)) => return Ok(record),
                 Ok(None) => {}
                 Err(error) => {
+                    if error.kind() == io::ErrorKind::TimedOut {
+                        self.cancel();
+                    }
                     self.poisoned = true;
                     return Err(error);
                 }
@@ -757,10 +760,23 @@ impl ActiveLink for HelperLink {
 impl Drop for HelperLink {
     fn drop(&mut self) {
         self.cancel();
-        if let Some(mut child) = self.child.take()
-            && !matches!(child.try_wait(), Ok(Some(_)))
-        {
-            let _ignored = child.kill();
+        if let Some(mut child) = self.child.take() {
+            match child.try_wait() {
+                Ok(Some(_)) => return,
+                Err(error) if error.raw_os_error() == Some(nix::libc::ECHILD) => {
+                    // The PID may be reused, so retain the handle without probing it again
+                    if let Some(lease) = self.lease.take() {
+                        crate::reaper::retain_unwaitable(child, lease);
+                    }
+                    return;
+                }
+                _ => {
+                    #[cfg(not(test))]
+                    let _ignored = child.kill();
+                    #[cfg(test)]
+                    let _ignored = tests::kill_during_drop(&mut child);
+                }
+            }
             // A single bounded reaper keeps the slot until exit is observed
             if let Some(lease) = self.lease.take() {
                 crate::reaper::submit(child, lease);

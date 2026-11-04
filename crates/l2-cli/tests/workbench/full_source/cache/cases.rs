@@ -10,7 +10,7 @@ use l2_workbench::{
         Counter, Job, MemoryBudget, MemoryClass,
         cache::{Cache, CacheReadPolicy, SourceIdentity, StageKey, StageStatus},
     },
-    store::{IngestReceipt, Store},
+    store::{IngestReceipt, SCHEMA_VERSION, Store},
 };
 use serde_json::json;
 use std::{error::Error, fs, path::Path};
@@ -118,8 +118,8 @@ fn warm_native_case_restores_exact_evidence_with_live_shared_charge() -> TestRes
     )?;
     let index_key = StageKey::new(
         "capture_index",
-        5,
-        "pcap-index-v1",
+        SCHEMA_VERSION,
+        "pcap-index-v2",
         &json!({}),
         &source,
         &[],
@@ -134,7 +134,7 @@ fn warm_native_case_restores_exact_evidence_with_live_shared_charge() -> TestRes
         .packet(&indexed.receipt.source_id, 1)?
         .flow
         .ok_or("missing flow")?;
-    let native_key = native_key(&indexed.receipt, flow_id, 2, "l2-native-case-v2")?;
+    let native_key = native_key(&indexed.receipt, flow_id, 4, "l2-native-case-v4")?;
     let expected = analyze_flow(&indexed.store, &indexed.receipt, None, None)?;
     let written = analyze_flow(&indexed.store, &indexed.receipt, Some(&cache), None)?;
     assert_eq!(written, expected);
@@ -251,6 +251,33 @@ fn charged_native_analysis_misses_legacy_json_but_reuses_the_capture_index() -> 
 }
 
 #[test]
+fn native_case_rebuilds_previous_algorithm_snapshot() -> TestResult {
+    let directory = tempfile::tempdir()?;
+    let (capture, cache) = prepare_capture(directory.path())?;
+    let indexed =
+        acquire_indexed_source(&capture, directory.path(), &AcquisitionOptions::default())?;
+    let flow_id = indexed
+        .store
+        .packet(&indexed.receipt.source_id, 1)?
+        .flow
+        .ok_or("expected flow")?;
+    let previous = indexed
+        .store
+        .investigate_flows(&[flow_id], Limits::default())?;
+    let key = native_key(&indexed.receipt, flow_id, 3, "l2-native-case-v3")?;
+    seed_snapshot(&cache, &key, &previous.case, previous.complete, false)?;
+    let job = Job::new("rebuild prior native case algorithm");
+    let actual = analyze_flow(&indexed.store, &indexed.receipt, Some(&cache), Some(&job))?;
+    assert_eq!(actual, previous.case);
+    assert_eq!(job.snapshot()?.counters.get(&Counter::CacheHits), Some(&0));
+    assert_eq!(
+        job.snapshot()?.counters.get(&Counter::CacheMisses),
+        Some(&1)
+    );
+    Ok(())
+}
+
+#[test]
 fn mismatched_native_snapshot_usage_fails_without_retaining_shared_memory() -> TestResult {
     let directory = tempfile::tempdir()?;
     let (capture, cache) = prepare_capture(directory.path())?;
@@ -267,7 +294,7 @@ fn mismatched_native_snapshot_usage_fails_without_retaining_shared_memory() -> T
     let result = indexed
         .store
         .investigate_flows(&[flow_id], Limits::default())?;
-    let key = native_key(&indexed.receipt, flow_id, 2, "l2-native-case-v2")?;
+    let key = native_key(&indexed.receipt, flow_id, 4, "l2-native-case-v4")?;
     seed_snapshot(&cache, &key, &result.case, result.complete, true)?;
 
     let budget = MemoryBudget::new(32 * 1024 * 1024);
@@ -292,7 +319,7 @@ fn optional_invalid_native_snapshot_rebuilds_exact_evidence_and_reports_the_fall
     let expected = indexed
         .store
         .investigate_flows(&[flow_id], Limits::default())?;
-    let key = native_key(&indexed.receipt, flow_id, 2, "l2-native-case-v2")?;
+    let key = native_key(&indexed.receipt, flow_id, 4, "l2-native-case-v4")?;
     seed_snapshot(&cache, &key, &expected.case, expected.complete, true)?;
     let job = Job::new("optional invalid native cache");
     let rebuilt = crate::workbench::full_source::cache::investigate_flow(
@@ -356,7 +383,7 @@ fn optional_native_commit_failure_preserves_the_already_computed_case() -> TestR
         );
         if strict_cache {
             assert!(result.is_err());
-            assert!(job.snapshot()?.cache_fallbacks.records().is_empty());
+            assert_eq!(job.snapshot()?.cache_fallbacks.records().len(), 0);
         } else {
             let actual = result?;
             assert_eq!(actual.case, expected.case);
@@ -403,7 +430,7 @@ fn native_snapshot_for_a_different_source_is_rejected_without_leaking_memory() -
         .store
         .investigate_flows(&[other_flow], Limits::default())?;
     assert_ne!(indexed.receipt.source_id, other.receipt.source_id);
-    let key = native_key(&indexed.receipt, flow_id, 2, "l2-native-case-v2")?;
+    let key = native_key(&indexed.receipt, flow_id, 4, "l2-native-case-v4")?;
     seed_snapshot(&cache, &key, &wrong.case, wrong.complete, false)?;
 
     let budget = MemoryBudget::new(32 * 1024 * 1024);

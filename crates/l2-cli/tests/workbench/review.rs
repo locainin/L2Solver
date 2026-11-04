@@ -153,12 +153,13 @@ fn html_bounds_associations_json_observations() -> Result<(), Box<dyn Error>> {
             .len(),
         3
     );
-    assert!(
+    assert_eq!(
         report
             .pointer("/correlation/groups")
             .and_then(Value::as_array)
             .ok_or("missing groups")?
-            .is_empty()
+            .len(),
+        0
     );
     Ok(())
 }

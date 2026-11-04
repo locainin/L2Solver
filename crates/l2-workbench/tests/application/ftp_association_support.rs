@@ -18,6 +18,7 @@ pub fn scope(vlan: u16) -> ForensicScope {
             vec![(0x8100, vlan)]
         },
         vlan_aux: None,
+        cooked_ifindex: None,
     }
 }
 

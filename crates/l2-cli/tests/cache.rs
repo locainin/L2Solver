@@ -18,7 +18,7 @@ fn cache_commands_manage_only_the_selected_xdg_roots() -> Result<(), Box<dyn Err
             "{}",
             String::from_utf8_lossy(&output.stderr)
         );
-        assert!(!output.stdout.is_empty());
+        assert_ne!(output.stdout.len(), 0);
         assert_eq!(std::fs::read(&sentinel)?, b"unrelated");
     }
     assert!(cache_home.join("l2solver").is_dir());

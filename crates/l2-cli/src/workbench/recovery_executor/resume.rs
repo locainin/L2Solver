@@ -8,7 +8,8 @@ use crate::arguments::RecoveryOptions;
 use l2_workbench::{
     evidence::{CasePrefixBinding, CaseSnapshotLimits, CaseSnapshotUsage},
     job::{
-        CacheFallbackKind, CacheStage, Job, MemoryBudget, MemoryClass, MemoryLease, WorkSnapshot,
+        CacheFallbackKind, CacheStage, Job, JobSnapshot, MemoryBudget, MemoryClass, MemoryLease,
+        WorkSnapshot,
         cache::{CacheError, ExecutionCheckpointLimits, ExecutionGeneration, Lease},
     },
 };
@@ -27,11 +28,21 @@ struct Metadata {
     work: Option<WorkSnapshot>,
 }
 
+struct AdmittedMetadata {
+    value: Metadata,
+    memory: MemoryLease,
+}
+
 #[derive(Serialize)]
 struct MetadataRef<'a> {
     version: u32,
     usage: CaseSnapshotUsage,
     work: Option<&'a WorkSnapshot>,
+}
+
+enum BudgetOrigin {
+    Supplied,
+    Discover,
 }
 
 /// One exclusively leased recovery stage and its checkpoint storage policy
@@ -41,14 +52,16 @@ pub struct RecoveryResume<'lease> {
     store_limits: ExecutionCheckpointLimits,
     executor_limit: usize,
     session_memory: MemoryBudget,
+    budget_origin: BudgetOrigin,
+    memory_limit: u64,
     refresh: bool,
     strict: bool,
     disabled: bool,
     last_save: Option<Instant>,
     initial: Option<CasePrefixBinding>,
-    memory: Option<MemoryBudget>,
     generation: Option<ExecutionGeneration>,
     usage: Option<CaseSnapshotUsage>,
+    metadata_memory: Option<MemoryLease>,
     #[cfg(test)]
     test_hooks: RelationalTestHooks,
 }
@@ -62,6 +75,7 @@ struct RelationalTestHooks {
     restored_relational: Option<u64>,
     forced_inner_limit: Option<(TestCheckpointPart, usize)>,
     forced_generation: Option<ExecutionGeneration>,
+    cancel_after_case_snapshot: bool,
 }
 
 #[cfg(test)]
@@ -75,7 +89,7 @@ pub(super) struct Loaded {
     pub(super) case: Case,
     pub(super) state: Vec<u8>,
     pub(super) work: Option<WorkSnapshot>,
-    pub(super) state_memory: Option<MemoryLease>,
+    pub(super) state_memory: MemoryLease,
 }
 
 impl<'lease> RecoveryResume<'lease> {
@@ -84,11 +98,12 @@ impl<'lease> RecoveryResume<'lease> {
         options: &RecoveryOptions,
         memory: Option<&MemoryBudget>,
     ) -> Self {
-        // Restoration keeps the native Case alive until the saved generation is validated
+        // The executor ceiling bounds checkpoint structure and verification work
         let executor_bytes = options.memory_limit / 8;
         Self {
             lease,
-            case_limits: CaseSnapshotLimits::new(options.cache_max_bytes, options.memory_limit / 4),
+            // Expanded bytes bound the stream; live allocations use the shared ledger
+            case_limits: CaseSnapshotLimits::new(options.cache_max_bytes, options.memory_limit),
             store_limits: ExecutionCheckpointLimits {
                 max_encoded_bytes: options.cache_max_bytes,
                 max_executor_bytes: executor_bytes,
@@ -99,20 +114,48 @@ impl<'lease> RecoveryResume<'lease> {
             session_memory: memory
                 .cloned()
                 .unwrap_or_else(|| MemoryBudget::new(options.memory_limit)),
+            budget_origin: if memory.is_some() {
+                BudgetOrigin::Supplied
+            } else {
+                BudgetOrigin::Discover
+            },
+            memory_limit: options.memory_limit,
             refresh: options.refresh,
             strict: options.strict_cache,
             disabled: false,
             last_save: None,
             initial: None,
-            memory: memory.cloned(),
             generation: None,
             usage: None,
+            metadata_memory: None,
             #[cfg(test)]
             test_hooks: RelationalTestHooks::default(),
         }
     }
 
-    pub(super) fn prepare(&mut self, initial: &Case) -> Result<(), RecoveryExecutionError> {
+    pub(super) fn prepare(&mut self, initial: &mut Case) -> Result<(), RecoveryExecutionError> {
+        if matches!(self.budget_origin, BudgetOrigin::Discover)
+            && let Some(existing) = initial
+                .memory_budget()
+                .or_else(|| self.lease.memory_budget())
+        {
+            self.session_memory = existing.clone();
+        }
+        if self
+            .session_memory
+            .snapshot()
+            .map_err(operational_error)?
+            .limit_bytes
+            > self.memory_limit
+        {
+            return Err(operational_error(
+                l2_workbench::job::MemoryError::IncompatibleWorkingSet,
+            ));
+        }
+        self.lease
+            .bind_memory_budget(&self.session_memory)
+            .map_err(cache_error)?;
+        initial.admit_memory_budget(&self.session_memory)?;
         self.initial = Some(initial.checkpoint_prefix()?);
         Ok(())
     }
@@ -128,9 +171,8 @@ impl<'lease> RecoveryResume<'lease> {
         else {
             return Ok(None);
         };
-        let metadata = Metadata::deserialize(active.metadata())
-            .map_err(|_| cache_error(CacheError::CorruptCheckpoint))?;
-        if metadata.version != METADATA_VERSION {
+        let metadata = admit_metadata(active.metadata(), &self.session_memory)?;
+        if metadata.value.version != METADATA_VERSION {
             return Err(cache_error(CacheError::CorruptCheckpoint));
         }
         let generation = active.generation().clone();
@@ -142,9 +184,9 @@ impl<'lease> RecoveryResume<'lease> {
         let case = crate::case_snapshot::read_streams(
             graph,
             blobs,
-            metadata.usage,
+            metadata.value.usage,
             self.case_limits,
-            self.memory.as_ref(),
+            Some(&self.session_memory),
         )
         .map_err(operational)?;
         if !self
@@ -159,25 +201,24 @@ impl<'lease> RecoveryResume<'lease> {
         bytes
             .try_reserve_exact(count)
             .map_err(|_| l2_workbench::recovery::RecoveryError::AllocationFailed)?;
-        if let Some(memory) = &mut state_memory {
-            memory
-                .try_resize(
-                    u64::try_from(bytes.capacity())
-                        .map_err(|_| CacheError::SizeOverflow)
-                        .map_err(cache_error)?,
-                )
-                .map_err(operational_error)?;
-        }
+        state_memory
+            .try_resize(
+                u64::try_from(bytes.capacity())
+                    .map_err(|_| CacheError::SizeOverflow)
+                    .map_err(cache_error)?,
+            )
+            .map_err(operational_error)?;
         bytes.resize(count, 0);
         state.read_exact(&mut bytes).map_err(operational_error)?;
         drop(active);
         self.generation = Some(generation);
-        self.usage = Some(metadata.usage);
+        self.usage = Some(metadata.value.usage);
+        self.metadata_memory = Some(metadata.memory);
         self.last_save = Some(Instant::now());
         Ok(Some(Loaded {
             case,
             state: bytes,
-            work: metadata.work,
+            work: metadata.value.work,
             state_memory,
         }))
     }
@@ -239,6 +280,8 @@ impl<'lease> RecoveryResume<'lease> {
         if self.disabled {
             return Ok(());
         }
+        executor.check_cancelled()?;
+        executor.case.validate_memory_budget(&self.session_memory)?;
         if !self
             .initial
             .as_ref()
@@ -247,40 +290,50 @@ impl<'lease> RecoveryResume<'lease> {
         {
             return Err(cache_error(CacheError::CorruptCheckpoint));
         }
-        let (snapshot, work) = if let Some(progress) = &executor.job {
-            (
-                progress.job.checkpoint_snapshot()?,
-                Some(progress.job.work_snapshot()?),
-            )
-        } else {
-            (Job::new("recovery checkpoint").checkpoint_snapshot()?, None)
-        };
+        let (snapshot, work) = checkpoint_progress(executor)?;
         let mut codec_error = None;
         let mut saved_usage = None;
+        let job = executor.job.as_ref().map(|progress| &progress.job);
+        #[cfg(test)]
+        let cancel_after_case = std::mem::take(&mut self.test_hooks.cancel_after_case_snapshot);
         let result = self
             .lease
             .save_active_generation(&snapshot, self.store_limits, |writer| {
-                let (mut graph, mut blobs, mut state) = writer.streams();
-                let usage = match crate::case_snapshot::write_streams(
-                    &mut graph,
-                    &mut blobs,
-                    executor.case,
-                    self.case_limits,
-                    self.memory.as_ref(),
-                ) {
+                let encoded = crate::case_snapshot::with_cancellation(job, |cancellation| {
+                    let (graph, blobs, state) = writer.streams();
+                    let mut state = cancellation.wrap(state);
+                    let usage = crate::case_snapshot::write_streams(
+                        graph,
+                        blobs,
+                        executor.case,
+                        self.case_limits,
+                        Some(&self.session_memory),
+                        cancellation,
+                    )?;
+                    #[cfg(test)]
+                    if cancel_after_case && let Some(job) = job {
+                        job.request_cancel();
+                    }
+                    if let Err(error) = checkpoint::write_with_memory(
+                        executor,
+                        cursor,
+                        &mut state,
+                        self.executor_limit,
+                        Some(&self.session_memory),
+                    ) {
+                        codec_error = Some(error);
+                        return Err(std::io::Error::other("checkpoint encoding failed").into());
+                    }
+                    Ok(usage)
+                });
+                let usage = match encoded {
                     Ok(usage) => usage,
                     Err(error) => {
-                        codec_error = Some(operational(error));
+                        codec_error = Some(codec_failure(error, codec_error.take()));
                         return Err(CacheError::CorruptCheckpoint);
                     }
                 };
                 saved_usage = Some(usage);
-                if let Err(error) =
-                    checkpoint::write(executor, cursor, &mut state, self.executor_limit)
-                {
-                    codec_error = Some(error);
-                    return Err(CacheError::CorruptCheckpoint);
-                }
                 Ok(MetadataRef {
                     version: METADATA_VERSION,
                     usage,
@@ -308,6 +361,8 @@ impl<'lease> RecoveryResume<'lease> {
         if self.disabled {
             return Ok(());
         }
+        executor.check_cancelled()?;
+        executor.case.validate_memory_budget(&self.session_memory)?;
         let usage = self
             .usage
             .ok_or_else(|| cache_error(CacheError::CorruptCheckpoint))?;
@@ -315,33 +370,37 @@ impl<'lease> RecoveryResume<'lease> {
             .generation
             .as_mut()
             .ok_or_else(|| cache_error(CacheError::CorruptCheckpoint))?;
-        let (snapshot, work) = if let Some(progress) = &executor.job {
-            (
-                progress.job.checkpoint_snapshot()?,
-                Some(progress.job.work_snapshot()?),
-            )
-        } else {
-            (Job::new("recovery checkpoint").checkpoint_snapshot()?, None)
-        };
+        let (snapshot, work) = checkpoint_progress(executor)?;
         let executor_limit = self.executor_limit;
         let mut codec_error = None;
-        let result = self.lease.update_active_executor(
-            generation,
-            &snapshot,
-            self.store_limits,
-            |mut state| {
-                if let Err(error) = checkpoint::write(executor, cursor, &mut state, executor_limit)
-                {
-                    codec_error = Some(error);
-                    return Err(CacheError::CorruptCheckpoint);
-                }
-                Ok(MetadataRef {
-                    version: METADATA_VERSION,
-                    usage,
-                    work: work.as_ref(),
-                })
-            },
-        );
+        let job = executor.job.as_ref().map(|progress| &progress.job);
+        let result =
+            self.lease
+                .update_active_executor(generation, &snapshot, self.store_limits, |state| {
+                    let encoded = crate::case_snapshot::with_cancellation(job, |cancellation| {
+                        let mut state = cancellation.wrap(state);
+                        if let Err(error) = checkpoint::write_with_memory(
+                            executor,
+                            cursor,
+                            &mut state,
+                            executor_limit,
+                            Some(&self.session_memory),
+                        ) {
+                            codec_error = Some(error);
+                            return Err(std::io::Error::other("checkpoint encoding failed").into());
+                        }
+                        Ok(())
+                    });
+                    if let Err(error) = encoded {
+                        codec_error = Some(codec_failure(error, codec_error.take()));
+                        return Err(CacheError::CorruptCheckpoint);
+                    }
+                    Ok(MetadataRef {
+                        version: METADATA_VERSION,
+                        usage,
+                        work: work.as_ref(),
+                    })
+                });
         match (result, codec_error) {
             (Err(CacheError::CorruptCheckpoint), Some(error)) => return Err(error),
             (Err(error), _) => return Err(cache_error(error)),
@@ -555,15 +614,18 @@ impl<'lease> RecoveryResume<'lease> {
     }
 
     #[cfg(test)]
+    pub(super) const fn cancel_after_next_case_snapshot(&mut self) {
+        self.test_hooks.cancel_after_case_snapshot = true;
+    }
+
+    #[cfg(test)]
     pub(super) const fn restored_relational_candidates(&self) -> Option<u64> {
         self.test_hooks.restored_relational
     }
 
-    fn reserve(&self, bytes: u64) -> Result<Option<MemoryLease>, RecoveryExecutionError> {
-        self.memory
-            .as_ref()
-            .map(|budget| budget.try_reserve(MemoryClass::Executor, bytes))
-            .transpose()
+    fn reserve(&self, bytes: u64) -> Result<MemoryLease, RecoveryExecutionError> {
+        self.session_memory
+            .try_reserve(MemoryClass::Executor, bytes)
             .map_err(operational_error)
     }
 }
@@ -604,6 +666,57 @@ fn is_runtime_failure(error: &RecoveryExecutionError) -> bool {
 
 fn cache_error(source: CacheError) -> RecoveryExecutionError {
     operational_error(source)
+}
+
+fn checkpoint_progress(
+    executor: &Executor<'_>,
+) -> Result<(JobSnapshot, Option<WorkSnapshot>), RecoveryExecutionError> {
+    if let Some(progress) = &executor.job {
+        Ok((
+            progress.job.checkpoint_snapshot()?,
+            Some(progress.job.work_snapshot()?),
+        ))
+    } else {
+        Ok((Job::new("recovery checkpoint").checkpoint_snapshot()?, None))
+    }
+}
+
+fn admit_metadata(
+    value: &serde_json::Value,
+    memory: &MemoryBudget,
+) -> Result<AdmittedMetadata, RecoveryExecutionError> {
+    // The parsed work copy outlives the cache entry's own metadata charge
+    let limit = usize::try_from(MAX_METADATA_BYTES).unwrap_or(usize::MAX);
+    let (encoded, buffer_memory) = checkpoint::encode(value, limit, Some(memory))?;
+    let admission = l2_workbench::job::admit_json(&encoded, memory, MemoryClass::Executor)
+        .map_err(|error| match error {
+            l2_workbench::job::JsonMemoryError::Memory(error) => operational_error(error),
+            l2_workbench::job::JsonMemoryError::InvalidJson { .. }
+            | l2_workbench::job::JsonMemoryError::SizeOverflow => {
+                cache_error(CacheError::CorruptCheckpoint)
+            }
+        })?;
+    let value =
+        serde_json::from_slice(&encoded).map_err(|_| cache_error(CacheError::CorruptCheckpoint))?;
+    let metadata = AdmittedMetadata {
+        value,
+        memory: admission.into_retained(),
+    };
+    drop(encoded);
+    drop(buffer_memory);
+    Ok(metadata)
+}
+
+fn codec_failure(
+    error: Box<dyn std::error::Error>,
+    codec_error: Option<RecoveryExecutionError>,
+) -> RecoveryExecutionError {
+    if error.downcast_ref::<l2_workbench::job::JobError>()
+        == Some(&l2_workbench::job::JobError::Cancelled)
+    {
+        return l2_workbench::job::JobError::Cancelled.into();
+    }
+    codec_error.unwrap_or_else(|| operational(error))
 }
 
 fn operational_error(source: impl std::error::Error + 'static) -> RecoveryExecutionError {

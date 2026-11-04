@@ -11,8 +11,13 @@ use l2_workbench::{
     reconstruction::{ReconstructionReport, Reconstructor},
     sha256,
 };
+#[path = "endpoint/capture.rs"]
+mod capture;
 #[path = "endpoint/event_xml.rs"]
 mod event_xml;
+#[cfg(target_os = "linux")]
+#[path = "endpoint/isolation.rs"]
+mod isolation;
 #[path = "endpoint/support.rs"]
 mod support;
 
@@ -85,7 +90,7 @@ fn unsupported_usn_without_file_events() -> Result<(), Box<dyn Error>> {
     let report = parse_usn_records(&record)?;
 
     assert!(!report.complete);
-    assert!(report.records.is_empty());
+    assert_eq!(report.records.len(), 0);
     assert_eq!(report.unsupported.len(), 1);
     assert_eq!(
         report.unsupported.first().map(|item| item.major_version),
@@ -172,7 +177,7 @@ fn mft_visitor_ranges_summary_counts() -> Result<(), Box<dyn Error>> {
     assert_eq!(report.source_sha256, format!("sha256:{}", sha256(&bytes)));
     assert_eq!(report.records_seen, 2);
     assert_eq!(report.streamed_records, 2);
-    assert!(report.records.is_empty());
+    assert_eq!(report.records.len(), 0);
     assert_eq!(streamed.len(), 2);
     assert_eq!(
         streamed.get(1).map(|record| record.source_range.offset),
@@ -397,11 +402,16 @@ fn strace_import_unusable_exact_correlation() -> Result<(), Box<dyn Error>> {
 
 #[test]
 fn strace_correlate_io_captured_packets() -> Result<(), Box<dyn Error>> {
+    // The parent only launches the test after a private scope has been proved
+    #[cfg(target_os = "linux")]
+    if !isolation::run_in_private_namespace()? {
+        return Ok(());
+    }
     let directory = tempfile::tempdir()?;
-    let pcap_path = directory.path().join("owned-loopback.pcap");
+    let capture_path = directory.path().join("owned-loopback.pcapng");
     let listener = TcpListener::bind(("127.0.0.1", 0))?;
     let port = listener.local_addr()?.port();
-    let mut capture = start_loopback_capture(&pcap_path, port)?;
+    let mut capture = start_loopback_capture(&capture_path, port)?;
     let output = Command::new("strace")
         .args([
             "-f",
@@ -433,12 +443,12 @@ fn strace_correlate_io_captured_packets() -> Result<(), Box<dyn Error>> {
         .ok_or("controlled write event missing")?;
     assert!(event.bytes_complete);
     assert_eq!(event.direction, IoDirection::OutOfProcess);
-    assert!(!event.frames.is_empty());
+    assert_ne!(event.frames.len(), 0);
 
     let capture_status = capture.0.wait()?;
     assert!(capture_status.success());
-    let pcap = std::fs::read(pcap_path)?;
-    let (case, reconstruction) = index_captured_pcap(&pcap)?;
+    let capture_bytes = std::fs::read(capture_path)?;
+    let (case, reconstruction) = index_pcapng_packets(&capture_bytes)?;
     let scope = capture_source_id(&case)?;
     let correlation = correlate_trace_with_capture(&report, &reconstruction, &case, Some(scope))
         .into_iter()
@@ -446,7 +456,7 @@ fn strace_correlate_io_captured_packets() -> Result<(), Box<dyn Error>> {
         .ok_or("trace correlation missing")?;
     assert_eq!(correlation.status, TraceMatchStatus::ExactUniqueMatch);
     assert_eq!(correlation.candidate_count, 1);
-    assert!(!correlation.captured_ranges.is_empty());
+    assert_ne!(correlation.captured_ranges.len(), 0);
     Ok(())
 }
 
@@ -466,13 +476,11 @@ impl Drop for CaptureProcess {
 
 fn start_loopback_capture(path: &Path, port: u16) -> Result<CaptureProcess, Box<dyn Error>> {
     let filter = format!("tcp and host 127.0.0.1 and port {port}");
+    // The default PCAPNG format works across the supported dumpcap releases
     let mut capture = CaptureProcess(
         Command::new("dumpcap")
-            .args([
-                "-i", "lo", "-p", "-f", &filter, "-c", "5", "-F", "pcap", "-w",
-            ])
+            .args(["-i", "lo", "-p", "-f", &filter, "-c", "5", "-w"])
             .arg(path)
-            .arg("tcp")
             .stdout(Stdio::null())
             .stderr(Stdio::piped())
             .spawn()?,
@@ -488,11 +496,11 @@ fn start_loopback_capture(path: &Path, port: u16) -> Result<CaptureProcess, Box<
     Ok(capture)
 }
 
-fn index_captured_pcap(bytes: &[u8]) -> Result<(Case, ReconstructionReport), Box<dyn Error>> {
+fn index_pcapng_packets(bytes: &[u8]) -> Result<(Case, ReconstructionReport), Box<dyn Error>> {
     let mut reader = CaptureSource::new(Cursor::new(bytes))?;
     let mut case = Case::new();
     let source = case.add_source(
-        "owned-loopback.pcap",
+        "owned-loopback.pcapng",
         "capture",
         u64::try_from(bytes.len())?,
         &sha256(bytes),
@@ -503,9 +511,8 @@ fn index_captured_pcap(bytes: &[u8]) -> Result<(Case, ReconstructionReport), Box
     while let Some(frame) = reader.next_packet()? {
         packet = packet.checked_add(1).ok_or("packet number overflow")?;
         reconstructor.observe(packet, &frame)?;
-        let Some(CaptureLocator::ClassicPcap { data_offset, .. }) = frame.metadata().locator()
-        else {
-            return Err("classic PCAP source range missing".into());
+        let Some(CaptureLocator::PcapNg { data_offset, .. }) = frame.metadata().locator() else {
+            return Err("PCAPNG packet source range missing".into());
         };
         case.add_bytes_node(
             "packet",
@@ -520,7 +527,7 @@ fn index_captured_pcap(bytes: &[u8]) -> Result<(Case, ReconstructionReport), Box
         )?;
     }
     if packet == 0 {
-        return Err("loopback PCAP contains no packet records".into());
+        return Err("loopback capture contains no packet records".into());
     }
     Ok((case, reconstructor.finish()?))
 }
@@ -578,7 +585,7 @@ fn trace_packet_repeated_bytes_ambiguous() -> Result<(), Box<dyn Error>> {
 
     assert_eq!(result.status, TraceMatchStatus::Ambiguous);
     assert_eq!(result.candidate_count, 2);
-    assert!(result.captured_ranges.is_empty());
+    assert_eq!(result.captured_ranges.len(), 0);
     Ok(())
 }
 

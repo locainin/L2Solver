@@ -3,6 +3,60 @@ use serde_json::json;
 use std::error::Error;
 
 #[test]
+fn duplicate_index_observations_do_not_increase_retained_admission() -> Result<(), Box<dyn Error>> {
+    use l2_workbench::{
+        evidence::Edge,
+        job::{MemoryBudget, MemoryClass},
+    };
+
+    let mut case = Case::new();
+    let input = case.add_bytes_node("input", b"input", Vec::new(), json!({}))?;
+    let details = json!({"shared_transform_receipt": input, "source_input_node": input});
+    let output = case.add_bytes_node("decoding_output", b"decoded", Vec::new(), details.clone())?;
+    let add_edge = |case: &mut Case, from, to, relation: &str, reason: &str| {
+        case.add_edge(Edge {
+            from,
+            to,
+            relation: relation.to_owned(),
+            status: EvidenceStatus::Observed,
+            reason: reason.to_owned(),
+        })
+    };
+    add_edge(&mut case, input, output, "produced", "first")?;
+    add_edge(&mut case, input, output, "validated_range", "first")?;
+    let memory = MemoryBudget::new(1024 * 1024);
+    let mut index = CaseIndex::with_memory(CaseIndexScanLedger::new()?, Some(&memory))?;
+    index.initialize(&case)?;
+    let retained = memory.snapshot()?.used(MemoryClass::Executor);
+    assert!(retained > 0);
+
+    let duplicate = case.add_bytes_node("decoding_output", b"decoded", Vec::new(), details)?;
+    add_edge(&mut case, input, duplicate, "produced", "second")?;
+    add_edge(&mut case, input, output, "validated_range", "second")?;
+    let available = memory.snapshot()?.limit_bytes - memory.snapshot()?.used_bytes;
+    let held = memory.try_reserve(MemoryClass::Executor, available)?;
+    index.refresh(&case)?;
+    drop(held);
+    assert_eq!(memory.snapshot()?.used(MemoryClass::Executor), retained);
+    assert_eq!(index.contextual_decoding_views.len(), 1);
+    assert_eq!(index.decoding_outputs.get(&input), Some(&output));
+    assert_eq!(
+        index.validated_range_inputs(output).map(BTreeSet::len),
+        Some(1)
+    );
+
+    let another = case.add_bytes_node("input", b"new", Vec::new(), json!({}))?;
+    add_edge(&mut case, another, output, "validated_range", "new input")?;
+    index.refresh(&case)?;
+    assert!(memory.snapshot()?.used(MemoryClass::Executor) > retained);
+    assert_eq!(
+        index.validated_range_inputs(output).map(BTreeSet::len),
+        Some(2)
+    );
+    Ok(())
+}
+
+#[test]
 fn source_only_blobs_do_not_consume_discovery_link_index_work() -> Result<(), Box<dyn Error>> {
     let mut case = Case::new();
     let mut index = CaseIndex::new(&case)?;

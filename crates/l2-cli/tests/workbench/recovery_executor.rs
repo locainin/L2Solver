@@ -28,6 +28,29 @@ use std::{
 };
 
 #[test]
+fn bounded_xor_search_is_not_counted_as_a_complete_negative() -> Result<(), Box<dyn Error>> {
+    let mut state = 0x482f_57b3_u32;
+    let bytes = (0..192)
+        .map(|_| {
+            state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            state.to_be_bytes().first().copied().unwrap_or_default()
+        })
+        .collect::<Vec<_>>();
+    let mut case = Case::new();
+    let input_node = source(&mut case, "tcp_byte_run", &bytes)?;
+    let plan = RecoveryPlan {
+        discover_transforms: true,
+        ..RecoveryPlan::default()
+    };
+    let outcome = execute(&mut case, &plan, &policy())?;
+    assert!(outcome.omissions.iter().any(|omission| matches!(omission,
+        RecoveryOmission::XorSearchLimit { input_node_id, search_truncated: true, .. } if *input_node_id == input_node
+    )));
+    assert_eq!(outcome.complete_negative_transform_searches, 0);
+    Ok(())
+}
+
+#[test]
 fn recovery_status_separates_transform_search_and_report_omissions() {
     let candidate_omission = RecoveryOmission::TransformDiscoveryAnalysis {
         input_node_id: 7,
@@ -311,7 +334,7 @@ fn failed_contextual_decoding_view_commit_does_not_cache_rolled_back_node()
     let execution_policy = policy();
     let mut executor = super::test_support::build_executor(&mut case, &plan, &execution_policy)?;
     let before = executor.case.try_clone()?;
-    let key = (blob_id(b"output"), receipt_node, input_node);
+    let key = super::contextual_view_key(&blob_id(b"output"), receipt_node, input_node)?;
 
     assert!(
         executor
@@ -1636,8 +1659,10 @@ fn framed_transform_lineage_batches_second_stage_outputs() -> Result<(), Box<dyn
     let batch = successful_record_batch(&outcome.candidates, &schema, 2)?;
     let input_nodes = record_batch_input_nodes(batch)?;
     let expected_parts = framed_record_bytes()
-        .chunks_exact(8)
-        .map(<[u8]>::to_vec)
+        .as_chunks::<8>()
+        .0
+        .iter()
+        .map(|pair| pair.to_vec())
         .collect::<Vec<_>>();
     let expected_hex_inputs = expected_parts
         .iter()
@@ -4496,7 +4521,7 @@ fn base64_hex_framed_record_bytes() -> Result<Vec<u8>, Box<dyn Error>> {
     use base64::Engine as _;
 
     let mut bytes = Vec::new();
-    for record_part in framed_record_bytes().chunks_exact(8) {
+    for record_part in framed_record_bytes().as_chunks::<8>().0 {
         let hexadecimal = hexadecimal_bytes(record_part)?;
         bytes.extend_from_slice(
             base64::engine::general_purpose::STANDARD
@@ -4946,14 +4971,12 @@ fn hex_bytes(value: &str) -> Result<Vec<u8>, Box<dyn Error>> {
     }
     let mut bytes = Vec::new();
     bytes.try_reserve_exact(value.len() / 2)?;
-    for pair in value.as_bytes().chunks_exact(2) {
-        let high = pair
-            .first()
-            .and_then(|byte| char::from(*byte).to_digit(16))
+    for &[high, low] in value.as_bytes().as_chunks::<2>().0 {
+        let high = char::from(high)
+            .to_digit(16)
             .ok_or("hex fixture has an invalid digit")?;
-        let low = pair
-            .get(1)
-            .and_then(|byte| char::from(*byte).to_digit(16))
+        let low = char::from(low)
+            .to_digit(16)
             .ok_or("hex fixture has an invalid digit")?;
         bytes.push(u8::try_from((high << 4) | low)?);
     }

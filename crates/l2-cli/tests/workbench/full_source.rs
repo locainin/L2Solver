@@ -573,7 +573,7 @@ fn reports_tcp_range_omissions_separately_from_selected_record_truncation()
         assert_eq!(analysis.coverage.selected_records, 2);
         assert_eq!(analysis.coverage.retained_records, 2);
         assert_eq!(analysis.coverage.omitted_records, 0);
-        assert!(analysis.coverage.retention_limits.is_empty());
+        assert_eq!(analysis.coverage.retention_limits.len(), 0);
         assert_eq!(
             analysis
                 .coverage

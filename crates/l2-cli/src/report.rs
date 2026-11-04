@@ -2,8 +2,11 @@
 
 use l2_capture::LinkType;
 use l2_codecs::{LldpFrame, StpError, StpFrame, Validity};
-use l2_core::{EthernetFrame, FrameField};
-use l2_discovery::{IpPacket, ip_packet};
+use l2_core::FrameField;
+use l2_discovery::{
+    IpPacket, ip_packet_from_payload,
+    link::{NetworkEnvelope, decode_network_frame},
+};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -15,7 +18,7 @@ pub enum Status {
 }
 
 pub struct Assessment<'input> {
-    pub ethernet: Option<EthernetFrame<'input>>,
+    pub network: Option<NetworkEnvelope<'input>>,
     pub lldp: Option<LldpFrame<'input>>,
     pub stp: Option<StpFrame<'input>>,
     pub ip: Option<IpPacket<'input>>,
@@ -29,7 +32,7 @@ pub fn assess(bytes: &[u8]) -> Assessment<'_> {
         Ok(frame) => frame,
         Err(error) => {
             return Assessment {
-                ethernet: None,
+                network: None,
                 lldp: None,
                 stp: None,
                 ip: None,
@@ -38,16 +41,22 @@ pub fn assess(bytes: &[u8]) -> Assessment<'_> {
             };
         }
     };
+    assess_network(NetworkEnvelope::Ethernet(ethernet))
+}
+
+fn assess_network(network: NetworkEnvelope<'_>) -> Assessment<'_> {
+    let field = network.field();
+    let payload = network.payload();
     let mut result = Assessment {
-        ethernet: None,
+        network: None,
         lldp: None,
         stp: None,
         ip: None,
         status: Status::Unsupported,
         diagnostic: None,
     };
-    if matches!(ethernet.field, FrameField::EtherType(0x0800 | 0x86dd)) {
-        result.ip = ip_packet(&ethernet);
+    if matches!(field, Some(FrameField::EtherType(0x0800 | 0x86dd))) {
+        result.ip = ip_packet_from_payload(network.protocol(), payload);
         if result.ip.is_some() {
             result.status = Status::Parsed;
         } else {
@@ -57,8 +66,8 @@ pub fn assess(bytes: &[u8]) -> Assessment<'_> {
             ));
         }
     }
-    if ethernet.field == FrameField::EtherType(0x88cc) {
-        match l2_codecs::decode_lldp(ethernet.payload) {
+    if field == Some(FrameField::EtherType(0x88cc)) {
+        match l2_codecs::decode_lldp(payload) {
             Ok(lldp) => {
                 result.status = if lldp.validity == Validity::Valid {
                     Status::Parsed
@@ -74,10 +83,8 @@ pub fn assess(bytes: &[u8]) -> Assessment<'_> {
         }
     }
     // LLC identifies bridge BPDUs without guessing from arbitrary payload bytes
-    if matches!(ethernet.field, FrameField::Length(_))
-        && ethernet.payload.starts_with(&[0x42, 0x42, 0x03])
-    {
-        match l2_codecs::decode_stp(ethernet.payload) {
+    if matches!(field, Some(FrameField::Length(_))) && payload.starts_with(&[0x42, 0x42, 0x03]) {
+        match l2_codecs::decode_stp(payload) {
             Ok(stp) => {
                 result.status = Status::Parsed;
                 result.stp = Some(stp);
@@ -93,15 +100,35 @@ pub fn assess(bytes: &[u8]) -> Assessment<'_> {
             }
         }
     }
-    result.ethernet = Some(ethernet);
+    if field.is_none() {
+        // The cooked protocol field cannot always be treated as an EtherType
+        result.diagnostic = Some(format!(
+            "unsupported Linux cooked protocol or hardware type (protocol 0x{:04x})",
+            network.protocol()
+        ));
+    }
+    result.network = Some(network);
     result
 }
 
 /// Route a captured frame through the decoder selected by its checked link type
 pub fn assess_with_link_type(link_type: LinkType, bytes: &[u8]) -> Assessment<'_> {
-    if !link_type.is_ethernet() {
-        return Assessment {
-            ethernet: None,
+    match link_type {
+        LinkType::Ethernet => assess(bytes),
+        LinkType::LinuxSll | LinkType::LinuxSll2 => decode_network_frame(link_type, bytes)
+            .map_or_else(
+                || Assessment {
+                    network: None,
+                    lldp: None,
+                    stp: None,
+                    ip: None,
+                    status: Status::Malformed,
+                    diagnostic: Some(format!("malformed {} header", link_type.name())),
+                },
+                assess_network,
+            ),
+        _ => Assessment {
+            network: None,
             lldp: None,
             stp: None,
             ip: None,
@@ -111,7 +138,6 @@ pub fn assess_with_link_type(link_type: LinkType, bytes: &[u8]) -> Assessment<'_
                 link_type.name(),
                 link_type.raw()
             )),
-        };
+        },
     }
-    assess(bytes)
 }

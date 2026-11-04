@@ -1,5 +1,5 @@
 use l2_audit::ForensicScope;
-use l2_capture::CapturedFrame;
+use l2_capture::{CapturedFrame, LinkType};
 use l2_discovery::NetworkAddress;
 use l2_workbench::tcp_range::RangeReport;
 use serde::Serialize;
@@ -9,6 +9,9 @@ pub(super) const MAX_UNRESOLVED_SOURCES: usize = 128;
 
 #[derive(Serialize)]
 pub(super) struct FlowSelection {
+    // The selected layout controls how capture scope is described in text
+    #[serde(skip)]
+    pub link_type: LinkType,
     pub scope: ForensicScope,
     pub source: NetworkAddress,
     pub destination: NetworkAddress,
@@ -44,8 +47,10 @@ pub(super) struct UnresolvedSource {
 #[serde(rename_all = "snake_case")]
 pub(super) enum UnresolvedReason {
     EthernetLayout,
+    CookedLayout,
     TruncatedCapture,
     LinkType,
+    UnsupportedProtocol,
     IpLayout,
     IpFragment,
     TcpLayout,
@@ -66,7 +71,7 @@ pub(super) struct CaptureTcpReport {
     pub flow: FlowSelection,
     pub sources: Vec<FrameSource>,
     pub range: RangeReport,
-    pub limitations: &'static [&'static str],
+    pub limitations: Vec<&'static str>,
 }
 
 pub(super) const LIMITATIONS: &[&str] = &[
@@ -78,3 +83,5 @@ pub(super) const LIMITATIONS: &[&str] = &[
     "Checksums, acknowledgement acceptance, receive windows, clocks, delivery, application processing, and malicious intent are not established",
     "Packets before the selected first record and after an explicit last record do not contribute; a complete range is not a complete session or capture",
 ];
+
+pub(super) const COOKED_LIMITATION: &str = "Linux cooked records do not establish Ethernet addresses or VLAN membership; SLL1 may combine multiple interfaces";

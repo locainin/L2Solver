@@ -1,6 +1,7 @@
 use l2_capture::{CaptureMetadata, InterfaceId};
 use l2_core::EthernetFrame;
 use l2_discovery::NetworkAddress;
+use l2_discovery::link::{CookedFrame, NetworkEnvelope};
 use serde::Serialize;
 
 /// Capture-local scope, retaining auxiliary VLAN data separately from in-band tags
@@ -10,9 +11,14 @@ pub struct ForensicScope {
     pub interface: u32,
     /// Outer-to-inner (TPID, VID) pairs; PCP and DEI do not change membership keys
     /// VID zero remains separate because the native VLAN cannot be inferred
+    /// An empty list for cooked captures does not establish VLAN membership
     pub vlan_ids: Vec<(u16, u16)>,
     /// A separate (TPID, VID) source claim, never merged into the captured tag stack
     pub vlan_aux: Option<(u16, u16)>,
+    /// Operating-system interface index reported by a cooked v2 header
+    /// This is independent of the capture section and interface identifiers
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cooked_ifindex: Option<u32>,
 }
 
 impl ForensicScope {
@@ -26,6 +32,24 @@ impl ForensicScope {
         )
     }
 
+    /// Preserve capture identity and any separately reported cooked interface index
+    ///
+    /// Cooked headers do not establish in-band Ethernet VLAN membership. SLL1
+    /// also lacks an operating-system interface index and can aggregate interfaces
+    #[must_use]
+    pub fn from_network_frame(metadata: &CaptureMetadata, frame: &NetworkEnvelope<'_>) -> Self {
+        if let Some(ethernet) = frame.ethernet() {
+            return Self::new(metadata, ethernet);
+        }
+        let mut scope = Self::from_parts(
+            metadata.interface(),
+            std::iter::empty(),
+            metadata.vlan().map(|tag| (tag.tpid, tag.tci)),
+        );
+        scope.cooked_ifindex = frame.cooked().and_then(CookedFrame::interface_index);
+        scope
+    }
+
     pub(crate) fn from_parts(
         source: InterfaceId,
         tags: impl Iterator<Item = (u16, u16)>,
@@ -36,6 +60,7 @@ impl ForensicScope {
             interface: source.index,
             vlan_ids: tags.map(|(tpid, tci)| (tpid, tci & 0x0fff)).collect(),
             vlan_aux: auxiliary.map(|(tpid, tci)| (tpid, tci & 0x0fff)),
+            cooked_ifindex: None,
         }
     }
 
@@ -119,6 +144,7 @@ pub struct TrailingData {
 /// Bounded literal observations, kept separate from policy failures and severity scores
 #[derive(Debug, Serialize)]
 pub struct ForensicReport {
+    /// Ethernet source and destination co-occurrences; cooked frames do not supply both
     pub communications: Vec<IpCommunication>,
     pub arp_observations: Vec<ArpObservation>,
     pub arp_changes: Vec<ArpBindingChange>,
@@ -129,7 +155,7 @@ pub struct ForensicReport {
     /// Complete unfragmented UDP payloads selected by source or destination port 53
     pub dns_candidates_seen: u64,
     pub dns_messages_parsed: u64,
-    /// Complete decoded Ethernet frames carrying an IPv4 or IPv6 `EtherType`
+    /// Complete decoded supported frames carrying an IPv4 or IPv6 `EtherType`
     pub ip_frames_seen: u64,
     /// Frames whose complete IP length and supported extension boundaries were read
     pub ip_frames_parsed: u64,

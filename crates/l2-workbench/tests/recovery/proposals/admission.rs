@@ -15,8 +15,8 @@ fn proposal_without_retained_results_needs_no_heap_workspace() -> Result<(), Box
         },
         &mut retained,
     )?;
-    assert!(report.proposals.is_empty());
-    assert!(report.assessments.is_empty());
+    assert_eq!(report.proposals.len(), 0);
+    assert_eq!(report.assessments.len(), 0);
     assert_eq!(retained.bytes(), 0);
     drop(report);
     drop(retained);
@@ -60,7 +60,7 @@ fn proposal_retains_only_the_memory_of_its_live_results() -> Result<(), Box<dyn 
         },
         &mut retained,
     )?;
-    assert!(!report.proposals.is_empty());
+    assert_ne!(report.proposals.len(), 0);
     assert_eq!(report.assessments.len(), 7);
     assert!(retained.bytes() > 0);
     drop(report);

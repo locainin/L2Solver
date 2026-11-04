@@ -146,7 +146,7 @@ fn owned_namespace_child_checks_each_filter() -> Result<(), Box<dyn Error>> {
 fn each_fixed_profile_produces_a_bounded_forward_only_program() -> Result<(), Box<dyn Error>> {
     for intent in intents()? {
         let instructions = super::instructions(&intent)?;
-        assert!(!instructions.is_empty());
+        assert_ne!(instructions, [] as [rscap::filter::BpfInstruction; 0]);
         assert!(instructions.len() <= super::MAX_INSTRUCTIONS);
     }
     Ok(())

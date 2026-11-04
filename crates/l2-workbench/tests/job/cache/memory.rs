@@ -428,6 +428,73 @@ fn unexpected_tree_growth_is_rejected_and_releases_its_memory_charge() -> Result
 
 #[cfg(target_os = "linux")]
 #[test]
+fn denied_checkpoint_read_after_a_large_write_avoids_scanning_the_wal() -> Result<(), Box<dyn Error>>
+{
+    assert_large_checkpoint_denial_is_bounded(false)
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn denied_checkpoint_read_after_a_large_write_with_an_idle_connection_is_bounded()
+-> Result<(), Box<dyn Error>> {
+    assert_large_checkpoint_denial_is_bounded(true)
+}
+
+#[cfg(target_os = "linux")]
+fn assert_large_checkpoint_denial_is_bounded(hold_idle: bool) -> Result<(), Box<dyn Error>> {
+    let temporary = tempfile::tempdir()?;
+    let key = stage_key("memory-large-write-small-wal")?;
+    let producer = cache_at(temporary.path(), 64 * 1024)?;
+    let consumer = cache_at(temporary.path(), 64 * 1024)?;
+    consumer.attach_memory_budget(MemoryBudget::new(1))?;
+
+    // Start the large write with no existing WAL or live database connection
+    let path = temporary.path().join("state/cache.sqlite3");
+    let database = rusqlite::Connection::open(&path)?;
+    database.query_row("SELECT count(*) FROM checkpoints", [], |row| {
+        row.get::<_, i64>(0)
+    })?;
+    drop(database);
+    assert!(!temporary.path().join("state/cache.sqlite3-wal").exists());
+    let idle = if hold_idle {
+        let database = rusqlite::Connection::open(&path)?;
+        database.set_db_config(
+            rusqlite::config::DbConfig::SQLITE_DBCONFIG_NO_CKPT_ON_CLOSE,
+            true,
+        )?;
+        database.query_row("SELECT count(*) FROM checkpoints", [], |row| {
+            row.get::<_, i64>(0)
+        })?;
+        Some(database)
+    } else {
+        None
+    };
+    let snapshot = l2_workbench::job::Job::new("x".repeat(LARGE_METADATA_BYTES)).snapshot()?;
+    producer.write_checkpoint(
+        &key,
+        &snapshot,
+        l2_workbench::job::cache::CheckpointStatus::Active,
+    )?;
+    drop(idle);
+
+    // The denied read must not first rebuild an oversized retained WAL
+    let before = thread_read_bytes()?;
+    assert!(matches!(
+        consumer.read_checkpoint(&key),
+        Err(CacheError::Memory(MemoryError::Limit { .. }))
+    ));
+    let delta = thread_read_bytes()?
+        .checked_sub(before)
+        .ok_or("thread I/O counter moved backwards")?;
+    assert!(
+        delta < u64::try_from(LARGE_METADATA_BYTES / 4)?,
+        "denied read after a large write read {delta} bytes"
+    );
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+#[test]
 fn denied_checkpoint_read_does_not_read_the_large_snapshot_column() -> Result<(), Box<dyn Error>> {
     let temporary = tempfile::tempdir()?;
     let key = stage_key("memory-denied-checkpoint-io")?;

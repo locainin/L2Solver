@@ -305,7 +305,7 @@ fn validate_last_record_pointer(
 ) -> Result<(), EndpointImportError> {
     let declared = usize::try_from(read_u32(chunk, 44)?)
         .map_err(|_| error("EVTX last-record offset exceeds the platform limit"))?;
-    if last_record.map_or(0, |offset| offset) != declared {
+    if last_record.unwrap_or(0) != declared {
         return Err(error(
             "EVTX last-record offset does not match record framing",
         ));

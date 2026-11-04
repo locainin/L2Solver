@@ -125,6 +125,19 @@ pub enum RecoveryOmission {
         omitted_candidates: usize,
         omitted_reports: usize,
     },
+    /// A bounded XOR hypothesis search examined only part of its candidate space
+    XorSearchLimit {
+        input_node_id: u64,
+        omitted_candidates: usize,
+        search_truncated: bool,
+        sample_truncated: bool,
+    },
+    /// A source-backed XOR observation could not be searched or retained
+    XorMessageOmission {
+        input_node_id: u64,
+        omitted: usize,
+        reason: std::borrow::Cow<'static, str>,
+    },
     /// TCP runs could not be included in an automatic framing discovery cohort
     FramingDiscoveryInputs {
         source_id: Option<String>,
@@ -254,6 +267,23 @@ pub enum RecoveryOmission {
 impl fmt::Display for RecoveryOmission {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::XorSearchLimit {
+                input_node_id,
+                omitted_candidates,
+                search_truncated,
+                sample_truncated,
+            } => write!(
+                formatter,
+                "XOR discovery for input node {input_node_id} omitted {omitted_candidates} eligible candidates; search truncated: {search_truncated}; sample truncated: {sample_truncated}"
+            ),
+            Self::XorMessageOmission {
+                input_node_id,
+                omitted,
+                reason,
+            } => write!(
+                formatter,
+                "XOR discovery for input node {input_node_id} omitted {omitted} observations or steps ({reason})"
+            ),
             Self::RecordDiscoveryLearningSample {
                 source_id,
                 unsampled_frames,

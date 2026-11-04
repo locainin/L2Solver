@@ -60,8 +60,8 @@ fn ordinary_udp_addresses_ports_trailer() -> Result<(), &'static str> {
     assert_eq!(transport.ports, (12345, 443));
     assert_eq!(transport.header, TransportHeader::Udp);
     assert_eq!(transport.payload_offset, packet.declared_len);
-    assert!(transport.payload.is_empty());
-    assert!(transport.trailing_bytes.is_empty());
+    assert_eq!(transport.payload, []);
+    assert_eq!(transport.trailing_bytes, []);
     Ok(())
 }
 
@@ -91,7 +91,7 @@ fn empty_ipv4_within_declared_envelope() -> Result<(), &'static str> {
     let frame = ethernet(0x0800, &bytes);
     let packet = ip_packet(&frame).ok_or("missing header-only IPv4 packet")?;
     assert_eq!(packet.declared_len, 20);
-    assert!(packet.trailing_bytes.is_empty());
+    assert_eq!(packet.trailing_bytes, []);
     assert_eq!(packet.ports(), None);
     assert!(packet.transport.is_none());
     Ok(())
@@ -145,7 +145,7 @@ fn tcp_fields_ip_options() -> Result<(), &'static str> {
     );
     assert_eq!(transport.payload_offset, 48);
     assert_eq!(transport.payload, [0xde, 0xad]);
-    assert!(transport.trailing_bytes.is_empty());
+    assert_eq!(transport.trailing_bytes, []);
     assert_eq!(
         transport.payload_offset + transport.payload.len(),
         packet.declared_len
@@ -289,7 +289,7 @@ fn atomic_ipv6_fragment_excludes_padding() -> Result<(), &'static str> {
     assert_eq!(transport.ports, (12345, 53));
     assert_eq!(transport.payload_offset, 56);
     assert_eq!(transport.payload, [0xde, 0xad]);
-    assert!(transport.trailing_bytes.is_empty());
+    assert_eq!(transport.trailing_bytes, []);
     assert_eq!(
         transport.payload_offset + transport.payload.len() + transport.trailing_bytes.len(),
         packet.declared_len
@@ -368,4 +368,41 @@ fn extension_walk_hard_limit() {
         *last = 59;
     }
     assert!(ip_packet(&ethernet(0x86dd, &ipv6(0, &allowed))).is_some());
+}
+
+#[test]
+fn raw_ip_payloads_expose_udp_tcp_and_reject_invalid_bounds() -> Result<(), &'static str> {
+    use l2_discovery::{ip_header_from_payload, ip_packet_from_payload};
+
+    let udp = [0x30, 0x39, 0, 53, 0, 10, 0, 0, 0xaa, 0xbb];
+    let mut tcp = vec![0x30, 0x39, 0x01, 0xbb];
+    tcp.extend_from_slice(&[0; 8]);
+    tcp.extend_from_slice(&[0x50, 0x02, 0, 0, 0, 0, 0, 0, 0xcc]);
+    for (ether_type, bytes, expected_protocol, expected_offset, expected_payload) in [
+        (0x0800, ipv4(17, &udp), 17, 28, &[0xaa, 0xbb][..]),
+        (0x86dd, ipv6(17, &udp), 17, 48, &[0xaa, 0xbb][..]),
+        (0x0800, ipv4(6, &tcp), 6, 40, &[0xcc][..]),
+        (0x86dd, ipv6(6, &tcp), 6, 60, &[0xcc][..]),
+    ] {
+        let header = ip_header_from_payload(ether_type, &bytes).ok_or("missing IP header")?;
+        assert_eq!(header.protocol, expected_protocol);
+        let packet = ip_packet_from_payload(ether_type, &bytes).ok_or("missing IP packet")?;
+        let transport = packet.transport.ok_or("missing transport")?;
+        assert_eq!(transport.ports.0, 12345);
+        assert_eq!(transport.payload_offset, expected_offset);
+        assert_eq!(transport.payload, expected_payload);
+        assert!(
+            ip_packet_from_payload(
+                ether_type,
+                bytes.get(..bytes.len() - 1).ok_or("short fixture")?
+            )
+            .is_none()
+        );
+    }
+    assert!(ip_header_from_payload(0x0806, &ipv4(17, &udp)).is_none());
+    assert!(ip_packet_from_payload(0x86dd, &ipv4(17, &udp)).is_none());
+    let mut invalid = ipv4(17, &udp);
+    *invalid.get_mut(3).ok_or("short fixture")? = 19;
+    assert!(ip_header_from_payload(0x0800, &invalid).is_none());
+    Ok(())
 }

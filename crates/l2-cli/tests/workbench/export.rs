@@ -21,7 +21,7 @@ fn exact_retained_stdout_new_file() -> Result<(), Box<dyn Error>> {
     )?;
     assert!(stdout.status.success());
     assert_eq!(stdout.stdout, bytes);
-    assert!(stdout.stderr.is_empty());
+    assert_eq!(stdout.stderr.len(), 0);
 
     let destination = directory.path().join("candidate.bin");
     let file_output = run(
@@ -36,7 +36,7 @@ fn exact_retained_stdout_new_file() -> Result<(), Box<dyn Error>> {
         &[],
     )?;
     assert!(file_output.status.success());
-    assert!(file_output.stdout.is_empty());
+    assert_eq!(file_output.stdout.len(), 0);
     assert_eq!(fs::read(&destination)?, bytes);
     assert_eq!(
         String::from_utf8(file_output.stderr)?,
@@ -70,7 +70,7 @@ fn unknown_nodes_without_retained_bytes() -> Result<(), Box<dyn Error>> {
             &[],
         )?;
         assert_eq!(output.status.code(), Some(1));
-        assert!(output.stdout.is_empty());
+        assert_eq!(output.stdout.len(), 0);
         assert!(!String::from_utf8(output.stderr)?.contains("Exported"));
         assert!(!destination.exists());
     }
@@ -114,7 +114,7 @@ fn incomplete_writing_bytes_partial_case() -> Result<(), Box<dyn Error>> {
     )?;
 
     assert_eq!(output.status.code(), Some(3));
-    assert!(output.stdout.is_empty());
+    assert_eq!(output.stdout.len(), 0);
     assert_eq!(fs::read(&destination)?, bytes);
     assert_eq!(
         String::from_utf8(output.stderr)?,
@@ -148,7 +148,7 @@ fn export_not_replace_existing_file() -> Result<(), Box<dyn Error>> {
     )?;
 
     assert_eq!(output.status.code(), Some(1));
-    assert!(output.stdout.is_empty());
+    assert_eq!(output.stdout.len(), 0);
     assert!(!String::from_utf8(output.stderr)?.contains("Exported"));
     assert_eq!(fs::read(destination)?, b"preserve");
     Ok(())
@@ -175,7 +175,7 @@ fn notice_escapes_control_characters_destination() -> Result<(), Box<dyn Error>>
     )?;
 
     assert!(output.status.success());
-    assert!(output.stdout.is_empty());
+    assert_eq!(output.stdout.len(), 0);
     assert_eq!(fs::read(&destination)?, b"retained");
     let diagnostic = String::from_utf8(output.stderr)?;
     assert_eq!(diagnostic.lines().count(), 1);

@@ -3,6 +3,9 @@ members = ["crates/*", "xtask"]
 resolver = "3"
 exclude = ["fuzz"]
 
+[workspace.package]
+rust-version = "1.96"
+
 [workspace.lints.rust]
 unsafe_code = "forbid"
 unfulfilled_lint_expectations = "deny"

@@ -261,7 +261,9 @@ pub struct MemoryBudget {
 }
 
 impl MemoryBudget {
-    pub(crate) fn same_ledger(&self, other: &Self) -> bool {
+    /// Return whether both budgets share the same aggregate admission ledger
+    #[must_use]
+    pub fn same_ledger(&self, other: &Self) -> bool {
         Arc::ptr_eq(&self.shared, &other.shared)
     }
 

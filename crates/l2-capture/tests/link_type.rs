@@ -4,12 +4,16 @@ use l2_capture::{CaptureMetadata, InterfaceId, LinkType};
 fn maps_datalinks_and_bounds_unknown() {
     assert_eq!(LinkType::from_raw(1), LinkType::Ethernet);
     assert_eq!(LinkType::from_raw(105), LinkType::Ieee80211);
+    assert_eq!(LinkType::from_raw(113), LinkType::LinuxSll);
     assert_eq!(LinkType::from_raw(127), LinkType::Ieee80211Radiotap);
+    assert_eq!(LinkType::from_raw(276), LinkType::LinuxSll2);
     assert_eq!(LinkType::from_raw(u16::MAX), LinkType::Unknown(u16::MAX));
 
     assert_eq!(LinkType::Ethernet.raw(), 1);
     assert_eq!(LinkType::Ieee80211.raw(), 105);
+    assert_eq!(LinkType::LinuxSll.raw(), 113);
     assert_eq!(LinkType::Ieee80211Radiotap.raw(), 127);
+    assert_eq!(LinkType::LinuxSll2.raw(), 276);
     assert_eq!(LinkType::Unknown(0x1234).raw(), 0x1234);
 }
 
@@ -17,7 +21,11 @@ fn maps_datalinks_and_bounds_unknown() {
 fn unknown_link_type_not_ethernet() {
     assert!(LinkType::Ethernet.is_supported());
     assert!(LinkType::Ieee80211.is_supported());
+    assert!(LinkType::LinuxSll.is_supported());
     assert!(LinkType::Ieee80211Radiotap.is_supported());
+    assert!(LinkType::LinuxSll2.is_supported());
+    assert!(!LinkType::LinuxSll.is_ethernet());
+    assert!(!LinkType::LinuxSll2.is_wireless());
     assert!(!LinkType::Unknown(101).is_supported());
     assert!(!LinkType::Unknown(101).is_ethernet());
     assert!(!LinkType::Ethernet.is_wireless());

@@ -31,7 +31,7 @@ fn malformed_tail_never_partial() -> Result<(), Box<dyn Error>> {
         ],
     )?;
     assert_eq!(output.status.code(), Some(1));
-    assert!(output.stdout.is_empty());
+    assert_eq!(output.stdout.len(), 0);
     Ok(())
 }
 
@@ -47,7 +47,7 @@ fn invalid_ranges_window_usage_errors() -> Result<(), Box<dyn Error>> {
     ] {
         let output = run_bytes(&[], &args)?;
         assert_eq!(output.status.code(), Some(2));
-        assert!(output.stdout.is_empty());
+        assert_eq!(output.stdout.len(), 0);
     }
     Ok(())
 }
@@ -61,7 +61,7 @@ fn missing_anchor_packet_input_error() -> Result<(), Box<dyn Error>> {
     ] {
         let output = run(&frames, &args)?;
         assert_eq!(output.status.code(), Some(1));
-        assert!(output.stdout.is_empty());
+        assert_eq!(output.stdout.len(), 0);
     }
     Ok(())
 }

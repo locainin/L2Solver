@@ -437,7 +437,7 @@ fn incomplete_case_evidence_collection_keeps_discovery_axes_independent()
     assert!(summary.discovery.input_coverage_complete);
     assert!(summary.discovery.search_exhaustive_within_plan);
     assert!(summary.discovery.report_details_complete);
-    assert!(summary.omissions().is_empty());
+    assert_eq!(summary.omissions().len(), 0);
 
     let mut coverage = RecoveryCoverage::default();
     coverage.record(&summary, RecoveryCaseKind::Flow)?;

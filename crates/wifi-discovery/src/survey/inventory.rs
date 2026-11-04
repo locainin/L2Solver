@@ -63,14 +63,12 @@ impl Survey {
         normal_status
     }
 
-    #[must_use]
     pub fn access_points(
         &self,
     ) -> impl DoubleEndedIterator<Item = &AccessPoint> + ExactSizeIterator {
         self.access_points.values()
     }
 
-    #[must_use]
     pub fn stations(&self) -> impl DoubleEndedIterator<Item = &Station> + ExactSizeIterator {
         self.stations.values()
     }

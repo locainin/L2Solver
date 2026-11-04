@@ -8,6 +8,7 @@ use std::{cell::Cell, path::Path};
 enum Change {
     Replace,
     Mutate,
+    Truncate,
 }
 
 struct ChangingMetadata<'a> {
@@ -30,6 +31,10 @@ impl Serialize for ChangingMetadata<'_> {
                 Change::Mutate => {
                     fs::write(&cursor, b"bad cursor").map_err(S::Error::custom)?;
                 }
+                // A short write must not publish a partial replacement
+                Change::Truncate => {
+                    fs::write(&cursor, b"short").map_err(S::Error::custom)?;
+                }
             }
         }
         // Both encoding passes emit identical metadata
@@ -50,7 +55,7 @@ fn cursor_file(directory: &Path) -> Result<PathBuf, Box<dyn Error>> {
 #[test]
 fn cursor_changed_during_metadata_serialization_cannot_replace_committed_state()
 -> Result<(), Box<dyn Error>> {
-    for change in [Change::Replace, Change::Mutate] {
+    for change in [Change::Replace, Change::Mutate, Change::Truncate] {
         let mut fixture = Fixture::new(None)?;
         let directory = fixture.directory()?;
         let metadata = ChangingMetadata {

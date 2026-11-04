@@ -10,7 +10,7 @@
 mod tests;
 
 use super::{Case, Edge, EvidenceError, SourceRange};
-use crate::job::{MemoryBudget, MemoryClass, MemoryLease, MemoryWorkingSet};
+use crate::job::{MemoryBudget, MemoryClass, MemoryError, MemoryLease, MemoryWorkingSet};
 use serde_json::Value;
 use std::{
     collections::HashMap,
@@ -373,7 +373,63 @@ pub(super) fn graph_bytes(case: &Case) -> Result<usize, EvidenceError> {
     Ok(bytes)
 }
 
+fn admit_existing_case(case: &Case, budget: &MemoryBudget) -> Result<CaseMemory, EvidenceError> {
+    let bytes = case
+        .blobs
+        .iter()
+        .try_fold(0_usize, |total, blob| {
+            total.checked_add(blob.bytes.capacity())
+        })
+        .ok_or_else(overflow)?;
+    let graph = graph_bytes(case)?;
+    let mut memory = CaseMemory::new(budget)?;
+    memory
+        .blobs
+        .try_resize(to_bytes(bytes)?)
+        .map_err(EvidenceError::Memory)?;
+    memory.set_graph(graph)?;
+    Ok(memory)
+}
+
 impl Case {
+    /// Return the aggregate budget that owns this Case's retained allocations
+    #[must_use]
+    pub fn memory_budget(&self) -> Option<&MemoryBudget> {
+        self.memory.as_ref().map(|memory| memory.graph.budget())
+    }
+
+    /// Check that this Case is charged to the supplied aggregate ledger
+    ///
+    /// # Errors
+    /// Returns an error if the Case is uncharged or belongs to another ledger
+    pub fn validate_memory_budget(&self, budget: &MemoryBudget) -> Result<(), EvidenceError> {
+        let Some(memory) = &self.memory else {
+            return Err(EvidenceError::Memory(MemoryError::IncompatibleWorkingSet));
+        };
+        if !memory.blobs.matches_budget(Some(budget), MemoryClass::Case)
+            || !memory.graph.matches_budget(Some(budget), MemoryClass::Case)
+        {
+            return Err(EvidenceError::Memory(MemoryError::IncompatibleWorkingSet));
+        }
+        Ok(())
+    }
+
+    /// Admit retained data to a shared budget or validate its existing ledger
+    ///
+    /// An already admitted Case keeps its current working-set owner. All later growth
+    /// remains charged to that owner, while the supplied budget shares its aggregate limit
+    ///
+    /// # Errors
+    /// Returns an error if admission fails or the Case belongs to another ledger
+    pub fn admit_memory_budget(&mut self, budget: &MemoryBudget) -> Result<(), EvidenceError> {
+        if self.memory.is_some() {
+            return self.validate_memory_budget(budget);
+        }
+        // Attach the leases only after both existing allocations have been admitted
+        self.memory = Some(admit_existing_case(self, budget)?);
+        Ok(())
+    }
+
     /// Bind retained allocations and later growth to an admitted Case working set
     ///
     /// Existing charges move within the same shared ledger without a second allocation
@@ -385,19 +441,7 @@ impl Case {
         if let Some(memory) = &mut self.memory {
             return memory.use_working_set(work.budget());
         }
-        let bytes = self
-            .blobs
-            .iter()
-            .try_fold(0_usize, |total, blob| {
-                total.checked_add(blob.bytes.capacity())
-            })
-            .ok_or_else(overflow)?;
-        let mut memory = CaseMemory::new(&work.budget().root())?;
-        memory
-            .blobs
-            .try_resize(to_bytes(bytes)?)
-            .map_err(EvidenceError::Memory)?;
-        memory.set_graph(graph_bytes(self)?)?;
+        let mut memory = admit_existing_case(self, &work.budget().root())?;
         memory.use_working_set(work.budget())?;
         self.memory = Some(memory);
         Ok(())

@@ -229,7 +229,7 @@ fn snapshot_zero_length_blob_roundtrips_without_advancing_the_pack_offset()
     let limits = small_limits();
     let (graph, blob_pack) = encode_snapshot(&case, limits)?;
 
-    assert!(blob_pack.is_empty());
+    assert_eq!(blob_pack.len(), 0);
     let (decoded, _usage) = Case::from_snapshot(graph.as_slice(), blob_pack.as_slice(), limits)?;
     assert_eq!(decoded, case);
     Ok(())

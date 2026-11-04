@@ -1,4 +1,5 @@
 use super::model::CaptureTcpReport;
+use l2_capture::LinkType;
 use std::io::{self, Write};
 
 pub(super) fn text(report: &CaptureTcpReport, output: &mut impl Write) -> io::Result<()> {
@@ -45,7 +46,7 @@ pub(super) fn text(report: &CaptureTcpReport, output: &mut impl Write) -> io::Re
         report.unresolved_sources.len(),
         report.unresolved_packets
     )?;
-    for limitation in report.limitations {
+    for limitation in &report.limitations {
         writeln!(output, "{limitation}")?;
     }
     Ok(())
@@ -78,12 +79,25 @@ fn summary(report: &CaptureTcpReport, output: &mut impl Write) -> io::Result<()>
         report.matching_packets,
         report.unresolved_packets
     )?;
+    write!(
+        output,
+        "Scope {}:{}",
+        report.flow.scope.section, report.flow.scope.interface
+    )?;
+    if let Some(ifindex) = report.flow.scope.cooked_ifindex {
+        write!(output, " cooked ifindex {ifindex}")?;
+    }
+    if matches!(
+        report.flow.link_type,
+        LinkType::LinuxSll | LinkType::LinuxSll2
+    ) {
+        write!(output, " VLAN membership unavailable")?;
+    } else {
+        write!(output, " VLAN {:?}", report.flow.scope.vlan_ids)?;
+    }
     writeln!(
         output,
-        "Scope {}:{} VLAN {:?} auxiliary {:?}; {}:{} -> {}:{}",
-        report.flow.scope.section,
-        report.flow.scope.interface,
-        report.flow.scope.vlan_ids,
+        " auxiliary {:?}; {}:{} -> {}:{}",
         report.flow.scope.vlan_aux,
         report.flow.source,
         report.flow.ports.0,

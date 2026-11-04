@@ -173,7 +173,7 @@ fn aligned_archive(contents: &[u8]) -> TestResult<Vec<u8>> {
 
 fn mixed_messages(archive: &[u8], session: u8) -> TestResult<Vec<Vec<u8>>> {
     let mut messages = Vec::new();
-    for (sequence, payload) in archive.chunks_exact(PAYLOAD_BYTES).enumerate() {
+    for (sequence, payload) in archive.as_chunks::<PAYLOAD_BYTES>().0.iter().enumerate() {
         let mut data = vec![0x51];
         data.extend(record(
             &[session + 4, session + 13, session + 29],
@@ -196,7 +196,7 @@ fn mixed_messages(archive: &[u8], session: u8) -> TestResult<Vec<Vec<u8>>> {
 
 fn alternate_messages(archive: &[u8], session: u8) -> TestResult<Vec<Vec<u8>>> {
     let mut messages = Vec::new();
-    for (sequence, payload) in archive.chunks_exact(PAYLOAD_BYTES).enumerate() {
+    for (sequence, payload) in archive.as_chunks::<PAYLOAD_BYTES>().0.iter().enumerate() {
         let mut data = vec![session + 20, session + 40, 0x39, u8::try_from(sequence)?];
         data.extend_from_slice(&u16::try_from(payload.len())?.to_be_bytes());
         data.extend_from_slice(payload);
@@ -215,7 +215,7 @@ fn alternate_messages(archive: &[u8], session: u8) -> TestResult<Vec<Vec<u8>>> {
 
 fn two_byte_messages(archive: &[u8], session: u8, extra_control: bool) -> TestResult<Vec<Vec<u8>>> {
     let mut messages = Vec::new();
-    for (sequence, payload) in archive.chunks_exact(PAYLOAD_BYTES).enumerate() {
+    for (sequence, payload) in archive.as_chunks::<PAYLOAD_BYTES>().0.iter().enumerate() {
         let mut data = vec![0x10, 0x20];
         data.extend(record(
             &[session + 4, session + 13, session + 29],

@@ -17,7 +17,7 @@ use l2_workbench::{
             StageStatus,
         },
     },
-    recovery::proposals::TRANSFORM_PROPOSAL_FORMAT_VERSION,
+    recovery::{proposals::TRANSFORM_PROPOSAL_FORMAT_VERSION, xor::XOR_PROPOSAL_FORMAT_VERSION},
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -32,7 +32,7 @@ use std::{
 // Work accounting changes belong here when they alter which searches can finish
 // Terminal-result policy changes must not replay earlier resumable entries
 // Capture indexing and native reconstruction keep their separate upstream versions
-pub(super) const RECOVERY_STAGE_VERSION: u32 = 31;
+pub(super) const RECOVERY_STAGE_VERSION: u32 = 32;
 const RECOVERY_STAGE: &str = "default_case_recovery";
 const RECOVERY_ALGORITHM: &str = "l2-default-case-recovery";
 const CASE_FILE: &str = "case.json";
@@ -299,6 +299,7 @@ fn recovery_key(
     let policy = json!({
         "native_case_version": workbench::full_source::NATIVE_CASE_VERSION,
         "transform_proposal_version": TRANSFORM_PROPOSAL_FORMAT_VERSION,
+        "xor_proposal_version": XOR_PROPOSAL_FORMAT_VERSION,
         "kind": kind_name(kind),
         "profile": profile_name(options.profile),
         "memory_limit_bytes": options.memory_limit,

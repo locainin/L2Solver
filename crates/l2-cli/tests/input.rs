@@ -133,7 +133,7 @@ fn capture_dash_reads_bounded_stdin() -> Result<(), Box<dyn Error>> {
     for arguments in [["inspect", "-"], ["json", "-"], ["observe", "-"]] {
         let output = run_with_stdin(&arguments, capture)?;
         assert!(output.status.success(), "stdin mode failed: {arguments:?}");
-        assert!(!output.stdout.is_empty());
+        assert_ne!(output.stdout.len(), 0);
     }
 
     let survey = run_with_stdin(&["survey", "-", "--format", "json"], capture)?;
@@ -148,7 +148,7 @@ fn capture_dash_reads_bounded_stdin() -> Result<(), Box<dyn Error>> {
     for command in ["assess", "survey"] {
         let named = run_with_stdin(&[command, "-"], capture)?;
         assert!(named.status.success(), "named stdin mode failed: {command}");
-        assert!(!named.stdout.is_empty());
+        assert_ne!(named.stdout.len(), 0);
     }
     Ok(())
 }

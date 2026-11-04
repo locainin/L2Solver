@@ -444,7 +444,7 @@ fn unknown_node_recipe_no_case() -> Result<(), Box<dyn Error>> {
         &[],
     )?;
     assert_eq!(unknown_node.status.code(), Some(1));
-    assert!(unknown_node.stdout.is_empty());
+    assert_eq!(unknown_node.stdout.len(), 0);
     assert!(!destination.exists());
 
     let valid_input = directory.path().join("input.json");
@@ -465,7 +465,7 @@ fn unknown_node_recipe_no_case() -> Result<(), Box<dyn Error>> {
         &[],
     )?;
     assert_eq!(invalid_recipe.status.code(), Some(1));
-    assert!(invalid_recipe.stdout.is_empty());
+    assert_eq!(invalid_recipe.stdout.len(), 0);
     assert!(!destination.exists());
     Ok(())
 }
@@ -497,7 +497,7 @@ fn fatal_record_atomicity() -> Result<(), Box<dyn Error>> {
     )?;
 
     assert_eq!(output.status.code(), Some(1));
-    assert!(output.stdout.is_empty());
+    assert_eq!(output.stdout.len(), 0);
     assert!(!destination.exists());
     Ok(())
 }

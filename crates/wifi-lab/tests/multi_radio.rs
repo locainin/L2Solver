@@ -21,7 +21,7 @@ fn same_frequency_per_radio_evidence() -> Result<(), Box<dyn Error>> {
     assert_eq!(report.observations().len(), 2);
     assert_eq!(report.accounting().captured_records(), 1);
     assert_eq!(report.accounting().observation_count(), 2);
-    assert!(report.losses().is_empty());
+    assert_eq!(report.losses(), []);
     let radios = report.radio_accounting();
     assert_eq!(radios.len(), 2);
     let first_stats = radios.first().ok_or("missing first radio")?;

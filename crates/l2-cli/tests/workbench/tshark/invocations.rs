@@ -1,6 +1,78 @@
-use super::{assert_error_contains, fixture, produce};
-use l2_workbench::tshark::TsharkReport;
+use super::{assert_error_contains, fixture, produce, run};
+use l2_workbench::{sha256, tshark::TsharkReport};
 use std::{error::Error, fs};
+
+#[test]
+fn glossary_inspection_accepts_older_parser_and_records_evidence() -> Result<(), Box<dyn Error>> {
+    let directory = tempfile::tempdir()?;
+    let options = fixture(directory.path(), b"1\n", &super::packets(1))?;
+
+    let report: TsharkReport = serde_json::from_value(produce(&options)?)?;
+
+    for (phase, glossary) in [("plugins", "plugins"), ("preferences", "currentprefs")] {
+        let invocation = report
+            .tool
+            .invocations
+            .iter()
+            .find(|invocation| invocation.phase == phase)
+            .ok_or("glossary invocation missing")?;
+        assert!(
+            invocation.argv.iter().map(String::as_str).eq([
+                "-G",
+                glossary,
+                "-n",
+                "-C",
+                report.tool.profile.name.as_str(),
+            ]),
+            "incorrect arguments for {phase}: {:?}",
+            invocation.argv
+        );
+    }
+    assert_eq!(report.tool.plugins.len(), 1);
+    assert_eq!(
+        report.tool.plugin_inventory_sha256,
+        sha256(b"fixture.so\t1.0\tdissector\tfixture.so\n")
+    );
+    assert_eq!(
+        report.tool.effective_preferences_sha256,
+        sha256(super::super::super::PREFERENCES.as_bytes())
+    );
+    assert_eq!(
+        report
+            .tool
+            .verified_profile_preferences
+            .get("gui.packet_list_show_related")
+            .map(String::as_str),
+        Some("FALSE")
+    );
+    report.validate()?;
+    Ok(())
+}
+
+#[test]
+fn glossary_inspection_reports_inventory_and_preference_failures() -> Result<(), Box<dyn Error>> {
+    for (glossary, phase) in [
+        ("plugins", "plugin inventory"),
+        ("currentprefs", "effective preferences"),
+    ] {
+        let directory = tempfile::tempdir()?;
+        let options = fixture(directory.path(), b"1\n", &super::packets(1))?;
+        fs::write(directory.path().join(format!("{glossary}.fail")), b"")?;
+        let mut output = Vec::new();
+
+        let error = match run(&options, &mut output) {
+            Ok(_) => return Err(format!("{phase} failure was accepted").into()),
+            Err(error) => error.to_string(),
+        };
+        assert!(error.contains(phase), "missing {phase} in {error}");
+        assert!(
+            error.contains(&format!("fixture {glossary} failed")),
+            "missing child diagnostic in {error}"
+        );
+        assert!(output.is_empty(), "receipt emitted after {phase} failed");
+    }
+    Ok(())
+}
 
 fn decode_arguments(report: &mut TsharkReport) -> Result<&mut Vec<String>, Box<dyn Error>> {
     Ok(&mut report

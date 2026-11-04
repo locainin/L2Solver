@@ -8,7 +8,7 @@ fn candidate_identity_budget_covers_every_closed_default_template() -> Result<()
     let templates = super::candidate_task_identity_templates();
     let maximum = super::maximum_task_identity_bytes(&templates)?;
 
-    assert!(!templates.is_empty());
+    assert_ne!(templates.len(), 0);
     for task in &templates {
         assert!(super::serialized_task_identity_bytes(task)? <= maximum);
     }

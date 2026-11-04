@@ -2,7 +2,7 @@ use std::{
     env, fs, io,
     path::{Path, PathBuf},
     sync::{Arc, OnceLock},
-    time::{SystemTime, UNIX_EPOCH},
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
 use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
@@ -12,7 +12,7 @@ use crate::hashing::is_sha256_digest;
 use crate::job::{JobSnapshot, MemoryBudget, MemoryLease};
 
 use super::{
-    database::{self, Durability},
+    database,
     entry::{CacheEntry, EntryRecord, Lease, read_entry},
     error::{CacheError, Result},
     filesystem::{HeldDirectory, LockGuard},
@@ -97,13 +97,13 @@ impl CacheInner {
     }
 
     pub(super) fn active_checkpoint(&self, key: &str) -> Result<bool> {
-        let connection = database::open_connection(&self.state_root, Durability::Recomputable)?;
+        let connection = database::open_connection(&self.state_root)?;
         active_checkpoint_in(&connection, key)
     }
 
     // The quota lock is held while this reservation is created
     pub(super) fn reserve_stage(&self, key: &StageKey, token: &str, bytes: i64) -> Result<()> {
-        let connection = database::open_connection(&self.state_root, Durability::Checkpoint)?;
+        let connection = database::open_connection(&self.state_root)?;
         connection.execute(
             "INSERT INTO execution_reservations(token, key, bytes) VALUES (?1, ?2, ?3)",
             params![token, key.as_str(), bytes],
@@ -120,7 +120,7 @@ impl CacheInner {
         manifest_json: &str,
         bytes: i64,
     ) -> Result<()> {
-        let mut connection = database::open_connection(&self.state_root, Durability::Checkpoint)?;
+        let mut connection = database::open_connection(&self.state_root)?;
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
         // Keep old bytes counted in the transaction that switches the live pointer
         let old_stage = retired::record_current(
@@ -194,7 +194,7 @@ impl CacheInner {
         status: CheckpointStatus,
         snapshot_json: &str,
     ) -> Result<()> {
-        let mut connection = database::open_connection(&self.state_root, Durability::Checkpoint)?;
+        let mut connection = database::open_connection(&self.state_root)?;
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
         transaction.execute(
             "INSERT INTO checkpoints (key, status, snapshot_version, snapshot_json, updated_ns)
@@ -429,6 +429,7 @@ impl Cache {
     ///
     /// Complete-only lookups never expose partial results, so an incomplete search cannot be
     /// replayed as a complete negative result
+    /// A concurrent `SQLite` writer may prevent this hit from refreshing its LRU position
     ///
     /// # Errors
     /// Returns an error when a writer holds the key, a path was replaced, or the entry is corrupt
@@ -438,8 +439,7 @@ impl Cache {
         let lock = self.inner.lock(key, false)?;
         // The database snapshot and OS lock keep lengths and their row contents consistent
         let budget = self.memory_budget();
-        let mut connection =
-            database::open_connection(&self.inner.state_root, Durability::Recomputable)?;
+        let mut connection = database::open_connection(&self.inner.state_root)?;
         let transaction = connection.transaction()?;
         let header = transaction
             .query_row(
@@ -492,10 +492,21 @@ impl Cache {
         drop(record);
         drop(transient);
         transaction.commit()?;
-        connection.execute(
+        // This connection is dropped after the optional recency write
+        connection.busy_timeout(Duration::ZERO)?;
+        match connection.execute(
             "UPDATE entries SET accessed_ns = MAX(?1, accessed_ns + 1) WHERE key = ?2",
             params![now_ns(), key.as_str()],
-        )?;
+        ) {
+            Ok(_) => {}
+            // A busy writer cannot invalidate the already checked and pinned entry
+            Err(rusqlite::Error::SqliteFailure(code, _))
+                if matches!(
+                    code.code,
+                    rusqlite::ErrorCode::DatabaseBusy | rusqlite::ErrorCode::DatabaseLocked
+                ) => {}
+            Err(error) => return Err(error.into()),
+        }
         Ok(Some(entry))
     }
 
@@ -580,8 +591,7 @@ impl Cache {
         key.validate()?;
         self.inner.check_locations()?;
         let budget = self.memory_budget();
-        let mut connection =
-            database::open_connection(&self.inner.state_root, Durability::Checkpoint)?;
+        let mut connection = database::open_connection(&self.inner.state_root)?;
         let transaction = connection.transaction()?;
         let header = transaction
             .query_row(
@@ -639,8 +649,7 @@ impl Cache {
     /// Returns an error when `SQLite` cannot read the cache index
     pub fn stats(&self) -> Result<CacheStats> {
         self.inner.check_locations()?;
-        let connection =
-            database::open_connection(&self.inner.state_root, Durability::Recomputable)?;
+        let connection = database::open_connection(&self.inner.state_root)?;
         let (entries, bytes, checkpoints): (i64, i64, i64) = connection.query_row(
             "SELECT
                  (SELECT count(*) FROM entries),
@@ -680,8 +689,7 @@ impl Cache {
     /// Returns an error when the index or entry directories cannot be updated safely
     pub fn clear(&self) -> Result<PruneReport> {
         let mut report = self.evict(None)?;
-        let mut connection =
-            database::open_connection(&self.inner.state_root, Durability::Checkpoint)?;
+        let mut connection = database::open_connection(&self.inner.state_root)?;
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
         transaction.execute(
             "DELETE FROM checkpoints WHERE status = ?1",
@@ -769,7 +777,7 @@ impl Cache {
                 });
             }
         }
-        let connection = database::open_connection(&self.inner.state_root, Durability::Checkpoint)?;
+        let connection = database::open_connection(&self.inner.state_root)?;
         let changed = connection.execute(
             "INSERT INTO execution_reservations (token, key, bytes) VALUES (?1, ?2, ?3)
              ON CONFLICT(token) DO UPDATE SET bytes = execution_reservations.bytes + excluded.bytes
@@ -793,8 +801,7 @@ impl Cache {
             .checked_add(incoming_bytes)
             .ok_or(CacheError::SizeOverflow)?;
         if required_bytes > self.inner.max_bytes {
-            let connection =
-                database::open_connection(&self.inner.state_root, Durability::Recomputable)?;
+            let connection = database::open_connection(&self.inner.state_root)?;
             let mut cursor = None;
             while let Some(row) = next_lru_row(&connection, cursor.as_ref())? {
                 if row.key != key.as_str() {
@@ -842,8 +849,7 @@ impl Cache {
         if remaining <= self.inner.max_bytes {
             return Ok(());
         }
-        let mut connection =
-            database::open_connection(&self.inner.state_root, Durability::Recomputable)?;
+        let mut connection = database::open_connection(&self.inner.state_root)?;
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let mut cursor = None;
         while remaining > self.inner.max_bytes {
@@ -915,8 +921,7 @@ impl Cache {
         self.cleanup_orphan_generations()?;
         let mut remaining = self.stats()?.entry_bytes;
         let mut report = PruneReport::default();
-        let connection =
-            database::open_connection(&self.inner.state_root, Durability::Recomputable)?;
+        let connection = database::open_connection(&self.inner.state_root)?;
         let mut cursor = None;
         while limit.is_none_or(|limit| remaining > limit) {
             let Some(row) = next_lru_row(&connection, cursor.as_ref())? else {
@@ -952,8 +957,7 @@ impl Cache {
             }
             Err(error) => return Err(error),
         };
-        let mut connection =
-            database::open_connection(&self.inner.state_root, Durability::Recomputable)?;
+        let mut connection = database::open_connection(&self.inner.state_root)?;
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
         // Recheck the durable pin in the same transaction that removes the entry row
         let active: bool = transaction.query_row(
@@ -1008,7 +1012,7 @@ impl Cache {
     }
 
     fn cleanup_retired_generations(&self) -> Result<()> {
-        let connection = database::open_connection(&self.inner.state_root, Durability::Checkpoint)?;
+        let connection = database::open_connection(&self.inner.state_root)?;
         let mut cursor = None;
         while let Some(key) =
             next_maintenance_key(&connection, MaintenanceKeys::Retired, cursor.as_deref())?
@@ -1032,7 +1036,7 @@ impl Cache {
     }
 
     fn cleanup_stale_reservations(&self) -> Result<()> {
-        let connection = database::open_connection(&self.inner.state_root, Durability::Checkpoint)?;
+        let connection = database::open_connection(&self.inner.state_root)?;
         let mut cursor = None;
         while let Some(key) = next_maintenance_key(
             &connection,
@@ -1093,7 +1097,7 @@ impl Cache {
             Err(CacheError::Io(error)) if error.kind() == io::ErrorKind::NotFound => {}
             Err(error) => return Err(error),
         }
-        let connection = database::open_connection(&self.inner.state_root, Durability::Checkpoint)?;
+        let connection = database::open_connection(&self.inner.state_root)?;
         validate_references(&connection, &self.inner.entries, key)?;
         match self.inner.entries.open_child(key) {
             Ok(directory) => {
@@ -1200,8 +1204,7 @@ impl Cache {
                 Err(CacheError::LockBusy) => continue,
                 Err(error) => return Err(error),
             };
-            let connection =
-                database::open_connection(&self.inner.state_root, Durability::Recomputable)?;
+            let connection = database::open_connection(&self.inner.state_root)?;
             validate_references(&connection, &self.inner.entries, &key)?;
             let key_directory = self.inner.entries.open_child(&key)?;
             for generation in fs::read_dir(key_directory.path())? {

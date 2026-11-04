@@ -107,7 +107,7 @@ fn cached_collection_uses_each_workers_reserved_credit() -> Result<(), Box<dyn E
             },
         )?;
     }
-    assert!(!expected.is_empty());
+    assert_ne!(expected.len(), 0);
     assert_eq!(restored, expected);
     assert_eq!(
         job.snapshot()?.counters.get(&Counter::CacheHits).copied(),

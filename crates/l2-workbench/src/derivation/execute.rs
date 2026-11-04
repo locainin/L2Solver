@@ -203,6 +203,9 @@ pub fn run_with_limits(
 /// The lease must outlive the returned report, including reports with a failed step
 /// Errors leave the original lease unchanged after temporary buffers are dropped
 /// Charges cover logical buffer capacities and bounded workspace, not allocator overhead or RSS
+///
+/// # Errors
+/// Returns an error for invalid requests, unsupported recipes, or denied memory admission
 pub fn run_with_memory(
     input: &[u8],
     recipe: &Recipe,
@@ -225,7 +228,7 @@ pub fn run_with_memory(
     }
 }
 
-fn supports_admission(recipe: &Recipe) -> bool {
+const fn supports_admission(recipe: &Recipe) -> bool {
     if !recipe.constraints.is_empty() {
         return false;
     }
@@ -238,6 +241,7 @@ fn supports_admission(recipe: &Recipe) -> bool {
             | Operation::Base64Decode { .. }
             | Operation::GzipDecompress {}
             | Operation::ZlibDecompress {}
+            | Operation::XorRepeat { .. }
     )
 }
 
@@ -329,7 +333,7 @@ fn run_validated<A: Admission>(
         })?;
     current.bytes.extend_from_slice(input);
     let metadata_bytes = if admission.is_active() {
-        metadata_bound(recipe.steps.len()).map_err(EngineError::Derivation)?
+        metadata_bound(recipe).map_err(EngineError::Derivation)?
     } else {
         0
     };
@@ -376,9 +380,10 @@ fn run_validated<A: Admission>(
     Ok(report)
 }
 
-fn metadata_bound(steps: usize) -> Result<u64, DerivationError> {
+fn metadata_bound(recipe: &Recipe) -> Result<u64, DerivationError> {
     // A digest has 64 hex bytes, with extra room for string formatting growth
     const DIGEST_ALLOCATION_BYTES: usize = 256;
+    let steps = recipe.steps.len();
     // Two hashes remain per step, with three more live during replacement
     let digest_bytes = steps
         .checked_mul(2)
@@ -388,8 +393,17 @@ fn metadata_bound(steps: usize) -> Result<u64, DerivationError> {
     let report_bytes = steps
         .checked_mul(std::mem::size_of::<StepReport>())
         .and_then(|bytes| bytes.checked_mul(2));
+    // Each step report clones its operation, including any XOR key bytes
+    let key_bytes = recipe.steps.iter().try_fold(0_usize, |total, operation| {
+        let length = match operation {
+            Operation::XorRepeat { key, .. } => key.len(),
+            _ => 0,
+        };
+        total.checked_add(length)
+    });
     digest_bytes
         .and_then(|digest| report_bytes.and_then(|reports| digest.checked_add(reports)))
+        .and_then(|total| key_bytes.and_then(|keys| total.checked_add(keys)))
         .and_then(|bytes| u64::try_from(bytes).ok())
         .ok_or(DerivationError::AllocationFailed)
 }
@@ -407,6 +421,10 @@ fn report_metadata_bytes(report: &DerivationReport) -> Result<u64, DerivationErr
             .checked_add(step.input_sha256.as_ref().map_or(0, String::capacity))
             .and_then(|bytes| {
                 bytes.checked_add(step.output_sha256.as_ref().map_or(0, String::capacity))
+            })
+            .and_then(|bytes| match &step.operation {
+                Operation::XorRepeat { key, .. } => bytes.checked_add(key.capacity()),
+                _ => Some(bytes),
             })
             .ok_or(DerivationError::AllocationFailed)?;
     }

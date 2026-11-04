@@ -175,20 +175,37 @@ struct CaseIndex<'a> {
     contains: HashMap<u64, Vec<u64>>,
 }
 
+#[derive(Clone, Copy)]
+enum IndexScope {
+    Mappings,
+    Context,
+}
+
 impl<'a> CaseIndex<'a> {
     fn new(case: &'a Case) -> Self {
+        Self::build(case, IndexScope::Context)
+    }
+
+    fn mappings(case: &'a Case) -> Self {
+        Self::build(case, IndexScope::Mappings)
+    }
+
+    fn build(case: &'a Case, scope: IndexScope) -> Self {
         let nodes: HashMap<_, _> = case.nodes().iter().map(|node| (node.id, node)).collect();
         let blobs: HashMap<_, _> = case
             .blobs()
             .iter()
             .map(|blob| (blob.id.as_str(), blob))
             .collect();
-        let episode_ids: HashSet<_> = case
-            .nodes()
-            .iter()
-            .filter(|node| node.kind == "tcp_episode")
-            .map(|node| node.id)
-            .collect();
+        let episode_ids: HashSet<_> = match scope {
+            IndexScope::Context => case
+                .nodes()
+                .iter()
+                .filter(|node| node.kind == "tcp_episode")
+                .map(|node| node.id)
+                .collect(),
+            IndexScope::Mappings => HashSet::new(),
+        };
         let mut packet_episodes: HashMap<u64, Vec<u64>> = HashMap::new();
         let mut mapped_by: HashMap<u64, Vec<u64>> = HashMap::new();
         let mut contains: HashMap<u64, Vec<u64>> = HashMap::new();
@@ -202,7 +219,9 @@ impl<'a> CaseIndex<'a> {
                     }
                 }
                 "mapped_by" => mapped_by.entry(edge.from).or_default().push(edge.to),
-                "contains" => contains.entry(edge.to).or_default().push(edge.from),
+                "contains" if matches!(scope, IndexScope::Context) => {
+                    contains.entry(edge.to).or_default().push(edge.from);
+                }
                 _ => {}
             }
         }
@@ -353,7 +372,7 @@ pub fn mapped_node_with_view(
     node_id: u64,
     view: DiscoveryView,
 ) -> Result<MappedNode<'_>, DiscoveryError> {
-    let index = CaseIndex::new(case);
+    let index = CaseIndex::mappings(case);
     mapped_node_indexed(node_id, &index, view, MappingCoverage::Exact)
 }
 
@@ -367,7 +386,7 @@ pub fn mapped_node_with_supporting_mappings(
     case: &Case,
     node_id: u64,
 ) -> Result<MappedNode<'_>, DiscoveryError> {
-    let index = CaseIndex::new(case);
+    let index = CaseIndex::mappings(case);
     mapped_node_indexed(
         node_id,
         &index,

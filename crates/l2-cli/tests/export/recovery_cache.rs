@@ -26,6 +26,13 @@ mod compatibility;
 #[path = "recovery_cache/lifecycle.rs"]
 mod lifecycle;
 
+#[path = "recovery_cache/writer_conflict.rs"]
+mod writer_conflict;
+
+#[cfg(target_os = "linux")]
+#[path = "recovery_cache/maintenance_contention.rs"]
+mod maintenance_contention;
+
 #[test]
 fn warm_cache_restores_the_case_and_local_coverage() -> Result<(), Box<dyn Error>> {
     let temporary = tempfile::tempdir()?;
@@ -221,7 +228,7 @@ fn refresh_recomputes_and_atomically_replaces_the_cached_recovery() -> Result<()
         0
     );
     assert_eq!(snapshot.counters.get(&Counter::CacheMisses), Some(&1));
-    assert!(snapshot.cache_fallbacks.records().is_empty());
+    assert_eq!(snapshot.cache_fallbacks.records().len(), 0);
     assert_eq!(cache.stats()?.entries, 1);
     Ok(())
 }
@@ -247,7 +254,7 @@ fn valid_cache_miss_and_no_cache_do_not_record_fallback_diagnostics() -> Result<
     )?;
 
     let cold_snapshot = job.snapshot()?;
-    assert!(cold_snapshot.cache_fallbacks.records().is_empty());
+    assert_eq!(cold_snapshot.cache_fallbacks.records().len(), 0);
     assert_eq!(cold_snapshot.counters.get(&Counter::CacheMisses), Some(&1));
 
     let mut no_cache = options.clone();
@@ -267,7 +274,7 @@ fn valid_cache_miss_and_no_cache_do_not_record_fallback_diagnostics() -> Result<
     )?;
 
     let no_cache_snapshot = no_cache_job.snapshot()?;
-    assert!(no_cache_snapshot.cache_fallbacks.records().is_empty());
+    assert_eq!(no_cache_snapshot.cache_fallbacks.records().len(), 0);
     assert_eq!(
         no_cache_snapshot.counters.get(&Counter::CacheHits),
         Some(&0)
@@ -575,6 +582,15 @@ fn cache_key_does_not_reuse_the_previous_transform_proposal_policy() -> Result<(
 }
 
 #[test]
+fn cache_key_does_not_reuse_results_without_xor_discovery() -> Result<(), Box<dyn Error>> {
+    let (_, scope) = case_and_scope(b"4142", 19)?;
+    let options = RecoveryOptions::default();
+    let old = previous_recovery_key(&scope, &options, super::RECOVERY_STAGE_VERSION)?;
+    assert_ne!(recovery_key(RecoveryCaseKind::Flow, &scope, &options)?, old);
+    Ok(())
+}
+
+#[test]
 fn changed_recovery_algorithm_rejects_a_stale_partial_result() -> Result<(), Box<dyn Error>> {
     // Earlier stages lack current search, schema handoff, or deferred assembly semantics
     for version in [
@@ -635,7 +651,7 @@ fn assert_previous_recovery_recomputed(version: u32) -> Result<(), Box<dyn Error
         current.coverage.is_complete(),
         "stale partial recovery was replayed"
     );
-    assert!(current.omissions.is_empty());
+    assert_eq!(current.omissions.len(), 0);
     assert!(
         !current_case
             .nodes()
@@ -727,7 +743,7 @@ fn cached_case_with_inaccurate_snapshot_usage_is_rejected_and_recomputed()
         )
         .is_err()
     );
-    assert!(strict_job.snapshot()?.cache_fallbacks.records().is_empty());
+    assert_eq!(strict_job.snapshot()?.cache_fallbacks.records().len(), 0);
 
     let job = Job::new("repair corrupt cache entry");
     let (mut fresh_case, fresh_scope) = case_and_scope(b"4142", 19)?;

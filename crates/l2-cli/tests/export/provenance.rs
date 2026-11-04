@@ -76,7 +76,7 @@ fn retained_case_keeps_direct_ranges_with_its_node() -> Result<(), Box<dyn Error
         provenance.node.as_ref().map(|node| node.ranges.as_slice()),
         Some([range].as_slice())
     );
-    assert!(provenance.source_ranges.is_empty());
+    assert_eq!(provenance.source_ranges.len(), 0);
     assert!(
         provenance
             .canonical_origin
@@ -129,7 +129,7 @@ fn omitted_case_without_ranges_does_not_publish_case_local_identity() -> Result<
     assert!(provenance.case_id.is_none());
     assert!(provenance.selected_node_id.is_none());
     assert!(provenance.node.is_none());
-    assert!(provenance.source_ranges.is_empty());
+    assert_eq!(provenance.source_ranges.len(), 0);
     assert!(
         provenance
             .canonical_origin
@@ -162,7 +162,7 @@ fn selected_artifact_without_verified_ranges_does_not_infer_node_ranges()
         }),
     )?;
 
-    assert!(provenance.source_ranges.is_empty());
+    assert_eq!(provenance.source_ranges.len(), 0);
     assert!(
         provenance
             .canonical_origin
@@ -322,7 +322,7 @@ fn mapping_receipt_with_a_gap_has_no_exact_object_range() -> Result<(), Box<dyn 
     let index = CaseArtifactIndex::new(&case, None)?;
     let budget = l2_workbench::job::MemoryBudget::new(1024 * 1024);
     let source_ranges = selected_artifact_source_ranges(&selected, &index, Some(&budget))?;
-    assert!(source_ranges.ranges.is_empty());
+    assert_eq!(source_ranges.ranges.len(), 0);
     assert_eq!(budget.snapshot()?.used_bytes, 0);
     Ok(())
 }
@@ -344,10 +344,11 @@ fn transformed_artifact_bytes_do_not_inherit_input_ranges() -> Result<(), Box<dy
     let selected = selected_origin(&mut case, input, b"WXYZ", 0, input_bytes.len())?;
     let index = CaseArtifactIndex::new(&case, None)?;
 
-    assert!(
+    assert_eq!(
         selected_artifact_source_ranges(&selected, &index, None)?
             .ranges
-            .is_empty()
+            .len(),
+        0
     );
     Ok(())
 }
@@ -472,7 +473,7 @@ fn signature_candidates_follow_the_input_and_case_retention() -> Result<(), Box<
                     .collect();
                 assert_eq!(ids, [expected]);
             } else {
-                assert!(origin.signature_candidates.is_empty());
+                assert_eq!(origin.signature_candidates.len(), 0);
             }
             Ok(())
         })?;
@@ -961,10 +962,11 @@ fn assert_forged_receipt_is_ignored(
     let selected = selected_origin(&mut case, input, b"cde", 2, 3)?;
     let index = CaseArtifactIndex::new(&case, None)?;
 
-    assert!(
+    assert_eq!(
         selected_artifact_source_ranges(&selected, &index, None)?
             .ranges
-            .is_empty()
+            .len(),
+        0
     );
     Ok(())
 }

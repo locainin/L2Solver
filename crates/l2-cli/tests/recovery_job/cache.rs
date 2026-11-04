@@ -29,7 +29,7 @@ fn checkpoint_memory_pressure_is_preserved_in_optional_and_strict_modes()
             .err()
             .ok_or("memory pressure was silently treated as an optional cache miss")?;
         assert!(crate::memory_error::find(error.as_ref()).is_some());
-        assert!(job.snapshot()?.cache_fallbacks.records().is_empty());
+        assert_eq!(job.snapshot()?.cache_fallbacks.records().len(), 0);
         assert_eq!(memory.snapshot()?.used_bytes, 0);
     }
     Ok(())
@@ -183,7 +183,7 @@ fn checkpoint_restoration_cannot_hide_a_job_state_error() -> Result<(), Box<dyn 
             error.downcast_ref::<JobError>(),
             Some(&JobError::RestoreAfterStart)
         );
-        assert!(running.snapshot()?.cache_fallbacks.records().is_empty());
+        assert_eq!(running.snapshot()?.cache_fallbacks.records().len(), 0);
     }
     Ok(())
 }
@@ -202,7 +202,7 @@ fn invalid_recovery_identity_is_not_downgraded_to_a_cache_fallback() -> Result<(
     let result =
         RecoveryCache::from_cache(cache, &invalid_identity, &RecoveryOptions::default(), &job);
     assert!(result.is_err(), "invalid identity must remain an error");
-    assert!(job.snapshot()?.cache_fallbacks.records().is_empty());
+    assert_eq!(job.snapshot()?.cache_fallbacks.records().len(), 0);
     Ok(())
 }
 
@@ -370,7 +370,7 @@ fn cancellation_is_preserved_when_checkpoint_finish_fails() -> Result<(), Box<dy
         fs::rename(&cache_root, temporary.path().join("moved-cache"))?;
         job.request_cancel();
         let error = session
-            .finish(Ok(()), &job)
+            .finish(Err::<(), Box<dyn Error>>(JobError::Cancelled.into()), &job)
             .err()
             .ok_or("cancellation was ignored")?;
         let cancellation = if strict {
@@ -381,10 +381,31 @@ fn cancellation_is_preserved_when_checkpoint_finish_fails() -> Result<(), Box<dy
             error.downcast_ref::<JobError>()
         };
         assert_eq!(cancellation, Some(&JobError::Cancelled));
+        assert_eq!(super::super::is_cancellation(error.as_ref()), !strict);
+        if strict {
+            assert!(error.to_string().contains("checkpoint failure"));
+        }
         if !strict {
             assert_checkpoint_fallback(&job)?;
         }
     }
+    Ok(())
+}
+
+#[test]
+fn successful_operation_remains_successful_after_late_cancellation() -> Result<(), Box<dyn Error>> {
+    let temporary = tempfile::tempdir()?;
+    let cache = Cache::open_at(
+        temporary.path().join("cache"),
+        temporary.path().join("state"),
+        1024 * 1024,
+    )?;
+    let job = Job::new("completed work");
+    let active = RecoveryCache::from_cache(cache, &identity()?, &RecoveryOptions::default(), &job)?;
+    job.request_cancel();
+
+    assert!(active.finish(Ok(true), &job)?);
+    assert!(!RecoveryCache::disabled().finish(Ok(false), &job)?);
     Ok(())
 }
 

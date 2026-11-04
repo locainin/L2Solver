@@ -4,7 +4,7 @@ pub const ROGUE_AP: [u8; 6] = [0x02, 0, 0, 0, 0, 9];
 
 // Keep malformed oversized fixture inputs non-panicking like the original builder
 fn length_byte(length: usize) -> u8 {
-    u8::try_from(length).ok().map_or(0, |value| value)
+    u8::try_from(length).unwrap_or(0)
 }
 
 // Build the SAE RSN element with caller-selected PMF capabilities

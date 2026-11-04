@@ -1,0 +1,6 @@
+# Require the release that fixes portable recording handling
+nextest-version = "0.9.150"
+
+# Keep each shard's test outcomes even when a test fails
+[profile.ci.junit]
+path = "junit.xml"

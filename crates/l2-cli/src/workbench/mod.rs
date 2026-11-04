@@ -30,6 +30,8 @@ mod query;
 mod receipt_verification;
 mod records;
 mod recovery_executor;
+#[cfg(test)]
+pub use recovery_executor::record_discovery_tests::build_session_relative_fixture_named;
 mod review;
 mod searches;
 mod selected;

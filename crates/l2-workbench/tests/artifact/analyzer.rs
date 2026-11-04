@@ -284,7 +284,7 @@ fn invalid_region_syntax_remains_a_complete_negative_for_its_exact_range()
         .ok_or("invalid encoded text range is missing")?;
 
     assert!(source_regions.report.coverage.complete);
-    assert!(region.proposal_report.proposals.is_empty());
+    assert_eq!(region.proposal_report.proposals.len(), 0);
     assert!(
         region
             .proposal_report
@@ -384,13 +384,13 @@ fn analysis_metadata_round_trips_without_embedding_artifact_bytes() -> Result<()
 
     assert_eq!(metadata.source_sha256, report.source_sha256);
     assert_eq!(metadata.artifacts.len(), report.artifacts.len());
-    assert!(first_metadata_artifact.bytes.is_empty());
+    assert_eq!(first_metadata_artifact.bytes.len(), 0);
     for (cached, original) in metadata.artifacts.iter().zip(&report.artifacts) {
         assert_eq!(cached.index, original.index);
         assert_eq!(cached.sha256, original.sha256);
         assert_eq!(cached.origins, original.origins);
         assert_eq!(cached.validation, original.validation);
-        assert!(cached.bytes.is_empty());
+        assert_eq!(cached.bytes.len(), 0);
     }
     assert_eq!(metadata.status, report.status);
     Ok(())
@@ -439,7 +439,7 @@ fn artifact_and_work_limits_return_a_partial_report() -> Result<(), Box<dyn Erro
 
     assert_eq!(report.artifacts.len(), 1);
     assert_eq!(report.status, AnalysisStatus::Partial);
-    assert!(!report.omissions.is_empty());
+    assert_ne!(report.omissions.len(), 0);
     Ok(())
 }
 
@@ -516,7 +516,7 @@ fn salvage_mode_keeps_a_complete_object_complete_when_no_repair_is_needed()
     )?;
 
     assert_eq!(report.status, AnalysisStatus::Complete);
-    assert!(report.omissions.is_empty());
+    assert_eq!(report.omissions.len(), 0);
     assert_eq!(
         report
             .artifacts
@@ -542,7 +542,7 @@ fn input_limit_preserves_original_hash_and_length() -> Result<(), Box<dyn Error>
         },
     )?;
 
-    assert!(report.artifacts.is_empty());
+    assert_eq!(report.artifacts.len(), 0);
     assert_eq!(report.source_sha256, l2_workbench::sha256(input));
     assert_eq!(report.source_length, input.len());
     assert_eq!(report.status, AnalysisStatus::Partial);

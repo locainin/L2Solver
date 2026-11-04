@@ -9,8 +9,8 @@ fn empty_message_preserves_header_fields() -> Result<(), &'static str> {
 
     assert_eq!(message.id, 0x4a21);
     assert_eq!(message.flags, 0x8183);
-    assert!(message.questions.is_empty());
-    assert!(message.records.is_empty());
+    assert_eq!(message.questions, [] as [l2_discovery::dns::DnsQuestion; 0]);
+    assert_eq!(message.records, [] as [l2_discovery::dns::DnsRecord; 0]);
     assert!(message.is_response());
     assert_eq!(message.opcode(), 0);
     assert_eq!(message.response_code(), 3);

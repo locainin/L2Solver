@@ -65,7 +65,7 @@ fn invalid_ranges_endpoints_not_case() -> Result<(), Box<dyn Error>> {
         case.add_node("literal", Some("sha256:unknown"), Vec::new(), json!({}))
             .is_err()
     );
-    assert!(case.nodes().is_empty());
+    assert_eq!(case.nodes().len(), 0);
 
     let node = case.add_node("literal", Some(&blob), Vec::new(), json!({}))?;
     assert!(
@@ -78,7 +78,7 @@ fn invalid_ranges_endpoints_not_case() -> Result<(), Box<dyn Error>> {
         })
         .is_err()
     );
-    assert!(case.edges().is_empty());
+    assert_eq!(case.edges().len(), 0);
     Ok(())
 }
 

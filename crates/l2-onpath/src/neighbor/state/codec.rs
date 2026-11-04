@@ -82,7 +82,7 @@ pub(super) fn validate(bytes: &[u8]) -> Result<(), StateSourceError> {
         .get(HEADER_LEN..)
         .ok_or(StateSourceError::InvalidEncoding)?;
     // A source is retained only after every record has passed the same decoder
-    for chunk in records.chunks_exact(RECORD_LEN).take(count) {
+    for chunk in records.as_chunks::<RECORD_LEN>().0.iter().take(count) {
         parse_record(chunk)?;
     }
     Ok(())

@@ -10,6 +10,39 @@ use std::{
     time::{Duration, Instant},
 };
 
+#[cfg(target_os = "linux")]
+#[path = "process/spawn_failure.rs"]
+mod spawn_failure;
+
+#[cfg(all(target_os = "linux", not(target_env = "uclibc")))]
+#[path = "process/pgid_reuse.rs"]
+mod pgid_reuse;
+
+#[cfg(all(target_os = "linux", not(target_env = "uclibc")))]
+thread_local! {
+    static OBSERVED_POLLS: std::cell::Cell<Option<usize>> = const { std::cell::Cell::new(None) };
+    static NEXT_POLL_ERROR: std::cell::Cell<Option<nix::errno::Errno>> = const { std::cell::Cell::new(None) };
+    static PERSISTENT_POLL_ERROR: std::cell::Cell<Option<nix::errno::Errno>> = const { std::cell::Cell::new(None) };
+}
+
+#[cfg(all(target_os = "linux", not(target_env = "uclibc")))]
+pub(super) fn record_observe() {
+    OBSERVED_POLLS.with(|count| {
+        count.set(count.get().map(|value| value + 1));
+    });
+}
+
+#[cfg(all(target_os = "linux", not(target_env = "uclibc")))]
+pub(super) fn waitid_with_fault(
+    pid: nix::unistd::Pid,
+    flags: nix::sys::wait::WaitPidFlag,
+) -> nix::Result<nix::sys::wait::WaitStatus> {
+    NEXT_POLL_ERROR
+        .take()
+        .or_else(|| PERSISTENT_POLL_ERROR.get())
+        .map_or_else(|| super::waitid(super::Id::Pid(pid), flags), Err)
+}
+
 fn empty_object_root(directory: &Path) -> Result<(), Box<dyn Error>> {
     std::fs::create_dir(directory)?;
     Ok(())
@@ -330,7 +363,7 @@ fn new_and_changed_objects_wait_for_a_second_unchanged_scan() -> Result<(), Box<
     // Explicit scan boundaries avoid relying on process scheduling between writes
     std::fs::write(&stable_path, b"stable")?;
     monitor.scan_objects(scan_policy)?;
-    assert!(monitor.stable_objects.is_empty());
+    assert_eq!(monitor.stable_objects.len(), 0);
 
     std::fs::write(&late_path, b"late")?;
     monitor.scan_objects(scan_policy)?;

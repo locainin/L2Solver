@@ -97,7 +97,7 @@ fn pattern_commands_overflowing_budgets_output() -> Result<(), Box<dyn Error>> {
             for invalid in ["0", "-1", "184467440737095516160"] {
                 let output = run(&[command, "-", option, invalid], &input)?;
                 assert_eq!(output.status.code(), Some(2));
-                assert!(output.stdout.is_empty());
+                assert_eq!(output.stdout.len(), 0);
                 assert!(
                     !String::from_utf8_lossy(&output.stderr).contains("unexpected argument '--max"),
                     "the budget option must be recognized before its value is rejected"
@@ -169,7 +169,7 @@ fn pattern_byte_boundaries_exact_omissions() -> Result<(), Box<dyn Error>> {
         );
 
         let tiny = report(&run(&[command, "-", "--max-report-bytes", "1"], &input)?, 3)?;
-        assert!(findings(&tiny)?.is_empty());
+        assert_eq!(findings(&tiny)?.len(), 0);
         assert_eq!(tiny.get("omitted_findings"), Some(&json!(3)));
         assert_eq!(tiny.get("complete"), Some(&json!(false)));
         assert_eq!(tiny.get("retained_finding_bytes"), Some(&json!(0)));

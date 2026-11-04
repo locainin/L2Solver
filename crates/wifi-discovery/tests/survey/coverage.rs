@@ -54,7 +54,7 @@ fn zero_frequency_without_changing_coverage() -> Result<(), Box<dyn std::error::
     );
     let coverage = survey.channel_coverage(1)?;
     assert_eq!(coverage.observed_ns(), 0);
-    assert!(coverage.channels().is_empty());
+    assert_eq!(coverage.channels(), []);
     Ok(())
 }
 
@@ -118,12 +118,12 @@ fn unordered_radio_schedules_remain_atomic() -> Result<(), Box<dyn std::error::E
     let radio_2 = survey.channel_coverage(2)?;
     assert_eq!(radio_2.total_scheduled_ns(), 40);
     assert_eq!(radio_2.observed_ns(), 0);
-    assert!(radio_2.channels().is_empty());
+    assert_eq!(radio_2.channels(), []);
 
     let radio_5 = survey.channel_coverage(5)?;
     assert_eq!(radio_5.total_scheduled_ns(), 30);
     assert_eq!(radio_5.observed_ns(), 0);
-    assert!(radio_5.channels().is_empty());
+    assert_eq!(radio_5.channels(), []);
     Ok(())
 }
 

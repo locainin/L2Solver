@@ -129,7 +129,7 @@ fn empty_input_preserved_downstream_parser() -> Result<(), Box<dyn Error>> {
         observation.input().link_type(),
         wifi_lab::LinkType::Radiotap
     );
-    assert!(observation.input().bytes().is_empty());
+    assert_eq!(observation.input().bytes(), []);
     Ok(())
 }
 
@@ -143,7 +143,7 @@ fn unregistered_air_reports_loss() -> Result<(), Box<dyn Error>> {
     ))?;
 
     let report = air.run()?;
-    assert!(report.observations().is_empty());
+    assert_eq!(report.observations(), []);
     let loss = report.losses().first().ok_or("missing no-radio loss")?;
     assert_eq!(loss.reason(), LossReason::NoRadio);
     assert_eq!(report.accounting().captured_records(), 0);

@@ -8,8 +8,12 @@ mod stream;
 
 pub use handshake::{HandshakeAssessment, HandshakeMatch, HandshakeStatus};
 use l2_audit::ForensicScope;
-use l2_capture::{CapturedFrame, LinkType};
-use l2_discovery::{TransportHeader, fragment_packet, ip_packet};
+use l2_capture::CapturedFrame;
+use l2_core::FrameField;
+use l2_discovery::{
+    TransportHeader, fragment_packet_from_payload, ip_packet_from_payload,
+    link::decode_network_frame,
+};
 pub use model::{
     ByteRun, Coverage, Datagram, Endpoint, InputSelection, Limits, Origin, ReconstructionReport,
     RecordRetentionLimit, RecordRetentionStatus, Stream, TcpSession, UdpMessage,
@@ -284,24 +288,30 @@ impl Reconstructor {
         }
         // Reserving the full captured size also bounds control-only observations
         self.retained_bytes += captured.bytes().len();
-        if captured.metadata().link_type() != LinkType::Ethernet {
-            self.unsupported_frames += 1;
-            return true;
-        }
-        let Ok(frame) = l2_core::decode(captured.bytes()) else {
+        let Some(frame) = decode_network_frame(captured.metadata().link_type(), captured.bytes())
+        else {
             self.unsupported_frames += 1;
             return true;
         };
-        let scope = ForensicScope::new(captured.metadata(), &frame);
-        let header_length = 14 + frame.vlan_tags.len() * 4;
-        if let Some(fragment) = fragment_packet(&frame) {
+        let Some(field) = frame.field() else {
+            // Cooked protocol fields without EtherType semantics remain opaque
+            self.unsupported_frames += 1;
+            return true;
+        };
+        let FrameField::EtherType(protocol) = field else {
+            return true;
+        };
+        let scope = ForensicScope::from_network_frame(captured.metadata(), &frame);
+        // Offsets always refer to the original captured link header
+        let header_length = frame.payload_offset();
+        if let Some(fragment) = fragment_packet_from_payload(protocol, frame.payload()) {
             self.pieces.push(fragments::Piece::new(
                 scope,
                 packet,
                 header_length,
                 fragment,
             ));
-        } else if let Some(ip) = ip_packet(&frame) {
+        } else if let Some(ip) = ip_packet_from_payload(protocol, frame.payload()) {
             if let Some(transport) = ip.transport {
                 self.transports.push(Transport {
                     scope,
@@ -336,7 +346,7 @@ impl Reconstructor {
             } else {
                 self.unsupported_frames += 1;
             }
-        } else if matches!(frame.field, l2_core::FrameField::EtherType(0x0800 | 0x86dd)) {
+        } else if matches!(protocol, 0x0800 | 0x86dd) {
             self.unsupported_frames += 1;
         }
         true

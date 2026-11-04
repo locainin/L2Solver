@@ -152,6 +152,10 @@ fn resolve_object_export(
             &timeout.stable_objects,
             timeout.describe(),
         )?,
+        // Keep cancellation typed when returning through the recovery job
+        Err(process::ProcessError::Cancelled) => {
+            return Err(l2_workbench::job::JobError::Cancelled.into());
+        }
         Err(error) => return Err(error.into()),
     };
     Ok(ResolvedObjectExport {

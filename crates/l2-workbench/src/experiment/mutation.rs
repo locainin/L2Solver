@@ -140,17 +140,11 @@ fn decode_hex(hex: &str) -> Result<Vec<u8>, MutationFailure> {
         return Err(MutationFailure::InvalidHex);
     }
     let mut output = reserve(hex.len() / 2)?;
-    for pair in hex.as_bytes().chunks_exact(2) {
-        let Some(high) = pair
-            .first()
-            .and_then(|byte| crate::hex::decode_nibble(*byte))
-        else {
+    for &[high, low] in hex.as_bytes().as_chunks::<2>().0 {
+        let Some(high) = crate::hex::decode_nibble(high) else {
             return Err(MutationFailure::InvalidHex);
         };
-        let Some(low) = pair
-            .get(1)
-            .and_then(|byte| crate::hex::decode_nibble(*byte))
-        else {
+        let Some(low) = crate::hex::decode_nibble(low) else {
             return Err(MutationFailure::InvalidHex);
         };
         output.push((high << 4) | low);

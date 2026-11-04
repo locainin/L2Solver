@@ -75,9 +75,9 @@ struct RawDirectionalFixture {
     run_nodes: Vec<u64>,
 }
 
-pub(super) struct SessionRelativeFixture {
-    pub(super) case: Case,
-    pub(super) plaintext: Vec<u8>,
+pub struct SessionRelativeFixture {
+    pub(crate) case: Case,
+    pub(crate) plaintext: Vec<u8>,
     pub(super) episode_nodes: Vec<u64>,
 }
 
@@ -1402,7 +1402,7 @@ fn automatic_framing_materialization_reaches_the_record_discovery_barrier() -> T
         .iter()
         .filter(|candidate| candidate.task() == &RecoveryTask::RecordDiscovery)
         .collect::<Vec<_>>();
-    assert!(!record_discoveries.is_empty());
+    assert_ne!(record_discoveries.len(), 0);
     let materialized_frames = case
         .nodes()
         .iter()
@@ -1859,7 +1859,7 @@ fn accepted_frame_identities(accepted: &Value) -> TestResult<&[Value]> {
         .get("frame_identities")
         .and_then(Value::as_array)
         .ok_or("accepted record schema omitted frame identities")?;
-    assert!(!frame_indices.is_empty());
+    assert_ne!(frame_indices.len(), 0);
     assert_eq!(frame_indices.len(), identities.len());
     for (position, (index, identity)) in frame_indices.iter().zip(identities).enumerate() {
         let expected_index = u64::try_from(position).ok();
@@ -2089,11 +2089,15 @@ fn assert_decoded_frames_feed_record_parser(case: &Case, record_diagnostics: &[V
 }
 
 pub(super) fn build_session_relative_fixture() -> TestResult<SessionRelativeFixture> {
+    build_session_relative_fixture_named("independent-relational-recovery")
+}
+
+pub fn build_session_relative_fixture_named(label: &str) -> TestResult<SessionRelativeFixture> {
     const SPLIT_NUMERATORS: [usize; 4] = [1, 3, 1, 2];
     const ARTIFACT_PART_BY_SESSION: [usize; 4] = [2, 3, 0, 1];
 
     let mut case = Case::new();
-    let source = capture(&mut case, "independent-relational-recovery")?;
+    let source = capture(&mut case, label)?;
     let plaintext = synthetic_png([31, 83, 137])?;
     let part_boundaries = [
         0,
@@ -2895,7 +2899,7 @@ fn compact_record_reports_do_not_hide_typed_schema_scheduling() -> TestResult<()
     policy.resources.max_output_bytes = 4_096;
     let limits = policy.record_schema_proposal_limits;
     let (expected_schemas, falsification_count) = typed_survivor_schemas(&sessions, limits)?;
-    assert!(!expected_schemas.is_empty());
+    assert_ne!(expected_schemas.len(), 0);
 
     let plan = RecoveryPlan {
         discover_records: true,

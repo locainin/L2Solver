@@ -190,7 +190,9 @@ fn record_omission_transitions(
             | RecoveryOmission::TransformDiscoveryAnalysis {
                 omitted_candidates: 1..,
                 ..
-            } => {
+            }
+            | RecoveryOmission::XorSearchLimit { .. }
+            | RecoveryOmission::XorMessageOmission { .. } => {
                 job.record_recovery_transition(RecoveryTransition {
                     stage,
                     outcome: RecoveryTransitionOutcome::WorkOmitted,

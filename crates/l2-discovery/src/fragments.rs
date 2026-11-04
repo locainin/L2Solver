@@ -34,31 +34,41 @@ pub struct FragmentPacket<'a> {
 /// Read supported fragment metadata while keeping truncated payload prefixes explicit
 #[must_use]
 pub fn fragment_packet<'a>(frame: &EthernetFrame<'a>) -> Option<FragmentPacket<'a>> {
-    let (family, header, identification, protocol, offset, more, payload_offset) = match frame.field
-    {
-        FrameField::EtherType(0x0800) => {
-            let header = ip::ipv4_header(frame.payload)?;
+    let FrameField::EtherType(protocol) = frame.field else {
+        return None;
+    };
+    fragment_packet_from_payload(protocol, frame.payload)
+}
+
+/// Read fragment facts from a protocol identifier and bounded IP payload
+///
+/// The identifier must have `EtherType` semantics for this link-layer format
+#[must_use]
+pub fn fragment_packet_from_payload(protocol: u16, payload: &[u8]) -> Option<FragmentPacket<'_>> {
+    let (family, header, identification, protocol, offset, more, payload_offset) = match protocol {
+        0x0800 => {
+            let header = ip::ipv4_header(payload)?;
             if !header.fragmented {
                 return None;
             }
-            let flags = read_u16(frame.payload, 6)?;
+            let flags = read_u16(payload, 6)?;
             let start = header.header_len;
             let protocol = header.protocol;
             (
                 IpFamily::V4,
                 header,
-                u32::from(read_u16(frame.payload, 4)?),
+                u32::from(read_u16(payload, 4)?),
                 protocol,
                 usize::from(flags & 0x1fff) * 8,
                 flags & 0x2000 != 0,
                 start,
             )
         }
-        FrameField::EtherType(0x86dd) => ipv6_fragment(frame.payload)?,
+        0x86dd => ipv6_fragment(payload)?,
         _ => return None,
     };
     let declared_payload_length = header.total_len.checked_sub(payload_offset)?;
-    let end = header.total_len.min(frame.payload.len());
+    let end = header.total_len.min(payload.len());
     Some(FragmentPacket {
         family,
         source: header.source,
@@ -69,8 +79,8 @@ pub fn fragment_packet<'a>(frame: &EthernetFrame<'a>) -> Option<FragmentPacket<'
         more,
         payload_offset,
         declared_payload_length,
-        payload: frame.payload.get(payload_offset..end)?,
-        captured_complete: frame.payload.len() >= header.total_len,
+        payload: payload.get(payload_offset..end)?,
+        captured_complete: payload.len() >= header.total_len,
     })
 }
 

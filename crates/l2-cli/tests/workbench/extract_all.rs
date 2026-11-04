@@ -34,7 +34,7 @@ fn writes_recovered_artifacts() -> Result<(), Box<dyn Error>> {
         "{}",
         String::from_utf8_lossy(&output.stderr)
     );
-    assert!(output.stderr.is_empty());
+    assert_eq!(output.stderr.len(), 0);
     verify_recovered_files(&destination, &nodes)?;
     verify_recovered_summary(&destination, &output.stdout)?;
     verify_recovered_manifest(&destination, &case, &nodes)?;
@@ -703,7 +703,7 @@ fn png_parse_edge_required() -> Result<(), Box<dyn Error>> {
     )?;
 
     assert!(output.status.success());
-    assert!(artifact_files(&destination)?.is_empty());
+    assert_eq!(artifact_files(&destination)?.len(), 0);
     let manifest: Value = serde_json::from_slice(&fs::read(destination.join("manifest.json"))?)?;
     assert_eq!(manifest.get("artifacts"), Some(&json!([])));
     Ok(())
@@ -742,7 +742,7 @@ fn png_structure_evidence_required() -> Result<(), Box<dyn Error>> {
     )?;
 
     assert!(output.status.success());
-    assert!(artifact_files(&destination)?.is_empty());
+    assert_eq!(artifact_files(&destination)?.len(), 0);
     let manifest: Value = serde_json::from_slice(&fs::read(destination.join("manifest.json"))?)?;
     assert_eq!(manifest.get("artifacts"), Some(&json!([])));
     Ok(())
@@ -787,7 +787,7 @@ fn forged_png_structure_rejected() -> Result<(), Box<dyn Error>> {
     )?;
 
     assert!(output.status.success());
-    assert!(artifact_files(&destination)?.is_empty());
+    assert_eq!(artifact_files(&destination)?.len(), 0);
     Ok(())
 }
 
@@ -823,7 +823,7 @@ fn png_signature_ignored() -> Result<(), Box<dyn Error>> {
     )?;
 
     assert!(output.status.success());
-    assert!(artifact_files(&destination)?.is_empty());
+    assert_eq!(artifact_files(&destination)?.len(), 0);
     let manifest: Value = serde_json::from_slice(&fs::read(destination.join("manifest.json"))?)?;
     assert_eq!(manifest.get("artifacts"), Some(&json!([])));
     Ok(())
@@ -1031,7 +1031,7 @@ fn hypothesis_parse_not_promoted() -> Result<(), Box<dyn Error>> {
         "{}",
         String::from_utf8_lossy(&output.stderr)
     );
-    assert!(artifact_files(&destination)?.is_empty());
+    assert_eq!(artifact_files(&destination)?.len(), 0);
     let manifest: Value = serde_json::from_slice(&fs::read(destination.join("manifest.json"))?)?;
     assert_eq!(manifest.get("artifacts"), Some(&json!([])));
     Ok(())
@@ -1061,7 +1061,7 @@ fn orphan_archive_member_rejected() -> Result<(), Box<dyn Error>> {
     )?;
 
     assert!(output.status.success());
-    assert!(artifact_files(&destination)?.is_empty());
+    assert_eq!(artifact_files(&destination)?.len(), 0);
     Ok(())
 }
 
@@ -1089,7 +1089,7 @@ fn orphan_png_trailer_rejected() -> Result<(), Box<dyn Error>> {
     )?;
 
     assert!(output.status.success());
-    assert!(artifact_files(&destination)?.is_empty());
+    assert_eq!(artifact_files(&destination)?.len(), 0);
     Ok(())
 }
 
@@ -1194,7 +1194,7 @@ fn forged_zip_structure_rejected() -> Result<(), Box<dyn Error>> {
     )?;
 
     assert!(output.status.success());
-    assert!(artifact_files(&destination)?.is_empty());
+    assert_eq!(artifact_files(&destination)?.len(), 0);
     Ok(())
 }
 
@@ -1232,7 +1232,7 @@ fn forged_valid_zip_structure_rejected() -> Result<(), Box<dyn Error>> {
     )?;
 
     assert!(output.status.success());
-    assert!(artifact_files(&destination)?.is_empty());
+    assert_eq!(artifact_files(&destination)?.len(), 0);
     assert!(case.edges().iter().any(|edge| {
         edge.from == input
             && edge.to == forged_structure
@@ -1344,7 +1344,7 @@ fn zip_structure_reference_mismatch_rejected() -> Result<(), Box<dyn Error>> {
     )?;
 
     assert!(output.status.success());
-    assert!(artifact_files(&destination)?.is_empty());
+    assert_eq!(artifact_files(&destination)?.len(), 0);
     Ok(())
 }
 
@@ -1368,7 +1368,7 @@ fn forged_der_structure_rejected() -> Result<(), Box<dyn Error>> {
     )?;
 
     assert!(output.status.success());
-    assert!(artifact_files(&destination)?.is_empty());
+    assert_eq!(artifact_files(&destination)?.len(), 0);
     Ok(())
 }
 
@@ -1406,7 +1406,7 @@ fn forged_valid_der_structure_rejected() -> Result<(), Box<dyn Error>> {
     )?;
 
     assert!(output.status.success());
-    assert!(artifact_files(&destination)?.is_empty());
+    assert_eq!(artifact_files(&destination)?.len(), 0);
     assert!(case.edges().iter().any(|edge| {
         edge.from == input
             && edge.to == forged_structure
@@ -1455,7 +1455,7 @@ fn der_structure_reference_mismatch_rejected() -> Result<(), Box<dyn Error>> {
     )?;
 
     assert!(output.status.success());
-    assert!(artifact_files(&destination)?.is_empty());
+    assert_eq!(artifact_files(&destination)?.len(), 0);
     Ok(())
 }
 
@@ -1888,7 +1888,7 @@ fn incomplete_evidence_excluded() -> Result<(), Box<dyn Error>> {
     )?;
 
     assert!(output.status.success());
-    assert!(artifact_files(&destination)?.is_empty());
+    assert_eq!(artifact_files(&destination)?.len(), 0);
     let summary = fs::read_to_string(destination.join("summary.txt"))?;
     assert!(summary.contains("Files: 0"));
     for kind in ["packet", "tcp_run", "record_candidate", "png_chunk_payload"] {
@@ -1923,7 +1923,7 @@ fn existing_directory_preserved() -> Result<(), Box<dyn Error>> {
     )?;
 
     assert_eq!(output.status.code(), Some(1));
-    assert!(output.stdout.is_empty());
+    assert_eq!(output.stdout.len(), 0);
     assert_eq!(
         fs::read(destination.join("keep.txt"))?,
         b"preserve existing data"
@@ -1956,7 +1956,7 @@ fn output_traversal_rejected() -> Result<(), Box<dyn Error>> {
     )?;
 
     assert_eq!(output.status.code(), Some(1));
-    assert!(output.stdout.is_empty());
+    assert_eq!(output.stdout.len(), 0);
     assert!(!destination.exists());
     Ok(())
 }
@@ -1992,7 +1992,7 @@ fn output_symlink_rejected() -> Result<(), Box<dyn Error>> {
     )?;
 
     assert_eq!(output.status.code(), Some(1));
-    assert!(output.stdout.is_empty());
+    assert_eq!(output.stdout.len(), 0);
     assert_eq!(fs::read(target.join("keep.txt"))?, b"preserve");
     assert_eq!(fs::read_dir(&target)?.count(), 1);
     assert!(fs::symlink_metadata(destination)?.file_type().is_symlink());
@@ -2030,7 +2030,7 @@ fn parent_symlink_rejected() -> Result<(), Box<dyn Error>> {
     )?;
 
     assert_eq!(output.status.code(), Some(1));
-    assert!(output.stdout.is_empty());
+    assert_eq!(output.stdout.len(), 0);
     assert!(!target.join("artifacts").exists());
     assert_eq!(fs::read_dir(target)?.count(), 0);
     Ok(())
@@ -2054,7 +2054,7 @@ fn invalid_case_rejected() -> Result<(), Box<dyn Error>> {
     )?;
 
     assert_eq!(output.status.code(), Some(1));
-    assert!(output.stdout.is_empty());
+    assert_eq!(output.stdout.len(), 0);
     assert!(!destination.exists());
     Ok(())
 }

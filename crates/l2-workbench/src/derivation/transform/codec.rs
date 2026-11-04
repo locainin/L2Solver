@@ -22,7 +22,7 @@ pub(super) fn hex_decode<A: Admission>(
     let output_length = input.len() / 2;
     check_output_size(output_length, budget)?;
     let mut output = Buffer::with_capacity(output_length, admission)?;
-    for (pair_index, pair) in input.chunks_exact(2).enumerate() {
+    for (pair_index, pair) in input.as_chunks::<2>().0.iter().enumerate() {
         let decoded =
             pair.iter()
                 .copied()

@@ -34,7 +34,8 @@ def completion_check(tmp_path):
         'if [ "$2" = "$L2_TEST_BAD_SHELL" ]; then\n'
         '    if [ "$L2_TEST_BAD_MODE" = generator ]; then exit 7; fi\n'
         '    if [ "$L2_TEST_BAD_MODE" = empty ]; then exit 0; fi\n'
-        "    printf 'if\\n'\n"
+        # A condition makes the unfinished block invalid in each supported shell
+        "    printf 'if true\\n'\n"
         "else\n"
         "    printf 'echo complete\\n'\n"
         "fi\n"
@@ -86,13 +87,10 @@ def test_release_completion_check_rejects_each_empty_script(
 
 def test_namespace_suite_has_runtime_tools_and_user_manager_before_execution():
     workflow = (ROOT / ".github/workflows/release-linux.yml").read_text()
-    tools = workflow.index("      - name: Install candidate check tools")
-    build_check = workflow.index("      - name: Check workspace Clippy")
+    requirements = (ROOT / ".github/actions/prepare-test-runner/action.yml").read_text()
     suite = workflow.index("      - name: Run workspace tests with Nextest")
-    assert tools < build_check < suite
-    setup = workflow.index("      - name: Prepare isolated-test user services")
-    assert tools < setup < suite
-    requirements = workflow[tools:setup]
+    assert workflow.rindex("uses: ./.github/actions/prepare-test-runner", 0, suite) < suite
+    assert "Prepare isolated-test user services" in requirements
     for package in ("iproute2", "python3-scapy", "tcpdump", "iputils-ping", "ethtool", "libcap2-bin", "libpcap-dev", "dbus-user-session"):
         assert package in requirements, f"missing namespace/runtime dependency: {package}"
     assert "libsqlite3-dev" not in requirements

@@ -29,7 +29,7 @@ fn scapy_dtp_claims_preserve_exact_values_without_sending() -> Result<(), Box<dy
     assert_eq!(trunk_type.administrative(), DtpTrunkEncapsulation::Dot1q);
     assert_eq!(observation.frame().bytes(), fixture::DTP);
     assert!(!report.summary().send_attempted());
-    assert!(link.sent.is_empty());
+    assert_eq!(link.sent, [] as [std::vec::Vec<u8>; 0]);
     let debug = format!("{report:?}");
     assert!(!debug.contains("PRIVATE-DOMAIN"));
     assert!(!debug.contains("PADDING-SECRET"));

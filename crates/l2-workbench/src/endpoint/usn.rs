@@ -268,14 +268,11 @@ fn validate_name_range(
 
 fn decode_utf16(bytes: &[u8]) -> Result<String, EndpointImportError> {
     let words = bytes
-        .chunks_exact(2)
-        .map(|pair| {
-            let raw = pair
-                .try_into()
-                .map_err(|_| error("USN filename word is truncated"))?;
-            Ok(u16::from_le_bytes(raw))
-        })
-        .collect::<Result<Vec<_>, EndpointImportError>>()?;
+        .as_chunks::<2>()
+        .0
+        .iter()
+        .map(|pair| u16::from_le_bytes(*pair))
+        .collect::<Vec<_>>();
     String::from_utf16(&words).map_err(|_| error("USN filename has invalid UTF-16"))
 }
 

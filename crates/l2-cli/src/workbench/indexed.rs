@@ -156,20 +156,12 @@ fn occurrence_cursor(
 }
 
 fn decode_hex(value: &str) -> Result<Vec<u8>, Box<dyn Error>> {
-    let mut chunks = value.as_bytes().chunks_exact(2);
+    let (chunks, remainder) = value.as_bytes().as_chunks::<2>();
     let mut bytes = Vec::with_capacity(value.len() / 2);
-    for pair in &mut chunks {
-        let high = pair
-            .first()
-            .copied()
-            .ok_or_else(|| invalid_argument("invalid hex key"))?;
-        let low = pair
-            .get(1)
-            .copied()
-            .ok_or_else(|| invalid_argument("invalid hex key"))?;
+    for &[high, low] in chunks {
         bytes.push((hex_digit(high)? << 4) | hex_digit(low)?);
     }
-    if !chunks.remainder().is_empty() {
+    if !remainder.is_empty() {
         return Err(invalid_argument("hex key must contain pairs of digits"));
     }
     Ok(bytes)

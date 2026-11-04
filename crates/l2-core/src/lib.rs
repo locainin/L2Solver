@@ -24,9 +24,10 @@ pub const MAX_VLAN_TAGS: usize = 4;
 // IEEE 802.3 reserves values through 1500 for the length field
 const LENGTH_FIELD_MAX: u16 = 1_500;
 
-// The EtherType range starts at 1536 after the reserved gap
-const ETHERTYPE_MIN: u16 = 1_536;
+/// The first `EtherType` value after the reserved Ethernet type/length gap
+pub const ETHERTYPE_MIN: u16 = 1_536;
 
-// Supported VLAN tag protocol identifiers
-const TPID_8021Q: u16 = 0x8100;
-const TPID_8021AD: u16 = 0x88a8;
+/// IEEE 802.1Q VLAN tag protocol identifier
+pub const TPID_8021Q: u16 = 0x8100;
+/// IEEE 802.1ad VLAN tag protocol identifier
+pub const TPID_8021AD: u16 = 0x88a8;

@@ -1,8 +1,44 @@
-use super::{Inventory, Result, Source, Store, invalid, verify};
+use super::{IngestReceipt, Inventory, Result, Source, Store, invalid, verify};
 use l2_pcap::CollectionSummary;
-use rusqlite::Connection;
+use rusqlite::{Connection, OptionalExtension};
 
 impl Store {
+    /// Check a receipt against the source metadata retained in this index
+    ///
+    /// # Errors
+    /// Rejects missing sources and inconsistent counts or collection declarations
+    pub fn validate_ingest_receipt(&self, receipt: &IngestReceipt) -> Result<()> {
+        let stored: Option<(u64, u64, u64, String)> = self
+            .connection
+            .query_row(
+                "SELECT bytes,packets,unsupported,collection_summary FROM sources WHERE sha256=?1",
+                [&receipt.source_id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .optional()?;
+        let Some((bytes, packets, unsupported, summary)) = stored else {
+            return Err(invalid("ingest receipt source is not in the index"));
+        };
+        // Derive supported packets from the source's canonical stored counts
+        let supported = packets
+            .checked_sub(unsupported)
+            .ok_or_else(|| invalid("invalid indexed packet totals"))?;
+        if (bytes, packets, supported, unsupported)
+            != (
+                receipt.bytes,
+                receipt.packets,
+                receipt.transport_packets,
+                receipt.unsupported_transport_packets,
+            )
+            || crate::capture_collection::from_json(&summary)? != receipt.collection_summary
+        {
+            return Err(invalid(
+                "ingest receipt does not match indexed source metadata",
+            ));
+        }
+        Ok(())
+    }
+
     /// Count disk-resident facts without materializing their connection state
     ///
     /// # Errors

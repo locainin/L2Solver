@@ -512,7 +512,7 @@ const fn is_encoding_byte(byte: u8) -> bool {
     byte.is_ascii_alphanumeric() || matches!(byte, b'+' | b'/' | b'=' | b'-' | b'_')
 }
 
-const DELIMITERS: [u8; 7] = [b':', b'|', b';', b',', b'\n', b'\r', b'\t'];
+const DELIMITERS: [u8; 7] = *b":|;,\n\r\t";
 
 const fn delimiter_index(byte: u8) -> Option<usize> {
     match byte {

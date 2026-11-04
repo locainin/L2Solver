@@ -16,5 +16,7 @@ mod support;
 #[path = "imports.rs"]
 mod imports;
 
+#[path = "cooked.rs"]
+mod cooked;
 #[path = "lifecycle.rs"]
 mod lifecycle;

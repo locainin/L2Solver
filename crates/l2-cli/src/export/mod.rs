@@ -118,7 +118,7 @@ pub fn run_with_job(
             writeln!(
                 output,
                 "Reused {} artifacts in {}{}",
-                reused.artifacts.len(),
+                reused.artifact_count,
                 destination.display().to_string().escape_debug(),
                 if reused.complete {
                     ""

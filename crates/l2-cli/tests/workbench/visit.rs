@@ -218,7 +218,7 @@ fn bundle_visiting_page_hash_mismatch() -> Result<(), Box<dyn Error>> {
     write_manifest(&bundle, &manifest)?;
     let output = run_query(&bundle)?;
     assert_eq!(output.status.code(), Some(1));
-    assert!(output.stdout.is_empty());
+    assert_eq!(output.stdout.len(), 0);
     Ok(())
 }
 
@@ -234,7 +234,7 @@ fn bundle_visiting_noncanonical_page_paths() -> Result<(), Box<dyn Error>> {
     write_manifest(&bundle, &manifest)?;
     let output = run_query(&bundle)?;
     assert_eq!(output.status.code(), Some(1));
-    assert!(output.stdout.is_empty());
+    assert_eq!(output.stdout.len(), 0);
     Ok(())
 }
 
@@ -245,7 +245,7 @@ fn bundle_visiting_rejects_missing_pages() -> Result<(), Box<dyn Error>> {
     fs::remove_file(bundle.join("pages/000002.json"))?;
     let output = run_query(&bundle)?;
     assert_eq!(output.status.code(), Some(1));
-    assert!(output.stdout.is_empty());
+    assert_eq!(output.stdout.len(), 0);
     Ok(())
 }
 
@@ -263,7 +263,7 @@ fn bundle_visiting_symlinked_page_documents() -> Result<(), Box<dyn Error>> {
 
     let output = run_query_with_timeout(&bundle)?;
     assert_eq!(output.status.code(), Some(1));
-    assert!(output.stdout.is_empty());
+    assert_eq!(output.stdout.len(), 0);
     Ok(())
 }
 
@@ -281,7 +281,7 @@ fn bundle_visiting_documents_without_blocking() -> Result<(), Box<dyn Error>> {
 
     let output = run_query_with_timeout(&bundle)?;
     assert_eq!(output.status.code(), Some(1));
-    assert!(output.stdout.is_empty());
+    assert_eq!(output.stdout.len(), 0);
     Ok(())
 }
 
@@ -299,7 +299,7 @@ fn bundle_visiting_primary_gaps() -> Result<(), Box<dyn Error>> {
     write_manifest(&bundle, &manifest)?;
     let output = run_query(&bundle)?;
     assert_eq!(output.status.code(), Some(1));
-    assert!(output.stdout.is_empty());
+    assert_eq!(output.stdout.len(), 0);
     Ok(())
 }
 
@@ -333,7 +333,7 @@ fn bundle_visiting_summary_window_gaps() -> Result<(), Box<dyn Error>> {
     write_manifest(&bundle, &manifest)?;
     let output = run_query(&bundle)?;
     assert_eq!(output.status.code(), Some(1));
-    assert!(output.stdout.is_empty());
+    assert_eq!(output.stdout.len(), 0);
     Ok(())
 }
 
@@ -345,7 +345,7 @@ fn bundle_visiting_inaccurate_raw_completeness() -> Result<(), Box<dyn Error>> {
     write_manifest(&bundle, &manifest)?;
     let output = run_query(&bundle)?;
     assert_eq!(output.status.code(), Some(1));
-    assert!(output.stdout.is_empty());
+    assert_eq!(output.stdout.len(), 0);
     Ok(())
 }
 
@@ -361,7 +361,7 @@ fn bundle_visiting_page_completeness_mismatch() -> Result<(), Box<dyn Error>> {
     write_manifest(&bundle, &manifest)?;
     let output = run_query(&bundle)?;
     assert_eq!(output.status.code(), Some(1));
-    assert!(output.stdout.is_empty());
+    assert_eq!(output.stdout.len(), 0);
     Ok(())
 }
 
@@ -430,6 +430,6 @@ fn bundle_visiting_unknown_manifest_fields() -> Result<(), Box<dyn Error>> {
     write_manifest(&bundle, &manifest)?;
     let output = run_query(&bundle)?;
     assert_eq!(output.status.code(), Some(1));
-    assert!(output.stdout.is_empty());
+    assert_eq!(output.stdout.len(), 0);
     Ok(())
 }

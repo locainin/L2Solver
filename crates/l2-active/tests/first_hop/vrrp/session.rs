@@ -43,7 +43,7 @@ fn scoped_advertisement_preserves_claims_addresses_and_receive_only_accounting()
     assert_eq!(item.frame().bytes(), VALID);
     assert_eq!(report.summary().received_packets(), 1);
     assert_eq!(report.summary().sent_packets(), 0);
-    assert!(link.sent.is_empty());
+    assert_eq!(link.sent, [] as [std::vec::Vec<u8>; 0]);
     Ok(())
 }
 
@@ -82,7 +82,7 @@ fn unrelated_frames_consume_the_selected_packet_or_byte_budget() -> Result<(), B
         assert_eq!(report.summary().received_packets(), 1);
         assert_eq!(report.summary().stop_reason(), expected_stop);
         assert_eq!(link.events.len(), 1);
-        assert!(link.sent.is_empty());
+        assert_eq!(link.sent, [] as [std::vec::Vec<u8>; 0]);
     }
     Ok(())
 }
@@ -483,7 +483,7 @@ fn silence_cancellation_loss_and_expired_deadlines_never_claim_a_router()
     let expired =
         monitor(None, 4, 4_096)?.run_until(&mut link, &AtomicBool::new(false), Instant::now())?;
     assert_eq!(expired.summary().stop_reason(), StopReason::Deadline);
-    assert!(link.sent.is_empty());
+    assert_eq!(link.sent, [] as [std::vec::Vec<u8>; 0]);
     Ok(())
 }
 

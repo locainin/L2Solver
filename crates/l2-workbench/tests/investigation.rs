@@ -6,10 +6,14 @@ mod artifacts;
 mod carrier_cohorts;
 #[path = "investigation/support.rs"]
 mod case_support;
+#[path = "investigation/cooked.rs"]
+mod cooked;
 #[path = "investigation/fragments.rs"]
 mod fragments;
 #[path = "investigation/ftp.rs"]
 mod ftp;
+#[path = "investigation/http_chunks.rs"]
+mod http_chunks;
 #[path = "investigation/large_runs.rs"]
 mod large_runs;
 #[path = "investigation/link_type.rs"]

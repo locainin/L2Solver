@@ -247,9 +247,9 @@ fn ages_by_elapsed_capture_time() -> Result<(), Box<dyn Error>> {
 #[test]
 fn preserves_observer_clock_sources() {
     let error = l2_engine::StpObserverError::InvalidAge;
-    assert!(!error.to_string().is_empty());
+    assert_ne!(error.to_string(), "");
     let clock = l2_engine::ClockError::DurationTooLarge { nanos: 9 };
     let wrapped = l2_engine::StpObserverError::Clock(clock);
-    assert!(!wrapped.to_string().is_empty());
+    assert_ne!(wrapped.to_string(), "");
     assert!(std::error::Error::source(&wrapped).is_some());
 }

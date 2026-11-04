@@ -9,6 +9,7 @@ type TestResult<T = ()> = Result<T, Box<dyn Error>>;
 
 mod publication_transition;
 mod publish;
+mod reuse_source;
 mod snapshot;
 mod strict_reuse;
 
@@ -174,14 +175,7 @@ fn newly_published_complete_result_is_reused_with_declared_artifacts() -> TestRe
         )?
         .ok_or("an owned result should be available")?;
     assert!(reused.complete);
-    assert_eq!(reused.artifacts.len(), 1);
-    assert_eq!(
-        reused
-            .artifacts
-            .first()
-            .map(|artifact| artifact.file.as_str()),
-        Some("artifact.bin")
-    );
+    assert_eq!(reused.artifact_count, 1);
     Ok(())
 }
 
@@ -798,14 +792,7 @@ fn gzip_evidence_sidecar_is_owned_and_reused_from_its_manifest_name() -> TestRes
         .ok_or("a result with its declared gzip sidecar should be reusable")?;
 
     assert!(reused.complete);
-    assert_eq!(reused.artifacts.len(), 1);
-    assert_eq!(
-        reused
-            .artifacts
-            .first()
-            .map(|artifact| artifact.file.as_str()),
-        Some("artifact.bin")
-    );
+    assert_eq!(reused.artifact_count, 1);
     Ok(())
 }
 
@@ -888,7 +875,7 @@ fn refine_result_identity_uses_the_ordered_manifest_source_set() -> TestResult {
         .reuse(&identity, None, true, &Job::new("reuse"))?
         .ok_or("an owned refine result should be available")?;
     assert!(reused.complete);
-    assert!(reused.artifacts.is_empty());
+    assert_eq!(reused.artifact_count, 0);
     Ok(())
 }
 

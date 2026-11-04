@@ -203,7 +203,7 @@ fn zip_end_observation_reports_candidate_and_scan_limits() -> Result<(), Box<dyn
     )?;
     let observed = result.zip_observation.ok_or("ZIP observation missing")?;
     assert_eq!(observed.scanned_bytes, 10);
-    assert!(observed.candidates.is_empty());
+    assert_eq!(observed.candidates.len(), 0);
     assert_eq!(observed.unscanned_bytes, source.len());
     Ok(())
 }
@@ -434,7 +434,7 @@ fn rolling_ranges_report_uncovered_bytes_and_keep_the_full_digest() -> Result<()
     let report = analyze_artifacts_from_reader(&mut Cursor::new(&bytes), bytes.len(), options)?;
     assert_eq!(report.source_sha256, l2_workbench::sha256(&bytes));
     assert_eq!(report.status, AnalysisStatus::Partial);
-    assert!(report.artifacts.is_empty());
+    assert_eq!(report.artifacts.len(), 0);
     assert!(report.omissions.iter().any(|omission| matches!(
         omission,
         AnalysisOmission::SourceRangeCoverage {
@@ -610,7 +610,7 @@ fn zero_output_budget_keeps_source_digest_and_reports_omitted_candidate()
     options.limits.max_total_output_bytes = 0;
     let report = analyze_artifacts_from_reader(&mut Cursor::new(&png), png.len(), options)?;
     assert_eq!(report.source_sha256, l2_workbench::sha256(&png));
-    assert!(report.artifacts.is_empty());
+    assert_eq!(report.artifacts.len(), 0);
     assert!(report.omissions.iter().any(|omission| matches!(omission,
         AnalysisOmission::SourceRangeCoverage { omitted_candidates, .. } if *omitted_candidates > 0)));
     Ok(())

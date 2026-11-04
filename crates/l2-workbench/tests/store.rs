@@ -10,6 +10,12 @@ mod frames;
 #[path = "store/collection.rs"]
 mod collection;
 
+#[path = "../../../tests/fixtures/cooked.rs"]
+mod cooked_fixture;
+
+#[path = "store/cooked.rs"]
+mod cooked;
+
 #[path = "store/cache.rs"]
 mod cache;
 
@@ -33,6 +39,9 @@ mod memory;
 
 #[path = "store/scopes.rs"]
 mod scopes;
+
+#[path = "store/selection_budget.rs"]
+mod selection_budget;
 
 #[path = "store/support.rs"]
 mod support;

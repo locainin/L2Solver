@@ -65,8 +65,14 @@ fn probes_invalid_never_changes() -> TestResult {
         captured(arp(SECOND_MAC, SECOND_MAC, ADDRESS), 0)?,
     ])?;
     assert_eq!(report.forensics.arp_observations.len(), 4);
-    assert!(report.forensics.arp_changes.is_empty());
-    assert!(report.network_model.address_conflicts.is_empty());
+    assert_eq!(
+        report.forensics.arp_changes,
+        [] as [l2_audit::ArpBindingChange; 0]
+    );
+    assert_eq!(
+        report.network_model.address_conflicts,
+        [] as [l2_audit::AddressConflict; 0]
+    );
     Ok(())
 }
 
@@ -102,8 +108,14 @@ fn reserved_vlan_not_binding_comparisons() -> TestResult {
     ])?;
     // Raw claims remain available even when a VLAN identifier cannot name valid membership
     assert_eq!(report.forensics.arp_observations.len(), 2);
-    assert!(report.forensics.arp_changes.is_empty());
-    assert!(report.network_model.address_conflicts.is_empty());
+    assert_eq!(
+        report.forensics.arp_changes,
+        [] as [l2_audit::ArpBindingChange; 0]
+    );
+    assert_eq!(
+        report.network_model.address_conflicts,
+        [] as [l2_audit::AddressConflict; 0]
+    );
     Ok(())
 }
 
@@ -130,8 +142,14 @@ fn auxiliary_vlan_claims_kept_separate() -> TestResult {
         ),
     )?;
     let report = assess([first, second])?;
-    assert!(report.forensics.arp_changes.is_empty());
-    assert!(report.network_model.address_conflicts.is_empty());
+    assert_eq!(
+        report.forensics.arp_changes,
+        [] as [l2_audit::ArpBindingChange; 0]
+    );
+    assert_eq!(
+        report.network_model.address_conflicts,
+        [] as [l2_audit::AddressConflict; 0]
+    );
     assert!(
         report
             .forensics

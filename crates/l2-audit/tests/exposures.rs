@@ -90,7 +90,7 @@ fn malformed_fingerprints_remain_diagnostics() -> Result<(), Box<dyn Error>> {
 
     let assessment = assess(&[observed], &Policy::default(), &Quality::default())?;
 
-    assert!(assessment.exposures.is_empty());
+    assert_eq!(assessment.exposures, [] as [l2_audit::Exposure; 0]);
     assert!(assessment.findings.is_empty());
     Ok(())
 }

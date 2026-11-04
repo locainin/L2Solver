@@ -20,7 +20,7 @@ fn indexed_shared_results_malformed_keys() -> Result<(), Box<dyn Error>> {
 
     let groups = run(&["indexed", path_arg(&directory)?, "shared-groups"], b"")?;
     assert!(groups.status.success());
-    assert!(groups.stdout.is_empty());
+    assert_eq!(groups.stdout.len(), 0);
 
     let occurrences = run(
         &[
@@ -35,7 +35,7 @@ fn indexed_shared_results_malformed_keys() -> Result<(), Box<dyn Error>> {
         b"",
     )?;
     assert!(occurrences.status.success());
-    assert!(occurrences.stdout.is_empty());
+    assert_eq!(occurrences.stdout.len(), 0);
 
     let malformed = run(
         &[

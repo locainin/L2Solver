@@ -91,3 +91,19 @@ fn cache_reader_checks_database_payload_status_version_and_topology() -> TestRes
     assert_eq!(loaded.snapshot, snapshot);
     Ok(())
 }
+
+#[test]
+fn valid_65536_byte_checkpoint_row_is_read_and_exercised() -> TestResult {
+    let cache = checkpoint_readers::cache::Fixture::new()?;
+    let snapshot = Job::new("generated boundary row").snapshot()?;
+    let mut row = vec![b' '];
+    row.extend_from_slice(&serde_json::to_vec(&snapshot)?);
+    row.resize(65_536, b' ');
+
+    let loaded = cache
+        .read(&row, 1, i64::from(JOB_SNAPSHOT_VERSION))?
+        .ok_or("missing boundary checkpoint")?;
+    assert_eq!(loaded.snapshot, snapshot);
+    checkpoint_readers::exercise(&row);
+    Ok(())
+}

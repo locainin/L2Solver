@@ -1,4 +1,4 @@
-use super::{decode_deadline, encode_deadline, ensure_before, monotonic_nanos};
+use super::{decode_deadline, decode_deadline_at, encode_deadline, ensure_before, monotonic_nanos};
 use std::{
     io,
     time::{Duration, Instant},
@@ -75,4 +75,37 @@ fn zero_ceiling_and_excessive_worker_deadlines_are_rejected() -> io::Result<()> 
 #[test]
 fn a_live_deadline_allows_the_operation() -> io::Result<()> {
     ensure_before(Instant::now() + Duration::from_secs(30))
+}
+
+#[test]
+fn decoded_deadline_enforces_exact_expiry_and_worker_ceiling() -> io::Result<()> {
+    let sampled = Instant::now();
+    let monotonic = 10_000;
+    let ceiling = u64::try_from(l2_active::MAX_TIMEOUT.as_nanos()).map_err(io::Error::other)?;
+
+    assert_eq!(
+        decode_deadline_at(monotonic, sampled, monotonic)
+            .err()
+            .map(|error| error.kind()),
+        Some(io::ErrorKind::TimedOut),
+        "a deadline equal to the sampled clock is already expired"
+    );
+    assert_eq!(
+        decode_deadline_at(monotonic + 1, sampled, monotonic)?,
+        sampled + Duration::from_nanos(1),
+        "a positive remaining deadline is accepted"
+    );
+    assert_eq!(
+        decode_deadline_at(monotonic + ceiling, sampled, monotonic)?,
+        sampled + l2_active::MAX_TIMEOUT,
+        "the worker accepts its exact timeout ceiling"
+    );
+    assert_eq!(
+        decode_deadline_at(monotonic + ceiling + 1, sampled, monotonic)
+            .err()
+            .map(|error| error.kind()),
+        Some(io::ErrorKind::InvalidInput),
+        "a deadline above the worker ceiling is rejected"
+    );
+    Ok(())
 }

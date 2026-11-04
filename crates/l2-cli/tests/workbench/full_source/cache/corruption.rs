@@ -118,7 +118,7 @@ fn assert_strict_rejects(directory: &Path, cache: &Cache, capture: &Path) -> Tes
         },
     );
     assert!(result.is_err());
-    assert!(job.snapshot()?.cache_fallbacks.records().is_empty());
+    assert_eq!(job.snapshot()?.cache_fallbacks.records().len(), 0);
     Ok(())
 }
 
@@ -355,7 +355,7 @@ fn memory_denial_does_not_start_an_uncached_fallback() -> TestResult {
     );
     let error = result.err().ok_or("memory denial was ignored")?;
     assert!(crate::memory_error::find(error.as_ref()).is_some());
-    assert!(job.snapshot()?.cache_fallbacks.records().is_empty());
+    assert_eq!(job.snapshot()?.cache_fallbacks.records().len(), 0);
     assert!(memory.snapshot()?.rejected > 0);
     Ok(())
 }
@@ -385,6 +385,6 @@ fn cancellation_during_corrupt_cache_lookup_does_not_start_fallback() -> TestRes
         },
     );
     assert!(result.is_err());
-    assert!(job.snapshot()?.cache_fallbacks.records().is_empty());
+    assert_eq!(job.snapshot()?.cache_fallbacks.records().len(), 0);
     Ok(())
 }

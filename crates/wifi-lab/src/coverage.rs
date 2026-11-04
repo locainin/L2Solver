@@ -158,5 +158,5 @@ fn basis_points(dwell_ns: u64, scheduled_ns: u64) -> u16 {
         return 0;
     }
     let scaled = u128::from(dwell_ns).saturating_mul(10_000) / u128::from(scheduled_ns);
-    u16::try_from(scaled).map_or(u16::MAX, |value| value)
+    u16::try_from(scaled).unwrap_or(u16::MAX)
 }

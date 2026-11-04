@@ -3,6 +3,7 @@
 import json
 import os
 import signal
+import socket
 import subprocess
 import sys
 import tempfile
@@ -262,6 +263,169 @@ class ProcessTests(unittest.TestCase):
             self.assertGreaterEqual(
                 metrics["process_io_bytes"]["wchar_bytes"], payload_size * 2
             )
+
+    @unittest.skipUnless(
+        sys.platform == "linux" and process_module._HAS_WAITID_WNOWAIT,
+        "requires Linux procfs and waitid with WNOWAIT",
+    )
+    def test_io_counts_include_writes_after_initial_sample_when_zombie_open_is_denied(
+        self,
+    ):
+        for deny_initial_open in (False, True):
+            with self.subTest(deny_initial_open=deny_initial_open):
+                self._check_io_after_initial_sample(deny_initial_open)
+
+    def _check_io_after_initial_sample(self, deny_initial_open):
+        with tempfile.TemporaryDirectory() as directory:
+            parent_socket, child_socket = socket.socketpair()
+            self.addCleanup(parent_socket.close)
+            self.addCleanup(child_socket.close)
+            parent_socket.settimeout(5)
+            payload_size = 262_144
+            command = [
+                sys.executable,
+                "-c",
+                textwrap.dedent(
+                    f"""
+                    import os, socket
+                    with socket.socket(fileno={child_socket.fileno()}) as gate:
+                        assert gate.recv(1) == b'x'
+                        for name in ('first.bin', 'second.bin'):
+                            with open(name, 'wb') as target:
+                                target.write(b'x' * {payload_size})
+                                target.flush()
+                                os.fsync(target.fileno())
+                    """
+                ),
+            ]
+            original_popen = subprocess.Popen
+            original_open = Path.open
+            original_sleep = time.sleep
+            state = {"child": None, "exited": False, "initial_open_denied": False}
+
+            def start_child(*args, **kwargs):
+                kwargs["pass_fds"] = (child_socket.fileno(),)
+                state["child"] = original_popen(*args, **kwargs)
+                child_socket.close()
+                return state["child"]
+
+            def deny_zombie_open(path, *args, **kwargs):
+                child = state["child"]
+                if child and path == Path(f"/proc/{child.pid}/io"):
+                    # Older Linux kernels make the zombie proc file root-owned
+                    if state["exited"]:
+                        raise PermissionError("zombie proc file is owned by root")
+                    if deny_initial_open and not state["initial_open_denied"]:
+                        state["initial_open_denied"] = True
+                        raise PermissionError("proc I/O is temporarily unavailable")
+                return original_open(path, *args, **kwargs)
+
+            def finish_child_before_next_sample(seconds):
+                if state["exited"]:
+                    original_sleep(seconds)
+                    return
+                # Let both writes finish after the first sample and before the next one
+                parent_socket.sendall(b"x")
+                self.assertEqual(parent_socket.recv(1), b"")
+                child = state["child"]
+                os.waitid(os.P_PID, child.pid, os.WEXITED | os.WNOWAIT)
+                state["exited"] = True
+
+            with (
+                patch.object(
+                    process_module.subprocess, "Popen", side_effect=start_child
+                ),
+                patch.object(Path, "open", deny_zombie_open),
+                patch.object(
+                    process_module.time, "sleep", finish_child_before_next_sample
+                ),
+            ):
+                result = run_child(command, Path(directory), 5)
+
+            self.assertEqual(result[:3], (0, None, None))
+            self.assertTrue(state["exited"])
+            self.assertEqual(state["initial_open_denied"], deny_initial_open)
+            self.assertGreaterEqual(
+                result[3]["process_io_bytes"]["wchar_bytes"], payload_size * 2
+            )
+
+    @unittest.skipUnless(sys.platform == "linux", "requires Linux process metrics")
+    def test_unavailable_proc_io_leaves_metrics_unavailable(self):
+        with tempfile.TemporaryDirectory() as directory:
+            original_open = Path.open
+
+            def deny_proc_io(path, *args, **kwargs):
+                if path.parent.parent == Path("/proc") and path.name == "io":
+                    raise PermissionError("proc I/O counters are unavailable")
+                return original_open(path, *args, **kwargs)
+
+            with patch.object(Path, "open", deny_proc_io):
+                result = run_child([sys.executable, "-c", "pass"], Path(directory), 5)
+
+            self.assertEqual(result[:3], (0, None, None))
+            self.assertIsNone(result[3]["process_io_bytes"])
+            self.assertEqual(result[3]["io_samples"], 0)
+
+    @unittest.skipUnless(sys.platform == "linux", "requires Linux process metrics")
+    def test_proc_io_path_is_not_reopened_after_child_is_reaped(self):
+        with tempfile.TemporaryDirectory() as directory:
+            original_popen = subprocess.Popen
+            original_open = Path.open
+            state = {"child": None, "late_opens": 0}
+
+            def start_child(*args, **kwargs):
+                state["child"] = original_popen(*args, **kwargs)
+                return state["child"]
+
+            def deny_proc_io(path, *args, **kwargs):
+                child = state["child"]
+                if child and path == Path(f"/proc/{child.pid}/io"):
+                    if child.returncode is not None:
+                        state["late_opens"] += 1
+                    raise PermissionError("proc I/O counters are unavailable")
+                return original_open(path, *args, **kwargs)
+
+            with (
+                patch.object(
+                    process_module.subprocess, "Popen", side_effect=start_child
+                ),
+                patch.object(process_module, "_HAS_WAITID_WNOWAIT", False),
+                patch.object(Path, "open", deny_proc_io),
+            ):
+                result = run_child([sys.executable, "-c", "pass"], Path(directory), 5)
+
+            self.assertEqual(result[:3], (0, None, None))
+            self.assertIsNone(result[3]["process_io_bytes"])
+            self.assertEqual(state["late_opens"], 0)
+
+    @unittest.skipUnless(sys.platform == "linux", "requires Linux process metrics")
+    def test_proc_io_handle_is_closed_when_observer_raises(self):
+        with tempfile.TemporaryDirectory() as directory:
+            original_open = Path.open
+            handles = []
+
+            def record_proc_io(path, *args, **kwargs):
+                opened = original_open(path, *args, **kwargs)
+                if path.parent.parent == Path("/proc") and path.name == "io":
+                    handles.append(opened)
+                return opened
+
+            def fail_sample():
+                raise ValueError("observation unavailable")
+
+            with (
+                patch.object(Path, "open", record_proc_io),
+                self.assertRaisesRegex(ValueError, "observation unavailable"),
+            ):
+                run_child(
+                    [sys.executable, "-c", "import time; time.sleep(10)"],
+                    Path(directory),
+                    5,
+                    sample=fail_sample,
+                )
+
+            self.assertEqual(len(handles), 1)
+            self.assertTrue(handles[0].closed)
 
     def test_exit_drains_all_buffered_chunks(self):
         with tempfile.TemporaryDirectory() as directory:

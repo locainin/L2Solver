@@ -17,7 +17,7 @@ fn observes_actual_lldp_and_cdp_claims_without_any_send() -> Result<(), Box<dyn 
     assert_eq!(report.status(), DiscoveryStatus::Observed);
     assert!(!report.summary().send_attempted());
     assert_eq!(report.summary().sent_packets(), 0);
-    assert!(link.sent.is_empty());
+    assert_eq!(link.sent, [] as [std::vec::Vec<u8>; 0]);
     assert_eq!(report.summary().received_packets(), 2);
     assert_eq!(report.summary().capture_loss(), Some(0));
     assert_eq!(report.summary().capture_backlog(), Some(false));
@@ -122,7 +122,7 @@ fn missing_capture_loss_and_transport_faults_never_create_positive_observations(
     assert_eq!(report.summary().total_received_bytes(), None);
     assert!(report.summary().loss_error().is_some());
     assert!(report.summary().backlog_error().is_some());
-    assert!(broken.sent.is_empty());
+    assert_eq!(broken.sent, [] as [std::vec::Vec<u8>; 0]);
     Ok(())
 }
 
@@ -135,7 +135,7 @@ fn cancellation_limit_and_unscoped_or_truncated_frames_are_accounted() -> Result
     let report = DiscoveryMonitor::new(limits(10, 4096)?).run(&mut link, &cancelled)?;
     assert_eq!(report.summary().stop_reason(), StopReason::Cancelled);
     assert!(report.observations().is_empty());
-    assert!(link.sent.is_empty());
+    assert_eq!(link.sent, [] as [std::vec::Vec<u8>; 0]);
     let mut link = Link::new(vec![event(good.clone())?], Some(0))?;
     let report = DiscoveryMonitor::new(limits(10, 4096)?).run_until(
         &mut link,
@@ -283,7 +283,7 @@ fn observed_claim_survives_loss_and_interface_failure_with_quality_visible()
     assert_eq!(report.summary().stop_reason(), StopReason::InterfaceDown);
     assert_eq!(report.summary().capture_loss(), Some(3));
     assert_eq!(report.summary().capture_backlog(), Some(true));
-    assert!(link.sent.is_empty());
+    assert_eq!(link.sent, [] as [std::vec::Vec<u8>; 0]);
     Ok(())
 }
 

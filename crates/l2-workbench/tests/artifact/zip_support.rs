@@ -137,7 +137,7 @@ pub(super) fn build_zip(entries: &[FixtureEntry<'_>]) -> Result<Vec<u8>, Box<dyn
         let local_offset = u32::try_from(archive.len())?;
         let compressed_length = entry
             .compressed_size
-            .map_or(entry.compressed_bytes.len(), core::convert::identity);
+            .unwrap_or(entry.compressed_bytes.len());
         let compressed_size = u32::try_from(compressed_length)?;
         let uncompressed_size = u32::try_from(entry.uncompressed_size)?;
         write_u32(&mut archive, 0x0403_4b50);

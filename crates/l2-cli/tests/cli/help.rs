@@ -121,7 +121,7 @@ fn assess_help_is_clear() -> Result<(), Box<dyn std::error::Error>> {
         .args(["assess", "--help"])
         .output()?;
     assert!(output.status.success());
-    assert!(output.stderr.is_empty());
+    assert_eq!(output.stderr.len(), 0);
     let text = String::from_utf8(output.stdout)?
         .split_whitespace()
         .collect::<Vec<_>>()
@@ -168,7 +168,7 @@ fn help_explains_incomplete_exit_status() -> Result<(), Box<dyn std::error::Erro
             .args(["workbench", "export", help])
             .output()?;
         assert!(output.status.success());
-        assert!(output.stderr.is_empty());
+        assert_eq!(output.stderr.len(), 0);
         let text = String::from_utf8(output.stdout)?
             .split_whitespace()
             .collect::<Vec<_>>()
@@ -189,7 +189,7 @@ fn extract_all_help_describes_retained_case_artifacts() -> Result<(), Box<dyn st
         .args(["workbench", "extract-all", "--help"])
         .output()?;
     assert!(output.status.success());
-    assert!(output.stderr.is_empty());
+    assert_eq!(output.stderr.len(), 0);
     let text = String::from_utf8(output.stdout)?
         .split_whitespace()
         .collect::<Vec<_>>()

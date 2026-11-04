@@ -65,7 +65,7 @@ fn scapy_vtp_summary_subset_and_request_are_structured_claims() -> Result<(), Bo
         VtpMessageKind::Request { start_value: 37 }
     ));
     assert!(!report.summary().send_attempted());
-    assert!(link.sent.is_empty());
+    assert_eq!(link.sent, [] as [std::vec::Vec<u8>; 0]);
     assert_eq!(
         report
             .observations()

@@ -147,6 +147,14 @@ fn write_source_identity(output: &mut File, summary: &Summary<'_>) -> io::Result
         "Packets without supported transport: {}",
         summary.coverage.source.packets_without_supported_transport
     )?;
+    if summary.coverage.source.packet_records != 0
+        && summary.coverage.source.supported_transport_records == 0
+    {
+        writeln!(
+            output,
+            "Native transport analysis: not performed; no source records had a supported transport envelope"
+        )?;
+    }
     Ok(())
 }
 

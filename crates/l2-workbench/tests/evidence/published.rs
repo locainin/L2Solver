@@ -824,7 +824,7 @@ fn dictionary_pressure_reports_typed_failure_and_admission_keeps_wire_bytes_stab
             .get_ref()
             .is_some_and(|cause| cause.downcast_ref::<MemoryError>().is_some())
     );
-    assert!(interrupted.is_empty());
+    assert_eq!(interrupted.len(), 0);
     assert!(budget.snapshot()?.rejected > 0);
     assert_eq!(budget.snapshot()?.used(MemoryClass::Publication), 0);
     let mut unrestricted = Vec::new();

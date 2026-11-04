@@ -40,8 +40,8 @@ fn region_only_pass_preserves_exact_values_and_derived_source_ranges() -> TestRe
     assert_eq!(region_values(&regions), region_values(&full));
     assert!(regions.coverage.complete);
     assert_eq!(regions.coverage.input_bytes_retained, 10);
-    assert!(regions.integer_interpretations.is_empty());
-    assert!(regions.partial_constraints.is_empty());
+    assert_eq!(regions.integer_interpretations.len(), 0);
+    assert_eq!(regions.partial_constraints.len(), 0);
     assert_eq!(regions.byte_observations.len(), messages.len());
     for (index, byte_fact) in regions.byte_observations.iter().enumerate() {
         assert!(byte_fact.origin_complete);

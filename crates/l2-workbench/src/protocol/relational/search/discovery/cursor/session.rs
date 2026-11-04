@@ -75,7 +75,7 @@ impl<'input, 'bytes> RelationalSearchSession<'input, 'bytes> {
         let digest = identity(samples, plan, options, job)?;
         let parameters = candidate_parameters(plan)?;
         let id = NEXT_SESSION
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |value| {
+            .try_update(Ordering::Relaxed, Ordering::Relaxed, |value| {
                 value.checked_add(1)
             })
             .map_err(|_| {

@@ -64,7 +64,7 @@ fn node_details_limit_rejects_addition() {
     let mut case = Case::new();
     let details = json!({ "note": "x".repeat(l2_workbench::evidence::MAX_NODE_DETAILS_BYTES) });
     assert!(case.add_node("literal", None, Vec::new(), details).is_err());
-    assert!(case.nodes().is_empty());
+    assert_eq!(case.nodes().len(), 0);
 }
 
 #[test]

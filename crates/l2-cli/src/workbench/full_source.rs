@@ -449,27 +449,7 @@ fn validate_indexed_receipt(
     store: &Store,
     receipt: &IngestReceipt,
 ) -> Result<SourceCoverage, Box<dyn Error>> {
-    let mut matching_source_found = false;
-    store.visit_sources(|source| {
-        if source.source_id == receipt.source_id {
-            if matching_source_found {
-                return Err(invalid("ingest receipt matches multiple indexed sources"));
-            }
-            matching_source_found = true;
-            if source.bytes != receipt.bytes || source.packets != receipt.packets {
-                return Err(invalid(
-                    "ingest receipt does not match indexed source metadata",
-                ));
-            }
-        }
-        Ok(())
-    })?;
-    if !matching_source_found {
-        return Err(invalid(
-            "ingest receipt must identify exactly one indexed source",
-        ));
-    }
-
+    store.validate_ingest_receipt(receipt)?;
     Ok(source_coverage(receipt))
 }
 

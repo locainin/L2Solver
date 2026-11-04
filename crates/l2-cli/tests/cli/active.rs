@@ -79,7 +79,7 @@ fn active_protocol_observer_discovery_errors_preserve_codes_and_omit_details()
             Some("discovery")
         );
         assert!(!String::from_utf8_lossy(&output.stderr).contains(&interface));
-        assert!(output.stdout.is_empty());
+        assert_eq!(output.stdout.len(), 0);
     }
     Ok(())
 }

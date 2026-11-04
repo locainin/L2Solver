@@ -446,7 +446,7 @@ fn silent_loss_and_pre_send_cancellation_never_claim_a_request() -> Result<(), B
     let report = probe(8, 4_096)?.run(&mut link, &AtomicBool::new(true))?;
     assert_eq!(report.summary().stop_reason(), StopReason::Cancelled);
     assert_eq!(report.summary().sent_packets(), 0);
-    assert!(link.sent.is_empty());
+    assert_eq!(link.sent, [] as [std::vec::Vec<u8>; 0]);
     Ok(())
 }
 
@@ -456,7 +456,7 @@ fn expired_shared_deadline_prevents_the_start() -> Result<(), Box<dyn Error>> {
     let report = probe(8, 4_096)?.run_until(&mut link, &AtomicBool::new(false), Instant::now())?;
     assert_eq!(report.status(), Dot1xStatus::Inconclusive);
     assert_eq!(report.summary().stop_reason(), StopReason::Deadline);
-    assert!(link.sent.is_empty());
+    assert_eq!(link.sent, [] as [std::vec::Vec<u8>; 0]);
     Ok(())
 }
 

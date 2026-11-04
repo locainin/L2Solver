@@ -384,7 +384,7 @@ fn exact_transform_blob_quota_remains_fatal() -> Result<(), Box<dyn Error>> {
         "an exact caller-selected transform remains fatal on the same aggregate Case quota"
     );
     assert_eq!(*exact_executor.case, before_exact);
-    assert!(exact_executor.omissions.is_empty());
+    assert_eq!(exact_executor.omissions.len(), 0);
     assert!(matches!(
         exact_executor
             .coordinator

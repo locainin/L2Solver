@@ -113,7 +113,7 @@ fn oversized_summary_preserves_case() -> Result<(), Box<dyn Error>> {
         failure.downcast_ref::<EvidenceError>(),
         Some(EvidenceError::NodeDetailsTooLarge { .. })
     ));
-    assert!(result.case.nodes().is_empty());
+    assert_eq!(result.case.nodes().len(), 0);
     assert!(result.complete);
     assert!(result.case.collection_complete());
     result.case.validate()?;
