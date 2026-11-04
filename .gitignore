@@ -1,10 +1,11 @@
 # Build and test outputs
-/target/
-/fuzz/target/
-/fuzz/artifacts/
-/fuzz/corpus/
+/target
+/fuzz/target
+/fuzz/artifacts
+/fuzz/corpus
 /mutants.out*
 __pycache__/
+*.[pP][yY][cC]
 /.pytest_cache/
 /.ruff_cache/
 
@@ -15,16 +16,16 @@ __pycache__/
 /.bacon-locations
 
 # Private data, documentation and review material
-/pcap_samples/
-/tests/pcaps/
-/review/
-/docs/
-/notes/
-/reports/
-/investigations/
-*.md
-*.rst
-*.log
+/pcap_samples
+/tests/pcaps
+/review
+/docs
+/notes
+/reports
+/investigations
+*.[mM][dD]
+*.[rR][sS][tT]
+*.[lL][oO][gG]
 .env
 .env.*
 
@@ -34,13 +35,20 @@ __pycache__/
 /*.bundle
 /review-*.manifest
 *.[cC][aA][pP]
+*.[cC][aA][pP].*
 *.[pP][cC][aA][pP]
+*.[pP][cC][aA][pP].*
 *.[pP][cC][aA][pP][nN][gG]
+*.[pP][cC][aA][pP][nN][gG].*
 
 # Generated benchmark and extraction outputs
-/benchmarks/cache/
-/benchmarks/results/
+/benchmarks/cache
+/benchmarks/results
 /benchmarks/malware-traffic-analysis.json
 /*.export/
 /challenge-export-current/
 /.l2solver-*/
+
+# Keep retired local checks out of commits
+/scripts/check_public_source.py
+/tests/scripts/test_public_source.py
