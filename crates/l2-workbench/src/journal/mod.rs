@@ -32,6 +32,8 @@ use std::{
     fs::File,
     io::{self, Read, Write},
     path::Path,
+    sync::{Arc, Mutex},
+    time::Instant,
 };
 
 pub type Result<T> = std::result::Result<T, Box<dyn Error>>;
@@ -45,6 +47,7 @@ pub struct Journal {
     directory: paths::Directory,
     options: JournalOptions,
     chain_query_active: Cell<bool>,
+    chain_deadline: Arc<Mutex<Option<Instant>>>,
 }
 impl Journal {
     /// Save the base case once inside a caller-managed staging directory
@@ -61,7 +64,7 @@ impl Journal {
         file.write_all(&bytes)?;
         file.sync_all()?;
         File::create_new(directory.path().join("journal.sqlite"))?;
-        let connection = Connection::open_with_flags(
+        let mut connection = Connection::open_with_flags(
             std::fs::canonicalize(directory.path().join("journal.sqlite"))?,
             OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_NOFOLLOW,
         )?;
@@ -85,11 +88,13 @@ impl Journal {
             [crate::sha256(&bytes)],
         )?;
         directory.sync()?;
+        let chain_deadline = chains::install_progress_handler(&mut connection)?;
         Ok(Self {
             connection,
             directory,
             options,
             chain_query_active: Cell::new(false),
+            chain_deadline,
         })
     }
     /// Open an existing investigation without replacing its base evidence
@@ -101,7 +106,7 @@ impl Journal {
         let directory = paths::Directory::open(path)?;
         let path = directory.path().join("journal.sqlite");
         paths::regular(&path)?;
-        let connection = Connection::open_with_flags(
+        let mut connection = Connection::open_with_flags(
             std::fs::canonicalize(path)?,
             OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_NOFOLLOW,
         )?;
@@ -113,11 +118,13 @@ impl Journal {
         }
         // Version 3 predates this performance-only index, so writable opens repair it in place
         ensure_check_identity_index(&connection)?;
+        let chain_deadline = chains::install_progress_handler(&mut connection)?;
         Ok(Self {
             connection,
             directory,
             options,
             chain_query_active: Cell::new(false),
+            chain_deadline,
         })
     }
     /// Open an existing investigation using a read-only `SQLite` connection
@@ -129,7 +136,7 @@ impl Journal {
         let directory = paths::Directory::open(path)?;
         let path = directory.path().join("journal.sqlite");
         paths::regular(&path)?;
-        let connection = Connection::open_with_flags(
+        let mut connection = Connection::open_with_flags(
             std::fs::canonicalize(path)?,
             OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NOFOLLOW,
         )?;
@@ -139,11 +146,13 @@ impl Journal {
         if app != APPLICATION_ID || version != VERSION {
             return Err(invalid("unsupported investigation journal"));
         }
+        let chain_deadline = chains::install_progress_handler(&mut connection)?;
         Ok(Self {
             connection,
             directory,
             options,
             chain_query_active: Cell::new(false),
+            chain_deadline,
         })
     }
     /// Recheck the retained case hash before using its node identifiers

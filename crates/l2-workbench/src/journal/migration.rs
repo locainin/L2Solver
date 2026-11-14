@@ -45,7 +45,11 @@ impl Journal {
 
         copy_base_case(&source_directory, &staging_directory, &base_hash)?;
         let staged_database_path = staging_directory.path().join("journal.sqlite");
-        source_database.backup(MAIN_DB, &staged_database_path, None)?;
+        source_database.backup(
+            MAIN_DB,
+            &staged_database_path,
+            None::<fn(rusqlite::backup::Progress)>,
+        )?;
         drop(source_database);
 
         let staged_database = Connection::open_with_flags(

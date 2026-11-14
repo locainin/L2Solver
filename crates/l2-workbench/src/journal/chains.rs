@@ -1,6 +1,27 @@
 use super::{Chain, ChainPlan, Event, EventSelector, Journal, Result, event_reader, invalid};
 use rusqlite::{Connection, params_from_iter, types::Value};
-use std::fmt::Write as _;
+use std::{
+    fmt::Write as _,
+    sync::{Arc, Mutex},
+    time::{Duration, Instant},
+};
+
+pub(super) fn install_progress_handler(
+    connection: &mut Connection,
+) -> Result<Arc<Mutex<Option<Instant>>>> {
+    let deadline = Arc::new(Mutex::new(None::<Instant>));
+    let current_deadline = Arc::clone(&deadline);
+    // The handler stays installed because changing it requires exclusive connection access
+    connection.progress_handler(
+        1_000,
+        Some(move || {
+            current_deadline.lock().map_or(true, |deadline| {
+                deadline.is_some_and(|deadline| Instant::now() >= deadline)
+            })
+        }),
+    )?;
+    Ok(deadline)
+}
 
 impl Journal {
     /// Stream ordered event chains using disk-backed joins over the whole investigation
@@ -18,7 +39,7 @@ impl Journal {
         mut visitor: impl FnMut(Chain) -> Result<()>,
     ) -> Result<u64> {
         let _activity = ChainActivity::enter(&self.chain_query_active)?;
-        let deadline = Deadline::install(&self.connection, plan.max_elapsed_ms.milliseconds())?;
+        let deadline = Deadline::install(&self.chain_deadline, plan.max_elapsed_ms.milliseconds())?;
         let (sql, args) = query(plan, &deadline)?;
         deadline.check()?;
         if plan.limit == Some(0) {
@@ -291,36 +312,32 @@ fn field_expression(step: usize, field: &str, args: &mut Vec<Value>) -> Result<(
 }
 
 struct Deadline<'a> {
-    connection: &'a rusqlite::Connection,
-    deadline: Option<std::time::Instant>,
+    state: &'a Mutex<Option<Instant>>,
+    deadline: Option<Instant>,
 }
 impl<'a> Deadline<'a> {
-    fn install(connection: &'a rusqlite::Connection, milliseconds: Option<u64>) -> Result<Self> {
+    fn install(state: &'a Mutex<Option<Instant>>, milliseconds: Option<u64>) -> Result<Self> {
         let deadline = match milliseconds {
             Some(0) => return Err(invalid("chain query time budget is already exhausted")),
             Some(milliseconds) => Some(
-                std::time::Instant::now()
-                    .checked_add(std::time::Duration::from_millis(milliseconds))
+                Instant::now()
+                    .checked_add(Duration::from_millis(milliseconds))
                     .ok_or_else(|| invalid("chain deadline exceeds the monotonic clock range"))?,
             ),
             None => None,
         };
-        if let Some(deadline) = deadline {
-            // Polling frequency controls deadline overhead, not how much evidence may be searched
-            connection
-                .progress_handler(1_000, Some(move || std::time::Instant::now() >= deadline))?;
-        }
-        Ok(Self {
-            connection,
-            deadline,
-        })
+        // Keep a local copy for frequent checks and share the same deadline with SQLite
+        *state
+            .lock()
+            .map_err(|_| invalid("chain deadline state is unavailable"))? = deadline;
+        Ok(Self { state, deadline })
     }
 
     fn check(&self) -> Result<()> {
         let Some(deadline) = self.deadline else {
             return Ok(());
         };
-        if std::time::Instant::now() >= deadline {
+        if Instant::now() >= deadline {
             return Err(invalid("chain query time budget is exhausted"));
         }
         Ok(())
@@ -349,6 +366,8 @@ impl<'a> Deadline<'a> {
 }
 impl Drop for Deadline<'_> {
     fn drop(&mut self) {
-        let _ = self.connection.progress_handler(0, None::<fn() -> bool>);
+        if let Ok(mut deadline) = self.state.lock() {
+            *deadline = None;
+        }
     }
 }

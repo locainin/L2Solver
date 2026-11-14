@@ -6,6 +6,9 @@ use l2_workbench::{
 use serde_json::json;
 use std::error::Error;
 
+#[path = "chains/deadline.rs"]
+mod deadline;
+
 #[test]
 fn event_chains_not_scopes_actors() -> Result<(), Box<dyn Error>> {
     let dir = tempfile::tempdir()?;
