@@ -521,12 +521,8 @@ pub(super) fn collect_matching_tshark_snapshot(
 ) -> Result<(tshark_objects::Collection, Option<String>), Box<dyn Error>> {
     let identity_matches = capture_identity_matches(source, &objects.source_identity);
     let mut collection = if identity_matches {
-        let directories = match objects.status {
-            workbench::ObjectExportStatus::Complete => &objects.directories,
-            workbench::ObjectExportStatus::Partial => &objects.partial_directories,
-        };
         tshark_objects::collect(
-            directories,
+            &objects.directories,
             artifacts,
             objects.budget.temporary_files,
             memory,

@@ -25,9 +25,8 @@ mod tests;
 /// Export-object directories kept alive with the capture snapshot and profile
 pub struct ExportObjectSet {
     pub temporary_directory: Workspace,
+    /// Snapshot directories containing only post-termination-verified objects
     pub directories: Vec<(String, PathBuf)>,
-    /// Snapshot directories containing only post-termination-verified partial objects
-    pub(crate) partial_directories: Vec<(String, PathBuf)>,
     pub source_identity: l2_workbench::tshark::SourceIdentity,
     pub budget: ObjectExportBudget,
     pub usage: ObjectExportUsage,
@@ -45,18 +44,11 @@ struct PartialObjectSnapshot {
     omitted_unstable: bool,
 }
 
-struct PartialObjectExport {
-    usage: ObjectExportUsage,
-    issues: Vec<String>,
-    directories: Vec<(String, PathBuf)>,
-}
-
 struct ResolvedObjectExport {
     usage: ObjectExportUsage,
     status: ObjectExportStatus,
     issues: Vec<String>,
     directories: Vec<(String, PathBuf)>,
-    partial_directories: Vec<(String, PathBuf)>,
 }
 
 /// Export `TShark` objects with the shared isolated profile and cooperative cancellation state
@@ -117,7 +109,6 @@ pub fn export_objects_with_job(
     Ok(ExportObjectSet {
         temporary_directory: prepared.directory,
         directories: resolved.directories,
-        partial_directories: resolved.partial_directories,
         source_identity: prepared.source.identity.clone(),
         budget,
         usage: resolved.usage,
@@ -132,7 +123,7 @@ fn resolve_object_export(
     partial_root: &Path,
     complete_directories: &[(String, PathBuf)],
 ) -> Result<ResolvedObjectExport, Box<dyn Error>> {
-    let partial = match output {
+    match output {
         Ok(output) if output.status.success() => {
             let valid_directories = safe_directory(object_root)
                 && complete_directories.iter().all(|(protocol, directory)| {
@@ -149,30 +140,22 @@ fn resolve_object_export(
             // Only the private snapshot may be used after validating the final tree
             let complete =
                 valid_directories && !output.unsafe_entries && !snapshot.omitted_unstable;
-            let (status, issues, directories, partial_directories) = if complete {
-                (
-                    ObjectExportStatus::Complete,
-                    Vec::new(),
-                    snapshot.directories,
-                    Vec::new(),
-                )
+            let (status, issues) = if complete {
+                (ObjectExportStatus::Complete, Vec::new())
             } else {
                 (
                     ObjectExportStatus::Partial,
                     vec![String::from(
                         "TShark object output contained unsafe or changed entries",
                     )],
-                    Vec::new(),
-                    snapshot.directories,
                 )
             };
-            return Ok(ResolvedObjectExport {
+            Ok(ResolvedObjectExport {
                 usage: output.object_usage,
                 status,
                 issues,
-                directories,
-                partial_directories,
-            });
+                directories: snapshot.directories,
+            })
         }
         Ok(output) => retain_partial_export(
             object_root,
@@ -181,7 +164,7 @@ fn resolve_object_export(
             &output.objects,
             complete_directories,
             describe_failed_export(&output),
-        )?,
+        ),
         Err(process::ProcessError::ObjectExportLimit(limit)) => retain_partial_export(
             object_root,
             partial_root,
@@ -189,7 +172,7 @@ fn resolve_object_export(
             &limit.stable_objects,
             complete_directories,
             limit.describe(),
-        )?,
+        ),
         Err(process::ProcessError::ObjectExportTimeout(timeout)) => retain_partial_export(
             object_root,
             partial_root,
@@ -197,20 +180,11 @@ fn resolve_object_export(
             &timeout.stable_objects,
             complete_directories,
             timeout.describe(),
-        )?,
+        ),
         // Keep cancellation typed when returning through the recovery job
-        Err(process::ProcessError::Cancelled) => {
-            return Err(l2_workbench::job::JobError::Cancelled.into());
-        }
-        Err(error) => return Err(error.into()),
-    };
-    Ok(ResolvedObjectExport {
-        usage: partial.usage,
-        status: ObjectExportStatus::Partial,
-        issues: partial.issues,
-        directories: Vec::new(),
-        partial_directories: partial.directories,
-    })
+        Err(process::ProcessError::Cancelled) => Err(l2_workbench::job::JobError::Cancelled.into()),
+        Err(error) => Err(error.into()),
+    }
 }
 
 fn describe_failed_export(output: &process::StreamOutput) -> String {
@@ -236,7 +210,7 @@ fn retain_partial_export(
     stable_objects: &[StableObject],
     allowed_directories: &[(String, PathBuf)],
     issue: String,
-) -> Result<PartialObjectExport, Box<dyn Error>> {
+) -> Result<ResolvedObjectExport, Box<dyn Error>> {
     let snapshot = retain_stable_objects(
         object_root,
         snapshot_root,
@@ -249,8 +223,9 @@ fn retain_partial_export(
             "TShark objects that changed or failed identity checks at the budget stop were omitted",
         ));
     }
-    Ok(PartialObjectExport {
+    Ok(ResolvedObjectExport {
         usage,
+        status: ObjectExportStatus::Partial,
         issues,
         directories: snapshot.directories,
     })

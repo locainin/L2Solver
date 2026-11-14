@@ -53,10 +53,10 @@ pub(super) fn prepare_capture(options: &TsharkOptions) -> Result<PreparedCapture
             keylog: options.tls_keylog.clone(),
             timeout: Duration::from_secs(u64::from(options.timeout_seconds)),
             timeout_seconds: options.timeout_seconds,
-            input_maximum: mib_to_bytes(options.max_input_mib)?,
-            metadata_maximum: usize::try_from(mib_to_bytes(options.max_metadata_mib)?)?,
-            output_maximum: usize::try_from(mib_to_bytes(options.max_output_mib)?)?,
-            diagnostic_maximum: usize::try_from(mib_to_bytes(options.max_diagnostics_mib)?)?,
+            input_maximum: mib_to_bytes(options.max_input_mib),
+            metadata_maximum: usize::try_from(mib_to_bytes(options.max_metadata_mib))?,
+            output_maximum: usize::try_from(mib_to_bytes(options.max_output_mib))?,
+            diagnostic_maximum: usize::try_from(mib_to_bytes(options.max_diagnostics_mib))?,
         },
         None,
     )
@@ -215,8 +215,7 @@ fn verify_snapshot(snapshot: &mut Snapshot) -> io::Result<()> {
     Ok(())
 }
 
-fn mib_to_bytes(mebibytes: u32) -> Result<u64, Box<dyn Error>> {
-    u64::from(mebibytes)
-        .checked_mul(1024 * 1024)
-        .ok_or_else(|| "configured MiB budget overflowed".into())
+fn mib_to_bytes(mebibytes: u32) -> u64 {
+    // Every u32 MiB count fits in u64 bytes
+    u64::from(mebibytes) * 1024 * 1024
 }

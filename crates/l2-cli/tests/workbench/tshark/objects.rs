@@ -1,5 +1,5 @@
 use super::super::budget::{ObjectFileSnapshot, StableObject};
-use super::{retain_partial_export, retain_stable_objects};
+use super::retain_stable_objects;
 use std::{
     error::Error,
     fs,
@@ -38,11 +38,10 @@ fn unsafe_complete_export() -> Result<(), Box<dyn Error>> {
         let (temporary, object_root, result) = run_fake_export(mode)?;
 
         assert_eq!(result.status, super::ObjectExportStatus::Partial, "{mode}");
-        assert!(result.directories.is_empty(), "{mode}");
         assert!(!result.issues.is_empty(), "{mode}");
-        assert_eq!(result.partial_directories.len(), 1, "{mode}");
+        assert_eq!(result.directories.len(), 1, "{mode}");
         let (protocol, directory) = result
-            .partial_directories
+            .directories
             .first()
             .ok_or("verified partial directory is missing")?;
         assert_eq!(protocol, "http", "{mode}");
@@ -212,48 +211,134 @@ fn partial_snapshot_keeps_only_unchanged_regular_files() -> Result<(), Box<dyn E
 }
 
 #[cfg(unix)]
+#[derive(Clone, Copy, Debug)]
+enum StopCause {
+    FailedExit,
+    Limit,
+    Timeout,
+}
+
+#[cfg(unix)]
+impl StopCause {
+    fn output(
+        self,
+        usage: super::ObjectExportUsage,
+        stable: StableObject,
+    ) -> (
+        Result<super::process::StreamOutput, super::process::ProcessError>,
+        String,
+    ) {
+        use super::super::budget::{ObjectExportLimit, ObjectExportResource};
+        use std::os::unix::process::ExitStatusExt;
+
+        match self {
+            Self::FailedExit => {
+                let status = std::process::ExitStatus::from_raw(7 << 8);
+                (
+                    Ok(super::process::StreamOutput {
+                        stderr: b"export denied".to_vec(),
+                        stderr_truncated: false,
+                        status,
+                        object_usage: usage,
+                        objects: vec![stable],
+                        unsafe_entries: false,
+                    }),
+                    format!("TShark object export failed with exit status {status}: export denied"),
+                )
+            }
+            Self::Limit => (
+                Err(super::process::ProcessError::ObjectExportLimit(
+                    ObjectExportLimit {
+                        resource: ObjectExportResource::Bytes,
+                        maximum: 8,
+                        observed: 30,
+                        usage,
+                        stable_objects: vec![stable],
+                    },
+                )),
+                String::from(concat!(
+                    "`TShark` object export stopped after observing temporary bytes above its budget of 8 ",
+                    "(observed 30; tree-entry limits stop at the first extra entry, while byte and file totals may overshoot between scans)"
+                )),
+            ),
+            Self::Timeout => (
+                Err(super::process::ProcessError::ObjectExportTimeout(
+                    super::process::ObjectExportTimeout {
+                        stderr: b"timeout diagnostic".to_vec(),
+                        stderr_truncated: false,
+                        stderr_complete: true,
+                        status: None,
+                        usage,
+                        stable_objects: vec![stable],
+                    },
+                )),
+                String::from("TShark object export exceeded its time budget: timeout diagnostic"),
+            ),
+        }
+    }
+}
+
+#[cfg(unix)]
 #[test]
-fn partial_export_preserves_exact_cause_usage_and_stable_objects() -> Result<(), Box<dyn Error>> {
-    let temporary = tempfile::tempdir()?;
-    let object_root = temporary.path().join("objects");
-    let protocol_root = object_root.join("http");
-    let snapshot_root = temporary.path().join("partial-objects");
-    fs::create_dir(&object_root)?;
-    fs::create_dir(&protocol_root)?;
-    let stable_path = protocol_root.join("stable.bin");
-    fs::write(&stable_path, b"stable object")?;
-    let stable = stable_object(&object_root, &stable_path)?;
-    let usage = super::ObjectExportUsage {
-        temporary_bytes_peak: 13,
-        temporary_files_peak: 1,
-        temporary_tree_entries_peak: 2,
-        protocol_directory_count: 1,
-        temporary_scan_complete: true,
-    };
-    let cause = String::from("TShark object export failed with exit status 7: export denied");
+fn partial_export_receipt() -> Result<(), Box<dyn Error>> {
+    for stop in [StopCause::FailedExit, StopCause::Limit, StopCause::Timeout] {
+        let temporary = tempfile::tempdir()?;
+        let object_root = temporary.path().join("objects");
+        let protocol_root = object_root.join("http");
+        let snapshot_root = temporary.path().join("partial-objects");
+        fs::create_dir(&object_root)?;
+        fs::create_dir(&protocol_root)?;
+        let stable_path = protocol_root.join("stable.bin");
+        let unfinished_path = protocol_root.join("unfinished.bin");
+        fs::write(&stable_path, b"stable object")?;
+        fs::write(&unfinished_path, b"unfinished object")?;
+        let stable = stable_object(&object_root, &stable_path)?;
+        let usage = super::ObjectExportUsage {
+            temporary_bytes_peak: 30,
+            temporary_files_peak: 2,
+            temporary_tree_entries_peak: 3,
+            protocol_directory_count: 1,
+            temporary_scan_complete: !matches!(stop, StopCause::Limit),
+        };
+        let (output, cause) = stop.output(usage, stable);
 
-    let partial = retain_partial_export(
-        &object_root,
-        &snapshot_root,
-        usage,
-        &[stable],
-        &[(String::from("http"), protocol_root.clone())],
-        cause.clone(),
-    )?;
+        let partial = super::resolve_object_export(
+            output,
+            &object_root,
+            &snapshot_root,
+            &[(String::from("http"), protocol_root.clone())],
+        )?;
 
-    assert_eq!(partial.usage, usage);
-    assert_eq!(partial.issues, vec![cause]);
-    assert_eq!(partial.directories.len(), 1);
-    let (protocol, snapshot_directory) = partial
-        .directories
-        .first()
-        .ok_or("partial snapshot directory is missing")?;
-    assert_eq!(protocol, "http");
-    assert_eq!(
-        fs::read(snapshot_directory.join("stable.bin"))?,
-        b"stable object"
-    );
-    assert!(!protocol_root.join("stable.bin").exists());
+        assert_eq!(
+            partial.status,
+            super::ObjectExportStatus::Partial,
+            "{stop:?}"
+        );
+        assert_eq!(partial.usage, usage, "{stop:?}");
+        assert_eq!(partial.issues, vec![cause], "{stop:?}");
+        assert_eq!(partial.directories.len(), 1, "{stop:?}");
+        let (protocol, snapshot_directory) = partial
+            .directories
+            .first()
+            .ok_or("partial snapshot directory is missing")?;
+        assert_eq!(protocol, "http", "{stop:?}");
+        assert_ne!(snapshot_directory, &protocol_root, "{stop:?}");
+        assert_eq!(
+            fs::read(snapshot_directory.join("stable.bin"))?,
+            b"stable object",
+            "{stop:?}"
+        );
+        assert!(
+            !snapshot_directory.join("unfinished.bin").exists(),
+            "{stop:?}"
+        );
+        assert_eq!(
+            fs::read(&unfinished_path)?,
+            b"unfinished object",
+            "{stop:?}"
+        );
+        assert!(!protocol_root.join("stable.bin").exists(), "{stop:?}");
+    }
     Ok(())
 }
 
