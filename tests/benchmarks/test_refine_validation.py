@@ -109,6 +109,16 @@ class RefineValidationTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "CPU"):
             validate_case(self.root, "near-eof")
 
+    def test_cleanup_failure_receipt_does_not_qualify_partial_output(self):
+        self.make_case("near-eof")
+        path = self.root / "receipts" / "near-eof" / "cgroup.json"
+        receipt = json.loads(path.read_text())
+        receipt.update(status="tool_failure", cleanup_error="cgroup cleanup failed")
+        path.write_text(json.dumps(receipt))
+
+        with self.assertRaisesRegex(ValueError, "partial result"):
+            validate_case(self.root, "near-eof")
+
     def test_collection_is_repeatable_and_does_not_write_partial_success(self):
         for case in CASE_INPUTS:
             self.make_case(case)
