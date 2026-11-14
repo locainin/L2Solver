@@ -170,8 +170,10 @@ def test_shared_runner_setup_keeps_namespace_and_user_service_preflight():
     setup = RUNNER_SETUP.read_text()
     for name in ("tests", "package"):
         assert "uses: ./.github/actions/prepare-test-runner" in job(name)
-    for package in ("apparmor", "dbus-user-session", "ethtool", "fish", "iproute2", "iputils-ping", "libcap2-bin", "libpcap-dev", "python3-pytest-subtests", "python3-scapy", "ripgrep", "strace", "tcpdump", "tshark", "zsh"):
+    for package in ("apparmor", "dbus-user-session", "ethtool", "fish", "iproute2", "iputils-ping", "libcap2-bin", "libpcap-dev", "python3-pytest-subtests", "python3-scapy", "ripgrep", "strace", "tcpdump", "zsh"):
         assert package in setup.split()
+    assert "bash tests/scripts/test_ci_install_tshark.sh" in setup
+    assert "bash scripts/ci/install-tshark.sh" in setup
     assert "profile l2solver-ci-unshare /usr/bin/unshare flags=(unconfined)" in setup
     assert "sudo apparmor_parser --replace" in setup
     assert "unshare --user --map-root-user --net --mount --pid --mount-proc --fork true" in setup

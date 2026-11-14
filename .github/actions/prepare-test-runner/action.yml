@@ -8,22 +8,49 @@ runs:
       run: |
         sudo apt-get update
         sudo DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
-          apparmor binutils dbus-user-session ethtool fish iproute2 iputils-ping libcap2-bin libpcap-dev \
-          python3-pytest python3-pytest-subtests python3-scapy ripgrep strace tcpdump tshark zsh
+          apparmor binutils build-essential curl dbus-user-session ethtool fish gnupg iproute2 iputils-ping \
+          libcap-dev libcap2-bin libpcap-dev lsb-release meson ninja-build pkg-config python3-pytest \
+          python3-pytest-subtests python3-scapy ripgrep strace tcpdump xz-utils zsh
+
+    - name: Verify and install Bubblewrap
+      shell: bash
+      run: |
+        bash tests/scripts/test_ci_install_bubblewrap.sh
+        bash scripts/ci/install-bubblewrap.sh
+
+    - name: Verify and install TShark
+      shell: bash
+      run: |
+        bash tests/scripts/test_ci_install_tshark.sh
+        bash scripts/ci/install-tshark.sh
 
     - name: Permit isolated test namespaces
       shell: bash
       run: |
-        # Grant user namespaces to unshare without changing the system-wide policy
-        namespace_profile="$RUNNER_TEMP/l2solver-ci-unshare.profile"
+        # Grant user namespaces to the test tools without changing the system-wide policy
+        namespace_profile="$RUNNER_TEMP/l2solver-ci-namespace.profile"
         cat > "$namespace_profile" <<'PROFILE'
         abi <abi/4.0>,
         profile l2solver-ci-unshare /usr/bin/unshare flags=(unconfined) {
           userns,
         }
+        profile l2solver-ci-bwrap /usr/bin/bwrap flags=(unconfined) {
+          userns,
+        }
         PROFILE
         sudo apparmor_parser --replace "$namespace_profile"
         unshare --user --map-root-user --net --mount --pid --mount-proc --fork true
+        # Exercise the same descriptor-bound mounts used by the TShark sandbox
+        (
+          exec 3< /usr/bin/bwrap
+          exec 4< /usr
+          exec 5< "$RUNNER_TEMP"
+          /proc/self/fd/3 --unshare-user --unshare-pid --unshare-net --unshare-ipc \
+            --unshare-uts --disable-userns --uid 65534 --gid 65534 --cap-drop ALL \
+            --new-session --die-with-parent --as-pid-1 --clearenv \
+            --ro-bind-fd 4 /usr --ro-bind-try /lib /lib --ro-bind-try /lib64 /lib64 \
+            --bind-fd 5 /ci-probe -- /usr/bin/true
+        )
 
     - name: Prepare isolated-test user services
       shell: bash
