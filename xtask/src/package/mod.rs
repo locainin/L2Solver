@@ -51,18 +51,6 @@ impl Entry {
     pub fn bytes(&self) -> &[u8] {
         &self.bytes
     }
-
-    /// Return the source-byte count
-    #[must_use]
-    pub const fn byte_len(&self) -> usize {
-        self.bytes.len()
-    }
-
-    /// Return the lowercase SHA-256 digest of the source bytes
-    #[must_use]
-    pub fn sha256(&self) -> &str {
-        &self.sha256
-    }
 }
 
 /// Package output paths and archive digest
