@@ -108,13 +108,12 @@ pub(super) fn recover(
     context: &RecoveryContext<'_>,
 ) -> Result<CachedRecovery> {
     let source_id = source_id(scope)?;
-    require_case_source(case, &source_id)?;
+    require_case_source(case, source_id)?;
     let key = recovery_key(kind, scope, context.options)?;
     let cache = context.cache.filter(|_| !context.options.no_cache);
 
     if let Some(cache) = cache {
-        if let Some((cached_case, result)) = lookup_result(cache, &key, &source_id, kind, context)?
-        {
+        if let Some((cached_case, result)) = lookup_result(cache, &key, source_id, kind, context)? {
             count_cache_hit(context.job)?;
             *case = cached_case;
             return Ok(result);
@@ -498,11 +497,10 @@ fn set_current_for(job: &Job, message: &str) -> Result<()> {
     Ok(())
 }
 
-fn source_id(scope: &Value) -> Result<String> {
+fn source_id(scope: &Value) -> Result<&str> {
     scope
         .get("source_id")
         .and_then(Value::as_str)
-        .map(str::to_owned)
         .ok_or_else(|| "recovery scope is missing its strong source_id".into())
 }
 

@@ -89,6 +89,11 @@ fn check_identity_bound_evidence_hash() -> Result<(), Box<dyn Error>> {
     journal.record_check(&id, &check(CheckOutcome::Pass), b"second evidence")?;
 
     let connection = rusqlite::Connection::open(directory.path().join("journal.sqlite"))?;
+    let identity: String = connection.query_row(
+        "SELECT identity FROM checks ORDER BY id LIMIT 1",
+        [],
+        |row| row.get(0),
+    )?;
     let second_evidence: String = connection.query_row(
         "SELECT evidence FROM checks ORDER BY id DESC LIMIT 1",
         [],
@@ -101,5 +106,13 @@ fn check_identity_bound_evidence_hash() -> Result<(), Box<dyn Error>> {
 
     assert_error_contains(journal.entry(&id), "check identity mismatch")?;
     assert_error_contains(journal.verify(), "check identity mismatch")?;
+    for reference in ["1", identity.as_str()] {
+        let mut output = Vec::new();
+        assert_error_contains(
+            journal.write_evidence(reference, &mut output),
+            "check identity mismatch",
+        )?;
+        assert_eq!(output, [] as [u8; 0]);
+    }
     Ok(())
 }

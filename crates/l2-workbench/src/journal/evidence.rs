@@ -58,15 +58,8 @@ impl Journal {
         let evidence = super::required_sha256(row, 7, 8, "journal check evidence")?;
         let binding_origin =
             super::bounded_text(row, 9, 10, self.options.max_entry_bytes, "check")?;
-        checks::decode(
-            id,
-            &hypothesis,
-            identity,
-            value,
-            evidence.clone(),
-            &binding_origin,
-        )?;
-        Ok(evidence)
+        checks::decode(id, &hypothesis, identity, value, evidence, &binding_origin)
+            .map(|check| check.evidence_sha256)
     }
 
     fn write_verified_object(&self, hash: &str, output: &mut impl Write) -> Result<u64> {
