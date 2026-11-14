@@ -2,9 +2,9 @@
 
 import importlib.util
 import os
-from pathlib import Path
 import subprocess
 import sys
+from pathlib import Path
 
 sys.dont_write_bytecode = True
 HERE = Path(__file__).resolve().parent
@@ -34,7 +34,7 @@ def prove_scope(fds, parent_uid):
         os.close(net_fd)
 
 
-def child(fds, parent_uid, test_binary, mode):
+def child(fds, parent_uid, test_binary, mode, test_name):
     prove_scope(fds, parent_uid)
     # Bring up only the loopback proven to belong to the private namespace
     ns.command("ip", "link", "set", "dev", "lo", "up")
@@ -61,7 +61,7 @@ def child(fds, parent_uid, test_binary, mode):
             environment[PARENT_FDS] = ",".join(str(fd) for fd in child_fds)
             environment[PARENT_UID] = str(parent_uid)
         result = subprocess.run(
-            [test_binary, "--exact", TEST_NAME, "--nocapture"],
+            [test_binary, "--exact", test_name, "--nocapture"],
             pass_fds=child_fds,
             env=environment,
             capture_output=True,
@@ -86,13 +86,13 @@ def child(fds, parent_uid, test_binary, mode):
     print("deadline_test_passed=true")
 
 
-def parent(test_binary, mode):
+def parent(test_binary, mode, test_name):
     fds = [ns.open_namespace(name) for name in NAMES]
     try:
         command = [
             "unshare", "--user", "--map-root-user", "--net", "--mount", "--pid",
             "--mount-proc", "--fork", "--kill-child=KILL", sys.executable, __file__, "--child",
-            *(str(fd) for fd in fds), str(os.getuid()), test_binary, mode,
+            *(str(fd) for fd in fds), str(os.getuid()), test_binary, mode, test_name,
         ]
         # One process group lets the timeout stop every fixture descendant
         process = subprocess.Popen(
@@ -110,10 +110,11 @@ def parent(test_binary, mode):
 
 def main():
     modes = {"--run": "run", "--probe-missing": "missing", "--probe-same": "same", "--probe-pid": "pid"}
-    if len(sys.argv) == 3 and sys.argv[1] in modes:
-        parent(sys.argv[2], modes[sys.argv[1]])
-    elif len(sys.argv) == 9 and sys.argv[1] == "--child" and sys.argv[8] in modes.values():
-        child([int(value) for value in sys.argv[2:6]], int(sys.argv[6]), sys.argv[7], sys.argv[8])
+    if len(sys.argv) in (3, 4) and sys.argv[1] in modes:
+        test_name = sys.argv[3] if len(sys.argv) == 4 else TEST_NAME
+        parent(sys.argv[2], modes[sys.argv[1]], test_name)
+    elif len(sys.argv) == 10 and sys.argv[1] == "--child" and sys.argv[8] in modes.values():
+        child([int(value) for value in sys.argv[2:6]], int(sys.argv[6]), sys.argv[7], sys.argv[8], sys.argv[9])
     elif len(sys.argv) == 2 and sys.argv[1] == "--verify":
         fds = [int(value) for value in os.environ[PARENT_FDS].split(",")]
         prove_scope(fds, int(os.environ[PARENT_UID]))

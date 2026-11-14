@@ -77,3 +77,56 @@ fn pins_real_namespace_interface_descriptors() -> Result<(), Box<dyn std::error:
     super::validate_pinned_descriptors(&pinned)?;
     Ok(())
 }
+
+#[cfg(target_os = "linux")]
+#[test]
+fn calling_thread_network_namespace() -> Result<(), Box<dyn std::error::Error>> {
+    use std::{io, os::unix::fs::MetadataExt, process::Command, thread};
+
+    const CHILD: &str = "L2_TEST_THREAD_NAMESPACE_CHILD";
+    if std::env::var_os(CHILD).is_none() {
+        // The worker changes only its thread inside a disposable user namespace
+        let output = Command::new("unshare")
+            .args(["--user", "--map-root-user", "--net"])
+            .arg(std::env::current_exe()?)
+            .args([
+                "--exact",
+                "interface::tests::calling_thread_network_namespace",
+                "--nocapture",
+            ])
+            .env(CHILD, "1")
+            .output()?;
+        assert!(
+            output.status.success()
+                && String::from_utf8_lossy(&output.stdout)
+                    .contains("test result: ok. 1 passed; 0 failed;"),
+            "namespace child failed: {} {}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        return Ok(());
+    }
+
+    let leader = std::fs::metadata("/proc/self/ns/net")?;
+    let worker = thread::spawn(move || -> io::Result<()> {
+        nix::sched::unshare(nix::sched::CloneFlags::CLONE_NEWNET).map_err(io::Error::other)?;
+        let own = std::fs::metadata("/proc/thread-self/ns/net")?;
+        assert_ne!(
+            (own.dev(), own.ino()),
+            (leader.dev(), leader.ino()),
+            "worker did not enter a different network namespace"
+        );
+        let pinned = pin("lo")?;
+        assert_eq!(
+            (
+                pinned.identity().namespace_device,
+                pinned.identity().namespace_inode
+            ),
+            (own.dev(), own.ino()),
+            "pinned namespace differs from the calling thread"
+        );
+        Ok(())
+    });
+    worker.join().map_err(|_| "namespace worker panicked")??;
+    Ok(())
+}

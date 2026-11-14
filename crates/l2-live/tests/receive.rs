@@ -12,6 +12,43 @@ use std::{net::UdpSocket, time::Instant};
 #[path = "receive/isolation.rs"]
 mod isolation;
 
+#[cfg(target_os = "linux")]
+fn assert_unproved_child_is_rejected(mode: &str) -> Result<(), Box<dyn std::error::Error>> {
+    let output = std::process::Command::new("python3")
+        .arg(isolation::namespace_fixture())
+        .arg(format!("--probe-{mode}"))
+        .arg(std::env::current_exe()?)
+        .output()?;
+    assert!(
+        output.status.success()
+            && String::from_utf8_lossy(&output.stdout)
+                .lines()
+                .any(|line| line == "namespace_rejected=true"),
+        "child with {mode} namespace proof was not rejected: {} {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn missing_parent_descriptors_gate() -> Result<(), Box<dyn std::error::Error>> {
+    assert_unproved_child_is_rejected("missing")
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn current_namespace_descriptors_gate() -> Result<(), Box<dyn std::error::Error>> {
+    assert_unproved_child_is_rejected("same")
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn current_pid_namespace_gate() -> Result<(), Box<dyn std::error::Error>> {
+    assert_unproved_child_is_rejected("pid")
+}
+
 #[test]
 fn unknown_interface_rejection() {
     let result = LiveLink::open_with_limits(
