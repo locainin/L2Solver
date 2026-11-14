@@ -51,10 +51,10 @@ class Analyzer:
         return {"available": True, "executable": str(self.tshark_executable),
                 "sha256": self.tshark_sha256, "version": self.tshark_version}
 
-    def command(self, name, arguments, executable=None):
+    def command(self, name, arguments):
         if hash_file(Path(self.binary)) != self.binary_sha256:
             raise ValueError("analyzer executable changed during the lab")
-        command = [executable or self.binary, *arguments]
+        command = [self.binary, *arguments]
         code, failure, error, metrics = run_child(command, self.directory, 30, name)
         self.commands.append({"name": name, "command": command, "exit_code": code,
                               "failure": failure, "error": error, "metrics": metrics})
@@ -69,7 +69,6 @@ class Analyzer:
 def captured_payload(analyzer, sample, receiver):
     if analyzer.tshark_executable is None:
         return None
-    analyzer.tshark_provenance()
     protocol = sample.transport
     source = receiver["source"][1]
     destination = receiver["destination"][1]
