@@ -16,7 +16,6 @@ use super::{
     entry::{CacheEntry, EntryRecord, Lease, read_entry},
     error::{CacheError, Result},
     filesystem::{HeldDirectory, LockGuard},
-    fingerprint::SourceFingerprint,
     key::StageKey,
     manifest::{MAX_RELATIVE_PATH_BYTES, safe_entry_path},
     memory,
@@ -410,14 +409,6 @@ impl Cache {
     #[must_use]
     pub fn max_bytes(&self) -> u64 {
         self.inner.max_bytes
-    }
-
-    /// Calculates a fast metadata and sample fingerprint for a regular source file
-    ///
-    /// # Errors
-    /// Returns an error for symlinked, unreadable, non-regular, or changing files
-    pub fn fingerprint_source(path: impl AsRef<Path>) -> Result<SourceFingerprint> {
-        SourceFingerprint::fast(path)
     }
 
     /// Looks up a validated entry while holding a shared OS file lock

@@ -6,7 +6,7 @@ use l2_pcap::CaptureSource;
 use l2_workbench::{
     job::{
         Counter, Job, Phase, PhaseState,
-        cache::{Cache, CacheReadPolicy, SourceIdentity, StageKey, StageStatus},
+        cache::{Cache, CacheReadPolicy, SourceFingerprint, SourceIdentity, StageKey, StageStatus},
     },
     reconstruction::Limits,
     store::{IngestReceipt, Options, SCHEMA_VERSION, Store},
@@ -325,7 +325,7 @@ fn strict_cache_rejects_a_stale_caller_fingerprint() -> Result<(), Box<dyn Error
     let directory = tempfile::tempdir()?;
     let capture_path = directory.path().join("capture.pcap");
     fs::write(&capture_path, LLDP_CAPTURE)?;
-    let fingerprint = Cache::fingerprint_source(&capture_path)?;
+    let fingerprint = SourceFingerprint::fast(&capture_path)?;
     fs::write(&capture_path, STP_CAPTURE)?;
     let cache = open_test_cache(directory.path())?;
     let options = AcquisitionOptions {
@@ -357,7 +357,7 @@ fn strict_cache_checks_content_before_trusting_a_matching_fast_alias() -> Result
     incorrect_receipt.source_id = format!("sha256:{}", "00".repeat(32));
     drop(indexed);
 
-    let fingerprint = Cache::fingerprint_source(&capture_path)?;
+    let fingerprint = SourceFingerprint::fast(&capture_path)?;
     let alias_key = StageKey::new(
         "capture_source",
         SCHEMA_VERSION,
@@ -434,7 +434,7 @@ fn concurrent_capture_acquisition_waits_for_alias_writer_and_reuses_its_index()
     drop(initial);
 
     // Hold the source alias as though a competing process is updating the index
-    let fingerprint = Cache::fingerprint_source(&capture_path)?;
+    let fingerprint = SourceFingerprint::fast(&capture_path)?;
     let alias_key = source_alias_key(&fingerprint)?;
     let writer_lease = cache.lease(&alias_key)?;
     let job = Job::new("concurrent capture acquisition");
@@ -486,7 +486,7 @@ fn persistently_busy_alias_falls_back_to_temporary_index_with_progress_message()
     let capture_path = directory.path().join("capture.pcap");
     fs::write(&capture_path, LLDP_CAPTURE)?;
     let cache = open_test_cache(directory.path())?;
-    let fingerprint = Cache::fingerprint_source(&capture_path)?;
+    let fingerprint = SourceFingerprint::fast(&capture_path)?;
     let alias_key = source_alias_key(&fingerprint)?;
     let writer_lease = cache.lease(&alias_key)?;
     let job = Job::new("busy capture cache");
@@ -770,7 +770,7 @@ fn prior_cooked_index_and_alias_are_not_reused() -> Result<(), Box<dyn Error>> {
     old_receipt.transport_packets = 0;
     old_receipt.unsupported_transport_packets = old_receipt.packets;
     drop(lease.commit(StageStatus::Complete, json!({"receipt": old_receipt}))?);
-    let fingerprint = Cache::fingerprint_source(&capture_path)?;
+    let fingerprint = SourceFingerprint::fast(&capture_path)?;
     let alias = StageKey::new(
         "capture_source",
         5,

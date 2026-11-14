@@ -147,23 +147,6 @@ struct PreparedImport {
 }
 
 impl Case {
-    /// Retain a full import and scan its leading configured byte range
-    ///
-    /// The full input is always hashed and offered for blob retention. Optional
-    /// literal and signature observations are bounded independently by scan options.
-    ///
-    /// # Errors
-    /// Returns an error when source metadata, selected scan limits, or case quotas
-    /// prevent retaining source provenance
-    pub fn scan_import(
-        &mut self,
-        label: &str,
-        kind: &str,
-        bytes: &[u8],
-    ) -> Result<ImportScanReport, EvidenceError> {
-        self.scan_import_with_options(label, kind, bytes, ImportScanOptions::default())
-    }
-
     /// Retain a full import and apply caller-selected optional scan budgets
     ///
     /// Source retention is recorded independently of scanner coverage. The root
