@@ -16,7 +16,8 @@ use std::{
     cmp::Ordering,
     error::Error,
     ffi::OsString,
-    fmt, fs,
+    fmt,
+    fs::{self, File},
     io::{self, Read},
     path::Path,
     process::{Child, Command, ExitStatus, Stdio},
@@ -27,6 +28,8 @@ use std::{
 };
 
 const WORKER_STOP_WAIT: Duration = Duration::from_millis(100);
+#[cfg(all(target_os = "linux", not(target_env = "uclibc")))]
+const GROUP_STOP_WAIT: Duration = Duration::from_millis(500);
 
 #[cfg(test)]
 #[path = "../../../tests/workbench/tshark/process.rs"]
@@ -45,7 +48,9 @@ pub(super) struct StreamOutput {
     pub stderr_truncated: bool,
     pub status: ExitStatus,
     pub object_usage: ObjectExportUsage,
-    pub stable_objects: Vec<StableObject>,
+    // A successful export uses the final scan after writers stop
+    pub objects: Vec<StableObject>,
+    pub unsafe_entries: bool,
 }
 
 /// Timeout receipt with the last bounded diagnostic tail and observed object state
@@ -341,11 +346,9 @@ fn wait_for_capture(
         if status.is_some() && stdout_result.is_some() && stderr_result.is_some() {
             let _ = stdout_worker.join();
             let _ = stderr_worker.join();
-            // A failed child can leave group members running after closing both pipes
+            // The waitable leader reserves its group until all capture helpers are signalled
             #[cfg(all(target_os = "linux", not(target_env = "uclibc")))]
-            if status.as_ref().is_some_and(|status| !status.success()) {
-                stop_process_group(child).map_err(ProcessError::Read)?;
-            }
+            stop_process_group(child).map_err(ProcessError::Read)?;
             #[cfg(not(all(target_os = "linux", not(target_env = "uclibc"))))]
             let status = status.ok_or_else(|| {
                 ProcessError::Read(io::Error::other("TShark exit status unavailable"))
@@ -448,6 +451,7 @@ fn run_streaming_with_spawner(
         match monitor.poll(&mut child, policy) {
             Ok(Some(output)) => {
                 let _ = worker.join();
+                #[cfg(not(all(target_os = "linux", not(target_env = "uclibc"))))]
                 if !output.status.success() {
                     // A failed direct child can leave helpers alive after closing stderr
                     stop_process_group(&child).map_err(ProcessError::Read)?;
@@ -482,6 +486,7 @@ struct StreamingMonitor {
     next_scan: Instant,
     previous_objects: Vec<StableObject>,
     stable_objects: Vec<StableObject>,
+    unsafe_entries: bool,
 }
 
 impl StreamingMonitor {
@@ -497,6 +502,7 @@ impl StreamingMonitor {
             next_scan: Instant::now(),
             previous_objects: Vec::new(),
             stable_objects: Vec::new(),
+            unsafe_entries: false,
         }
     }
 
@@ -511,6 +517,11 @@ impl StreamingMonitor {
             return Err(ProcessError::TimedOut);
         }
         if self.status.is_some() && self.diagnostics.is_some() {
+            // Stop writers before the last scan while the leader still reserves the group ID
+            #[cfg(all(target_os = "linux", not(target_env = "uclibc")))]
+            stop_group_before_final_scan(child, policy)?;
+            #[cfg(all(test, target_os = "linux", not(target_env = "uclibc")))]
+            tests::before_final_scan();
             self.scan_objects(policy)?;
             if Instant::now() >= policy.deadline {
                 return Err(ProcessError::TimedOut);
@@ -564,10 +575,14 @@ impl StreamingMonitor {
             policy.object_budget,
             &mut self.usage,
         ) {
-            Ok(current_objects) => {
+            Ok(current) => {
+                // Every non-directory must be a private regular file in a protocol directory
+                self.unsafe_entries = usize::try_from(current.files).ok()
+                    != Some(current.stable_objects.len())
+                    || current.entries - current.files != policy.protocol_directory_count;
                 self.stable_objects =
-                    intersect_object_scans(&self.previous_objects, &current_objects);
-                self.previous_objects = current_objects;
+                    intersect_object_scans(&self.previous_objects, &current.stable_objects);
+                self.previous_objects = current.stable_objects;
                 Ok(())
             }
             Err(ProcessError::ObjectExportLimit(mut limit)) => {
@@ -591,7 +606,12 @@ impl StreamingMonitor {
             stderr_truncated,
             status,
             object_usage: self.usage,
-            stable_objects: std::mem::take(&mut self.stable_objects),
+            objects: if status.success() {
+                std::mem::take(&mut self.previous_objects)
+            } else {
+                std::mem::take(&mut self.stable_objects)
+            },
+            unsafe_entries: self.unsafe_entries,
         })
     }
 
@@ -613,17 +633,10 @@ fn observe_object_tree(
     protocol_directory_count: u64,
     budget: ObjectExportBudget,
     usage: &mut ObjectExportUsage,
-) -> Result<Vec<StableObject>, ProcessError> {
+) -> Result<ObjectTreeScan, ProcessError> {
     usage.temporary_scan_complete = false;
-    let root_metadata = fs::symlink_metadata(root).map_err(ProcessError::Read)?;
-    if !root_metadata.file_type().is_dir() {
-        return Err(ProcessError::Read(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "TShark object output root is not a directory",
-        )));
-    }
-
-    let mut directories = vec![root.to_owned()];
+    let root_directory = open_tree_directory(root).map_err(ProcessError::Read)?;
+    let mut directories = vec![(std::path::PathBuf::new(), root_directory)];
     let maximum_entries = budget
         .temporary_files
         .checked_add(protocol_directory_count)
@@ -631,19 +644,23 @@ fn observe_object_tree(
             ProcessError::Read(io::Error::other("TShark object entry budget overflow"))
         })?;
     let mut scan = ObjectTreeScan::default();
-    while let Some(directory) = directories.pop() {
-        let entries = fs::read_dir(directory).map_err(ProcessError::Read)?;
+    while let Some((relative_directory, directory)) = directories.pop() {
+        // Each descriptor pins its directory even if the child replaces its name
+        let directory_path = tree_directory_source(&directory).map_err(ProcessError::Read)?;
+        let entries = fs::read_dir(directory_path).map_err(ProcessError::Read)?;
         for entry in entries {
             let entry = entry.map_err(ProcessError::Read)?;
             observe_tree_entry(
                 &entry,
                 &mut directories,
-                root,
+                &relative_directory,
                 &mut scan,
                 maximum_entries,
                 budget,
                 usage,
             )?;
+            #[cfg(all(test, target_os = "linux"))]
+            tests::after_tree_entry();
         }
     }
     usage.temporary_bytes_peak = usage.temporary_bytes_peak.max(scan.bytes);
@@ -651,7 +668,7 @@ fn observe_object_tree(
     usage.temporary_scan_complete = true;
     scan.stable_objects
         .sort_by(|left, right| left.relative_path.cmp(&right.relative_path));
-    Ok(scan.stable_objects)
+    Ok(scan)
 }
 
 #[derive(Default)]
@@ -664,8 +681,8 @@ struct ObjectTreeScan {
 
 fn observe_tree_entry(
     entry: &fs::DirEntry,
-    directories: &mut Vec<std::path::PathBuf>,
-    root: &Path,
+    directories: &mut Vec<(std::path::PathBuf, File)>,
+    relative_directory: &Path,
     scan: &mut ObjectTreeScan,
     maximum_entries: u64,
     budget: ObjectExportBudget,
@@ -677,12 +694,14 @@ fn observe_tree_entry(
         .ok_or_else(|| ProcessError::Read(io::Error::other("TShark tree entry count overflow")))?;
     usage.temporary_tree_entries_peak = usage.temporary_tree_entries_peak.max(scan.entries);
     let path = entry.path();
+    let relative_path = relative_directory.join(entry.file_name());
     let metadata = fs::symlink_metadata(&path).map_err(ProcessError::Read)?;
     if metadata.file_type().is_dir() {
         if scan.entries > maximum_entries {
             return Err(tree_entry_limit(maximum_entries, scan.entries, usage));
         }
-        directories.push(path);
+        let directory = open_tree_directory(&path).map_err(ProcessError::Read)?;
+        directories.push((relative_path, directory));
         return Ok(());
     }
 
@@ -716,7 +735,7 @@ fn observe_tree_entry(
     if scan.entries > maximum_entries {
         return Err(tree_entry_limit(maximum_entries, scan.entries, usage));
     }
-    if let Some(relative_path) = eligible_object_path(root, &path)
+    if let Some(relative_path) = eligible_object_path(&relative_path)
         && let Some(snapshot) = ObjectFileSnapshot::from_metadata(&metadata)
     {
         scan.stable_objects.push(StableObject {
@@ -727,10 +746,9 @@ fn observe_tree_entry(
     Ok(())
 }
 
-fn eligible_object_path(root: &Path, path: &Path) -> Option<std::path::PathBuf> {
+fn eligible_object_path(relative_path: &Path) -> Option<std::path::PathBuf> {
     use std::path::Component;
 
-    let relative_path = path.strip_prefix(root).ok()?;
     let mut components = relative_path.components();
     let Component::Normal(_) = components.next()? else {
         return None;
@@ -742,6 +760,37 @@ fn eligible_object_path(root: &Path, path: &Path) -> Option<std::path::PathBuf> 
         return None;
     }
     Some(relative_path.to_owned())
+}
+
+#[cfg(target_os = "linux")]
+fn open_tree_directory(path: &Path) -> io::Result<File> {
+    use std::{fs::OpenOptions, os::unix::fs::OpenOptionsExt};
+
+    OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .open(path)
+}
+
+#[cfg(not(target_os = "linux"))]
+fn open_tree_directory(_path: &Path) -> io::Result<File> {
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "safe TShark object scanning requires Linux",
+    ))
+}
+
+#[cfg(target_os = "linux")]
+fn tree_directory_source(directory: &File) -> io::Result<std::path::PathBuf> {
+    super::secure_files::descriptor_source(directory)
+}
+
+#[cfg(not(target_os = "linux"))]
+fn tree_directory_source(_directory: &File) -> io::Result<std::path::PathBuf> {
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "safe TShark object scanning requires Linux",
+    ))
 }
 
 fn intersect_object_scans(
@@ -902,20 +951,45 @@ fn check_sigchld_policy(status: &str) -> io::Result<()> {
 }
 
 fn capture(mut reader: impl Read, maximum: usize) -> Result<Vec<u8>, ProcessError> {
-    let limit = u64::try_from(maximum)
-        .ok()
-        .and_then(|size| size.checked_add(1))
-        .ok_or(ProcessError::OutputLimit)?;
     let mut bytes = Vec::new();
-    reader
-        .by_ref()
-        .take(limit)
-        .read_to_end(&mut bytes)
-        .map_err(ProcessError::Read)?;
-    if bytes.len() > maximum {
-        return Err(ProcessError::OutputLimit);
+    let mut scratch = [0_u8; 8192];
+    loop {
+        let remaining = maximum - bytes.len();
+        // The extra byte is read only into stack memory after the budget is full
+        let read_size = remaining.clamp(1, scratch.len());
+        let (buffer, _) = scratch.split_at_mut(read_size);
+        let count = match reader.read(buffer) {
+            Ok(0) => return Ok(bytes),
+            Ok(count) => count,
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+            Err(error) => return Err(ProcessError::Read(error)),
+        };
+        if remaining == 0 {
+            return Err(ProcessError::OutputLimit);
+        }
+        let chunk = buffer.get(..count).ok_or_else(|| {
+            ProcessError::Read(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "reader returned an invalid byte count",
+            ))
+        })?;
+        let required = bytes.len() + chunk.len();
+        if required > bytes.capacity() {
+            // Moving reallocations can temporarily retain both buffers; this bounds retained capacity
+            let target = bytes
+                .capacity()
+                .saturating_mul(2)
+                .max(required)
+                .min(maximum);
+            bytes
+                .try_reserve_exact(target - bytes.len())
+                .map_err(|error| ProcessError::Read(io::Error::other(error)))?;
+            if bytes.capacity() > maximum {
+                return Err(ProcessError::OutputLimit);
+            }
+        }
+        bytes.extend_from_slice(chunk);
     }
-    Ok(bytes)
 }
 
 #[cfg(all(target_os = "linux", not(target_env = "uclibc")))]
@@ -1021,4 +1095,171 @@ fn stop_process_group(child: &std::process::Child) -> io::Result<bool> {
     #[cfg(not(unix))]
     let _ = child;
     Ok(exited)
+}
+
+#[cfg(all(target_os = "linux", not(target_env = "uclibc")))]
+fn stop_group_before_final_scan(
+    child: &Child,
+    policy: StreamingPolicy<'_>,
+) -> Result<(), ProcessError> {
+    stop_process_group(child).map_err(ProcessError::Read)?;
+    validate_proc_view().map_err(ProcessError::Read)?;
+    let cleanup_deadline = Instant::now() + GROUP_STOP_WAIT;
+    let deadline = policy.deadline.min(cleanup_deadline);
+    match wait_for_group_stop(Path::new("/proc"), child.id(), deadline, policy.job) {
+        Err(ProcessError::TimedOut) if cleanup_deadline < policy.deadline => {
+            Err(ProcessError::Read(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "TShark process group did not stop",
+            )))
+        }
+        result => result,
+    }?;
+    check_group_stop_budget(policy.deadline, policy.job)
+}
+
+#[cfg(all(target_os = "linux", not(target_env = "uclibc")))]
+fn validate_proc_view() -> io::Result<()> {
+    let self_pid = fs::read_link("/proc/self")?;
+    if self_pid.to_str() != Some(std::process::id().to_string().as_str()) {
+        return Err(io::Error::other("procfs uses a different PID namespace"));
+    }
+    validate_proc_mount(&fs::read_to_string("/proc/self/mountinfo")?)
+}
+
+#[cfg(all(target_os = "linux", not(target_env = "uclibc")))]
+fn validate_proc_mount(mountinfo: &str) -> io::Result<()> {
+    let mut found = false;
+    for line in mountinfo.lines() {
+        let (mount, filesystem) = line
+            .split_once(" - ")
+            .ok_or_else(|| io::Error::other("invalid procfs mount information"))?;
+        found |= proc_mount_exposes_processes(mount, filesystem)?;
+    }
+    if !found {
+        return Err(io::Error::other("procfs mount is unavailable"));
+    }
+    Ok(())
+}
+
+#[cfg(all(target_os = "linux", not(target_env = "uclibc")))]
+fn proc_mount_exposes_processes(mount: &str, filesystem: &str) -> io::Result<bool> {
+    let mut mount_fields = mount.split_whitespace();
+    if mount_fields.nth(4) != Some("/proc") {
+        return Ok(false);
+    }
+    let mount_options = mount_fields
+        .next()
+        .ok_or_else(|| io::Error::other("procfs mount options are unavailable"))?;
+    let mut filesystem_fields = filesystem.split_whitespace();
+    if filesystem_fields.next() != Some("proc") {
+        return Err(io::Error::other("/proc is not a procfs mount"));
+    }
+    let options = filesystem_fields
+        .nth(1)
+        .ok_or_else(|| io::Error::other("procfs filesystem options are unavailable"))?;
+    if mount_options
+        .split(',')
+        .chain(options.split(','))
+        .any(|option| {
+            (option == "hidepid" || option.starts_with("hidepid="))
+                && !matches!(option, "hidepid=0" | "hidepid=off")
+        })
+    {
+        return Err(io::Error::other("procfs hides processes"));
+    }
+    Ok(true)
+}
+
+#[cfg(all(target_os = "linux", not(target_env = "uclibc")))]
+fn wait_for_group_stop(
+    proc_root: &Path,
+    process_group: u32,
+    deadline: Instant,
+    job: Option<&Job>,
+) -> Result<(), ProcessError> {
+    while process_group_has_live_members(proc_root, process_group, deadline, job)? {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        thread::sleep(remaining.min(Duration::from_millis(3)));
+    }
+    Ok(())
+}
+
+#[cfg(all(target_os = "linux", not(target_env = "uclibc")))]
+fn process_group_has_live_members(
+    proc_root: &Path,
+    process_group: u32,
+    deadline: Instant,
+    job: Option<&Job>,
+) -> Result<bool, ProcessError> {
+    check_group_stop_budget(deadline, job)?;
+    let entries = fs::read_dir(proc_root).map_err(ProcessError::Read)?;
+    for entry in entries {
+        check_group_stop_budget(deadline, job)?;
+        if process_is_live_in_group(&entry.map_err(ProcessError::Read)?, process_group)? {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+#[cfg(all(target_os = "linux", not(target_env = "uclibc")))]
+fn process_is_live_in_group(
+    entry: &fs::DirEntry,
+    process_group: u32,
+) -> Result<bool, ProcessError> {
+    if entry
+        .file_name()
+        .to_str()
+        .and_then(|name| name.parse::<u32>().ok())
+        .is_none()
+    {
+        return Ok(false);
+    }
+    let stat = match fs::read_to_string(entry.path().join("stat")) {
+        Ok(stat) => stat,
+        // A process can disappear between listing procfs and reading its state
+        Err(error)
+            if error.kind() == io::ErrorKind::NotFound
+                || error.raw_os_error() == Some(nix::libc::ESRCH) =>
+        {
+            return Ok(false);
+        }
+        Err(error) => return Err(ProcessError::Read(error)),
+    };
+    let (state, group, threads) = parse_process_group_stat(&stat).map_err(ProcessError::Read)?;
+    // A zombie leader can still have threads that can write
+    Ok(group == process_group && (!matches!(state, "Z" | "X" | "x") || threads > 1))
+}
+
+#[cfg(all(target_os = "linux", not(target_env = "uclibc")))]
+fn check_group_stop_budget(deadline: Instant, job: Option<&Job>) -> Result<(), ProcessError> {
+    if job.is_some_and(Job::is_cancelled) {
+        return Err(ProcessError::Cancelled);
+    }
+    if Instant::now() >= deadline {
+        return Err(ProcessError::TimedOut);
+    }
+    Ok(())
+}
+
+#[cfg(all(target_os = "linux", not(target_env = "uclibc")))]
+fn parse_process_group_stat(stat: &str) -> io::Result<(&str, u32, u32)> {
+    let (_, fields) = stat
+        .rsplit_once(") ")
+        .ok_or_else(|| io::Error::other("invalid process metadata"))?;
+    let mut fields = fields.split_whitespace();
+    let state = fields
+        .next()
+        .filter(|state| state.len() == 1)
+        .ok_or_else(|| io::Error::other("invalid process state"))?;
+    let group = fields
+        .nth(1)
+        .and_then(|value| value.parse().ok())
+        .ok_or_else(|| io::Error::other("invalid process group"))?;
+    let threads = fields
+        .nth(14)
+        .and_then(|value| value.parse().ok())
+        .ok_or_else(|| io::Error::other("invalid process thread count"))?;
+    Ok((state, group, threads))
 }

@@ -26,7 +26,7 @@ if [ "$1" = '-G' ]; then
         printf '%s\n' 'glossary profile missing' >&2
         exit 65
     fi
-    if [ -f "${0%/*}/$2.fail" ]; then
+    if [ "$2" = '__FAILED_GLOSSARY__' ]; then
         printf 'fixture %s failed\n' "$2" >&2
         exit 42
     fi
@@ -43,20 +43,20 @@ if [ "$1" = '-G' ]; then
     exit 64
 fi
 
-# Each phase reads a fixed fixture next to the copied executable
+# Keep phase output inside the selected executable for the isolated filesystem
 for argument in "$@"; do
     case "$argument" in
         -v)
-            printf '%s\n' 'TShark receipt fixture'
+            printf '%s\n' 'TShark 4.4.19'
             exit 0
             ;;
         fields)
             printf '%s\n' 'packet count diagnostic' >&2
-            cat "${0%/*}/frames.txt"
+            printf '%b' '__FRAMES_OCTAL__'
             exit 0
             ;;
         json)
-            cat "${0%/*}/packets.json"
+            printf '%b' '__PACKETS_OCTAL__'
             exit 0
             ;;
     esac

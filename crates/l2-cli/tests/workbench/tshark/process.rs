@@ -10,6 +10,9 @@ use std::{
     time::{Duration, Instant},
 };
 
+#[path = "process/capture.rs"]
+mod capture;
+
 #[cfg(target_os = "linux")]
 #[path = "process/spawn_failure.rs"]
 mod spawn_failure;
@@ -19,10 +22,38 @@ mod spawn_failure;
 mod pgid_reuse;
 
 #[cfg(all(target_os = "linux", not(target_env = "uclibc")))]
+#[path = "process/group_cleanup.rs"]
+mod group_cleanup;
+
+#[cfg(target_os = "linux")]
+#[path = "process/scan_race.rs"]
+mod scan_race;
+
+#[cfg(target_os = "linux")]
+thread_local! {
+    static NEXT_SCANNED_ENTRY: std::cell::RefCell<Option<Box<dyn FnOnce()>>> = const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(target_os = "linux")]
+pub(super) fn after_tree_entry() {
+    if let Some(observer) = NEXT_SCANNED_ENTRY.take() {
+        observer();
+    }
+}
+
+#[cfg(all(target_os = "linux", not(target_env = "uclibc")))]
 thread_local! {
     static OBSERVED_POLLS: std::cell::Cell<Option<usize>> = const { std::cell::Cell::new(None) };
     static NEXT_POLL_ERROR: std::cell::Cell<Option<nix::errno::Errno>> = const { std::cell::Cell::new(None) };
     static PERSISTENT_POLL_ERROR: std::cell::Cell<Option<nix::errno::Errno>> = const { std::cell::Cell::new(None) };
+    static FINAL_SCAN_OBSERVER: std::cell::RefCell<Option<Box<dyn FnOnce()>>> = const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(all(target_os = "linux", not(target_env = "uclibc")))]
+pub(super) fn before_final_scan() {
+    if let Some(observer) = FINAL_SCAN_OBSERVER.take() {
+        observer();
+    }
 }
 
 #[cfg(all(target_os = "linux", not(target_env = "uclibc")))]

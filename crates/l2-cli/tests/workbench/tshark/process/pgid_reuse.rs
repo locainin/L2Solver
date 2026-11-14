@@ -12,6 +12,7 @@ use std::{
     os::unix::process::CommandExt,
     path::{Path, PathBuf},
     process::{Child, Command, Stdio},
+    rc::Rc,
     thread,
     time::{Duration, Instant},
 };
@@ -651,6 +652,97 @@ fn buffered_failure_stops_descendant_after_it_closes_capture_pipes() -> Result<(
         "failed buffered capture left a same-group descendant running"
     );
     Ok(())
+}
+
+fn exited_leader_stops_descendant(mode: Mode, exit_code: i32) -> Result<(), Box<dyn Error>> {
+    let temporary = tempfile::tempdir()?;
+    let pid_path = temporary.path().join("descendant.pid");
+    let release = temporary.path().join("release");
+    let _release = ReleaseOnDrop(release.clone());
+    let object_root = temporary.path().join("objects");
+    empty_object_root(&object_root)?;
+    let script = "sh -c 'printf \"%s\\n\" \"$$\" > \"$DESCENDANT\"; i=0; while [ ! -f \"$RELEASE\" ] && [ \"$i\" -lt 100 ]; do i=$((i + 1)); sleep 0.02; done' </dev/null >/dev/null 2>&1 & while [ ! -s \"$DESCENDANT\" ]; do sleep 0.01; done; printf captured; printf diagnostic >&2; exit \"$EXIT_CODE\"";
+    let arguments = [OsString::from("-c"), OsString::from(script)];
+    let environment = [
+        (
+            OsString::from("DESCENDANT"),
+            pid_path.as_os_str().to_owned(),
+        ),
+        (OsString::from("RELEASE"), release.as_os_str().to_owned()),
+        (OsString::from("EXIT_CODE"), exit_code.to_string().into()),
+    ];
+    match mode {
+        Mode::Buffered => {
+            let output = super::super::run(
+                Path::new("sh"),
+                &arguments,
+                &environment,
+                Duration::from_secs(2),
+                1024,
+                1024,
+            )?;
+            assert_eq!(output.status.code(), Some(exit_code));
+            assert_eq!(output.stdout, b"captured");
+            assert_eq!(output.stderr, b"diagnostic");
+        }
+        Mode::Streaming => {
+            let scan_state = Rc::new(std::cell::RefCell::new(None));
+            let observer_state = Rc::clone(&scan_state);
+            let observer_pid_path = pid_path.clone();
+            super::FINAL_SCAN_OBSERVER.replace(Some(Box::new(move || {
+                let observed = read_pid(&observer_pid_path)
+                    .and_then(|pid| u32::try_from(pid).map_err(io::Error::other))
+                    .and_then(super::process_is_running);
+                observer_state.replace(Some(observed));
+            })));
+            let output = run_streaming(
+                Path::new("sh"),
+                &arguments,
+                &environment,
+                policy(
+                    Instant::now() + Duration::from_secs(2),
+                    &object_root,
+                    0,
+                    ObjectExportBudget::default(),
+                ),
+            )?;
+            assert_eq!(output.status.code(), Some(exit_code));
+            assert_eq!(output.stderr, b"diagnostic");
+            assert!(output.object_usage.temporary_scan_complete);
+            let running_at_scan = scan_state
+                .take()
+                .ok_or("the final object scan was not observed")??;
+            assert!(
+                !running_at_scan,
+                "the final object scan started while a descendant could still write"
+            );
+        }
+    }
+    let descendant = u32::try_from(read_pid(&pid_path)?)?;
+    let deadline = Instant::now() + Duration::from_millis(300);
+    while super::process_is_running(descendant)? && Instant::now() < deadline {
+        thread::sleep(Duration::from_millis(2));
+    }
+    assert!(
+        !super::process_is_running(descendant)?,
+        "capture left a same-group descendant running"
+    );
+    Ok(())
+}
+
+#[test]
+fn buffered_success_descendant_cleanup() -> Result<(), Box<dyn Error>> {
+    exited_leader_stops_descendant(Mode::Buffered, 0)
+}
+
+#[test]
+fn streaming_success_descendant_cleanup() -> Result<(), Box<dyn Error>> {
+    exited_leader_stops_descendant(Mode::Streaming, 0)
+}
+
+#[test]
+fn streaming_failure_final_scan_quiescence() -> Result<(), Box<dyn Error>> {
+    exited_leader_stops_descendant(Mode::Streaming, 7)
 }
 
 struct PersistentPollError;

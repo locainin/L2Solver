@@ -45,6 +45,8 @@ pub use recovery_executor::{
     RecoveryOmission, RecoveryResourceSummary, RecoveryResume, RecoveryRunSummary,
     recover_case_with_job,
 };
+#[cfg(test)]
+pub use tshark::Workspace;
 pub use tshark::tshark_cache_identity;
 pub use tshark::{ExportObjectSet, ObjectExportBudget, ObjectExportStatus, ObjectExportUsage};
 

@@ -65,7 +65,7 @@ fn selected_executable_reports_public_version_and_fast_metadata() -> Result<(), 
     let executable = temporary.path().join("tshark");
     executable_script(
         &executable,
-        "[ \"$1\" = \"-n\" ] && [ \"$2\" = \"-v\" ] || exit 9\nprintf 'TShark (Wireshark) 4.4.2\\n'",
+        "[ \"$#\" = 2 ] && [ \"$1\" = \"-n\" ] && [ \"$2\" = \"-v\" ] || exit 9\nprintf 'TShark (Wireshark) 4.4.20\\n'",
     )?;
     let search_path = std::env::join_paths([temporary.path()])?;
 
@@ -75,9 +75,9 @@ fn selected_executable_reports_public_version_and_fast_metadata() -> Result<(), 
     assert_eq!(field(&identity, "/version/status")?, "available");
     assert_eq!(
         field(&identity, "/version/public_version")?,
-        "TShark (Wireshark) 4.4.2"
+        "TShark (Wireshark) 4.4.20"
     );
-    assert_eq!(field(&identity, "/arguments_epoch")?, 1);
+    assert_eq!(field(&identity, "/arguments_epoch")?, 2);
     assert_eq!(
         field(&identity, "/executable/length")?,
         fs::metadata(&executable)?.len()
@@ -126,13 +126,16 @@ fn non_utf8_search_path_and_executable_are_encoded_without_panicking() -> Result
         .join(OsString::from_vec(b"tool-\xff".to_vec()));
     fs::create_dir(&directory)?;
     let executable = directory.join("tshark");
-    executable_script(&executable, "printf 'TShark 4.4.2\\n'")?;
+    executable_script(&executable, "printf 'TShark 4.4.20\\n'")?;
     let search_path = std::env::join_paths([&directory])?;
 
     let identity = identity_for_path(Some(&search_path), None);
 
     assert_eq!(field(&identity, "/executable/status")?, "selected");
-    assert_eq!(field(&identity, "/version/public_version")?, "TShark 4.4.2");
+    assert_eq!(
+        field(&identity, "/version/public_version")?,
+        "TShark 4.4.20"
+    );
     assert_eq!(selected_path(&identity)?, executable.canonicalize()?);
     assert!(field(&identity, "/executable/path_hex")?.as_str().is_some());
     Ok(())
@@ -152,18 +155,17 @@ fn non_executable_shadow_file_does_not_hide_or_run_the_next_executable()
     let executable = executable_directory.join("tshark");
     executable_script(
         &executable,
-        "printf '%s %s' \"$1\" \"$2\" > \"${0}.args\"\nprintf 'TShark 4.4.2\\n'",
+        "[ \"$#\" = 2 ] && [ \"$1\" = \"-n\" ] && [ \"$2\" = \"-v\" ] || exit 9\nprintf 'TShark 4.4.20\\n'",
     )?;
     let search_path = std::env::join_paths([&shadow, &executable_directory])?;
 
     let identity = identity_for_path(Some(&search_path), None);
 
-    assert_eq!(field(&identity, "/version/public_version")?, "TShark 4.4.2");
-    assert_eq!(selected_path(&identity)?, executable.canonicalize()?);
     assert_eq!(
-        fs::read_to_string(executable.with_extension("args"))?,
-        "-n -v"
+        field(&identity, "/version/public_version")?,
+        "TShark 4.4.20"
     );
+    assert_eq!(selected_path(&identity)?, executable.canonicalize()?);
     Ok(())
 }
 

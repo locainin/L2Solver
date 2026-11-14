@@ -25,7 +25,7 @@ pub struct TsharkOptions {
     /// Maximum metadata stdout in MiB per phase (default 16; covers plugin and source-frame-count output)
     #[arg(long, default_value_t = 16, value_parser = clap::value_parser!(u32).range(1..))]
     pub max_metadata_mib: u32,
-    /// Maximum JSON stdout in MiB (default 256 to bound memory; excess output fails, never truncates)
+    /// Maximum admitted JSON data in MiB, including retained stdout, parser scratch and decoded data (default 256; allocator overhead and process RSS are separate)
     #[arg(long, default_value_t = 256, value_parser = clap::value_parser!(u32).range(1..))]
     pub max_output_mib: u32,
     /// Maximum captured stderr in MiB per phase (default 1; increase for verbose plugin diagnostics)

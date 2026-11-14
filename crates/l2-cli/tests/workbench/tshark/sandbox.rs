@@ -1,0 +1,439 @@
+use super::{BRIDGE, Sandbox, check_status};
+use crate::workbench::tshark::{
+    process,
+    secure_files::{VerifiedExecutable, Workspace},
+};
+use std::{
+    error::Error,
+    ffi::{OsStr, OsString},
+    fs::{self, File},
+    io::Write,
+    net::TcpListener,
+    os::unix::{fs::PermissionsExt, net::UnixStream},
+    process::Command,
+    time::{Duration, Instant},
+};
+
+const CLEAN_STATUS: &str = "Uid:\t1000\t1000\t1000\t1000\nGid:\t1000\t1000\t1000\t1000\nCapInh:\t0000000000000000\nCapPrm:\t0000000000000000\nCapEff:\t0000000000000000\nCapBnd:\t000001ffffffffff\nCapAmb:\t0000000000000000\n";
+const PROBE_VARIABLE: &str = "L2_SANDBOX_TEST_PROBE";
+
+#[test]
+fn sandbox_descriptor_enumeration_failure() -> Result<(), Box<dyn Error>> {
+    let (scrub, _) = BRIDGE
+        .split_once("exec 3<\"$1\"")
+        .ok_or("bridge setup missing")?;
+    // Fill the descriptor table before Bash tries to enumerate /proc/self/fd
+    let command = format!(
+        "ulimit -n 10 || exit 125; exec 3</dev/null 4</dev/null 5</dev/null 6</dev/null 7</dev/null 8</dev/null 9</dev/null || exit 125; printf 'ready\\n'; {scrub} printf 'continued\\n'"
+    );
+    let result = Command::new("/usr/bin/bash")
+        .args(["--noprofile", "--norc", "-c", &command])
+        .output()?;
+    assert!(
+        !result.status.success(),
+        "descriptor enumeration did not abort"
+    );
+    assert_eq!(
+        result.stdout, b"ready\n",
+        "bridge continued after enumeration failed"
+    );
+    Ok(())
+}
+
+#[test]
+fn privilege_status_clean() -> Result<(), Box<dyn Error>> {
+    check_status(CLEAN_STATUS)?;
+    Ok(())
+}
+
+#[test]
+fn privilege_status_rejections() {
+    for status in [
+        CLEAN_STATUS.replace("Uid:\t1000\t1000\t1000\t1000", "Uid:\t0\t0\t0\t0"),
+        CLEAN_STATUS.replace("Uid:\t1000\t1000\t1000\t1000", "Uid:\t1000\t1000\t0\t1000"),
+        CLEAN_STATUS.replace("Uid:\t1000\t1000\t1000\t1000", "Uid:\t1000\t1000\t1000\t0"),
+        CLEAN_STATUS.replace(
+            "Gid:\t1000\t1000\t1000\t1000",
+            "Gid:\t1000\t1001\t1000\t1000",
+        ),
+        CLEAN_STATUS.replace("CapInh:\t0000000000000000", "CapInh:\t0000000000000001"),
+        CLEAN_STATUS.replace("CapPrm:\t0000000000000000", "CapPrm:\t0000000000000001"),
+        CLEAN_STATUS.replace("CapEff:\t0000000000000000", "CapEff:\t0000000000000001"),
+        CLEAN_STATUS.replace("CapAmb:\t0000000000000000", "CapAmb:\t0000000000000001"),
+        CLEAN_STATUS.replace("CapAmb:\t0000000000000000\n", ""),
+        CLEAN_STATUS.replace("CapAmb:\t0000000000000000", "CapAmb:\tbogus"),
+        format!("{CLEAN_STATUS}Uid:\t0\t0\t0\t0\n"),
+    ] {
+        assert!(check_status(&status).is_err(), "accepted {status:?}");
+    }
+}
+
+#[test]
+fn sandbox_probe() -> Result<(), Box<dyn Error>> {
+    if std::env::var_os(PROBE_VARIABLE).is_none() {
+        return Ok(());
+    }
+
+    let status = fs::read_to_string("/proc/self/status")?;
+    for (field, expected) in [
+        ("Uid", "65534\t65534\t65534\t65534"),
+        ("Gid", "65534\t65534\t65534\t65534"),
+        ("CapInh", "0000000000000000"),
+        ("CapPrm", "0000000000000000"),
+        ("CapEff", "0000000000000000"),
+        ("CapBnd", "0000000000000000"),
+        ("CapAmb", "0000000000000000"),
+        ("NoNewPrivs", "1"),
+    ] {
+        let actual = status
+            .lines()
+            .find_map(|line| line.strip_prefix(field)?.strip_prefix(':').map(str::trim));
+        assert_eq!(actual, Some(expected), "unexpected {field} in {status}");
+    }
+    assert_eq!(fs::read("/work/capture.bin")?, b"capture bytes");
+    assert_eq!(fs::read("/work/tls-keylog.txt")?, b"keylog bytes");
+    assert!(fs::write("/work/capture.bin", b"changed").is_err());
+    assert!(fs::write("/work/tls-keylog.txt", b"changed").is_err());
+    assert!(fs::write("/work/forbidden", b"changed").is_err());
+    // The pre-sandbox workspace descriptor must not bypass the read-only mount
+    assert!(fs::write("/proc/self/fd/4/capture.bin", b"changed").is_err());
+    fs::write("/output/writable", b"allowed")?;
+    let host_file = std::env::var_os("L2_SANDBOX_TEST_HOST_FILE").ok_or("host file missing")?;
+    assert!(fs::write(host_file, b"escape").is_err());
+    let tcp_error = TcpListener::bind("127.0.0.1:0")
+        .err()
+        .ok_or("TCP socket was allowed")?;
+    assert_eq!(tcp_error.raw_os_error(), Some(libc::EPERM));
+    let pair_error = UnixStream::pair().err().ok_or("socket pair was allowed")?;
+    assert_eq!(pair_error.raw_os_error(), Some(libc::EPERM));
+    Ok(())
+}
+
+#[test]
+fn sandbox_filesystem_network_credentials() -> Result<(), Box<dyn Error>> {
+    let parent = tempfile::tempdir()?;
+    let workspace = Workspace::new(Some(parent.path()))?;
+    let mut capture = workspace.create_file(OsStr::new("capture.bin"))?;
+    capture.write_all(b"capture bytes")?;
+    let mut keylog = workspace.create_file(OsStr::new("tls-keylog.txt"))?;
+    keylog.write_all(b"keylog bytes")?;
+    let output_path = workspace.path().join("results");
+    fs::create_dir(&output_path)?;
+    let output = File::open(&output_path)?;
+    let executable = VerifiedExecutable::open(&std::env::current_exe()?)?;
+    let sandbox = Sandbox::new(&workspace, &executable, Some(&capture), Some(&keylog))?;
+    let name = format!(
+        "{}::sandbox_probe",
+        module_path!()
+            .split_once("::")
+            .ok_or("test module path missing")?
+            .1
+    );
+    let arguments = [
+        OsString::from("--exact"),
+        OsString::from(name),
+        OsString::from("--nocapture"),
+    ];
+    let host_file = parent.path().join("outside");
+    let environment = [
+        (OsString::from(PROBE_VARIABLE), OsString::from("1")),
+        (
+            OsString::from("L2_SANDBOX_TEST_HOST_FILE"),
+            host_file.as_os_str().to_owned(),
+        ),
+    ];
+    let launch = sandbox.command(&arguments, &environment, Some(&output))?;
+    let result = process::run(
+        &launch.executable,
+        &launch.arguments,
+        &launch.environment,
+        Duration::from_secs(10),
+        64 * 1024,
+        64 * 1024,
+    )?;
+    assert!(
+        result.status.success(),
+        "stdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&result.stdout),
+        String::from_utf8_lossy(&result.stderr)
+    );
+    assert_eq!(fs::read(output_path.join("writable"))?, b"allowed");
+    assert!(!host_file.exists());
+    assert_eq!(
+        fs::read(workspace.path().join("capture.bin"))?,
+        b"capture bytes"
+    );
+    assert_eq!(
+        fs::read(workspace.path().join("tls-keylog.txt"))?,
+        b"keylog bytes"
+    );
+    Ok(())
+}
+
+#[test]
+fn sandbox_argument_integrity() -> Result<(), Box<dyn Error>> {
+    let parent = tempfile::tempdir()?;
+    let workspace = Workspace::new(Some(parent.path()))?;
+    let script = parent.path().join("fixture");
+    fs::write(&script, "#!/bin/sh\nprintf '<%s>\\n' \"$@\"\n")?;
+    fs::set_permissions(&script, fs::Permissions::from_mode(0o700))?;
+    let executable = VerifiedExecutable::open(&script)?;
+    let sandbox = Sandbox::new(&workspace, &executable, None, None)?;
+    let arguments = [
+        OsString::from("with spaces"),
+        OsString::from("$(touch /tmp/never)"),
+        OsString::from("; literal"),
+    ];
+    let launch = sandbox.command(&arguments, &[], None)?;
+    let result = process::run(
+        &launch.executable,
+        &launch.arguments,
+        &launch.environment,
+        Duration::from_secs(10),
+        4096,
+        4096,
+    )?;
+    assert!(
+        result.status.success(),
+        "{}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    assert_eq!(
+        result.stdout,
+        b"<with spaces>\n<$(touch /tmp/never)>\n<; literal>\n"
+    );
+    Ok(())
+}
+
+#[test]
+fn sandbox_workspace_path_translation() -> Result<(), Box<dyn Error>> {
+    let parent = tempfile::tempdir()?;
+    let workspace = Workspace::new(Some(parent.path()))?;
+    let script = parent.path().join("fixture");
+    fs::write(
+        &script,
+        "#!/bin/sh\nprintf '<%s>\\n' \"$HOME\" \"$TMPDIR\" \"$@\"\n",
+    )?;
+    fs::set_permissions(&script, fs::Permissions::from_mode(0o700))?;
+    let executable = VerifiedExecutable::open(&script)?;
+    let sandbox = Sandbox::new(&workspace, &executable, None, None)?;
+    let output_path = workspace.path().join("export-objects");
+    fs::create_dir(&output_path)?;
+    let output = File::open(&output_path)?;
+    let mut keylog = OsString::from("tls.keylog_file:");
+    keylog.push(workspace.path().join("tls-keylog.txt"));
+    let mut object = OsString::from("http,");
+    object.push(output_path.join("http"));
+    let mut similar_prefix = workspace.path().as_os_str().to_owned();
+    similar_prefix.push("-other");
+    let arguments = [
+        workspace.path().join("capture.bin").into_os_string(),
+        keylog,
+        object,
+        similar_prefix.clone(),
+    ];
+    let environment = [
+        (
+            OsString::from("HOME"),
+            workspace.path().join("home").into_os_string(),
+        ),
+        (
+            OsString::from("TMPDIR"),
+            workspace.path().as_os_str().to_owned(),
+        ),
+    ];
+    let launch = sandbox.command(&arguments, &environment, Some(&output))?;
+    let result = process::run(
+        &launch.executable,
+        &launch.arguments,
+        &launch.environment,
+        Duration::from_secs(10),
+        4096,
+        4096,
+    )?;
+    assert!(
+        result.status.success(),
+        "{}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    let expected = format!(
+        "</work/home>\n</tmp>\n</work/capture.bin>\n<tls.keylog_file:/work/tls-keylog.txt>\n<http,/output/http>\n<{}>\n",
+        similar_prefix.to_string_lossy()
+    );
+    assert_eq!(result.stdout, expected.as_bytes());
+    Ok(())
+}
+
+#[test]
+fn sandbox_snapshot_inode_identity() -> Result<(), Box<dyn Error>> {
+    let parent = tempfile::tempdir()?;
+    let workspace = Workspace::new(Some(parent.path()))?;
+    let mut capture = workspace.create_file(OsStr::new("capture.bin"))?;
+    capture.write_all(b"original capture")?;
+    let script = parent.path().join("fixture");
+    fs::write(&script, "#!/bin/sh\ncat /work/capture.bin\n")?;
+    fs::set_permissions(&script, fs::Permissions::from_mode(0o700))?;
+    let executable = VerifiedExecutable::open(&script)?;
+    let sandbox = Sandbox::new(&workspace, &executable, Some(&capture), None)?;
+    drop(capture);
+    drop(executable);
+    fs::rename(
+        workspace.path().join("capture.bin"),
+        workspace.path().join("original"),
+    )?;
+    fs::write(workspace.path().join("capture.bin"), b"replacement capture")?;
+    fs::rename(&script, parent.path().join("original-fixture"))?;
+    fs::write(&script, "#!/bin/sh\nprintf replacement\n")?;
+    fs::set_permissions(&script, fs::Permissions::from_mode(0o700))?;
+    let launch = sandbox.command(&[], &[], None)?;
+    let result = process::run(
+        &launch.executable,
+        &launch.arguments,
+        &launch.environment,
+        Duration::from_secs(10),
+        4096,
+        4096,
+    )?;
+    assert!(
+        result.status.success(),
+        "{}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    assert_eq!(result.stdout, b"original capture");
+    Ok(())
+}
+
+#[test]
+fn sandbox_inherited_descriptor() -> Result<(), Box<dyn Error>> {
+    const PROBE: &str = "L2_SANDBOX_INHERITED_FD_PROBE";
+    if std::env::var_os(PROBE).is_some() {
+        let parent = tempfile::tempdir()?;
+        let workspace = Workspace::new(Some(parent.path()))?;
+        let script = parent.path().join("fixture");
+        fs::write(
+            &script,
+            "#!/bin/sh\nif [ -e /proc/self/fd/9 ]; then : > /proc/self/fd/9/escaped; fi\n",
+        )?;
+        fs::set_permissions(&script, fs::Permissions::from_mode(0o700))?;
+        let executable = VerifiedExecutable::open(&script)?;
+        let sandbox = Sandbox::new(&workspace, &executable, None, None)?;
+        let launch = sandbox.command(&[], &[], None)?;
+        let result = process::run(
+            &launch.executable,
+            &launch.arguments,
+            &launch.environment,
+            Duration::from_secs(10),
+            4096,
+            4096,
+        )?;
+        assert!(
+            result.status.success(),
+            "{}",
+            String::from_utf8_lossy(&result.stderr)
+        );
+        return Ok(());
+    }
+    let host_directory = tempfile::tempdir()?;
+    let test_name = format!(
+        "{}::sandbox_inherited_descriptor",
+        module_path!()
+            .split_once("::")
+            .ok_or("test module path missing")?
+            .1
+    );
+    let result = Command::new("/bin/sh")
+        .args(["-c", "exec 9<\"$1\"; shift; exec \"$@\"", "fd-test"])
+        .arg(host_directory.path())
+        .arg(std::env::current_exe()?)
+        .args(["--exact", &test_name, "--nocapture"])
+        .env(PROBE, "1")
+        .output()?;
+    assert!(
+        result.status.success(),
+        "stdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&result.stdout),
+        String::from_utf8_lossy(&result.stderr)
+    );
+    assert!(
+        !host_directory.path().join("escaped").exists(),
+        "sandbox retained a host directory descriptor"
+    );
+    Ok(())
+}
+
+#[test]
+fn sandbox_unused_descriptors() -> Result<(), Box<dyn Error>> {
+    let parent = tempfile::tempdir()?;
+    let workspace = Workspace::new(Some(parent.path()))?;
+    let script = parent.path().join("fixture");
+    fs::write(
+        &script,
+        "#!/bin/sh\nfor fd in 6 7 8; do if [ -d /proc/self/fd/$fd ]; then : > /proc/self/fd/$fd/escaped; fi; done\n",
+    )?;
+    fs::set_permissions(&script, fs::Permissions::from_mode(0o700))?;
+    let executable = VerifiedExecutable::open(&script)?;
+    let sandbox = Sandbox::new(&workspace, &executable, None, None)?;
+    let launch = sandbox.command(&[], &[], None)?;
+    let result = process::run(
+        &launch.executable,
+        &launch.arguments,
+        &launch.environment,
+        Duration::from_secs(10),
+        4096,
+        4096,
+    )?;
+    assert!(
+        result.status.success(),
+        "{}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    assert!(
+        !workspace.path().join("escaped").exists(),
+        "unused mount slot exposed the writable workspace"
+    );
+    Ok(())
+}
+
+#[test]
+fn sandbox_detached_descendants() -> Result<(), Box<dyn Error>> {
+    let parent = tempfile::tempdir()?;
+    let workspace = Workspace::new(Some(parent.path()))?;
+    let script = parent.path().join("fixture");
+    fs::write(
+        &script,
+        "#!/bin/sh\nsetsid /bin/sh -c 'touch /output/ready; sleep 1; touch /output/escaped' </dev/null >/dev/null 2>&1 &\nwhile [ ! -e /output/ready ]; do sleep 0.01; done\n",
+    )?;
+    fs::set_permissions(&script, fs::Permissions::from_mode(0o700))?;
+    let executable = VerifiedExecutable::open(&script)?;
+    let sandbox = Sandbox::new(&workspace, &executable, None, None)?;
+    let output_path = workspace.path().join("results");
+    fs::create_dir(&output_path)?;
+    let output = File::open(&output_path)?;
+    let launch = sandbox.command(&[], &[], Some(&output))?;
+    let result = process::run(
+        &launch.executable,
+        &launch.arguments,
+        &launch.environment,
+        Duration::from_secs(10),
+        4096,
+        4096,
+    )?;
+    assert!(
+        result.status.success(),
+        "{}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    assert!(
+        output_path.join("ready").exists(),
+        "detached child never started"
+    );
+    let deadline = Instant::now() + Duration::from_millis(1400);
+    while Instant::now() < deadline {
+        assert!(
+            !output_path.join("escaped").exists(),
+            "detached child survived namespace shutdown"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    Ok(())
+}

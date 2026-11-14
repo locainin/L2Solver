@@ -1,6 +1,11 @@
 //! Describe the selected `TShark` using bounded, non-authoritative metadata
 
-use super::{process, resolve_executable_in_search_path};
+use super::{
+    executable::resolve_executable_in_search_path,
+    process, sandbox,
+    secure_files::{VerifiedExecutable, Workspace},
+    version,
+};
 use l2_workbench::job::Job;
 use serde_json::{Value, json};
 use std::{
@@ -16,14 +21,14 @@ use std::os::unix::ffi::OsStrExt;
 #[cfg(windows)]
 use std::os::windows::ffi::OsStrExt;
 
-const ARGUMENTS_EPOCH: u32 = 1;
+const ARGUMENTS_EPOCH: u32 = 2;
 const VERSION_ARGUMENTS: [&str; 2] = ["-n", "-v"];
 const VERSION_PROBE_TIMEOUT: Duration = Duration::from_secs(2);
 const VERSION_STDOUT_MAXIMUM: usize = 4 * 1024;
 const VERSION_STDERR_MAXIMUM: usize = 4 * 1024;
 
 /// Return a cache identity even when `TShark` is absent or its version is unavailable
-pub(super) fn identity(job: Option<&Job>) -> Value {
+pub fn identity(job: Option<&Job>) -> Value {
     let search_path = env::var_os("PATH");
     identity_for_path(search_path.as_deref(), job)
 }
@@ -53,7 +58,36 @@ fn identity_for_path(search_path: Option<&OsStr>, job: Option<&Job>) -> Value {
         }
     };
 
-    let metadata = match fs::metadata(&executable) {
+    // The privilege gate applies before even a version probe may start
+    if let Err(error) = sandbox::check_privileges() {
+        let executable = json!({
+            "status": "verification_unavailable",
+            "path_hex": encode_path(&executable),
+            "error_kind": format!("{:?}", error.kind())
+        });
+        let version = if job.is_some_and(Job::is_cancelled) {
+            json!({"status": "cancelled"})
+        } else if error.kind() == io::ErrorKind::PermissionDenied {
+            unavailable("privileged_context")
+        } else {
+            unavailable("sandbox_unavailable")
+        };
+        return cache_identity(&executable, &version);
+    }
+
+    let verified = match VerifiedExecutable::open(&executable) {
+        Ok(verified) => verified,
+        Err(error) => {
+            let executable_metadata = json!({
+                "status": "verification_failed",
+                "path_hex": encode_path(&executable),
+                "error_kind": format!("{:?}", error.kind())
+            });
+            let version = unavailable("verification_failed");
+            return cache_identity(&executable_metadata, &version);
+        }
+    };
+    let metadata = match verified.file.metadata() {
         Ok(metadata) => metadata,
         Err(error) => {
             let executable_metadata = json!({
@@ -67,8 +101,8 @@ fn identity_for_path(search_path: Option<&OsStr>, job: Option<&Job>) -> Value {
     };
 
     // File metadata keeps this lookup quick; it does not claim to be a content hash
-    let executable_metadata = executable_metadata(&executable, &metadata);
-    let version = version_identity(&executable, job);
+    let executable_metadata = executable_metadata(&verified.path, &metadata);
+    let version = version_identity(&verified, job);
     cache_identity(&executable_metadata, &version)
 }
 
@@ -113,12 +147,28 @@ fn executable_metadata(path: &Path, metadata: &fs::Metadata) -> Value {
     value
 }
 
-fn version_identity(executable: &Path, job: Option<&Job>) -> Value {
+fn version_identity(executable: &VerifiedExecutable, job: Option<&Job>) -> Value {
+    if job.is_some_and(Job::is_cancelled) {
+        return json!({"status": "cancelled"});
+    }
+    let workspace = match Workspace::new(None) {
+        Ok(workspace) => workspace,
+        Err(error) => return unavailable_error("workspace_unavailable", &error),
+    };
+    let sandbox = match sandbox::Sandbox::new(&workspace, executable, None, None) {
+        Ok(sandbox) => sandbox,
+        Err(error) => return unavailable_error("sandbox_unavailable", &error),
+    };
     let arguments = VERSION_ARGUMENTS.map(OsString::from);
+    let launch = match sandbox.command(&arguments, &[], None) {
+        Ok(launch) => launch,
+        Err(error) => return unavailable_error("sandbox_unavailable", &error),
+    };
+    // Launch owns the descriptors used by the sandbox until the process exits
     let output = match process::run_with_job(
-        executable,
-        &arguments,
-        &[],
+        &launch.executable,
+        &launch.arguments,
+        &launch.environment,
         VERSION_PROBE_TIMEOUT,
         VERSION_STDOUT_MAXIMUM,
         VERSION_STDERR_MAXIMUM,
@@ -135,25 +185,13 @@ fn version_identity(executable: &Path, job: Option<&Job>) -> Value {
             return unavailable("output_limit");
         }
         Err(process::ProcessError::Spawn(error)) => {
-            return json!({
-                "status": "unavailable",
-                "reason": "spawn_failed",
-                "error_kind": format!("{:?}", error.kind())
-            });
+            return unavailable_error("spawn_failed", &error);
         }
         Err(process::ProcessError::WorkerSpawn { source, .. }) => {
-            return json!({
-                "status": "unavailable",
-                "reason": "worker_spawn_failed",
-                "error_kind": format!("{:?}", source.kind())
-            });
+            return unavailable_error("worker_spawn_failed", &source);
         }
         Err(process::ProcessError::Read(error)) => {
-            return json!({
-                "status": "unavailable",
-                "reason": "output_read_failed",
-                "error_kind": format!("{:?}", error.kind())
-            });
+            return unavailable_error("output_read_failed", &error);
         }
         Err(
             process::ProcessError::ObjectExportLimit(_)
@@ -177,6 +215,8 @@ fn version_identity(executable: &Path, job: Option<&Job>) -> Value {
     };
     if version.is_empty() {
         unavailable("empty_version")
+    } else if version::validate(version).is_err() {
+        unavailable("unsupported_version")
     } else {
         json!({"status": "available", "public_version": version})
     }
@@ -184,6 +224,10 @@ fn version_identity(executable: &Path, job: Option<&Job>) -> Value {
 
 fn unavailable(reason: &str) -> Value {
     json!({"status": "unavailable", "reason": reason})
+}
+
+fn unavailable_error(reason: &str, error: &io::Error) -> Value {
+    json!({"status": "unavailable", "reason": reason, "error_kind": format!("{:?}", error.kind())})
 }
 
 fn encode_path(path: &Path) -> String {
@@ -237,3 +281,7 @@ fn path_bytes(path: &OsStr) -> Vec<u8> {
 #[cfg(test)]
 #[path = "../../../tests/workbench/tshark/cache_identity.rs"]
 mod tests;
+
+#[cfg(all(test, target_os = "linux"))]
+#[path = "../../../tests/workbench/tshark/cache_identity_security.rs"]
+mod security_tests;

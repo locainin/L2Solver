@@ -1016,37 +1016,69 @@ fn unsafe_tshark_files_are_skipped() -> Result<(), Box<dyn Error>> {
     let destination = temporary.path().join("output");
     let executable = install_tshark(
         temporary.path(),
-        "printf '%s' 'object bytes' > \"$destination/first\"\n/bin/ln \"$destination/first\" \"$destination/hard-link\"\n/bin/ln -s \"$destination/first\" \"$destination/symbolic-link\"",
-    )?;
-    fs::write(&capture, empty_capture())?;
-
-    let output = export_with_tshark(&capture, &destination, &executable)?;
-
-    assert_eq!(output.status.code(), Some(0));
-    assert_eq!(artifact_paths(&destination)?.len(), 0);
-    let summary = fs::read_to_string(destination.join("summary.txt"))?;
-    assert!(summary.contains("TShark objects exported: 0"));
-    assert!(summary.contains("unsafe object entry"));
-    Ok(())
-}
-
-#[cfg(unix)]
-#[test]
-fn tshark_stage_escape_aborts_publication() -> Result<(), Box<dyn Error>> {
-    let temporary = tempfile::tempdir()?;
-    let capture = temporary.path().join("capture.pcap");
-    let destination = temporary.path().join("output");
-    let executable = install_tshark(
-        temporary.path(),
-        "printf '%s' 'unexpected' > \"$destination/../../../escaped\"",
+        "printf '%s' 'unsafe object bytes' > \"$destination/first\"\n/bin/ln \"$destination/first\" \"$destination/hard-link\"\n/bin/ln -s \"$destination/first\" \"$destination/symbolic-link\"",
     )?;
     fs::write(&capture, capture_with_http_body(BODY)?)?;
 
     let output = export_with_tshark(&capture, &destination, &executable)?;
 
-    assert!(!output.status.success());
-    assert!(!destination.exists());
-    assert!(String::from_utf8_lossy(&output.stderr).contains("unexpected entry"));
+    assert_eq!(output.status.code(), Some(0));
+    let artifacts = artifact_paths(&destination)?;
+    assert_eq!(artifacts.len(), 1);
+    assert_eq!(
+        fs::read(artifacts.first().ok_or("native artifact is missing")?)?,
+        BODY
+    );
+    let summary = fs::read_to_string(destination.join("summary.txt"))?;
+    assert!(summary.contains("Native complete HTTP bodies: 1"));
+    assert!(summary.contains("TShark export: partial"));
+    assert!(summary.contains("TShark objects exported: 0"));
+    assert!(
+        summary.contains("TShark object output contained unsafe or changed entries"),
+        "{summary}"
+    );
+    Ok(())
+}
+
+#[cfg(unix)]
+#[test]
+fn tshark_stage_escape_native_export() -> Result<(), Box<dyn Error>> {
+    let temporary = tempfile::tempdir()?;
+    let capture = temporary.path().join("capture.pcap");
+    let destination = temporary.path().join("output");
+    let escaped = temporary.path().join("escaped");
+    let attack = format!(
+        "if printf '%s' 'unexpected' > \"$destination/../../../escaped\" 2>/dev/null; then printf '%s\\n' 'stage traversal stayed in sandbox' >&2; else printf '%s\\n' 'stage traversal denied' >&2; fi\nif printf '%s' 'unexpected' > {} 2>/dev/null; then printf '%s\\n' 'host escape succeeded' >&2; exit 91; fi\nprintf '%s\\n' 'host escape denied' >&2\nexit 92",
+        shell_quote(&escaped)
+    );
+    let executable = install_tshark(temporary.path(), &attack)?;
+    fs::write(&capture, capture_with_http_body(BODY)?)?;
+
+    let output = export_with_tshark(&capture, &destination, &executable)?;
+
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(!escaped.exists(), "sandbox wrote an escaped host file");
+    let artifacts = artifact_paths(&destination)?;
+    assert_eq!(artifacts.len(), 1);
+    assert_eq!(
+        fs::read(artifacts.first().ok_or("native artifact is missing")?)?,
+        BODY
+    );
+    let summary = fs::read_to_string(destination.join("summary.txt"))?;
+    assert!(summary.contains("Native complete HTTP bodies: 1"));
+    assert!(summary.contains("TShark export: partial"));
+    assert!(summary.contains("TShark objects exported: 0"));
+    assert!(summary.contains("host escape denied"), "{summary}");
+    assert!(
+        summary.contains("stage traversal stayed in sandbox")
+            || summary.contains("stage traversal denied"),
+        "{summary}"
+    );
     Ok(())
 }
 
@@ -2313,6 +2345,10 @@ fn install_tshark_for_protocol(
     let executable = executable_directory.join("tshark");
     let script = r#"#!/bin/sh
 set -eu
+if [ "$1" = -n ] && [ "$2" = -v ]; then
+  printf '%s\n' 'TShark (Wireshark) 4.6.9'
+  exit 0
+fi
 for argument in "$@"; do
   if [ "$argument" = help ]; then
     printf '%s\n' 'The available export object types for the "--export-objects" option are:' __TYPE_LIST__
@@ -2328,7 +2364,7 @@ for argument in "$@"; do
     -r) read_capture=1 ;;
   esac
 done
-case "$capture_file" in *'/.l2solver-'*'/capture.bin') ;; *) exit 67 ;; esac
+case "$capture_file" in /work/capture.bin) ;; *) exit 67 ;; esac
 [ -f "$capture_file" ] && [ ! -L "$capture_file" ] || exit 68
 for argument in "$@"; do
   case "$argument" in

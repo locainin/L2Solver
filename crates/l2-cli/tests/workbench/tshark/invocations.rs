@@ -1,4 +1,4 @@
-use super::{assert_error_contains, fixture, produce, run};
+use super::{assert_error_contains, fixture, fixture_with_failed_glossary, produce, run};
 use l2_workbench::{sha256, tshark::TsharkReport};
 use std::{error::Error, fs};
 
@@ -35,7 +35,7 @@ fn glossary_inspection_accepts_older_parser_and_records_evidence() -> Result<(),
     );
     assert_eq!(
         report.tool.effective_preferences_sha256,
-        sha256(super::super::super::PREFERENCES.as_bytes())
+        sha256(super::super::super::profile::PREFERENCES.as_bytes())
     );
     assert_eq!(
         report
@@ -56,8 +56,8 @@ fn glossary_inspection_reports_inventory_and_preference_failures() -> Result<(),
         ("currentprefs", "effective preferences"),
     ] {
         let directory = tempfile::tempdir()?;
-        let options = fixture(directory.path(), b"1\n", &super::packets(1))?;
-        fs::write(directory.path().join(format!("{glossary}.fail")), b"")?;
+        let options =
+            fixture_with_failed_glossary(directory.path(), b"1\n", &super::packets(1), glossary)?;
         let mut output = Vec::new();
 
         let error = match run(&options, &mut output) {

@@ -1,9 +1,13 @@
 use super::{
-    PROFILE, PreparedCapture,
     budget::{ObjectExportBudget, ObjectExportStatus, ObjectExportUsage, StableObject},
-    prepare_export_capture, process,
+    executable::verify_executable_unchanged,
+    inspection::inspect_version,
+    phase::run_phase,
+    preparation::{PreparedCapture, prepare_export_capture, verify_prepared_capture},
+    process,
     process::StreamingPolicy,
-    run_phase, verify_executable_unchanged, verify_prepared_capture,
+    profile::PROFILE,
+    secure_files::Workspace,
 };
 use l2_workbench::job::Job;
 
@@ -20,7 +24,7 @@ mod tests;
 
 /// Export-object directories kept alive with the capture snapshot and profile
 pub struct ExportObjectSet {
-    pub temporary_directory: tempfile::TempDir,
+    pub temporary_directory: Workspace,
     pub directories: Vec<(String, PathBuf)>,
     /// Snapshot directories containing only post-termination-verified partial objects
     pub(crate) partial_directories: Vec<(String, PathBuf)>,
@@ -69,6 +73,7 @@ pub fn export_objects_with_job(
     if let Some(job) = job {
         job.check_cancelled()?;
     }
+    inspect_version(&prepared)?;
     let types = available_types(&prepared)?;
     if let Some(job) = job {
         job.check_cancelled()?;
@@ -76,11 +81,17 @@ pub fn export_objects_with_job(
     let object_root = prepared.directory.path().join("export-objects");
     fs::create_dir(&object_root)?;
     let invocation = build_object_arguments(&prepared, &object_root, types)?;
-
-    let output = process::run_streaming(
-        &prepared.executable,
+    let output_directory = File::open(&object_root)?;
+    let launch = prepared.sandbox.command(
         &invocation.arguments,
         &prepared.environment,
+        Some(&output_directory),
+    )?;
+
+    let output = process::run_streaming(
+        &launch.executable,
+        &launch.arguments,
+        &launch.environment,
         StreamingPolicy {
             stderr_maximum: 16 * 1024,
             deadline: prepared.deadline,
@@ -94,11 +105,11 @@ pub fn export_objects_with_job(
         output,
         &object_root,
         &prepared.directory.path().join("partial-export-objects"),
-        invocation.directories,
+        &invocation.directories,
     )?;
     verify_prepared_capture(&mut prepared)?;
     verify_executable_unchanged(
-        &prepared.executable,
+        &mut prepared.executable.file,
         prepared.executable_bytes,
         &prepared.executable_sha256,
     )?;
@@ -119,23 +130,56 @@ fn resolve_object_export(
     output: Result<process::StreamOutput, process::ProcessError>,
     object_root: &Path,
     partial_root: &Path,
-    complete_directories: Vec<(String, PathBuf)>,
+    complete_directories: &[(String, PathBuf)],
 ) -> Result<ResolvedObjectExport, Box<dyn Error>> {
     let partial = match output {
         Ok(output) if output.status.success() => {
+            let valid_directories = safe_directory(object_root)
+                && complete_directories.iter().all(|(protocol, directory)| {
+                    valid_type(protocol)
+                        && *directory == object_root.join(protocol)
+                        && safe_directory(directory)
+                });
+            let snapshot = retain_stable_objects(
+                object_root,
+                partial_root,
+                &output.objects,
+                complete_directories,
+            )?;
+            // Only the private snapshot may be used after validating the final tree
+            let complete =
+                valid_directories && !output.unsafe_entries && !snapshot.omitted_unstable;
+            let (status, issues, directories, partial_directories) = if complete {
+                (
+                    ObjectExportStatus::Complete,
+                    Vec::new(),
+                    snapshot.directories,
+                    Vec::new(),
+                )
+            } else {
+                (
+                    ObjectExportStatus::Partial,
+                    vec![String::from(
+                        "TShark object output contained unsafe or changed entries",
+                    )],
+                    Vec::new(),
+                    snapshot.directories,
+                )
+            };
             return Ok(ResolvedObjectExport {
                 usage: output.object_usage,
-                status: ObjectExportStatus::Complete,
-                issues: Vec::new(),
-                directories: complete_directories,
-                partial_directories: Vec::new(),
+                status,
+                issues,
+                directories,
+                partial_directories,
             });
         }
         Ok(output) => retain_partial_export(
             object_root,
             partial_root,
             output.object_usage,
-            &output.stable_objects,
+            &output.objects,
+            complete_directories,
             describe_failed_export(&output),
         )?,
         Err(process::ProcessError::ObjectExportLimit(limit)) => retain_partial_export(
@@ -143,6 +187,7 @@ fn resolve_object_export(
             partial_root,
             limit.usage,
             &limit.stable_objects,
+            complete_directories,
             limit.describe(),
         )?,
         Err(process::ProcessError::ObjectExportTimeout(timeout)) => retain_partial_export(
@@ -150,6 +195,7 @@ fn resolve_object_export(
             partial_root,
             timeout.usage,
             &timeout.stable_objects,
+            complete_directories,
             timeout.describe(),
         )?,
         // Keep cancellation typed when returning through the recovery job
@@ -188,9 +234,15 @@ fn retain_partial_export(
     snapshot_root: &Path,
     usage: ObjectExportUsage,
     stable_objects: &[StableObject],
+    allowed_directories: &[(String, PathBuf)],
     issue: String,
 ) -> Result<PartialObjectExport, Box<dyn Error>> {
-    let snapshot = retain_stable_objects(object_root, snapshot_root, stable_objects)?;
+    let snapshot = retain_stable_objects(
+        object_root,
+        snapshot_root,
+        stable_objects,
+        allowed_directories,
+    )?;
     let mut issues = vec![issue];
     if snapshot.omitted_unstable {
         issues.push(String::from(
@@ -209,6 +261,7 @@ fn retain_stable_objects(
     object_root: &Path,
     snapshot_root: &Path,
     stable_objects: &[StableObject],
+    allowed_directories: &[(String, PathBuf)],
 ) -> Result<PartialObjectSnapshot, Box<dyn Error>> {
     if stable_objects.is_empty() {
         return Ok(PartialObjectSnapshot {
@@ -226,7 +279,13 @@ fn retain_stable_objects(
     let mut directories = std::collections::BTreeMap::<String, PathBuf>::new();
     let mut omitted_unstable = false;
     for object in stable_objects {
-        if !move_stable_object(object_root, snapshot_root, object, &mut directories) {
+        if !move_stable_object(
+            object_root,
+            snapshot_root,
+            object,
+            allowed_directories,
+            &mut directories,
+        ) {
             omitted_unstable = true;
         }
     }
@@ -240,12 +299,19 @@ fn move_stable_object(
     object_root: &Path,
     snapshot_root: &Path,
     object: &StableObject,
+    allowed_directories: &[(String, PathBuf)],
     directories: &mut std::collections::BTreeMap<String, PathBuf>,
 ) -> bool {
     let Some((protocol, filename)) = stable_object_path(&object.relative_path) else {
         return false;
     };
     let source_directory = object_root.join(&protocol);
+    if !allowed_directories
+        .iter()
+        .any(|(allowed_protocol, path)| allowed_protocol == &protocol && path == &source_directory)
+    {
+        return false;
+    }
     if !safe_directory(&source_directory) {
         return false;
     }
@@ -308,7 +374,7 @@ fn stable_object_path(path: &Path) -> Option<(String, std::ffi::OsString)> {
         return None;
     };
     let protocol = protocol.to_str()?;
-    if validate_type(protocol).is_err() {
+    if !valid_type(protocol) {
         return None;
     }
     let Component::Normal(filename) = components.next()? else {
@@ -372,14 +438,7 @@ fn available_types(prepared: &PreparedCapture) -> Result<Vec<String>, Box<dyn Er
         OsString::from("--export-objects"),
         OsString::from("help"),
     ];
-    let output = run_phase(
-        &prepared.executable,
-        &arguments,
-        &prepared.environment,
-        prepared.deadline,
-        prepared.metadata_maximum,
-        prepared.diagnostic_maximum,
-    )?;
+    let output = run_phase(prepared, &arguments, prepared.metadata_maximum)?;
     if !output.status.success() {
         let mut failure = format!(
             "TShark export-object type discovery failed with exit status {}",
@@ -395,50 +454,59 @@ fn available_types(prepared: &PreparedCapture) -> Result<Vec<String>, Box<dyn Er
 
     let stdout = String::from_utf8_lossy(&output.stdout);
     let stderr = String::from_utf8_lossy(&output.stderr);
-    parse_types(&format!("{stdout}\n{stderr}"))
+    Ok(parse_types(&format!("{stdout}\n{stderr}"))?)
 }
 
-fn parse_types(output: &str) -> Result<Vec<String>, Box<dyn Error>> {
+#[derive(Debug, Eq, PartialEq)]
+enum InventoryError {
+    MissingHeader,
+    Empty,
+    InvalidType,
+}
+
+impl std::fmt::Display for InventoryError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(match self {
+            Self::MissingHeader => "TShark did not list its export object types",
+            Self::Empty => "TShark returned no usable export object types",
+            Self::InvalidType => "TShark returned an unsafe export object type",
+        })
+    }
+}
+
+impl Error for InventoryError {}
+
+fn parse_types(output: &str) -> Result<Vec<String>, InventoryError> {
     let Some(header) = output.lines().position(|line| {
         line.to_ascii_lowercase()
             .contains("available export object types")
     }) else {
-        return Err("TShark did not list its export object types".into());
+        return Err(InventoryError::MissingHeader);
     };
 
     let mut types = Vec::new();
     for line in output.lines().skip(header + 1) {
         let protocol = line.trim();
         if protocol.is_empty() {
-            if !types.is_empty() {
-                break;
-            }
             continue;
         }
-        if validate_type(protocol).is_err() {
-            if types.is_empty() {
-                continue;
-            }
-            break;
+        // Upstream emits no footer, so every nonblank line must be a type
+        if !valid_type(protocol) {
+            return Err(InventoryError::InvalidType);
         }
         if !types.iter().any(|known| known == protocol) {
             types.push(protocol.to_owned());
         }
     }
     if types.is_empty() {
-        return Err("TShark returned no usable export object types".into());
+        return Err(InventoryError::Empty);
     }
     Ok(types)
 }
 
-fn validate_type(protocol: &str) -> Result<(), Box<dyn Error>> {
-    if !protocol.is_empty()
+fn valid_type(protocol: &str) -> bool {
+    !protocol.is_empty()
         && protocol
             .bytes()
             .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-')
-    {
-        Ok(())
-    } else {
-        Err("TShark returned an unsafe export object type".into())
-    }
 }
