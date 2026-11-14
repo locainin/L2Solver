@@ -8,6 +8,10 @@ use rusqlite::params;
 use serde_json::json;
 use std::collections::BTreeMap;
 
+#[cfg(test)]
+#[path = "../../tests/journal/imports_internal.rs"]
+mod tests;
+
 impl Journal {
     /// Retain an explicitly supplied event and preserve its caller-provided meaning
     ///
@@ -31,9 +35,9 @@ impl Journal {
     /// # Errors
     /// Returns metadata or storage errors
     pub fn import_case_events(&mut self, case: &Case) -> Result<u64> {
-        let before = self.overview()?.events;
         let options = self.options;
         let tx = self.connection.transaction()?;
+        let mut added = 0_u64;
         let packets = packet_facts(case);
         let by_record: BTreeMap<_, _> = packets
             .iter()
@@ -46,6 +50,7 @@ impl Journal {
         for p in &packets {
             if let Some(event) = packet_event(p)? {
                 insert_event(&tx, options.max_entry_bytes, &event)?;
+                added += tx.changes();
             }
         }
         for node in case.nodes().iter().filter(|n| n.kind != "packet") {
@@ -90,28 +95,31 @@ impl Journal {
                             .collect(),
                     },
                 )?;
+                added += tx.changes();
             }
         }
         tx.commit()?;
-        Ok(self.overview()?.events - before)
+        Ok(added)
     }
     /// Stream every indexed packet into durable observations without page-local context
     ///
     /// # Errors
     /// Rejects changed retained packets, invalid metadata and storage errors
     pub fn import_index_events(&mut self, store: &Store) -> Result<u64> {
-        let before = self.overview()?.events;
         let options = self.options;
         let tx = self.connection.transaction()?;
+        let mut added = 0_u64;
         store.visit_frames(|packet, frame| {
             let facts = crate::query::packet::frame_facts(&frame, packet.range);
             if let Some(event) = packet_event(&facts)? {
                 insert_event(&tx, options.max_entry_bytes, &event)?;
+                // Other writers and ignored duplicates cannot change this count
+                added += tx.changes();
             }
             Ok(())
         })?;
         tx.commit()?;
-        Ok(self.overview()?.events - before)
+        Ok(added)
     }
 }
 
