@@ -121,6 +121,11 @@ fn reads_obsolete_packet_block_metadata_and_exact_lengths() -> Result<(), Box<dy
     assert_eq!(frame.metadata().direction(), Direction::Inbound);
     assert_eq!(frame.metadata().fcs().length(), Some(4));
     assert!(reader.next_packet()?.is_none());
+    assert_eq!(
+        reader.collection_summary().authority().as_str(),
+        "source_declared"
+    );
+    assert_eq!(reader.collection_summary().packet_block_packets_dropped, 2);
     Ok(())
 }
 
@@ -162,6 +167,16 @@ fn packet_block_uses_section_endianness_and_selected_interface()
     assert_eq!(timestamp.resolution(), TimestampResolution::binary(10)?);
     assert_eq!(timestamp.offset_seconds(), 12);
     assert!(reader.next_packet()?.is_none());
+    assert_eq!(
+        reader.collection_summary().authority().as_str(),
+        "source_declared"
+    );
+    assert_eq!(
+        reader
+            .collection_summary()
+            .packet_blocks_with_unavailable_drop_count,
+        1
+    );
     Ok(())
 }
 

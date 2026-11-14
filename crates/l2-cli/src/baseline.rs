@@ -16,7 +16,7 @@ use std::{
     path::Path,
 };
 
-/// Whether a baseline comparison retained all authoritative observations
+/// Whether a baseline comparison analyzed its retained observations
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum BaselineCollectionStatus {
     Complete,
@@ -28,6 +28,7 @@ pub enum BaselineCollectionStatus {
 pub struct BaselineCompareResult {
     pub changes: Vec<Change>,
     pub status: BaselineCollectionStatus,
+    pub acquisition_authority: l2_capture::CollectionAuthority,
 }
 
 fn snapshot(report: &Report, mappings: &[SourceMapping]) -> Result<Baseline, Box<dyn Error>> {
@@ -179,6 +180,11 @@ pub fn create(
         baseline.facts.len(),
         path.display().to_string().escape_debug()
     )?;
+    writeln!(
+        output,
+        "analysis_complete=true acquisition_quality=unverified authority={}",
+        report.quality.acquisition_authority.as_str()
+    )?;
     Ok(true)
 }
 
@@ -199,13 +205,27 @@ pub fn compare(
     } else {
         BaselineCollectionStatus::Incomplete
     };
-    Ok(BaselineCompareResult { changes, status })
+    Ok(BaselineCompareResult {
+        changes,
+        status,
+        acquisition_authority: report.quality.acquisition_authority,
+    })
 }
 
 pub fn render_comparison(
     comparison: &BaselineCompareResult,
     output: &mut impl Write,
 ) -> io::Result<()> {
+    writeln!(
+        output,
+        "analysis_complete={} acquisition_quality=unverified authority={}",
+        comparison.status == BaselineCollectionStatus::Complete,
+        comparison.acquisition_authority.as_str()
+    )?;
+    writeln!(
+        output,
+        "Baseline acquisition quality is unverified; comparison is scoped to retained observations."
+    )?;
     if comparison.changes.is_empty() {
         writeln!(output, "No differences among retained observations")?;
     }

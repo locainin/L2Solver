@@ -149,7 +149,7 @@ fn finish(
                 options.source,
                 complete,
             ),
-            OutputFormat::Json => render_json(output, summary, inventory, &assessment),
+            OutputFormat::Json => render_json(output, summary, inventory, &assessment, complete),
             OutputFormat::Html => {
                 // Terminal color sequences must never enter the HTML source
                 let mut text = Vec::new();

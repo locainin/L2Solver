@@ -11,6 +11,7 @@ use crate::{
     pcapng_blocks::{
         BLOCK_TRAILER_LENGTH, ENHANCED_PACKET_BLOCK, ENHANCED_PACKET_MIN_LENGTH, PACKET_BLOCK,
         PACKET_BLOCK_MIN_LENGTH, SIMPLE_PACKET_BLOCK, SIMPLE_PACKET_MIN_LENGTH, read_u16, read_u32,
+        read_u64,
     },
     pcapng_model::{InterfaceDescription, PcapNgOption},
     pcapng_options::{OptionScope, parse_options},
@@ -31,6 +32,11 @@ pub struct DecodedPacketBlock {
     pub drops_count: u16,
 }
 
+pub struct DecodedPacket {
+    pub frame: CapturedFrame,
+    pub drops_count: Option<u64>,
+}
+
 /// Decode one Enhanced Packet Block against the interfaces in the active section.
 pub fn decode_enhanced_packet(
     bytes: &[u8],
@@ -38,7 +44,7 @@ pub fn decode_enhanced_packet(
     section: u32,
     interfaces: &[InterfaceDescription],
     block_offset: u64,
-) -> Result<CapturedFrame, Error> {
+) -> Result<DecodedPacket, Error> {
     if bytes.len() < ENHANCED_PACKET_MIN_LENGTH {
         return Err(Error::InvalidBlockLength {
             block_type: ENHANCED_PACKET_BLOCK,
@@ -87,7 +93,7 @@ pub fn decode_packet_block(
     let timestamp_ticks = (u64::from(timestamp_high) << 32) + u64::from(timestamp_low);
     let captured_length = read_u32(bytes, 20, order)?;
     let original_length = read_u32(bytes, 24, order)?;
-    let frame = decode_packet(
+    let decoded = decode_packet(
         bytes,
         order,
         interface,
@@ -99,7 +105,10 @@ pub fn decode_packet_block(
             original_length,
         },
     )?;
-    Ok(DecodedPacketBlock { frame, drops_count })
+    Ok(DecodedPacketBlock {
+        frame: decoded.frame,
+        drops_count,
+    })
 }
 
 fn interface(
@@ -126,7 +135,7 @@ fn decode_packet(
     interface: &InterfaceDescription,
     block_offset: u64,
     packet: PacketFields,
-) -> Result<CapturedFrame, Error> {
+) -> Result<DecodedPacket, Error> {
     validate_packet_lengths(
         packet.captured_length,
         packet.original_length,
@@ -151,6 +160,16 @@ fn decode_packet(
         order,
     )?;
     let (direction, fcs) = packet_flags(&options, interface, order)?;
+    // Option 4 has this meaning only on enhanced packets, not obsolete blocks
+    let drops_count = if packet.block_type == ENHANCED_PACKET_BLOCK {
+        options
+            .iter()
+            .find(|option| option.code == 4)
+            .map(|option| read_u64(&option.value, 0, order))
+            .transpose()?
+    } else {
+        None
+    };
     let packet_bytes = bytes
         .get(PACKET_DATA_START..PACKET_DATA_START + captured_length)
         .ok_or(Error::InvalidHeaderLayout)?
@@ -183,7 +202,8 @@ fn decode_packet(
         Some(identity) => metadata.with_linux_interface(identity),
         None => metadata,
     };
-    CapturedFrame::new(packet_bytes, metadata).map_err(Error::from)
+    let frame = CapturedFrame::new(packet_bytes, metadata).map_err(Error::from)?;
+    Ok(DecodedPacket { frame, drops_count })
 }
 
 fn packet_bounds(

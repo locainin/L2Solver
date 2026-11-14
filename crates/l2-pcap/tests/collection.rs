@@ -181,6 +181,7 @@ fn collection_round_fixed_header_length() -> Result<(), Box<dyn std::error::Erro
         assert!(reader.next_packet()?.is_none());
         let quality = reader.collection_summary();
         assert_eq!(quality.reported_sections, 1);
+        assert_eq!(quality.authority().as_str(), "source_declared");
         assert_eq!(
             quality.incomplete_sections,
             u64::from(!report.supports_complete_collection())
@@ -218,6 +219,32 @@ fn later_complete_not_incomplete_collection() -> Result<(), Box<dyn std::error::
     let quality = reader.collection_summary();
     assert_eq!(quality.reported_sections, 2);
     assert_eq!(quality.incomplete_sections, 1);
+    Ok(())
+}
+
+#[test]
+fn collection_authority_and_counters() -> Result<(), Box<dyn std::error::Error>> {
+    let mut absent = PcapNgReader::new(Cursor::new(pcapng::section_header_with_options(
+        ByteOrder::Little,
+        -1,
+        &[],
+    )))?;
+    assert!(absent.next_packet()?.is_none());
+    assert_eq!(absent.collection_summary().authority().as_str(), "absent");
+
+    let mut declared = PcapNgReader::new(Cursor::new(pcapng::section_header_with_options(
+        ByteOrder::Little,
+        -1,
+        &[(
+            1,
+            b"l2solver:collection:v1:2:2:0000000001:0000000003:0000000004:1",
+        )],
+    )))?;
+    assert!(declared.next_packet()?.is_none());
+    let summary = declared.collection_summary();
+    assert_eq!(summary.authority().as_str(), "source_declared");
+    assert_eq!((summary.capture_dropped, summary.interface_dropped), (3, 4));
+    assert_eq!(summary.incomplete_sections, 1);
     Ok(())
 }
 

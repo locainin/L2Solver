@@ -82,7 +82,10 @@ fn dump(records: &[CapturedRecord]) -> Result<(ExitStatus, Vec<Value>), Box<dyn 
     let parsed = stdout
         .lines()
         .map(serde_json::from_str)
-        .collect::<Result<Vec<Value>, _>>()?;
+        .collect::<Result<Vec<Value>, _>>()?
+        .into_iter()
+        .filter(|value| value.get("record_type") != Some(&serde_json::json!("source_collection")))
+        .collect();
     Ok((output.status, parsed))
 }
 

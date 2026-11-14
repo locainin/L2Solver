@@ -140,6 +140,35 @@ fn packet_block_drop_counts_make_collection_incomplete() {
 }
 
 #[test]
+fn pcapng_loss_incomplete_collection() -> Result<(), Box<dyn Error>> {
+    for summary in [
+        CollectionSummary {
+            enhanced_packet_packets_dropped: Some(9),
+            ..CollectionSummary::default()
+        },
+        CollectionSummary {
+            interface_statistics_interface_dropped: Some(11),
+            ..CollectionSummary::default()
+        },
+        CollectionSummary {
+            interface_statistics_os_dropped: Some(3),
+            ..CollectionSummary::default()
+        },
+    ] {
+        assert!(capture_collection::reports_incomplete_collection(summary));
+        assert_eq!(
+            capture_collection::from_json(&capture_collection::to_json(summary)?)?,
+            summary
+        );
+        let (mut result, source_id) = source_case()?;
+        capture_collection::apply_to_case(&mut result, &source_id, summary)?;
+        assert!(!result.complete);
+        assert!(!result.case.collection_complete());
+    }
+    Ok(())
+}
+
+#[test]
 fn old_collection_summary_json_defaults_packet_block_counters() -> Result<(), Box<dyn Error>> {
     let old_summary = r#"{"sections":1,"reported_sections":1,"incomplete_sections":0,"capture_dropped":0,"interface_dropped":0}"#;
 
@@ -156,5 +185,29 @@ fn old_collection_summary_json_defaults_packet_block_counters() -> Result<(), Bo
             ..CollectionSummary::default()
         }
     );
+    Ok(())
+}
+
+#[test]
+fn collection_summary_unverified_authority() -> Result<(), Box<dyn Error>> {
+    let summary = CollectionSummary {
+        sections: 1,
+        reported_sections: 1,
+        ..CollectionSummary::default()
+    };
+    let value = capture_collection::to_value(summary)?;
+    assert_eq!(value.get("authority"), Some(&json!("source_declared")));
+    assert_eq!(value.get("acquisition_quality"), Some(&json!("unverified")));
+    for (field, forged) in [
+        ("authority", json!("verified_local")),
+        ("authority", json!("absent")),
+        ("acquisition_quality", json!("verified")),
+    ] {
+        let mut forged_summary = value.clone();
+        *forged_summary
+            .get_mut(field)
+            .ok_or("missing summary field")? = forged;
+        assert!(capture_collection::from_json(&forged_summary.to_string()).is_err());
+    }
     Ok(())
 }

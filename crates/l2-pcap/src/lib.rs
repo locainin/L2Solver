@@ -14,6 +14,7 @@ mod pcapng_linux_identity;
 mod pcapng_model;
 mod pcapng_options;
 mod pcapng_packets;
+mod pcapng_statistics;
 mod pcapng_writer;
 mod reader;
 mod source;

@@ -62,6 +62,14 @@ fn streaming_bundle_global_source_ranges() -> Result<(), Box<dyn Error>> {
     assert_eq!(pages.len(), 3);
     let receipt: Value = serde_json::from_slice(&output.stdout)?;
     assert_eq!(receipt.get("pages"), Some(&Value::from(3)));
+    assert_eq!(
+        receipt.pointer("/acquisition_quality/status"),
+        Some(&Value::from("unverified"))
+    );
+    assert_eq!(
+        receipt.pointer("/acquisition_quality/authority"),
+        Some(&Value::from("absent"))
+    );
     assert!(output.stdout.len() < 1024);
     assert_eq!(
         pages
@@ -117,7 +125,8 @@ fn stream_defaults_to_directory_summary() -> Result<(), Box<dyn Error>> {
         "Created stream directory: {}",
         destination.display()
     )));
-    assert!(text.contains("Pages: 3; raw collection: complete; analysis: complete"));
+    assert!(text.contains("Pages: 3; raw records retained: complete; analysis: complete"));
+    assert!(text.contains("acquisition: unverified (authority=absent)"));
     assert!(destination.join("manifest.json").is_file());
     Ok(())
 }

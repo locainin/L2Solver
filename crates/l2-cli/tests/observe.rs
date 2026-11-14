@@ -284,12 +284,16 @@ fn preserves_unsupported_timestamp_span() -> Result<(), Box<dyn std::error::Erro
         .lines()
         .map(serde_json::from_str)
         .collect::<Result<_, _>>()?;
-    assert_eq!(records.len(), 2);
+    assert_eq!(records.len(), 3);
     assert_eq!(
         records
             .get(1)
             .and_then(|value| value.pointer("/timestamp/ticks")),
         Some(&serde_json::json!(u64::MAX))
+    );
+    assert_eq!(
+        records.get(2).and_then(|value| value.get("record_type")),
+        Some(&serde_json::json!("source_collection"))
     );
     std::fs::remove_dir_all(directory)?;
     Ok(())

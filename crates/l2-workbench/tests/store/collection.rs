@@ -180,7 +180,7 @@ fn incomplete_source_reopen_selected_analysis() -> Result<(), Box<dyn Error>> {
 
     let inventory = store.inventory()?;
     assert_eq!(inventory.collection_summary, expected);
-    assert_eq!(inventory.sources_with_unknown_collection_quality, 0);
+    assert_eq!(inventory.sources_with_unknown_collection_quality, 1);
     let inventory_json = serde_json::to_value(inventory)?;
     assert_eq!(
         inventory_json.get("collection_summary"),
@@ -263,9 +263,13 @@ fn missing_collection_not_counted_clean() -> Result<(), Box<dyn Error>> {
         .ok_or("flow missing")?;
     let analysis = store.investigate_flow(flow)?;
     assert!(analysis.complete);
-    assert!(analysis.case.limitations().iter().any(|limitation| {
-        limitation.contains("collection quality") && limitation.contains("unknown")
-    }));
+    assert!(
+        analysis
+            .case
+            .limitations()
+            .iter()
+            .any(|limitation| { limitation.contains("acquisition quality is unverified") })
+    );
     Ok(())
 }
 
@@ -341,6 +345,39 @@ fn packet_block_drop_summary_roundtrips_store_and_verification() -> Result<(), B
         retained.metadata().locator(),
         Some(l2_capture::CaptureLocator::PcapNg { block_type: 2, .. })
     ));
+    store.verify_sources()?;
+    Ok(())
+}
+
+#[test]
+fn interface_loss_persistence() -> Result<(), Box<dyn Error>> {
+    let temporary = tempfile::tempdir()?;
+    let mut store = Store::create(temporary.path(), Options::default())?;
+    for drops in [5_u64, 7] {
+        let mut bytes = pcapng(&frame()?, None)?;
+        let mut statistics = vec![0; 12];
+        statistics.extend_from_slice(&5_u16.to_le_bytes());
+        statistics.extend_from_slice(&8_u16.to_le_bytes());
+        statistics.extend_from_slice(&drops.to_le_bytes());
+        let length = u32::try_from(statistics.len() + 12)?;
+        bytes.extend_from_slice(&5_u32.to_le_bytes());
+        bytes.extend_from_slice(&length.to_le_bytes());
+        bytes.extend_from_slice(&statistics);
+        bytes.extend_from_slice(&length.to_le_bytes());
+        let receipt = store.ingest(&format!("loss-{drops}.pcapng"), Cursor::new(bytes))?;
+        assert_eq!(
+            receipt
+                .collection_summary
+                .interface_statistics_interface_dropped,
+            Some(drops)
+        );
+    }
+    drop(store);
+
+    let store = Store::open(temporary.path(), Options::default())?;
+    let summary = store.inventory()?.collection_summary;
+    assert_eq!(summary.interface_statistics_interface_dropped, Some(12));
+    assert_eq!(summary.interface_statistics_os_dropped, None);
     store.verify_sources()?;
     Ok(())
 }

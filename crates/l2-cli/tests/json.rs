@@ -5,6 +5,14 @@ pub mod captures;
 
 use std::process::Command;
 
+fn first_record(output: &[u8]) -> Result<serde_json::Value, Box<dyn std::error::Error>> {
+    let line = output
+        .split(|byte| *byte == b'\n')
+        .next()
+        .ok_or("missing frame")?;
+    Ok(serde_json::from_slice(line)?)
+}
+
 #[test]
 fn preserves_json_frame_metadata() -> Result<(), Box<dyn std::error::Error>> {
     let fixtures = crate::capture_paths::CapturePaths::new()?;
@@ -13,7 +21,7 @@ fn preserves_json_frame_metadata() -> Result<(), Box<dyn std::error::Error>> {
         .arg(fixtures.path("lldp.pcap"))
         .output()?;
     assert!(output.status.success());
-    let value: serde_json::Value = serde_json::from_slice(&output.stdout)?;
+    let value = first_record(&output.stdout)?;
     assert_eq!(value.get("sequence"), Some(&serde_json::json!(1)));
     assert_eq!(value.get("status"), Some(&serde_json::json!("parsed")));
     assert_eq!(value.get("captured_len"), Some(&serde_json::json!(41)));
@@ -53,7 +61,7 @@ fn reports_malformed_frame_status() -> Result<(), Box<dyn std::error::Error>> {
         .arg(fixtures.path("short.pcap"))
         .output()?;
     assert_eq!(output.status.code(), Some(3));
-    let value: serde_json::Value = serde_json::from_slice(&output.stdout)?;
+    let value = first_record(&output.stdout)?;
     assert_eq!(value.get("status"), Some(&serde_json::json!("malformed")));
     assert_eq!(value.get("raw_bytes"), Some(&serde_json::json!([0])));
     assert!(
@@ -83,7 +91,7 @@ fn reports_unsupported_frame_status() -> Result<(), Box<dyn std::error::Error>> 
         .arg(&path)
         .output()?;
     assert_eq!(output.status.code(), Some(3));
-    let value: serde_json::Value = serde_json::from_slice(&output.stdout)?;
+    let value = first_record(&output.stdout)?;
     assert_eq!(value.get("status"), Some(&serde_json::json!("unsupported")));
 
     std::fs::remove_dir_all(directory)?;

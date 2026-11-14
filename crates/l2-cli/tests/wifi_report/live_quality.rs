@@ -21,6 +21,22 @@ fn replayed_source_blocks_completion() -> Result<(), Box<dyn std::error::Error>>
         json.pointer("/source_collection/incomplete_sections"),
         Some(&serde_json::json!(1))
     );
+    for source_collection in [
+        l2_pcap::CollectionSummary {
+            enhanced_packet_packets_dropped: Some(3),
+            ..l2_pcap::CollectionSummary::default()
+        },
+        l2_pcap::CollectionSummary {
+            interface_statistics_os_dropped: Some(2),
+            ..l2_pcap::CollectionSummary::default()
+        },
+    ] {
+        let summary = Summary {
+            source_collection,
+            ..Summary::default()
+        };
+        assert!(!collection_complete(&summary, &inventory, true));
+    }
     Ok(())
 }
 

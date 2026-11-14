@@ -160,6 +160,9 @@ pub struct InterfaceObservation {
 
 #[derive(Debug, Default, Serialize)]
 pub struct Quality {
+    /// Origin of acquisition conditions; source declarations are not verified
+    #[serde(serialize_with = "serialize_collection_authority")]
+    pub acquisition_authority: l2_capture::CollectionAuthority,
     pub frames: u64,
     pub malformed: u64,
     pub invalid: u64,
@@ -169,6 +172,20 @@ pub struct Quality {
     pub unsupported_fingerprints: u64,
     pub unsupported_link_types: u64,
     pub incomplete: bool,
+}
+
+#[expect(
+    clippy::trivially_copy_pass_by_ref,
+    reason = "Serde passes fields by reference"
+)]
+fn serialize_collection_authority<S>(
+    authority: &l2_capture::CollectionAuthority,
+    serializer: S,
+) -> Result<S::Ok, S::Error>
+where
+    S: serde::Serializer,
+{
+    serializer.serialize_str(authority.as_str())
 }
 
 /// One bounded assessment resource whose configured ceiling was reached
@@ -326,7 +343,9 @@ pub struct Report {
     pub evidence: Vec<PacketEvidence>,
 }
 impl Report {
-    /// Whether capture and resource accounting support a complete passive assessment
+    /// Whether the available capture was analyzed without known completeness issues
+    ///
+    /// This does not independently verify whether the source lost packets
     #[must_use]
     pub fn collection_complete(&self) -> bool {
         self.quality.frames != 0

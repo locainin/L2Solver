@@ -263,6 +263,21 @@ impl Survey {
         Ok(())
     }
 
+    /// Retain where acquisition conditions came from
+    ///
+    /// # Errors
+    /// Returns an error when collection already failed
+    pub const fn record_acquisition_authority(
+        &mut self,
+        authority: l2_capture::CollectionAuthority,
+    ) -> Result<(), AuditError> {
+        if self.terminated {
+            return Err(AuditError::Terminated);
+        }
+        self.quality.acquisition_authority = authority;
+        Ok(())
+    }
+
     /// Evaluate explicit policy over the collected observations
     /// # Errors
     /// Rejects invalid policy or a collection that failed earlier

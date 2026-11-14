@@ -271,7 +271,7 @@ impl RawReportOptions {
 
 #[derive(Debug, Subcommand)]
 enum BaselineCommand {
-    /// Create a baseline only from complete authoritative observations
+    /// Create a baseline from observations without known analysis omissions
     Create {
         #[arg(value_name = "CAPTURE")]
         capture: PathBuf,

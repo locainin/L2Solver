@@ -44,6 +44,7 @@ pub fn decode(bytes: &[u8]) -> Result<Option<CollectionReport>, Error> {
     let received = counter(fields.next())?;
     let capture_dropped = counter(fields.next())?;
     let interface_dropped = counter(fields.next())?;
+    // This bit records the producer's claim and does not authenticate the file
     let authoritative = match fields.next() {
         Some("0") => false,
         Some("1") => true,

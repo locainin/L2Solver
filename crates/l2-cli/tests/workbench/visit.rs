@@ -161,6 +161,49 @@ fn single_case_validation_path() -> Result<(), Box<dyn Error>> {
 }
 
 #[test]
+fn legacy_collection_summary_bundle() -> Result<(), Box<dyn Error>> {
+    let directory = tempfile::tempdir()?;
+    let (bundle, mut manifest) = create_bundle(directory.path(), 1)?;
+    let page_path = bundle.join("pages/000001.json");
+    let mut page: Value = serde_json::from_slice(&fs::read(&page_path)?)?;
+    let summary = page
+        .get_mut("nodes")
+        .and_then(Value::as_array_mut)
+        .and_then(|nodes| {
+            nodes
+                .iter_mut()
+                .find(|node| node.get("kind") == Some(&json!("capture_collection_summary")))
+        })
+        .and_then(|node| node.pointer_mut("/details/summary"))
+        .and_then(Value::as_object_mut)
+        .ok_or("missing collection summary")?;
+    summary.remove("authority");
+    summary.remove("acquisition_quality");
+    let document = serde_json::to_vec(&page)?;
+    fs::write(page_path, &document)?;
+    set_field(
+        first_page_mut(&mut manifest)?,
+        "sha256",
+        json!(sha256(&document)),
+    )?;
+    let source = manifest
+        .pointer_mut("/source/collection_summary")
+        .and_then(Value::as_object_mut)
+        .ok_or("missing manifest collection summary")?;
+    source.remove("authority");
+    source.remove("acquisition_quality");
+    write_manifest(&bundle, &manifest)?;
+
+    let output = run_query(&bundle)?;
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    Ok(())
+}
+
+#[test]
 fn bundle_visiting_length_captured_packets() -> Result<(), Box<dyn Error>> {
     let directory = tempfile::tempdir()?;
     let mut bytes = empty_capture();
