@@ -3,7 +3,7 @@ use std::{
     path::{Path, PathBuf},
 };
 
-use crate::job::{JobSnapshot, MemoryBudget, MemoryLease};
+use crate::job::{MemoryBudget, MemoryLease};
 use serde_json::Value;
 
 use super::{
@@ -212,28 +212,6 @@ impl Lease {
     #[must_use]
     pub fn directory(&self) -> &Path {
         self.directory.path()
-    }
-
-    /// Durably checkpoints the current work and keeps its files for a later lease
-    ///
-    /// This is the resumable path for interrupted work. Dropping a lease without calling this
-    /// method removes its uncommitted work directory
-    ///
-    /// # Errors
-    /// Returns an error when the work directory changed or the full-synchronous checkpoint write fails
-    pub fn preserve(mut self, snapshot: &JobSnapshot) -> Result<()> {
-        self.cache.inner.check_locations()?;
-        self.directory.check_location()?;
-        let (snapshot_json, memory) = self.cache.encode_checkpoint(snapshot)?;
-        self.cleanup_on_drop = false;
-        let result = self.cache.inner.record_checkpoint(
-            &self.key,
-            super::model::CheckpointStatus::Active,
-            &snapshot_json,
-        );
-        drop(snapshot_json);
-        drop(memory);
-        result
     }
 
     /// Atomically seals the work directory and publishes its metadata

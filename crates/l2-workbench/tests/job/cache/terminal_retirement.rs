@@ -18,6 +18,7 @@ fn terminal_retirement_failure_child() -> Result<(), Box<dyn Error>> {
     let cache = cache_at(Path::new(&base), 64 * 1024)?;
     let key = stage_key("terminal-retirement")?;
     let lease = cache.lease(&key)?;
+    fs::write(lease.directory().join("result.bin"), NEW_RESULT)?;
     let entry = lease.commit(StageStatus::Complete, json!({"generation":2}))?;
     assert_eq!(fs::read(entry.directory().join("result.bin"))?, NEW_RESULT);
     Ok(())
@@ -39,8 +40,7 @@ fn retirement_unlink_failure_retains_accounting_until_cleanup_succeeds()
         writer.streams().2.write_all(b"old-cursor")?;
         Ok(json!({"generation":1}))
     })?;
-    fs::write(lease.directory().join("result.bin"), NEW_RESULT)?;
-    lease.preserve(&snapshot)?;
+    drop(lease);
 
     let database = rusqlite::Connection::open(temporary.path().join("state/cache.sqlite3"))?;
     let (relative, old_bytes): (String, u64) = database.query_row(

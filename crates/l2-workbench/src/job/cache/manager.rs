@@ -96,11 +96,6 @@ impl CacheInner {
         self.locks.lock_with_retry(QUOTA_LOCK, true)
     }
 
-    pub(super) fn active_checkpoint(&self, key: &str) -> Result<bool> {
-        let connection = database::open_connection(&self.state_root)?;
-        active_checkpoint_in(&connection, key)
-    }
-
     // The quota lock is held while this reservation is created
     pub(super) fn reserve_stage(&self, key: &StageKey, token: &str, bytes: i64) -> Result<()> {
         let connection = database::open_connection(&self.state_root)?;
@@ -529,18 +524,9 @@ impl Cache {
         }
         let _memory = self.maintenance_charge()?;
         let staging_key = self.inner.staging.open_child_or_create(key.as_str())?;
-        let active_checkpoint = self.inner.active_checkpoint(key.as_str())?;
-        // A checkpointed work directory remains available to the next lease
-        let existing = find_staging_directory(&staging_key)?;
-        let (staging_path, name) = if active_checkpoint {
-            match existing {
-                Some(existing) => existing,
-                None => create_staging_directory(&staging_key)?,
-            }
-        } else {
-            clean_staging_directory(&staging_key)?;
-            create_staging_directory(&staging_key)?
-        };
+        // Active execution data lives in committed generations, not private staging
+        clean_staging_directory(&staging_key)?;
+        let (staging_path, name) = create_staging_directory(&staging_key)?;
         let directory = match staging_key.open_child(&name) {
             Ok(directory) => directory,
             Err(error) => {
@@ -1169,11 +1155,6 @@ impl Cache {
             };
             self.clear_stale_execution(&key)?;
             let staging_key = self.inner.staging.open_child(&key)?;
-            // Check again after the exclusive lock closes the checkpoint-write race
-            if self.inner.active_checkpoint(&key)? {
-                drop(lock);
-                continue;
-            }
             clean_staging_directory(&staging_key)?;
             let _ = fs::remove_dir(staging_key.path());
             drop(lock);
@@ -1429,31 +1410,6 @@ fn clean_staging_directory(directory: &HeldDirectory) -> Result<()> {
         fs::remove_dir_all(entry.path())?;
     }
     Ok(())
-}
-
-fn find_staging_directory(directory: &HeldDirectory) -> Result<Option<(PathBuf, String)>> {
-    directory.check_location()?;
-    let mut found = None;
-    for entry in fs::read_dir(directory.path())? {
-        let entry = entry?;
-        let metadata = fs::symlink_metadata(entry.path())?;
-        if metadata.file_type().is_symlink() || !metadata.is_dir() {
-            return Err(CacheError::UnsafePath(
-                "managed staging directory contains an unsafe item",
-            ));
-        }
-        let name = entry
-            .file_name()
-            .into_string()
-            .map_err(|_| CacheError::UnsafePath("managed work directory name is invalid"))?;
-        if !name.starts_with("lease-") || found.is_some() {
-            return Err(CacheError::CorruptEntry(
-                "multiple or unrecognized resumable work directories exist".to_owned(),
-            ));
-        }
-        found = Some((entry.path(), name));
-    }
-    Ok(found)
 }
 
 fn create_staging_directory(directory: &HeldDirectory) -> Result<(PathBuf, String)> {

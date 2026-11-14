@@ -570,24 +570,37 @@ fn active_checkpoints_pin_entries_and_preserve_the_job_snapshot() -> Result<(), 
 }
 
 #[test]
-fn preserved_work_reopens_under_an_active_checkpoint() -> Result<(), Box<dyn Error>> {
+fn stale_staging_active_execution() -> Result<(), Box<dyn Error>> {
     let temporary = tempfile::tempdir()?;
-    let cache = cache_at(temporary.path(), 1024)?;
-    let key = stage_key("resumable-work")?;
+    let cache = cache_at(temporary.path(), 64 * 1024)?;
+    let key = stage_key("stale-work")?;
     let snapshot = Job::new("recover interrupted stage").snapshot()?;
-    let lease = cache.lease(&key)?;
-    fs::write(lease.directory().join("cursor.json"), b"resume-at-12")?;
-    let work_directory = lease.directory().to_path_buf();
+    let mut lease = cache.lease(&key)?;
+    lease.save_active(&snapshot, execution::limits(), |writer| {
+        writer.streams().2.write_all(b"resume-at-12")?;
+        Ok(json!({"next": 12}))
+    })?;
+    let staging_key = lease
+        .directory()
+        .parent()
+        .ok_or_else(|| missing("staging key directory missing"))?
+        .to_path_buf();
+    drop(lease);
+    let abandoned = staging_key.join("lease-abandoned");
+    fs::create_dir(&abandoned)?;
+    fs::write(abandoned.join("uncommitted"), b"discard")?;
 
-    lease.preserve(&snapshot)?;
-    assert!(work_directory.is_dir());
-    let resumed = cache.lease(&key)?;
-    assert_eq!(
-        fs::read(resumed.directory().join("cursor.json"))?,
-        b"resume-at-12"
-    );
-    let partial = resumed.commit(StageStatus::Partial, json!({"next": 12}))?;
-    assert_eq!(partial.status(), StageStatus::Partial);
+    // A crash can leave a private stage even though the execution is already committed
+    let reopened = cache_at(temporary.path(), 64 * 1024)?;
+    assert!(!abandoned.exists());
+    let resumed = reopened.lease(&key)?;
+    let mut active = resumed
+        .load_active(execution::limits())?
+        .ok_or_else(|| missing("active execution disappeared"))?;
+    let mut cursor = Vec::new();
+    active.streams().2.read_to_end(&mut cursor)?;
+    assert_eq!(cursor, b"resume-at-12");
+    assert_eq!(active.snapshot(), &snapshot);
     Ok(())
 }
 
