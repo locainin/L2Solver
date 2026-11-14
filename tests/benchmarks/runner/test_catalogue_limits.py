@@ -144,6 +144,39 @@ def test_hash_accepts_exact_capture_length(tmp_path):
     assert loader.hash_file(path, expected_bytes=3) == hashlib.sha256(b"abc").hexdigest()
 
 
+def test_hash_open_stream_respects_length_and_caller_ownership(tmp_path):
+    import hashlib
+
+    path = tmp_path / "capture.pcap"
+    path.write_bytes(b"abc")
+
+    with path.open("rb") as stream:
+        assert loader.hash_file(stream, expected_bytes=3) == hashlib.sha256(b"abc").hexdigest()
+        assert not stream.closed
+        stream.seek(0)
+        with pytest.raises(ValueError, match="length mismatch"):
+            loader.hash_file(stream, expected_bytes=2)
+        assert not stream.closed
+
+
+def test_hash_growing_stream_stops_at_byte_budget():
+    import io
+
+    class GrowingStream(io.BytesIO):
+        def __init__(self):
+            super().__init__()
+            self.requests = []
+
+        def read(self, size=-1):
+            self.requests.append(size)
+            return b"x" * size
+
+    stream = GrowingStream()
+    with pytest.raises(ValueError, match="length mismatch"):
+        loader.hash_file(stream, expected_bytes=3)
+    assert stream.requests == [4]
+
+
 @pytest.mark.parametrize("expected", [-2, -1, True, False, "3", 1.0])
 def test_hash_rejects_invalid_length_budgets(tmp_path, expected):
     with pytest.raises(ValueError, match="expected_bytes"):

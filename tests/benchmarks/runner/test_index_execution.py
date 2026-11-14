@@ -364,7 +364,10 @@ class IndexExecutionTests(unittest.TestCase):
             self.assertEqual(result["validation"]["flow_rows_checked"], 1)
             self.assertEqual(result["validation"]["relationship_rows_checked"], 1)
             self.assertEqual(result["evidence_bytes"], result["output_bytes"])
-            self.assertGreaterEqual(result["artifact_bytes"], result["output_bytes"])
+            run_directory = sample / "runs/index-one"
+            self.assertGreater((run_directory / "index.stdout.log").stat().st_size, 0)
+            log_bytes = sum(path.stat().st_size for path in run_directory.glob("*.log"))
+            self.assertEqual(result["artifact_bytes"], result["output_bytes"] + log_bytes)
             self.assertGreaterEqual(result["elapsed_seconds"], result["analyzer_elapsed_seconds"])
             self.assertGreaterEqual(result["elapsed_seconds"], result["validation_seconds"])
             self.assertGreaterEqual(result["elapsed_seconds"] - result["analyzer_elapsed_seconds"],
