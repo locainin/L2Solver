@@ -45,11 +45,25 @@ def _expected_files(root, values):
                 or (digest, length) in seen):
             raise ValueError("invalid or duplicate oracle artifact identity")
         path = local_file(root, value["file"])
-        if hash_file(path, expected_bytes=length) != digest:
-            raise ValueError("oracle artifact bytes do not match its identity")
         seen.add((digest, length))
         result.append({"path": path, "sha256": digest, "byte_length": length})
     return result
+
+
+def verify_protocol_artifacts(truth, *, final=False):
+    files = {}
+    for row in truth.values():
+        for artifact in row["expected"]:
+            # Resolve aliases again on each pass to detect retargeted paths
+            path = artifact["path"].resolve()
+            identity = (artifact["sha256"], artifact["byte_length"])
+            if path in files and files[path] != identity:
+                raise ValueError("conflicting oracle artifact identity")
+            files[path] = identity
+    for path, (digest, length) in files.items():
+        if hash_file(path, expected_bytes=length) != digest:
+            raise ValueError("oracle artifact changed during scoring" if final
+                             else "oracle artifact bytes do not match its identity")
 
 
 def load_protocol_truth(oracle_path, ledger_path, manifest):
@@ -75,6 +89,7 @@ def load_protocol_truth(oracle_path, ledger_path, manifest):
                 or (category == "negative_control" and case.split != "negative")):
             raise ValueError("classification category conflicts with oracle or public split")
         result[case_id] = {"category": category, "expected": expected}
+    verify_protocol_artifacts(result)
     return result
 
 

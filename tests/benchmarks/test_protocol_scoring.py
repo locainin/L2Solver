@@ -7,7 +7,9 @@ import tempfile
 import unittest
 from contextlib import redirect_stderr, redirect_stdout
 from pathlib import Path
+from unittest.mock import patch
 
+import benchmarks.protocol_scoring as protocol_scoring
 from benchmarks.protocol_scoring import FrozenIdentities, main, score_protocol_run
 from benchmarks.runner.catalogue import hash_file
 from benchmarks.runner.recovery import build_extract_command, validate_export_output
@@ -248,8 +250,117 @@ class ProtocolScoringTests(unittest.TestCase):
     def test_expected_reference_bytes_must_match_the_oracle(self):
         frozen = self.identities()
         (self.private / "expected.bin").write_bytes(b"x" * len(self.expected))
-        with self.assertRaisesRegex(ValueError, "oracle artifact"):
+        with self.assertRaisesRegex(ValueError, "oracle artifact bytes do not match its identity"):
             self.score(identities=frozen)
+
+    def test_shared_reference_reads_once_per_check_and_compares_each_case(self):
+        (self.private / "alias").symlink_to(".", target_is_directory=True)
+        oracle = json.loads(self.oracle.read_text())
+        oracle["cases"][5]["expected"][0]["file"] = "alias/expected.bin"
+        write_json(self.oracle, oracle)
+        row = self.blind["cases"][5]
+        output = self.run / "case-005" / "output"
+        write_export(output, artifact_rows=[{"file": "artifact.bin", "bytes": self.expected, "provenance": []}])
+        row.update(exit_code=0, process_failure=None, output=validate_export_output(output, exit_code=0))
+        write_json(self.run / "case-005" / "case.json", row)
+        write_json(self.receipt, self.blind)
+
+        reads = {"opens": 0, "bytes": 0}
+        original_open = Path.open
+        expected_path = (self.private / "expected.bin").resolve()
+
+        def tracked_open(path, *args, **kwargs):
+            stream = original_open(path, *args, **kwargs)
+            if args and args[0] == "rb" and path.resolve() == expected_path:
+                reads["opens"] += 1
+                original_read = stream.read
+
+                def tracked_read(*read_args):
+                    data = original_read(*read_args)
+                    reads["bytes"] += len(data)
+                    return data
+
+                stream.read = tracked_read
+            return stream
+
+        with patch.object(Path, "open", tracked_open):
+            result = self.score()
+
+        self.assertEqual(result["totals"]["matched_artifacts"], 2)
+        self.assertEqual([result["cases"][i]["matched_artifacts"] for i in (0, 5)], [1, 1])
+        self.assertEqual(reads, {"opens": 4, "bytes": 4 * len(self.expected)})
+
+    def test_conflicting_reference_identities_are_rejected(self):
+        (self.private / "alias").symlink_to(".", target_is_directory=True)
+        oracle = json.loads(self.oracle.read_text())
+        other = oracle["cases"][5]["expected"][0]
+        other["file"] = "alias/expected.bin"
+        for field, value in (("sha256", "0" * 64), ("bytes", len(self.expected) + 1)):
+            with self.subTest(field=field):
+                changed = dict(other, **{field: value})
+                oracle["cases"][5]["expected"] = [changed]
+                write_json(self.oracle, oracle)
+                with self.assertRaisesRegex(ValueError, "conflicting oracle artifact identity"):
+                    self.score()
+
+    def test_distinct_reference_files_with_same_identity_are_each_verified(self):
+        (self.private / "other.bin").write_bytes(b"x" * len(self.expected))
+        oracle = json.loads(self.oracle.read_text())
+        oracle["cases"][5]["expected"][0]["file"] = "other.bin"
+        write_json(self.oracle, oracle)
+        with self.assertRaisesRegex(ValueError, "oracle artifact"):
+            self.score()
+
+    def test_duplicate_reference_identity_within_case_is_rejected(self):
+        oracle = json.loads(self.oracle.read_text())
+        oracle["cases"][0]["expected"].append(dict(oracle["cases"][0]["expected"][0]))
+        write_json(self.oracle, oracle)
+        with self.assertRaisesRegex(ValueError, "duplicate oracle artifact identity"):
+            self.score()
+
+    def test_reference_mutation_after_scoring_is_rejected(self):
+        original_score_case = protocol_scoring._score_case
+        for shared in (True, False):
+            with self.subTest(shared=shared):
+                (self.private / "expected.bin").write_bytes(self.expected)
+                target = self.private / ("expected.bin" if shared else "other.bin")
+                target.write_bytes(self.expected)
+                oracle = json.loads(self.oracle.read_text())
+                oracle["cases"][5]["expected"][0]["file"] = target.name
+                write_json(self.oracle, oracle)
+
+                def score_and_mutate(case, *args):
+                    result = original_score_case(case, *args)
+                    if case.case_id == "timeout-positive":
+                        target.write_bytes(b"x" * len(self.expected))
+                    return result
+
+                with patch.object(protocol_scoring, "_score_case", side_effect=score_and_mutate):
+                    with self.assertRaisesRegex(ValueError, "oracle artifact changed during scoring"):
+                        self.score()
+
+    def test_reference_alias_retarget_after_scoring_is_rejected(self):
+        other = self.private / "other"
+        other.mkdir()
+        other_bytes = b"x" * len(self.expected)
+        (other / "expected.bin").write_bytes(other_bytes)
+        alias = self.private / "alias"
+        alias.symlink_to("other", target_is_directory=True)
+        oracle = json.loads(self.oracle.read_text())
+        oracle["cases"][5]["expected"][0].update(file="alias/expected.bin", sha256=digest(other_bytes))
+        write_json(self.oracle, oracle)
+        original_score_case = protocol_scoring._score_case
+
+        def score_and_retarget(case, *args):
+            result = original_score_case(case, *args)
+            if case.case_id == "timeout-positive":
+                alias.unlink()
+                alias.symlink_to(".", target_is_directory=True)
+            return result
+
+        with patch.object(protocol_scoring, "_score_case", side_effect=score_and_retarget):
+            with self.assertRaisesRegex(ValueError, "conflicting oracle artifact identity"):
+                self.score()
 
     def test_cli_writes_once_without_overwriting_scored_evidence(self):
         frozen = self.identities()
