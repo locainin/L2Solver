@@ -1,4 +1,4 @@
-use super::support::{empty_capture, ipv4_header_frame, path_arg, run};
+use super::support::{empty_capture, ipv4_capture, path_arg, run};
 use l2_workbench::{evidence::Case, sha256};
 use serde_json::{Value, json};
 use std::{
@@ -10,21 +10,8 @@ use std::{
     time::{Duration, Instant},
 };
 
-fn capture(records: u32) -> Vec<u8> {
-    let frame = ipv4_header_frame([192, 0, 2, 1], [192, 0, 2, 2]);
-    let mut bytes = empty_capture();
-    for record in 0..records {
-        bytes.extend_from_slice(&record.to_le_bytes());
-        bytes.extend_from_slice(&0_u32.to_le_bytes());
-        bytes.extend_from_slice(&34_u32.to_le_bytes());
-        bytes.extend_from_slice(&34_u32.to_le_bytes());
-        bytes.extend_from_slice(&frame);
-    }
-    bytes
-}
-
 fn create_bundle(root: &Path, records: u32) -> Result<(std::path::PathBuf, Value), Box<dyn Error>> {
-    create_bundle_from_capture(root, &capture(records))
+    create_bundle_from_capture(root, &ipv4_capture(records))
 }
 
 fn create_bundle_from_capture(
@@ -135,7 +122,7 @@ fn bundle_visiting_page_windows_context() -> Result<(), Box<dyn Error>> {
     );
     assert_eq!(
         report.pointer("/inventory/source_ids/0"),
-        Some(&json!(format!("sha256:{}", sha256(&capture(5))))),
+        Some(&json!(format!("sha256:{}", sha256(&ipv4_capture(5))))),
     );
     Ok(())
 }

@@ -58,7 +58,6 @@ fn default_enqueue_and_pop_remain_fifo() -> TestResult {
     let second = queued_id(coordinator.enqueue(&case, node_id, RecoveryTask::RecordDiscovery)?)?;
 
     assert_eq!(coordinator.peek_next_id(), Some(first));
-    assert_eq!(coordinator.peek_next_id(), Some(first));
     assert_eq!(coordinator.pop_next(), Ok(Some(first)));
     assert_eq!(coordinator.pop_next(), Ok(Some(second)));
     assert_eq!(coordinator.peek_next_id(), None);

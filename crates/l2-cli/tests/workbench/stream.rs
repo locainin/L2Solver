@@ -1,29 +1,14 @@
-use super::support::{
-    capture_with_truncated_record, empty_capture, ipv4_header_frame, path_arg, run,
-};
+use super::support::{capture_with_truncated_record, ipv4_capture, path_arg, run};
 use l2_workbench::{evidence::Case, sha256};
 use serde_json::Value;
 use std::{error::Error, fs};
-
-fn capture(records: u32) -> Vec<u8> {
-    let frame = ipv4_header_frame([192, 0, 2, 1], [192, 0, 2, 2]);
-    let mut bytes = empty_capture();
-    for record in 0..records {
-        bytes.extend_from_slice(&record.to_le_bytes());
-        bytes.extend_from_slice(&0_u32.to_le_bytes());
-        bytes.extend_from_slice(&34_u32.to_le_bytes());
-        bytes.extend_from_slice(&34_u32.to_le_bytes());
-        bytes.extend_from_slice(&frame);
-    }
-    bytes
-}
 
 #[test]
 fn streaming_bundle_global_source_ranges() -> Result<(), Box<dyn Error>> {
     let directory = tempfile::tempdir()?;
     let input = directory.path().join("input.pcap");
     let destination = directory.path().join("bundle");
-    let bytes = capture(5);
+    let bytes = ipv4_capture(5);
     fs::write(&input, &bytes)?;
     let output = run(
         &[
@@ -99,7 +84,7 @@ fn stream_defaults_to_directory_summary() -> Result<(), Box<dyn Error>> {
     let directory = tempfile::tempdir()?;
     let input = directory.path().join("input.pcap");
     let destination = directory.path().join("bundle");
-    fs::write(&input, capture(5))?;
+    fs::write(&input, ipv4_capture(5))?;
 
     let output = run(
         &[
@@ -136,7 +121,7 @@ fn streaming_failure_no_partial_publish() -> Result<(), Box<dyn Error>> {
     let directory = tempfile::tempdir()?;
     let input = directory.path().join("broken.pcap");
     let destination = directory.path().join("bundle");
-    let mut bytes = capture(3);
+    let mut bytes = ipv4_capture(3);
     bytes.pop();
     fs::write(&input, bytes)?;
     let output = run(
@@ -150,7 +135,7 @@ fn streaming_failure_no_partial_publish() -> Result<(), Box<dyn Error>> {
     )?;
     assert!(!output.status.success());
     assert!(!destination.exists());
-    fs::write(&input, capture(1))?;
+    fs::write(&input, ipv4_capture(1))?;
     fs::create_dir(&destination)?;
     fs::write(destination.join("marker"), b"keep")?;
     let output = run(
