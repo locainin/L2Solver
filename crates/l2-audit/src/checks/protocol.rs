@@ -1,12 +1,12 @@
 //! Protocol visibility becomes a finding only when a scoped policy forbids it
 
-use super::{Finding, InterfaceObservation, Severity, Verdict, scoped};
+use super::{Finding, Findings, InterfaceObservation, Severity, Verdict, scoped};
 use crate::{Disposition, FingerprintStatus, Protocol, ResolvedExpectations};
 
 pub(super) fn evaluate_protocol_policy(
     interface: &InterfaceObservation,
     policy: &ResolvedExpectations,
-    findings: &mut Vec<Finding>,
+    findings: &mut Findings,
 ) {
     for observation in &interface.protocols {
         if observation.status != FingerprintStatus::Observed
@@ -14,34 +14,36 @@ pub(super) fn evaluate_protocol_policy(
         {
             continue;
         }
-        findings.push(scoped(
-            Some(interface),
-            Some(observation.packet),
-            Finding {
-                check_id: "CTRL-POLICY-001".into(),
-                verdict: Verdict::Fail,
-                severity: protocol_severity(observation.protocol),
-                title: "Control protocol violates the interface policy".into(),
-                expected: format!(
-                    "{} traffic is forbidden for segment {} role {}",
-                    observation.protocol, policy.segment, policy.role
-                ),
-                observed: format!(
-                    "{} valid {} frame(s) observed",
-                    observation.frames, observation.protocol
-                ),
-                evidence_packets: Vec::new(),
-                source_interfaces: Vec::new(),
-                remediation: format!(
-                    "Review {} exposure and switch-port role configuration",
-                    observation.protocol
-                ),
-                limitations: vec![
-                    "Passive visibility does not establish whether active negotiation succeeds"
-                        .into(),
-                ],
-            },
-        ));
+        findings.push(|| {
+            scoped(
+                Some(interface),
+                Some(observation.packet),
+                Finding {
+                    check_id: "CTRL-POLICY-001".into(),
+                    verdict: Verdict::Fail,
+                    severity: protocol_severity(observation.protocol),
+                    title: "Control protocol violates the interface policy".into(),
+                    expected: format!(
+                        "{} traffic is forbidden for segment {} role {}",
+                        observation.protocol, policy.segment, policy.role
+                    ),
+                    observed: format!(
+                        "{} valid {} frame(s) observed",
+                        observation.frames, observation.protocol
+                    ),
+                    evidence_packets: Vec::new(),
+                    source_interfaces: Vec::new(),
+                    remediation: format!(
+                        "Review {} exposure and switch-port role configuration",
+                        observation.protocol
+                    ),
+                    limitations: vec![
+                        "Passive visibility does not establish whether active negotiation succeeds"
+                            .into(),
+                    ],
+                },
+            )
+        });
     }
 }
 

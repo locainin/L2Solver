@@ -8,6 +8,9 @@ use crate::{
 use l2_capture::InterfaceId;
 use std::collections::BTreeMap;
 
+mod findings;
+pub use findings::Findings;
+
 #[path = "checks/lldp.rs"]
 mod lldp;
 #[path = "checks/protocol.rs"]
@@ -23,7 +26,7 @@ mod vlan;
 /// out of this vector. The assessment layer reports those observations as
 /// informational exposures and reports untestable checks as coverage entries
 /// instead of manufacturing a security finding
-pub fn evaluate_policy(interfaces: &[InterfaceObservation], policy: &Policy) -> Vec<Finding> {
+pub fn evaluate_policy(interfaces: &[InterfaceObservation], policy: &Policy) -> Findings {
     evaluate_policy_inner(interfaces, |interface| {
         policy.expectations_for(interface.section, interface.index)
     })
@@ -38,7 +41,7 @@ pub fn evaluate_policy_with_source_labels(
     interfaces: &[InterfaceObservation],
     policy: &Policy,
     labels: &SourceLabelMap,
-) -> Result<Vec<Finding>, AuditError> {
+) -> Result<Findings, AuditError> {
     let mut resolved = BTreeMap::new();
     for interface in interfaces {
         let source = InterfaceId {
@@ -59,11 +62,11 @@ pub fn evaluate_policy_with_source_labels(
     }))
 }
 
-fn evaluate_policy_inner<F>(interfaces: &[InterfaceObservation], mut resolve: F) -> Vec<Finding>
+fn evaluate_policy_inner<F>(interfaces: &[InterfaceObservation], mut resolve: F) -> Findings
 where
     F: FnMut(&InterfaceObservation) -> Option<ResolvedExpectations>,
 {
-    let mut findings = Vec::new();
+    let mut findings = Findings::default();
     // Direct callers may provide interfaces in any order; keep finding order stable
     let mut ordered: Vec<_> = interfaces.iter().collect();
     ordered.sort_by_key(|interface| (interface.section, interface.index));

@@ -68,6 +68,32 @@ fn stp(root_suffix: u8) -> Vec<u8> {
 }
 
 #[test]
+fn finding_limit_incomplete_survey() -> Result<(), Box<dyn std::error::Error>> {
+    let mut survey = Survey::new();
+    for packet in 0..l2_audit::MAX_FINDINGS {
+        let root = if packet % 2 == 0 { 1 } else { 2 };
+        survey.observe(&captured(stp(root))?)?;
+    }
+    let report = survey.finish(&Policy {
+        allow_untagged: Some(false),
+        expected_stp_root: Some("00:00:00:00:00:00".into()),
+        ..Policy::default()
+    })?;
+    assert_eq!(report.findings.len(), l2_audit::MAX_FINDINGS);
+    assert!(
+        report.quality.clean(),
+        "the fixture must isolate finding overflow"
+    );
+    assert!(report.resource_limits.is_reached(ResourceLimit::Findings));
+    assert!(
+        !report.collection_complete(),
+        "omitted findings must prevent a complete assessment"
+    );
+    assert!(report.resource_limits.collection_incomplete());
+    Ok(())
+}
+
+#[test]
 fn inventory_limits_report_omitted_facts() -> Result<(), Box<dyn std::error::Error>> {
     let limits = SurveyLimits::default()
         .with_mac_facts(2)?

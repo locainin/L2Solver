@@ -5,6 +5,9 @@ use l2_audit::{
 };
 use std::{collections::BTreeMap, error::Error};
 
+#[path = "assessment/limits.rs"]
+mod limits;
+
 fn interface() -> InterfaceObservation {
     InterfaceObservation {
         section: 0,

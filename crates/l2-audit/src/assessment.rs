@@ -2,11 +2,9 @@
 
 use crate::{
     AuditError, CheckCategory, Finding, InterfaceObservation, NetworkModel, Policy, Quality,
-    Severity, SourceLabelMap, build_network_model, checks,
+    ResourceLimitStatus, Severity, SourceLabelMap, build_network_model, checks,
     exposures::build_exposures,
-    planner::{
-        CheckPlan, MAX_FINDINGS, PlannerInput, plan_passive, plan_passive_with_source_labels,
-    },
+    planner::{CheckPlan, PlannerInput, plan_passive, plan_passive_with_source_labels},
     role::{PortRoleInference, infer_port_roles},
 };
 use serde::Serialize;
@@ -59,6 +57,8 @@ pub struct AssessmentResult {
     pub network_model: NetworkModel,
     pub exposures: Vec<Exposure>,
     pub findings: Vec<Finding>,
+    /// Assessment results omitted after a report ceiling was reached
+    pub resource_limits: ResourceLimitStatus,
     pub coverage: Vec<CoverageEntry>,
     pub coverage_summary: Vec<CoverageMetric>,
     pub plan: CheckPlan,
@@ -88,8 +88,7 @@ pub fn assess_with_input(
     input: &PlannerInput,
 ) -> Result<AssessmentResult, AuditError> {
     policy.validate()?;
-    let mut findings = checks::evaluate_policy(interfaces, policy);
-    findings.truncate(MAX_FINDINGS);
+    let findings = checks::evaluate_policy(interfaces, policy);
     let plan = plan_passive(input, policy);
     Ok(build_assessment(interfaces, quality, findings, plan))
 }
@@ -123,15 +122,14 @@ pub fn assess_with_input_and_source_labels(
 ) -> Result<AssessmentResult, AuditError> {
     // Plan first so policy and source validation precede finding evaluation
     let plan = plan_passive_with_source_labels(input, policy, labels)?;
-    let mut findings = checks::evaluate_policy_with_source_labels(interfaces, policy, labels)?;
-    findings.truncate(MAX_FINDINGS);
+    let findings = checks::evaluate_policy_with_source_labels(interfaces, policy, labels)?;
     Ok(build_assessment(interfaces, quality, findings, plan))
 }
 
 fn build_assessment(
     interfaces: &[InterfaceObservation],
     quality: &Quality,
-    findings: Vec<Finding>,
+    findings: checks::Findings,
     plan: CheckPlan,
 ) -> AssessmentResult {
     let port_roles = infer_port_roles(interfaces);
@@ -143,7 +141,8 @@ fn build_assessment(
         port_roles,
         network_model,
         exposures,
-        findings,
+        findings: findings.entries,
+        resource_limits: findings.limits,
         coverage,
         coverage_summary,
         plan,

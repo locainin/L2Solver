@@ -185,6 +185,7 @@ pub enum ResourceLimit {
     StpTransitions,
     ForensicRecords,
     DnsMessages,
+    Findings,
 }
 
 /// Resource ceilings reached while retaining a usable partial assessment
@@ -224,6 +225,7 @@ impl ResourceLimitStatus {
                     | ResourceLimit::StpTransitions
                     | ResourceLimit::ForensicRecords
                     | ResourceLimit::DnsMessages
+                    | ResourceLimit::Findings
             )
         })
     }

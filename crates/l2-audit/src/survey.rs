@@ -296,7 +296,7 @@ impl Survey {
     }
 
     fn finish_with_profile_and_optional_source_labels(
-        self,
+        mut self,
         policy: &Policy,
         profile: AssessmentProfile,
         labels: Option<&SourceLabelMap>,
@@ -338,6 +338,10 @@ impl Survey {
         } else {
             assess_with_input(&interfaces, policy, &self.quality, &planner_input)?
         };
+        // Collection and assessment share one set of completion limits
+        for resource in assessment.resource_limits.reached() {
+            self.resource_limits.mark(*resource);
+        }
         Ok(Report {
             schema_version: 8,
             tool_version: env!("CARGO_PKG_VERSION").into(),
