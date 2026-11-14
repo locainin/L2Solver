@@ -218,7 +218,7 @@ fn collect_flow_cases(
                 job.increment(counter, 1)?;
             }
             batch.push(pending);
-            if batch_ready(batch.len(), worker_count, context.memory)? {
+            if batch_ready(&mut batch, worker_count, context.memory)? {
                 process_case_batch(&mut batch, pool, staging, context, &mut collect_case)?;
             }
             Ok(())

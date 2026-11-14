@@ -317,15 +317,20 @@ fn queued_native_case_bytes_flush_a_batch_before_the_requested_worker_count() ->
     use l2_workbench::job::{MemoryBudget, MemoryClass};
     let memory = MemoryBudget::new(512 * 1024 * 1024);
     let retained = memory.try_reserve(MemoryClass::Case, 128 * 1024 * 1024)?;
-    assert!(super::super::processing::batch_ready(1, 20, Some(&memory))?);
+    let mut batch = [batch_case(&memory, 0)?];
+    assert!(super::super::processing::batch_ready(
+        &mut batch,
+        20,
+        Some(&memory)
+    )?);
     assert!(!super::super::processing::batch_ready(
-        0,
+        &mut [],
         20,
         Some(&memory)
     )?);
     drop(retained);
     assert!(!super::super::processing::batch_ready(
-        1,
+        &mut batch,
         20,
         Some(&memory)
     )?);
@@ -337,8 +342,114 @@ fn shared_capture_index_bytes_do_not_count_as_queued_case_bytes() -> TestResult 
     use l2_workbench::job::{MemoryBudget, MemoryClass};
     let memory = MemoryBudget::new(512 * 1024 * 1024);
     let index = memory.try_reserve(MemoryClass::Base, 160 * 1024 * 1024)?;
-    assert!(!super::super::processing::batch_ready(1, 4, Some(&memory))?);
-    assert!(super::super::processing::batch_ready(4, 4, Some(&memory))?);
+    let mut single = [batch_case(&memory, 0)?];
+    let mut full = [
+        batch_case(&memory, 0)?,
+        batch_case(&memory, 0)?,
+        batch_case(&memory, 0)?,
+        batch_case(&memory, 0)?,
+    ];
+    assert!(!super::super::processing::batch_ready(
+        &mut single,
+        4,
+        Some(&memory)
+    )?);
+    assert!(super::super::processing::batch_ready(
+        &mut full,
+        4,
+        Some(&memory)
+    )?);
     drop(index);
+    Ok(())
+}
+
+fn batch_case(
+    memory: &l2_workbench::job::MemoryBudget,
+    payload_bytes: usize,
+) -> Result<crate::export::processing::PendingCase, Box<dyn Error>> {
+    use crate::{
+        export::processing::PendingCase,
+        workbench::full_source::{
+            FlowAnalysis, FullSourceItem, PerFlowCoverage, ReconstructionCaseOmissions,
+        },
+    };
+    use l2_workbench::{evidence::Case, investigation::BuildResult};
+
+    let mut case = Case::with_memory_budget(memory)?;
+    if payload_bytes != 0 {
+        case.add_bytes_node(
+            "opaque",
+            &vec![1; payload_bytes],
+            Vec::new(),
+            serde_json::json!({}),
+        )?;
+    }
+    PendingCase::new(FullSourceItem::Flow(Box::new(FlowAnalysis {
+        flow: crate::export::provenance_tests::flow(1),
+        result: BuildResult {
+            case,
+            complete: true,
+        },
+        coverage: PerFlowCoverage {
+            selected_records: 0,
+            retained_records: 0,
+            omitted_records: 0,
+            retention_limits: Vec::new(),
+            reconstruction_omissions: ReconstructionCaseOmissions::default(),
+            complete: true,
+        },
+    })))
+}
+
+#[test]
+fn pending_case_growth_threshold() -> TestResult {
+    use l2_workbench::job::{MemoryBudget, MemoryClass};
+
+    let memory = MemoryBudget::new(512 * 1024 * 1024);
+    let retained = memory.try_reserve(MemoryClass::Case, 95 * 1024 * 1024)?;
+    let mut batch = [batch_case(&memory, 0)?];
+    assert!(!super::super::processing::batch_ready(
+        &mut batch,
+        20,
+        Some(&memory)
+    )?);
+    let boundary = memory.try_reserve(MemoryClass::Case, 1024 * 1024)?;
+
+    assert!(
+        super::super::processing::batch_ready(&mut batch, 20, Some(&memory))?,
+        "queued Case charges and recovery growth should trigger collection"
+    );
+    drop(boundary);
+    drop(retained);
+    Ok(())
+}
+
+#[test]
+fn largest_pending_case_growth() -> TestResult {
+    use l2_workbench::job::{MemoryBudget, MemoryClass};
+
+    let memory = MemoryBudget::new(512 * 1024 * 1024);
+    let retained = memory.try_reserve(MemoryClass::Case, 87 * 1024 * 1024)?;
+    let mut batch = [
+        batch_case(&memory, 0)?,
+        batch_case(&memory, 4 * 1024 * 1024)?,
+    ];
+    assert!(!super::super::processing::batch_ready(
+        &mut batch,
+        20,
+        Some(&memory)
+    )?);
+    let boundary = memory.try_reserve(MemoryClass::Case, 1024 * 1024)?;
+    assert!(
+        super::super::processing::batch_ready(&mut batch, 20, Some(&memory))?,
+        "the largest Case must supply the recovery growth forecast"
+    );
+    batch.swap(0, 1);
+    assert!(
+        super::super::processing::batch_ready(&mut batch, 20, Some(&memory))?,
+        "the growth forecast must not depend on Case order"
+    );
+    drop(boundary);
+    drop(retained);
     Ok(())
 }

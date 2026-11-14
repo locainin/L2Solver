@@ -107,21 +107,30 @@ pub(super) fn recovery_worker_count(requested: Option<usize>, available_cpus: us
 
 /// Release queued native Cases before a CPU-sized batch consumes recovery's working room
 pub(super) fn batch_ready(
-    queued: usize,
+    queued: &mut [PendingCase],
     workers: usize,
     memory: Option<&MemoryBudget>,
-) -> Result<bool, MemoryError> {
-    if queued == 0 {
+) -> Result<bool, Box<dyn Error>> {
+    if queued.is_empty() {
         return Ok(false);
     }
-    if queued >= workers {
+    if queued.len() >= workers {
         return Ok(true);
     }
     let Some(memory) = memory else {
         return Ok(false);
     };
     let snapshot = memory.snapshot()?;
-    Ok(snapshot.used(MemoryClass::Case) >= snapshot.limit_bytes / CASE_BUFFER_DIVISOR)
+    let mut largest_growth = 0;
+    for pending in queued {
+        largest_growth =
+            largest_growth.max(admission::startup_growth(case_mut(&mut pending.item))?);
+    }
+    // Leave room for recovery before another native Case is built
+    Ok(snapshot
+        .used(MemoryClass::Case)
+        .saturating_add(largest_growth)
+        >= snapshot.limit_bytes / CASE_BUFFER_DIVISOR)
 }
 
 /// One analyzed Case waiting for its bounded recovery batch
