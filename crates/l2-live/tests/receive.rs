@@ -124,3 +124,44 @@ fn expired_deadline_stops_after_loopback_traffic() -> Result<(), Box<dyn std::er
     assert_eq!(link.stop_reason(), Some(StopReason::Deadline));
     Ok(())
 }
+
+#[cfg(target_os = "linux")]
+#[test]
+fn interface_rename_revalidation() -> Result<(), Box<dyn std::error::Error>> {
+    fn ip(arguments: &[&str]) -> Result<(), Box<dyn std::error::Error>> {
+        let output = std::process::Command::new("ip").args(arguments).output()?;
+        if !output.status.success() {
+            return Err(format!(
+                "ip {arguments:?}: {}",
+                String::from_utf8_lossy(&output.stderr)
+            )
+            .into());
+        }
+        Ok(())
+    }
+
+    if !isolation::run_in_private_namespace()? {
+        return Ok(());
+    }
+
+    let mut link = LiveLink::open_with_limits("lo", 1, Duration::from_secs(10))?;
+    let original = link.interface_identity()?;
+    assert_eq!(original.ifindex(), 1);
+
+    // The proved private namespace owns this loopback name
+    ip(&["link", "set", "dev", "lo", "down"])?;
+    ip(&["link", "set", "dev", "lo", "name", "l2renamed"])?;
+    assert!(
+        link.interface_identity().is_err(),
+        "identity accepted a stale interface name"
+    );
+    assert!(
+        link.statistics().is_err(),
+        "statistics accepted a stale interface name"
+    );
+    assert!(
+        link.recv().is_err(),
+        "receive accepted a stale interface name"
+    );
+    Ok(())
+}

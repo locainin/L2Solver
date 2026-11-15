@@ -71,16 +71,25 @@ fn retains_namespace_ifindex_and_datalink() -> Result<(), Box<dyn std::error::Er
 #[cfg(target_os = "linux")]
 #[test]
 fn pins_real_namespace_interface_descriptors() -> Result<(), Box<dyn std::error::Error>> {
+    use rustix::{
+        fs::{OFlags, fcntl_getfl},
+        io::{FdFlags, fcntl_getfd},
+    };
+
     let pinned = pin("lo")?;
 
     assert_eq!(pinned.identity(), current_snapshot("lo")?);
     super::validate_pinned_descriptors(&pinned)?;
+    // Held descriptors must not leak across a later process launch
+    assert!(fcntl_getfd(&pinned.namespace)?.contains(FdFlags::CLOEXEC));
+    assert!(fcntl_getfd(&pinned.interface)?.contains(FdFlags::CLOEXEC));
+    assert!(fcntl_getfl(&pinned.interface)?.contains(OFlags::DIRECTORY));
     Ok(())
 }
 
 #[cfg(target_os = "linux")]
 #[test]
-fn calling_thread_network_namespace() -> Result<(), Box<dyn std::error::Error>> {
+fn thread_namespace_identity() -> Result<(), Box<dyn std::error::Error>> {
     use std::{io, os::unix::fs::MetadataExt, process::Command, thread};
 
     const CHILD: &str = "L2_TEST_THREAD_NAMESPACE_CHILD";
@@ -91,7 +100,7 @@ fn calling_thread_network_namespace() -> Result<(), Box<dyn std::error::Error>> 
             .arg(std::env::current_exe()?)
             .args([
                 "--exact",
-                "interface::tests::calling_thread_network_namespace",
+                "interface::tests::thread_namespace_identity",
                 "--nocapture",
             ])
             .env(CHILD, "1")
@@ -125,6 +134,28 @@ fn calling_thread_network_namespace() -> Result<(), Box<dyn std::error::Error>> 
             (own.dev(), own.ino()),
             "pinned namespace differs from the calling thread"
         );
+
+        // The new thread namespace owns this temporary interface pair
+        for arguments in [
+            &[
+                "link", "add", "l2test0", "type", "veth", "peer", "name", "l2test1",
+            ][..],
+            &["link", "set", "dev", "l2test0", "up"][..],
+            &["link", "set", "dev", "l2test1", "up"][..],
+        ] {
+            let output = Command::new("ip").args(arguments).output()?;
+            assert!(
+                output.status.success(),
+                "ip {arguments:?}: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+        let expected = nix::net::if_::if_nametoindex("l2test0").map_err(io::Error::other)?;
+        assert_ne!(expected, 1, "the capture must use a non-loopback interface");
+        let capture = pcap::Capture::from_device("l2test0")
+            .and_then(pcap::Capture::open)
+            .map_err(io::Error::other)?;
+        assert_eq!(super::capture_socket_ifindex(&capture)?, expected);
         Ok(())
     });
     worker.join().map_err(|_| "namespace worker panicked")??;

@@ -1,4 +1,4 @@
-"""Run the deadline test with a proved private loopback and bounded cleanup."""
+# Run live capture tests in a proved private namespace with bounded cleanup
 
 import importlib.util
 import os
@@ -82,8 +82,8 @@ def child(fds, parent_uid, test_binary, mode, test_name):
         print("namespace_rejected=true")
         return
     if result.returncode or "test result: ok. 1 passed; 0 failed;" not in result.stdout:
-        raise RuntimeError(f"deadline child failed: {result.stdout} {result.stderr}")
-    print("deadline_test_passed=true")
+        raise RuntimeError(f"namespace test failed: {result.stdout} {result.stderr}")
+    print("private_test_passed=true")
 
 
 def parent(test_binary, mode, test_name):
@@ -101,7 +101,7 @@ def parent(test_binary, mode, test_name):
         )
         stdout, stderr = ns.wait_for_owned_process(process, 20)
         if process.returncode:
-            raise RuntimeError(f"isolated deadline failed: {stdout} {stderr}")
+            raise RuntimeError(f"isolated namespace test failed: {stdout} {stderr}")
         print(stdout.strip())
     finally:
         for fd in fds:

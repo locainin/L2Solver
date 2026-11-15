@@ -47,10 +47,10 @@ pub fn run_in_private_namespace() -> Result<bool, Box<dyn Error>> {
     if !output.status.success()
         || !String::from_utf8_lossy(&output.stdout)
             .lines()
-            .any(|line| line == "deadline_test_passed=true")
+            .any(|line| line == "private_test_passed=true")
     {
         return Err(format!(
-            "isolated deadline fixture failed: {} {}",
+            "isolated namespace fixture failed: {} {}",
             String::from_utf8_lossy(&output.stdout),
             String::from_utf8_lossy(&output.stderr)
         )
