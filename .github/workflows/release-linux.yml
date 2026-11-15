@@ -97,8 +97,12 @@ jobs:
           fail-on-cache-miss: true
 
       # Tests contain paths embedded at build time, so recreate target in the checkout
+      # Child-scope tests need a neutral parent; their own limits and rejection cases remain enforced
       - name: Run workspace tests with Nextest
         run: >-
+          systemd-run --user --scope --quiet
+          --property=TasksMax=infinity --property=MemoryMax=infinity
+          --property=MemoryHigh=infinity --property=MemorySwapMax=infinity --
           cargo nextest run --archive-file "$RUNNER_TEMP/l2solver-tests.tar.zst"
           --extract-to "$GITHUB_WORKSPACE" --profile ci
           --partition hash:${{ matrix.shard }}/8 --test-threads 2 --no-tests fail
@@ -369,6 +373,9 @@ jobs:
 
       - name: Check packaged executable and record blocked release work
         run: >-
+          systemd-run --user --scope --quiet
+          --property=TasksMax=infinity --property=MemoryMax=infinity
+          --property=MemoryHigh=infinity --property=MemorySwapMax=infinity --
           /usr/bin/python3 -m benchmarks.qualification
           --package-directory "$RUNNER_TEMP/l2solver-dist"
           --output-directory "$RUNNER_TEMP/l2solver-qualification"

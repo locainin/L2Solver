@@ -60,6 +60,21 @@ def test_test_shards_reuse_the_same_complete_archived_build():
     assert "junit.xml" in tests
 
 
+def test_scoped_runner_fixture():
+    for role, step, payload in (
+        ("tests", "Run workspace tests with Nextest", "cargo nextest run"),
+        ("package", "Check packaged executable and record blocked release work", "/usr/bin/python3 -m benchmarks.qualification"),
+    ):
+        commands = job(role)
+        command = commands[commands.index(f"- name: {step}"):]
+        command = command.split("\n      - name:", 1)[0]
+        assert "systemd-run --user --scope --quiet" in command
+        for control in ("TasksMax", "MemoryMax", "MemoryHigh", "MemorySwapMax"):
+            assert f"--property={control}=infinity" in command
+        assert "--wait" not in command.split()
+        assert command.index("systemd-run") < command.index(payload)
+
+
 def test_python_regressions_run_once_without_waiting_for_the_release_build():
     python = job("python")
     assert "needs:" not in python
