@@ -108,15 +108,21 @@ def test_delegated_cgroup_cases_remain_required_during_package_qualification():
     assert "test_real_runner_samples_live_unlinked_spool_and_process" in package
 
 
-def test_package_runs_the_real_binary_installer_after_build_and_rejects_skips():
+def test_source_bound_candidate():
     package = job("package")
     build = package.index("- name: Build Linux release candidate")
     install = package.index("- name: Qualify real executable installation privately")
-    provenance = package.index("- name: Package build provenance and checksum")
-    assert build < install < provenance
-    step = package[install:provenance]
+    completions = package.index("- name: Check generated completion syntax")
+    assert build < install < completions
+    build_step = package[build:install]
+    assert "/usr/bin/python3 -m benchmarks.package_release" in build_step
+    assert '--output-directory "$RUNNER_TEMP/l2solver-dist"' in build_step
+    assert "--binary" not in build_step
+    assert 'tar -xzf "$RUNNER_TEMP/l2solver-dist/l2solver-x86_64-unknown-linux-gnu.tar.gz"' in build_step
+    assert "Package build provenance and checksum" not in package
+    step = package[install:completions]
     assert "L2_TEST_INSTALL_BINARIES:" in step
-    assert "target/x86_64-unknown-linux-gnu/release" in step
+    assert "runner.temp }}/l2solver-candidate" in step
     assert "test_real_binaries_install_run_upgrade_and_uninstall_in_private_namespace" in step
     assert '--junitxml="$INSTALLER_JUNIT"' in step
     assert 'case.find("skipped")' in step
@@ -160,7 +166,7 @@ def test_registry_cache_and_job_timeouts_have_scoped_keys():
     # The pinned action keys by compiler, host, manifests and both lockfiles
     assert "Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0" in cache
     assert "shared-key: ${{ inputs.role }}" in cache
-    assert 'cache-targets: "true"' in cache
+    assert "cache-targets: ${{ inputs.role != 'package' }}" in cache
     assert 'cache-bin: "false"' in cache
     assert "save-if: ${{ github.ref == 'refs/heads/dev' }}" in cache
     for name in ("prepare_tests", "quality", "compatibility", "fuzz", "package"):

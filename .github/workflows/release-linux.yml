@@ -318,14 +318,16 @@ jobs:
             tests/benchmarks/test_refine_cgroup_integration.py::RefineCgroupIntegrationTests::test_real_runner_samples_live_unlinked_spool_and_process
 
       - name: Build Linux release candidate
-        run: >-
-          cargo build --locked --release --package l2-cli --package l2-active-cli --package l2-active-linux
-          --bin l2solver --bin l2solver-active --bin l2solver-active-helper
-          --target x86_64-unknown-linux-gnu
+        run: |
+          /usr/bin/python3 -m benchmarks.package_release \
+            --output-directory "$RUNNER_TEMP/l2solver-dist"
+          mkdir -p "$RUNNER_TEMP/l2solver-candidate"
+          tar -xzf "$RUNNER_TEMP/l2solver-dist/l2solver-x86_64-unknown-linux-gnu.tar.gz" \
+            -C "$RUNNER_TEMP/l2solver-candidate"
 
       - name: Qualify real executable installation privately
         env:
-          L2_TEST_INSTALL_BINARIES: ${{ github.workspace }}/target/x86_64-unknown-linux-gnu/release
+          L2_TEST_INSTALL_BINARIES: ${{ runner.temp }}/l2solver-candidate
           INSTALLER_JUNIT: ${{ runner.temp }}/real-installer.xml
         run: |
           /usr/bin/python3 -m pytest -q \
@@ -349,22 +351,13 @@ jobs:
         shell: bash
         run: |
           for shell in bash zsh fish; do
-            completion=$(target/x86_64-unknown-linux-gnu/release/l2solver completions "$shell")
+            completion=$("$RUNNER_TEMP/l2solver-candidate/l2solver" completions "$shell")
             if [[ -z "$completion" ]]; then
               printf 'empty %s completion script\n' "$shell" >&2
               exit 1
             fi
             printf '%s\n' "$completion" | "$shell" -n
           done
-
-      - name: Package build provenance and checksum
-        run: >-
-          /usr/bin/python3 -m benchmarks.package_release
-          --binary target/x86_64-unknown-linux-gnu/release/l2solver
-          --active-binary target/x86_64-unknown-linux-gnu/release/l2solver-active
-          --helper-binary target/x86_64-unknown-linux-gnu/release/l2solver-active-helper
-          --lockfile Cargo.lock
-          --output-directory "$RUNNER_TEMP/l2solver-dist"
 
       - name: Check the extracted active application in isolated networks
         run: >-

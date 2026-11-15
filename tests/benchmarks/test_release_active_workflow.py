@@ -6,6 +6,8 @@ import subprocess
 import tarfile
 from pathlib import Path
 
+from benchmarks.package_release import OBSERVED_BUILD_COMMAND
+
 
 ROOT = Path(__file__).resolve().parents[2]
 
@@ -27,17 +29,18 @@ REQUIRED_PARENTS = (
 
 def test_release_build_and_package_include_the_matching_helper():
     workflow = (ROOT / ".github/workflows/release-linux.yml").read_text()
-    assert "--package l2-active-linux" in workflow
-    assert "--bin l2solver-active-helper" in workflow
-    assert "--active-binary target/x86_64-unknown-linux-gnu/release/l2solver-active" in workflow
-    assert "--helper-binary target/x86_64-unknown-linux-gnu/release/l2solver-active-helper" in workflow
+    assert "/usr/bin/python3 -m benchmarks.package_release" in workflow
+    build = " ".join(OBSERVED_BUILD_COMMAND)
+    assert "--package l2-active-linux" in build
+    assert "--bin l2solver-active-helper" in build
+    assert "--bin l2solver-active" in build
 
 
 def test_release_runs_the_extracted_application_before_upload():
     workflow = (ROOT / ".github/workflows/release-linux.yml").read_text()
     command = "bash benchmarks/check_active_release.sh"
     assert command in workflow
-    assert workflow.index("Package build provenance") < workflow.index(command)
+    assert workflow.index("Build Linux release candidate") < workflow.index(command)
     assert workflow.index(command) < workflow.index("Upload unqualified review candidate")
 
 

@@ -7,10 +7,11 @@ import tarfile
 from pathlib import Path
 
 from benchmarks.package_release import (
-    ARCHIVE_NAME,
     ACTIVE_NAME,
+    ARCHIVE_NAME,
     HELPER_NAME,
     NOTICE_PATH,
+    OBSERVED_BUILD_COMMAND,
     PROVENANCE_NAME,
     TARGET,
 )
@@ -112,11 +113,13 @@ def unpack_package(
         and isinstance(provenance.get("active_binary"), dict)
         and isinstance(provenance.get("active_helper"), dict)
         and type(provenance.get("schema_version")) is int
-        and provenance.get("schema_version") == 3
+        and provenance.get("schema_version") == 4
         and provenance.get("target") == TARGET
         and provenance.get("source_commit") == source_commit
         and provenance.get("source_tree") == source_tree
-        and provenance.get("build", {}).get("command_kind") == "rebuild_recipe"
+        and provenance.get("build", {}).get("command_kind") == "observed"
+        and provenance.get("build", {}).get("source_binding") == "verified"
+        and provenance.get("build", {}).get("command") == " ".join(OBSERVED_BUILD_COMMAND)
         and provenance.get("dependency_lock", {}).get("sha256") == lock_sha256
         and provenance.get("toolchain", {}).get("rustc") == rustc_version
         and provenance.get("toolchain", {}).get("cargo") == cargo_version
