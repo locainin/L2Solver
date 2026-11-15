@@ -23,6 +23,17 @@ fn capture_capacity_limit() -> Result<(), Box<dyn Error>> {
             );
         }
     }
+    let chunks = Cursor::new(b"a")
+        .chain(Cursor::new(b"b"))
+        .chain(Cursor::new(b"c"))
+        .chain(Cursor::new(b"d"));
+    let captured = capture(chunks, 64)?;
+    assert_eq!(captured, b"abcd");
+    assert_eq!(
+        captured.capacity(),
+        4,
+        "a filled buffer must not grow before another byte arrives"
+    );
     Ok(())
 }
 
