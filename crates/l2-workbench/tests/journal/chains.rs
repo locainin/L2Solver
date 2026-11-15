@@ -338,7 +338,7 @@ fn chain_deadline_blocking_visitor() -> Result<(), Box<dyn Error>> {
         steps: vec![EventSelector::default()],
         same_actor: true,
         max_gap_ticks: None,
-        limit: None,
+        limit: Some(1),
         joins: Vec::new(),
         max_elapsed_ms: ChainDeadline::limited(100),
     };
@@ -371,6 +371,7 @@ fn chain_deadline_blocking_visitor() -> Result<(), Box<dyn Error>> {
 
     let mut unlimited = plan;
     unlimited.max_elapsed_ms = ChainDeadline::unlimited();
+    unlimited.limit = None;
     let mut emitted = 0;
     journal.visit_chains(&unlimited, |_| {
         emitted += 1;

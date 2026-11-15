@@ -6,7 +6,20 @@ use crate::{
 };
 use rusqlite::hooks::{AuthAction, AuthContext, Authorization};
 use serde_json::json;
-use std::{io::Cursor, sync::mpsc, thread, time::Duration};
+use std::{
+    io::Cursor,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+        mpsc,
+    },
+    thread,
+    time::Duration,
+};
+
+// Reuse the unit-test entry point for tests that need the journal connection
+#[path = "deadline_internal.rs"]
+mod deadline_internal;
 
 const WAIT: Duration = Duration::from_secs(30);
 
@@ -89,6 +102,8 @@ fn assert_import_count(
     });
     ready_rx.recv_timeout(WAIT)?;
     let mut release = Some(release_tx);
+    let concurrent_write_finished = Arc::new(AtomicBool::new(false));
+    let callback_write_finished = Arc::clone(&concurrent_write_finished);
     journal
         .connection
         .authorizer(Some(move |context: AuthContext<'_>| {
@@ -103,15 +118,21 @@ fn assert_import_count(
                 if release.send(()).is_err() || finished_rx.recv_timeout(WAIT).is_err() {
                     return Authorization::Deny;
                 }
+                callback_write_finished.store(true, Ordering::Relaxed);
             }
             Authorization::Allow
         }))?;
     let added = import(&mut journal)?;
-    writer.join().map_err(|_| "concurrent writer panicked")??;
+    // Check the handoff before joining so a missing insert fails without waiting
+    assert!(
+        concurrent_write_finished.load(Ordering::Relaxed),
+        "the concurrent writer must finish during the import"
+    );
     assert_eq!(
         added, expected,
         "the other writer is not part of this import"
     );
+    writer.join().map_err(|_| "concurrent writer panicked")??;
     assert_eq!(journal.overview()?.events, expected + 1);
     let mut events = Vec::new();
     journal.visit_events(0, None, |event| {

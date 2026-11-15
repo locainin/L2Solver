@@ -121,22 +121,60 @@ fn oversized_summary_preserves_case() -> Result<(), Box<dyn Error>> {
 }
 
 #[test]
-fn packet_block_drop_counts_make_collection_incomplete() {
-    let known_drops = CollectionSummary {
-        packet_block_packets_dropped: 3,
-        ..CollectionSummary::default()
-    };
-    let unavailable_drops = CollectionSummary {
-        packet_blocks_with_unavailable_drop_count: 1,
-        ..CollectionSummary::default()
-    };
+fn reported_drop_counts_incomplete() {
+    assert!(!capture_collection::reports_incomplete_collection(
+        CollectionSummary::default()
+    ));
 
-    assert!(capture_collection::reports_incomplete_collection(
-        known_drops
-    ));
-    assert!(capture_collection::reports_incomplete_collection(
-        unavailable_drops
-    ));
+    // Each source of loss must affect completeness without help from another counter
+    for (counter, summary) in [
+        (
+            "incomplete sections",
+            CollectionSummary {
+                sections: 1,
+                reported_sections: 1,
+                incomplete_sections: 1,
+                ..CollectionSummary::default()
+            },
+        ),
+        (
+            "capture drops",
+            CollectionSummary {
+                sections: 1,
+                reported_sections: 1,
+                capture_dropped: 1,
+                ..CollectionSummary::default()
+            },
+        ),
+        (
+            "interface drops",
+            CollectionSummary {
+                sections: 1,
+                reported_sections: 1,
+                interface_dropped: 1,
+                ..CollectionSummary::default()
+            },
+        ),
+        (
+            "packet block drops",
+            CollectionSummary {
+                packet_block_packets_dropped: 3,
+                ..CollectionSummary::default()
+            },
+        ),
+        (
+            "unavailable packet block drops",
+            CollectionSummary {
+                packet_blocks_with_unavailable_drop_count: 1,
+                ..CollectionSummary::default()
+            },
+        ),
+    ] {
+        assert!(
+            capture_collection::reports_incomplete_collection(summary),
+            "{counter} must mark collection incomplete"
+        );
+    }
 }
 
 #[test]
