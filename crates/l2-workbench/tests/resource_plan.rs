@@ -68,14 +68,6 @@ fn runtime_representation() {
 
 #[test]
 fn exact_budgets() -> Result<(), Box<dyn std::error::Error>> {
-    assert_eq!(
-        host().automatic_child_memory().map(NonZeroU64::get),
-        Some(4_000)
-    );
-    assert_eq!(
-        host().automatic_child_tasks().map(NonZeroU64::get),
-        Some(16)
-    );
     let plan = ResourcePlan::new(host(), input(), limits(), None, ObjectLimitMode::Explicit)?;
     assert_eq!(*plan.limits(), limits());
     Ok(())
@@ -313,16 +305,6 @@ fn rejects_host_exhaustion() {
             ObjectLimitMode::Explicit
         )
         .is_err()
-    );
-    assert_eq!(
-        HostCapacity {
-            memory_bytes: 1,
-            workspace_bytes: 1,
-            tasks: 1,
-            allocation_granule: NonZeroU64::MIN,
-        }
-        .automatic_child_tasks(),
-        None
     );
 }
 

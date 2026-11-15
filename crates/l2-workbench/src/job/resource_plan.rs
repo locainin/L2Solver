@@ -18,20 +18,6 @@ pub struct HostCapacity {
     pub allocation_granule: NonZeroU64,
 }
 
-impl HostCapacity {
-    /// Select half the observed memory headroom for an automatic child limit
-    #[must_use]
-    pub const fn automatic_child_memory(self) -> Option<NonZeroU64> {
-        NonZeroU64::new(self.memory_bytes / 2)
-    }
-
-    /// Select fewer than the available task slots for an automatic child limit
-    #[must_use]
-    pub const fn automatic_child_tasks(self) -> Option<NonZeroU64> {
-        NonZeroU64::new(self.tasks / 2)
-    }
-}
-
 /// Return available bytes after leaving at least one eighth for other work
 #[must_use]
 pub const fn workspace_capacity(available_bytes: u64) -> u64 {
