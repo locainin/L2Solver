@@ -13,12 +13,44 @@ pub struct WorkingSetSnapshot {
     pub peak_active_cases: usize,
     /// Total successful Case admissions during this invocation
     pub admitted_cases: u64,
-    /// Capacity held for future allocations, excluded from live `used_bytes`
+    /// External-process allowances currently held, including before process launch
+    pub active_processes: usize,
+    /// Largest simultaneous number of held external-process allowances
+    pub peak_active_processes: usize,
+    /// Total external-process allowances admitted during this invocation
+    pub admitted_processes: u64,
+    /// Capacity held for future allocations and processes, excluded from live `used_bytes`
     pub reserved_bytes: u64,
     /// Largest simultaneous future-capacity reservation
     pub peak_reserved_bytes: u64,
     /// Admission requests rejected by the aggregate limit
     pub admission_denials: u64,
+}
+
+#[derive(Clone, Copy, Debug)]
+enum ScopeKind {
+    Case,
+    ExternalProcess,
+}
+
+impl WorkingSetSnapshot {
+    fn record_admission(&mut self, kind: ScopeKind, admitted: u64) {
+        let (total, active, peak) = match kind {
+            ScopeKind::Case => (
+                &mut self.admitted_cases,
+                &mut self.active_cases,
+                &mut self.peak_active_cases,
+            ),
+            ScopeKind::ExternalProcess => (
+                &mut self.admitted_processes,
+                &mut self.active_processes,
+                &mut self.peak_active_processes,
+            ),
+        };
+        *total = admitted;
+        *active += 1;
+        *peak = (*peak).max(*active);
+    }
 }
 
 #[derive(Debug)]
@@ -27,6 +59,7 @@ pub(super) struct ScopeState {
     used: u64,
     reserved: u64,
     active: bool,
+    kind: ScopeKind,
 }
 
 #[derive(Debug)]
@@ -43,6 +76,15 @@ pub(super) struct Scope {
 #[derive(Debug)]
 pub struct MemoryWorkingSet {
     budget: MemoryBudget,
+}
+
+/// Capacity reserved for an external process, not a measurement of its memory use
+///
+/// Dropping this guard releases the allowance without reporting it as owned heap
+#[must_use = "hold the reservation while external memory remains in use"]
+#[derive(Debug)]
+pub struct ProcessWorkingSet {
+    _working_set: MemoryWorkingSet,
 }
 
 impl MemoryWorkingSet {
@@ -62,6 +104,29 @@ impl MemoryBudget {
     /// # Errors
     /// Returns an error for a nested scope, exhausted capacity, overflow, or poisoned state
     pub fn try_working_set(&self, additional_bytes: u64) -> Result<MemoryWorkingSet, MemoryError> {
+        self.try_scope(additional_bytes, ScopeKind::Case)
+    }
+
+    /// Reserve future capacity for an external process in the same admission ledger
+    ///
+    /// The allowance stays separate from observed process RSS and owned live allocations
+    ///
+    /// # Errors
+    /// Returns an error for a nested scope, exhausted capacity, overflow, or poisoned state
+    pub fn try_process_working_set(
+        &self,
+        additional_bytes: u64,
+    ) -> Result<ProcessWorkingSet, MemoryError> {
+        Ok(ProcessWorkingSet {
+            _working_set: self.try_scope(additional_bytes, ScopeKind::ExternalProcess)?,
+        })
+    }
+
+    fn try_scope(
+        &self,
+        additional_bytes: u64,
+        kind: ScopeKind,
+    ) -> Result<MemoryWorkingSet, MemoryError> {
         if self.scope.is_some() {
             return Err(MemoryError::NestedWorkingSet);
         }
@@ -91,11 +156,12 @@ impl MemoryBudget {
         }
         let id = state.next_scope;
         let next = id.checked_add(1).ok_or(MemoryError::ObservationOverflow)?;
-        let admitted = state
-            .working_sets
-            .admitted_cases
-            .checked_add(1)
-            .ok_or(MemoryError::ObservationOverflow)?;
+        let admitted = match kind {
+            ScopeKind::Case => state.working_sets.admitted_cases,
+            ScopeKind::ExternalProcess => state.working_sets.admitted_processes,
+        }
+        .checked_add(1)
+        .ok_or(MemoryError::ObservationOverflow)?;
         state.scopes.insert(
             id,
             ScopeState {
@@ -103,6 +169,7 @@ impl MemoryBudget {
                 used: 0,
                 reserved: additional_bytes,
                 active: true,
+                kind,
             },
         );
         state.next_scope = next;
@@ -114,12 +181,7 @@ impl MemoryBudget {
             .working_sets
             .peak_reserved_bytes
             .max(state.working_sets.reserved_bytes);
-        state.working_sets.admitted_cases = admitted;
-        state.working_sets.active_cases += 1;
-        state.working_sets.peak_active_cases = state
-            .working_sets
-            .peak_active_cases
-            .max(state.working_sets.active_cases);
+        state.working_sets.record_admission(kind, admitted);
         drop(state);
         Ok(MemoryWorkingSet {
             budget: Self {
@@ -208,10 +270,14 @@ impl Drop for MemoryWorkingSet {
             && let Some(saved) = state.scopes.get_mut(&scope.id)
         {
             let reserved = saved.reserved;
+            let kind = saved.kind;
             saved.active = false;
             saved.reserved = 0;
             state.working_sets.reserved_bytes -= reserved;
-            state.working_sets.active_cases -= 1;
+            match kind {
+                ScopeKind::Case => state.working_sets.active_cases -= 1,
+                ScopeKind::ExternalProcess => state.working_sets.active_processes -= 1,
+            }
             scope.shared.released.notify_all();
         }
     }

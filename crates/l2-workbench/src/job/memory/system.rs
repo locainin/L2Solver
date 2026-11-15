@@ -1,7 +1,7 @@
 //! OS observations kept separate from explicitly charged allocations
 
 use super::{MemoryBudget, MemoryError};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use std::{io, sync::TryLockError, time::Instant};
 
 /// Resident process memory and the containing Linux memory cgroup
@@ -51,7 +51,7 @@ pub struct CgroupMemorySnapshot {
 }
 
 /// Memory-controller events reported by the kernel, without invented per-job attribution
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize)]
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
 pub struct CgroupMemoryEvents {
     /// Charges throttled at memory.high
     pub high: u64,

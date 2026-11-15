@@ -7,6 +7,8 @@ use std::time::Instant;
 
 type TestResult = Result<(), Box<dyn Error + Send + Sync>>;
 
+#[path = "memory/process_working_set.rs"]
+mod process_working_set;
 #[path = "memory/split.rs"]
 mod split;
 #[path = "memory/working_set.rs"]
