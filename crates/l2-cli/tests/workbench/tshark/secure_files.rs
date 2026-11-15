@@ -204,6 +204,21 @@ fn executable_type_permissions() -> Result<(), Box<dyn Error>> {
 }
 
 #[test]
+fn executable_path_flags() -> Result<(), Box<dyn Error>> {
+    use rustix::fs::{OFlags, fcntl_getfl};
+
+    let directory = tempfile::tempdir()?;
+    fs::write(directory.path().join("file"), b"executable")?;
+    symlink("file", directory.path().join("link"))?;
+    let parent = File::open(directory.path())?;
+    let candidate = super::open_path_inode(&parent, OsStr::new("link"))?;
+    assert!(candidate.metadata()?.file_type().is_symlink());
+    assert!(fcntl_getfd(&candidate)?.contains(FdFlags::CLOEXEC));
+    assert!(fcntl_getfl(&candidate)?.contains(OFlags::PATH | OFlags::NOFOLLOW));
+    Ok(())
+}
+
+#[test]
 fn executable_ancestry_rejection() -> Result<(), Box<dyn Error>> {
     let parent = tempfile::tempdir()?;
     let unsafe_directory = parent.path().join("unsafe");

@@ -141,8 +141,7 @@ impl VerifiedExecutable {
             })?;
             let parent = open_trusted_directory(parent)?;
             // Inspect a path-only handle before opening it for reading
-            let flags = OFlags::PATH | OFlags::NOFOLLOW | OFlags::CLOEXEC;
-            let candidate = File::from(fs::openat(&parent, name, flags, Mode::empty())?);
+            let candidate = open_path_inode(&parent, name)?;
             let file = open_verified_inode(&candidate)?;
             Ok(Self { path, file })
         }
@@ -152,6 +151,12 @@ impl VerifiedExecutable {
             Err(unsupported_platform())
         }
     }
+}
+
+#[cfg(target_os = "linux")]
+fn open_path_inode(parent: &File, name: &OsStr) -> io::Result<File> {
+    let flags = OFlags::PATH | OFlags::NOFOLLOW | OFlags::CLOEXEC;
+    Ok(File::from(fs::openat(parent, name, flags, Mode::empty())?))
 }
 
 #[cfg(target_os = "linux")]
