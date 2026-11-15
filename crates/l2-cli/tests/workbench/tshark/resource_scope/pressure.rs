@@ -45,7 +45,9 @@ impl ScopeProbe {
     ) -> Result<Self, Box<dyn std::error::Error>> {
         let memory = NonZeroU64::new(MEMORY_LIMIT).ok_or("zero memory")?;
         let tasks = NonZeroU64::new(TASK_LIMIT).ok_or("zero tasks")?;
-        let resource = ResourceScope::new(memory, 0, tasks, remaining)?;
+        let mut resource = ResourceScope::new(memory, 0, tasks, remaining)?;
+        // Keep the fixture's throttle above its hard cap when exercising OOM
+        resource.limits.memory_high = MEMORY_LIMIT * 2;
         let mut launch = resource.wrap(launch)?;
         let mut gate = launch.scope.take().ok_or("missing scope gate")?;
         gate.claim()?;
@@ -74,6 +76,7 @@ impl ScopeProbe {
         }
         let receipt = probe.gate.receipt().ok_or("missing scope receipt")?;
         assert_eq!(receipt.memory_max_bytes, MEMORY_LIMIT);
+        assert_eq!(receipt.memory_high_bytes, MEMORY_LIMIT * 2);
         assert_eq!(receipt.swap_max_bytes, 0);
         assert_eq!(receipt.tasks_max, TASK_LIMIT);
         Ok(probe)
@@ -120,27 +123,6 @@ impl ScopeProbe {
             }
             thread::sleep(Duration::from_millis(2));
         }
-        Ok(())
-    }
-
-    fn set_high_to_max(&self) -> TestResult {
-        let scope = self.gate.verified.as_ref().ok_or("scope not verified")?;
-        let flags =
-            rustix::fs::OFlags::WRONLY | rustix::fs::OFlags::NOFOLLOW | rustix::fs::OFlags::CLOEXEC;
-        let mut high = fs::File::from(rustix::fs::openat(
-            &scope.directory,
-            "memory.high",
-            flags,
-            rustix::fs::Mode::empty(),
-        )?);
-        // Preserve the hard cap while avoiding a long throttle before the OOM probe
-        high.write_all(MEMORY_LIMIT.to_string().as_bytes())?;
-        assert_eq!(
-            control_text(&scope.directory, "memory.high")?
-                .trim()
-                .parse::<u64>()?,
-            MEMORY_LIMIT
-        );
         Ok(())
     }
 
@@ -232,13 +214,16 @@ fn fixture_guard() -> TestResult {
     let memory = control_text(&directory, "memory.max")?
         .trim()
         .parse::<u64>()?;
+    let high = control_text(&directory, "memory.high")?
+        .trim()
+        .parse::<u64>()?;
     let swap = control_text(&directory, "memory.swap.max")?
         .trim()
         .parse::<u64>()?;
     let tasks = control_text(&directory, "pids.max")?
         .trim()
         .parse::<u64>()?;
-    if memory > MEMORY_LIMIT || swap != 0 || tasks > TASK_LIMIT {
+    if memory != MEMORY_LIMIT || high != MEMORY_LIMIT * 2 || swap != 0 || tasks > TASK_LIMIT {
         return Err("fixture resource controls are too permissive".into());
     }
     if control_text(&directory, "memory.oom.group")?.trim() != "1" {
@@ -332,15 +317,16 @@ fn memory_oom() -> TestResult {
     let temporary = tempfile::tempdir()?;
     let marker = temporary.path().join("oom");
     let mut probe = ScopeProbe::start("oom", &marker)?;
-    probe.set_high_to_max()?;
     probe.release()?;
     let status = match probe.wait(Instant::now() + Duration::from_secs(6)) {
         Ok(status) => status,
         Err(error) => {
             let scope = probe.gate.verified.as_ref().ok_or("scope not verified")?;
             let current = control_text(&scope.directory, "memory.current")?;
+            let high = control_text(&scope.directory, "memory.high")?;
+            let max = control_text(&scope.directory, "memory.max")?;
             let events = control_text(&scope.directory, "memory.events")?;
-            return Err(format!("{error}: memory.current={current:?}, events={events:?}").into());
+            return Err(format!("{error}: memory.current={current:?}, memory.high={high:?}, memory.max={max:?}, events={events:?}").into());
         }
     };
     assert_eq!(status.signal(), Some(libc::SIGKILL));
