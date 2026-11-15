@@ -1106,16 +1106,29 @@ fn stop_group_before_final_scan(
     validate_proc_view().map_err(ProcessError::Read)?;
     let cleanup_deadline = Instant::now() + GROUP_STOP_WAIT;
     let deadline = policy.deadline.min(cleanup_deadline);
-    match wait_for_group_stop(Path::new("/proc"), child.id(), deadline, policy.job) {
-        Err(ProcessError::TimedOut) if cleanup_deadline < policy.deadline => {
+    group_stop_result(
+        wait_for_group_stop(Path::new("/proc"), child.id(), deadline, policy.job),
+        cleanup_deadline,
+        policy.deadline,
+    )?;
+    check_group_stop_budget(policy.deadline, policy.job)
+}
+
+#[cfg(all(target_os = "linux", not(target_env = "uclibc")))]
+fn group_stop_result(
+    result: Result<(), ProcessError>,
+    cleanup_deadline: Instant,
+    operation_deadline: Instant,
+) -> Result<(), ProcessError> {
+    match result {
+        Err(ProcessError::TimedOut) if cleanup_deadline < operation_deadline => {
             Err(ProcessError::Read(io::Error::new(
                 io::ErrorKind::TimedOut,
                 "TShark process group did not stop",
             )))
         }
         result => result,
-    }?;
-    check_group_stop_budget(policy.deadline, policy.job)
+    }
 }
 
 #[cfg(all(target_os = "linux", not(target_env = "uclibc")))]

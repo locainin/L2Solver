@@ -47,6 +47,35 @@ fn privilege_status_clean() -> Result<(), Box<dyn Error>> {
 }
 
 #[test]
+fn privileged_caller() -> Result<(), Box<dyn Error>> {
+    const PROBE: &str = "L2_PRIVILEGED_CALLER_PROBE";
+    if std::env::var_os(PROBE).is_some() {
+        assert_eq!(rustix::process::geteuid().as_raw(), 0);
+        let error = super::check_privileges()
+            .err()
+            .ok_or("privileged caller was accepted")?;
+        assert_eq!(error.kind(), std::io::ErrorKind::PermissionDenied);
+        return Ok(());
+    }
+    // Namespace root has no additional authority over the host
+    let result = Command::new("unshare")
+        .args(["--user", "--map-root-user", "--"])
+        .arg(std::env::current_exe()?)
+        .args([
+            "--exact",
+            "workbench::tshark::sandbox::tests::privileged_caller",
+        ])
+        .env(PROBE, "1")
+        .output()?;
+    assert!(
+        result.status.success(),
+        "{}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    Ok(())
+}
+
+#[test]
 fn privilege_status_rejections() {
     for status in [
         CLEAN_STATUS.replace("Uid:\t1000\t1000\t1000\t1000", "Uid:\t0\t0\t0\t0"),
@@ -435,5 +464,118 @@ fn sandbox_detached_descendants() -> Result<(), Box<dyn Error>> {
         );
         std::thread::sleep(Duration::from_millis(20));
     }
+    Ok(())
+}
+
+#[cfg(all(
+    target_endian = "little",
+    any(target_arch = "x86_64", target_arch = "aarch64")
+))]
+fn filter_action(program: &[u8], syscall: u32, flags: u32) -> Result<u32, Box<dyn Error>> {
+    if !program.len().is_multiple_of(8) {
+        return Err("incomplete BPF instruction".into());
+    }
+    #[cfg(target_arch = "x86_64")]
+    let architecture = 0xc000_0000 | u32::from(libc::EM_X86_64);
+    #[cfg(target_arch = "aarch64")]
+    let architecture = 0xc000_0000 | u32::from(libc::EM_AARCH64);
+
+    let mut accumulator = 0;
+    let mut position = 0;
+    loop {
+        let instruction: [u8; 8] = program
+            .as_chunks::<8>()
+            .0
+            .get(position)
+            .copied()
+            .ok_or("BPF program did not return")?;
+        let [
+            code_lo,
+            code_hi,
+            yes,
+            no,
+            value_0,
+            value_1,
+            value_2,
+            value_3,
+        ] = instruction;
+        let code = u32::from(u16::from_ne_bytes([code_lo, code_hi]));
+        let value = u32::from_ne_bytes([value_0, value_1, value_2, value_3]);
+        position += 1;
+        match code {
+            code if code == libc::BPF_LD | libc::BPF_W | libc::BPF_ABS => {
+                // Load the fields defined by Linux's seccomp_data layout
+                accumulator = match usize::try_from(value)? {
+                    offset if offset == std::mem::offset_of!(libc::seccomp_data, nr) => syscall,
+                    offset if offset == std::mem::offset_of!(libc::seccomp_data, arch) => {
+                        architecture
+                    }
+                    offset if offset == std::mem::offset_of!(libc::seccomp_data, args) => flags,
+                    _ => return Err("unexpected seccomp data offset".into()),
+                };
+            }
+            code if code == libc::BPF_JMP | libc::BPF_JEQ | libc::BPF_K => {
+                position += usize::from(if accumulator == value { yes } else { no });
+            }
+            code if code == libc::BPF_JMP | libc::BPF_JGE | libc::BPF_K => {
+                position += usize::from(if accumulator >= value { yes } else { no });
+            }
+            code if code == libc::BPF_JMP | libc::BPF_JSET | libc::BPF_K => {
+                position += usize::from(if accumulator & value != 0 { yes } else { no });
+            }
+            code if code == libc::BPF_RET | libc::BPF_K => return Ok(value),
+            _ => return Err("unexpected BPF instruction".into()),
+        }
+    }
+}
+
+#[cfg(all(
+    target_endian = "little",
+    any(target_arch = "x86_64", target_arch = "aarch64")
+))]
+#[test]
+fn seccomp_clone_namespace_flags() -> Result<(), Box<dyn Error>> {
+    let program = super::seccomp_filter()?;
+    let clone = u32::try_from(libc::SYS_clone)?;
+    let normal = u32::try_from(
+        libc::CLONE_VM
+            | libc::CLONE_FS
+            | libc::CLONE_FILES
+            | libc::CLONE_SIGHAND
+            | libc::CLONE_THREAD,
+    )?;
+    let denied = libc::SECCOMP_RET_ERRNO | u32::try_from(libc::EPERM)?;
+
+    assert_eq!(filter_action(&program, clone, 0)?, libc::SECCOMP_RET_ALLOW);
+    assert_eq!(
+        filter_action(&program, clone, normal)?,
+        libc::SECCOMP_RET_ALLOW
+    );
+    for (name, flag) in [
+        ("CLONE_NEWNS", libc::CLONE_NEWNS),
+        ("CLONE_NEWCGROUP", libc::CLONE_NEWCGROUP),
+        ("CLONE_NEWUTS", libc::CLONE_NEWUTS),
+        ("CLONE_NEWIPC", libc::CLONE_NEWIPC),
+        ("CLONE_NEWUSER", libc::CLONE_NEWUSER),
+        ("CLONE_NEWPID", libc::CLONE_NEWPID),
+        ("CLONE_NEWNET", libc::CLONE_NEWNET),
+    ] {
+        let flag = u32::try_from(flag)?;
+        assert_eq!(filter_action(&program, clone, flag)?, denied, "{name}");
+        assert_eq!(
+            filter_action(&program, clone, normal | flag)?,
+            denied,
+            "{name}"
+        );
+    }
+    // clone3 falls back to clone, and network syscalls stay blocked
+    assert_eq!(
+        filter_action(&program, u32::try_from(libc::SYS_clone3)?, 0)?,
+        libc::SECCOMP_RET_ERRNO | u32::try_from(libc::ENOSYS)?
+    );
+    assert_eq!(
+        filter_action(&program, u32::try_from(libc::SYS_socket)?, 0)?,
+        denied
+    );
     Ok(())
 }

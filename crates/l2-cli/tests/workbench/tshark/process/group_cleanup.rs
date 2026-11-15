@@ -1,14 +1,60 @@
 use super::super::{
-    ProcessError, process_group_has_live_members, validate_proc_mount, wait_for_group_stop,
+    ProcessError, process_group_has_live_members, validate_proc_mount, validate_proc_view,
+    wait_for_group_stop,
 };
 use l2_workbench::job::Job;
 use std::{
     error::Error,
     fs, io,
     path::Path,
+    process::Command,
     time::{Duration, Instant},
 };
 
+#[test]
+fn group_stop_errors() {
+    let deadline = std::time::Instant::now();
+    for (cleanup, process_timeout) in [
+        (deadline, false),
+        (deadline + Duration::from_secs(1), true),
+        (deadline + Duration::from_secs(2), true),
+    ] {
+        let result = super::super::group_stop_result(
+            Err(ProcessError::TimedOut),
+            cleanup,
+            deadline + Duration::from_secs(1),
+        );
+        if process_timeout {
+            assert!(matches!(result, Err(ProcessError::TimedOut)));
+        } else {
+            assert!(
+                matches!(result, Err(ProcessError::Read(error)) if error.kind() == io::ErrorKind::TimedOut)
+            );
+        }
+    }
+    assert!(super::super::group_stop_result(Ok(()), deadline, deadline).is_ok());
+    assert!(matches!(
+        super::super::group_stop_result(Err(ProcessError::Cancelled), deadline, deadline),
+        Err(ProcessError::Cancelled)
+    ));
+}
+
+#[test]
+fn process_stat_read_error() -> Result<(), Box<dyn Error>> {
+    let directory = tempfile::tempdir()?;
+    std::fs::create_dir_all(directory.path().join("123/stat"))?;
+    let result = super::super::process_group_has_live_members(
+        directory.path(),
+        123,
+        Instant::now() + Duration::from_secs(5),
+        None,
+    );
+    assert!(
+        matches!(result, Err(ProcessError::Read(error)) if error.kind() == io::ErrorKind::IsADirectory),
+        "a failed stat read was treated as an absent process"
+    );
+    Ok(())
+}
 fn write_stat(
     root: &Path,
     pid: u32,
@@ -88,6 +134,53 @@ fn visible_proc_mount() {
     assert!(validate_proc_mount(hidden).is_err());
     assert!(validate_proc_mount(other_filesystem).is_err());
     assert!(validate_proc_mount("").is_err());
+}
+
+#[test]
+fn proc_view_pid_namespace_mismatch() -> Result<(), Box<dyn Error>> {
+    const CHILD: &str = "L2_TEST_PROC_VIEW_NAMESPACE_CHILD";
+    if std::env::var_os(CHILD).is_some() {
+        // The inherited proc mount still shows the parent PID namespace
+        let proc_pid = fs::read_link("/proc/self")?;
+        let current_pid = std::process::id().to_string();
+        assert_ne!(proc_pid, Path::new(&current_pid));
+        let result = validate_proc_view();
+        assert!(result.is_err(), "a mismatched proc view was accepted");
+        let error = result.err().ok_or("proc view error missing")?;
+        assert_eq!(error.to_string(), "procfs uses a different PID namespace");
+        return Ok(());
+    }
+
+    let name = format!(
+        "{}::proc_view_pid_namespace_mismatch",
+        module_path!()
+            .split_once("::")
+            .ok_or("test module missing")?
+            .1
+    );
+    // Keep the parent's proc mount while entering a new PID namespace
+    let output = Command::new("unshare")
+        .args(["--user", "--map-root-user", "--pid", "--fork"])
+        .arg(std::env::current_exe()?)
+        .args(["--exact", &name, "--nocapture"])
+        .env(CHILD, "1")
+        .output()?;
+    assert!(
+        output.status.success(),
+        "namespace test failed: {} {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&output.stdout).contains("1 passed; 0 failed"),
+        "namespace child did not run the test"
+    );
+    Ok(())
+}
+
+#[test]
+fn proc_view_current_pid_namespace() -> io::Result<()> {
+    validate_proc_view()
 }
 
 #[test]

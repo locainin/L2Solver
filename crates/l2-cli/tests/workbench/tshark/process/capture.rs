@@ -54,18 +54,22 @@ fn capture_maximum_usize() -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
-struct FailureReader;
+struct FailureReader(bool);
 
 impl Read for FailureReader {
     fn read(&mut self, _buffer: &mut [u8]) -> io::Result<usize> {
-        Err(io::Error::from(io::ErrorKind::BrokenPipe))
+        if std::mem::replace(&mut self.0, true) {
+            Ok(0)
+        } else {
+            Err(io::Error::from(io::ErrorKind::BrokenPipe))
+        }
     }
 }
 
 #[test]
 fn capture_read_failure() {
     assert!(matches!(
-        capture(FailureReader, 8),
+        capture(FailureReader(false), 8),
         Err(ProcessError::Read(error)) if error.kind() == io::ErrorKind::BrokenPipe
     ));
 }
