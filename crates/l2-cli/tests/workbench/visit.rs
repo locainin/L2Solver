@@ -191,6 +191,57 @@ fn legacy_collection_summary_bundle() -> Result<(), Box<dyn Error>> {
 }
 
 #[test]
+fn collection_declaration_mismatch() -> Result<(), Box<dyn Error>> {
+    for (field, replacement) in [
+        (
+            "/details/source_id",
+            json!(format!("sha256:{}", "0".repeat(64))),
+        ),
+        ("/details/summary/sections", json!(42)),
+    ] {
+        let directory = tempfile::tempdir()?;
+        let (bundle, mut manifest) = create_bundle(directory.path(), 1)?;
+        let page_path = bundle.join("pages/000001.json");
+        let mut page: Value = serde_json::from_slice(&fs::read(&page_path)?)?;
+        let summary = page
+            .get_mut("nodes")
+            .and_then(Value::as_array_mut)
+            .and_then(|nodes| {
+                nodes
+                    .iter_mut()
+                    .find(|node| node.get("kind") == Some(&json!("capture_collection_summary")))
+            })
+            .ok_or("missing collection summary")?;
+        let original = summary.pointer_mut(field).ok_or("missing summary field")?;
+        assert_ne!(
+            *original, replacement,
+            "fixture already has the changed value"
+        );
+        *original = replacement;
+
+        // Update the digest so collection validation checks the edited declaration
+        let document = serde_json::to_vec(&page)?;
+        fs::write(page_path, &document)?;
+        set_field(
+            first_page_mut(&mut manifest)?,
+            "sha256",
+            json!(sha256(&document)),
+        )?;
+        write_manifest(&bundle, &manifest)?;
+
+        let output = run_query(&bundle)?;
+        assert_eq!(output.status.code(), Some(1), "{field}");
+        assert!(output.stdout.is_empty(), "{field}");
+        let stderr = String::from_utf8(output.stderr)?;
+        assert!(
+            stderr.contains("bundle page collection declaration disagrees with the manifest"),
+            "{field}: {stderr}"
+        );
+    }
+    Ok(())
+}
+
+#[test]
 fn bundle_visiting_length_captured_packets() -> Result<(), Box<dyn Error>> {
     let directory = tempfile::tempdir()?;
     let mut bytes = empty_capture();

@@ -8,6 +8,7 @@ fn static_case_limitations_are_counted_once_and_actual_omissions_keep_flow_conte
     let mut spool = LimitationSpool::new(temporary.path())?;
     let static_message = "Capture order and header addresses do not establish ownership, delivery, causality, or malicious intent";
     let actual_omission = "1 capture record was omitted after the retention budget; later absence and event chains are unresolved";
+    let source_context = "Source sha256:0000000000000000000000000000000000000000000000000000000000000000 acquisition quality is unverified (authority: absent); packet timestamps are unavailable for this Case";
 
     spool.push_case_limitation(CaseLimitationOrigin::Flow(4), static_message)?;
     spool.push_case_limitation(CaseLimitationOrigin::Flow(7), static_message)?;
@@ -17,6 +18,8 @@ fn static_case_limitations_are_counted_once_and_actual_omissions_keep_flow_conte
     )?;
     spool.push_case_limitation(CaseLimitationOrigin::Flow(4), actual_omission)?;
     spool.push_case_limitation(CaseLimitationOrigin::Flow(7), actual_omission)?;
+    spool.push_case_limitation(CaseLimitationOrigin::Flow(4), source_context)?;
+    spool.push_case_limitation(CaseLimitationOrigin::Flow(7), source_context)?;
 
     let mut output = File::create(temporary.path().join("limitations.txt"))?;
     spool.write_to(&mut output)?;
@@ -34,6 +37,14 @@ fn static_case_limitations_are_counted_once_and_actual_omissions_keep_flow_conte
     );
     assert!(
         report.contains(&format!("- Flow 7: {actual_omission}")),
+        "{report}"
+    );
+    assert!(
+        report.contains(&format!("- Flow 4: {source_context}")),
+        "{report}"
+    );
+    assert!(
+        report.contains(&format!("- Flow 7: {source_context}")),
         "{report}"
     );
     Ok(())

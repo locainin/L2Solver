@@ -68,12 +68,26 @@ fn run(path: &Path, args: &[&str]) -> Result<std::process::Output, Box<dyn Error
         .output()?)
 }
 
+fn assert_text_drop_counts(text: &str, expected: [&str; 3]) {
+    let fields = [
+        "enhanced_packet_packets_dropped=",
+        "interface_statistics_interface_dropped=",
+        "interface_statistics_os_dropped=",
+    ];
+    for (field, value) in fields.into_iter().zip(expected) {
+        let actual = text
+            .split_whitespace()
+            .find_map(|item| item.strip_prefix(field));
+        assert_eq!(actual, Some(value), "unexpected {field} in {text}");
+    }
+}
+
 #[test]
 fn capture_loss_propagation() -> Result<(), Box<dyn Error>> {
-    for (epb, interface, operating_system, lower_bound) in [
-        (Some(9), None, None, 9),
-        (None, Some(11), Some(4), 15),
-        (Some(9), Some(11), Some(4), 15),
+    for (epb, interface, operating_system, lower_bound, expected_counts) in [
+        (Some(9), None, None, 9, ["9", "unknown", "unknown"]),
+        (None, Some(11), Some(4), 15, ["unknown", "11", "4"]),
+        (Some(9), Some(11), Some(4), 15, ["9", "11", "4"]),
     ] {
         let directory = tempfile::tempdir()?;
         let path = directory.path().join("loss.pcapng");
@@ -83,6 +97,7 @@ fn capture_loss_propagation() -> Result<(), Box<dyn Error>> {
         let text = String::from_utf8(output.stdout)?;
         assert!(text.contains("authority=source_declared"));
         assert!(text.contains("Capture inspection: incomplete"));
+        assert_text_drop_counts(&text, expected_counts);
 
         let output = run(&path, &["assess", "--format", "json"])?;
         assert_eq!(
@@ -145,16 +160,20 @@ fn capture_loss_propagation() -> Result<(), Box<dyn Error>> {
 
 #[test]
 fn zero_loss_receipts() -> Result<(), Box<dyn Error>> {
-    for (epb, interface, os) in [
-        (None, None, None),
-        (Some(0), None, None),
-        (None, Some(0), None),
-        (None, None, Some(0)),
-        (Some(0), Some(0), Some(0)),
+    for (epb, interface, os, expected_counts) in [
+        (None, None, None, ["unknown", "unknown", "unknown"]),
+        (Some(0), None, None, ["0", "unknown", "unknown"]),
+        (None, Some(0), None, ["unknown", "0", "unknown"]),
+        (None, None, Some(0), ["unknown", "unknown", "0"]),
+        (Some(0), Some(0), Some(0), ["0", "0", "0"]),
     ] {
         let directory = tempfile::tempdir()?;
         let path = directory.path().join("no-loss.pcapng");
         std::fs::write(&path, capture(epb, interface, os))?;
+        let output = run(&path, &["inspect"])?;
+        assert_eq!(output.status.code(), Some(0));
+        let text = String::from_utf8(output.stdout)?;
+        assert_text_drop_counts(&text, expected_counts);
         let output = run(&path, &["assess", "--format", "json"])?;
         assert_eq!(
             output.status.code(),

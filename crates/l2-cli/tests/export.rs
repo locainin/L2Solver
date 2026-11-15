@@ -2883,7 +2883,7 @@ fn packet_block_drop_count_makes_full_source_export_partial() -> Result<(), Box<
     let capture = temporary.path().join("packet-block-drops.pcapng");
     let destination = temporary.path().join("output");
     let source = capture_with_packet_block_drops(&capture_with_http_body(BODY)?, 7)?;
-    fs::write(&capture, source)?;
+    fs::write(&capture, &source)?;
 
     let output = export(&capture, Some(&destination))?;
 
@@ -2901,6 +2901,20 @@ fn packet_block_drop_count_makes_full_source_export_partial() -> Result<(), Box<
         limitations
             .contains("Obsolete Packet Blocks report 7 packets dropped between captured packets")
     );
+    let source_id = format!("sha256:{}", l2_workbench::sha256(&source));
+    let quality = format!(
+        "Source {source_id} acquisition quality is unverified (authority: source_declared); analysis is scoped to captured bytes"
+    );
+    assert!(
+        limitations.contains(&format!(
+            "Case limitation applies to 1 flow Cases and 0 cohort Cases: {quality}"
+        )),
+        "{limitations}"
+    );
+    assert!(
+        limitations.contains(&format!("- Flow 1: Source {source_id} reports 7 packets dropped between packets in obsolete Packet Blocks; analysis is scoped to the packets present")),
+        "{limitations}"
+    );
     let manifest: serde_json::Value =
         serde_json::from_slice(&fs::read(destination.join("manifest.json"))?)?;
     assert_eq!(
@@ -2914,6 +2928,20 @@ fn packet_block_drop_count_makes_full_source_export_partial() -> Result<(), Box<
             .pointer("/full_source_coverage/source/collection_summary/packet_block_packets_dropped")
             .and_then(serde_json::Value::as_u64),
         Some(7)
+    );
+    let components = manifest
+        .get("incomplete_components")
+        .and_then(serde_json::Value::as_array)
+        .ok_or("missing incomplete export components")?;
+    assert!(
+        components.iter().any(|component| {
+            component.get("component") == Some(&serde_json::json!("source_collection"))
+                && component.get("reason")
+                    == Some(&serde_json::json!(
+                        "7 packets reported dropped between obsolete Packet Blocks"
+                    ))
+        }),
+        "{components:?}"
     );
     Ok(())
 }
