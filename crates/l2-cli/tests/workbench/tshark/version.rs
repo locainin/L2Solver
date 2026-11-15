@@ -24,13 +24,14 @@ fn affected_version_metadata_gate() -> Result<(), Box<dyn std::error::Error>> {
     )?;
     fs::set_permissions(&executable, fs::Permissions::from_mode(0o700))?;
     let prepared = prepare_capture_from(
-        CapturePreparation {
+        &CapturePreparation {
             capture,
             executable,
             keylog: None,
             timeout: std::time::Duration::from_secs(5),
             timeout_seconds: 5,
-            input_maximum: 1024,
+            input_maximum: Some(1024),
+            object_budget: None,
             metadata_maximum: 1024,
             output_maximum: 1024,
             diagnostic_maximum: 1024,

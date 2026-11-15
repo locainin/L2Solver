@@ -5,6 +5,7 @@ use super::{
     inspection::inspect_tool,
     preparation::{prepare_capture, verify_prepared_capture},
     receipt::build_report,
+    snapshot::HashControl,
 };
 use crate::arguments::TsharkOptions;
 use std::{error::Error, io::Write};
@@ -22,11 +23,15 @@ pub(in crate::workbench) fn run(
     if u64::try_from(decoded.packets.len())? != counted.receipt.count {
         return Err("TShark decoded packet count differs from the source packet count".into());
     }
-    verify_prepared_capture(&mut prepared)?;
+    verify_prepared_capture(&mut prepared, None)?;
     verify_executable_unchanged(
         &mut prepared.executable.file,
         prepared.executable_bytes,
         &prepared.executable_sha256,
+        HashControl {
+            deadline: prepared.deadline,
+            job: None,
+        },
     )?;
     let report = build_report(prepared, inspection, counted, decoded);
     serde_json::to_writer(output, &report)?;

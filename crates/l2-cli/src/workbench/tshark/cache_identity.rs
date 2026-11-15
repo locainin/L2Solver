@@ -2,7 +2,7 @@
 
 use super::{
     executable::resolve_executable_in_search_path,
-    process, sandbox,
+    process, resources, sandbox,
     secure_files::{VerifiedExecutable, Workspace},
     version,
 };
@@ -13,7 +13,7 @@ use std::{
     ffi::{OsStr, OsString},
     fs, io,
     path::Path,
-    time::{Duration, UNIX_EPOCH},
+    time::{Duration, Instant, UNIX_EPOCH},
 };
 
 #[cfg(unix)]
@@ -21,7 +21,7 @@ use std::os::unix::ffi::OsStrExt;
 #[cfg(windows)]
 use std::os::windows::ffi::OsStrExt;
 
-const ARGUMENTS_EPOCH: u32 = 2;
+const ARGUMENTS_EPOCH: u32 = 3;
 const VERSION_ARGUMENTS: [&str; 2] = ["-n", "-v"];
 const VERSION_PROBE_TIMEOUT: Duration = Duration::from_secs(2);
 const VERSION_STDOUT_MAXIMUM: usize = 4 * 1024;
@@ -30,7 +30,32 @@ const VERSION_STDERR_MAXIMUM: usize = 4 * 1024;
 /// Return a cache identity even when `TShark` is absent or its version is unavailable
 pub fn identity(job: Option<&Job>) -> Value {
     let search_path = env::var_os("PATH");
-    identity_for_path(search_path.as_deref(), job)
+    let mut identity = identity_for_path(search_path.as_deref(), job);
+    let configuration =
+        resources::operator_configuration(Some(super::ObjectExportBudget::DEFAULT), env::var_os);
+    let requests = match configuration {
+        Ok(configuration) => configuration_identity(configuration),
+        Err(error) => json!({"error": error.to_string()}),
+    };
+    let Some(fields) = identity.as_object_mut() else {
+        return json!({"arguments_epoch": ARGUMENTS_EPOCH, "resource_requests": requests, "error": "invalid TShark identity"});
+    };
+    fields.insert("resource_requests".to_owned(), requests);
+    identity
+}
+
+fn configuration_identity(configuration: resources::OperatorConfiguration) -> Value {
+    json!({
+        "memory_bytes": configuration.memory_bytes,
+        "swap_bytes": configuration.swap_bytes,
+        "tasks": configuration.tasks,
+        "temporary_bytes": configuration.temporary_bytes,
+        "tmp_bytes": configuration.tmp_bytes,
+        "shm_bytes": configuration.shm_bytes,
+        "object_bytes": configuration.objects.map(|request| request.budget.temporary_bytes),
+        "object_files": configuration.objects.map(|request| request.budget.temporary_files),
+        "object_explicit": configuration.objects.map(|request| request.mode == l2_workbench::job::ObjectLimitMode::Explicit),
+    })
 }
 
 fn identity_for_path(search_path: Option<&OsStr>, job: Option<&Job>) -> Value {
@@ -148,59 +173,79 @@ fn executable_metadata(path: &Path, metadata: &fs::Metadata) -> Value {
 }
 
 fn version_identity(executable: &VerifiedExecutable, job: Option<&Job>) -> Value {
+    let Some(deadline) = Instant::now().checked_add(VERSION_PROBE_TIMEOUT) else {
+        return unavailable("timed_out");
+    };
     if job.is_some_and(Job::is_cancelled) {
         return json!({"status": "cancelled"});
     }
-    let workspace = match Workspace::new(None) {
+    let Ok(parent_bytes) = u64::try_from(VERSION_STDOUT_MAXIMUM + VERSION_STDERR_MAXIMUM) else {
+        return unavailable("resource_plan_unavailable");
+    };
+    let ceiling = match resources::job_ceiling(job, parent_bytes) {
+        Ok(ceiling) => ceiling,
+        Err(error) => {
+            return json!({"status":"unavailable", "reason":"resource_plan_unavailable", "error":error.to_string()});
+        }
+    };
+    let configuration = match resources::operator_configuration(None, env::var_os) {
+        Ok(configuration) => configuration,
+        Err(error) => {
+            return json!({"status":"unavailable", "reason":"resource_plan_unavailable", "error":error.to_string()});
+        }
+    };
+    let (plan, parent) = match resources::resolve(
+        None,
+        l2_workbench::job::InputSize {
+            capture_bytes: Some(0),
+            keylog_bytes: 0,
+        },
+        None,
+        configuration,
+        VERSION_PROBE_TIMEOUT,
+        ceiling,
+        parent_bytes,
+    ) {
+        Ok(plan) => plan,
+        Err(error) => {
+            return json!({"status":"unavailable", "reason":"resource_plan_unavailable", "error":error.to_string()});
+        }
+    };
+    let _reservation = match resources::reserve(job, &plan, parent_bytes) {
+        Ok(reservation) => reservation,
+        Err(error) => {
+            return json!({"status":"unavailable", "reason":"resource_plan_unavailable", "error":error.to_string()});
+        }
+    };
+    let workspace = match Workspace::in_parent(parent) {
         Ok(workspace) => workspace,
         Err(error) => return unavailable_error("workspace_unavailable", &error),
     };
-    let sandbox = match sandbox::Sandbox::new(&workspace, executable, None, None) {
+    let sandbox = match sandbox::Sandbox::new(&workspace, executable, None, None, &plan, deadline) {
         Ok(sandbox) => sandbox,
         Err(error) => return unavailable_error("sandbox_unavailable", &error),
     };
     let arguments = VERSION_ARGUMENTS.map(OsString::from);
-    let launch = match sandbox.command(&arguments, &[], None) {
+    let mut launch = match sandbox.command(&arguments, &[], None) {
         Ok(launch) => launch,
         Err(error) => return unavailable_error("sandbox_unavailable", &error),
     };
     // Launch owns the descriptors used by the sandbox until the process exits
-    let output = match process::run_with_job(
-        &launch.executable,
-        &launch.arguments,
-        &launch.environment,
-        VERSION_PROBE_TIMEOUT,
+    let output = match process::run_launch(
+        &mut launch,
+        deadline.saturating_duration_since(Instant::now()),
         VERSION_STDOUT_MAXIMUM,
         VERSION_STDERR_MAXIMUM,
         job,
     ) {
         Ok(output) => output,
-        Err(process::ProcessError::Cancelled) => {
-            return json!({"status": "cancelled"});
-        }
-        Err(process::ProcessError::TimedOut) => {
-            return unavailable("timed_out");
-        }
-        Err(process::ProcessError::OutputLimit) => {
-            return unavailable("output_limit");
-        }
-        Err(process::ProcessError::Spawn(error)) => {
-            return unavailable_error("spawn_failed", &error);
-        }
-        Err(process::ProcessError::WorkerSpawn { source, .. }) => {
-            return unavailable_error("worker_spawn_failed", &source);
-        }
-        Err(process::ProcessError::Read(error)) => {
-            return unavailable_error("output_read_failed", &error);
-        }
-        Err(
-            process::ProcessError::ObjectExportLimit(_)
-            | process::ProcessError::ObjectExportTimeout(_),
-        ) => {
-            return unavailable("unexpected_process_result");
-        }
+        Err(error) => return process_unavailable(&error),
     };
 
+    version_output(&output)
+}
+
+fn version_output(output: &process::Output) -> Value {
     if !output.status.success() {
         return json!({
             "status": "unavailable",
@@ -219,6 +264,33 @@ fn version_identity(executable: &VerifiedExecutable, job: Option<&Job>) -> Value
         unavailable("unsupported_version")
     } else {
         json!({"status": "available", "public_version": version})
+    }
+}
+
+fn process_unavailable(error: &process::ProcessError) -> Value {
+    use process::ProcessError;
+    match error {
+        ProcessError::Cancelled => json!({"status":"cancelled"}),
+        ProcessError::TimedOut => unavailable("timed_out"),
+        ProcessError::OutputLimit => unavailable("output_limit"),
+        ProcessError::Spawn(error) => unavailable_error("spawn_failed", error),
+        ProcessError::WorkerSpawn { source, .. } => {
+            unavailable_error("worker_spawn_failed", source)
+        }
+        ProcessError::Read(error) => unavailable_error("output_read_failed", error),
+        ProcessError::Containment(error) => unavailable_error("containment_unavailable", error),
+        ProcessError::MemoryLimit(receipt) => {
+            json!({"status":"unavailable", "reason":"memory_limit", "containment":receipt})
+        }
+        ProcessError::TaskLimit(receipt) => {
+            json!({"status":"unavailable", "reason":"task_limit", "containment":receipt})
+        }
+        ProcessError::ScopeCleanup { .. } => {
+            json!({"status":"unavailable", "reason":"containment_cleanup_failed", "error":error.to_string()})
+        }
+        ProcessError::ObjectExportLimit(_) | ProcessError::ObjectExportTimeout(_) => {
+            unavailable("unexpected_process_result")
+        }
     }
 }
 

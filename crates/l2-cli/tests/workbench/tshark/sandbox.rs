@@ -1,15 +1,18 @@
 use super::{BRIDGE, Sandbox, check_status};
 use crate::workbench::tshark::{
-    process,
+    ObjectExportBudget,
+    process::{self, StreamingPolicy},
+    resources::test_plan,
     secure_files::{VerifiedExecutable, Workspace},
 };
 use std::{
     error::Error,
     ffi::{OsStr, OsString},
-    fs::{self, File},
-    io::Write,
+    fs,
+    io::{self, Write},
     net::TcpListener,
     os::unix::{fs::PermissionsExt, net::UnixStream},
+    path::Path,
     process::Command,
     time::{Duration, Instant},
 };
@@ -103,6 +106,13 @@ fn sandbox_probe() -> Result<(), Box<dyn Error>> {
         return Ok(());
     }
 
+    assert_eq!(fs::read_link("/proc/self/fd/1")?, Path::new("/dev/null"));
+    assert_eq!(
+        fs::symlink_metadata("/proc/self/fd/9")
+            .err()
+            .map(|error| error.kind()),
+        Some(io::ErrorKind::NotFound)
+    );
     let status = fs::read_to_string("/proc/self/status")?;
     for (field, expected) in [
         ("Uid", "65534\t65534\t65534\t65534"),
@@ -126,7 +136,12 @@ fn sandbox_probe() -> Result<(), Box<dyn Error>> {
     assert!(fs::write("/work/forbidden", b"changed").is_err());
     // The pre-sandbox workspace descriptor must not bypass the read-only mount
     assert!(fs::write("/proc/self/fd/4/capture.bin", b"changed").is_err());
-    fs::write("/output/writable", b"allowed")?;
+    for path in ["/forbidden", "/tool/forbidden", "/dev/forbidden"] {
+        assert!(fs::write(path, b"changed").is_err(), "writable: {path}");
+    }
+    fs::write("/tmp/writable", b"x")?;
+    fs::write("/dev/shm/writable", b"x")?;
+    fs::write("/output/writable", b"x")?;
     let host_file = std::env::var_os("L2_SANDBOX_TEST_HOST_FILE").ok_or("host file missing")?;
     assert!(fs::write(host_file, b"escape").is_err());
     let tcp_error = TcpListener::bind("127.0.0.1:0")
@@ -146,11 +161,15 @@ fn sandbox_filesystem_network_credentials() -> Result<(), Box<dyn Error>> {
     capture.write_all(b"capture bytes")?;
     let mut keylog = workspace.create_file(OsStr::new("tls-keylog.txt"))?;
     keylog.write_all(b"keylog bytes")?;
-    let output_path = workspace.path().join("results");
-    fs::create_dir(&output_path)?;
-    let output = File::open(&output_path)?;
     let executable = VerifiedExecutable::open(&std::env::current_exe()?)?;
-    let sandbox = Sandbox::new(&workspace, &executable, Some(&capture), Some(&keylog))?;
+    let sandbox = Sandbox::new(
+        &workspace,
+        &executable,
+        Some(&capture),
+        Some(&keylog),
+        &test_plan()?,
+        Instant::now() + Duration::from_secs(10),
+    )?;
     let name = format!(
         "{}::sandbox_probe",
         module_path!()
@@ -171,22 +190,20 @@ fn sandbox_filesystem_network_credentials() -> Result<(), Box<dyn Error>> {
             host_file.as_os_str().to_owned(),
         ),
     ];
-    let launch = sandbox.command(&arguments, &environment, Some(&output))?;
-    let result = process::run(
-        &launch.executable,
-        &launch.arguments,
-        &launch.environment,
-        Duration::from_secs(10),
-        64 * 1024,
-        64 * 1024,
-    )?;
+    let mut launch = sandbox.command(&arguments, &environment, Some(&[]))?;
+    let result = process::run_streaming_launch(&mut launch, streaming_policy(workspace.path()))?;
     assert!(
         result.status.success(),
-        "stdout: {}\nstderr: {}",
-        String::from_utf8_lossy(&result.stdout),
+        "stderr: {}",
         String::from_utf8_lossy(&result.stderr)
     );
-    assert_eq!(fs::read(output_path.join("writable"))?, b"allowed");
+    let output = launch
+        .output_storage
+        .as_ref()
+        .ok_or("output mount missing")?
+        .path()?;
+    assert_eq!(fs::read(output.join("writable"))?, b"x");
+    assert!(!workspace.path().join("results").exists());
     assert!(!host_file.exists());
     assert_eq!(
         fs::read(workspace.path().join("capture.bin"))?,
@@ -207,21 +224,21 @@ fn sandbox_argument_integrity() -> Result<(), Box<dyn Error>> {
     fs::write(&script, "#!/bin/sh\nprintf '<%s>\\n' \"$@\"\n")?;
     fs::set_permissions(&script, fs::Permissions::from_mode(0o700))?;
     let executable = VerifiedExecutable::open(&script)?;
-    let sandbox = Sandbox::new(&workspace, &executable, None, None)?;
+    let sandbox = Sandbox::new(
+        &workspace,
+        &executable,
+        None,
+        None,
+        &test_plan()?,
+        Instant::now() + Duration::from_secs(10),
+    )?;
     let arguments = [
         OsString::from("with spaces"),
         OsString::from("$(touch /tmp/never)"),
         OsString::from("; literal"),
     ];
-    let launch = sandbox.command(&arguments, &[], None)?;
-    let result = process::run(
-        &launch.executable,
-        &launch.arguments,
-        &launch.environment,
-        Duration::from_secs(10),
-        4096,
-        4096,
-    )?;
+    let mut launch = sandbox.command(&arguments, &[], None)?;
+    let result = process::run_launch(&mut launch, Duration::from_secs(10), 4096, 4096, None)?;
     assert!(
         result.status.success(),
         "{}",
@@ -245,10 +262,15 @@ fn sandbox_workspace_path_translation() -> Result<(), Box<dyn Error>> {
     )?;
     fs::set_permissions(&script, fs::Permissions::from_mode(0o700))?;
     let executable = VerifiedExecutable::open(&script)?;
-    let sandbox = Sandbox::new(&workspace, &executable, None, None)?;
+    let sandbox = Sandbox::new(
+        &workspace,
+        &executable,
+        None,
+        None,
+        &test_plan()?,
+        Instant::now() + Duration::from_secs(10),
+    )?;
     let output_path = workspace.path().join("export-objects");
-    fs::create_dir(&output_path)?;
-    let output = File::open(&output_path)?;
     let mut keylog = OsString::from("tls.keylog_file:");
     keylog.push(workspace.path().join("tls-keylog.txt"));
     let mut object = OsString::from("http,");
@@ -271,22 +293,22 @@ fn sandbox_workspace_path_translation() -> Result<(), Box<dyn Error>> {
             workspace.path().as_os_str().to_owned(),
         ),
     ];
-    let launch = sandbox.command(&arguments, &environment, Some(&output))?;
-    let result = process::run(
-        &launch.executable,
-        &launch.arguments,
-        &launch.environment,
-        Duration::from_secs(10),
-        4096,
-        4096,
-    )?;
+    let output_launch = sandbox.command(&arguments, &environment, Some(&["http".to_owned()]))?;
+    assert!(
+        output_launch
+            .arguments
+            .iter()
+            .any(|argument| argument == "http,/output/http")
+    );
+    let mut launch = sandbox.command(&arguments, &environment, None)?;
+    let result = process::run_launch(&mut launch, Duration::from_secs(10), 4096, 4096, None)?;
     assert!(
         result.status.success(),
         "{}",
         String::from_utf8_lossy(&result.stderr)
     );
     let expected = format!(
-        "</work/home>\n</tmp>\n</work/capture.bin>\n<tls.keylog_file:/work/tls-keylog.txt>\n<http,/output/http>\n<{}>\n",
+        "</work/home>\n</tmp>\n</work/capture.bin>\n<tls.keylog_file:/work/tls-keylog.txt>\n<http,/work/export-objects/http>\n<{}>\n",
         similar_prefix.to_string_lossy()
     );
     assert_eq!(result.stdout, expected.as_bytes());
@@ -303,7 +325,14 @@ fn sandbox_snapshot_inode_identity() -> Result<(), Box<dyn Error>> {
     fs::write(&script, "#!/bin/sh\ncat /work/capture.bin\n")?;
     fs::set_permissions(&script, fs::Permissions::from_mode(0o700))?;
     let executable = VerifiedExecutable::open(&script)?;
-    let sandbox = Sandbox::new(&workspace, &executable, Some(&capture), None)?;
+    let sandbox = Sandbox::new(
+        &workspace,
+        &executable,
+        Some(&capture),
+        None,
+        &test_plan()?,
+        Instant::now() + Duration::from_secs(10),
+    )?;
     drop(capture);
     drop(executable);
     fs::rename(
@@ -314,15 +343,8 @@ fn sandbox_snapshot_inode_identity() -> Result<(), Box<dyn Error>> {
     fs::rename(&script, parent.path().join("original-fixture"))?;
     fs::write(&script, "#!/bin/sh\nprintf replacement\n")?;
     fs::set_permissions(&script, fs::Permissions::from_mode(0o700))?;
-    let launch = sandbox.command(&[], &[], None)?;
-    let result = process::run(
-        &launch.executable,
-        &launch.arguments,
-        &launch.environment,
-        Duration::from_secs(10),
-        4096,
-        4096,
-    )?;
+    let mut launch = sandbox.command(&[], &[], None)?;
+    let result = process::run_launch(&mut launch, Duration::from_secs(10), 4096, 4096, None)?;
     assert!(
         result.status.success(),
         "{}",
@@ -345,16 +367,16 @@ fn sandbox_inherited_descriptor() -> Result<(), Box<dyn Error>> {
         )?;
         fs::set_permissions(&script, fs::Permissions::from_mode(0o700))?;
         let executable = VerifiedExecutable::open(&script)?;
-        let sandbox = Sandbox::new(&workspace, &executable, None, None)?;
-        let launch = sandbox.command(&[], &[], None)?;
-        let result = process::run(
-            &launch.executable,
-            &launch.arguments,
-            &launch.environment,
-            Duration::from_secs(10),
-            4096,
-            4096,
+        let sandbox = Sandbox::new(
+            &workspace,
+            &executable,
+            None,
+            None,
+            &test_plan()?,
+            Instant::now() + Duration::from_secs(10),
         )?;
+        let mut launch = sandbox.command(&[], &[], None)?;
+        let result = process::run_launch(&mut launch, Duration::from_secs(10), 4096, 4096, None)?;
         assert!(
             result.status.success(),
             "{}",
@@ -401,16 +423,16 @@ fn sandbox_unused_descriptors() -> Result<(), Box<dyn Error>> {
     )?;
     fs::set_permissions(&script, fs::Permissions::from_mode(0o700))?;
     let executable = VerifiedExecutable::open(&script)?;
-    let sandbox = Sandbox::new(&workspace, &executable, None, None)?;
-    let launch = sandbox.command(&[], &[], None)?;
-    let result = process::run(
-        &launch.executable,
-        &launch.arguments,
-        &launch.environment,
-        Duration::from_secs(10),
-        4096,
-        4096,
+    let sandbox = Sandbox::new(
+        &workspace,
+        &executable,
+        None,
+        None,
+        &test_plan()?,
+        Instant::now() + Duration::from_secs(10),
     )?;
+    let mut launch = sandbox.command(&[], &[], None)?;
+    let result = process::run_launch(&mut launch, Duration::from_secs(10), 4096, 4096, None)?;
     assert!(
         result.status.success(),
         "{}",
@@ -434,19 +456,21 @@ fn sandbox_detached_descendants() -> Result<(), Box<dyn Error>> {
     )?;
     fs::set_permissions(&script, fs::Permissions::from_mode(0o700))?;
     let executable = VerifiedExecutable::open(&script)?;
-    let sandbox = Sandbox::new(&workspace, &executable, None, None)?;
-    let output_path = workspace.path().join("results");
-    fs::create_dir(&output_path)?;
-    let output = File::open(&output_path)?;
-    let launch = sandbox.command(&[], &[], Some(&output))?;
-    let result = process::run(
-        &launch.executable,
-        &launch.arguments,
-        &launch.environment,
-        Duration::from_secs(10),
-        4096,
-        4096,
+    let sandbox = Sandbox::new(
+        &workspace,
+        &executable,
+        None,
+        None,
+        &test_plan()?,
+        Instant::now() + Duration::from_secs(10),
     )?;
+    let mut launch = sandbox.command(&[], &[], Some(&[]))?;
+    let result = process::run_streaming_launch(&mut launch, streaming_policy(workspace.path()))?;
+    let output_path = launch
+        .output_storage
+        .as_ref()
+        .ok_or("output mount missing")?
+        .path()?;
     assert!(
         result.status.success(),
         "{}",
@@ -465,6 +489,20 @@ fn sandbox_detached_descendants() -> Result<(), Box<dyn Error>> {
         std::thread::sleep(Duration::from_millis(20));
     }
     Ok(())
+}
+
+fn streaming_policy(object_root: &std::path::Path) -> StreamingPolicy<'_> {
+    StreamingPolicy {
+        stderr_maximum: 64 * 1024,
+        deadline: Instant::now() + Duration::from_secs(10),
+        object_root,
+        protocol_directory_count: 0,
+        object_budget: ObjectExportBudget {
+            temporary_bytes: 1,
+            temporary_files: 1,
+        },
+        job: None,
+    }
 }
 
 #[cfg(all(

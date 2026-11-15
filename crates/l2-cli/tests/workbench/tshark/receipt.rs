@@ -26,7 +26,7 @@ fn options(capture: &Path, executable: &Path) -> TsharkOptions {
         tls_keylog: None,
         output: None,
         timeout_seconds: 30,
-        max_input_mib: 1,
+        max_input_mib: Some(1),
         max_metadata_mib: 1,
         max_output_mib: 16,
         max_diagnostics_mib: 1,

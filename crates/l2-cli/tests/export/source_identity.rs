@@ -37,6 +37,7 @@ fn mismatch_omits_tshark_objects() -> Result<(), Box<dyn std::error::Error>> {
     let missing_directory = temporary.path().join("must-not-be-read");
     let mut artifacts = ArtifactCollection::new(temporary.path(), ArtifactLimits::default())?;
     let objects = ExportObjectSet {
+        containment: None,
         temporary_directory: crate::workbench::Workspace::new(None)?,
         directories: vec![(String::from("http"), missing_directory)],
         source_identity: identity,
@@ -92,6 +93,7 @@ fn partial_tshark_export_preserves_verified_objects_and_exact_limit_receipt()
         "`TShark` object export stopped after observing temporary bytes above its budget of 8 (observed 15; tree-entry limits stop at the first extra entry, while byte and file totals may overshoot between scans)",
     );
     let objects = ExportObjectSet {
+        containment: None,
         temporary_directory: crate::workbench::Workspace::new(None)?,
         directories: vec![(String::from("http"), object_directory)],
         source_identity: SourceIdentity {

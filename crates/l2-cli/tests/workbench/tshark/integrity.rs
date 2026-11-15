@@ -6,7 +6,10 @@ use super::super::{
         verify_prepared_capture,
     },
     secure_files::Workspace,
-    snapshot::{ensure_before_deadline, snapshot_with_clock, verify_source_unchanged},
+    snapshot::{
+        HashControl, ensure_before_deadline, snapshot_retained, snapshot_with_clock,
+        verify_source_unchanged,
+    },
 };
 use crate::arguments::TsharkOptions;
 use std::{
@@ -24,12 +27,54 @@ fn executable(path: &Path, contents: &[u8]) -> io::Result<()> {
     fs::set_permissions(path, Permissions::from_mode(0o700))
 }
 
+fn hash_control() -> HashControl<'static> {
+    HashControl {
+        deadline: Instant::now() + Duration::from_secs(10),
+        job: None,
+    }
+}
+
 #[test]
 fn expired_snapshot_deadline() {
     assert!(matches!(
         ensure_before_deadline(Instant::now()),
         Err(super::super::process::ProcessError::TimedOut)
     ));
+}
+
+#[test]
+fn sparse_snapshot() -> Result<(), Box<dyn Error>> {
+    use std::io::Write;
+    use std::os::unix::fs::MetadataExt;
+
+    let parent = tempfile::tempdir()?;
+    let source = parent.path().join("capture");
+    let mut file = File::create_new(&source)?;
+    file.write_all(b"capture")?;
+    let length = 4 * 1024 * 1024;
+    file.set_len(length)?;
+    let workspace = Workspace::new(Some(parent.path()))?;
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let snapshot = snapshot_with_clock(
+        &source,
+        &workspace,
+        "capture.bin",
+        length,
+        "capture",
+        deadline,
+        Instant::now,
+    )?;
+    let expected = fs::read(&source)?;
+    assert_eq!(fs::read(&snapshot.path)?, expected);
+    assert_eq!(snapshot.identity.sha256, l2_workbench::sha256(&expected));
+    assert_eq!(snapshot.identity.length, length);
+    if file.metadata()?.blocks() * 512 < length / 2 {
+        assert!(
+            snapshot.file.metadata()?.blocks() * 512 < length / 2,
+            "private snapshot expanded sparse bytes"
+        );
+    }
+    Ok(())
 }
 
 #[test]
@@ -47,7 +92,7 @@ fn source_object_identity() -> Result<(), Box<dyn Error>> {
     for (path_bytes, held_bytes) in [(b"modified", original), (original, b"modified")] {
         fs::write(&source, path_bytes)?;
         fs::write(&held_path, held_bytes)?;
-        let error = verify_source_unchanged(&mut held, &source, &digest, 8)
+        let error = verify_source_unchanged(&mut held, &source, &digest, 8, hash_control())
             .err()
             .ok_or("changed source object was accepted")?;
         assert_eq!(error.kind(), io::ErrorKind::InvalidData);
@@ -63,11 +108,11 @@ fn executable_integrity_same_length() -> Result<(), Box<dyn Error>> {
     let mut file = File::open(&path)?;
     let digest = l2_workbench::sha256(b"original");
 
-    verify_executable_unchanged(&mut file, 8, &digest)?;
+    verify_executable_unchanged(&mut file, 8, &digest, hash_control())?;
     // Rewriting in place keeps the held descriptor and byte count unchanged
     fs::write(&path, b"changed!")?;
     assert_eq!(
-        verify_executable_unchanged(&mut file, 8, &digest)
+        verify_executable_unchanged(&mut file, 8, &digest, hash_control())
             .err()
             .map(|error| error.kind()),
         Some(io::ErrorKind::InvalidData)
@@ -137,6 +182,51 @@ fn snapshot_input_budget() -> Result<(), Box<dyn Error>> {
 }
 
 #[test]
+fn retained_snapshot_uses_held_inode() -> Result<(), Box<dyn Error>> {
+    let directory = tempfile::tempdir()?;
+    let source = directory.path().join("source");
+    let moved = directory.path().join("old-source");
+    let original = b"original";
+    fs::write(&source, original)?;
+    let mut held = File::open(&source)?;
+    fs::rename(&source, &moved)?;
+    fs::write(&source, b"replaced")?;
+    let identity = l2_workbench::tshark::SourceIdentity {
+        label: "capture".into(),
+        length: 8,
+        sha256: l2_workbench::sha256(original),
+    };
+    let workspace = Workspace::new(Some(directory.path()))?;
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let snapshot = snapshot_retained(&mut held, &identity, &workspace, deadline, None)?;
+    fs::write(&moved, b"modified")?;
+    assert_eq!(fs::read(&snapshot.path)?, original);
+    assert_eq!(snapshot.identity.sha256, identity.sha256);
+    Ok(())
+}
+
+#[test]
+fn retained_snapshot_rejects_changed_bytes() -> Result<(), Box<dyn Error>> {
+    let directory = tempfile::tempdir()?;
+    let source = directory.path().join("source");
+    fs::write(&source, b"original")?;
+    let mut held = File::open(&source)?;
+    let identity = l2_workbench::tshark::SourceIdentity {
+        label: "capture".into(),
+        length: 8,
+        sha256: l2_workbench::sha256(b"original"),
+    };
+    fs::write(&source, b"modified")?;
+    let workspace = Workspace::new(Some(directory.path()))?;
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let error = snapshot_retained(&mut held, &identity, &workspace, deadline, None)
+        .err()
+        .ok_or("changed retained bytes were accepted")?;
+    assert!(error.to_string().contains("retained source"));
+    Ok(())
+}
+
+#[test]
 fn prepared_input_integrity() -> Result<(), Box<dyn Error>> {
     let directory = tempfile::tempdir()?;
     let capture = directory.path().join("capture");
@@ -151,13 +241,14 @@ fn prepared_input_integrity() -> Result<(), Box<dyn Error>> {
         keylog: Some(keylog.clone()),
         timeout: Duration::from_secs(15),
         timeout_seconds: 15,
-        input_maximum: 1024,
+        input_maximum: Some(1024),
+        object_budget: None,
         metadata_maximum: 1024,
         output_maximum: 1024,
         diagnostic_maximum: 1024,
     };
     let mut prepared =
-        prepare_capture_from_at(preparation, Some(directory.path()), Instant::now())?;
+        prepare_capture_from_at(&preparation, Some(directory.path()), Instant::now())?;
     let snapshot = prepared.source.path.clone();
     let keylog_snapshot = prepared
         .keylog
@@ -165,7 +256,7 @@ fn prepared_input_integrity() -> Result<(), Box<dyn Error>> {
         .ok_or("keylog snapshot missing")?
         .path
         .clone();
-    verify_prepared_capture(&mut prepared)?;
+    verify_prepared_capture(&mut prepared, None)?;
 
     // Keep lengths fixed so each check must compare the digest
     for path in [&capture, &keylog, &snapshot, &keylog_snapshot] {
@@ -173,7 +264,7 @@ fn prepared_input_integrity() -> Result<(), Box<dyn Error>> {
         let mut changed = original.clone();
         *changed.first_mut().ok_or("empty test input")? ^= 1;
         fs::write(path, &changed)?;
-        let result = verify_prepared_capture(&mut prepared);
+        let result = verify_prepared_capture(&mut prepared, None);
         fs::write(path, &original)?;
         assert_eq!(
             result.err().map(|error| error.kind()),
@@ -181,7 +272,7 @@ fn prepared_input_integrity() -> Result<(), Box<dyn Error>> {
             "{}",
             path.display()
         );
-        verify_prepared_capture(&mut prepared)?;
+        verify_prepared_capture(&mut prepared, None)?;
     }
     Ok(())
 }
@@ -199,7 +290,7 @@ fn mib_budget_units() -> Result<(), Box<dyn Error>> {
         tls_keylog: None,
         output: None,
         timeout_seconds: 15,
-        max_input_mib: 1,
+        max_input_mib: Some(1),
         max_metadata_mib: 2,
         max_output_mib: 3,
         max_diagnostics_mib: 4,
@@ -219,11 +310,30 @@ fn export_output_budgets() -> Result<(), Box<dyn Error>> {
     const CHILD: &str = "L2_TSHARK_EXPORT_BUDGET_CHILD";
     if let Some(directory) = std::env::var_os(CHILD) {
         let directory = Path::new(&directory);
-        let prepared = prepare_export_capture(&directory.join("capture"), directory)?;
+        let capture = directory.join("capture");
+        let mut source = File::open(&capture)?;
+        let identity = l2_workbench::tshark::SourceIdentity {
+            label: "capture".into(),
+            length: 7,
+            sha256: l2_workbench::sha256(b"capture"),
+        };
+        let memory = l2_workbench::job::MemoryBudget::new(512 * 1024 * 1024);
+        let job = l2_workbench::job::Job::with_memory_budget("export", &memory);
+        let prepared = prepare_export_capture(
+            &capture,
+            &mut source,
+            &identity,
+            directory,
+            super::super::ObjectExportBudget::DEFAULT,
+            Some(&job),
+        )?;
+        assert_eq!(memory.snapshot()?.working_sets.active_processes, 1);
         let output = run_phase(&prepared, &[], prepared.metadata_maximum)?;
         assert!(output.status.success());
         assert_eq!(output.stdout.len(), 4096);
         assert_eq!(output.stderr.len(), 4096);
+        drop(prepared);
+        assert_eq!(memory.snapshot()?.working_sets.active_processes, 0);
         return Ok(());
     }
 

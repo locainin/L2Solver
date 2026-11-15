@@ -4,7 +4,35 @@ use std::{
     error::Error,
     fs,
     path::{Path, PathBuf},
+    time::{Duration, Instant},
 };
+
+fn deadline() -> Instant {
+    Instant::now() + Duration::from_secs(5)
+}
+
+fn clean_scope() -> l2_workbench::tshark::ScopeReceipt {
+    use l2_workbench::tshark::{ScopeReceipt, ScopeUsage};
+
+    ScopeReceipt {
+        memory_max_bytes: 4,
+        memory_high_bytes: 3,
+        swap_max_bytes: 0,
+        tasks_max: 2,
+        effective_memory_max_bytes: 4,
+        effective_memory_high_bytes: 3,
+        effective_swap_max_bytes: 0,
+        effective_tasks_max: 2,
+        usage: Some(ScopeUsage {
+            memory_peak_bytes: None,
+            tasks_peak: None,
+            memory_events: Some(l2_workbench::job::CgroupMemoryEvents::default()),
+            tasks_max_events: Some(0),
+            observed_after_stop: true,
+            observed_while_frozen: false,
+        }),
+    }
+}
 
 #[test]
 fn inventory_interruption() {
@@ -89,12 +117,16 @@ fn export_completion_invariants() -> Result<(), Box<dyn Error>> {
             object_usage: super::ObjectExportUsage::default(),
             objects,
             unsafe_entries: mode == "unsafe",
+            scope: None,
         };
         let result = super::resolve_object_export(
             Ok(output),
             &object_root,
             &temporary.path().join("verified-objects"),
             &[(String::from("http"), protocol_root)],
+            deadline(),
+            None,
+            Some(&clean_scope()),
         )?;
 
         if mode == "complete" {
@@ -123,6 +155,23 @@ fn upstream_inventory() -> Result<(), Box<dyn Error>> {
             "dicom", "ftp-data", "http", "imf", "smb", "tftp", "x509af", "zipfile"
         ]
     );
+    Ok(())
+}
+
+#[test]
+fn large_inventory_order_and_deduplication() -> Result<(), Box<dyn Error>> {
+    use std::fmt::Write as _;
+
+    let mut inventory = String::from("Available export object types:\n");
+    for number in 0..12_000 {
+        writeln!(inventory, "protocol{number:05}")?;
+    }
+    inventory.push_str("protocol00000\nprotocol06000\nprotocol11999\n");
+    let types = super::parse_types(&inventory)?;
+    assert_eq!(types.len(), 12_000);
+    assert_eq!(types.first().map(String::as_str), Some("protocol00000"));
+    assert_eq!(types.get(6_000).map(String::as_str), Some("protocol06000"));
+    assert_eq!(types.last().map(String::as_str), Some("protocol11999"));
     Ok(())
 }
 
@@ -231,6 +280,9 @@ fn run_fake_export(
         &object_root,
         &temporary.path().join("verified-objects"),
         &[(String::from("http"), protocol_root)],
+        deadline(),
+        None,
+        Some(&clean_scope()),
     )?;
     Ok((temporary, object_root, result))
 }
@@ -242,6 +294,9 @@ fn cancelled_object_export_preserves_the_job_cancellation_type() -> Result<(), B
         Path::new("unused-object-root"),
         Path::new("unused-partial-root"),
         &[],
+        deadline(),
+        None,
+        None,
     )
     .err()
     .ok_or("cancelled object export unexpectedly succeeded")?;
@@ -285,7 +340,14 @@ fn partial_snapshot_keeps_only_unchanged_regular_files() -> Result<(), Box<dyn E
     symlink(&complete_path, &replaced_path)?;
 
     let allowed = [(String::from("http"), protocol_root)];
-    let snapshot = retain_stable_objects(&object_root, &snapshot_root, &stable_objects, &allowed)?;
+    let snapshot = retain_stable_objects(
+        &object_root,
+        &snapshot_root,
+        &stable_objects,
+        &allowed,
+        deadline(),
+        None,
+    )?;
 
     assert!(snapshot.omitted_unstable);
     assert_eq!(snapshot.directories.len(), 1);
@@ -303,6 +365,274 @@ fn partial_snapshot_keeps_only_unchanged_regular_files() -> Result<(), Box<dyn E
     assert_eq!(fs::read_link(&replaced_path)?, complete_path);
     assert_eq!(fs::read_dir(snapshot_directory)?.count(), 1);
     Ok(())
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn snapshot_copies_across_filesystems() -> Result<(), Box<dyn Error>> {
+    use std::os::unix::fs::MetadataExt;
+
+    let temporary_objects = tempfile::tempdir_in("/dev/shm")?;
+    let temporary_snapshot = tempfile::tempdir_in(".")?;
+    assert_ne!(
+        temporary_objects.path().metadata()?.dev(),
+        temporary_snapshot.path().metadata()?.dev(),
+        "the test requires separate filesystems"
+    );
+    let object_root = temporary_objects.path();
+    let protocol_root = object_root.join("http");
+    fs::create_dir(&protocol_root)?;
+    let object = protocol_root.join("object.bin");
+    fs::write(&object, b"tmpfs object")?;
+    let stable = stable_object(object_root, &object)?;
+    let snapshot = retain_stable_objects(
+        object_root,
+        &temporary_snapshot.path().join("objects"),
+        &[stable],
+        &[(String::from("http"), protocol_root)],
+        deadline(),
+        None,
+    )?;
+
+    assert!(!snapshot.omitted_unstable);
+    let (_, directory) = snapshot.directories.first().ok_or("snapshot missing")?;
+    assert_eq!(fs::read(directory.join("object.bin"))?, b"tmpfs object");
+    assert_eq!(fs::read(object)?, b"tmpfs object");
+    Ok(())
+}
+
+#[cfg(unix)]
+#[test]
+fn snapshot_deadline_and_cancellation() -> Result<(), Box<dyn Error>> {
+    let temporary = tempfile::tempdir()?;
+    let object_root = temporary.path().join("objects");
+    let protocol_root = object_root.join("http");
+    fs::create_dir_all(&protocol_root)?;
+    let object = protocol_root.join("object.bin");
+    fs::write(&object, b"stable object")?;
+    let stable = stable_object(&object_root, &object)?;
+    let allowed = [(String::from("http"), protocol_root)];
+    let expired = retain_stable_objects(
+        &object_root,
+        &temporary.path().join("expired"),
+        std::slice::from_ref(&stable),
+        &allowed,
+        Instant::now(),
+        None,
+    )?;
+    assert!(expired.deadline_reached);
+    assert_eq!(expired.directories, Vec::new());
+    assert_eq!(fs::read(&object)?, b"stable object");
+
+    let job = l2_workbench::job::Job::new("cancelled object copy");
+    job.request_cancel();
+    let error = retain_stable_objects(
+        &object_root,
+        &temporary.path().join("cancelled"),
+        &[stable],
+        &allowed,
+        deadline(),
+        Some(&job),
+    )
+    .err()
+    .ok_or("cancelled snapshot unexpectedly succeeded")?;
+    assert_eq!(
+        error.downcast_ref::<l2_workbench::job::JobError>(),
+        Some(&l2_workbench::job::JobError::Cancelled)
+    );
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn snapshot_disk_full() -> Result<(), Box<dyn Error>> {
+    let mut source = fs::File::open("/dev/zero")?;
+    let mut destination = fs::OpenOptions::new().write(true).open("/dev/full")?;
+    let error = super::copy_object_data(&mut source, &mut destination, 1, deadline(), None)
+        .err()
+        .ok_or("full destination unexpectedly accepted output")?;
+    assert_eq!(
+        error
+            .downcast_ref::<std::io::Error>()
+            .and_then(std::io::Error::raw_os_error),
+        Some(libc::ENOSPC)
+    );
+    Ok(())
+}
+
+#[cfg(unix)]
+#[test]
+fn expired_snapshot_is_partial() -> Result<(), Box<dyn Error>> {
+    use std::os::unix::process::ExitStatusExt;
+
+    let temporary = tempfile::tempdir()?;
+    let root = temporary.path().join("objects");
+    let protocol = root.join("http");
+    fs::create_dir_all(&protocol)?;
+    let object = protocol.join("object.bin");
+    fs::write(&object, b"finished")?;
+    let output = super::process::StreamOutput {
+        stderr: Vec::new(),
+        stderr_truncated: false,
+        status: std::process::ExitStatus::from_raw(0),
+        object_usage: super::ObjectExportUsage::default(),
+        objects: vec![stable_object(&root, &object)?],
+        unsafe_entries: false,
+        scope: None,
+    };
+    let result = super::resolve_object_export(
+        Ok(output),
+        &root,
+        &temporary.path().join("snapshot"),
+        &[(String::from("http"), protocol)],
+        Instant::now(),
+        None,
+        Some(&clean_scope()),
+    )?;
+    assert_eq!(result.status, super::ObjectExportStatus::Partial);
+    assert_eq!(result.directories, Vec::new());
+    assert_eq!(
+        result.issues,
+        ["TShark object snapshot stopped at its time budget; remaining objects were omitted"]
+    );
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn scope_resource_limits() -> Result<(), Box<dyn Error>> {
+    use l2_workbench::job::CgroupMemoryEvents;
+    for (name, events, task_events, partial) in [
+        (
+            "memory pressure",
+            CgroupMemoryEvents {
+                high: 1,
+                max: 1,
+                ..CgroupMemoryEvents::default()
+            },
+            0,
+            false,
+        ),
+        (
+            "out of memory",
+            CgroupMemoryEvents {
+                oom: 1,
+                ..CgroupMemoryEvents::default()
+            },
+            0,
+            true,
+        ),
+        (
+            "OOM kill",
+            CgroupMemoryEvents {
+                oom_kill: 1,
+                ..CgroupMemoryEvents::default()
+            },
+            0,
+            true,
+        ),
+        ("task limit", CgroupMemoryEvents::default(), 1, true),
+    ] {
+        let mut receipt = clean_scope();
+        let usage = receipt.usage.as_mut().ok_or("scope usage missing")?;
+        usage.memory_events = Some(events);
+        usage.tasks_max_events = Some(task_events);
+        let (status, issues) = scope_result(Some(receipt))?;
+        let expected = if partial {
+            super::ObjectExportStatus::Partial
+        } else {
+            super::ObjectExportStatus::Complete
+        };
+        assert_eq!(status, expected, "{name}");
+        assert_eq!(issues.is_empty(), !partial, "{name}");
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn scope_counter_availability() -> Result<(), Box<dyn Error>> {
+    let mut missing_memory = clean_scope();
+    missing_memory
+        .usage
+        .as_mut()
+        .ok_or("usage missing")?
+        .memory_events = None;
+    let mut missing_tasks = clean_scope();
+    missing_tasks
+        .usage
+        .as_mut()
+        .ok_or("usage missing")?
+        .tasks_max_events = None;
+    let mut before_stop = clean_scope();
+    before_stop
+        .usage
+        .as_mut()
+        .ok_or("usage missing")?
+        .observed_after_stop = false;
+    for receipt in [
+        None,
+        Some(missing_memory),
+        Some(missing_tasks),
+        Some(before_stop),
+    ] {
+        let (status, issues) = scope_result(receipt)?;
+        assert_eq!(status, super::ObjectExportStatus::Partial);
+        assert!(
+            issues
+                .iter()
+                .any(|issue| issue.contains("resource event counters unavailable"))
+        );
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn frozen_scope_counters() -> Result<(), Box<dyn Error>> {
+    let mut receipt = clean_scope();
+    let usage = receipt.usage.as_mut().ok_or("scope usage missing")?;
+    usage.observed_after_stop = false;
+    usage.observed_while_frozen = true;
+    let (status, issues) = scope_result(Some(receipt))?;
+    assert_eq!(status, super::ObjectExportStatus::Complete);
+    assert_eq!(issues, Vec::<String>::new());
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn scope_result(
+    receipt: Option<l2_workbench::tshark::ScopeReceipt>,
+) -> Result<(super::ObjectExportStatus, Vec<String>), Box<dyn Error>> {
+    use std::os::unix::process::ExitStatusExt;
+
+    let temporary = tempfile::tempdir()?;
+    let root = temporary.path().join("objects");
+    let protocol = root.join("http");
+    fs::create_dir_all(&protocol)?;
+    let object = protocol.join("object.bin");
+    fs::write(&object, b"finished")?;
+    let output = super::process::StreamOutput {
+        stderr: Vec::new(),
+        stderr_truncated: false,
+        status: std::process::ExitStatus::from_raw(0),
+        object_usage: super::ObjectExportUsage::default(),
+        objects: vec![stable_object(&root, &object)?],
+        unsafe_entries: false,
+        scope: receipt,
+    };
+    let result = super::resolve_object_export(
+        Ok(output),
+        &root,
+        &temporary.path().join("snapshot"),
+        &[(String::from("http"), protocol)],
+        deadline(),
+        None,
+        receipt.as_ref(),
+    )?;
+    let (_, directory) = result.directories.first().ok_or("snapshot missing")?;
+    assert_eq!(fs::read(directory.join("object.bin"))?, b"finished");
+    Ok((result.status, result.issues))
 }
 
 #[cfg(unix)]
@@ -337,6 +667,7 @@ impl StopCause {
                         object_usage: usage,
                         objects: vec![stable],
                         unsafe_entries: false,
+                        scope: None,
                     }),
                     format!("TShark object export failed with exit status {status}: export denied"),
                 )
@@ -402,6 +733,9 @@ fn partial_export_receipt() -> Result<(), Box<dyn Error>> {
             &object_root,
             &snapshot_root,
             &[(String::from("http"), protocol_root.clone())],
+            deadline(),
+            None,
+            Some(&clean_scope()),
         )?;
 
         assert_eq!(
@@ -432,7 +766,11 @@ fn partial_export_receipt() -> Result<(), Box<dyn Error>> {
             b"unfinished object",
             "{stop:?}"
         );
-        assert!(!protocol_root.join("stable.bin").exists(), "{stop:?}");
+        assert_eq!(
+            fs::read(protocol_root.join("stable.bin"))?,
+            b"stable object",
+            "{stop:?}"
+        );
     }
     Ok(())
 }

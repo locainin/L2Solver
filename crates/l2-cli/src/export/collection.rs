@@ -114,12 +114,12 @@ fn collect_export_inner(
     let coverage = collect_flow_cases(&indexed, options, &mut collection, context, &pool, staging)?;
     let (tshark, tshark_error) = collect_tshark_and_finish(
         &options.capture,
+        &indexed,
         staging,
         &coverage.source,
         &mut collection.artifacts,
         phases,
-        context.job,
-        context.memory,
+        context,
     )?;
     let CaseCollection {
         artifacts,
@@ -141,13 +141,14 @@ fn collect_export_inner(
 
 fn collect_tshark_and_finish(
     capture: &Path,
+    indexed: &workbench::full_source::IndexedSource,
     staging: &Path,
     source: &workbench::full_source::SourceCoverage,
     artifacts: &mut ArtifactCollection,
     phases: CollectionPhases<'_>,
-    job: Option<&l2_workbench::job::Job>,
-    memory: Option<&MemoryBudget>,
+    context: &RecoveryContext<'_>,
 ) -> Result<(tshark_objects::Collection, Option<String>), Box<dyn Error>> {
+    let job = context.job;
     if let Some(job) = job {
         job.set_current(
             Phase::NativeExtraction,
@@ -156,12 +157,12 @@ fn collect_tshark_and_finish(
     }
     let tshark_result = collect_tshark_objects(
         capture,
+        indexed,
         staging,
         source,
         artifacts,
         TSHARK_OBJECT_BUDGET,
-        job,
-        memory,
+        context,
     );
     let phase_result = phases.finish(match &tshark_result {
         Ok(_) => l2_workbench::job::PhaseOutcome::Completed,
@@ -477,27 +478,21 @@ fn record_case_evidence(
 
 fn collect_tshark_objects(
     capture: &Path,
+    indexed: &workbench::full_source::IndexedSource,
     staging: &Path,
     source: &workbench::full_source::SourceCoverage,
     artifacts: &mut ArtifactCollection,
     budget: workbench::ObjectExportBudget,
-    job: Option<&l2_workbench::job::Job>,
-    memory: Option<&MemoryBudget>,
+    context: &RecoveryContext<'_>,
 ) -> Result<(tshark_objects::Collection, Option<String>), Box<dyn Error>> {
+    let job = context.job;
     if let Some(job) = job {
         job.check_cancelled()?;
     }
-    if capture == Path::new("-") {
-        return Ok((
-            tshark_objects::Collection::default(),
-            Some(String::from(
-                "TShark export omitted for standard input because full-source ingest consumed the source and it cannot be reopened safely",
-            )),
-        ));
-    }
-    match workbench::export_tshark_objects_with_job(capture, staging, budget, job) {
+    match workbench::export_tshark_objects_with_job(capture, indexed, staging, budget, job) {
         Ok(objects) => {
-            let result = collect_matching_tshark_snapshot(source, &objects, artifacts, memory)?;
+            let result =
+                collect_matching_tshark_snapshot(source, &objects, artifacts, context.memory)?;
             if let Some(job) = job {
                 job.check_cancelled()?;
             }
@@ -533,6 +528,7 @@ pub(super) fn collect_matching_tshark_snapshot(
     collection.export_status = Some(objects.status);
     collection.export_budget = Some(objects.budget);
     collection.export_usage = Some(objects.usage);
+    collection.containment = objects.containment;
     collection.issues.extend(objects.issues.iter().cloned());
     let mismatch = (!identity_matches).then(|| {
         String::from(

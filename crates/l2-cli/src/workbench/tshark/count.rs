@@ -8,6 +8,7 @@ use l2_workbench::sha256;
 use std::{error::Error, ffi::OsString};
 
 pub(super) struct CaptureCount {
+    pub(super) containment: Option<l2_workbench::tshark::ScopeReceipt>,
     pub(super) arguments: Vec<OsString>,
     pub(super) stderr: Vec<u8>,
     pub(super) receipt: PacketCountReceipt,
@@ -34,6 +35,7 @@ pub(super) fn capture(prepared: &PreparedCapture) -> Result<CaptureCount, Box<dy
         output_sha256: sha256(&output.stdout),
     };
     Ok(CaptureCount {
+        containment: output.scope,
         arguments,
         // The output hash and count retain the evidence without keeping another large buffer
         stderr: output.stderr,

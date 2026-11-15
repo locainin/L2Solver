@@ -772,6 +772,30 @@ fn tshark_objects_use_safe_names() -> Result<(), Box<dyn Error>> {
     assert!(summary.contains("TShark objects exported: 1"));
     assert!(summary.contains("TShark packet provenance is not reported"));
     assert!(!summary.contains("SHA-256:"));
+    let manifest: serde_json::Value =
+        serde_json::from_slice(&fs::read(destination.join("manifest.json"))?)?;
+    assert_eq!(
+        manifest
+            .pointer("/tshark/status")
+            .and_then(serde_json::Value::as_str),
+        Some("complete")
+    );
+    assert_eq!(
+        manifest
+            .pointer("/tshark/containment/usage/observed_while_frozen")
+            .and_then(serde_json::Value::as_bool),
+        Some(true)
+    );
+    assert!(
+        manifest
+            .pointer("/tshark/containment/usage/memory_events")
+            .is_some_and(serde_json::Value::is_object)
+    );
+    assert!(
+        manifest
+            .pointer("/tshark/containment/usage/tasks_max_events")
+            .is_some_and(serde_json::Value::is_u64)
+    );
     Ok(())
 }
 
@@ -1993,7 +2017,7 @@ fn assert_partial_cohort_coverage(manifest: &serde_json::Value) -> Result<(), Bo
 }
 
 #[test]
-fn stdin_reports_tshark_omission() -> Result<(), Box<dyn Error>> {
+fn stdin_reports_missing_tshark() -> Result<(), Box<dyn Error>> {
     let temporary = tempfile::tempdir()?;
     let capture = capture_with_http_body(BODY)?;
     for (label, flags, expected_status) in [
@@ -2027,13 +2051,66 @@ fn stdin_reports_tshark_omission() -> Result<(), Box<dyn Error>> {
             BODY
         );
         let summary = fs::read_to_string(destination.join("summary.txt"))?;
-        assert!(summary.contains("TShark export omitted for standard input"));
+        assert!(summary.contains("TShark executable not found: tshark"));
         assert!(
         summary.contains(
             "Artifact discovery within retained supported-transport flow Cases, bounded unordered source/scope/IP-pair cohorts, and known TShark object types: partial"
         )
     );
     }
+    Ok(())
+}
+
+#[test]
+fn stdin_exports_tshark_objects() -> Result<(), Box<dyn Error>> {
+    let temporary = tempfile::tempdir()?;
+    let capture = capture_with_http_body(BODY)?;
+    let executable = install_tshark(
+        temporary.path(),
+        "printf '%s' 'stdin object' > \"$destination/object\"",
+    )?;
+    let destination = temporary.path().join("output");
+    let mut child = Command::new(env!("CARGO_BIN_EXE_l2solver"))
+        .args(["extract", "-", "--output"])
+        .arg(&destination)
+        .arg("--require-tshark")
+        .env("PATH", executable)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()?;
+    child
+        .stdin
+        .take()
+        .ok_or("child standard input is unavailable")?
+        .write_all(&capture)?;
+    let output = child.wait_with_output()?;
+    assert!(
+        output.status.success(),
+        "{}\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let artifacts = artifact_paths(&destination)?;
+    let bytes = artifacts
+        .iter()
+        .map(fs::read)
+        .collect::<Result<Vec<_>, _>>()?;
+    assert_eq!(bytes.len(), 2);
+    assert_eq!(
+        bytes
+            .iter()
+            .filter(|bytes| bytes.as_slice() == b"stdin object")
+            .count(),
+        1
+    );
+    assert_eq!(
+        bytes
+            .iter()
+            .filter(|bytes| bytes.as_slice() == BODY)
+            .count(),
+        1
+    );
     Ok(())
 }
 

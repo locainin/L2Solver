@@ -1,4 +1,4 @@
-use super::snapshot::hash_file;
+use super::snapshot::{HashControl, hash_file};
 use std::{
     fs::{self, File},
     io,
@@ -69,8 +69,9 @@ pub(super) fn verify_executable_unchanged(
     file: &mut File,
     length: u64,
     digest: &str,
+    control: HashControl<'_>,
 ) -> io::Result<()> {
-    let (current_length, current_digest) = hash_file(file, u64::MAX)?;
+    let (current_length, current_digest) = hash_file(file, length, control)?;
     if current_length != length || current_digest != digest {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,

@@ -743,7 +743,7 @@ fn write_tshark_status(output: &mut File, summary: &Summary<'_>) -> io::Result<(
     if let Some(budget) = summary.tshark.export_budget {
         writeln!(
             output,
-            "TShark temporary-object budget: {} bytes and {} files; the 50 ms polling scan may overshoot before stopping the process group",
+            "TShark temporary-object budget: {} logical bytes and {} files; private tmpfs bounds allocated data, cgroups bound child memory/tasks, and polling bounds observed logical bytes and file counts",
             budget.temporary_bytes, budget.temporary_files
         )?;
         writeln!(

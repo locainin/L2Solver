@@ -23,6 +23,7 @@ pub(super) struct Collection {
     pub(super) export_status: Option<ObjectExportStatus>,
     pub(super) export_budget: Option<ObjectExportBudget>,
     pub(super) export_usage: Option<ObjectExportUsage>,
+    pub(super) containment: Option<l2_workbench::tshark::ScopeReceipt>,
     pub(super) issues: Vec<String>,
 }
 

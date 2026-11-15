@@ -1,5 +1,12 @@
 use super::super::{ObjectExportBudget, ObjectExportUsage, observe_object_tree};
-use std::{cell::Cell, error::Error, fs, os::unix::fs::symlink, rc::Rc};
+use std::{
+    cell::Cell,
+    error::Error,
+    fs,
+    os::unix::fs::symlink,
+    rc::Rc,
+    time::{Duration, Instant},
+};
 
 #[test]
 fn directory_swap() -> Result<(), Box<dyn Error>> {
@@ -20,7 +27,15 @@ fn directory_swap() -> Result<(), Box<dyn Error>> {
         swap_observed.set(result.is_ok());
     })));
     let mut usage = ObjectExportUsage::default();
-    let scan = observe_object_tree(&root, 1, ObjectExportBudget::default(), &mut usage);
+    let scan = observe_object_tree(
+        super::policy(
+            Instant::now() + Duration::from_secs(2),
+            &root,
+            1,
+            ObjectExportBudget::default(),
+        ),
+        &mut usage,
+    );
 
     assert!(swapped.get(), "directory swap did not run");
     if let Ok(scan) = scan {

@@ -19,9 +19,9 @@ pub struct TsharkOptions {
     /// Shared subprocess time budget in seconds (default 120; operational deadline across phases)
     #[arg(long, default_value_t = 120, value_parser = clap::value_parser!(u32).range(1..))]
     pub timeout_seconds: u32,
-    /// Maximum combined capture and key-log snapshot size in MiB (default 256; increase for larger captures)
-    #[arg(long, default_value_t = 256, value_parser = clap::value_parser!(u32).range(1..))]
-    pub max_input_mib: u32,
+    /// Maximum combined capture and key-log snapshot size in MiB (default: available workspace with a safety reserve)
+    #[arg(long, value_parser = clap::value_parser!(u32).range(1..))]
+    pub max_input_mib: Option<u32>,
     /// Maximum metadata stdout in MiB per phase (default 16; covers plugin and source-frame-count output)
     #[arg(long, default_value_t = 16, value_parser = clap::value_parser!(u32).range(1..))]
     pub max_metadata_mib: u32,

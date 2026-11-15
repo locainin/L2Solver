@@ -3,7 +3,7 @@
 mod cache;
 mod checkpoint;
 #[cfg(target_os = "linux")]
-mod system_memory;
+pub mod system_memory;
 pub use cache::RecoveryCache;
 
 use crate::{

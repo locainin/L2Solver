@@ -1,6 +1,7 @@
 #![cfg(unix)]
 
-use super::identity_for_path;
+use super::{configuration_identity, identity_for_path};
+use crate::workbench::tshark::{ObjectExportBudget, resources::operator_configuration};
 use l2_workbench::job::Job;
 use serde_json::Value;
 use std::{
@@ -14,6 +15,46 @@ use std::{
 
 #[cfg(unix)]
 use std::os::unix::{ffi::OsStringExt, fs::PermissionsExt};
+
+#[test]
+fn resource_identity() -> Result<(), Box<dyn Error>> {
+    let entries = [
+        ("L2SOLVER_TSHARK_MEMORY_MIB", "4"),
+        ("L2SOLVER_TSHARK_SWAP_MIB", "0"),
+        ("L2SOLVER_TSHARK_TASKS", "12"),
+        ("L2SOLVER_TSHARK_TEMPORARY_MIB", "8"),
+        ("L2SOLVER_TSHARK_TMP_MIB", "1"),
+        ("L2SOLVER_TSHARK_SHM_MIB", "2"),
+        ("L2SOLVER_TSHARK_OBJECT_MIB", "512"),
+        ("L2SOLVER_TSHARK_OBJECT_FILES", "16384"),
+    ];
+    let explicit = operator_configuration(Some(ObjectExportBudget::DEFAULT), |name| {
+        entries
+            .iter()
+            .find(|(key, _)| *key == name)
+            .map(|(_, value)| (*value).into())
+    })?;
+    assert_eq!(
+        configuration_identity(explicit),
+        serde_json::json!({
+            "memory_bytes": 4 * 1024 * 1024,
+            "swap_bytes": 0,
+            "tasks": 12,
+            "temporary_bytes": 8 * 1024 * 1024,
+            "tmp_bytes": 1024 * 1024,
+            "shm_bytes": 2 * 1024 * 1024,
+            "object_bytes": 512 * 1024 * 1024,
+            "object_files": 16384,
+            "object_explicit": true,
+        })
+    );
+    let automatic = operator_configuration(Some(ObjectExportBudget::DEFAULT), |_| None)?;
+    assert_eq!(
+        configuration_identity(automatic).get("object_explicit"),
+        Some(&serde_json::json!(false))
+    );
+    Ok(())
+}
 
 fn executable_script(path: &Path, body: &str) -> Result<(), Box<dyn Error>> {
     fs::write(path, format!("#!/bin/sh\n{body}\n"))?;
@@ -54,6 +95,26 @@ fn hex_value(digit: u8) -> Result<u8, Box<dyn Error>> {
     }
 }
 
+#[test]
+fn version_admission() -> Result<(), Box<dyn Error>> {
+    let temporary = tempfile::tempdir()?;
+    executable_script(
+        &temporary.path().join("tshark"),
+        "printf 'TShark (Wireshark) 4.4.20\\n'",
+    )?;
+    let search_path = std::env::join_paths([temporary.path()])?;
+    let memory = l2_workbench::job::MemoryBudget::new(1);
+    let job = Job::with_memory_budget("version", &memory);
+    let identity = identity_for_path(Some(search_path.as_os_str()), Some(&job));
+    assert_eq!(field(&identity, "/version/status")?, "unavailable");
+    assert_eq!(
+        field(&identity, "/version/reason")?,
+        "resource_plan_unavailable"
+    );
+    assert_eq!(memory.snapshot()?.working_sets.active_processes, 0);
+    Ok(())
+}
+
 fn field<'a>(identity: &'a Value, path: &str) -> Result<&'a Value, Box<dyn Error>> {
     identity
         .pointer(path)
@@ -78,7 +139,7 @@ fn selected_executable_reports_public_version_and_fast_metadata() -> Result<(), 
         field(&identity, "/version/public_version")?,
         "TShark (Wireshark) 4.4.20"
     );
-    assert_eq!(field(&identity, "/arguments_epoch")?, 2);
+    assert_eq!(field(&identity, "/arguments_epoch")?, 3);
     assert_eq!(
         field(&identity, "/executable/length")?,
         fs::metadata(&executable)?.len()

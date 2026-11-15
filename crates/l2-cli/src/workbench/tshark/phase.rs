@@ -10,16 +10,15 @@ pub(super) fn run_phase(
     if remaining.is_zero() {
         return Err(process::ProcessError::TimedOut.into());
     }
-    let launch = prepared
+    let mut launch = prepared
         .sandbox
         .command(arguments, &prepared.environment, None)?;
-    Ok(process::run(
-        &launch.executable,
-        &launch.arguments,
-        &launch.environment,
+    Ok(process::run_launch(
+        &mut launch,
         remaining,
         stdout_maximum,
         prepared.diagnostic_maximum,
+        None,
     )?)
 }
 

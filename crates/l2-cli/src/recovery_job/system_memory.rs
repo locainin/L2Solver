@@ -18,13 +18,13 @@ const MAX_PROC_BYTES: u64 = 64 * 1024;
 const MAX_MOUNTINFO_BYTES: u64 = 1024 * 1024;
 const MAX_ANCESTORS: usize = 128;
 
-pub(super) struct Reader {
+pub struct Reader {
     status: PathBuf,
     hierarchy: Vec<PathBuf>,
 }
 
 impl Reader {
-    pub(super) fn open(proc_directory: &Path) -> io::Result<Self> {
+    pub fn open(proc_directory: &Path) -> io::Result<Self> {
         let cgroups = text(&proc_directory.join("cgroup"), MAX_PROC_BYTES)?;
         let mounts = text(&proc_directory.join("mountinfo"), MAX_MOUNTINFO_BYTES)?;
         Ok(Self {
@@ -33,7 +33,7 @@ impl Reader {
         })
     }
 
-    pub(super) fn sample(&self) -> io::Result<SystemMemorySnapshot> {
+    pub fn sample(&self) -> io::Result<SystemMemorySnapshot> {
         let status = text(&self.status, MAX_PROC_BYTES)?;
         let rss = status_bytes(&status, "VmRSS:")?;
         let peak_rss = status_bytes(&status, "VmHWM:")?;
@@ -104,7 +104,7 @@ impl Reader {
     }
 }
 
-fn hierarchy(cgroups: &str, mounts: &str) -> io::Result<Vec<PathBuf>> {
+pub fn hierarchy(cgroups: &str, mounts: &str) -> io::Result<Vec<PathBuf>> {
     let Some(path) = cgroups.lines().find_map(|line| line.strip_prefix("0::")) else {
         return Ok(Vec::new());
     };
@@ -192,10 +192,12 @@ fn decode_path(value: &str) -> io::Result<PathBuf> {
 }
 
 fn text(path: &Path, maximum: u64) -> io::Result<String> {
+    read_bounded(File::open(path)?, maximum)
+}
+
+pub fn read_bounded(file: File, maximum: u64) -> io::Result<String> {
     let mut value = String::new();
-    File::open(path)?
-        .take(maximum + 1)
-        .read_to_string(&mut value)?;
+    file.take(maximum + 1).read_to_string(&mut value)?;
     if u64::try_from(value.len()).map_err(|_| invalid())? > maximum {
         return Err(invalid());
     }
@@ -224,7 +226,7 @@ fn limit(path: &Path, mount_root: bool) -> io::Result<Option<u64>> {
     }
 }
 
-fn field(text: &str, name: &str) -> io::Result<Option<u64>> {
+pub fn field(text: &str, name: &str) -> io::Result<Option<u64>> {
     let mut found = None;
     for line in text.lines() {
         let mut words = line.split_whitespace();

@@ -35,11 +35,13 @@ Exit status:
 const DEV_HELP: &str =
     "Developer:\n  l2solver dev --help       Internal diagnostics and fixture tooling";
 
-const EXTRACT_HELP: &str = r"The default is CAPTURE.export. Matching owned output is reused. --refresh atomically replaces owned output, even when its previous input differs. Unrelated destinations are refused. Standard input requires --output and skips TShark. Use -- before a filename starting with -.
+const EXTRACT_HELP: &str = r"The default is CAPTURE.export. Matching owned output is reused. --refresh atomically replaces owned output, even when its previous input differs. Unrelated destinations are refused. Standard input requires --output. Use -- before a filename starting with -.
 
 Progress defaults to automatic terminal detection. --refresh recomputes results, --no-cache skips reads and writes, and --strict-cache checks cached content in full.
 
 TShark enrichment is optional. If TShark is missing or object export fails, available artifacts are still published. Incomplete native analysis or a required TShark failure returns status 3. Packets outside discovery scope are reported without failing extraction. summary.txt shows native and TShark status separately.
+
+TShark object limits: L2SOLVER_TSHARK_OBJECT_MIB (MiB); L2SOLVER_TSHARK_OBJECT_FILES (count).
 
 Examples:
   l2solver extract traffic.pcapng -o recovered/

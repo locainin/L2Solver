@@ -18,7 +18,7 @@ use std::{
     ffi::OsString,
     fmt,
     fs::{self, File},
-    io::{self, Read},
+    io::{self, Read, Write},
     path::Path,
     process::{Child, Command, ExitStatus, Stdio},
     sync::mpsc,
@@ -40,6 +40,7 @@ pub(super) struct Output {
     pub stdout: Vec<u8>,
     pub stderr: Vec<u8>,
     pub status: ExitStatus,
+    pub scope: Option<l2_workbench::tshark::ScopeReceipt>,
 }
 
 /// Exit status and a bounded tail of `TShark` diagnostics
@@ -51,6 +52,7 @@ pub(super) struct StreamOutput {
     // A successful export uses the final scan after writers stop
     pub objects: Vec<StableObject>,
     pub unsafe_entries: bool,
+    pub scope: Option<l2_workbench::tshark::ScopeReceipt>,
 }
 
 /// Timeout receipt with the last bounded diagnostic tail and observed object state
@@ -120,6 +122,187 @@ trait WorkerSpawner {
         F: FnOnce() + Send + 'static;
 }
 
+trait ProcessGate {
+    fn verify(&mut self, child: u32) -> io::Result<bool>;
+    fn stop(&mut self, deadline: Instant) -> io::Result<()>;
+    #[cfg(target_os = "linux")]
+    fn verify_member(&self, process: &File) -> io::Result<()>;
+    #[cfg(target_os = "linux")]
+    fn request_freeze(&mut self) -> io::Result<()>;
+    #[cfg(target_os = "linux")]
+    fn poll_frozen(&mut self) -> io::Result<bool>;
+    #[cfg(target_os = "linux")]
+    fn verify_only_members(&mut self, outer_pid: u32) -> io::Result<()>;
+}
+
+#[cfg(target_os = "linux")]
+impl ProcessGate for super::resource_scope::Gate {
+    fn verify(&mut self, child: u32) -> io::Result<bool> {
+        self.verify(child)
+    }
+
+    fn stop(&mut self, deadline: Instant) -> io::Result<()> {
+        self.stop_verified_scope(deadline)
+    }
+
+    fn verify_member(&self, process: &File) -> io::Result<()> {
+        self.verify_member(process)
+    }
+
+    fn request_freeze(&mut self) -> io::Result<()> {
+        self.request_freeze()
+    }
+
+    fn poll_frozen(&mut self) -> io::Result<bool> {
+        self.poll_frozen()
+    }
+
+    fn verify_only_members(&mut self, outer_pid: u32) -> io::Result<()> {
+        self.verify_only_members(outer_pid)
+    }
+}
+
+struct ScopeSession<'a> {
+    gate: Option<&'a mut dyn ProcessGate>,
+    verified: bool,
+    stopped: bool,
+}
+
+impl<'a> ScopeSession<'a> {
+    fn new(gate: Option<&'a mut dyn ProcessGate>) -> Self {
+        Self {
+            gate,
+            verified: false,
+            stopped: false,
+        }
+    }
+
+    fn enter(
+        &mut self,
+        child: &mut Child,
+        deadline: Instant,
+        job: Option<&Job>,
+        keep_input: bool,
+    ) -> Result<(), ProcessError> {
+        let Some(gate) = self.gate.as_deref_mut() else {
+            return Ok(());
+        };
+        loop {
+            check_start_budget(deadline, job)?;
+            if observe_exit(child).map_err(ProcessError::Read)?.is_some() {
+                return Err(ProcessError::Containment(io::Error::other(
+                    "resource launcher exited before verification",
+                )));
+            }
+            if gate.verify(child.id()).map_err(ProcessError::Containment)? {
+                self.verified = true;
+                break;
+            }
+            thread::sleep(Duration::from_millis(3));
+        }
+        check_start_budget(deadline, job)?;
+        let input = child.stdin.as_mut().ok_or_else(|| {
+            ProcessError::Containment(io::Error::other("resource gate input unavailable"))
+        })?;
+        input
+            .write_all(b"scope\n")
+            .map_err(ProcessError::Containment)?;
+        if !keep_input {
+            drop(child.stdin.take());
+        }
+        Ok(())
+    }
+
+    fn stop(&mut self) -> Result<(), io::Error> {
+        if !self.verified || self.stopped {
+            return Ok(());
+        }
+        self.stopped = true;
+        if let Some(gate) = self.gate.as_deref_mut() {
+            gate.stop(Instant::now() + Duration::from_millis(500))?;
+        }
+        Ok(())
+    }
+
+    fn failure(&mut self, primary: ProcessError) -> ProcessError {
+        with_cleanup_error(primary, self.stop())
+    }
+
+    fn stop_before_reap(&mut self) -> Result<(), ProcessError> {
+        self.stop().map_err(|source| ProcessError::ScopeCleanup {
+            primary: None,
+            source,
+        })
+    }
+
+    #[cfg(target_os = "linux")]
+    fn verify_member(&self, process: &File) -> Result<(), ProcessError> {
+        if !self.verified {
+            return Err(ProcessError::Containment(io::Error::other(
+                "resource scope is not verified",
+            )));
+        }
+        self.gate
+            .as_deref()
+            .ok_or_else(|| {
+                ProcessError::Containment(io::Error::other("resource scope unavailable"))
+            })?
+            .verify_member(process)
+            .map_err(ProcessError::Containment)
+    }
+
+    #[cfg(target_os = "linux")]
+    fn finish_output(
+        &mut self,
+        outer_pid: u32,
+        deadline: Instant,
+        job: Option<&Job>,
+    ) -> Result<(), ProcessError> {
+        if !self.verified {
+            return Err(ProcessError::Containment(io::Error::other(
+                "resource scope is not verified",
+            )));
+        }
+        let gate = self.gate.as_deref_mut().ok_or_else(|| {
+            ProcessError::Containment(io::Error::other("resource scope unavailable"))
+        })?;
+        check_start_budget(deadline, job)?;
+        gate.request_freeze().map_err(ProcessError::Containment)?;
+        loop {
+            check_start_budget(deadline, job)?;
+            if gate.poll_frozen().map_err(ProcessError::Containment)? {
+                break;
+            }
+            thread::sleep(Duration::from_millis(3));
+        }
+        check_start_budget(deadline, job)?;
+        gate.verify_only_members(outer_pid)
+            .map_err(ProcessError::Containment)?;
+        check_start_budget(deadline, job)?;
+        self.stop_before_reap()
+    }
+}
+
+fn check_start_budget(deadline: Instant, job: Option<&Job>) -> Result<(), ProcessError> {
+    if job.is_some_and(Job::is_cancelled) {
+        return Err(ProcessError::Cancelled);
+    }
+    if Instant::now() >= deadline {
+        return Err(ProcessError::TimedOut);
+    }
+    Ok(())
+}
+
+fn stop_after_error(
+    scope: &mut ScopeSession<'_>,
+    child: &mut Child,
+    primary: ProcessError,
+) -> ProcessError {
+    let error = scope.failure(primary);
+    stop_and_reap(child);
+    error
+}
+
 struct ThreadSpawner;
 
 impl WorkerSpawner for ThreadSpawner {
@@ -137,6 +320,13 @@ impl WorkerSpawner for ThreadSpawner {
 #[derive(Debug)]
 pub(super) enum ProcessError {
     Spawn(io::Error),
+    Containment(io::Error),
+    MemoryLimit(Box<l2_workbench::tshark::ScopeReceipt>),
+    TaskLimit(Box<l2_workbench::tshark::ScopeReceipt>),
+    ScopeCleanup {
+        primary: Option<Box<Self>>,
+        source: io::Error,
+    },
     WorkerSpawn {
         worker: &'static str,
         source: io::Error,
@@ -153,6 +343,27 @@ impl fmt::Display for ProcessError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Spawn(error) => write!(formatter, "could not start TShark: {error}"),
+            Self::Containment(error) => write!(formatter, "could not contain TShark: {error}"),
+            Self::MemoryLimit(receipt) => write!(
+                formatter,
+                "TShark encountered an out-of-memory event (effective limit: {} bytes)",
+                receipt.effective_memory_max_bytes
+            ),
+            Self::TaskLimit(receipt) => write!(
+                formatter,
+                "TShark reached its task limit (effective limit: {})",
+                receipt.effective_tasks_max
+            ),
+            Self::ScopeCleanup { primary, source } => {
+                if let Some(primary) = primary {
+                    write!(
+                        formatter,
+                        "{primary}; resource scope cleanup failed: {source}"
+                    )
+                } else {
+                    write!(formatter, "resource scope cleanup failed: {source}")
+                }
+            }
             Self::WorkerSpawn { worker, source } => {
                 write!(
                     formatter,
@@ -169,15 +380,62 @@ impl fmt::Display for ProcessError {
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum ResourceLimit {
+    Memory,
+    Tasks,
+}
+
+pub(super) fn resource_limit(
+    receipt: &l2_workbench::tshark::ScopeReceipt,
+) -> Option<ResourceLimit> {
+    let usage = receipt.usage?;
+    if usage
+        .memory_events
+        .is_some_and(|events| events.oom > 0 || events.oom_kill > 0)
+    {
+        Some(ResourceLimit::Memory)
+    } else if usage.tasks_max_events.is_some_and(|events| events > 0) {
+        Some(ResourceLimit::Tasks)
+    } else {
+        None
+    }
+}
+
 impl Error for ProcessError {
     fn source(&self) -> Option<&(dyn Error + 'static)> {
         match self {
-            Self::Spawn(error) | Self::Read(error) | Self::WorkerSpawn { source: error, .. } => {
-                Some(error)
-            }
+            Self::Spawn(error)
+            | Self::Containment(error)
+            | Self::Read(error)
+            | Self::WorkerSpawn { source: error, .. } => Some(error),
+            Self::ScopeCleanup {
+                primary: Some(primary),
+                ..
+            } => Some(primary.as_ref()),
+            Self::ScopeCleanup { source, .. } => Some(source),
             _ => None,
         }
     }
+}
+
+#[cfg(all(test, target_os = "linux"))]
+fn run_with_gate_and_spawner(
+    executable: &Path,
+    arguments: &[OsString],
+    environment: &[(OsString, OsString)],
+    policy: CapturePolicy<'_>,
+    spawner: &mut impl WorkerSpawner,
+    gate: &mut dyn ProcessGate,
+) -> Result<Output, ProcessError> {
+    run_capture(
+        executable,
+        arguments,
+        environment,
+        policy,
+        spawner,
+        Some(gate),
+    )
 }
 
 fn start_worker(
@@ -194,6 +452,7 @@ fn start_worker(
 }
 
 /// Run an offline `TShark` process while draining both pipes and enforcing hard budgets
+#[cfg(test)]
 pub(super) fn run(
     executable: &Path,
     arguments: &[OsString],
@@ -201,27 +460,6 @@ pub(super) fn run(
     timeout: Duration,
     stdout_maximum: usize,
     stderr_maximum: usize,
-) -> Result<Output, ProcessError> {
-    run_with_job(
-        executable,
-        arguments,
-        environment,
-        timeout,
-        stdout_maximum,
-        stderr_maximum,
-        None,
-    )
-}
-
-/// Run a bounded command while observing shared cancellation
-pub(super) fn run_with_job(
-    executable: &Path,
-    arguments: &[OsString],
-    environment: &[(OsString, OsString)],
-    timeout: Duration,
-    stdout_maximum: usize,
-    stderr_maximum: usize,
-    job: Option<&Job>,
 ) -> Result<Output, ProcessError> {
     run_with_job_and_spawner(
         executable,
@@ -231,18 +469,86 @@ pub(super) fn run_with_job(
             timeout,
             stdout_maximum,
             stderr_maximum,
-            job,
+            job: None,
         },
         &mut ThreadSpawner,
     )
 }
 
+pub(super) fn run_launch(
+    launch: &mut super::sandbox::Launch,
+    timeout: Duration,
+    stdout_maximum: usize,
+    stderr_maximum: usize,
+    job: Option<&Job>,
+) -> Result<Output, ProcessError> {
+    #[cfg(target_os = "linux")]
+    {
+        if launch.output_bootstrap {
+            return Err(ProcessError::Containment(io::Error::other(
+                "object export requires streaming",
+            )));
+        }
+        let gate = launch.scope.as_mut().ok_or_else(|| {
+            ProcessError::Containment(io::Error::other("resource scope is required"))
+        })?;
+        gate.claim().map_err(ProcessError::Containment)?;
+        let mut output = run_capture(
+            &launch.executable,
+            &launch.arguments,
+            &launch.environment,
+            CapturePolicy {
+                timeout,
+                stdout_maximum,
+                stderr_maximum,
+                job,
+            },
+            &mut ThreadSpawner,
+            Some(gate),
+        )?;
+        if let Some(receipt) = launch
+            .scope
+            .as_ref()
+            .and_then(super::resource_scope::Gate::receipt)
+        {
+            if let Some(limit) = resource_limit(&receipt) {
+                return Err(match limit {
+                    ResourceLimit::Memory => ProcessError::MemoryLimit(Box::new(receipt)),
+                    ResourceLimit::Tasks => ProcessError::TaskLimit(Box::new(receipt)),
+                });
+            }
+            output.scope = Some(receipt);
+        }
+        Ok(output)
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = (launch, timeout, stdout_maximum, stderr_maximum, job);
+        Err(ProcessError::Containment(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "resource scope unavailable",
+        )))
+    }
+}
+
+#[cfg(test)]
 fn run_with_job_and_spawner(
     executable: &Path,
     arguments: &[OsString],
     environment: &[(OsString, OsString)],
     policy: CapturePolicy<'_>,
     spawner: &mut impl WorkerSpawner,
+) -> Result<Output, ProcessError> {
+    run_capture(executable, arguments, environment, policy, spawner, None)
+}
+
+fn run_capture(
+    executable: &Path,
+    arguments: &[OsString],
+    environment: &[(OsString, OsString)],
+    policy: CapturePolicy<'_>,
+    spawner: &mut impl WorkerSpawner,
+    gate: Option<&mut dyn ProcessGate>,
 ) -> Result<Output, ProcessError> {
     let CapturePolicy {
         timeout,
@@ -256,18 +562,18 @@ fn run_with_job_and_spawner(
     let deadline = Instant::now()
         .checked_add(timeout)
         .ok_or(ProcessError::TimedOut)?;
-    let mut child = spawn(executable, arguments, environment)?;
+    let mut scope = ScopeSession::new(gate);
+    let mut child = spawn(executable, arguments, environment, scope.gate.is_some())?;
+    if let Err(error) = scope.enter(&mut child, deadline, job, false) {
+        return Err(stop_after_error(&mut scope, &mut child, error));
+    }
     let Some(stdout) = child.stdout.take() else {
-        stop_and_reap(&mut child);
-        return Err(ProcessError::Read(io::Error::other(
-            "stdout pipe unavailable",
-        )));
+        let error = ProcessError::Read(io::Error::other("stdout pipe unavailable"));
+        return Err(stop_after_error(&mut scope, &mut child, error));
     };
     let Some(stderr) = child.stderr.take() else {
-        stop_and_reap(&mut child);
-        return Err(ProcessError::Read(io::Error::other(
-            "stderr pipe unavailable",
-        )));
+        let error = ProcessError::Read(io::Error::other("stderr pipe unavailable"));
+        return Err(stop_after_error(&mut scope, &mut child, error));
     };
     let (sender, receiver) = mpsc::channel();
     let stdout_sender = sender.clone();
@@ -278,8 +584,7 @@ fn run_with_job_and_spawner(
         Err(error) => {
             // No reader owns stderr yet, so close it before stopping the process
             drop(stderr);
-            stop_and_reap(&mut child);
-            return Err(error);
+            return Err(stop_after_error(&mut scope, &mut child, error));
         }
     };
     let stderr_worker = match start_worker(spawner, "stderr", move || {
@@ -288,7 +593,7 @@ fn run_with_job_and_spawner(
         Ok(worker) => worker,
         Err(error) => {
             // Stop the process group so the first reader can finish before joining
-            stop_and_reap(&mut child);
+            let error = stop_after_error(&mut scope, &mut child, error);
             join_workers_after_stop([stdout_worker]);
             return Err(error);
         }
@@ -299,6 +604,7 @@ fn run_with_job_and_spawner(
         [stdout_worker, stderr_worker],
         deadline,
         job,
+        &mut scope,
     )
 }
 
@@ -308,6 +614,7 @@ fn wait_for_capture(
     workers: [JoinHandle<()>; 2],
     deadline: Instant,
     job: Option<&Job>,
+    scope: &mut ScopeSession<'_>,
 ) -> Result<Output, ProcessError> {
     let [stdout_worker, stderr_worker] = workers;
     let mut stdout_result = None;
@@ -316,16 +623,16 @@ fn wait_for_capture(
 
     loop {
         if job.is_some_and(Job::is_cancelled) {
-            stop_and_reap(child);
+            let error = stop_after_error(scope, child, ProcessError::Cancelled);
             join_workers_after_stop([stdout_worker, stderr_worker]);
-            return Err(ProcessError::Cancelled);
+            return Err(error);
         }
         while let Ok((is_stdout, result)) = receiver.try_recv() {
             match result {
                 Ok(bytes) if is_stdout => stdout_result = Some(bytes),
                 Ok(bytes) => stderr_result = Some(bytes),
                 Err(error) => {
-                    stop_and_reap(child);
+                    let error = stop_after_error(scope, child, error);
                     join_workers_after_stop([stdout_worker, stderr_worker]);
                     return Err(error);
                 }
@@ -335,17 +642,32 @@ fn wait_for_capture(
             status = match observe_exit(child) {
                 Ok(status) => status,
                 Err(error) => {
-                    if !lost_child(&error) {
+                    let lost = lost_child(&error);
+                    let error = scope.failure(ProcessError::Read(error));
+                    if !lost {
                         stop_and_reap(child);
                     }
                     join_workers_after_stop([stdout_worker, stderr_worker]);
-                    return Err(ProcessError::Read(error));
+                    return Err(error);
                 }
             };
         }
         if status.is_some() && stdout_result.is_some() && stderr_result.is_some() {
             let _ = stdout_worker.join();
             let _ = stderr_worker.join();
+            let cleanup = scope.stop();
+            let budget = check_start_budget(deadline, job);
+            if let Err(source) = cleanup {
+                stop_and_reap(child);
+                return Err(ProcessError::ScopeCleanup {
+                    primary: budget.err().map(Box::new),
+                    source,
+                });
+            }
+            if let Err(error) = budget {
+                stop_and_reap(child);
+                return Err(error);
+            }
             // The waitable leader reserves its group until all capture helpers are signalled
             #[cfg(all(target_os = "linux", not(target_env = "uclibc")))]
             stop_process_group(child).map_err(ProcessError::Read)?;
@@ -355,16 +677,18 @@ fn wait_for_capture(
             })?;
             #[cfg(all(target_os = "linux", not(target_env = "uclibc")))]
             let status = child.wait().map_err(ProcessError::Read)?;
+            check_start_budget(deadline, job)?;
             return Ok(Output {
                 stdout: stdout_result.unwrap_or_default(),
                 stderr: stderr_result.unwrap_or_default(),
                 status,
+                scope: None,
             });
         }
         if Instant::now() >= deadline {
-            stop_and_reap(child);
+            let error = stop_after_error(scope, child, ProcessError::TimedOut);
             join_workers_after_stop([stdout_worker, stderr_worker]);
-            return Err(ProcessError::TimedOut);
+            return Err(error);
         }
         thread::sleep(Duration::from_millis(3));
     }
@@ -373,6 +697,7 @@ fn wait_for_capture(
 /// Run `TShark` with discarded stdout, a bounded stderr tail, and one deadline
 ///
 /// The isolated process group lets timeout cleanup stop helper processes too
+#[cfg(test)]
 pub(super) fn run_streaming(
     executable: &Path,
     arguments: &[OsString],
@@ -388,6 +713,47 @@ pub(super) fn run_streaming(
     )
 }
 
+pub(super) fn run_streaming_launch(
+    launch: &mut super::sandbox::Launch,
+    policy: StreamingPolicy<'_>,
+) -> Result<StreamOutput, ProcessError> {
+    #[cfg(target_os = "linux")]
+    {
+        if !launch.output_bootstrap || launch.output_storage.is_some() {
+            return Err(ProcessError::Containment(io::Error::other(
+                "object export bootstrap unavailable",
+            )));
+        }
+        let gate = launch.scope.as_mut().ok_or_else(|| {
+            ProcessError::Containment(io::Error::other("resource scope is required"))
+        })?;
+        gate.claim().map_err(ProcessError::Containment)?;
+        let mut output = run_streaming_inner(
+            &launch.executable,
+            &launch.arguments,
+            &launch.environment,
+            policy,
+            &mut ThreadSpawner,
+            Some(gate),
+            Some(&mut launch.output_storage),
+        )?;
+        output.scope = launch
+            .scope
+            .as_ref()
+            .and_then(super::resource_scope::Gate::receipt);
+        Ok(output)
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = (launch, policy);
+        Err(ProcessError::Containment(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "resource scope unavailable",
+        )))
+    }
+}
+
+#[cfg(test)]
 fn run_streaming_with_spawner(
     executable: &Path,
     arguments: &[OsString],
@@ -395,85 +761,444 @@ fn run_streaming_with_spawner(
     policy: StreamingPolicy<'_>,
     spawner: &mut impl WorkerSpawner,
 ) -> Result<StreamOutput, ProcessError> {
+    run_streaming_inner(
+        executable,
+        arguments,
+        environment,
+        policy,
+        spawner,
+        None,
+        #[cfg(target_os = "linux")]
+        None,
+    )
+}
+
+fn run_streaming_inner(
+    executable: &Path,
+    arguments: &[OsString],
+    environment: &[(OsString, OsString)],
+    policy: StreamingPolicy<'_>,
+    spawner: &mut impl WorkerSpawner,
+    gate: Option<&mut dyn ProcessGate>,
+    #[cfg(target_os = "linux")] bootstrap: Option<
+        &mut Option<super::output_storage::OutputStorage>,
+    >,
+) -> Result<StreamOutput, ProcessError> {
     if policy.job.is_some_and(Job::is_cancelled) {
         return Err(ProcessError::Cancelled);
     }
     if Instant::now() >= policy.deadline {
-        return Err(ProcessError::ObjectExportTimeout(ObjectExportTimeout {
-            stderr: Vec::new(),
-            stderr_truncated: false,
-            stderr_complete: true,
-            status: None,
-            usage: ObjectExportUsage {
-                protocol_directory_count: policy.protocol_directory_count,
-                ..ObjectExportUsage::default()
-            },
-            stable_objects: Vec::new(),
-        }));
+        return Err(empty_stream_timeout(policy));
     }
+    #[cfg(target_os = "linux")]
+    let output_bootstrap = bootstrap.is_some();
+    #[cfg(not(target_os = "linux"))]
+    let output_bootstrap = false;
+    let mut scope = ScopeSession::new(gate);
     let mut child = spawn_with_output(
         executable,
         arguments,
         environment,
-        Stdio::null(),
+        if output_bootstrap {
+            Stdio::piped()
+        } else {
+            Stdio::null()
+        },
         Stdio::piped(),
+        scope.gate.is_some(),
     )?;
+    if let Err(error) = scope.enter(&mut child, policy.deadline, policy.job, output_bootstrap) {
+        let error = if matches!(error, ProcessError::TimedOut) {
+            empty_stream_timeout(policy)
+        } else {
+            error
+        };
+        return Err(stop_after_error(&mut scope, &mut child, error));
+    }
+    let (worker, diagnostics) = start_diagnostic_worker(&mut child, policy, &mut scope, spawner)?;
+    let mut monitor = StreamingMonitor::new(policy, Arc::clone(&diagnostics));
+    #[cfg(target_os = "linux")]
+    let (root, control) = if let Some(storage) = bootstrap {
+        match bootstrap_output(&mut child, storage, &scope, policy.deadline, policy.job) {
+            Ok((root, control)) => (Some(root), Some(control)),
+            Err(error) => {
+                let cleanup = scope.stop();
+                stop_and_reap(&mut child);
+                join_workers_after_stop([worker]);
+                let error = if matches!(error, ProcessError::TimedOut) {
+                    ProcessError::ObjectExportTimeout(monitor.timeout_receipt())
+                } else {
+                    error
+                };
+                return Err(with_cleanup_error(error, cleanup));
+            }
+        }
+    } else {
+        (None, None)
+    };
+    #[cfg(target_os = "linux")]
+    let policy = StreamingPolicy {
+        object_root: root.as_deref().unwrap_or(policy.object_root),
+        ..policy
+    };
+
+    wait_for_streaming(
+        &mut child,
+        worker,
+        &mut monitor,
+        policy,
+        &mut scope,
+        #[cfg(target_os = "linux")]
+        control,
+    )
+}
+
+fn start_diagnostic_worker(
+    child: &mut Child,
+    policy: StreamingPolicy<'_>,
+    scope: &mut ScopeSession<'_>,
+    spawner: &mut impl WorkerSpawner,
+) -> Result<(JoinHandle<()>, SharedDiagnostics), ProcessError> {
     let Some(stderr) = child.stderr.take() else {
-        stop_and_reap(&mut child);
-        return Err(ProcessError::Read(io::Error::other(
-            "stderr pipe unavailable",
-        )));
+        let error = ProcessError::Read(io::Error::other("stderr pipe unavailable"));
+        return Err(stop_after_error(scope, child, error));
     };
     let diagnostics = Arc::new(Mutex::new(DiagnosticState::default()));
     let worker_diagnostics = Arc::clone(&diagnostics);
-    let worker = match start_worker(spawner, "stderr", move || {
+    let worker = start_worker(spawner, "stderr", move || {
         let result = drain_tail(stderr, policy.stderr_maximum, &worker_diagnostics);
         let mut state = lock_diagnostics(&worker_diagnostics);
         state.complete = true;
         if let Err(error) = result {
             state.error = Some(error.to_string());
         }
-    }) {
-        Ok(worker) => worker,
-        Err(error) => {
-            stop_and_reap(&mut child);
-            return Err(error);
-        }
-    };
-    let mut monitor = StreamingMonitor::new(policy, Arc::clone(&diagnostics));
+    })
+    .map_err(|error| stop_after_error(scope, child, error))?;
+    Ok((worker, diagnostics))
+}
 
+fn wait_for_streaming(
+    child: &mut Child,
+    worker: JoinHandle<()>,
+    monitor: &mut StreamingMonitor,
+    policy: StreamingPolicy<'_>,
+    scope: &mut ScopeSession<'_>,
+    #[cfg(target_os = "linux")] mut control: Option<OutputControl<std::process::ChildStdout>>,
+) -> Result<StreamOutput, ProcessError> {
     loop {
         if policy.job.is_some_and(Job::is_cancelled) {
-            stop_and_reap(&mut child);
+            let error = stop_after_error(scope, child, ProcessError::Cancelled);
             join_workers_after_stop([worker]);
-            return Err(ProcessError::Cancelled);
+            return Err(error);
         }
-        match monitor.poll(&mut child, policy) {
+        #[cfg(target_os = "linux")]
+        let result = poll_output_control(control.as_mut(), child, policy, scope, monitor)
+            .and_then(|()| monitor.poll_scoped(child, policy, scope));
+        #[cfg(not(target_os = "linux"))]
+        let result = monitor.poll_scoped(child, policy, scope);
+        match result {
             Ok(Some(output)) => {
                 let _ = worker.join();
                 #[cfg(not(all(target_os = "linux", not(target_env = "uclibc"))))]
                 if !output.status.success() {
                     // A failed direct child can leave helpers alive after closing stderr
-                    stop_process_group(&child).map_err(ProcessError::Read)?;
+                    stop_process_group(child).map_err(ProcessError::Read)?;
                 }
-                #[cfg(all(target_os = "linux", not(target_env = "uclibc")))]
+                #[cfg(target_os = "linux")]
                 let output = StreamOutput {
-                    status: child.wait().map_err(ProcessError::Read)?,
+                    status: if control.is_some() {
+                        let _ = child.wait().map_err(ProcessError::Read)?;
+                        output.status
+                    } else {
+                        child.wait().map_err(ProcessError::Read)?
+                    },
                     ..output
                 };
+                if let Err(error) = check_start_budget(policy.deadline, policy.job) {
+                    return Err(if matches!(error, ProcessError::TimedOut) {
+                        ProcessError::ObjectExportTimeout(monitor.timeout_receipt())
+                    } else {
+                        error
+                    });
+                }
                 return Ok(output);
             }
             Ok(None) => thread::sleep(Duration::from_millis(3)),
             Err(error) => {
-                if !matches!(&error, ProcessError::Read(source) if lost_child(source)) {
-                    stop_and_reap(&mut child);
+                let lost = matches!(&error, ProcessError::Read(source) if lost_child(source));
+                let cleanup = scope.stop();
+                if !lost {
+                    stop_and_reap(child);
                 }
                 join_workers_after_stop([worker]);
-                if matches!(error, ProcessError::TimedOut) {
-                    return Err(ProcessError::ObjectExportTimeout(monitor.timeout_receipt()));
-                }
-                return Err(error);
+                let error = if matches!(error, ProcessError::TimedOut) {
+                    ProcessError::ObjectExportTimeout(monitor.timeout_receipt())
+                } else {
+                    error
+                };
+                return Err(with_cleanup_error(error, cleanup));
             }
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+#[cfg_attr(
+    not(target_env = "uclibc"),
+    expect(
+        clippy::needless_pass_by_ref_mut,
+        reason = "uClibc uses Child::try_wait to observe the child"
+    )
+)]
+fn poll_output_control(
+    control: Option<&mut OutputControl<std::process::ChildStdout>>,
+    child: &mut Child,
+    policy: StreamingPolicy<'_>,
+    scope: &mut ScopeSession<'_>,
+    monitor: &mut StreamingMonitor,
+) -> Result<(), ProcessError> {
+    use std::os::unix::process::ExitStatusExt;
+
+    let Some(control) = control else {
+        return Ok(());
+    };
+    if let Some(status) = control.poll(policy.deadline, policy.job)? {
+        scope.finish_output(child.id(), policy.deadline, policy.job)?;
+        monitor.status = Some(ExitStatus::from_raw(i32::from(status) << 8));
+    } else if !control.complete && observe_exit(child).map_err(ProcessError::Read)?.is_some() {
+        return Err(invalid_control(
+            "sandbox supervisor exited before completion",
+        ));
+    }
+    Ok(())
+}
+
+fn with_cleanup_error(primary: ProcessError, cleanup: io::Result<()>) -> ProcessError {
+    match cleanup {
+        Ok(()) => primary,
+        Err(source) => ProcessError::ScopeCleanup {
+            primary: Some(Box::new(primary)),
+            source,
+        },
+    }
+}
+
+fn empty_stream_timeout(policy: StreamingPolicy<'_>) -> ProcessError {
+    ProcessError::ObjectExportTimeout(ObjectExportTimeout {
+        stderr: Vec::new(),
+        stderr_truncated: false,
+        stderr_complete: true,
+        status: None,
+        usage: ObjectExportUsage {
+            protocol_directory_count: policy.protocol_directory_count,
+            ..ObjectExportUsage::default()
+        },
+        stable_objects: Vec::new(),
+    })
+}
+
+#[cfg(target_os = "linux")]
+struct OutputControl<R> {
+    reader: R,
+    line: Vec<u8>,
+    bytes: usize,
+    reported_exit: Option<u8>,
+    complete: bool,
+}
+
+#[cfg(target_os = "linux")]
+impl<R: Read> OutputControl<R> {
+    const fn new(reader: R) -> Self {
+        Self {
+            reader,
+            line: Vec::new(),
+            bytes: 0,
+            reported_exit: None,
+            complete: false,
+        }
+    }
+
+    fn poll(&mut self, deadline: Instant, job: Option<&Job>) -> Result<Option<u8>, ProcessError> {
+        const MAX_CONTROL_BYTES: usize = 4096;
+        if self.complete {
+            return Ok(None);
+        }
+        loop {
+            check_start_budget(deadline, job)?;
+            let mut byte = [0_u8; 1];
+            match self.reader.read(&mut byte) {
+                Ok(0) => return Err(invalid_control("sandbox control ended before completion")),
+                Ok(_) => {
+                    self.bytes += 1;
+                    if self.bytes > MAX_CONTROL_BYTES {
+                        return Err(invalid_control("sandbox control exceeded its byte limit"));
+                    }
+                    let [byte] = byte;
+                    if byte == b'\n' {
+                        if let Some(status) = self.finish_line()? {
+                            self.complete = true;
+                            return Ok(Some(status));
+                        }
+                    } else {
+                        self.line.push(byte);
+                    }
+                }
+                Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
+                Err(error) if error.kind() == io::ErrorKind::WouldBlock => return Ok(None),
+                Err(error) => return Err(ProcessError::Containment(error)),
+            }
+        }
+    }
+
+    fn finish_line(&mut self) -> Result<Option<u8>, ProcessError> {
+        let line = std::mem::take(&mut self.line);
+        if line.starts_with(b"{") {
+            let value: serde_json::Value = serde_json::from_slice(&line)
+                .map_err(|_| invalid_control("invalid sandbox exit status"))?;
+            let object = value
+                .as_object()
+                .filter(|object| object.len() == 1)
+                .ok_or_else(|| invalid_control("invalid sandbox exit status"))?;
+            let status = object
+                .get("exit-code")
+                .and_then(serde_json::Value::as_u64)
+                .and_then(|status| u8::try_from(status).ok())
+                .ok_or_else(|| invalid_control("invalid sandbox exit status"))?;
+            if self.reported_exit.replace(status).is_some() {
+                return Err(invalid_control("duplicate sandbox exit status"));
+            }
+            return Ok(None);
+        }
+        let text = line
+            .strip_prefix(b"L2_EXPORT_DONE:")
+            .and_then(|value| std::str::from_utf8(value).ok())
+            .ok_or_else(|| invalid_control("invalid sandbox completion signal"))?;
+        let status = text
+            .parse::<u8>()
+            .map_err(|_| invalid_control("invalid sandbox completion status"))?;
+        if text != status.to_string() || self.reported_exit.is_some_and(|exit| exit != status) {
+            return Err(invalid_control("sandbox completion status disagrees"));
+        }
+        Ok(Some(status))
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn invalid_control(message: &'static str) -> ProcessError {
+    ProcessError::Containment(io::Error::new(io::ErrorKind::InvalidData, message))
+}
+
+#[cfg(target_os = "linux")]
+fn bootstrap_output(
+    child: &mut Child,
+    storage: &mut Option<super::output_storage::OutputStorage>,
+    scope: &ScopeSession<'_>,
+    deadline: Instant,
+    job: Option<&Job>,
+) -> Result<(std::path::PathBuf, OutputControl<std::process::ChildStdout>), ProcessError> {
+    use rustix::fs::{OFlags, fcntl_getfl, fcntl_setfl};
+
+    let mut stdout = child.stdout.take().ok_or_else(|| {
+        ProcessError::Containment(io::Error::other("sandbox status pipe unavailable"))
+    })?;
+    let flags = fcntl_getfl(&stdout).map_err(|error| ProcessError::Containment(error.into()))?;
+    fcntl_setfl(&stdout, flags | OFlags::NONBLOCK)
+        .map_err(|error| ProcessError::Containment(error.into()))?;
+    let status = read_bootstrap_line(&mut stdout, deadline, job)?;
+    let status: serde_json::Value = serde_json::from_slice(&status).map_err(|error| {
+        ProcessError::Containment(io::Error::new(io::ErrorKind::InvalidData, error))
+    })?;
+    let pid = status
+        .get("child-pid")
+        .and_then(serde_json::Value::as_u64)
+        .and_then(|pid| u32::try_from(pid).ok())
+        .filter(|pid| *pid > 0)
+        .ok_or_else(|| {
+            ProcessError::Containment(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "invalid sandbox child PID",
+            ))
+        })?;
+    let mount_namespace = status
+        .get("mnt-namespace")
+        .and_then(serde_json::Value::as_u64)
+        .filter(|namespace| *namespace > 0)
+        .ok_or_else(|| {
+            ProcessError::Containment(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "invalid sandbox mount namespace",
+            ))
+        })?;
+    let sandbox = super::output_storage::SandboxProcess::pin(pid, mount_namespace)
+        .map_err(ProcessError::Containment)?;
+    if read_bootstrap_line(&mut stdout, deadline, job)? != b"L2_EXPORT_READY\n" {
+        return Err(ProcessError::Containment(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "invalid sandbox readiness signal",
+        )));
+    }
+    // Only the trusted monitor and blocked bootstrap can write before release
+    match stdout.read(&mut [0_u8; 1]) {
+        Err(error) if error.kind() == io::ErrorKind::WouldBlock => {}
+        Err(error) => return Err(ProcessError::Containment(error)),
+        Ok(_) => {
+            return Err(ProcessError::Containment(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "unexpected sandbox status data",
+            )));
+        }
+    }
+    check_start_budget(deadline, job)?;
+    scope.verify_member(sandbox.directory())?;
+    let output = sandbox.output().map_err(ProcessError::Containment)?;
+    let root = output.path().map_err(ProcessError::Containment)?;
+    *storage = Some(output);
+    check_start_budget(deadline, job)?;
+    let input = child.stdin.as_mut().ok_or_else(|| {
+        ProcessError::Containment(io::Error::other("sandbox bootstrap input unavailable"))
+    })?;
+    input
+        .write_all(b"L2_EXPORT_GO\n")
+        .map_err(ProcessError::Containment)?;
+    Ok((root, OutputControl::new(stdout)))
+}
+
+#[cfg(target_os = "linux")]
+fn read_bootstrap_line(
+    reader: &mut impl Read,
+    deadline: Instant,
+    job: Option<&Job>,
+) -> Result<Vec<u8>, ProcessError> {
+    const MAX_STATUS_LINE: usize = 4096;
+    let mut line = Vec::new();
+    loop {
+        check_start_budget(deadline, job)?;
+        let mut byte = [0_u8; 1];
+        match reader.read(&mut byte) {
+            Ok(0) => {
+                return Err(ProcessError::Containment(io::Error::new(
+                    io::ErrorKind::UnexpectedEof,
+                    "sandbox bootstrap ended early",
+                )));
+            }
+            Ok(_) => {
+                let [byte] = byte;
+                line.push(byte);
+                if byte == b'\n' {
+                    return Ok(line);
+                }
+                if line.len() >= MAX_STATUS_LINE {
+                    return Err(ProcessError::Containment(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "sandbox status line is too long",
+                    )));
+                }
+            }
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
+            Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                thread::sleep(Duration::from_millis(3));
+            }
+            Err(error) => return Err(ProcessError::Containment(error)),
         }
     }
 }
@@ -506,10 +1231,20 @@ impl StreamingMonitor {
         }
     }
 
+    #[cfg(test)]
     fn poll(
         &mut self,
         child: &mut Child,
         policy: StreamingPolicy<'_>,
+    ) -> Result<Option<StreamOutput>, ProcessError> {
+        self.poll_scoped(child, policy, &mut ScopeSession::new(None))
+    }
+
+    fn poll_scoped(
+        &mut self,
+        child: &mut Child,
+        policy: StreamingPolicy<'_>,
+        scope: &mut ScopeSession<'_>,
     ) -> Result<Option<StreamOutput>, ProcessError> {
         self.receive_diagnostics()?;
         self.poll_child(child)?;
@@ -517,23 +1252,20 @@ impl StreamingMonitor {
             return Err(ProcessError::TimedOut);
         }
         if self.status.is_some() && self.diagnostics.is_some() {
+            scope.stop_before_reap()?;
             // Stop writers before the last scan while the leader still reserves the group ID
             #[cfg(all(target_os = "linux", not(target_env = "uclibc")))]
             stop_group_before_final_scan(child, policy)?;
             #[cfg(all(test, target_os = "linux", not(target_env = "uclibc")))]
             tests::before_final_scan();
             self.scan_objects(policy)?;
-            if Instant::now() >= policy.deadline {
-                return Err(ProcessError::TimedOut);
-            }
+            check_start_budget(policy.deadline, policy.job)?;
             return self.finish().map(Some);
         }
         if Instant::now() >= self.next_scan {
             self.scan_objects(policy)?;
             self.next_scan = Instant::now() + Duration::from_millis(50);
-            if Instant::now() >= policy.deadline {
-                return Err(ProcessError::TimedOut);
-            }
+            check_start_budget(policy.deadline, policy.job)?;
         }
         Ok(None)
     }
@@ -569,12 +1301,7 @@ impl StreamingMonitor {
     }
 
     fn scan_objects(&mut self, policy: StreamingPolicy<'_>) -> Result<(), ProcessError> {
-        match observe_object_tree(
-            policy.object_root,
-            policy.protocol_directory_count,
-            policy.object_budget,
-            &mut self.usage,
-        ) {
+        match observe_object_tree(policy, &mut self.usage) {
             Ok(current) => {
                 // Every non-directory must be a private regular file in a protocol directory
                 self.unsafe_entries = usize::try_from(current.files).ok()
@@ -612,6 +1339,7 @@ impl StreamingMonitor {
                 std::mem::take(&mut self.stable_objects)
             },
             unsafe_entries: self.unsafe_entries,
+            scope: None,
         })
     }
 
@@ -629,26 +1357,28 @@ impl StreamingMonitor {
 }
 
 fn observe_object_tree(
-    root: &Path,
-    protocol_directory_count: u64,
-    budget: ObjectExportBudget,
+    policy: StreamingPolicy<'_>,
     usage: &mut ObjectExportUsage,
 ) -> Result<ObjectTreeScan, ProcessError> {
     usage.temporary_scan_complete = false;
-    let root_directory = open_tree_directory(root).map_err(ProcessError::Read)?;
+    check_start_budget(policy.deadline, policy.job)?;
+    let root_directory = open_tree_directory(policy.object_root).map_err(ProcessError::Read)?;
     let mut directories = vec![(std::path::PathBuf::new(), root_directory)];
-    let maximum_entries = budget
+    let maximum_entries = policy
+        .object_budget
         .temporary_files
-        .checked_add(protocol_directory_count)
+        .checked_add(policy.protocol_directory_count)
         .ok_or_else(|| {
             ProcessError::Read(io::Error::other("TShark object entry budget overflow"))
         })?;
     let mut scan = ObjectTreeScan::default();
     while let Some((relative_directory, directory)) = directories.pop() {
+        check_start_budget(policy.deadline, policy.job)?;
         // Each descriptor pins its directory even if the child replaces its name
         let directory_path = tree_directory_source(&directory).map_err(ProcessError::Read)?;
         let entries = fs::read_dir(directory_path).map_err(ProcessError::Read)?;
         for entry in entries {
+            check_start_budget(policy.deadline, policy.job)?;
             let entry = entry.map_err(ProcessError::Read)?;
             observe_tree_entry(
                 &entry,
@@ -656,18 +1386,20 @@ fn observe_object_tree(
                 &relative_directory,
                 &mut scan,
                 maximum_entries,
-                budget,
+                policy.object_budget,
                 usage,
             )?;
             #[cfg(all(test, target_os = "linux"))]
             tests::after_tree_entry();
         }
     }
+    check_start_budget(policy.deadline, policy.job)?;
     usage.temporary_bytes_peak = usage.temporary_bytes_peak.max(scan.bytes);
     usage.temporary_files_peak = usage.temporary_files_peak.max(scan.files);
-    usage.temporary_scan_complete = true;
     scan.stable_objects
         .sort_by(|left, right| left.relative_path.cmp(&right.relative_path));
+    check_start_budget(policy.deadline, policy.job)?;
+    usage.temporary_scan_complete = true;
     Ok(scan)
 }
 
@@ -876,6 +1608,7 @@ fn spawn(
     executable: &Path,
     arguments: &[OsString],
     environment: &[(OsString, OsString)],
+    gated: bool,
 ) -> Result<Child, ProcessError> {
     spawn_with_output(
         executable,
@@ -883,6 +1616,7 @@ fn spawn(
         environment,
         Stdio::piped(),
         Stdio::piped(),
+        gated,
     )
 }
 
@@ -892,6 +1626,7 @@ fn spawn_with_output(
     environment: &[(OsString, OsString)],
     stdout: Stdio,
     stderr: Stdio,
+    gated: bool,
 ) -> Result<Child, ProcessError> {
     // Auto-reaped children cannot reserve their process group during cleanup
     #[cfg(target_os = "linux")]
@@ -916,7 +1651,7 @@ fn spawn_with_output(
     }
     command
         .args(arguments)
-        .stdin(Stdio::null())
+        .stdin(if gated { Stdio::piped() } else { Stdio::null() })
         .stdout(stdout)
         .stderr(stderr)
         .spawn()

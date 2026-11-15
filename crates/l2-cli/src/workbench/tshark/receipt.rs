@@ -48,7 +48,7 @@ fn invocation_receipts(
     counted: &CaptureCount,
     decoded: &CaptureDecode,
 ) -> Vec<InvocationReceipt> {
-    vec![
+    let mut receipts = vec![
         invocation_receipt(
             "version",
             &[OsString::from("-n"), OsString::from("-v")],
@@ -82,7 +82,17 @@ fn invocation_receipts(
                 .as_ref()
                 .map(|snapshot| snapshot.path.as_path()),
         ),
-    ]
+    ];
+    for (receipt, containment) in receipts.iter_mut().zip([
+        inspection.version_output.scope,
+        inspection.plugin_output.scope,
+        inspection.preferences_output.scope,
+        counted.containment,
+        decoded.containment,
+    ]) {
+        receipt.containment = containment;
+    }
+    receipts
 }
 
 fn phase_diagnostics(
@@ -128,6 +138,7 @@ fn build_tool_receipt(
         executable_sha256: prepared.executable_sha256,
         version: inspection.version,
         budgets: BudgetReceipt {
+            resource_limits: Some(*prepared.resources.limits()),
             timeout_seconds: prepared.timeout_seconds,
             combined_input_bytes: prepared.input_maximum,
             metadata_stdout_bytes_per_phase: prepared.metadata_maximum,
@@ -181,6 +192,7 @@ fn invocation_receipt(
         })
         .collect();
     InvocationReceipt {
+        containment: None,
         phase: phase.to_owned(),
         argv,
     }

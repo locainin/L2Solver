@@ -1,7 +1,8 @@
 //! Build a mandatory, descriptor-bound sandbox for each offline `TShark` process
 
 use super::secure_files::{VerifiedExecutable, Workspace};
-use std::{ffi::OsString, fs::File, io, path::PathBuf};
+use l2_workbench::job::ResourcePlan;
+use std::{ffi::OsString, fs::File, io, path::PathBuf, time::Instant};
 
 #[cfg(target_os = "linux")]
 use {
@@ -19,6 +20,10 @@ use {
 #[path = "../../../tests/workbench/tshark/sandbox.rs"]
 mod tests;
 
+#[cfg(all(test, target_os = "linux"))]
+#[path = "../../../tests/workbench/tshark/sandbox_bridge.rs"]
+mod bridge_tests;
+
 #[cfg(target_os = "linux")]
 const BRIDGE: &str = concat!(
     "shopt -s failglob || exit 126; ",
@@ -29,7 +34,23 @@ const BRIDGE: &str = concat!(
     "if [[ -n $4 ]]; then exec 6<\"$4\" || exit 126; fi; ",
     "if [[ -n $5 ]]; then exec 7<\"$5\" || exit 126; fi; ",
     "if [[ -n $6 ]]; then exec 8<\"$6\" || exit 126; fi; ",
-    "shift 6; exec \"$@\"",
+    "if [[ $7 == 1 ]]; then exec 9>&1 || exit 126; fi; ",
+    "output=$7; shift 7; ",
+    "if [[ $output != 1 ]]; then exec \"$@\"; fi; ",
+    "\"$@\" <&0 & child=$!; ",
+    "wait \"$child\"; status=$?; ",
+    "printf 'L2_EXPORT_DONE:%d\\n' \"$status\" || exit 126; ",
+    "exec 1>&- 9>&- 2>/dev/null || exit 126; ",
+    "IFS= read -r || :; exit 0",
+);
+
+#[cfg(target_os = "linux")]
+const OUTPUT_BOOTSTRAP: &str = concat!(
+    "printf 'L2_EXPORT_READY\\n' || exit 126; ",
+    "IFS= read -r reply || exit 126; ",
+    "[[ $reply == L2_EXPORT_GO ]] || exit 126; ",
+    "exec </dev/null >/dev/null || exit 126; ",
+    "exec \"$@\"",
 );
 
 #[cfg(target_os = "linux")]
@@ -69,10 +90,6 @@ const BWRAP_OPTIONS: &[&str] = &[
     "/proc",
     "--dev",
     "/dev",
-    "--perms",
-    "1777",
-    "--tmpfs",
-    "/tmp",
     "--dir",
     "/tool",
 ];
@@ -118,6 +135,10 @@ const BLOCKED_SYSCALLS: &[libc::c_long] = &[
 /// Own the trusted files used to prepare every sandboxed invocation
 pub(super) struct Sandbox {
     #[cfg(target_os = "linux")]
+    plan: ResourcePlan,
+    #[cfg(target_os = "linux")]
+    deadline: Instant,
+    #[cfg(target_os = "linux")]
     workspace: File,
     #[cfg(target_os = "linux")]
     workspace_path: PathBuf,
@@ -141,7 +162,13 @@ pub(super) struct Launch {
     pub(super) arguments: Vec<OsString>,
     pub(super) environment: Vec<(OsString, OsString)>,
     #[cfg(target_os = "linux")]
-    _handles: Vec<File>,
+    pub(super) handles: Vec<File>,
+    #[cfg(target_os = "linux")]
+    pub(super) scope: Option<super::resource_scope::Gate>,
+    #[cfg(target_os = "linux")]
+    pub(super) output_bootstrap: bool,
+    #[cfg(target_os = "linux")]
+    pub(super) output_storage: Option<super::output_storage::OutputStorage>,
 }
 
 impl Sandbox {
@@ -151,6 +178,8 @@ impl Sandbox {
         executable: &VerifiedExecutable,
         capture: Option<&File>,
         keylog: Option<&File>,
+        plan: &ResourcePlan,
+        deadline: Instant,
     ) -> io::Result<Self> {
         #[cfg(target_os = "linux")]
         {
@@ -161,6 +190,8 @@ impl Sandbox {
             let mut filter = tempfile::tempfile_in(descriptor_source(&workspace.handle)?)?;
             filter.write_all(&seccomp_filter()?)?;
             Ok(Self {
+                plan: *plan,
+                deadline,
                 workspace: workspace.handle.try_clone()?,
                 workspace_path: workspace.path().to_owned(),
                 executable: executable.file.try_clone()?,
@@ -173,17 +204,17 @@ impl Sandbox {
         }
         #[cfg(not(target_os = "linux"))]
         {
-            let _ = (workspace, executable, capture, keylog);
+            let _ = (workspace, executable, capture, keylog, plan, deadline);
             Err(unsupported())
         }
     }
 
-    /// Build a launch that retains all mount sources and the optional output directory
+    /// Build a launch with private, bounded output and pinned mount sources
     pub(super) fn command(
         &self,
         arguments: &[OsString],
         environment: &[(OsString, OsString)],
-        output: Option<&File>,
+        output: Option<&[String]>,
     ) -> io::Result<Launch> {
         #[cfg(target_os = "linux")]
         {
@@ -204,10 +235,6 @@ impl Sandbox {
                 .as_ref()
                 .map(|file| held_source(&mut handles, file))
                 .transpose()?;
-            let output = output
-                .map(|file| held_source(&mut handles, file))
-                .transpose()?;
-
             // Clear inherited handles before opening only the sources this launch needs
             let mut command: Vec<OsString> =
                 ["--noprofile", "--norc", "-c", BRIDGE, "l2solver-sandbox"]
@@ -217,50 +244,137 @@ impl Sandbox {
             command.push(filter.into_os_string());
             command.push(workspace.into_os_string());
             command.push(executable.into_os_string());
-            for source in [&capture, &keylog, &output] {
+            for source in [&capture, &keylog] {
                 command.push(
                     source
                         .as_ref()
                         .map_or_else(OsString::new, |path| path.as_os_str().to_owned()),
                 );
             }
+            command.push(if output.is_some() {
+                shell.as_os_str().to_owned()
+            } else {
+                OsString::new()
+            });
+            command.push(OsString::from(if output.is_some() { "1" } else { "0" }));
             command.push(bubblewrap.into_os_string());
             command.extend(BWRAP_OPTIONS.iter().map(OsString::from));
-            append_bind(&mut command, "--ro-bind-fd", "4", "/work");
-            append_bind(&mut command, "--ro-bind-fd", "5", "/tool/tshark");
-            if capture.is_some() {
-                append_bind(&mut command, "--ro-bind-fd", "6", "/work/capture.bin");
-            }
-            if keylog.is_some() {
-                append_bind(&mut command, "--ro-bind-fd", "7", "/work/tls-keylog.txt");
-            }
-            if output.is_some() {
-                append_bind(&mut command, "--bind-fd", "8", "/output");
-            }
+            self.append_mounts(&mut command, output, capture.is_some(), keylog.is_some())?;
             self.append_environment(&mut command, environment, output.is_some());
-            command.extend(
-                ["--chdir", "/work", "--seccomp", "3", "--", "/tool/tshark"]
-                    .into_iter()
-                    .map(OsString::from),
-            );
-            command.extend(
-                arguments
-                    .iter()
-                    .map(|argument| self.map_argument(argument, output.is_some())),
-            );
-            Ok(Launch {
+            self.append_target(&mut command, arguments, output.is_some());
+            let launch = Launch {
                 executable: shell,
                 arguments: command,
                 // No caller-controlled environment reaches the pre-sandbox shell or bwrap
                 environment: Vec::new(),
-                _handles: handles,
-            })
+                handles,
+                scope: None,
+                output_bootstrap: output.is_some(),
+                output_storage: None,
+            };
+            self.scope_launch(launch)
         }
         #[cfg(not(target_os = "linux"))]
         {
             let _ = (arguments, environment, output);
             Err(unsupported())
         }
+    }
+
+    #[cfg(target_os = "linux")]
+    fn scope_launch(&self, launch: Launch) -> io::Result<Launch> {
+        let remaining = self.deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "TShark sandbox deadline expired",
+            ));
+        }
+        let limits = self.plan.limits();
+        super::resource_scope::ResourceScope::new(
+            limits.child_memory_bytes,
+            limits.child_swap_bytes,
+            limits.child_tasks,
+            remaining,
+        )?
+        .wrap(launch)
+    }
+
+    #[cfg(target_os = "linux")]
+    fn append_target(&self, command: &mut Vec<OsString>, arguments: &[OsString], output: bool) {
+        command.extend(
+            ["--chdir", "/work", "--seccomp", "3", "--"]
+                .into_iter()
+                .map(OsString::from),
+        );
+        if output {
+            command.extend(
+                [
+                    "/tool/bootstrap",
+                    "--noprofile",
+                    "--norc",
+                    "-c",
+                    OUTPUT_BOOTSTRAP,
+                    "l2solver-object-export",
+                ]
+                .into_iter()
+                .map(OsString::from),
+            );
+        }
+        command.push(OsString::from("/tool/tshark"));
+        command.extend(
+            arguments
+                .iter()
+                .map(|argument| self.map_argument(argument, output)),
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    fn append_mounts(
+        &self,
+        command: &mut Vec<OsString>,
+        output: Option<&[String]>,
+        capture: bool,
+        keylog: bool,
+    ) -> io::Result<()> {
+        let limits = self.plan.limits();
+        append_tmpfs(command, "/tmp", limits.tmpfs_bytes.get(), "1777");
+        append_tmpfs(command, "/dev/shm", limits.shm_bytes.get(), "1777");
+        append_bind(command, "--ro-bind-fd", "4", "/work");
+        append_bind(command, "--ro-bind-fd", "5", "/tool/tshark");
+        if capture {
+            append_bind(command, "--ro-bind-fd", "6", "/work/capture.bin");
+        }
+        if keylog {
+            append_bind(command, "--ro-bind-fd", "7", "/work/tls-keylog.txt");
+        }
+        if let Some(protocols) = output {
+            if protocols
+                .iter()
+                .any(|protocol| !super::objects::valid_type(protocol))
+            {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "invalid output protocol",
+                ));
+            }
+            append_tmpfs(command, "/output", limits.object_bytes.get(), "0700");
+            for protocol in protocols {
+                command.extend([
+                    OsString::from("--dir"),
+                    OsString::from(format!("/output/{protocol}")),
+                ]);
+            }
+            append_bind(command, "--ro-bind-fd", "8", "/tool/bootstrap");
+            command.extend([OsString::from("--json-status-fd"), OsString::from("9")]);
+        }
+        // The implicit root and device mounts must not provide spare writable space
+        command.extend(
+            ["--remount-ro", "/", "--remount-ro", "/dev"]
+                .into_iter()
+                .map(OsString::from),
+        );
+        Ok(())
     }
 
     #[cfg(target_os = "linux")]
@@ -430,7 +544,7 @@ fn invalid_status() -> io::Error {
 }
 
 #[cfg(target_os = "linux")]
-fn trusted_system_executable(path: &Path) -> io::Result<File> {
+pub(super) fn trusted_system_executable(path: &Path) -> io::Result<File> {
     let executable = VerifiedExecutable::open(path)?;
     if fs::fstat(&executable.file)?.st_uid != 0 {
         return Err(io::Error::new(
@@ -462,6 +576,18 @@ fn append_bind(arguments: &mut Vec<OsString>, option: &str, source: &str, destin
     arguments.extend([
         OsString::from(option),
         OsString::from(source),
+        OsString::from(destination),
+    ]);
+}
+
+#[cfg(target_os = "linux")]
+fn append_tmpfs(arguments: &mut Vec<OsString>, destination: &str, size: u64, mode: &str) {
+    arguments.extend([
+        OsString::from("--size"),
+        OsString::from(size.to_string()),
+        OsString::from("--perms"),
+        OsString::from(mode),
+        OsString::from("--tmpfs"),
         OsString::from(destination),
     ]);
 }

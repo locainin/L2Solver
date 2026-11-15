@@ -9,7 +9,7 @@ use super::{
     profile::verify_effective_preferences,
     run,
     secure_files::Workspace,
-    snapshot::{snapshot_with_clock, verify_source_unchanged},
+    snapshot::{HashControl, snapshot_with_clock, verify_source_unchanged},
 };
 use crate::arguments::{TsharkOptions, WorkbenchCommand, parse};
 use sha2::{Digest, Sha256};
@@ -155,7 +155,7 @@ fn tshark_budgets_old_arbitrary_ceiling() -> Result<(), Box<dyn Error>> {
         return Err("TShark subcommand did not produce TShark options".into());
     };
     assert_eq!(options.timeout_seconds, 5000);
-    assert_eq!(options.max_input_mib, 20_000);
+    assert_eq!(options.max_input_mib, Some(20_000));
     assert_eq!(options.max_metadata_mib, 20_000);
     assert_eq!(options.max_output_mib, 20_000);
     assert_eq!(options.max_diagnostics_mib, 20_000);
@@ -172,7 +172,19 @@ fn changed_source_rejected_tool_execution() -> Result<(), Box<dyn Error>> {
 
     fs::write(&source_path, b"second snapshot")?;
 
-    assert!(verify_source_unchanged(&mut source, &source_path, &digest, 14).is_err());
+    assert!(
+        verify_source_unchanged(
+            &mut source,
+            &source_path,
+            &digest,
+            14,
+            HashControl {
+                deadline: Instant::now() + Duration::from_secs(10),
+                job: None
+            },
+        )
+        .is_err()
+    );
     Ok(())
 }
 
@@ -187,7 +199,7 @@ fn absent_tshark_error_without_dependency() -> Result<(), Box<dyn Error>> {
         tls_keylog: None,
         output: None,
         timeout_seconds: 1,
-        max_input_mib: 1,
+        max_input_mib: Some(1),
         max_metadata_mib: 1,
         max_output_mib: 1,
         max_diagnostics_mib: 1,
@@ -208,7 +220,8 @@ fn tshark_capture_snapshot_uses_preparation_deadline() -> Result<(), Box<dyn Err
         keylog: None,
         timeout: Duration::from_secs(1),
         timeout_seconds: 1,
-        input_maximum: u64::MAX,
+        input_maximum: Some(u64::MAX),
+        object_budget: None,
         metadata_maximum: 1024,
         output_maximum: 1024,
         diagnostic_maximum: 1024,
@@ -218,7 +231,7 @@ fn tshark_capture_snapshot_uses_preparation_deadline() -> Result<(), Box<dyn Err
         .ok_or("test clock could not represent a prior instant")?;
 
     assert_error_contains(
-        prepare_capture_from_at(preparation, None, started_at),
+        prepare_capture_from_at(&preparation, None, started_at),
         "time budget",
     )?;
     Ok(())
@@ -329,7 +342,7 @@ fn installed_tshark_policy() -> Result<(), Box<dyn Error>> {
         tls_keylog: Some(keylog.clone()),
         output: None,
         timeout_seconds: 30,
-        max_input_mib: 1,
+        max_input_mib: Some(1),
         max_metadata_mib: 1,
         max_output_mib: 16,
         max_diagnostics_mib: 1,

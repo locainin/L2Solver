@@ -37,6 +37,7 @@ pub struct Workspace {
 
 impl Workspace {
     /// Create a workspace inside a trusted directory
+    #[cfg(test)]
     pub(crate) fn new(parent: Option<&Path>) -> io::Result<Self> {
         #[cfg(target_os = "linux")]
         {
@@ -57,7 +58,7 @@ impl Workspace {
     }
 
     #[cfg(target_os = "linux")]
-    fn in_parent(parent: File) -> io::Result<Self> {
+    pub(super) fn in_parent(parent: File) -> io::Result<Self> {
         // The saved descriptor, not the original name, determines the creation target
         let parent_path = descriptor_source(&parent)?;
         let directory = tempfile::Builder::new()
@@ -77,6 +78,11 @@ impl Workspace {
             handle,
             parent,
         })
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    pub(super) fn in_parent(_parent: File) -> io::Result<Self> {
+        Err(unsupported_platform())
     }
 
     /// The proc-fd path remains valid while the workspace exists
@@ -173,7 +179,7 @@ fn open_verified_inode(candidate: &File) -> io::Result<File> {
 }
 
 #[cfg(target_os = "linux")]
-fn open_trusted_directory(path: &Path) -> io::Result<File> {
+pub(super) fn open_trusted_directory(path: &Path) -> io::Result<File> {
     let canonical = path.canonicalize()?;
     let flags = OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC;
     let current = File::from(fs::openat(CWD, Path::new("/"), flags, Mode::empty())?);

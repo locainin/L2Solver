@@ -227,6 +227,66 @@ fn require_tshark_change_conflicts_until_refresh() -> Result<(), Box<dyn Error>>
     Ok(())
 }
 
+#[test]
+fn object_limit_identity() -> Result<(), Box<dyn Error>> {
+    let fixture = Fixture::new("TShark (Wireshark) 4.4.21")?;
+    let first = run_limits(&fixture, "1", "5", &[])?;
+    assert_success(&first);
+    assert_exported_object(&fixture.destination)?;
+    let original_manifest = manifest_bytes(&fixture.destination)?;
+    let original_artifacts = repeated::artifact_contents(&fixture.destination)?;
+    let original = manifest(&fixture.destination)?;
+    assert_eq!(
+        original
+            .pointer("/l2solver_result/identity/settings/tshark/resource_requests/object_bytes")
+            .and_then(serde_json::Value::as_u64),
+        Some(1024 * 1024)
+    );
+    assert_eq!(
+        original
+            .pointer("/l2solver_result/identity/settings/tshark/resource_requests/object_files")
+            .and_then(serde_json::Value::as_u64),
+        Some(5)
+    );
+    assert_eq!(
+        original
+            .pointer("/l2solver_result/identity/settings/tshark/resource_requests/object_explicit")
+            .and_then(serde_json::Value::as_bool),
+        Some(true)
+    );
+
+    for (bytes, files) in [("2", "5"), ("1", "6")] {
+        let changed = run_limits(&fixture, bytes, files, &[])?;
+        assert_identity_conflict(
+            &fixture.destination,
+            &changed,
+            &original_manifest,
+            &original_artifacts,
+        )?;
+    }
+    let refreshed = run_limits(&fixture, "2", "6", &["--refresh"])?;
+    assert_success(&refreshed);
+    assert_exported_object(&fixture.destination)?;
+    assert_eq!(
+        repeated::artifact_contents(&fixture.destination)?,
+        original_artifacts
+    );
+    let refreshed_manifest = manifest(&fixture.destination)?;
+    assert_eq!(
+        refreshed_manifest
+            .pointer("/tshark/object_export_budget/temporary_bytes")
+            .and_then(serde_json::Value::as_u64),
+        Some(2 * 1024 * 1024)
+    );
+    assert_eq!(
+        refreshed_manifest
+            .pointer("/tshark/object_export_budget/temporary_files")
+            .and_then(serde_json::Value::as_u64),
+        Some(6)
+    );
+    Ok(())
+}
+
 struct Fixture {
     _temporary: tempfile::TempDir,
     root: PathBuf,
@@ -312,6 +372,22 @@ fn run(
 ) -> std::io::Result<Output> {
     let mut command = repeated::extraction_command(&fixture.root, &fixture.capture, destination);
     command.env("PATH", path).args(flags).output()
+}
+
+fn run_limits(
+    fixture: &Fixture,
+    bytes: &str,
+    files: &str,
+    flags: &[&str],
+) -> std::io::Result<Output> {
+    let mut command =
+        repeated::extraction_command(&fixture.root, &fixture.capture, &fixture.destination);
+    command
+        .env("PATH", &fixture.tshark)
+        .env("L2SOLVER_TSHARK_OBJECT_MIB", bytes)
+        .env("L2SOLVER_TSHARK_OBJECT_FILES", files)
+        .args(flags)
+        .output()
 }
 
 fn assert_success(output: &Output) {

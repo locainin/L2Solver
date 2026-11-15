@@ -15,6 +15,7 @@ use serde::de::DeserializeSeed;
 use std::{error::Error, ffi::OsString};
 
 pub(super) struct CaptureDecode {
+    pub(super) containment: Option<l2_workbench::tshark::ScopeReceipt>,
     pub(super) arguments: Vec<OsString>,
     pub(super) stderr: Vec<u8>,
     pub(super) output_sha256: String,
@@ -48,6 +49,7 @@ pub(super) fn decode_capture(prepared: &PreparedCapture) -> Result<CaptureDecode
         stdout,
         stderr,
         status,
+        scope,
     } = run_phase(prepared, &arguments, prepared.output_maximum)?;
     require_success("offline decode", status, &stderr)?;
     // Hash the original bytes before releasing them after decoding
@@ -55,6 +57,7 @@ pub(super) fn decode_capture(prepared: &PreparedCapture) -> Result<CaptureDecode
     let packets = decode_packets(&stdout, stdout.capacity(), prepared.output_maximum)?;
     drop(stdout);
     Ok(CaptureDecode {
+        containment: scope,
         arguments,
         stderr,
         output_sha256,

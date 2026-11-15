@@ -33,6 +33,8 @@ fn extract_help_describes_recovery_and_optional_enrichment()
         "available artifacts are still published",
         "summary.txt shows native and TShark status separately",
         "TShark enrichment is optional",
+        "L2SOLVER_TSHARK_OBJECT_MIB",
+        "L2SOLVER_TSHARK_OBJECT_FILES",
         "--require-tshark",
         "Packets outside discovery scope are reported without failing extraction",
         "Select the search effort: fast, normal, or deep",

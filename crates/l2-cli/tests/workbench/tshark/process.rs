@@ -19,6 +19,10 @@ mod capture;
 #[path = "process/spawn_failure.rs"]
 mod spawn_failure;
 
+#[cfg(target_os = "linux")]
+#[path = "process/containment.rs"]
+mod containment;
+
 #[cfg(all(target_os = "linux", not(target_env = "uclibc")))]
 #[path = "process/pgid_reuse.rs"]
 mod pgid_reuse;

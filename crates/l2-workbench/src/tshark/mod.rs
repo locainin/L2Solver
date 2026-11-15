@@ -4,5 +4,6 @@ mod model;
 
 pub use model::{
     BudgetReceipt, Diagnostic, EnrichedPacket, InvocationReceipt, PacketCountReceipt, PluginRecord,
-    ProfileReceipt, Provenance, SourceIdentity, ToolReceipt, TsharkFrameObservation, TsharkReport,
+    ProfileReceipt, Provenance, ScopeReceipt, ScopeUsage, SourceIdentity, ToolReceipt,
+    TsharkFrameObservation, TsharkReport,
 };
