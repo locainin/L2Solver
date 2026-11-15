@@ -60,6 +60,24 @@ fn sorts_interfaces_and_rejects_unknown() -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
+#[cfg(target_os = "linux")]
+#[test]
+fn interface_list_excludes_unbound_any() -> Result<(), Box<dyn Error>> {
+    if nix::net::if_::if_nametoindex("any").is_ok() {
+        return Ok(());
+    }
+    let output = Command::new(env!("CARGO_BIN_EXE_l2solver"))
+        .arg("interfaces")
+        .output()?;
+    assert!(output.status.success());
+    let text = String::from_utf8(output.stdout)?;
+    assert!(
+        !text.lines().any(|line| line.starts_with("any\t")),
+        "unbound libpcap source was listed as a capture interface"
+    );
+    Ok(())
+}
+
 #[test]
 fn observes_stp_from_live_bridge() -> Result<(), Box<dyn Error>> {
     let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
