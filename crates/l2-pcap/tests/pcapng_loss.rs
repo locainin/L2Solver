@@ -93,6 +93,39 @@ fn interface_statistics_section_maxima() -> Result<(), Box<dyn Error>> {
 }
 
 #[test]
+fn interface_statistics_minimum_block() -> Result<(), Box<dyn Error>> {
+    for order in [ByteOrder::Little, ByteOrder::Big] {
+        let mut capture = section_header(order, -1);
+        capture.extend_from_slice(&interface(order, 64, &[]));
+        // The required fields fit in a 24-byte block when options are absent
+        let statistics = block(order, 5, &[0; 12]);
+        assert_eq!(statistics.len(), 24);
+        capture.extend_from_slice(&statistics);
+        capture.extend_from_slice(&enhanced_packet(order, 0, 1, &[0x42], 1, &[]));
+
+        let mut reader = PcapNgReader::new(Cursor::new(capture))?;
+        let packet = reader.next_packet();
+        assert!(
+            matches!(&packet, Ok(Some(_))),
+            "a minimum-length statistics block must not stop the following packet"
+        );
+        assert_eq!(packet?.ok_or("missing packet")?.bytes(), [0x42]);
+        assert!(reader.next_packet()?.is_none());
+        assert_eq!(
+            reader
+                .collection_summary()
+                .interface_statistics_interface_dropped,
+            None
+        );
+        assert_eq!(
+            reader.collection_summary().interface_statistics_os_dropped,
+            None
+        );
+    }
+    Ok(())
+}
+
+#[test]
 fn interface_statistics_invalid_fields() {
     for order in [ByteOrder::Little, ByteOrder::Big] {
         let mut header = section_header(order, -1);
