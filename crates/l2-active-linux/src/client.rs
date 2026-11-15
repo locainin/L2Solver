@@ -40,6 +40,11 @@ const RESPONSE_RESERVE: Duration = Duration::from_secs(2);
 const RECEIVE_SLICE: Duration = Duration::from_millis(40);
 
 /// One explicitly admitted operation executed by the active helper
+///
+/// The host must not ignore `SIGCHLD` or set `SA_NOCLDWAIT`, and no other
+/// waiter may reap helper children. Keep this policy while helpers or their
+/// asynchronous cleanup are active. The ignored-signal case is checked at
+/// launch; other violations cannot be detected reliably
 pub struct HelperLink {
     channel: Channel,
     control: Option<OwnedFd>,

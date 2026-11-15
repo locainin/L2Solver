@@ -1,3 +1,5 @@
+//! Reap helper children under the host's sole-waiter signal policy
+
 #[cfg(test)]
 #[path = "../tests/reaper/slots.rs"]
 pub mod tests;
@@ -75,7 +77,7 @@ impl Retention {
 }
 
 pub fn reserve() -> io::Result<Lease> {
-    // Automatic child reaping can make a numeric PID refer to another process
+    // The public host contract also excludes SA_NOCLDWAIT and competing waiters
     let status = std::fs::read_to_string("/proc/self/status").map_err(|error| {
         io::Error::new(
             error.kind(),

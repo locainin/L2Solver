@@ -29,6 +29,11 @@ pub enum ActiveOutcome {
 
 /// Execute an active command using an externally controlled cancellation token
 ///
+/// On Linux, the host must not ignore `SIGCHLD` or set `SA_NOCLDWAIT`, and no other
+/// waiter may reap helper children. Keep this policy while helpers or their
+/// asynchronous cleanup are active. The ignored-signal case is checked at
+/// launch; other violations cannot be detected reliably
+///
 /// # Errors
 /// Returns a typed error for discovery, scope, helper, or output failures
 pub fn execute(
