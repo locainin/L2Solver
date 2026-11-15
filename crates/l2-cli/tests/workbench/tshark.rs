@@ -6,7 +6,7 @@ use super::{
     decode::decode_packets,
     preparation::{CapturePreparation, prepare_capture_from_at},
     process::{self, ProcessError},
-    profile::verify_effective_preferences,
+    profile::{create_profile, verify_effective_preferences},
     run,
     secure_files::Workspace,
     snapshot::{HashControl, snapshot_with_clock, verify_source_unchanged},
@@ -99,6 +99,8 @@ fn tshark_json_ambiguous_packet_identity() {
 
 #[test]
 fn isolated_profile_missing_changed_settings() -> Result<(), Box<dyn Error>> {
+    let temporary = tempfile::tempdir()?;
+    let profile = create_profile(temporary.path(), None)?;
     let preferences = concat!(
         "# L2Solver isolated offline profile\n",
         "gui.packet_list_show_related: FALSE\n",
@@ -110,7 +112,7 @@ fn isolated_profile_missing_changed_settings() -> Result<(), Box<dyn Error>> {
         "tls.desegment_ssl_records: TRUE\n",
         "tls.desegment_ssl_application_data: TRUE\n",
     );
-    let verified = verify_effective_preferences(preferences.as_bytes())?;
+    let verified = verify_effective_preferences(preferences.as_bytes(), &profile)?;
 
     assert_eq!(
         verified
@@ -123,8 +125,11 @@ fn isolated_profile_missing_changed_settings() -> Result<(), Box<dyn Error>> {
         Some("TRUE")
     );
     assert!(
-        verify_effective_preferences(b"#gui.packet_list_show_related: TRUE\nip.defragment: TRUE\n")
-            .is_err()
+        verify_effective_preferences(
+            b"#gui.packet_list_show_related: TRUE\nip.defragment: TRUE\n",
+            &profile
+        )
+        .is_err()
     );
     Ok(())
 }

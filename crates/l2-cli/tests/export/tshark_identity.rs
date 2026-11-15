@@ -13,6 +13,141 @@ use std::{
 const EXPORTED_OBJECT: &[u8] = b"identity fixture exported object";
 
 #[test]
+fn collision_bodies_published() -> Result<(), Box<dyn Error>> {
+    use std::collections::BTreeSet;
+
+    let fixture = Fixture::with_export("TShark (Wireshark) 4.4.19", &collision_script(1001))?;
+    let output = run_limits(&fixture, "8", "1001", &["--require-tshark"])?;
+    assert_success(&output);
+    assert_eq!(
+        manifest(&fixture.destination)?
+            .pointer("/tshark/status")
+            .and_then(serde_json::Value::as_str),
+        Some("complete")
+    );
+    let actual = repeated::artifact_contents(&fixture.destination)?
+        .into_iter()
+        .map(|(_, body)| body)
+        .filter(|body| body.starts_with(b"object-"))
+        .collect::<BTreeSet<_>>();
+    let expected = (0..1001)
+        .map(|number| format!("object-{number:04}").into_bytes())
+        .collect::<BTreeSet<_>>();
+    assert_eq!(actual, expected);
+    Ok(())
+}
+
+#[test]
+fn collision_guard_is_partial() -> Result<(), Box<dyn Error>> {
+    let fixture = Fixture::with_export("TShark (Wireshark) 4.4.19", &collision_script(8))?;
+    let output = run_limits(&fixture, "1", "3", &["--require-tshark"])?;
+    assert_eq!(
+        output.status.code(),
+        Some(3),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let result = manifest(&fixture.destination)?;
+    assert_eq!(
+        result
+            .pointer("/tshark/status")
+            .and_then(serde_json::Value::as_str),
+        Some("partial")
+    );
+    assert!(
+        fs::read_to_string(fixture.destination.join("summary.txt"))?
+            .contains("TShark export: partial")
+    );
+    Ok(())
+}
+
+#[test]
+fn ignored_collision_profile_is_partial() -> Result<(), Box<dyn Error>> {
+    let fixture = Fixture::with_export("TShark (Wireshark) 4.4.19", &collision_script(8))?;
+    let executable = fixture.tshark.join("tshark");
+    let script = fs::read_to_string(&executable)?;
+    let expected = "while IFS= read -r line; do printf '%s\\n' \"$line\"; done < \"$WIRESHARK_CONFIG_DIR/profiles/$5/preferences\"";
+    let wrong = "while IFS= read -r line; do case \"$line\" in 'gui.max_export_objects: '*) printf '%s\\n' 'gui.max_export_objects: 1000' ;; *) printf '%s\\n' \"$line\" ;; esac; done < \"$WIRESHARK_CONFIG_DIR/profiles/$5/preferences\"";
+    assert!(
+        script.contains(expected),
+        "fixture preference phase missing"
+    );
+    fs::write(&executable, script.replace(expected, wrong))?;
+    let output = run_limits(&fixture, "1", "3", &["--require-tshark"])?;
+    assert_eq!(
+        output.status.code(),
+        Some(3),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let summary = fs::read_to_string(fixture.destination.join("summary.txt"))?;
+    assert!(summary.contains("TShark profile setting gui.max_export_objects did not take effect"));
+    assert!(summary.contains("TShark export: partial"));
+    Ok(())
+}
+
+#[test]
+fn export_diagnostics_reach_receipt() -> Result<(), Box<dyn Error>> {
+    for (diagnostic, partial) in [
+        ("informational message", false),
+        (
+            "tshark: The file \"/output/http/object.bin\" could not be created: Permission denied.",
+            true,
+        ),
+    ] {
+        let script = format!(
+            "printf '%s\\n' '{diagnostic}' >&2; printf '%s' 'object body' > \"$destination/object.bin\""
+        );
+        let fixture = Fixture::with_export("TShark (Wireshark) 4.4.19", &script)?;
+        let output = run_limits(&fixture, "1", "3", &["--require-tshark"])?;
+        assert_eq!(
+            output.status.code(),
+            Some(if partial { 3 } else { 0 }),
+            "{diagnostic}"
+        );
+        let result = manifest(&fixture.destination)?;
+        assert_eq!(
+            result
+                .pointer("/tshark/status")
+                .and_then(serde_json::Value::as_str),
+            Some(if partial { "partial" } else { "complete" }),
+            "{diagnostic}"
+        );
+        if partial {
+            let issues = result
+                .pointer("/tshark/issues")
+                .and_then(serde_json::Value::as_array)
+                .ok_or("TShark issues missing")?;
+            assert!(issues.iter().any(|issue| {
+                issue
+                    .as_str()
+                    .is_some_and(|issue| issue.contains(diagnostic))
+            }));
+        }
+    }
+    Ok(())
+}
+
+fn collision_script(count: usize) -> String {
+    r#"
+limit=1000
+while IFS= read -r line; do
+    case "$line" in
+        'gui.max_export_objects: '*) limit=${line#'gui.max_export_objects: '} ;;
+    esac
+done < "$WIRESHARK_CONFIG_DIR/profiles/l2solver-offline/preferences"
+number=0
+while [ "$number" -lt __COUNT__ ]; do
+    slot=$number
+    if [ "$slot" -ge "$limit" ]; then slot=$((limit - 1)); fi
+    printf 'object-%04d' "$number" > "$destination/same($slot).bin"
+    number=$((number + 1))
+done
+"#
+    .replace("__COUNT__", &count.to_string())
+}
+
+#[test]
 fn required_export_failure() -> Result<(), Box<dyn Error>> {
     let fixture = Fixture::new("TShark (Wireshark) 4.4.19")?;
     fixture.set_script("TShark (Wireshark) 4.4.19", ExportMode::Fails)?;
@@ -304,14 +439,18 @@ enum ExportMode {
 
 impl Fixture {
     fn new(version: &str) -> Result<Self, Box<dyn Error>> {
+        Self::with_export(
+            version,
+            "printf '%s' 'identity fixture exported object' > \"$destination/identity-fixture.txt\"",
+        )
+    }
+
+    fn with_export(version: &str, export: &str) -> Result<Self, Box<dyn Error>> {
         let temporary = tempfile::tempdir()?;
         let root = temporary.path().to_owned();
         let capture = root.join("capture.pcap");
         let destination = root.join("result");
-        let tshark = install_tshark(
-            &root,
-            "printf '%s' 'identity fixture exported object' > \"$destination/identity-fixture.txt\"",
-        )?;
+        let tshark = install_tshark(&root, export)?;
         let wrapper = tshark.join("tshark");
         let export_script = fs::read_to_string(&wrapper)?;
         fs::write(

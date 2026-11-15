@@ -34,10 +34,27 @@ pub(super) struct Profile {
     xdg_config_directory: PathBuf,
     xdg_data_directory: PathBuf,
     temporary_directory: PathBuf,
+    preferences: String,
     pub(super) preferences_sha256: String,
 }
 
-pub(super) fn create_profile(directory: &Path) -> io::Result<Profile> {
+pub(super) fn create_profile(directory: &Path, object_files: Option<u64>) -> io::Result<Profile> {
+    let mut preferences = PREFERENCES.to_owned();
+    if let Some(object_files) = object_files {
+        // A guard filename makes suffix exhaustion exceed the monitored file budget
+        let collision_limit = object_files
+            .checked_add(1)
+            .and_then(|limit| i32::try_from(limit).ok())
+            .ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "TShark object count exceeds the supported collision limit",
+                )
+            })?;
+        preferences.push_str("gui.max_export_objects: ");
+        preferences.push_str(&collision_limit.to_string());
+        preferences.push('\n');
+    }
     let config_directory = directory.join("config");
     let extcap_directory = directory.join("extcap");
     let home_directory = directory.join("home");
@@ -49,7 +66,8 @@ pub(super) fn create_profile(directory: &Path) -> io::Result<Profile> {
     fs::create_dir_all(&xdg_data_directory)?;
     // Offline reads need no external capture helpers, including helpers probed at startup
     fs::create_dir(&extcap_directory)?;
-    fs::write(profile_directory.join("preferences"), PREFERENCES)?;
+    fs::write(profile_directory.join("preferences"), &preferences)?;
+    let preferences_sha256 = sha256(preferences.as_bytes());
     Ok(Profile {
         config_directory,
         extcap_directory,
@@ -57,7 +75,8 @@ pub(super) fn create_profile(directory: &Path) -> io::Result<Profile> {
         xdg_config_directory,
         xdg_data_directory,
         temporary_directory: directory.to_owned(),
-        preferences_sha256: sha256(PREFERENCES.as_bytes()),
+        preferences,
+        preferences_sha256,
     })
 }
 
@@ -87,8 +106,10 @@ pub(super) fn profile_environment(profile: &Profile) -> Vec<(OsString, OsString)
 
 pub(super) fn verify_effective_preferences(
     bytes: &[u8],
+    profile: &Profile,
 ) -> Result<BTreeMap<String, String>, Box<dyn Error>> {
-    let expected = PREFERENCES
+    let expected = profile
+        .preferences
         .lines()
         .map(str::trim)
         .filter(|line| !line.is_empty() && !line.starts_with('#'))

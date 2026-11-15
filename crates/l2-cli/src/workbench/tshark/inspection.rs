@@ -43,15 +43,8 @@ pub(super) fn inspect_tool(prepared: &PreparedCapture) -> Result<ToolInspection,
     )?;
     let plugins = parse_plugins(&plugin_output.stdout)?;
 
-    let mut preferences_args = vec![OsString::from("-G"), OsString::from("currentprefs")];
-    preferences_args.extend_from_slice(&profile_args);
-    let preferences_output = run_phase(prepared, &preferences_args, prepared.metadata_maximum)?;
-    require_success(
-        "effective preferences",
-        preferences_output.status,
-        &preferences_output.stderr,
-    )?;
-    let verified_profile_preferences = verify_effective_preferences(&preferences_output.stdout)?;
+    let (preferences_args, preferences_output, verified_profile_preferences) =
+        inspect_preferences(prepared)?;
     let effective_preferences_count = preference_count(&preferences_output.stdout)?;
     Ok(ToolInspection {
         version,
@@ -64,6 +57,25 @@ pub(super) fn inspect_tool(prepared: &PreparedCapture) -> Result<ToolInspection,
         verified_profile_preferences,
         effective_preferences_count,
     })
+}
+
+type PreferenceInspection = (Vec<OsString>, process::Output, BTreeMap<String, String>);
+
+pub(super) fn inspect_preferences(
+    prepared: &PreparedCapture,
+) -> Result<PreferenceInspection, Box<dyn Error>> {
+    let preferences_args = ["-G", "currentprefs", "-n", "-C", PROFILE]
+        .into_iter()
+        .map(OsString::from)
+        .collect::<Vec<_>>();
+    let preferences_output = run_phase(prepared, &preferences_args, prepared.metadata_maximum)?;
+    require_success(
+        "effective preferences",
+        preferences_output.status,
+        &preferences_output.stderr,
+    )?;
+    let verified = verify_effective_preferences(&preferences_output.stdout, &prepared.profile)?;
+    Ok((preferences_args, preferences_output, verified))
 }
 
 pub(super) fn inspect_version(

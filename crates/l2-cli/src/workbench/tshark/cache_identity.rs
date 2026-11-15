@@ -21,7 +21,7 @@ use std::os::unix::ffi::OsStrExt;
 #[cfg(windows)]
 use std::os::windows::ffi::OsStrExt;
 
-const ARGUMENTS_EPOCH: u32 = 3;
+const ARGUMENTS_EPOCH: u32 = 4;
 const VERSION_ARGUMENTS: [&str; 2] = ["-n", "-v"];
 const VERSION_PROBE_TIMEOUT: Duration = Duration::from_secs(2);
 const VERSION_STDOUT_MAXIMUM: usize = 4 * 1024;

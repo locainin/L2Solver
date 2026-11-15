@@ -7,8 +7,107 @@ use std::{
     time::{Duration, Instant},
 };
 
+#[cfg(all(target_os = "linux", not(target_env = "uclibc")))]
+#[path = "collisions.rs"]
+mod collisions;
+
 fn deadline() -> Instant {
     Instant::now() + Duration::from_secs(5)
+}
+
+#[test]
+fn object_profile_collision_limit() -> Result<(), Box<dyn Error>> {
+    let temporary = tempfile::tempdir()?;
+    let profile = super::super::profile::create_profile(temporary.path(), Some(16_384))?;
+    let environment = super::super::profile::profile_environment(&profile);
+    let config = environment
+        .iter()
+        .find(|(name, _)| name == "WIRESHARK_CONFIG_DIR")
+        .map(|(_, value)| PathBuf::from(value))
+        .ok_or("profile configuration directory missing")?;
+    let preferences = fs::read_to_string(
+        config
+            .join("profiles")
+            .join(super::super::profile::PROFILE)
+            .join("preferences"),
+    )?;
+    assert!(
+        preferences
+            .lines()
+            .any(|line| line == "gui.max_export_objects: 16385")
+    );
+    let verify = super::super::profile::verify_effective_preferences;
+    assert!(verify(preferences.as_bytes(), &profile).is_ok());
+    assert!(verify(preferences.replace("16385", "1000").as_bytes(), &profile).is_err());
+    assert!(verify(super::super::profile::PREFERENCES.as_bytes(), &profile).is_err());
+    for invalid in [i32::MAX as u64, u64::MAX] {
+        let temporary = tempfile::tempdir()?;
+        assert!(super::super::profile::create_profile(temporary.path(), Some(invalid)).is_err());
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+#[test]
+fn export_diagnostics() -> Result<(), Box<dyn Error>> {
+    use std::os::unix::process::ExitStatusExt;
+
+    for (diagnostic, truncated, partial) in [
+        ("", false, false),
+        ("tshark: informational message\n", false, false),
+        (
+            "tshark: The file \"/output/http/object\" could not be created: Permission denied.\n",
+            false,
+            true,
+        ),
+        (
+            "tshark: An error occurred while writing to the file \"/output/http/object\": Input/output error.\n",
+            false,
+            true,
+        ),
+        ("informational tail", true, true),
+    ] {
+        let temporary = tempfile::tempdir()?;
+        let root = temporary.path().join("objects");
+        let protocol = root.join("http");
+        fs::create_dir_all(&protocol)?;
+        let output = super::process::StreamOutput {
+            stderr: diagnostic.as_bytes().to_vec(),
+            stderr_truncated: truncated,
+            status: std::process::ExitStatus::from_raw(0),
+            object_usage: super::ObjectExportUsage::default(),
+            objects: Vec::new(),
+            unsafe_entries: false,
+            scope: None,
+        };
+        let result = super::resolve_object_export(
+            Ok(output),
+            &root,
+            &temporary.path().join("snapshot"),
+            &[(String::from("http"), protocol)],
+            deadline(),
+            None,
+            Some(&clean_scope()),
+        )?;
+        assert_eq!(
+            result.status,
+            if partial {
+                super::ObjectExportStatus::Partial
+            } else {
+                super::ObjectExportStatus::Complete
+            },
+            "{diagnostic:?}, truncated={truncated}"
+        );
+        if partial && !truncated {
+            assert!(
+                result
+                    .issues
+                    .iter()
+                    .any(|issue| issue.contains(diagnostic.trim()))
+            );
+        }
+    }
+    Ok(())
 }
 
 fn clean_scope() -> l2_workbench::tshark::ScopeReceipt {

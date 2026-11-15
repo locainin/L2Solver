@@ -139,7 +139,7 @@ fn selected_executable_reports_public_version_and_fast_metadata() -> Result<(), 
         field(&identity, "/version/public_version")?,
         "TShark (Wireshark) 4.4.20"
     );
-    assert_eq!(field(&identity, "/arguments_epoch")?, 3);
+    assert_eq!(field(&identity, "/arguments_epoch")?, 4);
     assert_eq!(
         field(&identity, "/executable/length")?,
         fs::metadata(&executable)?.len()

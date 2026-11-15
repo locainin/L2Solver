@@ -1,7 +1,7 @@
 use super::{
     budget::{ObjectExportBudget, ObjectExportStatus, ObjectExportUsage, StableObject},
     executable::verify_executable_unchanged,
-    inspection::inspect_version,
+    inspection::{inspect_preferences, inspect_version},
     phase::run_phase,
     preparation::{PreparedCapture, prepare_export_capture, verify_prepared_capture},
     process,
@@ -76,6 +76,7 @@ pub fn export_objects_with_job(
         job.check_cancelled()?;
     }
     inspect_version(&prepared)?;
+    inspect_preferences(&prepared)?;
     let types = available_types(&prepared)?;
     if let Some(job) = job {
         job.check_cancelled()?;
@@ -318,6 +319,25 @@ fn retain_complete_export(
         issues.push(String::from(
             "TShark object output contained unsafe or changed entries",
         ));
+    }
+    let diagnostic = String::from_utf8_lossy(&output.stderr);
+    if output.stderr_truncated
+        || diagnostic.lines().any(|line| {
+            line.contains("/output/")
+                || line.contains("Failed to create export objects output directory")
+                || (line.contains("Can't register ") && line.contains(" tap:"))
+        })
+    {
+        let mut issue =
+            String::from("TShark object export diagnostics indicate output may be incomplete");
+        if !diagnostic.trim().is_empty() {
+            issue.push_str(": ");
+            issue.push_str(diagnostic.trim());
+        }
+        if output.stderr_truncated {
+            issue.push_str(" [diagnostic output truncated]");
+        }
+        issues.push(issue);
     }
     add_snapshot_timeout(&mut issues, snapshot.deadline_reached);
     let status = if issues.is_empty() {

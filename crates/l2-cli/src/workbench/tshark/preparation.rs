@@ -288,7 +288,10 @@ fn prepare_admitted(
             )
         })
         .transpose()?;
-    let profile = create_profile(directory.path())?;
+    let object_files = preparation
+        .object_budget
+        .map(|_| admission.resources.limits().object_files.get());
+    let profile = create_profile(directory.path(), object_files)?;
     let environment = profile_environment(&profile);
     let sandbox = sandbox::Sandbox::new(
         &directory,
