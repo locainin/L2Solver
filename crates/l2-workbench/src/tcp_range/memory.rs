@@ -2,11 +2,7 @@
 
 use super::{MAX_DETAILED_SPANS, Observation, Span, spans};
 
-pub fn range_memory_bound(
-    length: usize,
-    input_bytes: usize,
-    observations: usize,
-) -> Option<u64> {
+pub fn range_memory_bound(length: usize, input_bytes: usize, observations: usize) -> Option<u64> {
     // Admit position maps, observation copies, span growth, and run references together
     let spans = length.min(MAX_DETAILED_SPANS + 1);
     let positions = length.checked_mul(std::mem::size_of::<spans::Position>())?;
