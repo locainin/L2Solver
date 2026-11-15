@@ -2,19 +2,25 @@ use super::{
     ResultDirectory, ResultIdentity, ResultKind, bounded, manifest,
     stamp::{OutputFileStamp, OutputHasher},
 };
-use l2_workbench::job::{Job, JobSnapshot, Phase, PhaseOutcome, cache::SourceIdentity};
+use l2_workbench::job::{Job, JobError, JobSnapshot, Phase, PhaseOutcome, cache::SourceIdentity};
 use l2_workbench::job::{
     RecoveryArtifactSample, RecoveryPublicationSample, RecoveryPublicationSourceBasis,
     RecoveryTransitionOutcome,
 };
-use std::{cell::Cell, collections::BTreeMap, error::Error, io, path::Path};
+use std::{
+    cell::Cell,
+    collections::BTreeMap,
+    error::Error,
+    fmt, io,
+    path::{Path, PathBuf},
+};
 
 pub(super) fn publish<T>(
     directory: ResultDirectory,
     identity: &ResultIdentity,
     job: &Job,
     writer: impl FnOnce(&Path) -> Result<T, Box<dyn Error>>,
-) -> Result<T, Box<dyn Error>> {
+) -> Result<(T, Option<PathBuf>), Box<dyn Error>> {
     let super::ResultDirectory { path, kind, state } = directory;
     let capture = PublicationCapture {
         started: Cell::new(false),
@@ -55,6 +61,7 @@ pub(super) fn publish<T>(
     let publication = match state {
         manifest::DirectoryState::Missing => {
             crate::publish::create_directory_with_precommit(&path, write_stage, before_commit)
+                .map(|()| None)
         }
         manifest::DirectoryState::Legacy { prepared }
         | manifest::DirectoryState::Owned { prepared, .. } => {
@@ -67,23 +74,94 @@ pub(super) fn publish<T>(
                 return Err(Box::new(error));
             }
             crate::publish::replace_directory_with_precommit(&prepared, write_stage, before_commit)
+                .map(|((), retained)| Some(retained))
         }
     };
 
     crate::publication_transition::record_result(job, &publication, capture.sample.get());
-    if let Err(error) = publication {
-        if capture.started.get() {
-            let outcome = if job.is_cancelled() {
-                PhaseOutcome::Cancelled
-            } else {
-                PhaseOutcome::Failed
-            };
-            job.finish(Phase::Publication, outcome)?;
-        }
-        return Err(Box::new(error));
+    let retained = match publication {
+        Ok(retained) => retained,
+        Err(error) => return Err(publication_failure(job, capture.started.get(), error)),
+    };
+    if let Err(progress) = job.finish(Phase::Publication, PhaseOutcome::Completed) {
+        return Err(Box::new(PublicationProgressError {
+            primary: None,
+            progress,
+            retained,
+        }));
     }
-    job.finish(Phase::Publication, PhaseOutcome::Completed)?;
-    value.ok_or_else(|| io::Error::other("result writer completed without a value").into())
+    Ok((
+        value.ok_or_else(|| io::Error::other("result writer completed without a value"))?,
+        retained,
+    ))
+}
+
+fn publication_failure(
+    job: &Job,
+    started: bool,
+    error: crate::publish::DirectoryPublishError,
+) -> Box<dyn Error> {
+    if started {
+        let outcome = if job.is_cancelled() {
+            PhaseOutcome::Cancelled
+        } else {
+            PhaseOutcome::Failed
+        };
+        if let Err(progress) = job.finish(Phase::Publication, outcome) {
+            return Box::new(PublicationProgressError {
+                primary: Some(Box::new(error)),
+                progress,
+                retained: None,
+            });
+        }
+    }
+    Box::new(error)
+}
+
+#[derive(Debug)]
+pub struct PublicationProgressError {
+    primary: Option<Box<dyn Error>>,
+    progress: JobError,
+    retained: Option<PathBuf>,
+}
+
+impl fmt::Display for PublicationProgressError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        if let Some(primary) = &self.primary {
+            write!(
+                formatter,
+                "{primary}; could not finish publication progress: {}",
+                self.progress
+            )
+        } else if let Some(path) = &self.retained {
+            #[expect(
+                clippy::unnecessary_debug_formatting,
+                reason = "Debug preserves non-Unicode path bytes"
+            )]
+            let path = if path.to_str().is_some() {
+                path.display().to_string().escape_debug().to_string()
+            } else {
+                format!("{:?}", path.as_os_str())
+            };
+            write!(
+                formatter,
+                "output was published; previous output retained at {path}; could not finish publication progress: {}",
+                self.progress
+            )
+        } else {
+            write!(
+                formatter,
+                "output was published; could not finish publication progress: {}",
+                self.progress
+            )
+        }
+    }
+}
+
+impl Error for PublicationProgressError {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        Some(self.primary.as_deref().unwrap_or(&self.progress))
+    }
 }
 
 struct PublicationCapture {
@@ -104,7 +182,7 @@ fn write_result_stage<T>(
     job.check_cancelled()?;
     job.start(Phase::Publication, None)?;
     capture.started.set(true);
-    let parsed = manifest::parse_staged_manifest(staging, kind)?;
+    let parsed = manifest::parse_staged_manifest(staging, kind, job)?;
     validate_identity(identity, kind, parsed.source_identity_sha256.as_deref())?;
     let file_names = manifest::staged_output_files(staging, kind, &parsed)?;
     let output_files = {
@@ -174,8 +252,8 @@ fn write_result_stage<T>(
         job: snapshot,
         output_files,
     };
-    manifest::append_receipt(&staging.join("manifest.json"), &receipt)?;
-    manifest::validate_staged_receipt(staging, kind)?;
+    manifest::append_receipt(&staging.join("manifest.json"), &receipt, job)?;
+    manifest::validate_staged_receipt(staging, kind, job)?;
     Ok(result)
 }
 

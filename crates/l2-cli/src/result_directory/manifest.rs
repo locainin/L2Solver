@@ -1,12 +1,12 @@
 use super::{ResultIdentity, ResultKind, bounded};
 use crate::{publish, safe_filename::is_safe_flat_file_name};
-use l2_workbench::{job::JobSnapshot, job::cache::SourceIdentity};
+use l2_workbench::job::{Job, JobError, JobSnapshot, MemoryClass, cache::SourceIdentity};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use std::{
     collections::{BTreeMap, BTreeSet},
     error::Error,
-    fs,
-    io::{self, Read},
+    fmt, fs,
+    io::{self, BufReader, Read},
     path::Path,
 };
 
@@ -19,6 +19,8 @@ const GZIP_EVIDENCE_FILE: &str = "evidence.jsonl.gz";
 const LIMITATIONS_FILE: &str = "limitations.txt";
 const MAX_DIRECTORY_ENTRIES: usize = 100_000;
 const MAX_MANIFEST_BYTES: u64 = 512 * 1024 * 1024;
+const MANIFEST_BUFFER_BYTES: usize = 16 * 1024;
+const CONFLICT_HINT: &str = "; use --refresh to replace it or -o PATH to choose another directory";
 /// Matches the default extraction artifact-count ceiling
 pub(super) const MAX_RESULT_ARTIFACTS: usize = 16_384;
 /// Matches the maximum refinement source-record count
@@ -43,6 +45,8 @@ pub(super) enum DirectoryState {
         manifest: OwnedManifest,
         /// Job and output receipts stored in the manifest
         receipt: Box<ResultReceipt>,
+        /// Identity of the manifest that was parsed during inspection
+        manifest_identity: ManifestFileIdentity,
     },
 }
 
@@ -153,9 +157,11 @@ struct RawSource {
 pub(super) fn inspect(
     path: &Path,
     kind: ResultKind,
+    job: &Job,
 ) -> Result<super::ResultDirectory, Box<dyn Error>> {
+    job.check_cancelled()?;
     match fs::symlink_metadata(path) {
-        Ok(metadata) if metadata.file_type().is_dir() => inspect_existing(path, kind),
+        Ok(metadata) if metadata.file_type().is_dir() => inspect_existing(path, kind, job),
         Ok(_) => {
             Err(actionable_conflict("result destination exists and is not a real directory").into())
         }
@@ -174,6 +180,7 @@ pub(super) fn inspect(
 fn inspect_existing(
     path: &Path,
     kind: ResultKind,
+    job: &Job,
 ) -> Result<super::ResultDirectory, Box<dyn Error>> {
     let prepared = publish::prepare_directory_replacement(path).map_err(|error| {
         actionable_conflict(&format!("existing result destination is unsafe: {error}"))
@@ -186,11 +193,15 @@ fn inspect_existing(
             "could not safely open the existing result manifest: {error}"
         ))
     })?;
-    let (raw, manifest_identity) = read_manifest(manifest_file).map_err(|error| {
-        actionable_conflict(&format!("existing result manifest is invalid: {error}"))
+    let (raw, manifest_identity) = read_manifest(manifest_file, job).map_err(|error| {
+        if error.is::<JobError>() || crate::memory_error::find(error.as_ref()).is_some() {
+            error
+        } else {
+            Box::new(ManifestInspectionError(error)) as Box<dyn Error>
+        }
     })?;
     verify_named_manifest(&prepared, manifest_identity)?;
-    inspect_prepared(path, kind, prepared, raw).map_err(|error| {
+    inspect_prepared(path, kind, prepared, raw, manifest_identity).map_err(|error| {
         actionable_conflict(&format!(
             "existing result directory cannot be reused: {error}"
         ))
@@ -198,11 +209,31 @@ fn inspect_existing(
     })
 }
 
+#[derive(Debug)]
+struct ManifestInspectionError(Box<dyn Error>);
+
+impl fmt::Display for ManifestInspectionError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            formatter,
+            "existing result manifest is invalid: {}{CONFLICT_HINT}",
+            self.0
+        )
+    }
+}
+
+impl Error for ManifestInspectionError {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        Some(self.0.as_ref())
+    }
+}
+
 fn inspect_prepared(
     path: &Path,
     kind: ResultKind,
     prepared: publish::PreparedDirectoryReplacement,
     raw: RawManifest,
+    manifest_identity: ManifestFileIdentity,
 ) -> Result<super::ResultDirectory, Box<dyn Error>> {
     prepared.check_location()?;
     let SourceFacts {
@@ -225,6 +256,7 @@ fn inspect_prepared(
             prepared,
             manifest,
             receipt: Box::new(receipt),
+            manifest_identity,
         }
     } else if kind == ResultKind::Extract {
         validate_directory_entries(&prepared, kind, &manifest, None)?;
@@ -249,8 +281,9 @@ fn inspect_prepared(
 pub(super) fn parse_staged_manifest(
     path: &Path,
     kind: ResultKind,
+    job: &Job,
 ) -> Result<OwnedManifest, Box<dyn Error>> {
-    let raw = read_manifest_path::<RawManifest>(path)?;
+    let raw = read_manifest_path::<RawManifest>(path, job)?;
     if raw.l2solver_result.is_some() {
         return Err(invalid_result("writer supplied a reserved l2solver_result field").into());
     }
@@ -270,8 +303,12 @@ pub(super) fn parse_staged_manifest(
     Ok(manifest)
 }
 
-pub(super) fn validate_staged_receipt(path: &Path, kind: ResultKind) -> Result<(), Box<dyn Error>> {
-    let raw = read_manifest_path::<RawManifest>(path)?;
+pub(super) fn validate_staged_receipt(
+    path: &Path,
+    kind: ResultKind,
+    job: &Job,
+) -> Result<(), Box<dyn Error>> {
+    let raw = read_manifest_path::<RawManifest>(path, job)?;
     let SourceFacts {
         complete,
         source_sha256s,
@@ -310,14 +347,15 @@ pub(super) fn staged_output_files(
 
 fn read_manifest<T: DeserializeOwned>(
     file: fs::File,
+    job: &Job,
 ) -> Result<(T, ManifestFileIdentity), Box<dyn Error>> {
-    deserialize_limited_manifest(file, MAX_MANIFEST_BYTES)
+    deserialize_limited_manifest(file, MAX_MANIFEST_BYTES, job)
 }
 
-fn read_manifest_path<T: DeserializeOwned>(path: &Path) -> Result<T, Box<dyn Error>> {
+fn read_manifest_path<T: DeserializeOwned>(path: &Path, job: &Job) -> Result<T, Box<dyn Error>> {
     let manifest_path = path.join(MANIFEST_FILE);
     let file = super::stamp::open_regular_path(&manifest_path)?;
-    let (value, identity) = deserialize_limited_manifest(file, MAX_MANIFEST_BYTES)?;
+    let (value, identity) = deserialize_limited_manifest(file, MAX_MANIFEST_BYTES, job)?;
     let current = super::stamp::open_regular_path(&manifest_path)?;
     ensure_same_manifest_identity(
         identity,
@@ -329,38 +367,74 @@ fn read_manifest_path<T: DeserializeOwned>(path: &Path) -> Result<T, Box<dyn Err
 fn deserialize_limited_manifest<T: DeserializeOwned>(
     mut file: fs::File,
     maximum_bytes: u64,
+    job: &Job,
 ) -> Result<(T, ManifestFileIdentity), Box<dyn Error>> {
     let before = ManifestFileIdentity::from_metadata(&file.metadata()?)?;
     if before.length > maximum_bytes {
         return Err(invalid_result("result manifest exceeds the safe size limit").into());
     }
-    let value = deserialize_manifest_value(&mut file, maximum_bytes)?;
+    let value = deserialize_manifest_value(&mut file, maximum_bytes, job)?;
     let after = ManifestFileIdentity::from_metadata(&file.metadata()?)?;
     ensure_same_manifest_identity(before, after)?;
     Ok((value, after))
 }
 
 pub(super) fn deserialize_manifest_value<T: DeserializeOwned>(
-    file: &mut fs::File,
+    file: &mut impl Read,
     maximum_bytes: u64,
+    job: &Job,
 ) -> Result<T, Box<dyn Error>> {
+    job.check_cancelled()?;
     let read_limit = maximum_bytes
         .checked_add(1)
         .ok_or_else(|| invalid_result("result manifest size limit overflow"))?;
+    let _memory = job
+        .memory_budget()
+        .map(|memory| memory.try_reserve(MemoryClass::Publication, MANIFEST_BUFFER_BYTES as u64))
+        .transpose()?;
     let mut limited = (&mut *file).take(read_limit);
-    let value = {
-        let mut deserializer = serde_json::Deserializer::from_reader(&mut limited);
+    let mut read_error = None;
+    let parsed = crate::case_snapshot::with_cancellation(Some(job), |cancellation| {
+        let reader = ManifestReader {
+            input: &mut limited,
+            error: &mut read_error,
+        };
+        let checked = cancellation.wrap(reader);
+        let reader = BufReader::with_capacity(MANIFEST_BUFFER_BYTES, checked);
+        let mut deserializer = serde_json::Deserializer::from_reader(reader);
         let value = T::deserialize(&mut deserializer)?;
         deserializer.end()?;
-        value
-    };
+        Ok(value)
+    });
+    if let Some(error) = read_error {
+        return Err(error.into());
+    }
+    let value = parsed?;
     if limited.limit() == 0 {
         return Err(invalid_result("result manifest exceeds the safe size limit").into());
     }
     Ok(value)
 }
 
-fn verify_named_manifest(
+struct ManifestReader<'a, R> {
+    input: R,
+    error: &'a mut Option<io::Error>,
+}
+
+impl<R: Read> Read for ManifestReader<'_, R> {
+    fn read(&mut self, bytes: &mut [u8]) -> io::Result<usize> {
+        match self.input.read(bytes) {
+            Err(error) if error.kind() != io::ErrorKind::Interrupted => {
+                let kind = error.kind();
+                *self.error = Some(error);
+                Err(io::Error::from(kind))
+            }
+            result => result,
+        }
+    }
+}
+
+pub(super) fn verify_named_manifest(
     prepared: &publish::PreparedDirectoryReplacement,
     expected: ManifestFileIdentity,
 ) -> Result<(), Box<dyn Error>> {
@@ -772,15 +846,16 @@ fn validate_directory_entries(
 pub(super) fn append_receipt(
     manifest_path: &Path,
     receipt: &ResultReceipt,
+    job: &Job,
 ) -> Result<(), Box<dyn Error>> {
-    use std::io::{Read, Seek, SeekFrom, Write};
+    use std::io::{BufWriter, Read, Seek, SeekFrom, Write};
 
     let mut source = super::stamp::open_regular_path(manifest_path)?;
     let source_len = source.metadata()?.len();
     if source_len == 0 || source_len > MAX_MANIFEST_BYTES {
         return Err(invalid_result("generated result manifest has an unsafe size").into());
     }
-    let brace_offset = last_non_whitespace_offset(&mut source, source_len)?;
+    let brace_offset = last_non_whitespace_offset(&mut source, source_len, job)?;
     source.seek(SeekFrom::Start(brace_offset))?;
     let mut closing = [0_u8; 1];
     source.read_exact(&mut closing)?;
@@ -794,24 +869,39 @@ pub(super) fn append_receipt(
         .create_new(true)
         .open(&temporary_path)?;
     source.seek(SeekFrom::Start(0))?;
-    let copied = std::io::copy(&mut source.take(brace_offset), &mut destination)?;
-    if copied != brace_offset {
-        return Err(invalid_result("generated result manifest changed while it was copied").into());
-    }
-    destination.write_all(b",\"l2solver_result\":")?;
-    serde_json::to_writer(&mut destination, receipt)?;
-    destination.write_all(b"}\n")?;
+    let _memory = job
+        .memory_budget()
+        .map(|memory| memory.try_reserve(MemoryClass::Publication, MANIFEST_BUFFER_BYTES as u64))
+        .transpose()?;
+    crate::case_snapshot::with_cancellation(Some(job), |cancellation| {
+        let mut input = cancellation.wrap((&mut source).take(brace_offset));
+        let checked = cancellation.wrap(&mut destination);
+        let mut output = BufWriter::with_capacity(MANIFEST_BUFFER_BYTES, checked);
+        let copied = std::io::copy(&mut input, &mut output)?;
+        if copied != brace_offset {
+            return Err(
+                invalid_result("generated result manifest changed while it was copied").into(),
+            );
+        }
+        output.write_all(b",\"l2solver_result\":")?;
+        serde_json::to_writer(&mut output, receipt)?;
+        output.write_all(b"}\n")?;
+        output.flush()?;
+        Ok(())
+    })?;
     destination.sync_all()?;
     drop(destination);
+    job.check_cancelled()?;
     fs::rename(&temporary_path, manifest_path)?;
     Ok(())
 }
 
-fn last_non_whitespace_offset(file: &mut fs::File, mut length: u64) -> io::Result<u64> {
+fn last_non_whitespace_offset(file: &mut fs::File, mut length: u64, job: &Job) -> io::Result<u64> {
     use std::io::{Read, Seek, SeekFrom};
 
     let mut byte = [0_u8; 1];
     while length != 0 {
+        job.check_cancelled().map_err(io::Error::other)?;
         length -= 1;
         file.seek(SeekFrom::Start(length))?;
         file.read_exact(&mut byte)?;
@@ -946,7 +1036,7 @@ fn staged_single_link(metadata: &fs::Metadata) -> bool {
 pub(super) fn actionable_conflict(message: &str) -> io::Error {
     io::Error::new(
         io::ErrorKind::InvalidInput,
-        format!("{message}; use --refresh to replace it or -o PATH to choose another directory"),
+        format!("{message}{CONFLICT_HINT}"),
     )
 }
 

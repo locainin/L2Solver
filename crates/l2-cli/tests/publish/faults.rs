@@ -21,8 +21,8 @@ fn old_output(destination: &Path) -> TestResult {
     Ok(())
 }
 
-fn assert_before_publication_errno(
-    result: Result<(), publish::DirectoryPublishError>,
+fn assert_before_publication_errno<T>(
+    result: Result<T, publish::DirectoryPublishError>,
     expected: i32,
 ) -> TestResult {
     let Err(publish::DirectoryPublishError::BeforePublication(error)) = result else {

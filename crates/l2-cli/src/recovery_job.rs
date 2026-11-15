@@ -107,10 +107,12 @@ pub fn run(
     })
 }
 
-fn is_cancellation(error: &(dyn Error + 'static)) -> bool {
+pub fn is_cancellation(error: &(dyn Error + 'static)) -> bool {
     crate::memory_error::find_map(error, |cause| {
         // A checkpoint failure must remain visible even when cancellation happened first
-        if cause.is::<CleanupFailure>() {
+        if cause.is::<CleanupFailure>()
+            || cause.is::<crate::result_directory::PublicationProgressError>()
+        {
             return Some(false);
         }
         if matches!(cause.downcast_ref::<JobError>(), Some(JobError::Cancelled))

@@ -18,7 +18,7 @@ use inspection::{
     stat_identity_at, verify_named_directory,
 };
 #[cfg(target_os = "linux")]
-use tree::{remove_directory_at, sync_tree};
+use tree::sync_tree;
 
 /// Validate the safe parent of a new directory destination and confirm its name is absent
 ///
@@ -178,13 +178,14 @@ pub fn prepare_directory_replacement(
 ///
 /// `before_commit` runs after the staged tree and destination identity are checked and
 /// immediately before the atomic exchange. A failure preserves the old destination
+/// The displaced directory is retained and its path is returned with the callback result
 /// Cooperative replacement commits in the same parent cannot overlap; contention or
 /// unsupported advisory locking fails before publication
 pub fn replace_directory_with_precommit<T>(
     prepared: &PreparedDirectoryReplacement,
     write: impl FnOnce(&Path) -> Result<T, Box<dyn Error>>,
     before_commit: impl FnOnce() -> Result<(), Box<dyn Error>>,
-) -> Result<T, super::DirectoryPublishError> {
+) -> Result<(T, PathBuf), super::DirectoryPublishError> {
     #[cfg(target_os = "linux")]
     {
         replace_directory_linux(prepared, write, before_commit)
@@ -201,7 +202,7 @@ fn replace_directory_linux<T>(
     prepared: &PreparedDirectoryReplacement,
     write: impl FnOnce(&Path) -> Result<T, Box<dyn Error>>,
     before_commit: impl FnOnce() -> Result<(), Box<dyn Error>>,
-) -> Result<T, super::DirectoryPublishError> {
+) -> Result<(T, PathBuf), super::DirectoryPublishError> {
     use std::{os::fd::AsRawFd, path::PathBuf};
 
     let path = &prepared.destination_path;
@@ -274,7 +275,7 @@ fn finish_directory_replacement<T>(
     staging_name: &OsStr,
     staging_identity: DirectoryIdentity,
     result: T,
-) -> Result<T, super::DirectoryPublishError> {
+) -> Result<(T, PathBuf), super::DirectoryPublishError> {
     use rustix::fs::{RenameFlags, renameat_with};
 
     let path = &prepared.destination_path;
@@ -332,21 +333,52 @@ fn finish_directory_replacement<T>(
         );
     }
 
-    // The retained name is checked before cleanup, and cleanup opens every directory without following links
-    if let Err(error) =
-        remove_directory_at(&prepared.parent_fd, staging_name, prepared.target_identity)
-    {
-        return Err(
-            super::DirectoryPublishError::PublishedReplacementUncertain {
-                source: error,
-                retained_path,
+    // Another process can still write through an open handle to the displaced directory
+    super::sync_parent_directory(&prepared.parent_fd, path).map_err(|source| {
+        let kind = source.kind();
+        super::DirectoryPublishError::PublishedDurabilityUncertain(io::Error::new(
+            kind,
+            RetainedAfterSyncFailure {
+                source,
+                path: retained_path.clone(),
             },
-        );
-    }
+        ))
+    })?;
+    Ok((result, retained_path))
+}
 
-    super::sync_parent_directory(&prepared.parent_fd, path)
-        .map_err(super::DirectoryPublishError::PublishedDurabilityUncertain)?;
-    Ok(result)
+#[cfg(target_os = "linux")]
+#[derive(Debug)]
+struct RetainedAfterSyncFailure {
+    source: io::Error,
+    path: PathBuf,
+}
+
+#[cfg(target_os = "linux")]
+impl std::fmt::Display for RetainedAfterSyncFailure {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        #[expect(
+            clippy::unnecessary_debug_formatting,
+            reason = "Debug preserves non-Unicode path bytes"
+        )]
+        let path = if self.path.to_str().is_some() {
+            self.path.display().to_string().escape_debug().to_string()
+        } else {
+            format!("{:?}", self.path.as_os_str())
+        };
+        write!(
+            formatter,
+            "{}; previous output retained at {path}",
+            self.source
+        )
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl Error for RetainedAfterSyncFailure {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        Some(&self.source)
+    }
 }
 
 #[cfg(target_os = "linux")]

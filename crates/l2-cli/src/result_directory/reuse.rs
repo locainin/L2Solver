@@ -27,7 +27,7 @@ pub(super) fn reuse_with_source_observer(
     mut observe: impl FnMut(usize),
 ) -> Result<Option<ReusedResult>, Box<dyn Error>> {
     job.check_cancelled()?;
-    let (prepared, manifest, receipt) = match &directory.state {
+    let (prepared, manifest, receipt, manifest_identity) = match &directory.state {
         DirectoryState::Missing => return Ok(None),
         DirectoryState::Legacy { .. } => {
             return Err(
@@ -38,7 +38,8 @@ pub(super) fn reuse_with_source_observer(
             prepared,
             manifest,
             receipt,
-        } => (prepared, manifest, receipt),
+            manifest_identity,
+        } => (prepared, manifest, receipt, *manifest_identity),
     };
 
     prepared.check_location()?;
@@ -58,7 +59,7 @@ pub(super) fn reuse_with_source_observer(
         &mut observe,
     )?;
 
-    verified_result(prepared, manifest, receipt, strict, job).map(Some)
+    verified_result(prepared, manifest, receipt, manifest_identity, strict, job).map(Some)
 }
 
 pub(super) fn reuse_refinement(
@@ -70,7 +71,7 @@ pub(super) fn reuse_refinement(
     strong_source: impl FnOnce() -> Result<SourceIdentity, Box<dyn Error>>,
 ) -> Result<Option<ReusedResult>, Box<dyn Error>> {
     job.check_cancelled()?;
-    let (prepared, manifest, receipt) = match &directory.state {
+    let (prepared, manifest, receipt, manifest_identity) = match &directory.state {
         DirectoryState::Missing => return Ok(None),
         DirectoryState::Legacy { .. } => {
             return Err(
@@ -81,7 +82,8 @@ pub(super) fn reuse_refinement(
             prepared,
             manifest,
             receipt,
-        } => (prepared, manifest, receipt),
+            manifest_identity,
+        } => (prepared, manifest, receipt, *manifest_identity),
     };
     prepared.check_location()?;
     ensure_policy_matches(directory, identity, receipt)?;
@@ -113,13 +115,14 @@ pub(super) fn reuse_refinement(
         let strong_identity = strong_source()?;
         verify_source(&strong_identity, receipt, None, true, job, &mut |_| {})?;
     }
-    verified_result(prepared, manifest, receipt, strict, job).map(Some)
+    verified_result(prepared, manifest, receipt, manifest_identity, strict, job).map(Some)
 }
 
 fn verified_result(
     prepared: &crate::publish::PreparedDirectoryReplacement,
     manifest: &super::manifest::OwnedManifest,
     receipt: &super::manifest::ResultReceipt,
+    manifest_identity: super::manifest::ManifestFileIdentity,
     strict: bool,
     job: &Job,
 ) -> Result<ReusedResult, Box<dyn Error>> {
@@ -127,7 +130,8 @@ fn verified_result(
     for output in &receipt.output_files {
         output.verify(prepared, strict, &mut hasher)?;
     }
-    prepared.check_location()?;
+    super::manifest::verify_named_manifest(prepared, manifest_identity)?;
+    job.check_cancelled()?;
     Ok(ReusedResult {
         complete: manifest.complete,
         // Inspection already matched every declared artifact to one validated receipt

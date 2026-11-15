@@ -48,7 +48,8 @@ fn warm_sample_match_reuses_without_calling_full_source_verification() -> TestRe
     )?;
     let identity =
         output::result_identity_with_source(sampled.identity.clone(), &options.recovery, &policy)?;
-    let inspected = ResultDirectory::inspect(&destination, ResultKind::Refine)?;
+    let inspected =
+        ResultDirectory::inspect(&destination, ResultKind::Refine, &Job::new("inspect"))?;
     let called = Cell::new(false);
     let reused = inspected.reuse_refinement(
         &identity,

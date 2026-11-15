@@ -100,7 +100,7 @@ pub fn run_with_job(
 ) -> Result<bool, Box<dyn Error>> {
     let artifact_limits = ArtifactLimits::default();
     let destination = destination(options)?;
-    let directory = ResultDirectory::inspect(&destination, ResultKind::Extract)?;
+    let directory = ResultDirectory::inspect(&destination, ResultKind::Extract, job)?;
     if options.capture == Path::new("-") {
         return run_standard_input(options, output, artifact_limits, job, &destination);
     }
@@ -172,8 +172,10 @@ pub fn run_with_job(
             Ok(result)
         })
     })();
-    let result = cache.finish(result, job);
-    let (count, complete) = result?;
+    if let Ok((_, Some(retained))) = &result {
+        crate::publication_transition::retained_notice(retained, options.recovery.progress);
+    }
+    let ((count, complete), _) = cache.finish(result, job)?;
     print_completion(output, options, &destination, count, complete)?;
     Ok(complete)
 }

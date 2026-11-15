@@ -29,6 +29,7 @@ fn refresh(prepared: &PreparedDirectoryReplacement, name: &str) -> Result<(), St
         |staging| write_output(staging, name),
         || Ok(()),
     )
+    .map(|(result, _)| result)
     .map_err(|error| error.to_string())
 }
 
@@ -81,7 +82,7 @@ fn concurrent_refresh_preserves_the_successful_winner() -> TestResult {
     };
     assert_eq!(fs::read(destination.join("payload"))?, winner.as_bytes());
     assert_eq!(fs::read(destination.join("manifest"))?, winner.as_bytes());
-    assert_eq!(fs::read_dir(root.path())?.count(), 1);
+    assert_eq!(fs::read_dir(root.path())?.count(), 2);
     Ok(())
 }
 

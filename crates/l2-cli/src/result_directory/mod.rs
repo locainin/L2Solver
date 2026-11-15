@@ -6,6 +6,8 @@ mod publish;
 mod reuse;
 mod stamp;
 
+pub use publish::PublicationProgressError;
+
 use l2_workbench::job::{Job, cache::SourceIdentity};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -61,8 +63,8 @@ impl ResultDirectory {
     /// # Errors
     /// Returns an error when the destination is unsafe, unrelated, corrupt, or owned by another
     /// result workflow
-    pub fn inspect(path: &Path, kind: ResultKind) -> Result<Self, Box<dyn Error>> {
-        manifest::inspect(path, kind)
+    pub fn inspect(path: &Path, kind: ResultKind, job: &Job) -> Result<Self, Box<dyn Error>> {
+        manifest::inspect(path, kind, job)
     }
 
     /// Return a matching owned result after checking its identity and file receipts
@@ -98,7 +100,7 @@ impl ResultDirectory {
     ///
     /// The callback builds all user-visible files. A receipt is appended to the staged manifest
     /// only after the callback succeeds; publication then creates a new destination or atomically
-    /// replaces the inspected directory
+    /// replaces the inspected directory. A replacement returns the retained previous directory
     ///
     /// # Errors
     /// Returns an error if the job is cancelled, the writer fails, the result is malformed, or
@@ -108,7 +110,7 @@ impl ResultDirectory {
         identity: &ResultIdentity,
         job: &l2_workbench::job::Job,
         writer: impl FnOnce(&Path) -> Result<T, Box<dyn Error>>,
-    ) -> Result<T, Box<dyn Error>> {
+    ) -> Result<(T, Option<std::path::PathBuf>), Box<dyn Error>> {
         publish::publish(self, identity, job, writer)
     }
 }

@@ -1,4 +1,4 @@
-use super::{Fixture, ResultDirectory, ResultKind, TestResult};
+use super::{Fixture, ResultKind, TestResult};
 use l2_workbench::job::{
     Counter, Job,
     cache::{SourceFingerprint, SourceIdentity},
@@ -19,7 +19,7 @@ fn published_large_source() -> TestResult<Fixture> {
 fn strict_and_fallback_reuse_cancel_after_one_source_chunk() -> TestResult {
     for strict in [true, false] {
         let fixture = published_large_source()?;
-        let existing = ResultDirectory::inspect(&fixture.output, ResultKind::Extract)?;
+        let existing = super::inspect(&fixture.output, ResultKind::Extract)?;
         let mut identity = fixture.identity.clone();
         if !strict {
             identity.source = SourceIdentity::Fast(SourceFingerprint::fast(&fixture.input)?);
@@ -64,7 +64,7 @@ fn strict_and_fallback_reuse_cancel_after_one_source_chunk() -> TestResult {
 fn strict_and_fallback_reuse_count_full_source_reads_and_reject_changed_bytes() -> TestResult {
     for strict in [true, false] {
         let fixture = published_large_source()?;
-        let existing = ResultDirectory::inspect(&fixture.output, ResultKind::Extract)?;
+        let existing = super::inspect(&fixture.output, ResultKind::Extract)?;
         let mut identity = fixture.identity.clone();
         if !strict {
             identity.source = SourceIdentity::Fast(SourceFingerprint::fast(&fixture.input)?);
@@ -106,7 +106,7 @@ fn changed_fast_fingerprint_counts_sample_and_full_identity_reads() -> TestResul
     fixture.identity.source = SourceIdentity::sha256_file(&fixture.input)?;
     let mut fast_identity = fixture.identity.clone();
     fast_identity.source = SourceIdentity::Fast(SourceFingerprint::fast(&fixture.input)?);
-    ResultDirectory::inspect(&fixture.output, ResultKind::Extract)?.publish(
+    super::inspect(&fixture.output, ResultKind::Extract)?.publish(
         &fast_identity,
         &Job::new("publish"),
         |staging| fixture.write_output(staging, "complete", b"published artifact"),
@@ -114,7 +114,7 @@ fn changed_fast_fingerprint_counts_sample_and_full_identity_reads() -> TestResul
     let previous = fixture.input.with_extension("previous");
     fs::rename(&fixture.input, previous)?;
     fs::write(&fixture.input, bytes)?;
-    let existing = ResultDirectory::inspect(&fixture.output, ResultKind::Extract)?;
+    let existing = super::inspect(&fixture.output, ResultKind::Extract)?;
     let job = Job::new("source fallback");
     assert!(
         existing
@@ -170,7 +170,7 @@ fn corrupt_artifact_receipts_remain_rejected_before_reuse() -> TestResult {
         }
         super::write_manifest(&fixture.output, &manifest)?;
         assert!(
-            ResultDirectory::inspect(&fixture.output, ResultKind::Extract).is_err(),
+            super::inspect(&fixture.output, ResultKind::Extract).is_err(),
             "accepted {corruption} receipt"
         );
     }
@@ -182,7 +182,7 @@ fn publication_uses_each_artifact_digest_when_manifest_order_differs_from_file_o
 {
     let fixture = Fixture::new()?;
     let job = Job::new("publish unsorted artifacts");
-    ResultDirectory::inspect(&fixture.output, ResultKind::Extract)?.publish(
+    super::inspect(&fixture.output, ResultKind::Extract)?.publish(
         &fixture.identity,
         &job,
         |staging| {
@@ -211,7 +211,7 @@ fn publication_uses_each_artifact_digest_when_manifest_order_differs_from_file_o
             Ok(())
         },
     )?;
-    let existing = ResultDirectory::inspect(&fixture.output, ResultKind::Extract)?;
+    let existing = super::inspect(&fixture.output, ResultKind::Extract)?;
     let reused = existing
         .reuse(
             &fixture.identity,

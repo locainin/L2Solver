@@ -21,7 +21,7 @@ fn replace_directory<T>(
     prepared: &publish::PreparedDirectoryReplacement,
     write: impl FnOnce(&std::path::Path) -> Result<T, Box<dyn Error>>,
 ) -> Result<T, publish::DirectoryPublishError> {
-    publish::replace_directory_with_precommit(prepared, write, || Ok(()))
+    publish::replace_directory_with_precommit(prepared, write, || Ok(())).map(|(result, _)| result)
 }
 
 fn remember_reader_error(errors: &Mutex<Vec<String>>, message: String) {
@@ -263,6 +263,77 @@ fn refresh_exposes_only_complete_old_or_new_directory_contents() -> Result<(), B
 }
 
 #[test]
+fn refresh_keeps_late_files() -> Result<(), Box<dyn Error>> {
+    use std::os::fd::AsRawFd;
+
+    let root = tempfile::tempdir()?;
+    let destination = root.path().join("bundle");
+    publish::create_directory(&destination, |staging| {
+        fs::write(staging.join("payload"), b"old output")?;
+        Ok(())
+    })?;
+    let held_directory = fs::File::open(&destination)?;
+    let prepared = publish::prepare_directory_replacement(&destination)?;
+    let note = destination.join("late-note");
+    test_hooks::set_before_directory_exchange(move || fs::write(note, b"important note"));
+
+    replace_directory(&prepared, |staging| {
+        fs::write(staging.join("payload"), b"new output")?;
+        Ok(())
+    })?;
+
+    let retained = fs::read_dir(root.path())?
+        .map(|entry| entry.map(|entry| entry.path()))
+        .collect::<std::io::Result<Vec<_>>>()?
+        .into_iter()
+        .find(|path| path != &destination)
+        .ok_or("the displaced directory was removed")?;
+    assert_eq!(fs::read(destination.join("payload"))?, b"new output");
+    assert_eq!(fs::read(retained.join("payload"))?, b"old output");
+    assert_eq!(fs::read(retained.join("late-note"))?, b"important note");
+
+    // A writer may keep the old directory open across the exchange
+    let held_path = format!("/proc/self/fd/{}/after-refresh", held_directory.as_raw_fd());
+    fs::write(held_path, b"still open")?;
+    assert_eq!(fs::read(retained.join("after-refresh"))?, b"still open");
+    Ok(())
+}
+
+#[test]
+fn repeated_refresh_retains_each_generation() -> Result<(), Box<dyn Error>> {
+    let root = tempfile::tempdir()?;
+    let destination = root.path().join("bundle");
+    publish::create_directory(&destination, |staging| {
+        fs::write(staging.join("payload"), b"first")?;
+        Ok(())
+    })?;
+    let first = publish::prepare_directory_replacement(&destination)?;
+    let ((), first_backup) = publish::replace_directory_with_precommit(
+        &first,
+        |staging| {
+            fs::write(staging.join("payload"), b"second")?;
+            Ok(())
+        },
+        || Ok(()),
+    )?;
+    let second = publish::prepare_directory_replacement(&destination)?;
+    let ((), second_backup) = publish::replace_directory_with_precommit(
+        &second,
+        |staging| {
+            fs::write(staging.join("payload"), b"third")?;
+            Ok(())
+        },
+        || Ok(()),
+    )?;
+
+    assert_ne!(first_backup, second_backup);
+    assert_eq!(fs::read(first_backup.join("payload"))?, b"first");
+    assert_eq!(fs::read(second_backup.join("payload"))?, b"second");
+    assert_eq!(fs::read(destination.join("payload"))?, b"third");
+    Ok(())
+}
+
+#[test]
 fn unsupported_exchange_preserves_existing_directory() -> Result<(), Box<dyn Error>> {
     let root = tempfile::tempdir()?;
     let destination = root.path().join("bundle");
@@ -476,7 +547,46 @@ fn replacement_sync_failure_reports_uncertainty_after_atomic_commit() -> Result<
         publish::DirectoryPublishError::PublishedDurabilityUncertain(_)
     ));
     assert!(error.to_string().contains("blind retry is unsafe"));
+    assert!(error.to_string().contains("previous output retained at"));
     assert_eq!(fs::read(destination.join("page.json"))?, b"new output");
+    let retained = fs::read_dir(root.path())?
+        .map(|entry| entry.map(|entry| entry.path()))
+        .collect::<std::io::Result<Vec<_>>>()?
+        .into_iter()
+        .find(|path| path != &destination)
+        .ok_or("previous output was not retained")?;
+    assert_eq!(fs::read(retained.join("page.json"))?, b"old output");
+    Ok(())
+}
+
+#[test]
+fn sync_error_names_non_utf8_backup() -> Result<(), Box<dyn Error>> {
+    use std::{ffi::OsStr, os::unix::ffi::OsStrExt};
+
+    let root = tempfile::tempdir()?;
+    let parent = root.path().join(OsStr::from_bytes(b"case-\xff"));
+    fs::create_dir(&parent)?;
+    let destination = parent.join("bundle");
+    publish::create_directory(&destination, |staging| {
+        fs::write(staging.join("payload"), b"old output")?;
+        Ok(())
+    })?;
+    let prepared = publish::prepare_directory_replacement(&destination)?;
+    set_fault(TestFault::DirectorySync);
+    let error = replace_directory(&prepared, |staging| {
+        fs::write(staging.join("payload"), b"new output")?;
+        Ok(())
+    })
+    .err()
+    .ok_or("sync failure was not reported")?;
+    assert!(error.to_string().contains(r"case-\xFF/"), "{error}");
+    let retained = fs::read_dir(&parent)?
+        .map(|entry| entry.map(|entry| entry.path()))
+        .collect::<std::io::Result<Vec<_>>>()?
+        .into_iter()
+        .find(|path| path != &destination)
+        .ok_or("retained directory is missing")?;
+    assert_eq!(fs::read(retained.join("payload"))?, b"old output");
     Ok(())
 }
 

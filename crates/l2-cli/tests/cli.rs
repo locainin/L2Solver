@@ -12,5 +12,7 @@ mod compatibility;
 mod help;
 #[path = "cli/limits.rs"]
 mod limits;
+#[path = "cli/retained_output.rs"]
+mod retained_output;
 #[path = "cli/robustness.rs"]
 mod robustness;

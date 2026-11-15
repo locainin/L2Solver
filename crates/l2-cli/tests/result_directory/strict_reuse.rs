@@ -1,6 +1,5 @@
 use super::{
-    Fixture, ResultDirectory, ResultKind, TestResult, json_field, json_field_mut, read_manifest,
-    write_manifest,
+    Fixture, ResultKind, TestResult, json_field, json_field_mut, read_manifest, write_manifest,
 };
 use l2_workbench::job::{Counter, Job, MemoryBudget, cache::SourceIdentity};
 use serde_json::Value;
@@ -27,7 +26,7 @@ fn write_result(fixture: &Fixture, staging: &Path, artifact_digest: bool) -> Tes
 }
 
 fn publish_result(fixture: &Fixture, job: &Job, artifact_digest: bool) -> TestResult {
-    ResultDirectory::inspect(&fixture.output, ResultKind::Extract)?.publish(
+    super::inspect(&fixture.output, ResultKind::Extract)?.publish(
         &fixture.identity,
         job,
         |staging| write_result(fixture, staging, artifact_digest),
@@ -58,7 +57,7 @@ fn strict_reuse_accepts_unchanged_outputs_with_matching_digests() -> TestResult 
             Some(actual.as_str())
         );
     }
-    let existing = ResultDirectory::inspect(&fixture.output, ResultKind::Extract)?;
+    let existing = super::inspect(&fixture.output, ResultKind::Extract)?;
     assert!(
         existing
             .reuse(
@@ -83,7 +82,7 @@ fn strict_reuse_rejects_same_length_changes_to_each_non_artifact_output() -> Tes
         *first ^= 1;
         fs::write(path, bytes)?;
 
-        let existing = ResultDirectory::inspect(&fixture.output, ResultKind::Extract)?;
+        let existing = super::inspect(&fixture.output, ResultKind::Extract)?;
         assert!(
             existing
                 .reuse(
@@ -127,7 +126,7 @@ fn legacy_unhashed_output_requires_refresh_for_strict_reuse() -> TestResult {
         .ok_or("summary digest is missing")? = Value::Null;
     write_manifest(&fixture.output, &manifest)?;
 
-    let existing = ResultDirectory::inspect(&fixture.output, ResultKind::Extract)?;
+    let existing = super::inspect(&fixture.output, ResultKind::Extract)?;
     assert!(
         existing
             .reuse(
@@ -186,7 +185,7 @@ fn publication_digest_buffer_obeys_the_job_memory_budget() -> TestResult {
 fn strict_reuse_accounts_for_output_reads_and_admits_the_hash_buffer() -> TestResult {
     let fixture = Fixture::new()?;
     publish_result(&fixture, &Job::new("publish"), false)?;
-    let existing = ResultDirectory::inspect(&fixture.output, ResultKind::Extract)?;
+    let existing = super::inspect(&fixture.output, ResultKind::Extract)?;
     let memory = MemoryBudget::new(1024 * 1024);
     let job = Job::with_memory_budget("strict reuse", &memory);
     assert!(
@@ -231,7 +230,7 @@ fn strict_reuse_accounts_for_output_reads_and_admits_the_hash_buffer() -> TestRe
 fn cancelled_job_stops_strict_result_reuse() -> TestResult {
     let fixture = Fixture::new()?;
     publish_result(&fixture, &Job::new("publish"), false)?;
-    let existing = ResultDirectory::inspect(&fixture.output, ResultKind::Extract)?;
+    let existing = super::inspect(&fixture.output, ResultKind::Extract)?;
     let job = Job::new("cancelled reuse");
     job.request_cancel();
     assert!(
@@ -246,7 +245,7 @@ fn cancelled_job_stops_strict_result_reuse() -> TestResult {
 fn named_output_recheck_rejects_replacement_of_the_held_file() -> TestResult {
     let fixture = Fixture::new()?;
     publish_result(&fixture, &Job::new("publish"), false)?;
-    let existing = ResultDirectory::inspect(&fixture.output, ResultKind::Extract)?;
+    let existing = super::inspect(&fixture.output, ResultKind::Extract)?;
     let super::super::manifest::DirectoryState::Owned { prepared, .. } = &existing.state else {
         return Err("published result should be owned".into());
     };
