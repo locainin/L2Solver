@@ -12,6 +12,106 @@ use std::{
 
 type TestResult = Result<(), Box<dyn Error>>;
 
+#[test]
+fn fatal_precedence() -> TestResult {
+    for invariant in [false, true] {
+        let pool = rayon::ThreadPoolBuilder::new().num_threads(2).build()?;
+        let (failed, receiver) = mpsc::channel();
+        let receiver = Mutex::new(receiver);
+        let result = process_ordered(
+            &pool,
+            vec![0, 1],
+            |_, _| Ok(Some(())),
+            |index, ()| -> Result<(), Box<dyn Error + Send + Sync>> {
+                if index == 0 {
+                    receiver
+                        .lock()
+                        .map_err(|error| error.to_string())?
+                        .recv_timeout(Duration::from_secs(3))?;
+                    return Err(
+                        classify_worker_error(&l2_workbench::job::JobError::Cancelled).into(),
+                    );
+                }
+                failed.send(())?;
+                let fatal: Box<dyn Error + Send + Sync> = if invariant {
+                    l2_workbench::job::JobError::LockPoisoned.into()
+                } else {
+                    std::io::Error::from_raw_os_error(libc::ENOSPC).into()
+                };
+                Err(classify_worker_error(fatal.as_ref()).into())
+            },
+            |()| Ok(()),
+        );
+        let error = result.err().ok_or("worker failure was lost")?;
+        if invariant {
+            assert_eq!(
+                crate::memory_error::find_map(error.as_ref(), |cause| {
+                    cause.downcast_ref::<l2_workbench::job::JobError>().copied()
+                }),
+                Some(l2_workbench::job::JobError::LockPoisoned)
+            );
+        } else {
+            assert_eq!(
+                crate::memory_error::find_map(error.as_ref(), |cause| {
+                    cause
+                        .downcast_ref::<std::io::Error>()
+                        .and_then(std::io::Error::raw_os_error)
+                }),
+                Some(libc::ENOSPC)
+            );
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn worker_io_cause() {
+    let errors = [
+        (
+            std::io::Error::other(std::io::Error::from_raw_os_error(libc::ENOSPC)),
+            std::io::ErrorKind::StorageFull,
+            Some(libc::ENOSPC),
+        ),
+        (
+            std::io::Error::other(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "access denied",
+            )),
+            std::io::ErrorKind::PermissionDenied,
+            None,
+        ),
+    ];
+    for (error, expected_kind, expected_code) in errors {
+        let classified = classify_worker_error(&error);
+        let actual = crate::memory_error::find_map(&classified, |cause| {
+            cause
+                .downcast_ref::<std::io::Error>()
+                .map(|error| (error.kind(), error.raw_os_error()))
+        });
+        assert_eq!(actual, Some((expected_kind, expected_code)));
+    }
+}
+
+#[test]
+fn cancellation_only() -> TestResult {
+    let pool = rayon::ThreadPoolBuilder::new().num_threads(2).build()?;
+    let result = process_ordered(
+        &pool,
+        vec![0, 1],
+        |_, _| Ok(Some(())),
+        |_, ()| Err::<(), _>(l2_workbench::job::JobError::Cancelled),
+        |()| Ok(()),
+    );
+    assert_eq!(
+        result
+            .err()
+            .ok_or("cancellation was lost")?
+            .downcast_ref::<l2_workbench::job::JobError>(),
+        Some(&l2_workbench::job::JobError::Cancelled)
+    );
+    Ok(())
+}
+
 struct RetainedCase {
     index: usize,
     drops: Arc<AtomicUsize>,

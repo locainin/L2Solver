@@ -20,7 +20,7 @@ use l2_workbench::{
 };
 use std::{
     error::Error,
-    fmt,
+    fmt, io,
     path::Path,
     sync::atomic::{AtomicUsize, Ordering},
 };
@@ -330,6 +330,7 @@ pub(super) struct WorkerFailure {
 enum WorkerCause {
     Memory(MemoryError),
     Job(JobError),
+    Io(io::Error),
 }
 
 impl fmt::Display for WorkerFailure {
@@ -343,27 +344,42 @@ impl Error for WorkerFailure {
         match &self.cause {
             Some(WorkerCause::Memory(error)) => Some(error),
             Some(WorkerCause::Job(error)) => Some(error),
+            Some(WorkerCause::Io(error)) => Some(error),
             None => None,
         }
     }
 }
 
 pub(super) fn classify_worker_error(error: &(dyn Error + 'static)) -> WorkerFailure {
+    let mut io_cause: Option<io::Error> = None;
+    let cause = crate::memory_error::find_map(error, |cause| {
+        if let Some(error) = cause.downcast_ref::<io::Error>()
+            && io_cause
+                .as_ref()
+                .and_then(io::Error::raw_os_error)
+                .is_none()
+        {
+            // Keep the first OS error or the innermost I/O error without an errno
+            io_cause = Some(error.raw_os_error().map_or_else(
+                || io::Error::new(error.kind(), error.to_string()),
+                io::Error::from_raw_os_error,
+            ));
+        }
+        // Prefer memory and job causes even when an I/O wrapper appears first
+        cause
+            .downcast_ref::<MemoryError>()
+            .copied()
+            .map(WorkerCause::Memory)
+            .or_else(|| {
+                cause
+                    .downcast_ref::<JobError>()
+                    .copied()
+                    .map(WorkerCause::Job)
+            })
+    });
     WorkerFailure {
         message: error.to_string(),
-        // Workers need a sendable cause without flattening cancellation into text
-        cause: crate::memory_error::find_map(error, |cause| {
-            cause
-                .downcast_ref::<MemoryError>()
-                .copied()
-                .map(WorkerCause::Memory)
-                .or_else(|| {
-                    cause
-                        .downcast_ref::<JobError>()
-                        .copied()
-                        .map(WorkerCause::Job)
-                })
-        }),
+        cause: cause.or_else(|| io_cause.map(WorkerCause::Io)),
     }
 }
 
