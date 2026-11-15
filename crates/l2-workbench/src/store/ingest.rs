@@ -7,6 +7,7 @@ use super::{
     paths::Directory,
     scopes, shared,
 };
+use crate::storage::SparseWriter;
 use l2_audit::ForensicScope;
 use l2_capture::{CaptureLocator, CapturedFrame, EvidenceSourceId};
 use l2_core::FrameField;
@@ -46,7 +47,8 @@ impl Store {
     /// Copy and index one capture in one pass, rolling back every uncommitted row
     ///
     /// # Errors
-    /// Rejects malformed captures, duplicate sources, invalid labels, and I/O failures
+    /// Rejects malformed captures, duplicate sources, invalid labels, captures above the
+    /// available workspace limit, and I/O failures
     ///
     /// Failures after publication can leave an orphan or an uncertain commit outcome
     /// Reopening supports verification or reindexing into a fresh directory; retrying an
@@ -59,6 +61,32 @@ impl Store {
         &mut self,
         label: &str,
         reader: impl Read,
+        sync_source_directory: impl FnOnce(&Directory) -> Result<()>,
+    ) -> Result<IngestReceipt> {
+        check_storage_locations(&self.directory, &self.sources)?;
+        let maximum = crate::job::workspace_capacity(self.sources.available_bytes()?)
+            .min(l2_pcap::ABSOLUTE_MAX_INPUT_BYTES);
+        self.ingest_with_limit_and_source_sync(label, reader, maximum, sync_source_directory)
+    }
+
+    /// Copy and index a capture without retaining more than the given logical bytes
+    ///
+    /// # Errors
+    /// Rejects input above the limit as well as every error returned by `ingest`
+    pub fn ingest_with_limit(
+        &mut self,
+        label: &str,
+        reader: impl Read,
+        maximum: u64,
+    ) -> Result<IngestReceipt> {
+        self.ingest_with_limit_and_source_sync(label, reader, maximum, Directory::sync)
+    }
+
+    fn ingest_with_limit_and_source_sync(
+        &mut self,
+        label: &str,
+        reader: impl Read,
+        maximum: u64,
         sync_source_directory: impl FnOnce(&Directory) -> Result<()>,
     ) -> Result<IngestReceipt> {
         if label.is_empty() || label.len() > 256 || label.chars().any(char::is_control) {
@@ -78,43 +106,41 @@ impl Store {
         let mut last_context = None;
         let mut scope_cache = scopes::Cache::default();
         let collection_summary = {
-            let copying = CopyReader {
-                inner: reader,
-                file: retained.as_file_mut(),
-                hash: &mut hash,
-                bytes: &mut bytes,
+            let mut writer = SparseWriter::new(retained.as_file_mut(), maximum)?;
+            let summary = {
+                let copying = CopyReader {
+                    inner: reader,
+                    file: &mut writer,
+                    hash: &mut hash,
+                    bytes: &mut bytes,
+                };
+                let mut capture = CaptureSource::with_limits(
+                    BufReader::with_capacity(1024 * 1024, copying),
+                    CaptureLimits::STREAMING,
+                )?;
+                while let Some(frame) = capture.next_packet()? {
+                    packets += 1;
+                    supported += u64::from(retain_packet(
+                        &transaction,
+                        source,
+                        u32::try_from(packets)?,
+                        &frame,
+                        &mut flow_cache,
+                        &mut last_context,
+                        &mut scope_cache,
+                    )?);
+                }
+                capture.collection_summary()
             };
-            let mut capture = CaptureSource::with_limits(
-                BufReader::with_capacity(1024 * 1024, copying),
-                CaptureLimits::STREAMING,
-            )?;
-            while let Some(frame) = capture.next_packet()? {
-                packets += 1;
-                supported += u64::from(retain_packet(
-                    &transaction,
-                    source,
-                    u32::try_from(packets)?,
-                    &frame,
-                    &mut flow_cache,
-                    &mut last_context,
-                    &mut scope_cache,
-                )?);
-            }
-            capture.collection_summary()
+            // A final hole needs an explicit length before the source is synced
+            writer.finish()?;
+            summary
         };
         let source_id = EvidenceSourceId::from_bytes(hash.finalize().into()).to_string();
         let digest = source_id
             .strip_prefix("sha256:")
             .ok_or_else(|| invalid("canonical source identity lacks its SHA-256 prefix"))?;
-        // Detect duplicate content explicitly so the storage schema never becomes the public error API
-        let duplicate: bool = transaction.query_row(
-            "SELECT EXISTS(SELECT 1 FROM sources WHERE sha256=?1)",
-            [&source_id],
-            |row| row.get(0),
-        )?;
-        if duplicate {
-            return Err(invalid("duplicate capture source content"));
-        }
+        check_duplicate_source(&transaction, &source_id)?;
         transaction.execute(
             "UPDATE sources SET sha256=?1,bytes=?2,packets=?3,unsupported=?4,collection_summary=?5 WHERE id=?6",
             params![source_id, bytes, packets, packets - supported, crate::capture_collection::to_json(collection_summary)?, source],
@@ -143,6 +169,19 @@ impl Store {
             collection_summary,
         })
     }
+}
+
+fn check_duplicate_source(connection: &Connection, source_id: &str) -> Result<()> {
+    // Keep the storage schema out of the public duplicate-source error
+    let duplicate: bool = connection.query_row(
+        "SELECT EXISTS(SELECT 1 FROM sources WHERE sha256=?1)",
+        [source_id],
+        |row| row.get(0),
+    )?;
+    if duplicate {
+        return Err(invalid("duplicate capture source content"));
+    }
+    Ok(())
 }
 
 fn verify_existing_source(sources: &Directory, source_id: &str, expected_bytes: u64) -> Result<()> {

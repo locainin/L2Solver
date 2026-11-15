@@ -10,6 +10,7 @@ mod ip_pair_cohort;
 mod model;
 mod packets;
 pub(crate) mod paths;
+mod retained;
 mod schema;
 mod scopes;
 mod shared;
