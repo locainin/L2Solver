@@ -19,6 +19,11 @@ fn cache_commands_manage_only_the_selected_xdg_roots() -> Result<(), Box<dyn Err
             String::from_utf8_lossy(&output.stderr)
         );
         assert_ne!(output.stdout.len(), 0);
+        if command == "stats" {
+            let text = String::from_utf8(output.stdout)?;
+            assert!(text.contains("SQLite state bytes:"), "{text}");
+            assert!(text.contains("SQLite state limit:"), "{text}");
+        }
         assert_eq!(std::fs::read(&sentinel)?, b"unrelated");
     }
     assert!(cache_home.join("l2solver").is_dir());

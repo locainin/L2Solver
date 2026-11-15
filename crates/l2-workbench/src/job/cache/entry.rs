@@ -11,6 +11,7 @@ use super::{
     error::{CacheError, Result},
     filesystem::{HeldDirectory, LockGuard},
     key::StageKey,
+    manager::StateRecord,
     manifest::{Manifest, safe_entry_path},
     memory,
     model::StageStatus,
@@ -288,8 +289,13 @@ impl Lease {
         }
         // Manifest and quota scratch belong to the same worker as the metadata it commits
         let budget = metadata.memory.as_ref().map(MemoryLease::budget);
-        let (prepared, bytes, _quota_lock) =
-            prepare_commit(&self.cache, self.directory.path(), &self.key, budget)?;
+        let (prepared, bytes, _quota_lock) = prepare_commit(
+            &self.cache,
+            self.directory.path(),
+            &self.key,
+            budget,
+            metadata_json.len(),
+        )?;
         self.cache.inner.check_locations()?;
         self.directory.check_location()?;
 
@@ -312,11 +318,7 @@ impl Lease {
             .inner
             .reserve_stage(&self.key, &relative_path, bytes)?;
         // Make every output file and directory durable before publishing the new pointer
-        self.directory.sync_tree()?;
-        prepared
-            .manifest
-            .validate(self.directory.path())
-            .map_err(|_| CacheError::CorruptEntry("stage changed while syncing".to_owned()))?;
+        self.sync_entry(&prepared.manifest)?;
         self.cache.inner.entries.sync()?;
         staging_key.rename_child_to(&generation, &entry_root)?;
         self.cleanup_on_drop = false;
@@ -354,6 +356,13 @@ impl Lease {
             metadata_memory,
         ))
     }
+
+    fn sync_entry(&self, manifest: &Manifest) -> Result<()> {
+        self.directory.sync_tree()?;
+        manifest
+            .validate(self.directory.path())
+            .map_err(|_| CacheError::CorruptEntry("stage changed while syncing".to_owned()))
+    }
 }
 
 struct PreparedManifest {
@@ -368,11 +377,16 @@ fn prepare_commit(
     directory: &Path,
     key: &StageKey,
     budget: Option<&MemoryBudget>,
+    metadata_bytes: usize,
 ) -> Result<(PreparedManifest, i64, LockGuard)> {
     let prepared = prepare_manifest(directory, budget)?;
     let entry_bytes = prepared.manifest.total_bytes();
     let bytes = i64::try_from(entry_bytes).map_err(|_| CacheError::SizeOverflow)?;
     let lock = cache.reserve_capacity(key, entry_bytes, budget)?;
+    let state_bytes = metadata_bytes
+        .checked_add(prepared.json.len())
+        .ok_or(CacheError::SizeOverflow)?;
+    cache.reserve_state(key, state_bytes, StateRecord::Stage)?;
     Ok((prepared, bytes, lock))
 }
 

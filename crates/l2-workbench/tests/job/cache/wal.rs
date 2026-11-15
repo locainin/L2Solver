@@ -23,6 +23,8 @@ const ROOT_MARKER: &str = "controlled-wal-test-root";
 const ROOT_MARKER_CONTENT: &[u8] = b"controlled cache WAL test";
 const REOPEN_TEST: &str = "cache::wal::committed_wal_survives_a_separate_process_reopen";
 #[cfg(target_os = "linux")]
+const LRU_FULL_TEST: &str = "cache::wal::full_lru_write_keeps_hit";
+#[cfg(target_os = "linux")]
 const CRASH_TEST: &str = "cache::wal::committed_wal_survives_a_killed_process";
 
 fn check_child_root(root: &Path) -> TestResult {
@@ -35,6 +37,60 @@ fn check_child_root(root: &Path) -> TestResult {
 
 fn wal_path(root: &Path) -> std::path::PathBuf {
     root.join("state/cache.sqlite3-wal")
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn full_lru_write_keeps_hit() -> TestResult {
+    if let Some(root) = std::env::var_os(CHILD_ROOT) {
+        let root = Path::new(&root);
+        check_child_root(root)?;
+        let cache = cache_at(root, 3)?;
+        let key = stage_key("full-recency")?;
+        let entry = cache
+            .lookup(&key, CacheReadPolicy::CompleteOnly)?
+            .ok_or("missing hit")?;
+        assert_eq!(fs::read(entry.directory().join("result.bin"))?, b"old");
+        return Ok(());
+    }
+    let temporary = tempfile::tempdir()?;
+    if !super::terminal_fsync::strace_available(temporary.path()) {
+        return Err("the recency write test needs usable strace".into());
+    }
+    fs::write(temporary.path().join(ROOT_MARKER), ROOT_MARKER_CONTENT)?;
+    let cache = cache_at(temporary.path(), 3)?;
+    let key = stage_key("full-recency")?;
+    write_entry(&cache, &key, b"old")?;
+    let database = Connection::open(temporary.path().join("state/cache.sqlite3"))?;
+    database.execute(
+        "UPDATE entries SET accessed_ns=1 WHERE key=?1",
+        [key.as_str()],
+    )?;
+    let trace = temporary.path().join("recency-full.trace");
+    let wal = wal_path(temporary.path());
+    let mut command = Command::new("strace");
+    command
+        .args(["-f", "-qq", "-yy", "--kill-on-exit", "-P"])
+        .arg(&wal)
+        .args([
+            "-e",
+            "trace=pwrite64",
+            "-e",
+            "inject=pwrite64:error=ENOSPC:when=1",
+            "-o",
+        ])
+        .arg(&trace)
+        .arg(std::env::current_exe()?)
+        .args(["--exact", LRU_FULL_TEST, "--nocapture"])
+        .env(CHILD_ROOT, temporary.path());
+    let (status, output) = run_child(&mut command)?;
+    let trace = fs::read_to_string(trace)?;
+    assert!(status.success(), "lookup child failed: {output}\n{trace}");
+    assert!(
+        trace.contains("ENOSPC") && trace.contains("INJECTED"),
+        "no WAL write was rejected: {trace}"
+    );
+    Ok(())
 }
 
 fn run_child(command: &mut Command) -> Result<(ExitStatus, String), Box<dyn Error>> {

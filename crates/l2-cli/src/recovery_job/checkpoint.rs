@@ -3,7 +3,7 @@
 use crate::result_directory::ResultIdentity;
 use l2_workbench::job::{
     Job, JobError, PhaseState,
-    cache::{Cache, CacheError, CheckpointStatus, StageKey},
+    cache::{Cache, CacheError, CheckpointStatus, JobCheckpointOwner, StageKey},
 };
 use serde_json::json;
 use std::{
@@ -76,6 +76,7 @@ pub(super) struct CheckpointWriter {
     cache: Cache,
     key: StageKey,
     job: Job,
+    _owner: JobCheckpointOwner,
     stop: Option<mpsc::Sender<WorkerCommand>>,
     worker: Option<JoinHandle<Result<(), CheckpointError>>>,
 }
@@ -97,6 +98,8 @@ impl CheckpointWriter {
             &[],
         )
         .map_err(CheckpointError::Identity)?;
+        // One owner reads and replaces this job's progress for its entire lifetime
+        let owner = cache.own_job_checkpoint(&key)?;
         let saved_snapshot = if refresh {
             None
         } else {
@@ -148,6 +151,7 @@ impl CheckpointWriter {
             cache: cache.clone(),
             key,
             job: job.clone(),
+            _owner: owner,
             stop: Some(stop.clone()),
             worker: Some(worker),
         };

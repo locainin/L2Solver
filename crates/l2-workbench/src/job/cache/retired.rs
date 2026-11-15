@@ -32,7 +32,7 @@ pub(super) fn record(
 // Call only while holding the exclusive key lock
 pub(super) fn cleanup(inner: &CacheInner, key: &str, relative_path: &str) -> Result<()> {
     safe_entry_path(inner.entries.path(), key, relative_path)?;
-    let mut connection = database::open_connection(&inner.state_root)?;
+    let mut connection = database::open_writer(&inner.state_root)?;
     let is_current: bool = connection.query_row(
         "SELECT EXISTS(SELECT 1 FROM entries WHERE key = ?1 AND relative_path = ?2)
              OR EXISTS(SELECT 1 FROM executions WHERE key = ?1 AND relative_path = ?2)",

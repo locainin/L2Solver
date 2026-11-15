@@ -9,7 +9,7 @@ use rusqlite::{Connection, OpenFlags, TransactionBehavior, config::DbConfig};
 
 use super::{
     error::{CacheError, Result},
-    filesystem::HeldDirectory,
+    filesystem::{HeldDirectory, LockGuard},
 };
 
 pub(super) const DATABASE_NAME: &str = "cache.sqlite3";
@@ -17,10 +17,58 @@ const SCHEMA_VERSION: u32 = 3;
 const APPLICATION_ID: i64 = 0x4c32_5343;
 const INITIALIZATION_LOCK: &str = "cache-init.lock";
 const WAL_CLOSE_CHECKPOINT_BYTES: u64 = 64 * 1024;
+// Two bounded checkpoint copies and the schema need space even with an empty file quota
+const MIN_DATABASE_BYTES: u64 = 4 * 1024 * 1024;
+const SQLITE_SHM_BYTES: u64 = 32 * 1024;
+const WAL_CHECK_INTERVAL: i32 = 256;
+
+pub(super) fn configure_limit(state: &mut HeldDirectory, file_limit: u64) -> Result<()> {
+    let existing = state_bytes(state)?;
+    let available = state.available_bytes()?.saturating_add(existing);
+    // Leave room for the database, WAL, shared-memory index, and one in-flight write
+    let usable = crate::job::workspace_capacity(available);
+    let limit = file_limit.max(MIN_DATABASE_BYTES).min(usable / 4);
+    if limit < 64 * 1024 {
+        return Err(CacheError::InvalidInput("not enough space for cache state"));
+    }
+    state.set_database_limit(limit);
+    Ok(())
+}
+
+pub(super) fn state_limit(state: &HeldDirectory) -> Result<u64> {
+    let limit = state
+        .database_limit()
+        .ok_or(CacheError::InvalidInput("cache state limit is missing"))?;
+    limit
+        .checked_mul(3)
+        .and_then(|bytes| bytes.checked_add(limit.div_ceil(8)))
+        .and_then(|bytes| bytes.checked_add(SQLITE_SHM_BYTES))
+        .ok_or(CacheError::SizeOverflow)
+}
+
+pub(super) fn state_bytes(state: &HeldDirectory) -> Result<u64> {
+    let database = match fs::symlink_metadata(state.path().join(DATABASE_NAME)) {
+        Ok(metadata) if metadata.is_file() && !metadata.file_type().is_symlink() => metadata.len(),
+        Ok(_) => {
+            return Err(CacheError::UnsafePath(
+                "SQLite database must be a regular file",
+            ));
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => 0,
+        Err(error) => return Err(error.into()),
+    };
+    let wal = validate_sidecar(state.path(), "-wal")?.unwrap_or(0);
+    let shm = validate_sidecar(state.path(), "-shm")?.unwrap_or(0);
+    database
+        .checked_add(wal)
+        .and_then(|bytes| bytes.checked_add(shm))
+        .ok_or(CacheError::SizeOverflow)
+}
 
 pub(super) struct CacheConnection<'state> {
     connection: Connection,
     state: &'state HeldDirectory,
+    writer: Option<LockGuard>,
 }
 
 impl Deref for CacheConnection<'_> {
@@ -39,6 +87,9 @@ impl DerefMut for CacheConnection<'_> {
 
 impl Drop for CacheConnection<'_> {
     fn drop(&mut self) {
+        if self.writer.is_some() {
+            let _ = self.connection.progress_handler(0, None::<fn() -> bool>);
+        }
         // Committed WAL data stays authoritative until SQLite checkpoints it
         match validate_sidecar(self.state.path(), "-wal") {
             Ok(Some(size)) if size < WAL_CLOSE_CHECKPOINT_BYTES => {
@@ -101,17 +152,73 @@ pub(super) fn initialize(state: &HeldDirectory, locks: &HeldDirectory) -> Result
 
 pub(super) fn open_connection(state: &HeldDirectory) -> Result<CacheConnection<'_>> {
     let database_path = state.ensure_regular_file(DATABASE_NAME)?;
-    let _ = validate_sidecar(state.path(), "-wal")?;
-    let _ = validate_sidecar(state.path(), "-shm")?;
+    check_sidecars(state)?;
     let connection = Connection::open_with_flags(
         &database_path,
         OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_NOFOLLOW,
     )?;
+    if let Some(limit) = state.database_limit() {
+        let page_size: u64 = connection.pragma_query_value(None, "page_size", |row| row.get(0))?;
+        let pages = (limit / page_size).clamp(1, u64::from(u32::MAX) - 1);
+        connection.pragma_update(None, "max_page_count", pages)?;
+        connection.pragma_update(None, "journal_size_limit", limit)?;
+    }
     connection.busy_timeout(Duration::from_secs(5))?;
     connection.execute_batch("PRAGMA foreign_keys = ON; PRAGMA trusted_schema = OFF;")?;
     // Sync committed WAL changes before old generation files can be removed
     connection.pragma_update(None, "synchronous", 2_i64)?;
-    Ok(CacheConnection { connection, state })
+    Ok(CacheConnection {
+        connection,
+        state,
+        writer: None,
+    })
+}
+
+pub(super) fn check_sidecars(state: &HeldDirectory) -> Result<()> {
+    state.check_location()?;
+    let _ = validate_sidecar(state.path(), "-wal")?;
+    let _ = validate_sidecar(state.path(), "-shm")?;
+    Ok(())
+}
+
+// Writers share a gate so a pinned reader cannot grow the WAL without bound
+pub(super) fn open_writer(state: &HeldDirectory) -> Result<CacheConnection<'_>> {
+    let lock = state.lock_with_retry("state-writer.lock", true)?;
+    writer_with_lock(state, lock)
+}
+
+pub(super) fn try_open_writer(state: &HeldDirectory) -> Result<CacheConnection<'_>> {
+    let lock = state.lock("state-writer.lock", true)?;
+    writer_with_lock(state, lock)
+}
+
+fn writer_with_lock(state: &HeldDirectory, lock: LockGuard) -> Result<CacheConnection<'_>> {
+    let mut connection = open_connection(state)?;
+    if let Some(limit) = state.database_limit() {
+        let wal = state.path().join(format!("{DATABASE_NAME}-wal"));
+        if validate_sidecar(state.path(), "-wal")?.unwrap_or(0) >= limit {
+            connection.busy_timeout(Duration::ZERO)?;
+            connection.execute_batch("PRAGMA wal_checkpoint(TRUNCATE)")?;
+            if validate_sidecar(state.path(), "-wal")?.unwrap_or(0) >= limit {
+                return Err(CacheError::CacheBusy);
+            }
+            connection.busy_timeout(Duration::from_secs(5))?;
+        }
+        // Stop a long SQL statement after its current operation crosses the WAL allowance
+        connection.connection.progress_handler(
+            WAL_CHECK_INTERVAL,
+            Some(move || match fs::symlink_metadata(&wal) {
+                Ok(metadata) => {
+                    !metadata.is_file()
+                        || metadata.file_type().is_symlink()
+                        || metadata.len() >= limit
+                }
+                Err(error) => error.kind() != std::io::ErrorKind::NotFound,
+            }),
+        )?;
+    }
+    connection.writer = Some(lock);
+    Ok(connection)
 }
 
 pub(super) fn checkpoint_wal(state: &HeldDirectory) -> Result<()> {

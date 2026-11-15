@@ -268,7 +268,7 @@ pub struct RecoveryOptions {
     /// Select the search effort: fast, normal, or deep
     #[arg(long, value_enum, default_value = "normal")]
     pub profile: RecoveryProfile,
-    /// Recompute and atomically replace owned output
+    /// Recompute; retain previous output
     #[arg(long)]
     pub refresh: bool,
     /// Skip recovery cache reads and writes
@@ -300,7 +300,7 @@ pub struct RecoveryOptions {
     /// Set the aggregate byte limit for refinement source and manifest reads
     #[arg(skip = 4_u64 * 1024 * 1024 * 1024)]
     pub source_read_limit: u64,
-    /// Set the maximum retained cache size using bytes, KB/MB/GB/TB, or KiB/MiB/GiB/TiB
+    /// Limit stage files; SQLite state has a separate allowance
     #[arg(
         long,
         value_name = "SIZE",

@@ -81,6 +81,15 @@ impl Lease {
         } else {
             self.cache.inner.quota_lock()?
         };
+        let state_bytes = next_json
+            .len()
+            .checked_add(snapshot_json.len())
+            .ok_or(CacheError::SizeOverflow)?;
+        self.cache.reserve_state(
+            &self.key,
+            state_bytes,
+            super::super::manager::StateRecord::Execution,
+        )?;
         commit_metadata(
             self,
             &previous,
@@ -209,7 +218,7 @@ pub(super) fn commit_metadata(
     snapshot_json: &str,
     change: Change<'_>,
 ) -> Result<()> {
-    let mut connection = database::open_connection(&lease.cache.inner.state_root)?;
+    let mut connection = database::open_writer(&lease.cache.inner.state_root)?;
     let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
     let updated = transaction.execute(
             "UPDATE executions SET envelope_json = ?1, bytes = ?2 WHERE key = ?3 AND relative_path = ?4 AND envelope_json = ?5 AND bytes = ?6",

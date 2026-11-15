@@ -42,8 +42,12 @@ mod scoped_memory;
 mod lookup;
 #[path = "cache/maintenance.rs"]
 mod maintenance;
+#[path = "cache/pairing.rs"]
+mod pairing;
 #[path = "cache/snapshot_version.rs"]
 mod snapshot_version;
+#[path = "cache/state_quota.rs"]
+mod state_quota;
 #[cfg(target_os = "linux")]
 #[path = "cache/terminal_fsync.rs"]
 mod terminal_fsync;
