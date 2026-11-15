@@ -49,6 +49,9 @@ mod selection_budget;
 #[path = "store/sparse.rs"]
 mod sparse;
 
+#[path = "store/truncated.rs"]
+mod truncated;
+
 #[path = "store/support.rs"]
 mod support;
 

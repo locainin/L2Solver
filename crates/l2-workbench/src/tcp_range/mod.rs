@@ -3,9 +3,11 @@
 //! This maps captured bytes to an explicit modular sequence range. It does not
 //! identify a connection generation or model what an endpoint accepted
 
+mod memory;
 mod model;
 mod spans;
 
+pub(crate) use memory::range_memory_bound;
 pub use model::{Observation, RangeReport, Segment, Span, SpanStatus};
 use std::{error::Error, fmt};
 
@@ -14,6 +16,9 @@ pub const MAX_RANGE_BYTES: usize = 0x7fff_ffff;
 pub const MAX_SEGMENT_BYTES: usize = 65_535;
 pub const MAX_OBSERVATIONS: usize = 1_024;
 pub const MAX_RETAINED_BYTES: usize = 4 * 1024 * 1024;
+
+// Leave most Case nodes for packet evidence when every observed byte is a separate run
+const MAX_DETAILED_SPANS: usize = crate::evidence::MAX_NODES / 16;
 
 /// A checked range or source-location error, before any observation is retained
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -35,6 +40,7 @@ pub struct TcpRange {
     // Cache the byte total so each quota check stays constant-time
     retained_bytes: usize,
     omitted_observations: u64,
+    unavailable_observations: u64,
     // Only omission locations survive when the byte observation itself cannot fit
     omitted_coverage: Vec<bool>,
     max_observations: usize,
@@ -79,6 +85,7 @@ impl TcpRange {
             observations: Vec::new(),
             retained_bytes: 0,
             omitted_observations: 0,
+            unavailable_observations: 0,
             omitted_coverage,
             max_observations,
             max_retained_bytes,
@@ -162,6 +169,16 @@ impl TcpRange {
         (0, 0, 0)
     }
 
+    pub(crate) fn mark_unavailable(&mut self, sequence: u32, length: usize) {
+        let (offset, _, length) = self.intersection(sequence, length);
+        if length != 0 {
+            self.unavailable_observations += 1;
+            for omitted in self.omitted_coverage.iter_mut().skip(offset).take(length) {
+                *omitted = true;
+            }
+        }
+    }
+
     /// Finish a value-consistency report without choosing among conflicting packets
     #[must_use]
     pub fn finish(self) -> RangeReport {
@@ -169,7 +186,7 @@ impl TcpRange {
             self.start_sequence,
             self.length,
             self.observations,
-            self.omitted_observations,
+            self.omitted_observations + self.unavailable_observations,
             &self.omitted_coverage,
         )
     }

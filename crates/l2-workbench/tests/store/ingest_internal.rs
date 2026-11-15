@@ -24,6 +24,9 @@ mod frames;
 #[path = "support.rs"]
 mod support;
 
+#[path = "ingest_disk.rs"]
+mod disk;
+
 #[test]
 fn source_directory_not_commit_row() -> Result<(), Box<dyn Error>> {
     let fixture = orphaned_source()?;

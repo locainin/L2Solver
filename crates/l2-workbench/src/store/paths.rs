@@ -84,6 +84,19 @@ impl Directory {
             ))
         }
     }
+
+    pub fn file_bytes(&self) -> Result<u64> {
+        let mut total = 0_u64;
+        for entry in std::fs::read_dir(self.path())? {
+            let metadata = std::fs::symlink_metadata(entry?.path())?;
+            if metadata.is_file() {
+                total = total
+                    .checked_add(metadata.len())
+                    .ok_or_else(|| invalid("workspace source size overflow"))?;
+            }
+        }
+        Ok(total)
+    }
 }
 
 pub fn regular(path: &Path) -> Result<File> {

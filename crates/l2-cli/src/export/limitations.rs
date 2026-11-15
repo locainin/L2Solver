@@ -179,7 +179,7 @@ const STATIC_CASE_LIMITATIONS: &[&str] = &[
     "DNS address uses describe later destination co-occurrence; TTL validity, resolver caching, application use, and causality are unresolved",
     "Exact tuple mismatches do not rule out NAT, proxies, protocol helpers, or omitted capture data",
     "A correlated session is an observed endpoint and timing match, not proof that the FTP command was accepted or caused the session",
-    "This indexed flow selection includes complete unfragmented transport envelopes only; raw fragments remain in the source and may require separate reconstruction",
+    "This indexed flow selection includes supported unfragmented transport envelopes and captured TCP prefixes; raw fragments remain in the source and may require separate reconstruction",
 ];
 
 fn static_case_limitation(message: &str) -> Option<&str> {

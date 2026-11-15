@@ -695,7 +695,7 @@ fn source_index_key(identity: &SourceIdentity) -> Result<StageKey, Box<dyn Error
     Ok(StageKey::new(
         "capture_index",
         SCHEMA_VERSION,
-        "pcap-index-v2",
+        "pcap-index-v3",
         &json!({}),
         identity,
         &[],

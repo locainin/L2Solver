@@ -15,6 +15,7 @@ mod schema;
 mod scopes;
 mod shared;
 mod verify;
+mod workspace;
 
 use crate::job::MemoryBudget;
 pub use model::{
@@ -33,8 +34,8 @@ use std::{
 
 pub type Result<T> = std::result::Result<T, Box<dyn Error>>;
 
-/// Disk index schema, including cooked capture interpretation and normalized scopes
-pub const SCHEMA_VERSION: u32 = 6;
+/// Disk index schema, including truncated TCP prefix selection
+pub const SCHEMA_VERSION: u32 = 7;
 
 /// One `SQLite` index and content-addressed copies of its original capture sources
 pub struct Store {
@@ -76,8 +77,7 @@ impl Store {
     /// Open a published index without write authority
     ///
     /// # Errors
-    /// Rejects non-regular indexes, unsupported schemas, older cooked indexes
-    /// requiring a rebuild, and storage failures
+    /// Rejects non-regular indexes, older indexes requiring a rebuild, and storage failures
     pub fn open(directory: &Path, options: Options) -> Result<Self> {
         options.validate()?;
         let directory = paths::Directory::open(directory)?;

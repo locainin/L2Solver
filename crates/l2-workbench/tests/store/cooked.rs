@@ -197,7 +197,7 @@ fn pcapng_sll2_ifindex_is_separate_from_capture_interface_and_flow_scope() -> Te
 }
 
 #[test]
-fn legacy_index_accepts_ethernet_but_rejects_cooked_requiring_reindex() -> TestResult {
+fn legacy_index_requires_reindex() -> TestResult {
     for version in [1_u16, 113, 276] {
         let packet = frames::tcp(false, 101, 0x18, b"data")?;
         let bytes = if version == 1 {
@@ -212,14 +212,10 @@ fn legacy_index_accepts_ethernet_but_rejects_cooked_requiring_reindex() -> TestR
         let connection = Connection::open(temporary.path().join("index.sqlite"))?;
         connection.pragma_update(None, "user_version", 5)?;
         drop(connection);
-        if version == 1 {
-            Store::open(temporary.path(), Options::default())?.verify_sources()?;
-        } else {
-            let Err(error) = Store::open(temporary.path(), Options::default()) else {
-                return Err("legacy cooked index was accepted".into());
-            };
-            assert!(error.to_string().contains("rebuild"));
-        }
+        let Err(error) = Store::open(temporary.path(), Options::default()) else {
+            return Err("legacy index was accepted".into());
+        };
+        assert!(error.to_string().contains("rebuild"));
     }
     Ok(())
 }

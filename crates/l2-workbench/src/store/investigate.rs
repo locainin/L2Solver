@@ -88,7 +88,7 @@ impl Store {
             },
         )?;
         let mut result = build_selected_with_case(input, total, limits, initial.case)?;
-        result.case.add_limitation("This indexed flow selection includes complete unfragmented transport envelopes only; raw fragments remain in the source and may require separate reconstruction")?;
+        result.case.add_limitation("This indexed flow selection includes supported unfragmented transport envelopes and captured TCP prefixes; raw fragments remain in the source and may require separate reconstruction")?;
         Ok(result)
     }
 
@@ -495,7 +495,7 @@ fn build_flow_page(
             "bounded flow page did not retain every selected record",
         ));
     }
-    result.case.add_limitation("This indexed flow page includes complete unfragmented transport envelopes only; raw fragments remain in the source and may require separate reconstruction")?;
+    result.case.add_limitation("This indexed flow page includes supported unfragmented transport envelopes and captured TCP prefixes; raw fragments remain in the source and may require separate reconstruction")?;
     result.case.mark_incomplete(
         "This bounded flow page is an independent selected-record analysis; TCP/session/application state was not joined across page boundaries, so objects split across pages remain unresolved",
     )?;

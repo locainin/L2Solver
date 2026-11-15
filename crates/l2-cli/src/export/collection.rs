@@ -313,7 +313,7 @@ fn collect_flow_case(
         collection.limitations.push_with_impact(
             Some(flow_id),
             format!(
-                "Flow analysis selected {} records, retained {}, and omitted {}; retention ceilings reached: {limits}; reconstruction omissions: {} TCP records, {} fragments, {} ranges, {} TCP byte positions affected by omitted observations or rejected ranges, {} TCP observations, {} fragment byte positions affected by omitted observations or rejected ranges, {} fragment observations, {} state observations, {} unmeasured ranges",
+                "Flow analysis selected {} records, retained {}, and omitted {}; retention ceilings reached: {limits}; reconstruction omissions: {} TCP records, {} fragments, {} ranges, {} TCP byte positions affected by omitted observations, span limits, or rejected ranges, {} TCP observations, {} fragment byte positions affected by omitted observations, span limits, or rejected ranges, {} fragment observations, {} state observations, {} unmeasured ranges",
                 analysis.coverage.selected_records,
                 analysis.coverage.retained_records,
                 analysis.coverage.omitted_records,

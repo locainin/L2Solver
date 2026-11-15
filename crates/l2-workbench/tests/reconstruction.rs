@@ -10,6 +10,8 @@ mod review;
 mod selected;
 #[path = "reconstruction/support.rs"]
 mod support;
+#[path = "reconstruction/truncated.rs"]
+mod truncated;
 #[path = "reconstruction/workflow.rs"]
 mod workflow;
 

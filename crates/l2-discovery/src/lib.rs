@@ -38,6 +38,7 @@ pub use fragments::{
 };
 pub use ip::{
     IpHeader, IpPacket, ip_header, ip_header_from_payload, ip_packet, ip_packet_from_payload,
+    tcp_prefix_from_payload, truncated_tcp_tuple_from_payload,
 };
 pub use model::{
     Discovery, Fingerprint, FingerprintStatus, IdentityRole, NetworkAddress, Protocol,

@@ -34,7 +34,12 @@ pub(super) fn finish(
             .is_some_and(|end| *end < bounds.extent);
     let coverage = if bounds.extent == 0 {
         None
-    } else if budget.reserve(bounds.extent, RangeKind::Tcp)? {
+    } else if budget.reserve(
+        bounds.extent,
+        RangeKind::Tcp,
+        packets.iter().map(|packet| packet.bytes.len()).sum(),
+        packets.len(),
+    )? {
         let coverage = coverage(packets, bounds.start, bounds.extent, budget)?;
         Some(budget.retain_coverage(coverage, RangeKind::Tcp)?)
     } else {
@@ -78,12 +83,15 @@ fn bounds(packets: &[Transport]) -> Result<Bounds, ReconstructionError> {
         .or_else(|| {
             packets
                 .iter()
-                .find(|packet| !packet.bytes.is_empty())
+                .find(|packet| !packet.bytes.is_empty() || packet.missing_bytes != 0)
                 .and_then(data_sequence)
         })
         .unwrap_or(0);
     if !start_known {
-        for packet in packets.iter().filter(|packet| !packet.bytes.is_empty()) {
+        for packet in packets
+            .iter()
+            .filter(|packet| !packet.bytes.is_empty() || packet.missing_bytes != 0)
+        {
             if let Some(sequence) = data_sequence(packet)
                 && start.wrapping_sub(sequence) < 0x8000_0000
             {
@@ -105,18 +113,19 @@ fn bounds(packets: &[Transport]) -> Result<Bounds, ReconstructionError> {
             continue;
         };
         let Some(offset) = offset(packet, start)? else {
-            if !packet.bytes.is_empty() || flags & 1 != 0 {
+            if !packet.bytes.is_empty() || packet.missing_bytes != 0 || flags & 1 != 0 {
                 bounds.outside += 1;
                 bounds.ambiguous = true;
             }
             continue;
         };
         // Bare acknowledgements do not declare a payload byte interval
-        if !packet.bytes.is_empty() || flags & 1 != 0 {
-            bounds.extent = bounds.extent.max(offset + packet.bytes.len());
+        let declared_length = packet.bytes.len() + packet.missing_bytes;
+        if declared_length != 0 || flags & 1 != 0 {
+            bounds.extent = bounds.extent.max(offset + declared_length);
         }
         if flags & 1 != 0 {
-            bounds.fin_ends.push(offset + packet.bytes.len());
+            bounds.fin_ends.push(offset + declared_length);
         }
         bounds
             .origins
@@ -143,10 +152,9 @@ fn offset(packet: &Transport, start: u32) -> Result<Option<usize>, Reconstructio
     let sequence = data_sequence(packet).ok_or(ReconstructionError("TCP stream received UDP"))?;
     let offset = usize::try_from(sequence.wrapping_sub(start))
         .map_err(|_| ReconstructionError("sequence offset is not representable"))?;
-    Ok(
-        (offset <= MAX_RANGE_BYTES && packet.bytes.len() <= MAX_RANGE_BYTES.saturating_sub(offset))
-            .then_some(offset),
-    )
+    Ok((offset <= MAX_RANGE_BYTES
+        && packet.bytes.len() + packet.missing_bytes <= MAX_RANGE_BYTES.saturating_sub(offset))
+    .then_some(offset))
 }
 
 fn coverage(
@@ -180,6 +188,15 @@ fn coverage(
                     payload: &packet.bytes,
                 })
                 .map_err(|_| ReconstructionError("invalid TCP observation range"))?;
+            if packet.missing_bytes != 0 {
+                // A later retransmission cannot establish what the missing bytes contained
+                let missing_start = sequence
+                    .wrapping_add(u32::from(flags & 2 != 0))
+                    .wrapping_add(u32::try_from(packet.bytes.len()).map_err(|_| {
+                        ReconstructionError("TCP captured payload exceeds sequence range")
+                    })?);
+                range.mark_unavailable(missing_start, packet.missing_bytes);
+            }
         }
     }
     Ok(Coverage::from_range(range.finish()))

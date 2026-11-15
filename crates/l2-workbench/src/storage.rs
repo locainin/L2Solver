@@ -55,6 +55,10 @@ impl<'file> SparseWriter<'file> {
         self.file.set_len(self.position)?;
         Ok(self.position)
     }
+
+    pub(crate) const fn position(&self) -> u64 {
+        self.position
+    }
 }
 
 impl Write for SparseWriter<'_> {

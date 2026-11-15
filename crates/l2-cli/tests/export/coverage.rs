@@ -75,7 +75,7 @@ fn writes_exact_tcp_fragment_and_unmeasured_range_omission_totals() -> Result<()
     let summary = std::fs::read_to_string(path)?;
     assert_eq!(
         summary.trim_end(),
-        "Flow reconstruction omissions: 3 TCP records, 2 fragments, 5 ranges, 23 TCP byte positions affected by omitted observations or rejected ranges, 11 TCP observations, 13 fragment byte positions affected by omitted observations or rejected ranges, 2 fragment observations, 7 state observations, 4 unmeasured ranges (in 2 of 5 Cases)"
+        "Flow reconstruction omissions: 3 TCP records, 2 fragments, 5 ranges, 23 TCP byte positions affected by omitted observations, span limits, or rejected ranges, 11 TCP observations, 13 fragment byte positions affected by omitted observations, span limits, or rejected ranges, 2 fragment observations, 7 state observations, 4 unmeasured ranges (in 2 of 5 Cases)"
     );
     Ok(())
 }

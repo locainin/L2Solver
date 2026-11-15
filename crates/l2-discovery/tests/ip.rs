@@ -1,5 +1,8 @@
 use l2_core::{EthernetFrame, FrameField};
-use l2_discovery::{NetworkAddress, TransportHeader, ip_header, ip_packet};
+use l2_discovery::{
+    NetworkAddress, TransportHeader, ip_header, ip_packet, tcp_prefix_from_payload,
+    truncated_tcp_tuple_from_payload,
+};
 
 const fn ethernet(field: u16, payload: &[u8]) -> EthernetFrame<'_> {
     EthernetFrame {
@@ -166,6 +169,42 @@ fn invalid_or_truncated_ip_rejected() {
         }
         assert!(ip_packet(&ethernet(0x0800, &bytes)).is_none());
     }
+}
+
+#[test]
+fn truncated_tcp_prefix_bounds() -> Result<(), &'static str> {
+    let mut tcp = vec![0x30, 0x39, 0x01, 0xbb];
+    tcp.extend_from_slice(&1_u32.to_be_bytes());
+    tcp.extend_from_slice(&0_u32.to_be_bytes());
+    tcp.extend_from_slice(&[0x50, 0x18, 0, 0, 0, 0, 0, 0]);
+    tcp.extend_from_slice(b"abcde");
+    for (protocol, bytes, header_len) in [(0x0800, ipv4(6, &tcp), 20), (0x86dd, ipv6(6, &tcp), 40)]
+    {
+        assert!(tcp_prefix_from_payload(protocol, &bytes).is_none());
+        let prefix = bytes.get(..bytes.len() - 2).ok_or("missing prefix")?;
+        let (ip, packet, missing) =
+            tcp_prefix_from_payload(protocol, prefix).ok_or("missing TCP prefix")?;
+        assert_eq!(ip.header_len, header_len);
+        assert_eq!(packet.payload, b"abc");
+        assert_eq!(packet.payload_offset, header_len + 20);
+        assert_eq!(missing, 2);
+        let short = prefix
+            .get(..header_len + 19)
+            .ok_or("missing short TCP header")?;
+        assert!(tcp_prefix_from_payload(protocol, short).is_none());
+        let ports_only = prefix.get(..header_len + 4).ok_or("missing TCP ports")?;
+        assert_eq!(
+            truncated_tcp_tuple_from_payload(protocol, ports_only).map(|(_, ports)| ports),
+            Some((12_345, 443))
+        );
+        let incomplete_ports = prefix.get(..header_len + 3).ok_or("missing short ports")?;
+        assert!(truncated_tcp_tuple_from_payload(protocol, incomplete_ports).is_none());
+    }
+    let mut fragment = ipv4(6, &tcp);
+    *fragment.get_mut(6).ok_or("missing fragment flags")? = 0x20;
+    fragment.truncate(fragment.len() - 2);
+    assert!(tcp_prefix_from_payload(0x0800, &fragment).is_none());
+    Ok(())
 }
 
 #[test]

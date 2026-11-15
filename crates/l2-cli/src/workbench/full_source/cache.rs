@@ -29,7 +29,7 @@ use std::{
 const SOURCE_ALIAS_STAGE: &str = "capture_source";
 const SOURCE_ALIAS_ALGORITHM: &str = "pcap-source-alias-v2";
 const SOURCE_INDEX_STAGE: &str = "capture_index";
-const SOURCE_INDEX_ALGORITHM: &str = "pcap-index-v2";
+const SOURCE_INDEX_ALGORITHM: &str = "pcap-index-v3";
 const INDEX_DIRECTORY: &str = "index";
 const CACHE_CONTENTION_WAIT: Duration = Duration::from_secs(5);
 const CACHE_CONTENTION_POLL: Duration = Duration::from_millis(20);
@@ -39,7 +39,7 @@ const CACHE_INVALID_FALLBACK_MESSAGE: &str =
 const CACHE_QUOTA_FALLBACK_MESSAGE: &str =
     "Cache quota reached; continuing with the available capture index";
 
-pub const NATIVE_CASE_VERSION: u32 = 4;
+pub const NATIVE_CASE_VERSION: u32 = 5;
 
 type Result<T> = std::result::Result<T, Box<dyn Error>>;
 

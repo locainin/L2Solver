@@ -30,6 +30,8 @@ mod selected;
 mod support;
 #[path = "investigation/timestamps.rs"]
 mod timestamps;
+#[path = "investigation/truncated.rs"]
+mod truncated;
 #[path = "investigation/window.rs"]
 mod window;
 

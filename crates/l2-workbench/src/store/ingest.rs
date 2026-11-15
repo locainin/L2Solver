@@ -6,8 +6,8 @@ use super::{
     invalid, packets,
     paths::Directory,
     scopes, shared,
+    workspace::Workspace,
 };
-use crate::storage::SparseWriter;
 use l2_audit::ForensicScope;
 use l2_capture::{CaptureLocator, CapturedFrame, EvidenceSourceId};
 use l2_core::FrameField;
@@ -63,10 +63,12 @@ impl Store {
         reader: impl Read,
         sync_source_directory: impl FnOnce(&Directory) -> Result<()>,
     ) -> Result<IngestReceipt> {
-        check_storage_locations(&self.directory, &self.sources)?;
-        let maximum = crate::job::workspace_capacity(self.sources.available_bytes()?)
-            .min(l2_pcap::ABSOLUTE_MAX_INPUT_BYTES);
-        self.ingest_with_limit_and_source_sync(label, reader, maximum, sync_source_directory)
+        self.ingest_with_limit_and_source_sync(
+            label,
+            reader,
+            l2_pcap::ABSOLUTE_MAX_INPUT_BYTES,
+            sync_source_directory,
+        )
     }
 
     /// Copy and index a capture without retaining more than the given logical bytes
@@ -89,13 +91,33 @@ impl Store {
         maximum: u64,
         sync_source_directory: impl FnOnce(&Directory) -> Result<()>,
     ) -> Result<IngestReceipt> {
+        self.ingest_with_workspace_limit(label, reader, maximum, sync_source_directory, None)
+    }
+
+    fn ingest_with_workspace_limit(
+        &mut self,
+        label: &str,
+        reader: impl Read,
+        maximum: u64,
+        sync_source_directory: impl FnOnce(&Directory) -> Result<()>,
+        ceiling: Option<u64>,
+    ) -> Result<IngestReceipt> {
         if label.is_empty() || label.len() > 256 || label.chars().any(char::is_control) {
             return Err(invalid("invalid capture source label"));
         }
         // Keep the database and retained evidence rooted at their opened directories
         check_storage_locations(&self.directory, &self.sources)?;
+        let existing_sources = self.sources.file_bytes()?;
+        let available = self
+            .directory
+            .available_bytes()?
+            .min(self.sources.available_bytes()?);
         let mut retained = tempfile::NamedTempFile::new_in(self.sources.path())?;
-        let transaction = self.connection.transaction()?;
+        // Lock the existing page count before reserving its rollback journal
+        let transaction = self
+            .connection
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let workspace = Workspace::new(&transaction, available, existing_sources, ceiling)?;
         transaction.execute("INSERT INTO sources(label) VALUES(?1)", [label])?;
         let source = transaction.last_insert_rowid();
         let mut hash = Sha256::new();
@@ -106,7 +128,7 @@ impl Store {
         let mut last_context = None;
         let mut scope_cache = scopes::Cache::default();
         let collection_summary = {
-            let mut writer = SparseWriter::new(retained.as_file_mut(), maximum)?;
+            let mut writer = workspace.writer(&transaction, retained.as_file_mut(), maximum)?;
             let summary = {
                 let copying = CopyReader {
                     inner: reader,
@@ -137,9 +159,6 @@ impl Store {
             summary
         };
         let source_id = EvidenceSourceId::from_bytes(hash.finalize().into()).to_string();
-        let digest = source_id
-            .strip_prefix("sha256:")
-            .ok_or_else(|| invalid("canonical source identity lacks its SHA-256 prefix"))?;
         check_duplicate_source(&transaction, &source_id)?;
         transaction.execute(
             "UPDATE sources SET sha256=?1,bytes=?2,packets=?3,unsupported=?4,collection_summary=?5 WHERE id=?6",
@@ -147,16 +166,7 @@ impl Store {
         )?;
         retained.as_file().sync_all()?;
         check_storage_locations(&self.directory, &self.sources)?;
-        let path = self.sources.path().join(format!("{digest}.pcap"));
-        // Reuse an orphan only when its regular-file contents match this complete source
-        match retained.persist_noclobber(&path) {
-            Ok(_) => {}
-            Err(error) if error.error.kind() == io::ErrorKind::AlreadyExists => {
-                drop(error.file);
-                verify_existing_source(&self.sources, &source_id, bytes)?;
-            }
-            Err(error) => return Err(error.into()),
-        }
+        publish_source(retained, &self.sources, &source_id, bytes)?;
         sync_source_directory(&self.sources)?;
         check_storage_locations(&self.directory, &self.sources)?;
         transaction.commit()?;
@@ -169,6 +179,28 @@ impl Store {
             collection_summary,
         })
     }
+}
+
+fn publish_source(
+    retained: tempfile::NamedTempFile,
+    sources: &Directory,
+    source_id: &str,
+    bytes: u64,
+) -> Result<()> {
+    let digest = source_id
+        .strip_prefix("sha256:")
+        .ok_or_else(|| invalid("canonical source identity lacks its SHA-256 prefix"))?;
+    let path = sources.path().join(format!("{digest}.pcap"));
+    // Reuse an orphan only when its regular-file contents match this complete source
+    match retained.persist_noclobber(&path) {
+        Ok(_) => {}
+        Err(error) if error.error.kind() == io::ErrorKind::AlreadyExists => {
+            drop(error.file);
+            verify_existing_source(sources, source_id, bytes)?;
+        }
+        Err(error) => return Err(error.into()),
+    }
+    Ok(())
 }
 
 fn check_duplicate_source(connection: &Connection, source_id: &str) -> Result<()> {
@@ -300,24 +332,55 @@ pub(super) fn transport<'a>(
     let Some(FrameField::EtherType(protocol)) = decoded.field() else {
         return Ok(None);
     };
-    let Some(ip) = ip_packet_from_payload(protocol, decoded.payload()) else {
-        return Ok(None);
-    };
-    let Some(transport) = ip.transport else {
-        return Ok(None);
-    };
+    let (source, destination, protocol, ports, payload, payload_offset) =
+        if let Some(ip) = ip_packet_from_payload(protocol, decoded.payload()) {
+            let Some(transport) = ip.transport else {
+                return Ok(None);
+            };
+            (
+                ip.source,
+                ip.destination,
+                ip.protocol,
+                transport.ports,
+                transport.payload,
+                decoded.payload_offset() + transport.payload_offset,
+            )
+        } else if let Some((ip, transport, _)) =
+            l2_discovery::tcp_prefix_from_payload(protocol, decoded.payload())
+        {
+            (
+                ip.source,
+                ip.destination,
+                ip.protocol,
+                transport.ports,
+                transport.payload,
+                decoded.payload_offset() + transport.payload_offset,
+            )
+        } else if let Some((ip, ports)) =
+            l2_discovery::truncated_tcp_tuple_from_payload(protocol, decoded.payload())
+        {
+            (
+                ip.source,
+                ip.destination,
+                ip.protocol,
+                ports,
+                &[][..],
+                frame.bytes().len(),
+            )
+        } else {
+            return Ok(None);
+        };
     let scope = scope_cache.retain(
         connection,
         &ForensicScope::from_network_frame(frame.metadata(), &decoded),
     )?;
     Ok(Some(Transport {
         scope,
-        protocol: ip.protocol,
-        source: flows::address_bytes(ip.source),
-        destination: flows::address_bytes(ip.destination),
-        ports: transport.ports,
-        payload: transport.payload,
-        payload_offset: offset
-            + u64::try_from(decoded.payload_offset() + transport.payload_offset)?,
+        protocol,
+        source: flows::address_bytes(source),
+        destination: flows::address_bytes(destination),
+        ports,
+        payload,
+        payload_offset: offset + u64::try_from(payload_offset)?,
     }))
 }

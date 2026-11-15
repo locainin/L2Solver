@@ -154,6 +154,42 @@ pub fn ip_packet_from_payload(protocol: u16, payload: &[u8]) -> Option<IpPacket<
     })
 }
 
+/// Read a captured TCP prefix when the declared IP payload extends past the capture
+///
+/// Complete IP and TCP headers are required; fragments and unsupported headers remain opaque
+#[must_use]
+pub fn tcp_prefix_from_payload(
+    protocol: u16,
+    payload: &[u8],
+) -> Option<(IpHeader, TransportPacket<'_>, usize)> {
+    let header = ip_header_from_payload(protocol, payload)?;
+    if header.protocol != 6 || header.fragmented || header.total_len <= payload.len() {
+        return None;
+    }
+    let transport = transport::parse(6, payload, header.header_len)?;
+    let missing = header.total_len - payload.len();
+    Some((header, transport, missing))
+}
+
+/// Read a TCP tuple from a truncated IP envelope without inferring a sequence number
+#[must_use]
+pub fn truncated_tcp_tuple_from_payload(
+    protocol: u16,
+    payload: &[u8],
+) -> Option<(IpHeader, (u16, u16))> {
+    let header = ip_header_from_payload(protocol, payload)?;
+    if header.protocol != 6
+        || header.fragmented
+        || header.total_len <= payload.len()
+        || header.total_len.checked_sub(header.header_len)? < 20
+    {
+        return None;
+    }
+    let tcp = payload.get(header.header_len..)?;
+    let ports = (read_u16(tcp, 0)?, read_u16(tcp, 2)?);
+    Some((header, ports))
+}
+
 fn walk_ipv6(packet: &[u8], header: &mut IpHeader) -> Option<()> {
     let mut count = 0;
     while matches!(header.protocol, 0 | 43 | 44 | 51 | 60) {

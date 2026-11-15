@@ -16,6 +16,8 @@ mod cache_failure;
 mod relational;
 #[path = "export/repeated.rs"]
 mod repeated;
+#[path = "export/truncated.rs"]
+mod truncated;
 #[path = "export/tshark_identity.rs"]
 mod tshark_identity;
 #[path = "export/xor_messages.rs"]
@@ -507,7 +509,7 @@ fn deduplicates_shared_case_limitations_across_flows_and_cohorts() -> Result<(),
     );
     let summary = fs::read_to_string(destination.join("summary.txt"))?;
     assert!(summary.contains(
-        "Cohort reconstruction omissions: 0 TCP records, 0 fragments, 0 ranges, 0 TCP byte positions affected by omitted observations or rejected ranges, 0 TCP observations, 0 fragment byte positions affected by omitted observations or rejected ranges, 0 fragment observations, 0 state observations, 0 unmeasured ranges (in 0 of 1 Case)"
+        "Cohort reconstruction omissions: 0 TCP records, 0 fragments, 0 ranges, 0 TCP byte positions affected by omitted observations, span limits, or rejected ranges, 0 TCP observations, 0 fragment byte positions affected by omitted observations, span limits, or rejected ranges, 0 fragment observations, 0 state observations, 0 unmeasured ranges (in 0 of 1 Case)"
     ));
     Ok(())
 }
@@ -1767,7 +1769,7 @@ fn reports_default_limit_reconstruction_omissions_from_supplementary_pages()
         u64::try_from(Limits::default().units + 2)?
     );
     assert_exact_supplementary_reconstruction_omissions(&manifest)?;
-    let page_omissions = "Supplementary page reconstruction omissions: 0 TCP records, 0 fragments, 1 ranges, 1 TCP byte positions affected by omitted observations or rejected ranges, 1 TCP observations, 0 fragment byte positions affected by omitted observations or rejected ranges, 0 fragment observations, 0 state observations, 0 unmeasured ranges (in 1 of 2 Cases)";
+    let page_omissions = "Supplementary page reconstruction omissions: 0 TCP records, 0 fragments, 1 ranges, 1 TCP byte positions affected by omitted observations, span limits, or rejected ranges, 1 TCP observations, 0 fragment byte positions affected by omitted observations, span limits, or rejected ranges, 0 fragment observations, 0 state observations, 0 unmeasured ranges (in 1 of 2 Cases)";
     assert!(summary.contains("Per-flow analysis: partial"));
     assert!(summary.contains(page_omissions), "{summary}");
     assert!(limitations.contains(page_omissions), "{limitations}");
@@ -1961,7 +1963,7 @@ fn assert_partial_flow_reconstruction_coverage(
         0
     );
     assert!(summary.contains(
-        "Flow reconstruction omissions: 0 TCP records, 0 fragments, 1 ranges, 12600000 TCP byte positions affected by omitted observations or rejected ranges, 210 TCP observations, 0 fragment byte positions affected by omitted observations or rejected ranges, 0 fragment observations, 0 state observations, 0 unmeasured ranges (in 1 of 2 Cases)"
+        "Flow reconstruction omissions: 0 TCP records, 0 fragments, 1 ranges, 12600000 TCP byte positions affected by omitted observations, span limits, or rejected ranges, 210 TCP observations, 0 fragment byte positions affected by omitted observations, span limits, or rejected ranges, 0 fragment observations, 0 state observations, 0 unmeasured ranges (in 1 of 2 Cases)"
     ), "{summary}");
     Ok(())
 }
@@ -1975,7 +1977,7 @@ fn assert_partial_flow_limitations(limitations: &str, long_flow_chunks: usize) {
     let selected = 1 + long_flow_chunks;
     let retained = long_flow_chunks;
     assert!(limitations.contains(&format!(
-        "Flow analysis selected {selected} records, retained {retained}, and omitted 1; retention ceilings reached: bytes; reconstruction omissions: 0 TCP records, 0 fragments, 1 ranges, 12600000 TCP byte positions affected by omitted observations or rejected ranges, 210 TCP observations, 0 fragment byte positions affected by omitted observations or rejected ranges, 0 fragment observations, 0 state observations, 0 unmeasured ranges"
+        "Flow analysis selected {selected} records, retained {retained}, and omitted 1; retention ceilings reached: bytes; reconstruction omissions: 0 TCP records, 0 fragments, 1 ranges, 12600000 TCP byte positions affected by omitted observations, span limits, or rejected ranges, 210 TCP observations, 0 fragment byte positions affected by omitted observations, span limits, or rejected ranges, 0 fragment observations, 0 state observations, 0 unmeasured ranges"
     )), "{limitations}");
     assert!(
         limitations
@@ -2424,6 +2426,10 @@ fn install_tshark_for_protocol(
 set -eu
 if [ "$1" = -n ] && [ "$2" = -v ]; then
   printf '%s\n' 'TShark (Wireshark) 4.6.9'
+  exit 0
+fi
+if [ "$1" = -G ] && [ "$2" = currentprefs ]; then
+  while IFS= read -r line; do printf '%s\n' "$line"; done < "$WIRESHARK_CONFIG_DIR/profiles/$5/preferences"
   exit 0
 fi
 for argument in "$@"; do
