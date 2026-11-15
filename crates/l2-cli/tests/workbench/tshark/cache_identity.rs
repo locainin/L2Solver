@@ -8,6 +8,7 @@ use std::{
     ffi::OsString,
     fs,
     path::{Path, PathBuf},
+    process::Command,
     time::Duration,
 };
 
@@ -113,6 +114,43 @@ fn missing_executable_returns_optional_identity_without_running_a_process()
     assert_eq!(field(&identity, "/executable/status")?, "missing");
     assert_eq!(field(&identity, "/version/status")?, "unavailable");
     assert_eq!(field(&identity, "/version/reason")?, "executable_not_found");
+    Ok(())
+}
+
+#[test]
+fn version_probe_workspace_error() -> Result<(), Box<dyn Error>> {
+    const CHILD: &str = "L2_TSHARK_IDENTITY_WORKSPACE_ERROR_CHILD";
+    if let Some(directory) = std::env::var_os(CHILD) {
+        let identity = identity_for_path(Some(&directory), None);
+        assert_eq!(field(&identity, "/version/status")?, "unavailable");
+        assert_eq!(
+            field(&identity, "/version/reason")?,
+            "workspace_unavailable"
+        );
+        assert_eq!(field(&identity, "/version/error_kind")?, "PermissionDenied");
+        return Ok(());
+    }
+
+    let directory = tempfile::tempdir()?;
+    executable_script(
+        &directory.path().join("tshark"),
+        "printf 'TShark 4.4.20\\n'",
+    )?;
+    let blocked = directory.path().join("blocked");
+    fs::create_dir(&blocked)?;
+    fs::set_permissions(&blocked, fs::Permissions::from_mode(0o500))?;
+    let result = Command::new(std::env::current_exe()?)
+        .args([
+            "--exact",
+            "workbench::tshark::cache_identity::tests::version_probe_workspace_error",
+        ])
+        .env(CHILD, directory.path())
+        .env("TMPDIR", &blocked)
+        .status();
+    // Restore the fixture before checking the child outcome
+    fs::set_permissions(&blocked, fs::Permissions::from_mode(0o700))?;
+    let status = result?;
+    assert!(status.success(), "workspace error child failed: {status}");
     Ok(())
 }
 

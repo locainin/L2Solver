@@ -160,6 +160,32 @@ fn renamed_parent_anchoring() -> Result<(), Box<dyn Error>> {
 }
 
 #[test]
+fn workspace_close_error() -> Result<(), Box<dyn Error>> {
+    let fixture = tempfile::tempdir()?;
+    let parent = fixture.path().join("parent");
+    fs::create_dir(&parent)?;
+    let workspace = Workspace::new(Some(&parent))?;
+    let name = workspace
+        .path()
+        .file_name()
+        .ok_or("workspace name missing")?;
+    let directory = parent.join(name);
+
+    // Restore permissions before checking the result so cleanup can finish
+    set_mode(&parent, 0o500)?;
+    let result = workspace.close();
+    set_mode(&parent, 0o700)?;
+    if directory.exists() {
+        fs::remove_dir(&directory)?;
+    }
+    assert_eq!(
+        result.err().map(|error| error.kind()),
+        Some(std::io::ErrorKind::PermissionDenied)
+    );
+    Ok(())
+}
+
+#[test]
 fn executable_type_permissions() -> Result<(), Box<dyn Error>> {
     let parent = tempfile::tempdir()?;
     let executable = parent.path().join("tool");
@@ -199,6 +225,61 @@ fn trusted_executable_symlink() -> Result<(), Box<dyn Error>> {
     let selected = VerifiedExecutable::open(&link)?;
     assert_eq!(selected.path, executable.canonicalize()?);
     assert_eq!(fs::read(descriptor_source(&selected.file)?)?, b"tool");
+    Ok(())
+}
+
+#[test]
+fn trusted_directory_flags() -> Result<(), Box<dyn Error>> {
+    use rustix::fs::{OFlags, fcntl_getfl};
+
+    let parent = tempfile::tempdir()?;
+    for path in [Path::new("/"), parent.path()] {
+        let directory = open_trusted_directory(path)?;
+        assert!(fcntl_getfd(&directory)?.contains(FdFlags::CLOEXEC));
+        assert!(fcntl_getfl(&directory)?.contains(OFlags::DIRECTORY | OFlags::NOFOLLOW));
+    }
+    Ok(())
+}
+
+#[test]
+fn executable_fifo_rejection() -> Result<(), Box<dyn Error>> {
+    use std::{
+        process::Stdio,
+        time::{Duration, Instant},
+    };
+
+    const PROBE: &str = "L2_EXECUTABLE_FIFO_PROBE";
+    if std::env::var_os(PROBE).is_some() {
+        let directory = tempfile::tempdir()?;
+        let fifo = directory.path().join("fifo");
+        rustix::fs::mkfifoat(rustix::fs::CWD, &fifo, rustix::fs::Mode::RUSR)?;
+        assert!(VerifiedExecutable::open(&fifo).is_err());
+        return Ok(());
+    }
+    let mut child = Command::new(std::env::current_exe()?)
+        .args([
+            "--exact",
+            "workbench::tshark::secure_files::tests::executable_fifo_rejection",
+        ])
+        .env(PROBE, "1")
+        .stdout(Stdio::null())
+        .spawn()?;
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let status = loop {
+        if let Some(status) = child.try_wait()? {
+            break Some(status);
+        }
+        if Instant::now() >= deadline {
+            child.kill()?;
+            child.wait()?;
+            break None;
+        }
+        std::thread::sleep(Duration::from_millis(5));
+    };
+    assert!(
+        status.is_some_and(|status| status.success()),
+        "FIFO was not rejected before a blocking read"
+    );
     Ok(())
 }
 

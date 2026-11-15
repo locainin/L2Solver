@@ -24,6 +24,9 @@ use std::{
 
 #[path = "tshark/decode.rs"]
 mod decode;
+#[cfg(target_os = "linux")]
+#[path = "tshark/integrity.rs"]
+mod integrity;
 #[cfg(unix)]
 #[path = "tshark/receipt.rs"]
 mod receipt;
