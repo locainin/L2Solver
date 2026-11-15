@@ -1,7 +1,7 @@
 use super::common::{LINUX_STP_PCAP, captured, ethernet_frame, frame, source_with_suffix};
 use super::lldp::lldp_frame;
-use l2_audit::{CoverageStatus, Policy, Survey, Verdict};
-use l2_capture::{CaptureMetadata, CapturedFrame, InterfaceId};
+use l2_audit::{AuditError, CoverageStatus, Policy, Survey, Verdict};
+use l2_capture::{CaptureMetadata, CapturedFrame, CollectionAuthority, InterfaceId};
 
 #[test]
 fn empty_survey_reports_untested_coverage() -> Result<(), Box<dyn std::error::Error>> {
@@ -77,6 +77,10 @@ fn limits_and_loss_fail_closed() -> Result<(), Box<dyn std::error::Error>> {
     let mut survey = Survey::new();
     survey.record_quality(u64::MAX, false)?;
     assert!(survey.record_quality(1, false).is_err());
+    assert!(matches!(
+        survey.record_acquisition_authority(CollectionAuthority::SourceDeclared),
+        Err(AuditError::Terminated)
+    ));
     assert!(survey.finish(&Policy::default()).is_err());
     Ok(())
 }
