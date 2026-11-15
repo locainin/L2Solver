@@ -8,6 +8,10 @@ use super::{
 };
 use std::{collections::BTreeMap, error::Error, ffi::OsString};
 
+#[cfg(test)]
+#[path = "../../../tests/workbench/tshark/inspection.rs"]
+mod tests;
+
 pub(super) struct ToolInspection {
     pub(super) version: String,
     pub(super) version_output: process::Output,

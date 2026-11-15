@@ -1,6 +1,10 @@
 use serde::de;
 use std::{error::Error, fmt, mem::size_of};
 
+#[cfg(test)]
+#[path = "../../../../tests/workbench/tshark/decode/budget.rs"]
+mod tests;
+
 // B-tree storage is not exposed by the standard library, so charge a generous
 // allowance for each object and each inserted key before the tree can grow
 pub(super) const OBJECT_BYTES: usize = 1024;

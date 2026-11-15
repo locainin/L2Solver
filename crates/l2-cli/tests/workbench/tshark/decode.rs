@@ -90,11 +90,45 @@ fn unfinished_escaped_string_scratch_admission() {
 }
 
 #[test]
-fn malformed_json_error_class() {
-    assert!(matches!(
-        decode_packets(b"[", 1, 1024),
-        Err(DecodeError::Json(_))
-    ));
+fn malformed_json_error_class() -> Result<(), Box<dyn Error>> {
+    let error = decode_packets(b"[", 1, 1024)
+        .err()
+        .ok_or("truncated JSON was accepted")?;
+    assert!(matches!(&error, DecodeError::Json(_)));
+    assert!(error.to_string().contains("invalid TShark JSON"));
+    assert!(std::error::Error::source(&error).is_some());
+    Ok(())
+}
+
+#[test]
+fn packet_array_diagnostic() -> Result<(), Box<dyn Error>> {
+    let error = decode_packets(b"{}", 2, 1024)
+        .err()
+        .ok_or("packet object was accepted")?;
+    assert!(error.to_string().contains("an array of TShark packets"));
+    Ok(())
+}
+
+#[test]
+fn nesting_boundary() -> Result<(), Box<dyn Error>> {
+    for (arrays, accepted) in [(92, true), (93, false)] {
+        let mut payload = Value::Null;
+        for _ in 0..arrays {
+            payload = Value::Array(vec![payload]);
+        }
+        // The packet, source and layers objects occupy the first three levels
+        let input = json!([{"_source":{"layers":{
+            "frame":{"frame.number":1}, "payload":payload
+        }}}]);
+        let bytes = serde_json::to_vec(&input)?;
+        let result = decode_packets(&bytes, bytes.len(), 1024 * 1024);
+        if accepted {
+            assert_eq!(result?.len(), 1, "{arrays} nested arrays");
+        } else {
+            assert!(matches!(result, Err(DecodeError::NestingLimit)));
+        }
+    }
+    Ok(())
 }
 
 #[test]

@@ -75,6 +75,7 @@ fn stable_release_banners() -> io::Result<()> {
         "TShark (Wireshark) 4.4.19 (Debian 4.4.19-1~deb12u1).",
         "TShark (Wireshark) 4.6.9 (Arch Linux build 3).",
         "TShark (Wireshark) 4.6.9 (v4.6.9 packaged release).",
+        "TShark (Wireshark) 4.6.9 (prebuilt package).",
     ] {
         validate(banner)
             .map_err(|error| io::Error::new(error.kind(), format!("{banner}: {error}")))?;

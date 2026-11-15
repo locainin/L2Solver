@@ -8,14 +8,109 @@ use std::{
 
 #[test]
 fn inventory_interruption() {
-    for output in [
-        "Available export object types:\nhttp\ninvalid_type\nftp-data\n",
-        "Available export object types:\nhttp\n\ninvalid_type\nftp-data\n",
-        "Available export object types:\ninvalid_type\nhttp\n",
-        "Available export object types:\nhttp\nUnknown footer!\n",
+    let invalid_type = "TShark returned an unsafe export object type";
+    for (output, diagnostic) in [
+        (
+            "not an inventory\n",
+            "TShark did not list its export object types",
+        ),
+        (
+            "Available export object types:\n\n",
+            "TShark returned no usable export object types",
+        ),
+        (
+            "Available export object types:\nhttp\ninvalid_type\nftp-data\n",
+            invalid_type,
+        ),
+        (
+            "Available export object types:\nhttp\n\ninvalid_type\nftp-data\n",
+            invalid_type,
+        ),
+        (
+            "Available export object types:\ninvalid_type\nhttp\n",
+            invalid_type,
+        ),
+        (
+            "Available export object types:\nhttp\nUnknown footer!\n",
+            invalid_type,
+        ),
     ] {
-        assert!(super::parse_types(output).is_err(), "accepted {output:?}");
+        assert_eq!(
+            super::parse_types(output)
+                .err()
+                .map(|error| error.to_string()),
+            Some(diagnostic.to_owned()),
+            "inventory {output:?}"
+        );
     }
+}
+
+#[cfg(unix)]
+#[test]
+fn export_completion_invariants() -> Result<(), Box<dyn Error>> {
+    use std::os::unix::{fs::symlink, process::ExitStatusExt};
+
+    // Make one condition fail at a time so no other failure can hide it
+    for mode in [
+        "complete",
+        "root_symlink",
+        "protocol_symlink",
+        "unsafe",
+        "changed",
+    ] {
+        let temporary = tempfile::tempdir()?;
+        let object_root = temporary.path().join("objects");
+        let protocol_root = object_root.join("http");
+        let actual_root = temporary.path().join("actual");
+        if mode == "root_symlink" {
+            fs::create_dir_all(actual_root.join("http"))?;
+            symlink(&actual_root, &object_root)?;
+        } else {
+            fs::create_dir(&object_root)?;
+            if mode == "protocol_symlink" {
+                fs::create_dir(&actual_root)?;
+                symlink(&actual_root, &protocol_root)?;
+            } else {
+                fs::create_dir(&protocol_root)?;
+            }
+        }
+        let mut objects = Vec::new();
+        if mode == "changed" {
+            let object = protocol_root.join("changed.bin");
+            fs::write(&object, b"before")?;
+            objects.push(stable_object(&object_root, &object)?);
+            // A later rewrite must not remain in the completed export
+            fs::write(&object, b"changed after the scan")?;
+        }
+        let output = super::process::StreamOutput {
+            stderr: Vec::new(),
+            stderr_truncated: false,
+            status: std::process::ExitStatus::from_raw(0),
+            object_usage: super::ObjectExportUsage::default(),
+            objects,
+            unsafe_entries: mode == "unsafe",
+        };
+        let result = super::resolve_object_export(
+            Ok(output),
+            &object_root,
+            &temporary.path().join("verified-objects"),
+            &[(String::from("http"), protocol_root)],
+        )?;
+
+        if mode == "complete" {
+            assert_eq!(result.status, super::ObjectExportStatus::Complete, "{mode}");
+            assert!(result.issues.is_empty(), "{mode}");
+        } else {
+            assert_eq!(result.status, super::ObjectExportStatus::Partial, "{mode}");
+            assert_eq!(
+                result.issues,
+                ["TShark object output contained unsafe or changed entries"],
+                "{mode}"
+            );
+        }
+        assert!(result.directories.is_empty(), "{mode}");
+    }
+    Ok(())
 }
 
 #[test]
