@@ -217,10 +217,10 @@ impl<'a> ScopeSession<'a> {
         if !self.verified || self.stopped {
             return Ok(());
         }
-        self.stopped = true;
         if let Some(gate) = self.gate.as_deref_mut() {
             gate.stop(Instant::now() + Duration::from_millis(500))?;
         }
+        self.stopped = true;
         Ok(())
     }
 

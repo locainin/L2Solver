@@ -67,6 +67,7 @@ enum GateFault {
     #[default]
     None,
     Stop,
+    StopOnce,
     Member,
     PendingFreeze,
     OtherMember,
@@ -108,7 +109,7 @@ impl ProcessGate for AcceptGate {
         self.waitable_on_stop = self
             .child
             .map(|child| Path::new(&format!("/proc/{child}")).exists());
-        if self.fault == GateFault::Stop {
+        if self.fault == GateFault::Stop || (self.fault == GateFault::StopOnce && self.stops == 1) {
             Err(io::Error::other("scope kill failed"))
         } else {
             Ok(())
@@ -410,6 +411,50 @@ fn worker_start_cleanup() -> Result<(), Box<dyn Error>> {
     assert_eq!(gate.stops, 1);
     assert_eq!(gate.waitable_on_stop, Some(true));
     assert!(!Path::new(&format!("/proc/{}", gate.child.ok_or("missing child")?)).exists());
+    Ok(())
+}
+
+#[test]
+fn streaming_cleanup_retry() -> Result<(), Box<dyn Error>> {
+    let temporary = tempfile::tempdir()?;
+    let root = temporary.path().join("objects");
+    empty_object_root(&root)?;
+    let arguments = [OsString::from("-c"), OsString::from("IFS= read -r token")];
+    for (fault, retry_fails) in [(GateFault::StopOnce, false), (GateFault::Stop, true)] {
+        let mut gate = AcceptGate {
+            fault,
+            ..AcceptGate::default()
+        };
+        let result = run_streaming_inner(
+            Path::new("/bin/sh"),
+            &arguments,
+            &[],
+            policy(
+                Instant::now() + Duration::from_secs(2),
+                &root,
+                0,
+                ObjectExportBudget::default(),
+            ),
+            &mut ThreadSpawner,
+            Some(&mut gate),
+            None,
+        );
+        assert_eq!(gate.stops, 2, "streaming cleanup must retry a failed stop");
+        let Err(ProcessError::ScopeCleanup { primary, source }) = result else {
+            return Err("failed cleanup did not produce a cleanup error".into());
+        };
+        assert_eq!(source.to_string(), "scope kill failed");
+        if retry_fails {
+            assert!(matches!(
+                primary.as_deref(),
+                Some(ProcessError::ScopeCleanup { primary: None, source })
+                    if source.to_string() == "scope kill failed"
+            ));
+        } else {
+            assert!(primary.is_none(), "successful retry must add no error");
+        }
+        assert!(!Path::new(&format!("/proc/{}", gate.child.ok_or("missing child")?)).exists());
+    }
     Ok(())
 }
 
