@@ -181,6 +181,9 @@ pub fn prepare_directory_replacement(
 /// The displaced directory is retained and its path is returned with the callback result
 /// Cooperative replacement commits in the same parent cannot overlap; contention or
 /// unsupported advisory locking fails before publication
+/// Use a parent whose entries only trusted writers can change for security-sensitive output.
+/// The exchange and identity checks are separate operations. A writer that ignores the
+/// advisory lock can still replace an entry between them, leaving publication uncertain
 pub fn replace_directory_with_precommit<T>(
     prepared: &PreparedDirectoryReplacement,
     write: impl FnOnce(&Path) -> Result<T, Box<dyn Error>>,
