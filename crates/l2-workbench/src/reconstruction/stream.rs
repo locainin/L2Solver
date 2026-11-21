@@ -120,7 +120,7 @@ fn bounds(packets: &[Transport]) -> Result<Bounds, ReconstructionError> {
             continue;
         };
         // Bare acknowledgements do not declare a payload byte interval
-        let declared_length = packet.bytes.len() + packet.missing_bytes;
+        let declared_length = packet.declared_payload_len();
         if declared_length != 0 || flags & 1 != 0 {
             bounds.extent = bounds.extent.max(offset + declared_length);
         }
@@ -153,7 +153,7 @@ fn offset(packet: &Transport, start: u32) -> Result<Option<usize>, Reconstructio
     let offset = usize::try_from(sequence.wrapping_sub(start))
         .map_err(|_| ReconstructionError("sequence offset is not representable"))?;
     Ok((offset <= MAX_RANGE_BYTES
-        && packet.bytes.len() + packet.missing_bytes <= MAX_RANGE_BYTES.saturating_sub(offset))
+        && packet.declared_payload_len() <= MAX_RANGE_BYTES.saturating_sub(offset))
     .then_some(offset))
 }
 

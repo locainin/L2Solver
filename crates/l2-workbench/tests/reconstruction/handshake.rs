@@ -12,6 +12,13 @@ fn ack(frame: &CapturedFrame, value: u32) -> Result<CapturedFrame, Box<dyn Error
     Ok(CapturedFrame::new(bytes, frame.metadata().clone())?)
 }
 
+fn truncated(frame: &CapturedFrame, missing: usize) -> Result<CapturedFrame, Box<dyn Error>> {
+    let mut bytes = frame.bytes().to_vec();
+    let captured = bytes.len().checked_sub(missing).ok_or("invalid snaplen")?;
+    bytes.truncate(captured);
+    Ok(CapturedFrame::new(bytes, frame.metadata().clone())?)
+}
+
 #[test]
 fn handshake_requires_both_acknowledgements() -> Result<(), Box<dyn Error>> {
     let mut engine = Reconstructor::new();
@@ -95,6 +102,75 @@ fn syn_payload_part_acknowledgement_constraints() -> Result<(), Box<dyn Error>> 
             .status,
         HandshakeStatus::ThreeWayObserved
     );
+    Ok(())
+}
+
+#[test]
+fn truncated_syn_payload_advances_both_sequences() -> Result<(), Box<dyn Error>> {
+    let mut engine = Reconstructor::new();
+    engine.observe(1, &truncated(&tcp(false, 100, 2, b"abcde")?, 2)?)?;
+    engine.observe(
+        2,
+        &truncated(&ack(&tcp(true, 900, 0x12, b"wxyz")?, 106)?, 2)?,
+    )?;
+    engine.observe(3, &ack(&tcp(false, 106, 0x10, b"")?, 905)?)?;
+    let report = engine.finish()?;
+    let handshake = &report.sessions.first().ok_or("missing episode")?.handshake;
+    assert_eq!(handshake.status, HandshakeStatus::ThreeWayObserved);
+    assert_eq!(handshake.mismatched_synack_packets, Vec::<u32>::new());
+    let witness = handshake
+        .matches
+        .first()
+        .ok_or("missing handshake witness")?;
+    assert_eq!(witness.initiator_next_sequence, 106);
+    assert_eq!(witness.responder_next_sequence, 905);
+    assert_eq!(witness.ack_packet, Some(3));
+    Ok(())
+}
+
+#[test]
+fn bare_syn_and_uncaptured_payload_are_distinct() -> Result<(), Box<dyn Error>> {
+    let mut engine = Reconstructor::new();
+    engine.observe(1, &tcp(false, 100, 2, b"")?)?;
+    engine.observe(2, &truncated(&tcp(false, 100, 2, b"abcde")?, 5)?)?;
+    engine.observe(3, &ack(&tcp(true, 900, 0x12, b"")?, 106)?)?;
+    engine.observe(4, &ack(&tcp(false, 106, 0x10, b"")?, 901)?)?;
+    let report = engine.finish()?;
+    let handshake = &report.sessions.first().ok_or("missing episode")?.handshake;
+    assert_eq!(handshake.status, HandshakeStatus::ThreeWayObserved);
+    assert_eq!(handshake.mismatched_synack_packets, Vec::<u32>::new());
+    assert_eq!(
+        handshake.matches.first().map(|item| item.syn_packet),
+        Some(2)
+    );
+    Ok(())
+}
+
+#[test]
+fn synack_retransmissions_use_declared_extent() -> Result<(), Box<dyn Error>> {
+    for (payload, missing, sequences) in [
+        (b"abcde".as_slice(), 0, &[906][..]),
+        (b"abcd".as_slice(), 1, &[906, 905][..]),
+    ] {
+        let mut engine = Reconstructor::new();
+        engine.observe(1, &tcp(false, 100, 2, b"")?)?;
+        engine.observe(
+            2,
+            &truncated(&ack(&tcp(true, 900, 0x12, b"abcde")?, 101)?, 2)?,
+        )?;
+        engine.observe(
+            3,
+            &truncated(&ack(&tcp(true, 900, 0x12, payload)?, 101)?, missing)?,
+        )?;
+        let report = engine.finish()?;
+        let handshake = &report.sessions.first().ok_or("missing episode")?.handshake;
+        let observed: Vec<_> = handshake
+            .matches
+            .iter()
+            .map(|item| item.responder_next_sequence)
+            .collect();
+        assert_eq!(observed, sequences);
+    }
     Ok(())
 }
 

@@ -45,6 +45,12 @@ struct Transport {
     fragment_candidate: Option<usize>,
 }
 
+impl Transport {
+    const fn declared_payload_len(&self) -> usize {
+        self.bytes.len() + self.missing_bytes
+    }
+}
+
 #[derive(Debug)]
 pub(crate) struct IncompleteHeader {
     pub(crate) scope: ForensicScope,

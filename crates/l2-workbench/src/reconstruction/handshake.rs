@@ -44,7 +44,7 @@ pub(super) fn assess(directions: [&[Transport]; 2]) -> HandshakeAssessment {
             if let Some((sequence, _, flags)) = tcp(packet)
                 && flags & 0x17 == 2
             {
-                let key = (direction, sequence, packet.bytes.len());
+                let key = (direction, sequence, packet.declared_payload_len());
                 // Episode assignment allows repeated SYNs and at most their first payload variant
                 // A changed sequence, opposite initial direction, or later progress starts a new episode
                 initial.entry(key).or_insert(packet);
@@ -118,8 +118,8 @@ fn match_syn(
             continue;
         }
         matched.insert(reply.packet);
-        // Identical SYN/ACK retransmissions supply one relationship witness
-        if !replies.insert((sequence, reply.bytes.len())) {
+        // Different capture lengths can describe the same SYN/ACK extent
+        if !replies.insert((sequence, reply.declared_payload_len())) {
             continue;
         }
         if report.matches.len() == MAX_WITNESSES {
@@ -165,10 +165,10 @@ const fn tcp(packet: &Transport) -> Option<(u32, u32, u8)> {
 
 fn next_sequence(packet: &Transport) -> Option<u32> {
     let (sequence, _, _) = tcp(packet)?;
-    // SYN occupies one sequence number; payload also occupies sequence space
+    // SYN and its full declared payload occupy TCP sequence space
     Some(
         sequence
-            .wrapping_add(u32::try_from(packet.bytes.len()).ok()?)
+            .wrapping_add(u32::try_from(packet.declared_payload_len()).ok()?)
             .wrapping_add(1),
     )
 }
