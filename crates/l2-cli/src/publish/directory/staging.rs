@@ -12,6 +12,10 @@ use std::{
     path::PathBuf,
 };
 
+#[cfg(test)]
+#[path = "../../../tests/publish/staging.rs"]
+mod tests;
+
 pub(super) struct StagedDirectory<'a> {
     temporary: tempfile::TempDir,
     parent: &'a OwnedFd,

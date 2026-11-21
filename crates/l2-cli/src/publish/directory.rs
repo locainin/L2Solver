@@ -5,6 +5,9 @@ use std::{
     path::{Path, PathBuf},
 };
 
+#[cfg(all(test, target_os = "linux"))]
+#[path = "../../tests/publish/exchange_identity.rs"]
+mod exchange_identity_tests;
 #[path = "directory/inspection.rs"]
 pub mod inspection;
 #[cfg(target_os = "linux")]
@@ -17,7 +20,8 @@ mod tree;
 pub use inspection::{DirectoryEntryKind, PreparedDirectoryReplacement};
 #[cfg(target_os = "linux")]
 use inspection::{
-    destination_entry_exists, stat_identity_at, trusted_directory_identity, verify_named_directory,
+    DirectoryIdentity, destination_entry_exists, stat_identity_at, trusted_directory_identity,
+    verify_named_directory,
 };
 #[cfg(target_os = "linux")]
 use staging::StagedDirectory;
@@ -278,32 +282,20 @@ fn finish_directory_replacement<T>(
     // The exchange moved the old result into the stage name
     staging.retain();
     let retained_path = retained_display_path(&prepared.parent_fd, path, &staging.name);
-    let identities = stat_identity_at(&prepared.parent_fd, &staging.name).and_then(|displaced| {
-        stat_identity_at(&prepared.parent_fd, &prepared.name)
-            .map(|published| (displaced, published))
-    });
-    let (displaced_identity, published_identity) = match identities {
-        Ok(identities) => identities,
-        Err(error) => {
-            return Err(
-                super::DirectoryPublishError::PublishedReplacementUncertain {
-                    source: error,
-                    retained_path,
-                },
-            );
-        }
-    };
-    if displaced_identity != prepared.target_identity || published_identity != staging.identity {
-        // RENAME_EXCHANGE has no inode compare-and-swap flag, so preserve unexpected entries
-        return Err(
-            super::DirectoryPublishError::PublishedReplacementUncertain {
-                source: io::Error::other(
-                    "directory names changed during atomic exchange; displaced content was retained",
-                ),
-                retained_path,
+    stat_identity_at(&prepared.parent_fd, &staging.name)
+        .and_then(|displaced| {
+            let published = stat_identity_at(&prepared.parent_fd, &prepared.name)?;
+            verify_exchange_identities(
+                (displaced, published),
+                (prepared.target_identity, staging.identity),
+            )
+        })
+        .map_err(
+            |source| super::DirectoryPublishError::PublishedReplacementUncertain {
+                source,
+                retained_path: retained_path.clone(),
             },
-        );
-    }
+        )?;
 
     // Another process can still write through an open handle to the displaced directory
     super::sync_parent_directory(&prepared.parent_fd, path).map_err(|source| {
@@ -317,6 +309,20 @@ fn finish_directory_replacement<T>(
         ))
     })?;
     Ok((result, retained_path))
+}
+
+#[cfg(target_os = "linux")]
+fn verify_exchange_identities(
+    actual: (DirectoryIdentity, DirectoryIdentity),
+    expected: (DirectoryIdentity, DirectoryIdentity),
+) -> io::Result<()> {
+    // RENAME_EXCHANGE has no inode compare-and-swap flag, so preserve unexpected entries
+    if actual != expected {
+        return Err(io::Error::other(
+            "directory names changed during atomic exchange; displaced content was retained",
+        ));
+    }
+    Ok(())
 }
 
 #[cfg(target_os = "linux")]

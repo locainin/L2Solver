@@ -81,10 +81,14 @@ impl TrustPolicy {
 /// Return the mount ID of an open descriptor
 pub(super) fn mount_id(fd: impl AsFd) -> io::Result<u64> {
     let stat = fs::statx(fd, "", AtFlags::EMPTY_PATH, StatxFlags::MNT_ID)?;
-    if stat.stx_mask & StatxFlags::MNT_ID.bits() == 0 {
+    require_mount_id(stat.stx_mask, stat.stx_mnt_id)
+}
+
+fn require_mount_id(mask: u32, id: u64) -> io::Result<u64> {
+    if mask & StatxFlags::MNT_ID.bits() == 0 {
         return Err(unavailable("mount ID is unavailable"));
     }
-    Ok(stat.stx_mnt_id)
+    Ok(id)
 }
 
 /// Open the current thread's descriptor links under an authenticated procfs root
