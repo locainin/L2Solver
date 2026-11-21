@@ -35,6 +35,9 @@ mod cache_corruption_tests;
 #[path = "full_source/cache/quota.rs"]
 mod cache_quota_tests;
 
+#[path = "full_source/cache/source_identity.rs"]
+mod cache_source_identity_tests;
+
 #[test]
 fn published_capture_index_can_be_reused_without_reingestion() -> Result<(), Box<dyn Error>> {
     let directory = tempfile::tempdir()?;

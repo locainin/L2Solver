@@ -2,6 +2,10 @@
 
 mod cases;
 
+#[cfg(test)]
+#[path = "../../../tests/workbench/full_source/cache/wait.rs"]
+mod wait_tests;
+
 pub(super) use cases::investigate_flow;
 
 use super::{IngestReceipt, input, invalid, label, validate_indexed_receipt};
@@ -52,7 +56,7 @@ pub struct AcquisitionOptions<'a> {
     pub job: Option<&'a Job>,
     /// Fingerprint sampled by a caller before acquisition began
     pub fingerprint: Option<SourceFingerprint>,
-    /// Require a whole-file digest before trusting a cached source alias
+    /// Require strict handling of cache failures and verify cold source identities
     pub strict_cache: bool,
 }
 
@@ -128,10 +132,10 @@ enum UncachedReason {
 
 /// Index a capture or reopen its complete content-addressed disk index
 ///
-/// Cached indexes are keyed by the source SHA-256 digest. A fast metadata and sample alias avoids
-/// rereading unchanged sources, while moved or strict-checked sources use a full digest before
-/// reuse. New index contents are built inside a cache lease and committed only after ingestion
-/// has finished and the open store has been closed
+/// Cached indexes are keyed by the source SHA-256 digest. A fast metadata and sample alias locates
+/// candidates, and the complete source is hashed before a cached index is reused. New index
+/// contents are built inside a cache lease and committed only after ingestion has finished and
+/// the open store has been closed
 ///
 /// # Errors
 /// Returns capture, filesystem, cache, source-change, or progress errors
@@ -337,7 +341,9 @@ fn inspect_cached_alias(
         WaitedCacheLookup::Ready(entry) => entry,
         WaitedCacheLookup::Busy => return Ok(AliasDecision::Busy),
     };
-    let source_id = trusted_source_id(path, fingerprint, strict_cache, entry.as_ref(), job)?;
+    let source_id = verified_source_id(path, fingerprint, strict_cache, entry.as_ref(), job);
+    check_cache_cancellation(job, true)?;
+    let source_id = source_id?;
     let Some(source_id) = source_id else {
         return Ok(AliasDecision::Build {
             entry,
@@ -361,6 +367,7 @@ fn inspect_cached_alias(
                 deadline,
                 strict_cache,
             )?;
+            check_cache_cancellation(job, true)?;
             count_cache_hit(job)?;
             skip_ingestion(job)?;
             Ok(AliasDecision::Reused(Box::new(indexed)))
@@ -726,10 +733,6 @@ struct SourceAliasMetadata {
     receipt: IngestReceipt,
 }
 
-fn decode_alias_metadata(value: &Value) -> Result<SourceAliasMetadata> {
-    serde_json::from_value(value.clone()).map_err(Into::into)
-}
-
 fn alias_metadata_value(fingerprint: &SourceFingerprint, receipt: &IngestReceipt) -> Result<Value> {
     serde_json::to_value(SourceAliasMetadata {
         fingerprint: fingerprint.clone(),
@@ -792,17 +795,17 @@ fn lookup_index_after_wait(
     }
 }
 
-fn trusted_source_id(
+fn verified_source_id(
     path: &Path,
     fingerprint: &SourceFingerprint,
     strict_cache: bool,
     alias_entry: Option<&CacheEntry>,
     job: Option<&Job>,
 ) -> Result<Option<String>> {
-    let alias_metadata = match alias_entry {
+    let alias_valid = match alias_entry {
         Some(entry) => {
-            if let Ok(metadata) = decode_alias_metadata(entry.metadata()) {
-                Some(metadata)
+            if serde_json::from_value::<SourceAliasMetadata>(entry.metadata().clone()).is_ok() {
+                true
             } else {
                 if let Some(job) = job {
                     job.record_cache_fallback(
@@ -811,24 +814,37 @@ fn trusted_source_id(
                         format_args!("capture source alias metadata was rejected"),
                     )?;
                 }
-                None
+                false
             }
         }
-        None => None,
+        None => false,
     };
-    let alias_is_current = alias_metadata
-        .as_ref()
-        .is_some_and(|metadata| metadata.fingerprint == *fingerprint);
-
-    // Exact metadata can reuse the digest unless the caller requested strict verification
-    if strict_cache || (alias_metadata.is_some() && !alias_is_current) {
-        let identity = SourceIdentity::sha256_file(path)?;
+    // An alias is only a hint; its receipt cannot prove the current source bytes
+    if strict_cache || alias_valid {
+        let identity = SourceIdentity::sha256_file_with_check_and_observer(
+            path,
+            || {
+                if let Some(job) = job {
+                    job.check_cancelled().map_err(io::Error::other)?;
+                }
+                Ok(())
+            },
+            |count| {
+                if let Some(job) = job {
+                    job.increment(
+                        Counter::SourceReadBytes,
+                        u64::try_from(count).map_err(io::Error::other)?,
+                    )
+                    .map_err(io::Error::other)?;
+                    job.check_cancelled().map_err(io::Error::other)?;
+                }
+                Ok(())
+            },
+        )?;
         check_fingerprint_unchanged(path, Some(fingerprint))?;
         return Ok(Some(source_id_from_identity(&identity)?));
     }
-    Ok(alias_metadata
-        .filter(|_| alias_is_current)
-        .map(|metadata| metadata.receipt.source_id))
+    Ok(None)
 }
 
 fn is_cache_lock_busy(error: &(dyn Error + 'static)) -> bool {
@@ -892,15 +908,7 @@ fn wait_for_cache_key(
     ingestion_pending: bool,
 ) -> Result<bool> {
     loop {
-        if let Some(job) = job
-            && job.is_cancelled()
-        {
-            if ingestion_pending {
-                job.start(Phase::Ingestion, None)?;
-                job.finish(Phase::Ingestion, PhaseOutcome::Cancelled)?;
-            }
-            return Err(l2_workbench::job::JobError::Cancelled.into());
-        }
+        check_cache_cancellation(job, ingestion_pending)?;
 
         let remaining = deadline.saturating_duration_since(Instant::now());
         if remaining.is_zero() {
@@ -916,6 +924,19 @@ fn wait_for_cache_key(
             Err(error) => return Err(error.into()),
         }
     }
+}
+
+fn check_cache_cancellation(job: Option<&Job>, ingestion_pending: bool) -> Result<()> {
+    if let Some(job) = job
+        && job.is_cancelled()
+    {
+        if ingestion_pending {
+            job.start(Phase::Ingestion, None)?;
+            job.finish(Phase::Ingestion, PhaseOutcome::Cancelled)?;
+        }
+        return Err(l2_workbench::job::JobError::Cancelled.into());
+    }
+    Ok(())
 }
 
 fn ensure_source_alias(
