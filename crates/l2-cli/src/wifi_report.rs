@@ -61,6 +61,7 @@ pub fn render_json(
     summary: &Summary,
     inventory: &Survey,
     assessment: &wifi_audit::Assessment,
+    analysis_complete: bool,
 ) -> Result<(), Box<dyn Error>> {
     #[derive(Serialize)]
     struct WirelessReport<'a> {
@@ -69,6 +70,8 @@ pub fn render_json(
         stations: Vec<&'a wifi_discovery::Station>,
         diagnostics: &'a [wifi_discovery::Diagnostic],
         assessment: &'a wifi_audit::Assessment,
+        analysis_complete: bool,
+        acquisition_quality: crate::source_collection::AcquisitionQuality,
     }
 
     let report = WirelessReport {
@@ -77,6 +80,10 @@ pub fn render_json(
         stations: inventory.stations().collect(),
         diagnostics: inventory.diagnostics(),
         assessment,
+        analysis_complete,
+        acquisition_quality: crate::source_collection::AcquisitionQuality::unverified(authority(
+            summary,
+        )),
     };
     // JSON uses the same all-or-error byte ceiling as the wired report
     output_limits::write_json(&report, output, output_limits::MAX_SURVEY_JSON_BYTES)
@@ -153,9 +160,14 @@ fn write_summary(
     writeln!(output, "Source        {}", source.escape_debug())?;
     writeln!(
         output,
-        "Capture       {} ({} frames)",
+        "Analysis      {} ({} frames)",
         if complete { "COMPLETE" } else { "INCOMPLETE" },
         summary.frames
+    )?;
+    writeln!(
+        output,
+        "Acquisition   UNVERIFIED (authority={})",
+        authority(summary).as_str()
     )?;
     #[cfg(feature = "live")]
     if let Some(live) = summary.live {
@@ -193,6 +205,14 @@ fn write_summary(
         assessment.exposures().len()
     )?;
     Ok(())
+}
+
+const fn authority(summary: &Summary) -> l2_capture::CollectionAuthority {
+    #[cfg(feature = "live")]
+    if summary.live.is_some() {
+        return l2_capture::CollectionAuthority::SourceDeclared;
+    }
+    summary.source_collection.authority()
 }
 
 fn write_findings(

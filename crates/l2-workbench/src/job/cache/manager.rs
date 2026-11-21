@@ -5,7 +5,7 @@ use std::{
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
-use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
+use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior, params};
 use tempfile::Builder;
 
 use crate::hashing::is_sha256_digest;
@@ -16,16 +16,16 @@ use super::{
     entry::{CacheEntry, EntryRecord, Lease, read_entry},
     error::{CacheError, Result},
     filesystem::{HeldDirectory, LockGuard},
-    fingerprint::SourceFingerprint,
     key::StageKey,
     manifest::{MAX_RELATIVE_PATH_BYTES, safe_entry_path},
     memory,
     model::{CacheReadPolicy, CacheStats, Checkpoint, CheckpointStatus, PruneReport, StageStatus},
-    retired,
+    pairing, retired,
 };
 
 const KEY_LOCK_SUFFIX: &str = ".lock";
 const QUOTA_LOCK: &str = "quota.lock";
+const JOB_LOCK_PREFIX: &str = "job-";
 // One row, directory entry, and their bounded path buffers are live at a time
 const MAINTENANCE_BYTES: u64 = 64 * 1024;
 
@@ -34,6 +34,11 @@ const MAINTENANCE_BYTES: u64 = 64 * 1024;
 pub struct Cache {
     pub(super) inner: Arc<CacheInner>,
     pub(super) memory_scope: Option<MemoryBudget>,
+}
+
+/// Exclusive ownership of one job's shared progress checkpoint
+pub struct JobCheckpointOwner {
+    _lock: LockGuard,
 }
 
 pub(super) struct CacheInner {
@@ -56,6 +61,13 @@ struct LruRow {
 struct CapacityPlan {
     base_bytes: u64,
     incoming_bytes: u64,
+}
+
+#[derive(Clone, Copy)]
+pub(super) enum StateRecord {
+    Stage,
+    Checkpoint,
+    Execution,
 }
 
 impl std::fmt::Debug for Cache {
@@ -96,14 +108,9 @@ impl CacheInner {
         self.locks.lock_with_retry(QUOTA_LOCK, true)
     }
 
-    pub(super) fn active_checkpoint(&self, key: &str) -> Result<bool> {
-        let connection = database::open_connection(&self.state_root)?;
-        active_checkpoint_in(&connection, key)
-    }
-
     // The quota lock is held while this reservation is created
     pub(super) fn reserve_stage(&self, key: &StageKey, token: &str, bytes: i64) -> Result<()> {
-        let connection = database::open_connection(&self.state_root)?;
+        let connection = database::open_writer(&self.state_root)?;
         connection.execute(
             "INSERT INTO execution_reservations(token, key, bytes) VALUES (?1, ?2, ?3)",
             params![token, key.as_str(), bytes],
@@ -120,7 +127,7 @@ impl CacheInner {
         manifest_json: &str,
         bytes: i64,
     ) -> Result<()> {
-        let mut connection = database::open_connection(&self.state_root)?;
+        let mut connection = database::open_writer(&self.state_root)?;
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
         // Keep old bytes counted in the transaction that switches the live pointer
         let old_stage = retired::record_current(
@@ -181,6 +188,7 @@ impl CacheInner {
             )?;
         }
         transaction.commit()?;
+        drop(connection);
         for old in [old_stage, old_execution].into_iter().flatten() {
             // Cleanup failure cannot undo a committed result or release its old quota
             let _ = retired::cleanup(self, key.as_str(), &old);
@@ -194,7 +202,7 @@ impl CacheInner {
         status: CheckpointStatus,
         snapshot_json: &str,
     ) -> Result<()> {
-        let mut connection = database::open_connection(&self.state_root)?;
+        let mut connection = database::open_writer(&self.state_root)?;
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
         transaction.execute(
             "INSERT INTO checkpoints (key, status, snapshot_version, snapshot_json, updated_ns)
@@ -218,6 +226,21 @@ impl CacheInner {
 }
 
 impl Cache {
+    /// Own a job checkpoint until the returned guard is dropped
+    ///
+    /// This lock is separate from stage pins so the owner can still save progress
+    ///
+    /// # Errors
+    /// Returns an error if another job owns this checkpoint or the cache is unavailable
+    pub fn own_job_checkpoint(&self, key: &StageKey) -> Result<JobCheckpointOwner> {
+        key.validate()?;
+        self.inner.check_locations()?;
+        let name = format!("{JOB_LOCK_PREFIX}{}{KEY_LOCK_SUFFIX}", key.as_str());
+        Ok(JobCheckpointOwner {
+            _lock: self.inner.locks.lock(&name, true)?,
+        })
+    }
+
     pub(super) fn configured_memory_budget(&self) -> Option<&MemoryBudget> {
         self.memory_scope
             .as_ref()
@@ -292,7 +315,7 @@ impl Cache {
         budget: Option<MemoryBudget>,
     ) -> Result<Self> {
         let cache_root = HeldDirectory::open_root(cache_root)?;
-        let state_root = HeldDirectory::open_root(state_root)?;
+        let mut state_root = HeldDirectory::open_root(state_root)?;
         if cache_root.path().starts_with(state_root.path())
             || state_root.path().starts_with(cache_root.path())
         {
@@ -304,6 +327,11 @@ impl Cache {
         let entries = cache_root.open_child_or_create("entries")?;
         let staging = cache_root.open_child_or_create("staging")?;
         let locks = state_root.open_child_or_create("locks")?;
+        // Pair both roots before startup maintenance can remove any generations
+        let cache_pair = cache_root.lock_with_retry("pairing.lock", true)?;
+        let state_pair = state_root.lock_with_retry("pairing.lock", true)?;
+        pairing::bind(&cache_root, &state_root, &entries, &staging, &locks)?;
+        database::configure_limit(&mut state_root, max_bytes)?;
         let memory_budget =
             budget.map_or_else(OnceLock::new, |budget| OnceLock::from(Some(budget)));
         let inner = Arc::new(CacheInner {
@@ -316,11 +344,12 @@ impl Cache {
             memory_budget,
         });
         inner.check_locations()?;
-        database::initialize(&inner.state_root, &inner.locks)?;
         let cache = Self {
             inner,
             memory_scope: None,
         };
+        drop(state_pair);
+        drop(cache_pair);
         match cache.prune() {
             Ok(_) | Err(CacheError::CacheBusy) => {}
             Err(error) => return Err(error),
@@ -417,14 +446,6 @@ impl Cache {
         self.inner.max_bytes
     }
 
-    /// Calculates a fast metadata and sample fingerprint for a regular source file
-    ///
-    /// # Errors
-    /// Returns an error for symlinked, unreadable, non-regular, or changing files
-    pub fn fingerprint_source(path: impl AsRef<Path>) -> Result<SourceFingerprint> {
-        SourceFingerprint::fast(path)
-    }
-
     /// Looks up a validated entry while holding a shared OS file lock
     ///
     /// Complete-only lookups never expose partial results, so an incomplete search cannot be
@@ -492,19 +513,28 @@ impl Cache {
         drop(record);
         drop(transient);
         transaction.commit()?;
-        // This connection is dropped after the optional recency write
+        // Recency is optional once the entry and its files have been validated
+        drop(connection);
+        let connection = match database::try_open_writer(&self.inner.state_root) {
+            Ok(connection) => connection,
+            Err(error) if unavailable_recency(&error) => {
+                self.inner.check_locations()?;
+                database::check_sidecars(&self.inner.state_root)?;
+                return Ok(Some(entry));
+            }
+            Err(error) => return Err(error),
+        };
         connection.busy_timeout(Duration::ZERO)?;
         match connection.execute(
             "UPDATE entries SET accessed_ns = MAX(?1, accessed_ns + 1) WHERE key = ?2",
             params![now_ns(), key.as_str()],
         ) {
             Ok(_) => {}
-            // A busy writer cannot invalidate the already checked and pinned entry
-            Err(rusqlite::Error::SqliteFailure(code, _))
-                if matches!(
-                    code.code,
-                    rusqlite::ErrorCode::DatabaseBusy | rusqlite::ErrorCode::DatabaseLocked
-                ) => {}
+            // Write pressure cannot invalidate the already checked and pinned entry
+            Err(error) if unavailable_recency_sqlite(&error) => {
+                self.inner.check_locations()?;
+                database::check_sidecars(&self.inner.state_root)?;
+            }
             Err(error) => return Err(error.into()),
         }
         Ok(Some(entry))
@@ -529,18 +559,9 @@ impl Cache {
         }
         let _memory = self.maintenance_charge()?;
         let staging_key = self.inner.staging.open_child_or_create(key.as_str())?;
-        let active_checkpoint = self.inner.active_checkpoint(key.as_str())?;
-        // A checkpointed work directory remains available to the next lease
-        let existing = find_staging_directory(&staging_key)?;
-        let (staging_path, name) = if active_checkpoint {
-            match existing {
-                Some(existing) => existing,
-                None => create_staging_directory(&staging_key)?,
-            }
-        } else {
-            clean_staging_directory(&staging_key)?;
-            create_staging_directory(&staging_key)?
-        };
+        // Active execution data lives in committed generations, not private staging
+        clean_staging_directory(&staging_key)?;
+        let (staging_path, name) = create_staging_directory(&staging_key)?;
         let directory = match staging_key.open_child(&name) {
             Ok(directory) => directory,
             Err(error) => {
@@ -574,6 +595,8 @@ impl Cache {
         // Shared ownership prevents pruning until the full-synchronous checkpoint commits
         let _pin = self.inner.lock(key, false)?;
         let (snapshot_json, charge) = self.encode_checkpoint(snapshot)?;
+        let _quota = self.inner.quota_lock()?;
+        self.reserve_state(key, snapshot_json.len(), StateRecord::Checkpoint)?;
         let result = self.inner.record_checkpoint(key, status, &snapshot_json);
         drop(snapshot_json);
         drop(charge);
@@ -667,6 +690,8 @@ impl Cache {
             entry_bytes,
             over_limit_bytes: entry_bytes.saturating_sub(self.inner.max_bytes),
             checkpoints: nonnegative(checkpoints)?,
+            state_bytes: database::state_bytes(&self.inner.state_root)?,
+            state_limit_bytes: database::state_limit(&self.inner.state_root)?,
         })
     }
 
@@ -689,7 +714,7 @@ impl Cache {
     /// Returns an error when the index or entry directories cannot be updated safely
     pub fn clear(&self) -> Result<PruneReport> {
         let mut report = self.evict(None)?;
-        let mut connection = database::open_connection(&self.inner.state_root)?;
+        let mut connection = database::open_writer(&self.inner.state_root)?;
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
         transaction.execute(
             "DELETE FROM checkpoints WHERE status = ?1",
@@ -730,6 +755,106 @@ impl Cache {
         let plan = self.capacity_plan(key, incoming_bytes)?;
         self.remove_capacity_candidates(key, &plan)?;
         Ok(quota_lock)
+    }
+
+    // The quota lock prevents new pins while state pressure evicts old records
+    pub(super) fn reserve_state(
+        &self,
+        key: &StageKey,
+        incoming: usize,
+        record: StateRecord,
+    ) -> Result<()> {
+        let limit = self
+            .inner
+            .state_root
+            .database_limit()
+            .ok_or(CacheError::CorruptDatabase)?;
+        let incoming = u64::try_from(incoming).map_err(|_| CacheError::SizeOverflow)?;
+        let mut reader = database::open_connection(&self.inner.state_root)?;
+        let snapshot = reader.transaction()?;
+        let (page_size, required) = required_state_bytes(&snapshot, key, incoming, record)?;
+        if required > limit {
+            return Err(CacheError::QuotaExceeded {
+                limit_bytes: limit,
+                required_bytes: required,
+            });
+        }
+        let fits = used_state_bytes(&snapshot, page_size)?
+            .checked_add(required)
+            .ok_or(CacheError::SizeOverflow)?
+            <= limit;
+        snapshot.commit()?;
+        if fits {
+            return Ok(());
+        }
+        drop(reader);
+        // Keep candidate deletions inside one write transaction so denial can roll them all back
+        let mut connection = database::open_writer(&self.inner.state_root)?;
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let (page_size, required) = required_state_bytes(&transaction, key, incoming, record)?;
+        let mut cursor = None;
+        let mut retired = false;
+        loop {
+            let used = used_state_bytes(&transaction, page_size)?;
+            let total = used.checked_add(required).ok_or(CacheError::SizeOverflow)?;
+            if total <= limit {
+                transaction.commit()?;
+                drop(connection);
+                if retired {
+                    self.cleanup_retired_generations()?;
+                }
+                return Ok(());
+            }
+            // Keep all candidate deletions reversible until the full request fits
+            let removed = transaction.execute(
+                "DELETE FROM checkpoints WHERE key IN (SELECT key FROM checkpoints c WHERE status=?1 AND key<>?2 AND NOT EXISTS(SELECT 1 FROM executions e WHERE e.key=c.key) ORDER BY updated_ns,key LIMIT 16)",
+                params![CheckpointStatus::Complete.to_database(), key.as_str()],
+            )?;
+            if removed != 0 {
+                continue;
+            }
+            if !self.retire_state_candidate(&transaction, key, &mut cursor)? {
+                return Err(CacheError::QuotaExceeded {
+                    limit_bytes: limit,
+                    required_bytes: total,
+                });
+            }
+            retired = true;
+        }
+    }
+
+    fn retire_state_candidate(
+        &self,
+        transaction: &Transaction<'_>,
+        key: &StageKey,
+        cursor: &mut Option<LruRow>,
+    ) -> Result<bool> {
+        while let Some(row) = next_lru_row(transaction, cursor.as_ref())? {
+            if row.key != key.as_str() && !active_checkpoint_in(transaction, &row.key)? {
+                let lock = match self
+                    .inner
+                    .locks
+                    .lock(&format!("{}{KEY_LOCK_SUFFIX}", row.key), true)
+                {
+                    Ok(lock) => Some(lock),
+                    Err(CacheError::LockBusy) => None,
+                    Err(error) => return Err(error),
+                };
+                if let Some(lock) = lock {
+                    let (path, bytes) = current_entry_record(transaction, &row.key)?
+                        .ok_or(CacheError::CorruptDatabase)?;
+                    retired::record(transaction, &self.inner.entries, &row.key, &path, bytes)?;
+                    if transaction.execute("DELETE FROM entries WHERE key=?1", [&row.key])? != 1 {
+                        return Err(CacheError::CorruptDatabase);
+                    }
+                    drop(lock);
+                    *cursor = Some(row);
+                    return Ok(true);
+                }
+            }
+            *cursor = Some(row);
+        }
+        Ok(false)
     }
 
     pub(super) fn reserve_execution_capacity(
@@ -777,7 +902,7 @@ impl Cache {
                 });
             }
         }
-        let connection = database::open_connection(&self.inner.state_root)?;
+        let connection = database::open_writer(&self.inner.state_root)?;
         let changed = connection.execute(
             "INSERT INTO execution_reservations (token, key, bytes) VALUES (?1, ?2, ?3)
              ON CONFLICT(token) DO UPDATE SET bytes = execution_reservations.bytes + excluded.bytes
@@ -849,7 +974,7 @@ impl Cache {
         if remaining <= self.inner.max_bytes {
             return Ok(());
         }
-        let mut connection = database::open_connection(&self.inner.state_root)?;
+        let mut connection = database::open_writer(&self.inner.state_root)?;
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let mut cursor = None;
         while remaining > self.inner.max_bytes {
@@ -896,6 +1021,7 @@ impl Cache {
         }
         // New key pins are barred by the quota gate until this atomic row change commits
         transaction.commit()?;
+        drop(connection);
         self.cleanup_retired_generations()?;
         let required = self
             .stats()?
@@ -957,7 +1083,7 @@ impl Cache {
             }
             Err(error) => return Err(error),
         };
-        let mut connection = database::open_connection(&self.inner.state_root)?;
+        let mut connection = database::open_writer(&self.inner.state_root)?;
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
         // Recheck the durable pin in the same transaction that removes the entry row
         let active: bool = transaction.query_row(
@@ -1002,7 +1128,7 @@ impl Cache {
         )?;
         transaction.execute("DELETE FROM entries WHERE key = ?1", [key])?;
         transaction.commit()?;
-
+        drop(connection);
         retired::cleanup(&self.inner, key, &relative_path)?;
         *remaining = remaining.saturating_sub(bytes);
         report.removed_entries = report.removed_entries.saturating_add(1);
@@ -1127,8 +1253,10 @@ impl Cache {
             Err(CacheError::Io(error)) if error.kind() == io::ErrorKind::NotFound => {}
             Err(error) => return Err(error),
         }
+        drop(connection);
         super::execution::cleanup_cursor_debris(self, key)?;
         // Cursor files in a retired generation remain charged until that generation is removed
+        let connection = database::open_writer(&self.inner.state_root)?;
         connection.execute(
             "DELETE FROM execution_reservations WHERE key = ?1 AND NOT EXISTS (
                  SELECT 1 FROM retired_generations
@@ -1169,11 +1297,6 @@ impl Cache {
             };
             self.clear_stale_execution(&key)?;
             let staging_key = self.inner.staging.open_child(&key)?;
-            // Check again after the exclusive lock closes the checkpoint-write race
-            if self.inner.active_checkpoint(&key)? {
-                drop(lock);
-                continue;
-            }
             clean_staging_directory(&staging_key)?;
             let _ = fs::remove_dir(staging_key.path());
             drop(lock);
@@ -1229,6 +1352,73 @@ impl Cache {
         }
         Ok(())
     }
+}
+
+fn previous_state_bytes(
+    connection: &Connection,
+    key: &StageKey,
+    record: StateRecord,
+) -> Result<u64> {
+    let query = match record {
+        StateRecord::Stage => {
+            "SELECT COALESCE((SELECT length(CAST(metadata_json AS BLOB)) + length(CAST(manifest_json AS BLOB)) FROM entries WHERE key=?1), 0)"
+        }
+        StateRecord::Checkpoint => {
+            "SELECT COALESCE((SELECT length(CAST(snapshot_json AS BLOB)) FROM checkpoints WHERE key=?1), 0)"
+        }
+        StateRecord::Execution => {
+            "SELECT COALESCE((SELECT length(CAST(snapshot_json AS BLOB)) FROM checkpoints WHERE key=?1), 0) + COALESCE((SELECT length(CAST(envelope_json AS BLOB)) FROM executions WHERE key=?1), 0)"
+        }
+    };
+    connection
+        .query_row(query, [key.as_str()], |row| row.get(0))
+        .map_err(Into::into)
+}
+
+fn used_state_bytes(connection: &Connection, page_size: u64) -> Result<u64> {
+    let pages: u64 = connection.pragma_query_value(None, "page_count", |row| row.get(0))?;
+    let free: u64 = connection.pragma_query_value(None, "freelist_count", |row| row.get(0))?;
+    pages
+        .checked_sub(free)
+        .and_then(|pages| pages.checked_mul(page_size))
+        .ok_or(CacheError::CorruptDatabase)
+}
+
+fn required_state_bytes(
+    connection: &Connection,
+    key: &StageKey,
+    incoming: u64,
+    record: StateRecord,
+) -> Result<(u64, u64)> {
+    let previous = previous_state_bytes(connection, key, record)?;
+    let page_size: u64 = connection.pragma_query_value(None, "page_size", |row| row.get(0))?;
+    let padding = page_size.checked_mul(8).ok_or(CacheError::SizeOverflow)?;
+    let required = incoming
+        .saturating_sub(previous)
+        .checked_add(padding)
+        .ok_or(CacheError::SizeOverflow)?;
+    Ok((page_size, required))
+}
+
+fn unavailable_recency(error: &CacheError) -> bool {
+    match error {
+        CacheError::LockBusy | CacheError::CacheBusy | CacheError::QuotaExceeded { .. } => true,
+        CacheError::Io(error) => error.kind() == io::ErrorKind::StorageFull,
+        CacheError::Database(error) => error
+            .downcast_ref::<rusqlite::Error>()
+            .is_some_and(unavailable_recency_sqlite),
+        _ => false,
+    }
+}
+
+const fn unavailable_recency_sqlite(error: &rusqlite::Error) -> bool {
+    matches!(error, rusqlite::Error::SqliteFailure(code, _) if matches!(
+        code.code,
+        rusqlite::ErrorCode::DatabaseBusy
+            | rusqlite::ErrorCode::DatabaseLocked
+            | rusqlite::ErrorCode::DiskFull
+            | rusqlite::ErrorCode::OperationInterrupted
+    ) || code.extended_code == rusqlite::ffi::SQLITE_IOERR_WRITE)
 }
 
 #[derive(Clone, Copy)]
@@ -1297,7 +1487,7 @@ fn validate_references(connection: &Connection, entries: &HeldDirectory, key: &s
     Ok(())
 }
 
-fn is_referenced(connection: &Connection, key: &str, relative: &str) -> Result<bool> {
+pub(super) fn is_referenced(connection: &Connection, key: &str, relative: &str) -> Result<bool> {
     connection
         .query_row(
             "SELECT EXISTS(SELECT 1 FROM entries WHERE key = ?1 AND relative_path = ?2)
@@ -1429,31 +1619,6 @@ fn clean_staging_directory(directory: &HeldDirectory) -> Result<()> {
         fs::remove_dir_all(entry.path())?;
     }
     Ok(())
-}
-
-fn find_staging_directory(directory: &HeldDirectory) -> Result<Option<(PathBuf, String)>> {
-    directory.check_location()?;
-    let mut found = None;
-    for entry in fs::read_dir(directory.path())? {
-        let entry = entry?;
-        let metadata = fs::symlink_metadata(entry.path())?;
-        if metadata.file_type().is_symlink() || !metadata.is_dir() {
-            return Err(CacheError::UnsafePath(
-                "managed staging directory contains an unsafe item",
-            ));
-        }
-        let name = entry
-            .file_name()
-            .into_string()
-            .map_err(|_| CacheError::UnsafePath("managed work directory name is invalid"))?;
-        if !name.starts_with("lease-") || found.is_some() {
-            return Err(CacheError::CorruptEntry(
-                "multiple or unrecognized resumable work directories exist".to_owned(),
-            ));
-        }
-        found = Some((entry.path(), name));
-    }
-    Ok(found)
 }
 
 fn create_staging_directory(directory: &HeldDirectory) -> Result<(PathBuf, String)> {

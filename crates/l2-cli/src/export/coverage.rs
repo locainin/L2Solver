@@ -625,6 +625,24 @@ fn source_incomplete_components(
                 collection.packet_blocks_with_unavailable_drop_count
             ));
         }
+        if let Some(drops @ 1..) = collection.enhanced_packet_packets_dropped {
+            reasons.push(format!(
+                "{drops} packets reported dropped between enhanced packets"
+            ));
+        }
+        if let Some(drops @ 1..) = collection.interface_statistics_interface_dropped {
+            reasons.push(format!(
+                "{drops} interface drops reported in cumulative statistics"
+            ));
+        }
+        if let Some(drops @ 1..) = collection.interface_statistics_os_dropped {
+            reasons.push(format!(
+                "{drops} operating-system drops reported in cumulative statistics"
+            ));
+        }
+        if reasons.is_empty() {
+            reasons.push("source-declared packet loss".into());
+        }
         components.push(IncompleteComponent {
             component: "source_collection",
             reason: reasons.join("; "),

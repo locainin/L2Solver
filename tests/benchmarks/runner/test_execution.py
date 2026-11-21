@@ -2,6 +2,8 @@
 
 import json
 import os
+import subprocess
+import sys
 import tempfile
 import time
 import unittest
@@ -80,7 +82,10 @@ class ExecutionTests(unittest.TestCase):
             catalogue, sample, metadata, capture = write_sample(root)
             case = case_for(metadata, capture)
             body = (
-                "import pathlib, sys\npathlib.Path(sys.argv[-1]).write_text("
+                "import pathlib, sys\n"
+                "print('analyzer output')\n"
+                "print('analyzer warning', file=sys.stderr)\n"
+                "pathlib.Path(sys.argv[-1]).write_text("
                 + repr(json.dumps(case))
                 + ")\n"
             )
@@ -111,10 +116,185 @@ class ExecutionTests(unittest.TestCase):
             self.assertEqual(result["validation"]["literal_nodes_checked"], 1)
             self.assertEqual(result["output_bytes"], result["case_bytes"])
             self.assertEqual(result["evidence_bytes"], result["case_bytes"])
-            self.assertGreaterEqual(result["artifact_bytes"], result["output_bytes"])
+            run_directory = sample / "runs/run-one"
+            self.assertEqual((run_directory / "stdout.log").read_bytes(), b"analyzer output\n")
+            self.assertEqual((run_directory / "stderr.log").read_bytes(), b"analyzer warning\n")
+            self.assertEqual(
+                result["artifact_bytes"],
+                result["output_bytes"] + len(b"analyzer output\n") + len(b"analyzer warning\n"),
+            )
             self.assertTrue((sample / "runs/run-one/result.json").is_file())
             with self.assertRaises(FileExistsError):
                 run_sample(load_catalogue(catalogue)[0], binary, "run-one", 5)
+
+    def test_changed_or_missing_executable_fails_case_evidence(self):
+        for action in ("write_text('changed executable')", "unlink()"):
+            for exit_code in (0, 3):
+                with (
+                    self.subTest(action=action, exit_code=exit_code),
+                    tempfile.TemporaryDirectory() as directory,
+                ):
+                    root = Path(directory)
+                    catalogue, sample, metadata, capture = write_sample(root)
+                    case = case_for(metadata, capture)
+                    case["collection_complete"] = exit_code == 0
+                    body = (
+                        "import pathlib, sys\n"
+                        "pathlib.Path(sys.argv[-1]).write_text("
+                        + repr(json.dumps(case))
+                        + ")\n"
+                        + f"pathlib.Path(__file__).{action}\n"
+                        + f"sys.exit({exit_code})\n"
+                    )
+                    result = run_sample(
+                        load_catalogue(catalogue)[0],
+                        program(root, body),
+                        "binary-changed",
+                        5,
+                    )
+
+                    self.assertEqual(result["status"], "evidence_failure")
+                    self.assertEqual(result["exit_code"], exit_code)
+                    self.assertNotIn("validation", result)
+                    self.assertTrue(result["error"])
+                    if action.startswith("write_text"):
+                        self.assertIn("executable changed", result["error"])
+                    receipt = json.loads(
+                        (sample / "runs/binary-changed/result.json").read_text()
+                    )
+                    self.assertEqual(receipt, result)
+
+    def test_analyzer_files_named_like_logs_count_toward_output_size(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            catalogue, _, metadata, capture = write_sample(root)
+            body = (
+                "import pathlib, sys\n"
+                "pathlib.Path(sys.argv[-1]).write_text("
+                + repr(json.dumps(case_for(metadata, capture)))
+                + ")\n"
+                "pathlib.Path('nested').mkdir()\n"
+                "pathlib.Path('nested/stdout.log').write_bytes(b'first')\n"
+                "pathlib.Path('nested/stage.stderr.log').write_bytes(b'second')\n"
+                "pathlib.Path('report.stdout.log').write_bytes(b'third')\n"
+            )
+            result = run_sample(
+                load_catalogue(catalogue)[0], program(root, body), "nested-output", 5
+            )
+
+            self.assertEqual(result["status"], "complete")
+            self.assertEqual(result["output_bytes"], result["case_bytes"] + 16)
+            self.assertEqual(result["artifact_bytes"], result["output_bytes"])
+
+    def test_unchanged_executable_allows_partial_case(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            catalogue, _, metadata, capture = write_sample(root)
+            case = case_for(metadata, capture)
+            case["collection_complete"] = False
+            body = (
+                "import pathlib, sys\n"
+                "pathlib.Path(sys.argv[-1]).write_text("
+                + repr(json.dumps(case))
+                + ")\nsys.exit(3)\n"
+            )
+            result = run_sample(
+                load_catalogue(catalogue)[0], program(root, body), "partial", 5
+            )
+
+            self.assertEqual(result["status"], "partial")
+            self.assertEqual(result["exit_code"], 3)
+            self.assertIn("validation", result)
+
+    @unittest.skipUnless(hasattr(os, "mkfifo"), "named pipes require POSIX")
+    def test_fifo_or_large_executable_replacement_fails_without_hanging(self):
+        for action in (
+            "os.unlink(__file__); os.mkfifo(__file__)",
+            "os.truncate(__file__, 32 * 1024 ** 3)",
+        ):
+            with self.subTest(action=action), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                catalogue, sample, metadata, capture = write_sample(root)
+                body = (
+                    "import os, pathlib, sys\n"
+                    "pathlib.Path(sys.argv[-1]).write_text("
+                    + repr(json.dumps(case_for(metadata, capture)))
+                    + ")\n"
+                    + action
+                    + "\n"
+                )
+                binary = program(root, body)
+                wrapper = (
+                    "import json, sys\n"
+                    "from benchmarks.runner.catalogue import load_catalogue\n"
+                    "from benchmarks.runner.execution import run_sample\n"
+                    "result = run_sample(load_catalogue(sys.argv[1])[0], sys.argv[2], 'changed', 1)\n"
+                    "print(json.dumps(result))\n"
+                )
+                completed = subprocess.run(
+                    [sys.executable, "-c", wrapper, str(catalogue), str(binary)],
+                    capture_output=True,
+                    text=True,
+                    check=True,
+                    timeout=4,
+                )
+
+                result = json.loads(completed.stdout)
+                self.assertEqual(result["status"], "evidence_failure")
+                self.assertIn("executable", result["error"])
+                receipt = json.loads((sample / "runs/changed/result.json").read_text())
+                self.assertEqual(receipt, result)
+
+    @unittest.skipUnless(hasattr(os, "mkfifo"), "named pipes require POSIX")
+    def test_initial_fifo_executable_is_rejected_without_hanging(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            catalogue, _, _, _ = write_sample(root)
+            binary = root / "analyzer"
+            os.mkfifo(binary)
+            wrapper = (
+                "import sys\n"
+                "from benchmarks.runner.catalogue import load_catalogue\n"
+                "from benchmarks.runner.execution import run_sample\n"
+                "try:\n"
+                "    run_sample(load_catalogue(sys.argv[1])[0], sys.argv[2], 'fifo', 1)\n"
+                "except ValueError as error:\n"
+                "    print(error)\n"
+                "else:\n"
+                "    raise AssertionError('FIFO executable was accepted')\n"
+            )
+            completed = subprocess.run(
+                [sys.executable, "-c", wrapper, str(catalogue), str(binary)],
+                capture_output=True,
+                text=True,
+                check=True,
+                timeout=4,
+            )
+
+            self.assertIn("not a regular file", completed.stdout)
+
+    @unittest.skipUnless(hasattr(os, "O_NOFOLLOW"), "no-follow opens are unavailable")
+    def test_symlink_executable_replacement_fails_even_with_same_bytes(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            catalogue, _, metadata, capture = write_sample(root)
+            body = (
+                "import pathlib, sys\n"
+                "pathlib.Path(sys.argv[-1]).write_text("
+                + repr(json.dumps(case_for(metadata, capture)))
+                + ")\n"
+                "current = pathlib.Path(__file__)\n"
+                "backup = current.with_name('backup')\n"
+                "backup.write_bytes(current.read_bytes())\n"
+                "current.unlink()\n"
+                "current.symlink_to(backup)\n"
+            )
+            result = run_sample(
+                load_catalogue(catalogue)[0], program(root, body), "symlink", 5
+            )
+
+            self.assertEqual(result["status"], "evidence_failure")
+            self.assertIn("executable", result["error"])
 
     def test_unexpected_exit_records_tool_failure(self):
         with tempfile.TemporaryDirectory() as directory:

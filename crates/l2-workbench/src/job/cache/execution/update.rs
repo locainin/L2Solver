@@ -30,7 +30,7 @@ impl Drop for PendingCursor {
         if self.commit_attempted || cleanup::remove_cursor(&self.parent, &self.name).is_err() {
             return;
         }
-        if let Ok(connection) = database::open_connection(&self.cache.inner.state_root) {
+        if let Ok(connection) = database::open_writer(&self.cache.inner.state_root) {
             let _ = connection.execute(
                 "DELETE FROM execution_reservations WHERE token = ?1",
                 [&self.token],
@@ -180,6 +180,15 @@ impl Lease {
             old_executor.directory.as_deref().unwrap_or("executor")
         );
         let quota = self.cache.inner.quota_lock()?;
+        let state_bytes = json
+            .len()
+            .checked_add(snapshot_json.len())
+            .ok_or(CacheError::SizeOverflow)?;
+        self.cache.reserve_state(
+            &self.key,
+            state_bytes,
+            super::super::manager::StateRecord::Execution,
+        )?;
         // Metadata serialization can run caller code, so check the synced file again afterward
         let held = prepared.file.file.metadata()?;
         let named = pending.directory.open_file("executor")?.metadata()?;

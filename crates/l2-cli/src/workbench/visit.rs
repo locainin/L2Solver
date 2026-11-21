@@ -275,13 +275,22 @@ fn validate_collection_summary(case: &Case, source: &Source) -> Result<(), Box<d
     if summaries.next().is_some() {
         return Err(invalid("bundle page repeats its collection declaration"));
     }
-    let expected = l2_workbench::capture_collection::to_value(source.collection_summary)?;
+    // Older pages omit the derived authority fields but retain the same counters
+    let encoded = summary
+        .details
+        .get("summary")
+        .map(serde_json::to_string)
+        .transpose()?;
+    let parsed = encoded
+        .as_deref()
+        .map(l2_workbench::capture_collection::from_json)
+        .transpose()?;
     if summary
         .details
         .get("source_id")
         .and_then(serde_json::Value::as_str)
         != Some(&source.id)
-        || summary.details.get("summary") != Some(&expected)
+        || parsed != Some(source.collection_summary)
     {
         return Err(invalid(
             "bundle page collection declaration disagrees with the manifest",

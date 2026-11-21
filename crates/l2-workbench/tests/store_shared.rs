@@ -7,6 +7,9 @@ mod fragments;
 #[path = "reconstruction/tcp.rs"]
 mod frames;
 
+#[path = "store/support.rs"]
+mod support;
+
 use l2_capture::{
     CaptureMetadata, CaptureTimestamp, CapturedFrame, InterfaceId, LinkType, TimestampResolution,
     TimestampSource,
@@ -18,23 +21,7 @@ use l2_workbench::store::{
 };
 use sha2::{Digest, Sha256};
 use std::{error::Error, io::Cursor};
-
-fn capture(frames: &[CapturedFrame]) -> Result<Vec<u8>, Box<dyn Error>> {
-    let mut bytes = Vec::new();
-    bytes.extend_from_slice(&0xa1b2_c3d4_u32.to_le_bytes());
-    bytes.extend_from_slice(&[2, 0, 4, 0]);
-    bytes.extend_from_slice(&[0; 8]);
-    bytes.extend_from_slice(&65_535_u32.to_le_bytes());
-    bytes.extend_from_slice(&1_u32.to_le_bytes());
-    for (index, frame) in frames.iter().enumerate() {
-        bytes.extend_from_slice(&1_u32.to_le_bytes());
-        bytes.extend_from_slice(&u32::try_from(index)?.to_le_bytes());
-        bytes.extend_from_slice(&u32::try_from(frame.bytes().len())?.to_le_bytes());
-        bytes.extend_from_slice(&frame.metadata().original_len().to_le_bytes());
-        bytes.extend_from_slice(frame.bytes());
-    }
-    Ok(bytes)
-}
+use support::capture;
 
 fn private_ip_frame(payload: &[u8]) -> Result<CapturedFrame, Box<dyn Error>> {
     let frame = frames::tcp(false, 1, 0x18, payload)?;

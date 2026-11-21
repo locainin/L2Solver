@@ -20,6 +20,7 @@ struct TsharkManifest {
     object_export_status: Option<workbench::ObjectExportStatus>,
     object_export_budget: Option<workbench::ObjectExportBudget>,
     object_export_usage: Option<workbench::ObjectExportUsage>,
+    containment: Option<l2_workbench::tshark::ScopeReceipt>,
     object_scan_entries: u64,
 }
 
@@ -79,10 +80,11 @@ pub(super) fn write_manifest(
             unsafe_entries_skipped: summary.tshark.unsafe_entries_skipped,
             issues,
             provenance_note: "Native origins use direct packet ranges and explicit node references; graph edges are not traversed. TShark origins identify protocol export only and do not report packet provenance",
-            temporary_output_policy: "Temporary bytes and files are polled every 50 ms and may overshoot before process-group termination; each tree walk stops at temporary_files plus the known protocol-directory count, and the collector pass reports its first over-budget entry",
+            temporary_output_policy: "Object data blocks are bounded by a private, page-rounded tmpfs; child memory and tasks are cgroup-limited. Logical lengths, file counts and tree entries are polled and may overshoot between scans. Only verified regular files are copied to trusted storage after the child scope stops",
             object_export_status: summary.tshark.export_status,
             object_export_budget: summary.tshark.export_budget,
             object_export_usage: summary.tshark.export_usage,
+            containment: summary.tshark.containment,
             object_scan_entries: summary.tshark.scan_entries,
         },
     )?;

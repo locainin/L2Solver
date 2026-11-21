@@ -20,7 +20,7 @@ use l2_workbench::{
 };
 use std::{
     error::Error,
-    fmt,
+    fmt, io,
     path::Path,
     sync::atomic::{AtomicUsize, Ordering},
 };
@@ -107,21 +107,30 @@ pub(super) fn recovery_worker_count(requested: Option<usize>, available_cpus: us
 
 /// Release queued native Cases before a CPU-sized batch consumes recovery's working room
 pub(super) fn batch_ready(
-    queued: usize,
+    queued: &mut [PendingCase],
     workers: usize,
     memory: Option<&MemoryBudget>,
-) -> Result<bool, MemoryError> {
-    if queued == 0 {
+) -> Result<bool, Box<dyn Error>> {
+    if queued.is_empty() {
         return Ok(false);
     }
-    if queued >= workers {
+    if queued.len() >= workers {
         return Ok(true);
     }
     let Some(memory) = memory else {
         return Ok(false);
     };
     let snapshot = memory.snapshot()?;
-    Ok(snapshot.used(MemoryClass::Case) >= snapshot.limit_bytes / CASE_BUFFER_DIVISOR)
+    let mut largest_growth = 0;
+    for pending in queued {
+        largest_growth =
+            largest_growth.max(admission::startup_growth(case_mut(&mut pending.item))?);
+    }
+    // Leave room for recovery before another native Case is built
+    Ok(snapshot
+        .used(MemoryClass::Case)
+        .saturating_add(largest_growth)
+        >= snapshot.limit_bytes / CASE_BUFFER_DIVISOR)
 }
 
 /// One analyzed Case waiting for its bounded recovery batch
@@ -321,6 +330,7 @@ pub(super) struct WorkerFailure {
 enum WorkerCause {
     Memory(MemoryError),
     Job(JobError),
+    Io(io::Error),
 }
 
 impl fmt::Display for WorkerFailure {
@@ -334,27 +344,42 @@ impl Error for WorkerFailure {
         match &self.cause {
             Some(WorkerCause::Memory(error)) => Some(error),
             Some(WorkerCause::Job(error)) => Some(error),
+            Some(WorkerCause::Io(error)) => Some(error),
             None => None,
         }
     }
 }
 
 pub(super) fn classify_worker_error(error: &(dyn Error + 'static)) -> WorkerFailure {
+    let mut io_cause: Option<io::Error> = None;
+    let cause = crate::memory_error::find_map(error, |cause| {
+        if let Some(error) = cause.downcast_ref::<io::Error>()
+            && io_cause
+                .as_ref()
+                .and_then(io::Error::raw_os_error)
+                .is_none()
+        {
+            // Keep the first OS error or the innermost I/O error without an errno
+            io_cause = Some(error.raw_os_error().map_or_else(
+                || io::Error::new(error.kind(), error.to_string()),
+                io::Error::from_raw_os_error,
+            ));
+        }
+        // Prefer memory and job causes even when an I/O wrapper appears first
+        cause
+            .downcast_ref::<MemoryError>()
+            .copied()
+            .map(WorkerCause::Memory)
+            .or_else(|| {
+                cause
+                    .downcast_ref::<JobError>()
+                    .copied()
+                    .map(WorkerCause::Job)
+            })
+    });
     WorkerFailure {
         message: error.to_string(),
-        // Workers need a sendable cause without flattening cancellation into text
-        cause: crate::memory_error::find_map(error, |cause| {
-            cause
-                .downcast_ref::<MemoryError>()
-                .copied()
-                .map(WorkerCause::Memory)
-                .or_else(|| {
-                    cause
-                        .downcast_ref::<JobError>()
-                        .copied()
-                        .map(WorkerCause::Job)
-                })
-        }),
+        cause: cause.or_else(|| io_cause.map(WorkerCause::Io)),
     }
 }
 

@@ -18,6 +18,7 @@ const INTERNAL_LOCK_RETRY: Duration = Duration::from_millis(10);
 pub(super) struct HeldDirectory {
     file: File,
     path: PathBuf,
+    database_limit: Option<u64>,
 }
 
 /// An OS advisory lock whose file descriptor stays open for the full lease
@@ -26,6 +27,48 @@ pub(super) struct LockGuard {
 }
 
 impl HeldDirectory {
+    pub(super) const fn set_database_limit(&mut self, limit: u64) {
+        self.database_limit = Some(limit);
+    }
+
+    pub(super) const fn database_limit(&self) -> Option<u64> {
+        self.database_limit
+    }
+
+    pub(super) fn available_bytes(&self) -> Result<u64> {
+        #[cfg(unix)]
+        {
+            let capacity = rustix::fs::fstatvfs(&self.file).map_err(io::Error::from)?;
+            capacity
+                .f_bavail
+                .checked_mul(capacity.f_frsize)
+                .ok_or(CacheError::SizeOverflow)
+        }
+        #[cfg(not(unix))]
+        {
+            Err(CacheError::InvalidInput(
+                "state filesystem capacity is unavailable",
+            ))
+        }
+    }
+
+    pub(super) fn identity(&self) -> Result<String> {
+        self.check_location()?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            let metadata = self.file.metadata()?;
+            Ok(format!("{}:{}", metadata.dev(), metadata.ino()))
+        }
+        #[cfg(not(unix))]
+        {
+            self.path
+                .to_str()
+                .map(str::to_owned)
+                .ok_or(CacheError::UnsafePath("cache path is not valid UTF-8"))
+        }
+    }
+
     pub(super) fn sync(&self) -> Result<()> {
         self.check_location()?;
         self.file.sync_all()?;
@@ -269,6 +312,7 @@ impl HeldDirectory {
         Ok(Self {
             file,
             path: canonical,
+            database_limit: None,
         })
     }
 
@@ -294,6 +338,10 @@ impl HeldDirectory {
 
     pub(super) fn open_child(&self, name: &str) -> Result<Self> {
         self.open_child_inner(name, true)
+    }
+
+    pub(super) fn inspect_child(&self, name: &str) -> Result<Self> {
+        self.open_child_inner(name, false)
     }
 
     fn open_child_inner(&self, name: &str, restrict_mode: bool) -> Result<Self> {
@@ -334,7 +382,11 @@ impl HeldDirectory {
             set_private_directory_mode(&file)?;
         }
 
-        Ok(Self { file, path })
+        Ok(Self {
+            file,
+            path,
+            database_limit: None,
+        })
     }
 
     pub(super) fn path(&self) -> &Path {
@@ -405,6 +457,19 @@ impl HeldDirectory {
     }
 
     pub(super) fn lock(&self, file_name: &str, exclusive: bool) -> Result<LockGuard> {
+        self.lock_inner(file_name, exclusive, true)
+    }
+
+    pub(super) fn inspect_lock(&self, file_name: &str) -> Result<LockGuard> {
+        self.lock_inner(file_name, true, false)
+    }
+
+    fn lock_inner(
+        &self,
+        file_name: &str,
+        exclusive: bool,
+        restrict_mode: bool,
+    ) -> Result<LockGuard> {
         self.check_location()?;
         validate_component(file_name)?;
 
@@ -414,7 +479,11 @@ impl HeldDirectory {
                 &self.file,
                 file_name,
                 rustix::fs::OFlags::RDWR
-                    | rustix::fs::OFlags::CREATE
+                    | if restrict_mode {
+                        rustix::fs::OFlags::CREATE
+                    } else {
+                        rustix::fs::OFlags::empty()
+                    }
                     | rustix::fs::OFlags::NOFOLLOW
                     | rustix::fs::OFlags::CLOEXEC,
                 rustix::fs::Mode::RUSR | rustix::fs::Mode::WUSR,
@@ -433,11 +502,13 @@ impl HeldDirectory {
                     return Err(CacheError::UnsafePath("cache lock is not a file"));
                 }
                 Ok(_) => File::options().read(true).write(true).open(path)?,
-                Err(error) if error.kind() == io::ErrorKind::NotFound => File::options()
-                    .read(true)
-                    .write(true)
-                    .create_new(true)
-                    .open(path)?,
+                Err(error) if error.kind() == io::ErrorKind::NotFound && restrict_mode => {
+                    File::options()
+                        .read(true)
+                        .write(true)
+                        .create_new(true)
+                        .open(path)?
+                }
                 Err(error) => return Err(error.into()),
             }
         };
@@ -450,7 +521,9 @@ impl HeldDirectory {
         {
             return Err(CacheError::UnsafePath("cache lock changed while opening"));
         }
-        set_private_file_mode(&file)?;
+        if restrict_mode {
+            set_private_file_mode(&file)?;
+        }
         acquire_lock(&file, exclusive)?;
         Ok(LockGuard { file })
     }

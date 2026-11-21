@@ -32,7 +32,7 @@ l2-audit = { path = "../crates/l2-audit", version = "0.2.0" }
 l2-capture = { path = "../crates/l2-capture", version = "0.1.0" }
 libfuzzer-sys = "0.4"
 serde_json = "1"
-rusqlite = { version = "0.40.2", features = ["bundled"] }
+rusqlite = { version = "0.41.0", features = ["bundled"] }
 tempfile = "3"
 l2-core = { path = "../crates/l2-core", version = "0.1.0" }
 l2-codecs = { path = "../crates/l2-codecs", version = "0.1.0" }

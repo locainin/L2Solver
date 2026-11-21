@@ -305,7 +305,7 @@ impl Drop for PendingGeneration {
             Err(error) if error.kind() == io::ErrorKind::NotFound => {}
             Err(_) => return,
         }
-        if let Ok(connection) = database::open_connection(&self.cache.inner.state_root) {
+        if let Ok(connection) = database::open_writer(&self.cache.inner.state_root) {
             let _ = connection.execute(
                 "DELETE FROM execution_reservations WHERE token = ?1",
                 [&self.token],
@@ -388,6 +388,17 @@ impl Lease {
         }));
         let prepared =
             write_generation(&directory, &budget, snapshot, limits, memory_budget, write)?;
+        let _quota = self.cache.inner.quota_lock()?;
+        let state_bytes = prepared
+            .envelope_json
+            .len()
+            .checked_add(prepared.snapshot_json.len())
+            .ok_or(CacheError::SizeOverflow)?;
+        self.cache.reserve_state(
+            &self.key,
+            state_bytes,
+            super::manager::StateRecord::Execution,
+        )?;
         let entry_root = self
             .cache
             .inner
@@ -744,7 +755,7 @@ fn publish(
     snapshot: &str,
     bytes: u64,
 ) -> Result<Option<String>> {
-    let mut connection = database::open_connection(&lease.cache.inner.state_root)?;
+    let mut connection = database::open_writer(&lease.cache.inner.state_root)?;
     let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
     let old = retired::record_current(
         &transaction,

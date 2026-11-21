@@ -1,4 +1,4 @@
-use super::support::{empty_capture, ipv4_header_frame, path_arg, run};
+use super::support::{empty_capture, ipv4_capture, path_arg, run};
 use l2_workbench::{evidence::Case, sha256};
 use serde_json::{Value, json};
 use std::{
@@ -10,21 +10,8 @@ use std::{
     time::{Duration, Instant},
 };
 
-fn capture(records: u32) -> Vec<u8> {
-    let frame = ipv4_header_frame([192, 0, 2, 1], [192, 0, 2, 2]);
-    let mut bytes = empty_capture();
-    for record in 0..records {
-        bytes.extend_from_slice(&record.to_le_bytes());
-        bytes.extend_from_slice(&0_u32.to_le_bytes());
-        bytes.extend_from_slice(&34_u32.to_le_bytes());
-        bytes.extend_from_slice(&34_u32.to_le_bytes());
-        bytes.extend_from_slice(&frame);
-    }
-    bytes
-}
-
 fn create_bundle(root: &Path, records: u32) -> Result<(std::path::PathBuf, Value), Box<dyn Error>> {
-    create_bundle_from_capture(root, &capture(records))
+    create_bundle_from_capture(root, &ipv4_capture(records))
 }
 
 fn create_bundle_from_capture(
@@ -135,7 +122,7 @@ fn bundle_visiting_page_windows_context() -> Result<(), Box<dyn Error>> {
     );
     assert_eq!(
         report.pointer("/inventory/source_ids/0"),
-        Some(&json!(format!("sha256:{}", sha256(&capture(5))))),
+        Some(&json!(format!("sha256:{}", sha256(&ipv4_capture(5))))),
     );
     Ok(())
 }
@@ -157,6 +144,100 @@ fn single_case_validation_path() -> Result<(), Box<dyn Error>> {
         report.pointer("/inventory/collection_complete"),
         Some(&json!(true))
     );
+    Ok(())
+}
+
+#[test]
+fn legacy_collection_summary_bundle() -> Result<(), Box<dyn Error>> {
+    let directory = tempfile::tempdir()?;
+    let (bundle, mut manifest) = create_bundle(directory.path(), 1)?;
+    let page_path = bundle.join("pages/000001.json");
+    let mut page: Value = serde_json::from_slice(&fs::read(&page_path)?)?;
+    let summary = page
+        .get_mut("nodes")
+        .and_then(Value::as_array_mut)
+        .and_then(|nodes| {
+            nodes
+                .iter_mut()
+                .find(|node| node.get("kind") == Some(&json!("capture_collection_summary")))
+        })
+        .and_then(|node| node.pointer_mut("/details/summary"))
+        .and_then(Value::as_object_mut)
+        .ok_or("missing collection summary")?;
+    summary.remove("authority");
+    summary.remove("acquisition_quality");
+    let document = serde_json::to_vec(&page)?;
+    fs::write(page_path, &document)?;
+    set_field(
+        first_page_mut(&mut manifest)?,
+        "sha256",
+        json!(sha256(&document)),
+    )?;
+    let source = manifest
+        .pointer_mut("/source/collection_summary")
+        .and_then(Value::as_object_mut)
+        .ok_or("missing manifest collection summary")?;
+    source.remove("authority");
+    source.remove("acquisition_quality");
+    write_manifest(&bundle, &manifest)?;
+
+    let output = run_query(&bundle)?;
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    Ok(())
+}
+
+#[test]
+fn collection_declaration_mismatch() -> Result<(), Box<dyn Error>> {
+    for (field, replacement) in [
+        (
+            "/details/source_id",
+            json!(format!("sha256:{}", "0".repeat(64))),
+        ),
+        ("/details/summary/sections", json!(42)),
+    ] {
+        let directory = tempfile::tempdir()?;
+        let (bundle, mut manifest) = create_bundle(directory.path(), 1)?;
+        let page_path = bundle.join("pages/000001.json");
+        let mut page: Value = serde_json::from_slice(&fs::read(&page_path)?)?;
+        let summary = page
+            .get_mut("nodes")
+            .and_then(Value::as_array_mut)
+            .and_then(|nodes| {
+                nodes
+                    .iter_mut()
+                    .find(|node| node.get("kind") == Some(&json!("capture_collection_summary")))
+            })
+            .ok_or("missing collection summary")?;
+        let original = summary.pointer_mut(field).ok_or("missing summary field")?;
+        assert_ne!(
+            *original, replacement,
+            "fixture already has the changed value"
+        );
+        *original = replacement;
+
+        // Update the digest so collection validation checks the edited declaration
+        let document = serde_json::to_vec(&page)?;
+        fs::write(page_path, &document)?;
+        set_field(
+            first_page_mut(&mut manifest)?,
+            "sha256",
+            json!(sha256(&document)),
+        )?;
+        write_manifest(&bundle, &manifest)?;
+
+        let output = run_query(&bundle)?;
+        assert_eq!(output.status.code(), Some(1), "{field}");
+        assert!(output.stdout.is_empty(), "{field}");
+        let stderr = String::from_utf8(output.stderr)?;
+        assert!(
+            stderr.contains("bundle page collection declaration disagrees with the manifest"),
+            "{field}: {stderr}"
+        );
+    }
     Ok(())
 }
 

@@ -23,6 +23,13 @@ PROVENANCE_NAME = "PROVENANCE.json"
 NOTICE_PATH = ROOT / "NOTICE-JEMALLOC.txt"
 HELPER_NAME = "l2solver-active-helper"
 ACTIVE_NAME = "l2solver-active"
+BUILD_COMMAND = (
+    "cargo", "build", "--locked", "--release", "--package", "l2-cli",
+    "--package", "l2-active-cli", "--package", "l2-active-linux",
+    "--bin", "l2solver", "--bin", ACTIVE_NAME, "--bin", HELPER_NAME,
+    "--target", TARGET,
+)
+OBSERVED_BUILD_COMMAND = (*BUILD_COMMAND, "--message-format=json-render-diagnostics")
 
 
 def _regular_file(path, description, *, executable=False):
@@ -67,7 +74,7 @@ def _provenance(
 
     # Record only portable identifiers and digests, never local filesystem paths
     return {
-        "schema_version": 3,
+        "schema_version": 4,
         "source_commit": metadata["source_commit"],
         "source_tree": metadata["source_tree"],
         "toolchain": {
@@ -84,13 +91,10 @@ def _provenance(
             "sha256": _hash_file(lockfile),
         },
         "build": {
-            "command_kind": "rebuild_recipe",
-            "command": (
-                "cargo build --locked --release --package l2-cli "
-                "--package l2-active-cli --package l2-active-linux "
-                "--bin l2solver --bin l2solver-active "
-                f"--bin {HELPER_NAME} --target {TARGET}"
-            )
+            "command_kind": "observed" if metadata["observed"] else "rebuild_recipe",
+            "source_binding": "verified" if metadata["observed"] else "unverified",
+            "command": " ".join(OBSERVED_BUILD_COMMAND)
+            if metadata["observed"] else " ".join(BUILD_COMMAND),
         },
         "binary": {
             "name": "l2solver",
@@ -174,6 +178,7 @@ def package_release(
     source_tree,
     rustc_version,
     cargo_version,
+    build_record=None,
     check_source=None,
 ):
     """Package matching Linux executables with provenance and a SHA-256 sidecar."""
@@ -206,8 +211,20 @@ def package_release(
             "source_tree": source_tree,
             "rustc_version": rustc_version,
             "cargo_version": cargo_version,
+            "observed": build_record is not None,
         },
     )
+    if build_record is not None:
+        expected = {
+            "source_commit": source_commit, "source_tree": source_tree,
+            "rustc_version": rustc_version, "cargo_version": cargo_version,
+            "lock_sha256": provenance["dependency_lock"]["sha256"],
+            "artifacts": {name: provenance[key]["sha256"] for name, key in (
+                ("l2solver", "binary"), (ACTIVE_NAME, "active_binary"), (HELPER_NAME, "active_helper"),
+            )},
+        }
+        if build_record != expected:
+            raise ValueError("package inputs differ from the observed build")
     with tempfile.TemporaryDirectory(
         prefix=".l2solver-release-", dir=output_directory.parent
     ) as staging_name:
@@ -296,31 +313,59 @@ def _release_metadata():
     }
 
 
+def _build_candidate(target):
+    artifacts = {}
+    # A fresh target avoids certifying an unrelated cached executable
+    with subprocess.Popen(OBSERVED_BUILD_COMMAND, cwd=ROOT, stdout=subprocess.PIPE, text=True,
+                          env={**os.environ, "CARGO_TARGET_DIR": str(target),
+                               "CARGO_BUILD_BUILD_DIR": str(target)}) as process:
+        for line in process.stdout:
+            message = json.loads(line)
+            if message.get("reason") != "compiler-artifact" or not message.get("executable"):
+                continue
+            name = message["target"]["name"]
+            if name not in ("l2solver", ACTIVE_NAME, HELPER_NAME):
+                continue
+            path, _ = _regular_file(message["executable"], name, executable=True)
+            if not path.is_relative_to(target.resolve()):
+                raise ValueError("Cargo artifact is outside the private target")
+            artifacts[name] = (path, _hash_file(path))
+        if process.wait() != 0:
+            raise ValueError("locked release build failed")
+    if set(artifacts) != {"l2solver", ACTIVE_NAME, HELPER_NAME}:
+        raise ValueError("Cargo did not produce the complete executable set")
+    return artifacts
+
+
 def main(arguments=None):
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--binary", type=Path, required=True)
-    parser.add_argument("--active-binary", type=Path, required=True)
-    parser.add_argument("--helper-binary", type=Path, required=True)
-    parser.add_argument("--lockfile", type=Path, default=Path("Cargo.lock"))
     parser.add_argument("--output-directory", type=Path, required=True)
     options = parser.parse_args(arguments)
 
     try:
+        if os.geteuid() == 0:
+            raise ValueError("run the release build as an ordinary user")
+        if options.output_directory.exists() or options.output_directory.is_symlink():
+            raise FileExistsError(f"output directory already exists: {options.output_directory}")
         metadata = _release_metadata()
 
+        lockfile = ROOT / "Cargo.lock"
+        lock_sha256 = _hash_file(lockfile)
+
         def check_source():
-            if _release_metadata() != metadata:
+            if _release_metadata() != metadata or _hash_file(lockfile) != lock_sha256:
                 raise ValueError("source or toolchain changed during packaging")
 
-        archive, checksum = package_release(
-            options.binary,
-            options.lockfile,
-            options.output_directory,
-            active_binary=options.active_binary,
-            helper_binary=options.helper_binary,
-            check_source=check_source,
-            **metadata,
-        )
+        with tempfile.TemporaryDirectory(prefix="l2solver-release-build-") as directory:
+            artifacts = _build_candidate(Path(directory))
+            check_source()
+            record = {**metadata, "lock_sha256": lock_sha256,
+                      "artifacts": {name: item[1] for name, item in artifacts.items()}}
+            archive, checksum = package_release(
+                artifacts["l2solver"][0], lockfile, options.output_directory,
+                active_binary=artifacts[ACTIVE_NAME][0], helper_binary=artifacts[HELPER_NAME][0],
+                build_record=record, check_source=check_source, **metadata,
+            )
     except (OSError, ValueError, subprocess.CalledProcessError) as error:
         print(f"release package: {error}", file=sys.stderr)
         return 2

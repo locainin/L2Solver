@@ -123,7 +123,7 @@ fn append(
     if initial_syn {
         history.initial_sequence = Some(sequence);
     }
-    history.payload_or_close |= !item.bytes.is_empty() || flags & 5 != 0;
+    history.payload_or_close |= !item.bytes.is_empty() || item.missing_bytes != 0 || flags & 5 != 0;
     episode
         .packets
         .get_mut(direction)

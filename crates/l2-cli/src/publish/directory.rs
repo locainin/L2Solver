@@ -5,8 +5,14 @@ use std::{
     path::{Path, PathBuf},
 };
 
+#[cfg(all(test, target_os = "linux"))]
+#[path = "../../tests/publish/exchange_identity.rs"]
+mod exchange_identity_tests;
 #[path = "directory/inspection.rs"]
 pub mod inspection;
+#[cfg(target_os = "linux")]
+#[path = "directory/staging.rs"]
+mod staging;
 #[cfg(target_os = "linux")]
 #[path = "directory/tree.rs"]
 mod tree;
@@ -14,11 +20,13 @@ mod tree;
 pub use inspection::{DirectoryEntryKind, PreparedDirectoryReplacement};
 #[cfg(target_os = "linux")]
 use inspection::{
-    DirectoryIdentity, destination_entry_exists, identity_from_fd, open_directory_at,
-    stat_identity_at, verify_named_directory,
+    DirectoryIdentity, destination_entry_exists, stat_identity_at, trusted_directory_identity,
+    verify_named_directory,
 };
 #[cfg(target_os = "linux")]
-use tree::{remove_directory_at, sync_tree};
+use staging::StagedDirectory;
+#[cfg(target_os = "linux")]
+use tree::sync_tree;
 
 /// Validate the safe parent of a new directory destination and confirm its name is absent
 ///
@@ -73,7 +81,6 @@ pub fn create_directory_with_precommit<T>(
     #[cfg(target_os = "linux")]
     {
         use rustix::fs::{RenameFlags, renameat_with};
-        use std::{os::fd::AsRawFd, path::PathBuf};
 
         let (parent, name) = super::parent_and_name(path)?;
         let parent_fd = super::open_parent(parent)?;
@@ -81,23 +88,15 @@ pub fn create_directory_with_precommit<T>(
             return Err(super::destination_exists(path).into());
         }
 
-        // A proc-fd path keeps tempfile's helper bound to the parent held above
-        let stable_parent = PathBuf::from(format!("/proc/self/fd/{}", parent_fd.as_raw_fd()));
-        let staging = tempfile::Builder::new()
-            .prefix(".l2solver-")
-            .tempdir_in(stable_parent)?;
-        let staging_name = staging_name(staging.path())?.to_owned();
-        let staging_fd = open_directory_at(&parent_fd, &staging_name, None)?;
-        let staging_identity = identity_from_fd(&staging_fd)?;
-
-        let result = write(staging.path())?;
-        sync_tree(&staging_fd, path)?;
-        verify_named_directory(&parent_fd, &staging_name, staging_identity)?;
+        let mut staging = StagedDirectory::create(&parent_fd, name)?;
+        let result = write(&staging.writer_path())?;
+        sync_tree(&staging.fd, path)?;
         before_commit().map_err(super::DirectoryPublishError::BeforePublication)?;
+        staging.check()?;
 
         renameat_with(
             &parent_fd,
-            &staging_name,
+            &staging.name,
             &parent_fd,
             name,
             RenameFlags::NOREPLACE,
@@ -116,8 +115,7 @@ pub fn create_directory_with_precommit<T>(
             }
         })?;
 
-        // The staging name now belongs to the destination and must not be removed by TempDir
-        let _published_path = staging.keep();
+        staging.retain();
         super::sync_parent_directory(&parent_fd, path)
             .map_err(super::DirectoryPublishError::PublishedDurabilityUncertain)?;
         Ok(result)
@@ -133,29 +131,37 @@ pub fn create_directory_with_precommit<T>(
 ///
 /// The returned value retains the parent and target descriptors plus the target's device and
 /// inode identity. Its descriptor-relative readers let callers validate ownership without
-/// reopening an unchecked pathname. This function validates directory type only.
+/// reopening an unchecked pathname. The target must be owned by root or the effective
+/// user and writable only by its owner.
 ///
 /// # Errors
-/// Returns an error if the destination is missing, is not a real directory, or changes while
-/// its descriptors are being prepared
+/// Returns an error if the destination is missing or unsafe, or changes while its
+/// descriptors are being prepared
 pub fn prepare_directory_replacement(
     path: &Path,
 ) -> Result<PreparedDirectoryReplacement, super::DirectoryPublishError> {
     #[cfg(target_os = "linux")]
     {
-        use rustix::fs::{Mode, OFlags};
+        use rustix::fs::Mode;
 
         let (parent, name) = super::parent_and_name(path)?;
-        let parent_fd = super::open_parent(parent)?;
-        let parent_identity = identity_from_fd(&parent_fd)?;
+        let trust = super::trust_policy::TrustPolicy::load()?;
+        let parent_fd = super::open_parent_with_trust(parent, &trust)?;
+        let parent_mount = super::trust_policy::mount_id(&parent_fd)?;
         let target_fd = rustix::fs::openat(
             &parent_fd,
             name,
-            OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC | OFlags::NOFOLLOW,
+            super::OUTPUT_DIRECTORY_FLAGS,
             Mode::empty(),
         )
         .map_err(io::Error::from)?;
-        let target_identity = identity_from_fd(&target_fd)?;
+        // The sticky bit protects the name in the parent, not writes inside the target
+        let target_identity = trusted_directory_identity(
+            &trust,
+            &target_fd,
+            "existing output directory",
+            Some(parent_mount),
+        )?;
         verify_named_directory(&parent_fd, name, target_identity)?;
 
         Ok(PreparedDirectoryReplacement {
@@ -164,7 +170,7 @@ pub fn prepare_directory_replacement(
             target_fd,
             name: name.to_owned(),
             target_identity,
-            parent_identity,
+            trust,
         })
     }
     #[cfg(not(target_os = "linux"))]
@@ -178,13 +184,16 @@ pub fn prepare_directory_replacement(
 ///
 /// `before_commit` runs after the staged tree and destination identity are checked and
 /// immediately before the atomic exchange. A failure preserves the old destination
+/// The displaced directory is retained and its path is returned with the callback result
 /// Cooperative replacement commits in the same parent cannot overlap; contention or
 /// unsupported advisory locking fails before publication
+/// The exchange and identity checks are separate operations. A writer that ignores the
+/// advisory lock can still replace an entry between them, leaving publication uncertain
 pub fn replace_directory_with_precommit<T>(
     prepared: &PreparedDirectoryReplacement,
     write: impl FnOnce(&Path) -> Result<T, Box<dyn Error>>,
     before_commit: impl FnOnce() -> Result<(), Box<dyn Error>>,
-) -> Result<T, super::DirectoryPublishError> {
+) -> Result<(T, PathBuf), super::DirectoryPublishError> {
     #[cfg(target_os = "linux")]
     {
         replace_directory_linux(prepared, write, before_commit)
@@ -201,49 +210,19 @@ fn replace_directory_linux<T>(
     prepared: &PreparedDirectoryReplacement,
     write: impl FnOnce(&Path) -> Result<T, Box<dyn Error>>,
     before_commit: impl FnOnce() -> Result<(), Box<dyn Error>>,
-) -> Result<T, super::DirectoryPublishError> {
-    use std::{os::fd::AsRawFd, path::PathBuf};
-
+) -> Result<(T, PathBuf), super::DirectoryPublishError> {
     let path = &prepared.destination_path;
-    verify_named_directory(
-        &prepared.parent_fd,
-        &prepared.name,
-        prepared.target_identity,
-    )
-    .map_err(|error| {
-        io::Error::new(
-            io::ErrorKind::InvalidInput,
-            format!("destination changed after it was validated: {error}"),
-        )
-    })?;
-    // The staging path remains anchored to the same parent even if its pathname is renamed
-    let stable_parent = PathBuf::from(format!("/proc/self/fd/{}", prepared.parent_fd.as_raw_fd()));
-    let staging = tempfile::Builder::new()
-        .prefix(".l2solver-")
-        .tempdir_in(stable_parent)?;
-    let staging_name = staging_name(staging.path())?.to_owned();
-    let staging_fd = open_directory_at(&prepared.parent_fd, &staging_name, None)?;
-    let staging_identity = identity_from_fd(&staging_fd)?;
+    prepared.check_target_at(&prepared.parent_fd, &prepared.name)?;
+    let staging = StagedDirectory::create(&prepared.parent_fd, &prepared.name)?;
 
-    let result = write(staging.path())?;
-    sync_tree(&staging_fd, path)?;
-    verify_named_directory(&prepared.parent_fd, &staging_name, staging_identity)?;
-    // Hold an independent parent description until exchange and old-tree cleanup finish
+    let result = write(&staging.writer_path())?;
+    sync_tree(&staging.fd, path)?;
+    // Hold an independent parent description through the final checks and exchange
     let _commit_lock = lock_replacement_parent(&prepared.parent_fd)?;
-    verify_named_directory(
-        &prepared.parent_fd,
-        &prepared.name,
-        prepared.target_identity,
-    )
-    .map_err(|error| {
-        io::Error::new(
-            io::ErrorKind::InvalidInput,
-            format!("destination changed after it was validated: {error}"),
-        )
-    })?;
     before_commit().map_err(super::DirectoryPublishError::BeforePublication)?;
-
-    finish_directory_replacement(prepared, staging, &staging_name, staging_identity, result)
+    staging.check()?;
+    prepared.check_target_at(&prepared.parent_fd, &prepared.name)?;
+    finish_directory_replacement(prepared, staging, result)
 }
 
 #[cfg(target_os = "linux")]
@@ -270,11 +249,9 @@ fn lock_replacement_parent(parent: &rustix::fd::OwnedFd) -> io::Result<rustix::f
 #[cfg(target_os = "linux")]
 fn finish_directory_replacement<T>(
     prepared: &PreparedDirectoryReplacement,
-    staging: tempfile::TempDir,
-    staging_name: &OsStr,
-    staging_identity: DirectoryIdentity,
+    mut staging: StagedDirectory<'_>,
     result: T,
-) -> Result<T, super::DirectoryPublishError> {
+) -> Result<(T, PathBuf), super::DirectoryPublishError> {
     use rustix::fs::{RenameFlags, renameat_with};
 
     let path = &prepared.destination_path;
@@ -288,7 +265,7 @@ fn finish_directory_replacement<T>(
 
     renameat_with(
         &prepared.parent_fd,
-        staging_name,
+        &staging.name,
         &prepared.parent_fd,
         &prepared.name,
         RenameFlags::EXCHANGE,
@@ -302,57 +279,84 @@ fn finish_directory_replacement<T>(
         }
     })?;
 
-    let retained_path = retained_display_path(&prepared.parent_fd, path, staging_name);
-    // From this point TempDir must not clean a name whose inode may have changed
-    let _retained_path = staging.keep();
-    let identities = stat_identity_at(&prepared.parent_fd, staging_name).and_then(|displaced| {
-        stat_identity_at(&prepared.parent_fd, &prepared.name)
-            .map(|published| (displaced, published))
-    });
-    let (displaced_identity, published_identity) = match identities {
-        Ok(identities) => identities,
-        Err(error) => {
-            return Err(
-                super::DirectoryPublishError::PublishedReplacementUncertain {
-                    source: error,
-                    retained_path,
-                },
-            );
-        }
-    };
-    if displaced_identity != prepared.target_identity || published_identity != staging_identity {
-        // RENAME_EXCHANGE has no inode compare-and-swap flag, so preserve unexpected entries
-        return Err(
-            super::DirectoryPublishError::PublishedReplacementUncertain {
-                source: io::Error::other(
-                    "directory names changed during atomic exchange; displaced content was retained",
-                ),
-                retained_path,
+    // The exchange moved the old result into the stage name
+    staging.retain();
+    let retained_path = retained_display_path(&prepared.parent_fd, path, &staging.name);
+    stat_identity_at(&prepared.parent_fd, &staging.name)
+        .and_then(|displaced| {
+            let published = stat_identity_at(&prepared.parent_fd, &prepared.name)?;
+            verify_exchange_identities(
+                (displaced, published),
+                (prepared.target_identity, staging.identity),
+            )
+        })
+        .map_err(
+            |source| super::DirectoryPublishError::PublishedReplacementUncertain {
+                source,
+                retained_path: retained_path.clone(),
             },
-        );
-    }
+        )?;
 
-    // The retained name is checked before cleanup, and cleanup opens every directory without following links
-    if let Err(error) =
-        remove_directory_at(&prepared.parent_fd, staging_name, prepared.target_identity)
-    {
-        return Err(
-            super::DirectoryPublishError::PublishedReplacementUncertain {
-                source: error,
-                retained_path,
+    // Another process can still write through an open handle to the displaced directory
+    super::sync_parent_directory(&prepared.parent_fd, path).map_err(|source| {
+        let kind = source.kind();
+        super::DirectoryPublishError::PublishedDurabilityUncertain(io::Error::new(
+            kind,
+            RetainedAfterSyncFailure {
+                source,
+                path: retained_path.clone(),
             },
-        );
-    }
-
-    super::sync_parent_directory(&prepared.parent_fd, path)
-        .map_err(super::DirectoryPublishError::PublishedDurabilityUncertain)?;
-    Ok(result)
+        ))
+    })?;
+    Ok((result, retained_path))
 }
 
 #[cfg(target_os = "linux")]
-fn staging_name(path: &Path) -> io::Result<&OsStr> {
-    path.file_name()
-        .ok_or_else(|| io::Error::other("temporary directory has no name"))
+fn verify_exchange_identities(
+    actual: (DirectoryIdentity, DirectoryIdentity),
+    expected: (DirectoryIdentity, DirectoryIdentity),
+) -> io::Result<()> {
+    // RENAME_EXCHANGE has no inode compare-and-swap flag, so preserve unexpected entries
+    if actual != expected {
+        return Err(io::Error::other(
+            "directory names changed during atomic exchange; displaced content was retained",
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+#[derive(Debug)]
+struct RetainedAfterSyncFailure {
+    source: io::Error,
+    path: PathBuf,
+}
+
+#[cfg(target_os = "linux")]
+impl std::fmt::Display for RetainedAfterSyncFailure {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        #[expect(
+            clippy::unnecessary_debug_formatting,
+            reason = "Debug preserves non-Unicode path bytes"
+        )]
+        let path = if self.path.to_str().is_some() {
+            self.path.display().to_string().escape_debug().to_string()
+        } else {
+            format!("{:?}", self.path.as_os_str())
+        };
+        write!(
+            formatter,
+            "{}; previous output retained at {path}",
+            self.source
+        )
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl Error for RetainedAfterSyncFailure {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        Some(&self.source)
+    }
 }
 
 #[cfg(target_os = "linux")]
@@ -367,7 +371,7 @@ fn retained_display_path(
         .parent()
         .filter(|parent| !parent.as_os_str().is_empty())
         .unwrap_or_else(|| Path::new("."));
-    let held_parent = PathBuf::from(format!("/proc/self/fd/{}", parent_fd.as_raw_fd()));
+    let held_parent = PathBuf::from(format!("/proc/thread-self/fd/{}", parent_fd.as_raw_fd()));
     std::fs::read_link(held_parent)
         .ok()
         .filter(|parent| parent.exists())

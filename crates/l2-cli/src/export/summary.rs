@@ -284,7 +284,7 @@ pub(super) fn write_reconstruction_omissions(
         let case_label = if coverage.cases == 1 { "Case" } else { "Cases" };
         writeln!(
             output,
-            "{scope} reconstruction omissions: {} TCP records, {} fragments, {} ranges, {} TCP byte positions affected by omitted observations or rejected ranges, {} TCP observations, {} fragment byte positions affected by omitted observations or rejected ranges, {} fragment observations, {} state observations, {} unmeasured ranges (in {} of {} {case_label})",
+            "{scope} reconstruction omissions: {} TCP records, {} fragments, {} ranges, {} TCP byte positions affected by omitted observations, span limits, or rejected ranges, {} TCP observations, {} fragment byte positions affected by omitted observations, span limits, or rejected ranges, {} fragment observations, {} state observations, {} unmeasured ranges (in {} of {} {case_label})",
             coverage.omitted_tcp_records,
             coverage.omitted_fragments,
             coverage.omitted_sequence_ranges,
@@ -743,7 +743,7 @@ fn write_tshark_status(output: &mut File, summary: &Summary<'_>) -> io::Result<(
     if let Some(budget) = summary.tshark.export_budget {
         writeln!(
             output,
-            "TShark temporary-object budget: {} bytes and {} files; the 50 ms polling scan may overshoot before stopping the process group",
+            "TShark temporary-object budget: {} logical bytes and {} files; private tmpfs bounds allocated data, cgroups bound child memory/tasks, and polling bounds observed logical bytes and file counts",
             budget.temporary_bytes, budget.temporary_files
         )?;
         writeln!(

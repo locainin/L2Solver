@@ -62,11 +62,26 @@ fn collect<L: LinkIo>(link: &mut L) -> Result<Survey, Box<dyn Error>> {
             }
             None => {
                 let quality = link.collection_summary();
-                let drops = quality
+                survey.record_acquisition_authority(quality.authority())?;
+                let section_drops = quality
                     .capture_dropped
                     .checked_add(quality.interface_dropped)
-                    .and_then(|total| total.checked_add(quality.packet_block_packets_dropped))
                     .ok_or("source loss counters exceed survey accounting range")?;
+                let statistics_drops = quality
+                    .interface_statistics_interface_dropped
+                    .unwrap_or(0)
+                    .checked_add(quality.interface_statistics_os_dropped.unwrap_or(0))
+                    .ok_or("interface loss statistics exceed survey accounting range")?;
+                // Different declarations may cover the same lost packets
+                let drops = [
+                    section_drops,
+                    quality.packet_block_packets_dropped,
+                    quality.enhanced_packet_packets_dropped.unwrap_or(0),
+                    statistics_drops,
+                ]
+                .into_iter()
+                .max()
+                .unwrap_or(0);
                 survey.record_quality(
                     drops,
                     l2_workbench::capture_collection::reports_incomplete_collection(quality),
@@ -127,11 +142,23 @@ pub fn render(
             )?;
         }
         OutputFormat::Json => {
-            output_limits::write_json(
-                &assessment.report,
-                output,
-                output_limits::MAX_SURVEY_JSON_BYTES,
-            )?;
+            #[derive(serde::Serialize)]
+            struct AssessmentJson<'a> {
+                #[serde(flatten)]
+                report: &'a Report,
+                analysis_complete: bool,
+                acquisition_quality: crate::source_collection::AcquisitionQuality,
+                dropped_count_semantics: &'static str,
+            }
+            let report = AssessmentJson {
+                report: &assessment.report,
+                analysis_complete: assessment.report.collection_complete(),
+                acquisition_quality: crate::source_collection::AcquisitionQuality::unverified(
+                    assessment.report.quality.acquisition_authority,
+                ),
+                dropped_count_semantics: "conservative_lower_bound",
+            };
+            output_limits::write_json(&report, output, output_limits::MAX_SURVEY_JSON_BYTES)?;
         }
         OutputFormat::Html => {
             let mut text = Vec::new();
@@ -176,6 +203,7 @@ fn live(
             limit.duration_is_goal(),
             stats,
         );
+        survey.record_acquisition_authority(l2_capture::CollectionAuthority::SourceDeclared)?;
         // Deadline completion and packet-limit interruption have different meanings
         let incomplete = !quality.supports_complete_collection();
         survey.record_quality(

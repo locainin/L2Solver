@@ -12,6 +12,43 @@ use std::{net::UdpSocket, time::Instant};
 #[path = "receive/isolation.rs"]
 mod isolation;
 
+#[cfg(target_os = "linux")]
+fn assert_unproved_child_is_rejected(mode: &str) -> Result<(), Box<dyn std::error::Error>> {
+    let output = std::process::Command::new("python3")
+        .arg(isolation::namespace_fixture())
+        .arg(format!("--probe-{mode}"))
+        .arg(std::env::current_exe()?)
+        .output()?;
+    assert!(
+        output.status.success()
+            && String::from_utf8_lossy(&output.stdout)
+                .lines()
+                .any(|line| line == "namespace_rejected=true"),
+        "child with {mode} namespace proof was not rejected: {} {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn missing_parent_descriptors_gate() -> Result<(), Box<dyn std::error::Error>> {
+    assert_unproved_child_is_rejected("missing")
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn current_namespace_descriptors_gate() -> Result<(), Box<dyn std::error::Error>> {
+    assert_unproved_child_is_rejected("same")
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn current_pid_namespace_gate() -> Result<(), Box<dyn std::error::Error>> {
+    assert_unproved_child_is_rejected("pid")
+}
+
 #[test]
 fn unknown_interface_rejection() {
     let result = LiveLink::open_with_limits(
@@ -85,5 +122,46 @@ fn expired_deadline_stops_after_loopback_traffic() -> Result<(), Box<dyn std::er
     std::thread::sleep(duration.saturating_sub(opened.elapsed()) + Duration::from_millis(10));
     assert!(link.recv()?.is_none());
     assert_eq!(link.stop_reason(), Some(StopReason::Deadline));
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn interface_rename_revalidation() -> Result<(), Box<dyn std::error::Error>> {
+    fn ip(arguments: &[&str]) -> Result<(), Box<dyn std::error::Error>> {
+        let output = std::process::Command::new("ip").args(arguments).output()?;
+        if !output.status.success() {
+            return Err(format!(
+                "ip {arguments:?}: {}",
+                String::from_utf8_lossy(&output.stderr)
+            )
+            .into());
+        }
+        Ok(())
+    }
+
+    if !isolation::run_in_private_namespace()? {
+        return Ok(());
+    }
+
+    let mut link = LiveLink::open_with_limits("lo", 1, Duration::from_secs(10))?;
+    let original = link.interface_identity()?;
+    assert_eq!(original.ifindex(), 1);
+
+    // The proved private namespace owns this loopback name
+    ip(&["link", "set", "dev", "lo", "down"])?;
+    ip(&["link", "set", "dev", "lo", "name", "l2renamed"])?;
+    assert!(
+        link.interface_identity().is_err(),
+        "identity accepted a stale interface name"
+    );
+    assert!(
+        link.statistics().is_err(),
+        "statistics accepted a stale interface name"
+    );
+    assert!(
+        link.recv().is_err(),
+        "receive accepted a stale interface name"
+    );
     Ok(())
 }

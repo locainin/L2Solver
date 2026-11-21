@@ -270,6 +270,9 @@ impl ToolReceipt {
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct BudgetReceipt {
+    /// Operation limits admitted before the private workspace was created
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resource_limits: Option<crate::job::ResourceLimits>,
     pub timeout_seconds: u32,
     pub combined_input_bytes: u64,
     pub metadata_stdout_bytes_per_phase: usize,
@@ -283,6 +286,38 @@ pub struct BudgetReceipt {
 pub struct InvocationReceipt {
     pub phase: String,
     pub argv: Vec<String>,
+    /// Verified operating-system controls and available kernel counters for this invocation
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub containment: Option<ScopeReceipt>,
+}
+
+/// Limits read back from the child cgroup before its untrusted executable starts
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ScopeReceipt {
+    pub memory_max_bytes: u64,
+    pub memory_high_bytes: u64,
+    pub swap_max_bytes: u64,
+    pub tasks_max: u64,
+    pub effective_memory_max_bytes: u64,
+    pub effective_memory_high_bytes: u64,
+    pub effective_swap_max_bytes: u64,
+    pub effective_tasks_max: u64,
+    pub usage: Option<ScopeUsage>,
+}
+
+/// Optional counters remain absent when a kernel or a removed scope cannot supply them
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ScopeUsage {
+    pub memory_peak_bytes: Option<u64>,
+    pub tasks_peak: Option<u64>,
+    pub memory_events: Option<crate::job::CgroupMemoryEvents>,
+    pub tasks_max_events: Option<u64>,
+    pub observed_after_stop: bool,
+    /// Counters read after the verified scope stopped running but before it was killed
+    #[serde(default)]
+    pub observed_while_frozen: bool,
 }
 
 /// Fixed profile identity and the explicit dissector settings applied

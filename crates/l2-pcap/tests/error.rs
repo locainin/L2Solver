@@ -177,7 +177,7 @@ fn pcapng_packet_errors_preserve_context() {
                 section: 2,
                 index: 9,
             },
-            "PCAPNG packet references unknown interface 9 in section 2",
+            "PCAPNG block references unknown interface 9 in section 2",
         ),
         (
             Error::SimplePacketWithoutInterface,
@@ -197,6 +197,10 @@ fn pcapng_packet_errors_preserve_context() {
         (
             Error::OptionAfterTerminator { block_type: 6 },
             "PCAPNG block 0x00000006 contains an option after opt_endofopt",
+        ),
+        (
+            Error::LossCounterOverflow,
+            "PCAPNG reported packet-loss counter overflow",
         ),
     ]);
 }

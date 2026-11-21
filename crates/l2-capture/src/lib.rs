@@ -2,6 +2,7 @@
 
 #![forbid(unsafe_code)]
 
+mod collection_authority;
 mod error;
 mod evidence_reference;
 mod frame;
@@ -9,6 +10,7 @@ mod link_type;
 mod metadata;
 mod source_identity;
 
+pub use collection_authority::CollectionAuthority;
 pub use error::FrameError;
 pub use evidence_reference::{EvidenceReferenceError, EvidenceSourceId, PacketReference};
 pub use frame::CapturedFrame;

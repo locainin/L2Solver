@@ -118,7 +118,10 @@ fn resolve(
                     || length <= 65_535 - piece.header_length)
         });
     let origins: Vec<_> = pieces.iter().map(|piece| piece.origin.clone()).collect();
-    let coverage = if length == 0 || !budget.reserve(length, RangeKind::Fragment)? {
+    let input_bytes = pieces.iter().map(|piece| piece.bytes.len()).sum();
+    let coverage = if length == 0
+        || !budget.reserve(length, RangeKind::Fragment, input_bytes, pieces.len())?
+    {
         None
     } else {
         let coverage = coverage(pieces, length, budget)?;
@@ -206,6 +209,7 @@ fn recover(
         packet: origins.iter().map(|origin| origin.packet).max()?,
         header: transport.header,
         bytes: transport.payload.to_vec(),
+        missing_bytes: 0,
         origins: clip_origins(origins, transport.payload_offset, transport.payload.len()),
         trailing_bytes: transport.trailing_bytes.to_vec(),
         trailing_origins: clip_origins(

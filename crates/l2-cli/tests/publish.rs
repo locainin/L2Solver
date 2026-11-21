@@ -27,6 +27,10 @@ mod concurrent_refresh;
 mod faults;
 
 #[cfg(target_os = "linux")]
+#[path = "publish/trust.rs"]
+mod trust;
+
+#[cfg(target_os = "linux")]
 mod linux {
     use super::publish::{
         self,

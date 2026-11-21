@@ -17,7 +17,8 @@ runs:
       with:
         shared-key: ${{ inputs.role }}
         workspaces: ${{ inputs.workspace }}
-        cache-targets: "true"
+        # Packaging observes a fresh build; its registry and source caches remain reusable
+        cache-targets: ${{ inputs.role != 'package' }}
         cache-bin: "false"
         # Pull requests restore the trusted default-branch cache without saving one
         save-if: ${{ github.ref == 'refs/heads/dev' }}

@@ -1,13 +1,14 @@
-#![no_main]
+#![cfg_attr(not(test), no_main)]
 
 use l2_workbench::tcp_range::{
-    MAX_OBSERVATIONS, MAX_RANGE_BYTES, Observation, Segment, SpanStatus, TcpRange,
+    MAX_OBSERVATIONS, MAX_RANGE_BYTES, Observation, Segment, Span, SpanStatus, TcpRange,
 };
+#[cfg(not(test))]
 use libfuzzer_sys::fuzz_target;
 
 const MAX_INPUT_SEGMENTS: usize = MAX_OBSERVATIONS + 2;
 
-struct InputSegment<'a> {
+pub(crate) struct InputSegment<'a> {
     packet_index: u32,
     payload_frame_offset: usize,
     sequence: u32,
@@ -64,7 +65,7 @@ fn range_intersection(
     (0, 0, 0)
 }
 
-fn verify_range(
+pub(crate) fn verify_range(
     start_sequence: u32,
     range_length: usize,
     inputs: &[InputSegment<'_>],
@@ -84,7 +85,7 @@ fn verify_range(
     report
 }
 
-fn check_report(
+pub(crate) fn check_report(
     start_sequence: u32,
     range_length: usize,
     inputs: &[InputSegment],
@@ -133,13 +134,32 @@ fn check_report(
     }
 
     assert_eq!(retained_index, report.observations.len());
-    check_totals(&expected, omitted_observations, report);
-    check_spans(range_length, &expected, report);
+    let (detail_end, detail_count) = expected_detail_limit(&expected);
+    check_totals(&expected, omitted_observations, detail_end, report);
+    check_spans(range_length, &expected, detail_end, detail_count, report);
+}
+
+fn expected_detail_limit(expected: &[ExpectedPosition]) -> (usize, usize) {
+    let maximum = l2_workbench::evidence::MAX_NODES / 16;
+    let mut previous = None;
+    let mut count = 0;
+    for (offset, position) in expected.iter().enumerate() {
+        let state = (expected_status(*position), position.omitted);
+        if previous != Some(state) {
+            if count == maximum {
+                return (offset, count);
+            }
+            count += 1;
+            previous = Some(state);
+        }
+    }
+    (expected.len(), count)
 }
 
 fn check_totals(
     expected: &[ExpectedPosition],
     omitted_observations: u64,
+    detail_end: usize,
     report: &l2_workbench::tcp_range::RangeReport,
 ) {
     assert_eq!(report.omitted_observations, omitted_observations);
@@ -147,13 +167,15 @@ fn check_totals(
     let mut missing_bytes = 0;
     let mut conflicting_bytes = 0;
     let mut omitted_bytes = 0;
-    for position in expected {
-        match expected_status(*position) {
-            SpanStatus::Observed => observed_bytes += 1,
-            SpanStatus::Gap => missing_bytes += 1,
-            SpanStatus::Conflict => conflicting_bytes += 1,
+    for (offset, position) in expected.iter().enumerate() {
+        if position.conflict {
+            conflicting_bytes += 1;
+        } else if position.value.is_some() {
+            observed_bytes += 1;
+        } else {
+            missing_bytes += 1;
         }
-        omitted_bytes += usize::from(position.omitted);
+        omitted_bytes += usize::from(position.omitted || offset >= detail_end);
     }
     assert_eq!(
         (
@@ -167,21 +189,33 @@ fn check_totals(
             missing_bytes,
             conflicting_bytes,
             omitted_bytes,
-        )
+        ),
+        "range totals"
     );
     assert_eq!(
         report.has_unique_coverage(),
-        missing_bytes == 0 && conflicting_bytes == 0 && omitted_observations == 0
+        missing_bytes == 0
+            && conflicting_bytes == 0
+            && omitted_observations == 0
+            && omitted_bytes == 0
     );
 }
 
 fn check_spans(
     range_length: usize,
     expected: &[ExpectedPosition],
+    detail_end: usize,
+    detail_count: usize,
     report: &l2_workbench::tcp_range::RangeReport,
 ) {
     // Consecutive spans must form one exact partition of the selected range
     let mut offset = 0;
+    let mut previous = None;
+    assert_eq!(
+        report.spans.len(),
+        detail_count + usize::from(detail_end < range_length)
+    );
+    assert!(report.spans.len() <= l2_workbench::evidence::MAX_NODES / 16 + 1);
     for span in &report.spans {
         assert_eq!(span.offset, offset);
         assert!(span.length > 0);
@@ -190,29 +224,36 @@ fn check_spans(
         let Some(positions) = expected.get(offset..end) else {
             unreachable!("span partitions stay inside the selected range");
         };
-        for position in positions {
-            assert_eq!(span.status, expected_status(*position));
-            assert_eq!(span.omitted_observation, position.omitted);
+        if span.status != SpanStatus::Omitted {
+            assert!(end <= detail_end, "detailed span exceeds limit");
+            assert_ne!(previous, Some((span.status, span.omitted_observation)));
+            check_detailed_positions(span, positions);
         }
         match span.status {
+            SpanStatus::Omitted => {
+                assert_eq!(offset, detail_end);
+                assert_eq!(end, range_length);
+                assert!(span.omitted_observation);
+                assert!(span.bytes.is_none(), "omitted suffix carries bytes");
+            }
             SpanStatus::Observed => {
-                let Some(bytes) = span.bytes.as_ref() else {
-                    unreachable!("observed spans carry their unambiguous values");
-                };
-                let mut expected_bytes = Vec::with_capacity(span.length);
-                for position in positions {
-                    let Some(value) = position.value else {
-                        unreachable!("observed positions have a retained value");
-                    };
-                    expected_bytes.push(value);
-                }
-                assert_eq!(bytes, &expected_bytes);
+                let expected_bytes: Option<Vec<_>> =
+                    positions.iter().map(|position| position.value).collect();
+                assert_eq!(span.bytes, expected_bytes);
             }
             SpanStatus::Conflict | SpanStatus::Gap => assert!(span.bytes.is_none()),
         }
+        previous = Some((span.status, span.omitted_observation));
         offset = end;
     }
     assert_eq!(offset, range_length);
+}
+
+fn check_detailed_positions(span: &Span, positions: &[ExpectedPosition]) {
+    for position in positions {
+        assert_eq!(span.status, expected_status(*position));
+        assert_eq!(span.omitted_observation, position.omitted);
+    }
 }
 
 fn check_observation(
@@ -228,12 +269,13 @@ fn check_observation(
     assert_eq!(observation.range_offset, range_offset);
     assert_eq!(
         observation.payload_frame_offset,
-        input.payload_frame_offset + skip
+        input.payload_frame_offset + skip,
+        "source frame offset"
     );
     let Some(bytes) = input.payload.get(skip..skip + length) else {
         unreachable!("expected clipping stays inside the source payload");
     };
-    assert_eq!(observation.bytes, bytes);
+    assert_eq!(observation.bytes, bytes, "source bytes");
 }
 
 const fn expected_status(position: ExpectedPosition) -> SpanStatus {
@@ -246,7 +288,7 @@ const fn expected_status(position: ExpectedPosition) -> SpanStatus {
     }
 }
 
-fn decode_input(data: &[u8]) -> Option<(u32, usize, Vec<InputSegment<'_>>)> {
+pub(crate) fn decode_input(data: &[u8]) -> Option<(u32, usize, Vec<InputSegment<'_>>)> {
     let header = data.get(..6)?;
     let start_sequence = u32::from_be_bytes(header.get(..4)?.try_into().ok()?);
     let encoded_length = u16::from_be_bytes(header.get(4..6)?.try_into().ok()?);
@@ -293,6 +335,7 @@ fn decode_input(data: &[u8]) -> Option<(u32, usize, Vec<InputSegment<'_>>)> {
     Some((start_sequence, range_length, inputs))
 }
 
+#[cfg(not(test))]
 fn check_quota_path(data: &[u8]) {
     let Some(&first_byte) = data.first() else {
         return;
@@ -339,6 +382,7 @@ fn check_quota_path(data: &[u8]) {
     assert!(report.omitted_observations > 0);
 }
 
+#[cfg(not(test))]
 fuzz_target!(|data: &[u8]| {
     if let Some((start_sequence, range_length, inputs)) = decode_input(data) {
         verify_range(start_sequence, range_length, &inputs);

@@ -45,17 +45,20 @@ pub use recovery_executor::{
     RecoveryOmission, RecoveryResourceSummary, RecoveryResume, RecoveryRunSummary,
     recover_case_with_job,
 };
+#[cfg(test)]
+pub use tshark::Workspace;
 pub use tshark::tshark_cache_identity;
 pub use tshark::{ExportObjectSet, ObjectExportBudget, ObjectExportStatus, ObjectExportUsage};
 
 /// Export `TShark` objects while observing the shared cancellation state
 pub fn export_tshark_objects_with_job(
     capture: &Path,
+    indexed: &full_source::IndexedSource,
     temporary_parent: &Path,
     budget: ObjectExportBudget,
     job: Option<&l2_workbench::job::Job>,
 ) -> Result<ExportObjectSet, Box<dyn Error>> {
-    tshark::export_objects_with_job(capture, temporary_parent, budget, job)
+    tshark::export_objects_with_job(capture, indexed, temporary_parent, budget, job)
 }
 
 use crate::{

@@ -11,6 +11,7 @@ pub enum OptionScope {
     Interface,
     PacketBlock,
     EnhancedPacket,
+    InterfaceStatistics,
 }
 
 #[derive(Clone, Copy)]
@@ -200,7 +201,19 @@ fn option_rule(code: u16, scope: OptionScope) -> Option<OptionRule> {
         OptionScope::Interface => interface_rule(code),
         OptionScope::PacketBlock => packet_block_rule(code),
         OptionScope::EnhancedPacket => enhanced_packet_rule(code),
+        OptionScope::InterfaceStatistics => statistics_rule(code),
     })
+}
+
+const fn statistics_rule(code: u16) -> Option<OptionRule> {
+    match code {
+        2..=8 => Some(OptionRule {
+            exact_length: Some(8),
+            minimum_length: None,
+            repeatable: false,
+        }),
+        _ => None,
+    }
 }
 
 const fn section_rule(code: u16) -> Option<OptionRule> {

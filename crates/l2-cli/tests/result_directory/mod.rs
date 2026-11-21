@@ -7,6 +7,10 @@ use crate::result_directory::{ResultDirectory, ResultIdentity, ResultKind};
 
 type TestResult<T = ()> = Result<T, Box<dyn Error>>;
 
+fn inspect(path: &std::path::Path, kind: ResultKind) -> TestResult<ResultDirectory> {
+    ResultDirectory::inspect(path, kind, &Job::new("inspect"))
+}
+
 mod publication_transition;
 mod publish;
 mod reuse_source;
@@ -14,7 +18,7 @@ mod snapshot;
 mod strict_reuse;
 
 struct Fixture {
-    _root: TempDir,
+    root: TempDir,
     input: PathBuf,
     output: PathBuf,
     identity: ResultIdentity,
@@ -37,12 +41,12 @@ impl Fixture {
             output: root.path().join("capture.export"),
             input,
             identity,
-            _root: root,
+            root,
         })
     }
 
     fn publish(&self, export_status: &str, artifact_bytes: &[u8]) -> TestResult {
-        let destination = ResultDirectory::inspect(&self.output, ResultKind::Extract)?;
+        let destination = inspect(&self.output, ResultKind::Extract)?;
         let job = Job::new("extract");
         destination.publish(&self.identity, &job, |staging| {
             self.write_output(staging, export_status, artifact_bytes)
@@ -102,7 +106,7 @@ impl Fixture {
     }
 
     fn publish_with_gzip_evidence(&self) -> TestResult {
-        let destination = ResultDirectory::inspect(&self.output, ResultKind::Extract)?;
+        let destination = inspect(&self.output, ResultKind::Extract)?;
         destination.publish(&self.identity, &Job::new("extract"), |staging| {
             self.write_gzip_output(staging, "artifact.bin", b"artifact-content", b"summary")
         })?;
@@ -151,7 +155,7 @@ impl Fixture {
 #[test]
 fn newly_published_complete_result_is_reused_with_declared_artifacts() -> TestResult {
     let fixture = Fixture::new()?;
-    let new_result = ResultDirectory::inspect(&fixture.output, ResultKind::Extract)?;
+    let new_result = inspect(&fixture.output, ResultKind::Extract)?;
     assert!(
         new_result
             .reuse(
@@ -165,7 +169,7 @@ fn newly_published_complete_result_is_reused_with_declared_artifacts() -> TestRe
 
     fixture.publish("complete", b"artifact-content")?;
 
-    let existing = ResultDirectory::inspect(&fixture.output, ResultKind::Extract)?;
+    let existing = inspect(&fixture.output, ResultKind::Extract)?;
     let reused = existing
         .reuse(
             &fixture.identity,
@@ -203,7 +207,7 @@ fn partial_result_is_reused_as_partial_not_a_complete_negative() -> TestResult {
     let fixture = Fixture::new()?;
     fixture.publish("partial", b"partial-artifact")?;
 
-    let existing = ResultDirectory::inspect(&fixture.output, ResultKind::Extract)?;
+    let existing = inspect(&fixture.output, ResultKind::Extract)?;
     let reused = existing
         .reuse(
             &fixture.identity,
@@ -223,7 +227,7 @@ fn changed_policy_returns_actionable_conflict() -> TestResult {
     let mut changed = fixture.identity.clone();
     changed.settings = json!({"flows": false, "limit": 7});
 
-    let existing = ResultDirectory::inspect(&fixture.output, ResultKind::Extract)?;
+    let existing = inspect(&fixture.output, ResultKind::Extract)?;
     let Err(error) = existing.reuse(&changed, Some(&fixture.input), false, &Job::new("reuse"))
     else {
         return Err("different policy must not reuse an old result".into());
@@ -239,7 +243,7 @@ fn unrelated_existing_directory_is_rejected_during_inspection() -> TestResult {
     fs::create_dir(&fixture.output)?;
     fs::write(fixture.output.join("user-data.txt"), b"keep")?;
 
-    let Err(error) = ResultDirectory::inspect(&fixture.output, ResultKind::Extract) else {
+    let Err(error) = inspect(&fixture.output, ResultKind::Extract) else {
         return Err("unowned output must be rejected before input processing".into());
     };
     let message = error.to_string();
@@ -256,7 +260,7 @@ fn mutated_artifact_is_not_reused() -> TestResult {
     fixture.publish("complete", b"original-artifact")?;
     fs::write(fixture.output.join("artifact.bin"), b"modified-artifact")?;
 
-    let existing = ResultDirectory::inspect(&fixture.output, ResultKind::Extract)?;
+    let existing = inspect(&fixture.output, ResultKind::Extract)?;
     assert!(
         existing
             .reuse(
@@ -276,7 +280,7 @@ fn extra_entry_invalidates_an_owned_result() -> TestResult {
     fixture.publish("complete", b"artifact-content")?;
     fs::write(fixture.output.join("unexpected.txt"), b"not-owned")?;
 
-    assert!(ResultDirectory::inspect(&fixture.output, ResultKind::Extract).is_err());
+    assert!(inspect(&fixture.output, ResultKind::Extract).is_err());
     Ok(())
 }
 
@@ -286,7 +290,7 @@ fn strict_reuse_detects_same_length_changed_input() -> TestResult {
     fixture.publish("complete", b"artifact-content")?;
     fs::write(&fixture.input, b"changed-input")?;
 
-    let existing = ResultDirectory::inspect(&fixture.output, ResultKind::Extract)?;
+    let existing = inspect(&fixture.output, ResultKind::Extract)?;
     assert!(
         existing
             .reuse(
@@ -343,7 +347,7 @@ fn result_manifest_rejects_malformed_json() -> TestResult {
         b"{\"schema_version\":",
     )?;
 
-    assert!(ResultDirectory::inspect(&fixture.output, ResultKind::Extract).is_err());
+    assert!(inspect(&fixture.output, ResultKind::Extract).is_err());
     Ok(())
 }
 
@@ -496,7 +500,7 @@ fn result_manifest_keeps_large_unrelated_report_fields_streamed() -> TestResult 
     )?;
     write_manifest(&fixture.output, &manifest)?;
 
-    ResultDirectory::inspect(&fixture.output, ResultKind::Extract)?;
+    inspect(&fixture.output, ResultKind::Extract)?;
     Ok(())
 }
 
@@ -507,15 +511,19 @@ fn result_manifest_reader_enforces_the_limit_after_open() -> TestResult {
     fs::write(&path, br#"{"a":1}"#)?;
 
     let mut exact_limit = fs::File::open(&path)?;
-    let parsed: serde_json::Value =
-        crate::result_directory::manifest::deserialize_manifest_value(&mut exact_limit, 7)?;
+    let parsed: serde_json::Value = crate::result_directory::manifest::deserialize_manifest_value(
+        &mut exact_limit,
+        7,
+        &Job::new("read"),
+    )?;
     assert_eq!(json_field(&parsed, "/a")?.as_i64(), Some(1));
 
     let mut lower_limit = fs::File::open(&path)?;
     assert!(
         crate::result_directory::manifest::deserialize_manifest_value::<serde_json::Value>(
             &mut lower_limit,
-            6
+            6,
+            &Job::new("read"),
         )
         .is_err()
     );
@@ -560,7 +568,7 @@ fn write_manifest(directory: &std::path::Path, manifest: &serde_json::Value) -> 
 }
 
 fn assert_manifest_limit_error(path: &std::path::Path, kind: ResultKind) -> TestResult {
-    let Err(error) = ResultDirectory::inspect(path, kind) else {
+    let Err(error) = inspect(path, kind) else {
         return Err("over-limit result manifest should be rejected during parsing".into());
     };
     let message = error.to_string();
@@ -569,7 +577,7 @@ fn assert_manifest_limit_error(path: &std::path::Path, kind: ResultKind) -> Test
 }
 
 fn assert_invalid_snapshot_error(path: &std::path::Path) -> TestResult {
-    let Err(error) = ResultDirectory::inspect(path, ResultKind::Extract) else {
+    let Err(error) = inspect(path, ResultKind::Extract) else {
         return Err("invalid job phase topology should be rejected".into());
     };
     let message = error.to_string();
@@ -590,7 +598,7 @@ fn publish_refine_result(output: &std::path::Path) -> TestResult<ResultIdentity>
         source: SourceIdentity::from_sha256(source_identity_sha256)?,
         settings: json!({"profile": "balanced"}),
     };
-    let destination = ResultDirectory::inspect(output, ResultKind::Refine)?;
+    let destination = inspect(output, ResultKind::Refine)?;
     destination.publish(&identity, &Job::new("refine"), |staging| {
         fs::write(staging.join("summary.txt"), b"refined summary")?;
         fs::write(
@@ -650,7 +658,7 @@ fn failed_refresh_keeps_the_previous_result_intact() -> TestResult {
     fixture.publish("complete", b"original-artifact")?;
     let manifest_before = fs::read(fixture.output.join("manifest.json"))?;
 
-    let destination = ResultDirectory::inspect(&fixture.output, ResultKind::Extract)?;
+    let destination = inspect(&fixture.output, ResultKind::Extract)?;
     let result = destination.publish(&fixture.identity, &Job::new("refresh"), |staging| {
         fs::write(staging.join("partial.txt"), b"unfinished")?;
         Err::<(), _>(io::Error::other("writer failed").into())
@@ -672,7 +680,7 @@ fn cancellation_after_staging_keeps_the_previous_result_intact() -> TestResult {
     let fixture = Fixture::new()?;
     fixture.publish("complete", b"original-artifact")?;
     let manifest_before = fs::read(fixture.output.join("manifest.json"))?;
-    let destination = ResultDirectory::inspect(&fixture.output, ResultKind::Extract)?;
+    let destination = inspect(&fixture.output, ResultKind::Extract)?;
     let job = Job::new("cancelled refresh");
     let writer_job = job.clone();
 
@@ -720,7 +728,7 @@ fn preexchange_failure_keeps_the_previous_result_intact() -> TestResult {
     let fixture = Fixture::new()?;
     fixture.publish("complete", b"original-artifact")?;
     let manifest_before = fs::read(fixture.output.join("manifest.json"))?;
-    let destination = ResultDirectory::inspect(&fixture.output, ResultKind::Extract)?;
+    let destination = inspect(&fixture.output, ResultKind::Extract)?;
     crate::publish::test_hooks::set_before_directory_exchange(|| {
         Err(io::Error::other("injected pre-exchange failure"))
     });
@@ -763,7 +771,7 @@ fn legacy_extract_requires_explicit_refresh() -> TestResult {
     fs::write(fixture.output.join("summary.txt"), b"legacy summary")?;
     fs::write(fixture.output.join("evidence.jsonl"), b"")?;
 
-    let existing = ResultDirectory::inspect(&fixture.output, ResultKind::Extract)?;
+    let existing = inspect(&fixture.output, ResultKind::Extract)?;
     let Err(error) = existing.reuse(
         &fixture.identity,
         Some(&fixture.input),
@@ -781,7 +789,7 @@ fn gzip_evidence_sidecar_is_owned_and_reused_from_its_manifest_name() -> TestRes
     let fixture = Fixture::new()?;
     fixture.publish_with_gzip_evidence()?;
 
-    let existing = ResultDirectory::inspect(&fixture.output, ResultKind::Extract)?;
+    let existing = inspect(&fixture.output, ResultKind::Extract)?;
     let reused = existing
         .reuse(
             &fixture.identity,
@@ -802,7 +810,7 @@ fn legacy_evidence_sidecar_can_be_refreshed_to_the_declared_gzip_sidecar() -> Te
     fs::create_dir(&fixture.output)?;
     fixture.write_output(&fixture.output, "complete", b"legacy-artifact")?;
 
-    let legacy = ResultDirectory::inspect(&fixture.output, ResultKind::Extract)?;
+    let legacy = inspect(&fixture.output, ResultKind::Extract)?;
     assert!(
         legacy
             .reuse(
@@ -823,7 +831,7 @@ fn legacy_evidence_sidecar_can_be_refreshed_to_the_declared_gzip_sidecar() -> Te
         )
     })?;
 
-    let refreshed = ResultDirectory::inspect(&fixture.output, ResultKind::Extract)?;
+    let refreshed = inspect(&fixture.output, ResultKind::Extract)?;
     let reused = refreshed
         .reuse(
             &fixture.identity,
@@ -847,14 +855,14 @@ fn undeclared_legacy_evidence_sidecar_is_rejected_beside_a_gzip_sidecar() -> Tes
         b"undeclared legacy sidecar",
     )?;
 
-    assert!(ResultDirectory::inspect(&fixture.output, ResultKind::Extract).is_err());
+    assert!(inspect(&fixture.output, ResultKind::Extract).is_err());
     Ok(())
 }
 
 #[test]
 fn gzip_evidence_sidecar_cannot_be_declared_as_an_artifact() -> TestResult {
     let fixture = Fixture::new()?;
-    let destination = ResultDirectory::inspect(&fixture.output, ResultKind::Extract)?;
+    let destination = inspect(&fixture.output, ResultKind::Extract)?;
     let result = destination.publish(&fixture.identity, &Job::new("invalid sidecar"), |staging| {
         fixture.write_gzip_output(staging, "evidence.jsonl.gz", b"gzip-sidecar", b"summary")
     });
@@ -870,7 +878,7 @@ fn refine_result_identity_uses_the_ordered_manifest_source_set() -> TestResult {
     let output = root.path().join("refined");
     let identity = publish_refine_result(&output)?;
 
-    let existing = ResultDirectory::inspect(&output, ResultKind::Refine)?;
+    let existing = inspect(&output, ResultKind::Refine)?;
     let reused = existing
         .reuse(&identity, None, true, &Job::new("reuse"))?
         .ok_or("an owned refine result should be available")?;
@@ -891,7 +899,7 @@ fn symlinked_artifact_is_rejected() -> TestResult {
     #[cfg(not(unix))]
     return Ok(());
 
-    assert!(ResultDirectory::inspect(&fixture.output, ResultKind::Extract).is_err());
+    assert!(inspect(&fixture.output, ResultKind::Extract).is_err());
     Ok(())
 }
 
@@ -902,7 +910,7 @@ fn hard_linked_artifact_is_rejected() -> TestResult {
     let outside_link = fixture.output.with_extension("linked");
     fs::hard_link(fixture.output.join("artifact.bin"), &outside_link)?;
 
-    assert!(ResultDirectory::inspect(&fixture.output, ResultKind::Extract).is_err());
+    assert!(inspect(&fixture.output, ResultKind::Extract).is_err());
     Ok(())
 }
 
@@ -910,7 +918,7 @@ fn hard_linked_artifact_is_rejected() -> TestResult {
 fn destination_replacement_after_inspection_is_detected() -> TestResult {
     let fixture = Fixture::new()?;
     fixture.publish("complete", b"artifact-content")?;
-    let existing = ResultDirectory::inspect(&fixture.output, ResultKind::Extract)?;
+    let existing = inspect(&fixture.output, ResultKind::Extract)?;
     let displaced = fixture.output.with_extension("displaced");
     fs::rename(&fixture.output, &displaced)?;
     fs::create_dir(&fixture.output)?;
@@ -928,6 +936,191 @@ fn destination_replacement_after_inspection_is_detected() -> TestResult {
     Ok(())
 }
 
+#[test]
+fn changed_manifest_rejected_on_reuse() -> TestResult {
+    for strict in [false, true] {
+        for replace in [false, true] {
+            let fixture = Fixture::new()?;
+            fixture.publish("complete", b"artifact-content")?;
+            let inspected = inspect(&fixture.output, ResultKind::Extract)?;
+            let manifest = fixture.output.join("manifest.json");
+            if replace {
+                let replacement = fixture.output.join("replacement.json");
+                fs::write(&replacement, b"{}")?;
+                fs::rename(replacement, &manifest)?;
+            } else {
+                fs::write(&manifest, b"{}")?;
+            }
+
+            assert!(
+                inspected
+                    .reuse(
+                        &fixture.identity,
+                        Some(&fixture.input),
+                        strict,
+                        &Job::new("reuse"),
+                    )
+                    .is_err(),
+                "changed manifest accepted: strict={strict}, replace={replace}"
+            );
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn manifest_reads_are_buffered() -> TestResult {
+    use std::io::Read;
+
+    struct TrackedReader<R> {
+        input: R,
+        reads: usize,
+    }
+    impl<R: Read> Read for TrackedReader<R> {
+        fn read(&mut self, bytes: &mut [u8]) -> io::Result<usize> {
+            self.reads += 1;
+            self.input.read(bytes)
+        }
+    }
+
+    let root = tempfile::tempdir()?;
+    let path = root.path().join("manifest.json");
+    fs::write(&path, format!("{{\"padding\":\"{}\"}}", "x".repeat(4096)))?;
+    let mut input = TrackedReader {
+        input: fs::File::open(path)?,
+        reads: 0,
+    };
+    let value: Value = crate::result_directory::manifest::deserialize_manifest_value(
+        &mut input,
+        8192,
+        &Job::new("read"),
+    )?;
+    assert_eq!(
+        value.get("padding").and_then(Value::as_str).map(str::len),
+        Some(4096)
+    );
+    assert!(input.reads < 10, "{} file reads", input.reads);
+    Ok(())
+}
+
+#[test]
+fn manifest_read_cancellation_and_io_error() -> TestResult {
+    use std::io::Read;
+
+    struct StopReader<R> {
+        input: R,
+        job: Job,
+        fail: bool,
+    }
+    impl<R: Read> Read for StopReader<R> {
+        fn read(&mut self, bytes: &mut [u8]) -> io::Result<usize> {
+            let result = if self.fail {
+                Err(io::Error::from_raw_os_error(libc::EIO))
+            } else {
+                self.input.read(bytes)
+            };
+            self.job.request_cancel();
+            result
+        }
+    }
+
+    let root = tempfile::tempdir()?;
+    let path = root.path().join("manifest.json");
+    fs::write(&path, format!("{{\"padding\":\"{}\"}}", "x".repeat(32_768)))?;
+    for fail in [false, true] {
+        let job = Job::new("manifest read");
+        let mut input = StopReader {
+            input: fs::File::open(&path)?,
+            job: job.clone(),
+            fail,
+        };
+        let error = crate::result_directory::manifest::deserialize_manifest_value::<Value>(
+            &mut input, 65_536, &job,
+        )
+        .err()
+        .ok_or("interrupted manifest read succeeded")?;
+        if fail {
+            assert_eq!(
+                error
+                    .downcast_ref::<io::Error>()
+                    .and_then(io::Error::raw_os_error),
+                Some(libc::EIO),
+                "{error}"
+            );
+        } else {
+            assert_eq!(
+                error.downcast_ref::<l2_workbench::job::JobError>(),
+                Some(&l2_workbench::job::JobError::Cancelled),
+            );
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn cancelled_manifest_inspection_is_typed() -> TestResult {
+    let fixture = Fixture::new()?;
+    fixture.publish("complete", b"artifact-content")?;
+    let job = Job::new("cancelled inspection");
+    job.request_cancel();
+    let error = ResultDirectory::inspect(&fixture.output, ResultKind::Extract, &job)
+        .err()
+        .ok_or("cancelled inspection succeeded")?;
+    assert_eq!(
+        error.downcast_ref::<l2_workbench::job::JobError>(),
+        Some(&l2_workbench::job::JobError::Cancelled),
+    );
+    Ok(())
+}
+
+#[test]
+fn manifest_inspection_preserves_memory_error() -> TestResult {
+    use l2_workbench::job::{MemoryBudget, MemoryError};
+
+    let fixture = Fixture::new()?;
+    fixture.publish("complete", b"artifact-content")?;
+    let memory = MemoryBudget::new(0);
+    let job = Job::with_memory_budget("inspect", &memory);
+
+    let error = ResultDirectory::inspect(&fixture.output, ResultKind::Extract, &job)
+        .err()
+        .ok_or("manifest inspection exceeded its budget")?;
+    assert!(
+        matches!(
+            error.downcast_ref::<MemoryError>(),
+            Some(MemoryError::Limit { .. })
+        ),
+        "memory error was wrapped: {error}"
+    );
+    assert_eq!(memory.snapshot()?.used_bytes, 0);
+    Ok(())
+}
+
+#[test]
+fn manifest_read_obeys_memory_budget() -> TestResult {
+    use l2_workbench::job::{MemoryBudget, MemoryError};
+    use std::io::Seek;
+
+    let root = tempfile::tempdir()?;
+    let path = root.path().join("manifest.json");
+    fs::write(&path, br#"{"a":1}"#)?;
+    let memory = MemoryBudget::new(0);
+    let job = Job::with_memory_budget("manifest", &memory);
+    let mut input = fs::File::open(path)?;
+    let error = crate::result_directory::manifest::deserialize_manifest_value::<Value>(
+        &mut input, 64, &job,
+    )
+    .err()
+    .ok_or("manifest read exceeded its budget")?;
+    assert!(matches!(
+        crate::memory_error::find(error.as_ref()),
+        Some(MemoryError::Limit { .. })
+    ));
+    assert_eq!(input.stream_position()?, 0);
+    assert_eq!(memory.snapshot()?.used_bytes, 0);
+    Ok(())
+}
+
 #[cfg(unix)]
 #[test]
 fn missing_destination_through_symlinked_parent_is_rejected() -> TestResult {
@@ -937,9 +1130,7 @@ fn missing_destination_through_symlinked_parent_is_rejected() -> TestResult {
     let linked_parent = root.path().join("linked");
     std::os::unix::fs::symlink(&real_parent, &linked_parent)?;
 
-    assert!(
-        ResultDirectory::inspect(&linked_parent.join("new-output"), ResultKind::Extract).is_err()
-    );
+    assert!(inspect(&linked_parent.join("new-output"), ResultKind::Extract).is_err());
     assert_eq!(fs::read_dir(real_parent)?.count(), 0);
     Ok(())
 }

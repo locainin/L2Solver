@@ -263,6 +263,21 @@ impl Survey {
         Ok(())
     }
 
+    /// Retain where acquisition conditions came from
+    ///
+    /// # Errors
+    /// Returns an error when collection already failed
+    pub const fn record_acquisition_authority(
+        &mut self,
+        authority: l2_capture::CollectionAuthority,
+    ) -> Result<(), AuditError> {
+        if self.terminated {
+            return Err(AuditError::Terminated);
+        }
+        self.quality.acquisition_authority = authority;
+        Ok(())
+    }
+
     /// Evaluate explicit policy over the collected observations
     /// # Errors
     /// Rejects invalid policy or a collection that failed earlier
@@ -296,7 +311,7 @@ impl Survey {
     }
 
     fn finish_with_profile_and_optional_source_labels(
-        self,
+        mut self,
         policy: &Policy,
         profile: AssessmentProfile,
         labels: Option<&SourceLabelMap>,
@@ -338,6 +353,10 @@ impl Survey {
         } else {
             assess_with_input(&interfaces, policy, &self.quality, &planner_input)?
         };
+        // Collection and assessment share one set of completion limits
+        for resource in assessment.resource_limits.reached() {
+            self.resource_limits.mark(*resource);
+        }
         Ok(Report {
             schema_version: 8,
             tool_version: env!("CARGO_PKG_VERSION").into(),

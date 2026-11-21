@@ -79,13 +79,18 @@ fn write_overview(
     writeln!(output, "Role         {role}")?;
     writeln!(
         output,
-        "Capture      {} ({} frames)",
+        "Analysis     {} ({} frames)",
         if report.collection_complete() {
             "COMPLETE"
         } else {
             "INCOMPLETE"
         },
         report.quality.frames
+    )?;
+    writeln!(
+        output,
+        "Acquisition  UNVERIFIED (authority={})",
+        report.quality.acquisition_authority.as_str()
     )?;
     writeln!(
         output,
@@ -301,7 +306,7 @@ fn write_network_model(report: &Report, output: &mut impl Write) -> io::Result<(
 }
 
 fn write_quality(report: &Report, output: &mut impl Write) -> io::Result<()> {
-    writeln!(output, "\nCapture quality")?;
+    writeln!(output, "\nAnalysis quality")?;
     writeln!(
         output,
         "  assessment_profile={}",
@@ -311,7 +316,7 @@ fn write_quality(report: &Report, output: &mut impl Write) -> io::Result<()> {
         output,
         "  {}",
         if report.collection_complete() {
-            "PASS — no parser, truncation, loss, or inventory-limit issue reported"
+            "COMPLETE — no parser, truncation, reported loss, or inventory-limit issue observed"
         } else {
             "INCOMPLETE — review the counters and reached resource limits"
         }
@@ -326,6 +331,7 @@ fn write_quality(report: &Report, output: &mut impl Write) -> io::Result<()> {
         report.quality.dropped,
         report.quality.incomplete
     )?;
+    writeln!(output, "  dropped count is a conservative lower bound")?;
     writeln!(
         output,
         "  unsupported_stp={} unsupported_fingerprints={} unsupported_link_types={}",

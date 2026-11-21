@@ -31,6 +31,8 @@ pub enum SpanStatus {
     Conflict,
     /// No retained value; omitted observations may still cover this position
     Gap,
+    /// Detailed coverage was omitted after the span limit
+    Omitted,
 }
 
 /// Adjacent positions with the same value status and omission coverage
@@ -39,6 +41,7 @@ pub struct Span {
     pub offset: usize,
     pub length: usize,
     pub status: SpanStatus,
+    /// Source observations or detailed span coverage are unavailable here
     pub omitted_observation: bool,
     /// Only unambiguous retained values are rendered as bytes
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -52,7 +55,9 @@ pub struct RangeReport {
     pub observed_bytes: usize,
     pub missing_bytes: usize,
     pub conflicting_bytes: usize,
+    /// Positions affected by unavailable observations or omitted span details
     pub omitted_bytes: usize,
+    /// Whole or partial observations unavailable because of truncation or limits
     pub omitted_observations: u64,
     pub observations: Vec<Observation>,
     pub spans: Vec<Span>,
@@ -64,6 +69,9 @@ impl RangeReport {
     /// This does not establish TCP connection identity, validity, or endpoint acceptance
     #[must_use]
     pub const fn has_unique_coverage(&self) -> bool {
-        self.missing_bytes == 0 && self.conflicting_bytes == 0 && self.omitted_observations == 0
+        self.missing_bytes == 0
+            && self.conflicting_bytes == 0
+            && self.omitted_observations == 0
+            && self.omitted_bytes == 0
     }
 }

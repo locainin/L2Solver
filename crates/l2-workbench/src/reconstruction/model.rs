@@ -91,7 +91,10 @@ pub struct Coverage {
 impl Coverage {
     #[must_use]
     pub const fn unique(&self) -> bool {
-        self.missing_bytes == 0 && self.conflicting_bytes == 0 && self.omitted_observations == 0
+        self.missing_bytes == 0
+            && self.conflicting_bytes == 0
+            && self.omitted_observations == 0
+            && self.omitted_bytes == 0
     }
     pub(crate) fn from_range(range: RangeReport) -> Self {
         Self {
@@ -194,6 +197,12 @@ pub struct UdpMessage {
 
 #[derive(Debug, Serialize)]
 pub struct ReconstructionReport {
+    /// Retain admitted range allocations while this report is in use
+    #[serde(skip)]
+    pub(crate) _memory: Option<crate::job::MemoryLease>,
+    /// Packet witnesses whose TCP ports were captured without a complete header
+    #[serde(skip)]
+    pub(crate) incomplete_header_records: Vec<super::IncompleteHeader>,
     /// Number of records supplied to the reconstructor
     pub frames: u64,
     /// Exact budgets used to retain these records and ranges
@@ -202,7 +211,9 @@ pub struct ReconstructionReport {
     pub input_selection: Option<InputSelection>,
     pub omitted_frames: u64,
     pub unsupported_frames: u64,
-    /// All configured budgets fit; this does not establish a complete source capture
+    /// Incomplete TCP headers whose captured ports identify a tuple but not a sequence
+    pub incomplete_tcp_headers: usize,
+    /// Retained observations and configured budgets fit; the source capture can still be incomplete
     pub complete: bool,
     pub omitted_fragments: usize,
     /// TCP transport records skipped after the retained episode ceiling
@@ -210,11 +221,11 @@ pub struct ReconstructionReport {
     pub omitted_ranges: usize,
     /// Ranges whose extents were rejected before byte or observation coverage was built
     pub unmeasured_omitted_ranges: usize,
-    /// TCP byte positions affected by omitted observations or a rejected range reservation
+    /// TCP byte positions affected by unavailable observations, span limits, or rejected ranges
     pub omitted_tcp_bytes: u64,
-    /// TCP observations omitted by per-direction coverage limits
+    /// TCP observations partially or wholly unavailable from truncation or coverage limits
     pub omitted_tcp_observations: u64,
-    /// Fragment byte positions affected by omitted observations or a rejected range reservation
+    /// Fragment positions affected by omitted observations, span limits, or rejected ranges
     pub omitted_fragment_bytes: u64,
     /// Fragment observations omitted by per-datagram coverage limits
     pub omitted_fragment_observations: u64,

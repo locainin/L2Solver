@@ -1,4 +1,4 @@
-use l2_audit::{FingerprintStatus, Policy, Protocol, ResourceLimit, Survey};
+use l2_audit::{FingerprintStatus, Policy, Protocol, ResourceLimit, Survey, SurveyLimits};
 use l2_capture::{CaptureMetadata, CapturedFrame, InterfaceId};
 
 const SOURCE: [u8; 6] = [0x02, 0, 0, 0, 0, 1];
@@ -82,6 +82,31 @@ fn keeps_new_protocol_evidence() -> Result<(), Box<dyn std::error::Error>> {
         Some(2)
     );
     assert_eq!(report.evidence_refs.len(), 2);
+    Ok(())
+}
+
+#[test]
+fn limited_identity_evidence() -> Result<(), Box<dyn std::error::Error>> {
+    // A full forensic budget must not hide evidence for a new identity
+    let limits = SurveyLimits::default().with_forensic_records(1)?;
+    let mut survey = Survey::with_limits(limits);
+    survey.observe(&arp(10)?)?;
+    survey.observe(&arp(11)?)?;
+
+    let report = survey.finish(&Policy::default())?;
+    let interface = report.interfaces.first().ok_or("missing interface")?;
+    assert_eq!(interface.identities.len(), 2);
+    assert!(
+        report
+            .resource_limits
+            .is_reached(ResourceLimit::ForensicRecords)
+    );
+    let sequences: Vec<_> = report
+        .evidence_refs
+        .iter()
+        .map(|item| item.sequence)
+        .collect();
+    assert_eq!(sequences, [1, 2]);
     Ok(())
 }
 

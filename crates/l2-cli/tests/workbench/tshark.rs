@@ -3,11 +3,15 @@ mod capture_paths;
 use crate::capture_fixtures as captures;
 
 use super::{
-    TsharkOptions, decode_packets, prepare_capture_from_at,
+    decode::decode_packets,
+    preparation::{CapturePreparation, prepare_capture_from_at},
     process::{self, ProcessError},
-    run, snapshot_with_clock, verify_source_unchanged,
+    profile::{create_profile, verify_effective_preferences},
+    run,
+    secure_files::Workspace,
+    snapshot::{HashControl, snapshot_with_clock, verify_source_unchanged},
 };
-use crate::arguments::{WorkbenchCommand, parse};
+use crate::arguments::{TsharkOptions, WorkbenchCommand, parse};
 use sha2::{Digest, Sha256};
 use std::{
     error::Error,
@@ -18,6 +22,11 @@ use std::{
     time::{Duration, Instant},
 };
 
+#[path = "tshark/decode.rs"]
+mod decode;
+#[cfg(target_os = "linux")]
+#[path = "tshark/integrity.rs"]
+mod integrity;
 #[cfg(unix)]
 #[path = "tshark/receipt.rs"]
 mod receipt;
@@ -53,7 +62,7 @@ fn tshark_json_identity_reassembled_fields() -> Result<(), Box<dyn Error>> {
         {"_source":{"layers":{"frame":{"frame.number":"2"},"ip":{"ip.src":"192.0.2.1"}}}}
     ]"#;
 
-    let packets = decode_packets(packet_json)?;
+    let packets = decode_packets(packet_json, packet_json.len(), 16 * 1024 * 1024)?;
 
     assert_eq!(packets.len(), 2);
     let first_packet = packets.first().ok_or("first decoded packet missing")?;
@@ -84,12 +93,14 @@ fn tshark_json_ambiguous_packet_identity() {
         br#"[{"_source":{"layers":{"frame":{}}}]"#,
         br#"[{"_source":{"layers":{"frame":{"frame.number":"2"}}}},{"_source":{"layers":{"frame":{"frame.number":"1"}}}}]"#,
     ] {
-        assert!(decode_packets(bytes).is_err(), "accepted {}", String::from_utf8_lossy(bytes));
+        assert!(decode_packets(bytes, bytes.len(), 16 * 1024 * 1024).is_err(), "accepted {}", String::from_utf8_lossy(bytes));
     }
 }
 
 #[test]
 fn isolated_profile_missing_changed_settings() -> Result<(), Box<dyn Error>> {
+    let temporary = tempfile::tempdir()?;
+    let profile = create_profile(temporary.path(), None)?;
     let preferences = concat!(
         "# L2Solver isolated offline profile\n",
         "gui.packet_list_show_related: FALSE\n",
@@ -101,7 +112,7 @@ fn isolated_profile_missing_changed_settings() -> Result<(), Box<dyn Error>> {
         "tls.desegment_ssl_records: TRUE\n",
         "tls.desegment_ssl_application_data: TRUE\n",
     );
-    let verified = super::verify_effective_preferences(preferences.as_bytes())?;
+    let verified = verify_effective_preferences(preferences.as_bytes(), &profile)?;
 
     assert_eq!(
         verified
@@ -114,8 +125,9 @@ fn isolated_profile_missing_changed_settings() -> Result<(), Box<dyn Error>> {
         Some("TRUE")
     );
     assert!(
-        super::verify_effective_preferences(
-            b"#gui.packet_list_show_related: TRUE\nip.defragment: TRUE\n"
+        verify_effective_preferences(
+            b"#gui.packet_list_show_related: TRUE\nip.defragment: TRUE\n",
+            &profile
         )
         .is_err()
     );
@@ -148,7 +160,7 @@ fn tshark_budgets_old_arbitrary_ceiling() -> Result<(), Box<dyn Error>> {
         return Err("TShark subcommand did not produce TShark options".into());
     };
     assert_eq!(options.timeout_seconds, 5000);
-    assert_eq!(options.max_input_mib, 20_000);
+    assert_eq!(options.max_input_mib, Some(20_000));
     assert_eq!(options.max_metadata_mib, 20_000);
     assert_eq!(options.max_output_mib, 20_000);
     assert_eq!(options.max_diagnostics_mib, 20_000);
@@ -165,7 +177,19 @@ fn changed_source_rejected_tool_execution() -> Result<(), Box<dyn Error>> {
 
     fs::write(&source_path, b"second snapshot")?;
 
-    assert!(verify_source_unchanged(&mut source, &source_path, &digest, 14).is_err());
+    assert!(
+        verify_source_unchanged(
+            &mut source,
+            &source_path,
+            &digest,
+            14,
+            HashControl {
+                deadline: Instant::now() + Duration::from_secs(10),
+                job: None
+            },
+        )
+        .is_err()
+    );
     Ok(())
 }
 
@@ -180,7 +204,7 @@ fn absent_tshark_error_without_dependency() -> Result<(), Box<dyn Error>> {
         tls_keylog: None,
         output: None,
         timeout_seconds: 1,
-        max_input_mib: 1,
+        max_input_mib: Some(1),
         max_metadata_mib: 1,
         max_output_mib: 1,
         max_diagnostics_mib: 1,
@@ -195,13 +219,14 @@ fn tshark_capture_snapshot_uses_preparation_deadline() -> Result<(), Box<dyn Err
     let directory = tempfile::tempdir()?;
     let capture = directory.path().join("input.pcap");
     fs::write(&capture, b"offline bytes")?;
-    let preparation = super::CapturePreparation {
+    let preparation = CapturePreparation {
         capture,
         executable: std::env::current_exe()?,
         keylog: None,
         timeout: Duration::from_secs(1),
         timeout_seconds: 1,
-        input_maximum: u64::MAX,
+        input_maximum: Some(u64::MAX),
+        object_budget: None,
         metadata_maximum: 1024,
         output_maximum: 1024,
         diagnostic_maximum: 1024,
@@ -211,7 +236,7 @@ fn tshark_capture_snapshot_uses_preparation_deadline() -> Result<(), Box<dyn Err
         .ok_or("test clock could not represent a prior instant")?;
 
     assert_error_contains(
-        prepare_capture_from_at(preparation, None, started_at),
+        prepare_capture_from_at(&preparation, None, started_at),
         "time budget",
     )?;
     Ok(())
@@ -222,8 +247,7 @@ fn tshark_capture_snapshot_stops_when_copy_deadline_expires() -> Result<(), Box<
     let directory = tempfile::tempdir()?;
     let capture = directory.path().join("input.pcap");
     fs::write(&capture, b"offline bytes")?;
-    let snapshot_directory = directory.path().join("snapshot");
-    fs::create_dir(&snapshot_directory)?;
+    let snapshot_directory = Workspace::new(Some(directory.path()))?;
     let started_at = Instant::now();
     let deadline = started_at
         .checked_add(Duration::from_secs(1))
@@ -251,7 +275,7 @@ fn tshark_capture_snapshot_stops_when_copy_deadline_expires() -> Result<(), Box<
     )?;
     assert_eq!(clock_checks, 4);
     assert_eq!(
-        fs::metadata(snapshot_directory.join("capture.bin"))?.len(),
+        fs::metadata(snapshot_directory.path().join("capture.bin"))?.len(),
         0
     );
     Ok(())
@@ -308,7 +332,7 @@ fn tshark_process_oversized_diagnostics_truncating() {
 }
 
 #[test]
-fn tshark_enrichment_when_tshark_available() -> Result<(), Box<dyn Error>> {
+fn installed_tshark_policy() -> Result<(), Box<dyn Error>> {
     let fixtures = capture_paths::CapturePaths::new()?;
     if Command::new("tshark").arg("--version").output().is_err() {
         return Ok(());
@@ -323,14 +347,24 @@ fn tshark_enrichment_when_tshark_available() -> Result<(), Box<dyn Error>> {
         tls_keylog: Some(keylog.clone()),
         output: None,
         timeout_seconds: 30,
-        max_input_mib: 1,
+        max_input_mib: Some(1),
         max_metadata_mib: 1,
         max_output_mib: 16,
         max_diagnostics_mib: 1,
     };
     let mut output = Vec::new();
 
-    run(&options, &mut output)?;
+    if let Err(error) = run(&options, &mut output) {
+        // Unqualified installed releases must fail without publishing a receipt
+        assert!(
+            error
+                .to_string()
+                .contains("supported patched upstream release"),
+            "{error}"
+        );
+        assert_eq!(output.len(), 0);
+        return Ok(());
+    }
 
     let report: serde_json::Value = serde_json::from_slice(&output)?;
     serde_json::from_value::<l2_workbench::tshark::TsharkReport>(report.clone())?.validate()?;

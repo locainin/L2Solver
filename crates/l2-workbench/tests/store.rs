@@ -22,6 +22,9 @@ mod cache;
 #[path = "store/integrity.rs"]
 mod integrity;
 
+#[path = "store/retained.rs"]
+mod retained;
+
 #[path = "store/link_types.rs"]
 mod link_types;
 
@@ -42,6 +45,12 @@ mod scopes;
 
 #[path = "store/selection_budget.rs"]
 mod selection_budget;
+
+#[path = "store/sparse.rs"]
+mod sparse;
+
+#[path = "store/truncated.rs"]
+mod truncated;
 
 #[path = "store/support.rs"]
 mod support;

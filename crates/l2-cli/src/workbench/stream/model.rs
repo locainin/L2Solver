@@ -46,4 +46,5 @@ pub struct Receipt {
     pub manifest_sha256: String,
     pub raw_collection_complete: bool,
     pub analysis_complete: bool,
+    pub acquisition_quality: crate::source_collection::AcquisitionQuality,
 }

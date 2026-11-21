@@ -1,12 +1,7 @@
-use std::{
-    ffi::{OsStr, OsString},
-    io,
-    path::Path,
-};
+use std::{io, path::Path};
 
 use super::inspection::{
-    DirectoryIdentity, identity_from_fd, identity_from_stat, open_directory_at,
-    verify_named_directory, verify_opened_identity, visit_directory_entries,
+    identity_from_stat, open_directory_at, verify_opened_identity, visit_directory_entries,
 };
 
 #[cfg(target_os = "linux")]
@@ -58,67 +53,4 @@ pub(super) fn sync_tree(directory: &rustix::fd::OwnedFd, display_path: &Path) ->
             error
         }
     })
-}
-
-#[cfg(target_os = "linux")]
-pub(super) fn remove_directory_at(
-    parent: &rustix::fd::OwnedFd,
-    name: &OsStr,
-    expected: DirectoryIdentity,
-) -> io::Result<()> {
-    use rustix::fs::{AtFlags, FileType};
-
-    let directory = open_directory_at(parent, name, Some(expected))?;
-    remove_directory_contents(&directory)?;
-    verify_named_directory(parent, name, expected)?;
-    let current = rustix::fs::statat(parent, name, AtFlags::SYMLINK_NOFOLLOW)?;
-    if !FileType::from_raw_mode(current.st_mode).is_dir()
-        || identity_from_stat(&current) != expected
-    {
-        return Err(io::Error::other(
-            "retained directory changed type during cleanup",
-        ));
-    }
-    rustix::fs::unlinkat(parent, name, AtFlags::REMOVEDIR).map_err(Into::into)
-}
-
-#[cfg(target_os = "linux")]
-fn remove_directory_contents(directory: &rustix::fd::OwnedFd) -> io::Result<()> {
-    use rustix::fs::{AtFlags, FileType};
-
-    let names = directory_names(directory)?;
-    for name in names {
-        let stat = rustix::fs::statat(directory, &name, AtFlags::SYMLINK_NOFOLLOW)?;
-        if FileType::from_raw_mode(stat.st_mode).is_dir() {
-            let child = open_directory_at(directory, &name, Some(identity_from_stat(&stat)))?;
-            remove_directory_contents(&child)?;
-            let current = rustix::fs::statat(directory, &name, AtFlags::SYMLINK_NOFOLLOW)?;
-            if identity_from_stat(&current) != identity_from_fd(&child)? {
-                return Err(io::Error::other(
-                    "directory entry changed during descriptor-relative cleanup",
-                ));
-            }
-            rustix::fs::unlinkat(directory, &name, AtFlags::REMOVEDIR)?;
-        } else {
-            // unlinkat removes a symbolic link itself and never opens its target
-            let current = rustix::fs::statat(directory, &name, AtFlags::SYMLINK_NOFOLLOW)?;
-            if identity_from_stat(&current) != identity_from_stat(&stat) {
-                return Err(io::Error::other(
-                    "entry changed during descriptor-relative cleanup",
-                ));
-            }
-            rustix::fs::unlinkat(directory, &name, AtFlags::empty())?;
-        }
-    }
-    rustix::fs::fsync(directory).map_err(Into::into)
-}
-
-#[cfg(target_os = "linux")]
-fn directory_names(directory: &rustix::fd::OwnedFd) -> io::Result<Vec<OsString>> {
-    let mut names = Vec::new();
-    visit_directory_entries(directory, &mut |name| {
-        names.push(name.to_owned());
-        Ok(())
-    })?;
-    Ok(names)
 }

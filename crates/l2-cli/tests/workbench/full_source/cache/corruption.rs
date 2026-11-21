@@ -1,7 +1,7 @@
 use super::{AcquisitionOptions, LLDP_CAPTURE, acquire_indexed_source, open_test_cache};
 use l2_workbench::job::{
     CacheFallbackKind, CacheStage, Counter, Job, MemoryBudget, MemoryClass, Phase, PhaseState,
-    cache::{Cache, CacheError},
+    cache::{Cache, CacheError, SourceFingerprint},
 };
 use rusqlite::{Connection, params};
 use serde_json::Value;
@@ -302,7 +302,7 @@ fn invalid_index_receipt_found_after_ingestion_keeps_the_staged_index() -> TestR
 fn source_change_is_not_treated_as_an_optional_cache_failure() -> TestResult {
     let directory = tempfile::tempdir()?;
     let (cache, capture, _) = seeded(directory.path())?;
-    let fingerprint = Cache::fingerprint_source(&capture)?;
+    let fingerprint = SourceFingerprint::fast(&capture)?;
     fs::write(&capture, super::STP_CAPTURE)?;
     let result = acquire_indexed_source(
         &capture,

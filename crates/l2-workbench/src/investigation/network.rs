@@ -17,10 +17,11 @@ use l2_core::FrameField;
 use l2_discovery::{
     ip_header_from_payload,
     link::{CookedVersion, NetworkEnvelope, decode_network_frame},
+    tcp_prefix_from_payload, truncated_tcp_tuple_from_payload,
 };
 use serde::Serialize;
 use serde_json::{Value, json};
-use std::error::Error;
+use std::{collections::BTreeMap, error::Error};
 
 pub(super) struct SessionNodes<'a> {
     pub session_index: usize,
@@ -173,6 +174,34 @@ fn network_details(
         );
         details.insert("protocol".to_owned(), json!(ip.protocol));
         details.insert("fragmented".to_owned(), json!(ip.fragmented));
+    }
+    if let Some(FrameField::EtherType(protocol)) = envelope.field()
+        && let Some((_, transport, missing)) = tcp_prefix_from_payload(protocol, envelope.payload())
+        && let l2_discovery::TransportHeader::Tcp {
+            sequence, flags, ..
+        } = transport.header
+    {
+        details.insert(
+            "truncated_tcp_payload".to_owned(),
+            json!({
+                "captured_bytes": transport.payload.len(),
+                "missing_bytes": missing,
+                "missing_sequence": sequence.wrapping_add(u32::from(flags & 2 != 0))
+                    .wrapping_add(u32::try_from(transport.payload.len())?),
+            }),
+        );
+    } else if let Some(FrameField::EtherType(protocol)) = envelope.field()
+        && let Some((header, ports)) =
+            truncated_tcp_tuple_from_payload(protocol, envelope.payload())
+    {
+        details.insert(
+            "truncated_tcp_header".to_owned(),
+            json!({
+                "ports": ports,
+                "captured_transport_bytes": envelope.payload().len() - header.header_len,
+                "missing_ip_bytes": header.total_len - envelope.payload().len(),
+            }),
+        );
     }
     Ok(())
 }
@@ -385,6 +414,13 @@ fn tcp_sessions<'a>(
     datagrams: &[u64],
 ) -> Result<Vec<SessionNodes<'a>>, Box<dyn Error>> {
     let mut session_nodes = Vec::with_capacity(report.sessions.len());
+    let mut incomplete = BTreeMap::<_, Vec<u32>>::new();
+    for header in &report.incomplete_header_records {
+        incomplete
+            .entry((&header.scope, &header.endpoints))
+            .or_default()
+            .push(header.packet);
+    }
     for (session_index, session) in report.sessions.iter().enumerate() {
         let control_episode = u32::try_from(session_index)?;
         let id = context.case.add_node("tcp_episode", None, Vec::new(), json!({
@@ -411,6 +447,9 @@ fn tcp_sessions<'a>(
             id,
             EvidenceStatus::Hypothesis,
         )?;
+        if let Some(packets) = incomplete.get(&(&session.scope, &session.endpoints)) {
+            context.packet_edges(packets.iter().copied(), id, EvidenceStatus::Unresolved)?;
+        }
         for candidate in session
             .directions
             .iter()

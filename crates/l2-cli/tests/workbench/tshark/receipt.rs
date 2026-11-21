@@ -1,5 +1,10 @@
-use super::super::{TsharkOptions, decode_packets, prepare_capture, run};
+use super::super::{
+    decode::{DecodeError, decode_packets},
+    preparation::prepare_capture,
+    run,
+};
 use super::{assert_error_contains, json_field};
+use crate::arguments::TsharkOptions;
 use l2_workbench::{sha256, tshark::TsharkReport};
 use serde_json::{Value, json};
 use std::{
@@ -21,7 +26,7 @@ fn options(capture: &Path, executable: &Path) -> TsharkOptions {
         tls_keylog: None,
         output: None,
         timeout_seconds: 30,
-        max_input_mib: 1,
+        max_input_mib: Some(1),
         max_metadata_mib: 1,
         max_output_mib: 16,
         max_diagnostics_mib: 1,
@@ -33,15 +38,39 @@ fn fixture(
     frames: &[u8],
     packets: &Value,
 ) -> Result<TsharkOptions, Box<dyn Error>> {
+    fixture_with_failed_glossary(directory, frames, packets, "")
+}
+
+fn fixture_with_failed_glossary(
+    directory: &Path,
+    frames: &[u8],
+    packets: &Value,
+    failed_glossary: &str,
+) -> Result<TsharkOptions, Box<dyn Error>> {
+    if !matches!(failed_glossary, "" | "plugins" | "currentprefs") {
+        return Err("unknown failed glossary fixture".into());
+    }
     let executable = directory.join("tshark-fixture");
+    let octal = |bytes: &[u8]| -> Result<String, std::fmt::Error> {
+        use std::fmt::Write as _;
+
+        let mut encoded = String::new();
+        for byte in bytes {
+            write!(encoded, "\\0{byte:03o}")?;
+        }
+        Ok(encoded)
+    };
+    // Octal escapes preserve every byte without adding shell quoting rules
+    let script = include_str!("fake_tshark.sh")
+        .replace("__FAILED_GLOSSARY__", failed_glossary)
+        .replace("__FRAMES_OCTAL__", &octal(frames)?)
+        .replace("__PACKETS_OCTAL__", &octal(&serde_json::to_vec(packets)?)?);
     // Close and sync the fixture before another test thread can ask the kernel to execute it
     let mut fixture = File::create(&executable)?;
-    fixture.write_all(include_bytes!("fake_tshark.sh"))?;
+    fixture.write_all(script.as_bytes())?;
     fixture.sync_all()?;
     drop(fixture);
     fs::set_permissions(&executable, fs::Permissions::from_mode(0o700))?;
-    fs::write(directory.join("frames.txt"), frames)?;
-    fs::write(directory.join("packets.json"), serde_json::to_vec(packets)?)?;
     let capture = directory.join("capture.pcap");
     fs::write(&capture, b"source fixture")?;
     Ok(options(&capture, &executable))
@@ -64,11 +93,23 @@ fn produce(options: &TsharkOptions) -> Result<Value, Box<dyn Error>> {
 #[test]
 fn complete_source_lossless_recorded_receipt() -> Result<(), Box<dyn Error>> {
     let directory = tempfile::tempdir()?;
-    let options = fixture(directory.path(), b"1\n2\n", &packets(2))?;
+    let decoded = packets(2);
+    let options = fixture(directory.path(), b"1\n2\n", &decoded)?;
 
     let report = produce(&options)?;
 
     assert_eq!(json_field(&report, "schema_version")?, 2);
+    assert_eq!(
+        json_field(&report, "output_sha256")?,
+        &json!("224e56244bb18551389991536e068d331c59493e8c3d777a166ddaad04c501f3")
+    );
+    assert_eq!(
+        json_field(&report, "packets")?,
+        &json!([
+            {"packet_number":1,"tool_derived":true,"fields":{"frame":{"frame.number":1}},"reassembled_fields":[]},
+            {"packet_number":2,"tool_derived":true,"fields":{"frame":{"frame.number":2}},"reassembled_fields":[]}
+        ])
+    );
     assert_eq!(
         json_field(&report, "source_packet_count")?,
         &json!({"count":2,"output_sha256":sha256(b"1\n2\n")})
@@ -118,6 +159,73 @@ fn complete_source_lossless_recorded_receipt() -> Result<(), Box<dyn Error>> {
             })
     );
     serde_json::from_value::<TsharkReport>(report)?.validate()?;
+    Ok(())
+}
+
+#[test]
+fn decoded_small_nodes_memory_limit() -> Result<(), Box<dyn Error>> {
+    let directory = tempfile::tempdir()?;
+    let nodes = vec![json!({"x": 0}); 4_000];
+    let decoded = json!([{"_source":{"layers":{
+        "frame":{"frame.number":"1"}, "nodes":nodes
+    }}}]);
+    let mut options = fixture(directory.path(), b"1\n", &decoded)?;
+    options.max_output_mib = 1;
+    let mut output = Vec::new();
+
+    let Err(error) = run(&options, &mut output) else {
+        return Err("decoded JSON unexpectedly fit its budget".into());
+    };
+    assert!(matches!(
+        error.downcast_ref::<DecodeError>(),
+        Some(DecodeError::MemoryLimit { .. })
+    ));
+    assert_eq!(output.len(), 0);
+    Ok(())
+}
+
+#[test]
+fn decoded_large_escaped_string_memory_limit() -> Result<(), Box<dyn Error>> {
+    let directory = tempfile::tempdir()?;
+    let decoded = json!([{"_source":{"layers":{
+        "frame":{"frame.number":"1"}, "text":"\\".repeat(300_000)
+    }}}]);
+    let mut options = fixture(directory.path(), b"1\n", &decoded)?;
+    options.max_output_mib = 1;
+    let mut output = Vec::new();
+
+    let Err(error) = run(&options, &mut output) else {
+        return Err("decoded JSON unexpectedly fit its budget".into());
+    };
+    assert!(matches!(
+        error.downcast_ref::<DecodeError>(),
+        Some(DecodeError::MemoryLimit { .. })
+    ));
+    assert_eq!(output.len(), 0);
+    Ok(())
+}
+
+#[test]
+fn decoded_nested_json_depth_limit() -> Result<(), Box<dyn Error>> {
+    let directory = tempfile::tempdir()?;
+    let mut nested = json!(null);
+    for _ in 0..100 {
+        nested = json!([nested]);
+    }
+    let decoded = json!([{"_source":{"layers":{
+        "frame":{"frame.number":"1"}, "nested":nested
+    }}}]);
+    let options = fixture(directory.path(), b"1\n", &decoded)?;
+    let mut output = Vec::new();
+
+    let Err(error) = run(&options, &mut output) else {
+        return Err("decoded JSON unexpectedly fit its depth limit".into());
+    };
+    assert!(matches!(
+        error.downcast_ref::<DecodeError>(),
+        Some(DecodeError::NestingLimit)
+    ));
+    assert_eq!(output.len(), 0);
     Ok(())
 }
 
@@ -301,7 +409,7 @@ fn merged_duplicate_values_reassembly_markers() -> Result<(), Box<dyn Error>> {
         "udp":{"udp.port":["12345","54321"]}
     }}}]))?;
 
-    let packets = decode_packets(&bytes)?;
+    let packets = decode_packets(&bytes, bytes.len(), 16 * 1024 * 1024)?;
 
     let packet = packets.first().ok_or("decoded packet missing")?;
     assert_eq!(
@@ -318,14 +426,24 @@ fn merged_duplicate_values_reassembly_markers() -> Result<(), Box<dyn Error>> {
 
 #[test]
 fn installed_tshark_layers_udp_ports() -> Result<(), Box<dyn Error>> {
-    if Command::new("tshark").arg("--version").output().is_err() {
-        return Ok(());
-    }
+    let version = Command::new("tshark").arg("--version").output()?;
+    assert!(
+        version.status.success(),
+        "installed TShark version probe failed"
+    );
+    let banner = std::str::from_utf8(&version.stdout)?
+        .lines()
+        .next()
+        .ok_or("installed TShark did not report a version")?;
     let directory = tempfile::tempdir()?;
     let capture = directory.path().join("encapsulated-udp.pcap");
     fs::write(&capture, encapsulated_udp_capture())?;
 
-    let report = produce(&options(&capture, Path::new("tshark")))?;
+    let report = produce(&options(&capture, Path::new("tshark")));
+    if super::super::version::validate(banner).is_err() {
+        return assert_error_contains(report, "requires a supported patched upstream release");
+    }
+    let report = report?;
 
     let fields = report
         .pointer("/packets/0/fields")

@@ -115,7 +115,7 @@ pub fn pin(interface: &str) -> io::Result<PinnedInterface> {
 
     let namespace = fs::openat(
         CWD,
-        Path::new("/proc/self/ns/net"),
+        Path::new("/proc/thread-self/ns/net"),
         OFlags::RDONLY | OFlags::CLOEXEC,
         Mode::empty(),
     )?;

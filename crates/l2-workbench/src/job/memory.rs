@@ -10,7 +10,7 @@ mod split_tests;
 
 pub use buffering::{BufferedCase, BufferedCaseSnapshot};
 pub use system::{CgroupMemoryEvents, CgroupMemorySnapshot, SystemMemorySnapshot};
-pub use working_set::{MemoryWorkingSet, WorkingSetSnapshot};
+pub use working_set::{MemoryWorkingSet, ProcessWorkingSet, WorkingSetSnapshot};
 
 use super::Job;
 use serde::Serialize;

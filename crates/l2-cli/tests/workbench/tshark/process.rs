@@ -1,3 +1,5 @@
+#[cfg(target_os = "linux")]
+use super::open_tree_directory;
 use super::{ProcessError, StreamingMonitor, StreamingPolicy, run_streaming};
 use crate::workbench::tshark::ObjectExportBudget;
 use l2_workbench::job::Job;
@@ -10,19 +12,54 @@ use std::{
     time::{Duration, Instant},
 };
 
+#[path = "process/capture.rs"]
+mod capture;
+
 #[cfg(target_os = "linux")]
 #[path = "process/spawn_failure.rs"]
 mod spawn_failure;
+
+#[cfg(target_os = "linux")]
+#[path = "process/containment.rs"]
+mod containment;
 
 #[cfg(all(target_os = "linux", not(target_env = "uclibc")))]
 #[path = "process/pgid_reuse.rs"]
 mod pgid_reuse;
 
 #[cfg(all(target_os = "linux", not(target_env = "uclibc")))]
+#[path = "process/group_cleanup.rs"]
+mod group_cleanup;
+
+#[cfg(target_os = "linux")]
+#[path = "process/scan_race.rs"]
+mod scan_race;
+
+#[cfg(target_os = "linux")]
+thread_local! {
+    static NEXT_SCANNED_ENTRY: std::cell::RefCell<Option<Box<dyn FnOnce()>>> = const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(target_os = "linux")]
+pub(super) fn after_tree_entry() {
+    if let Some(observer) = NEXT_SCANNED_ENTRY.take() {
+        observer();
+    }
+}
+
+#[cfg(all(target_os = "linux", not(target_env = "uclibc")))]
 thread_local! {
     static OBSERVED_POLLS: std::cell::Cell<Option<usize>> = const { std::cell::Cell::new(None) };
     static NEXT_POLL_ERROR: std::cell::Cell<Option<nix::errno::Errno>> = const { std::cell::Cell::new(None) };
     static PERSISTENT_POLL_ERROR: std::cell::Cell<Option<nix::errno::Errno>> = const { std::cell::Cell::new(None) };
+    static FINAL_SCAN_OBSERVER: std::cell::RefCell<Option<Box<dyn FnOnce()>>> = const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(all(target_os = "linux", not(target_env = "uclibc")))]
+pub(super) fn before_final_scan() {
+    if let Some(observer) = FINAL_SCAN_OBSERVER.take() {
+        observer();
+    }
 }
 
 #[cfg(all(target_os = "linux", not(target_env = "uclibc")))]
@@ -392,6 +429,80 @@ fn new_and_changed_objects_wait_for_a_second_unchanged_scan() -> Result<(), Box<
 
     monitor.scan_objects(scan_policy)?;
     assert_eq!(monitor.stable_objects.len(), 2);
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn object_scan_unsafe_entries() -> Result<(), Box<dyn Error>> {
+    let temporary = tempfile::tempdir()?;
+    let protocol = temporary.path().join("http");
+    std::fs::create_dir(&protocol)?;
+    std::fs::write(protocol.join("object.bin"), b"safe")?;
+    let scan_policy = policy(
+        Instant::now() + Duration::from_secs(2),
+        temporary.path(),
+        1,
+        ObjectExportBudget::default(),
+    );
+    let mut monitor = StreamingMonitor::new(scan_policy, std::sync::Arc::default());
+
+    // A regular object in the expected directory is safe
+    monitor.scan_objects(scan_policy)?;
+    assert!(!monitor.unsafe_entries);
+
+    // A symlink must be reported even when the directory count is correct
+    let link = protocol.join("link");
+    std::os::unix::fs::symlink("missing", &link)?;
+    monitor.scan_objects(scan_policy)?;
+    assert!(monitor.unsafe_entries);
+    std::fs::remove_file(link)?;
+
+    // A directory outside the declared set is unsafe even with only regular files
+    let undeclared = policy(
+        Instant::now() + Duration::from_secs(2),
+        temporary.path(),
+        0,
+        ObjectExportBudget::default(),
+    );
+    monitor.scan_objects(undeclared)?;
+    assert!(monitor.unsafe_entries);
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn object_directory_types() -> Result<(), Box<dyn Error>> {
+    let temporary = tempfile::tempdir()?;
+    let directory = temporary.path().join("directory");
+    let link = temporary.path().join("link");
+    let file = temporary.path().join("file");
+    std::fs::create_dir(&directory)?;
+    std::os::unix::fs::symlink(&directory, &link)?;
+    std::fs::write(&file, b"not a directory")?;
+
+    assert!(open_tree_directory(&directory).is_ok());
+    assert!(open_tree_directory(&link).is_err());
+    assert!(open_tree_directory(&file).is_err());
+    Ok(())
+}
+
+#[test]
+fn streaming_monitor_expired_deadline() -> Result<(), Box<dyn Error>> {
+    let temporary = tempfile::tempdir()?;
+    let scan_policy = policy(
+        Instant::now(),
+        temporary.path(),
+        0,
+        ObjectExportBudget::default(),
+    );
+    let mut monitor = StreamingMonitor::new(scan_policy, std::sync::Arc::default());
+    let mut child = std::process::Command::new("true").spawn()?;
+
+    // Reap the child before asserting so a failed check leaves no process behind
+    let result = monitor.poll(&mut child, scan_policy);
+    let _status = child.wait()?;
+    assert!(matches!(result, Err(ProcessError::TimedOut)));
     Ok(())
 }
 

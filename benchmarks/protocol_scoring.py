@@ -10,7 +10,7 @@ from pathlib import Path
 
 from .protocol_evaluation import load_blind_manifest
 from .runner.catalogue import hash_file, read_json
-from .runner.protocol_truth import compare_protocol_artifacts, load_protocol_truth
+from .runner.protocol_truth import compare_protocol_artifacts, load_protocol_truth, verify_protocol_artifacts
 from .runner.recovery import build_extract_command, validate_export_output
 
 MAX_RECEIPT_BYTES = 64 * 1024 * 1024
@@ -213,10 +213,7 @@ def score_protocol_run(manifest_path, run_root, binary, oracle_path, identities,
     if ledger_path is not None:
         _verify_file(ledger_path, identities.ledger_sha256, "classification ledger")
     load_blind_manifest(manifest_path)
-    for row in truth.values():
-        for artifact in row["expected"]:
-            if hash_file(artifact["path"], expected_bytes=artifact["byte_length"]) != artifact["sha256"]:
-                raise ValueError("oracle artifact changed during scoring")
+    verify_protocol_artifacts(truth, final=True)
     return {"schema_version": 1, "corpus_id": manifest.corpus_id,
             "identities": {"source_commit": identities.source_commit, "binary_sha256": identities.binary_sha256,
                            "manifest_sha256": identities.manifest_sha256, "run_sha256": identities.run_sha256,

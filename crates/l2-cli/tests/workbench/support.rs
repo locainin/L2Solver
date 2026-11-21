@@ -33,6 +33,19 @@ pub fn empty_capture() -> Vec<u8> {
     bytes
 }
 
+pub fn ipv4_capture(records: u32) -> Vec<u8> {
+    let frame = ipv4_header_frame([192, 0, 2, 1], [192, 0, 2, 2]);
+    let mut bytes = empty_capture();
+    for record in 0..records {
+        bytes.extend_from_slice(&record.to_le_bytes());
+        bytes.extend_from_slice(&0_u32.to_le_bytes());
+        bytes.extend_from_slice(&34_u32.to_le_bytes());
+        bytes.extend_from_slice(&34_u32.to_le_bytes());
+        bytes.extend_from_slice(&frame);
+    }
+    bytes
+}
+
 pub fn capture_with_truncated_record() -> Vec<u8> {
     let mut bytes = empty_capture();
     for value in [0_u32, 0, 14, 14] {

@@ -1,6 +1,5 @@
 use super::{
-    Fixture, ResultDirectory, ResultKind, TestResult, json_field, json_field_mut, read_manifest,
-    write_manifest,
+    Fixture, ResultKind, TestResult, json_field, json_field_mut, read_manifest, write_manifest,
 };
 use l2_workbench::job::{Counter, Job, MemoryBudget, cache::SourceIdentity};
 use serde_json::Value;
@@ -27,7 +26,7 @@ fn write_result(fixture: &Fixture, staging: &Path, artifact_digest: bool) -> Tes
 }
 
 fn publish_result(fixture: &Fixture, job: &Job, artifact_digest: bool) -> TestResult {
-    ResultDirectory::inspect(&fixture.output, ResultKind::Extract)?.publish(
+    super::inspect(&fixture.output, ResultKind::Extract)?.publish(
         &fixture.identity,
         job,
         |staging| write_result(fixture, staging, artifact_digest),
@@ -58,7 +57,7 @@ fn strict_reuse_accepts_unchanged_outputs_with_matching_digests() -> TestResult 
             Some(actual.as_str())
         );
     }
-    let existing = ResultDirectory::inspect(&fixture.output, ResultKind::Extract)?;
+    let existing = super::inspect(&fixture.output, ResultKind::Extract)?;
     assert!(
         existing
             .reuse(
@@ -68,6 +67,130 @@ fn strict_reuse_accepts_unchanged_outputs_with_matching_digests() -> TestResult 
                 &Job::new("reuse")
             )?
             .is_some_and(|result| result.complete)
+    );
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn reuse_rechecks_manifest_permissions() -> TestResult {
+    use std::{io, os::unix::fs::PermissionsExt};
+
+    for strict in [false, true] {
+        let fixture = Fixture::new()?;
+        publish_result(&fixture, &Job::new("publish"), true)?;
+        let existing = super::inspect(&fixture.output, ResultKind::Extract)?;
+        fs::set_permissions(
+            fixture.output.join("manifest.json"),
+            fs::Permissions::from_mode(0o664),
+        )?;
+
+        let error = existing
+            .reuse(
+                &fixture.identity,
+                Some(&fixture.input),
+                strict,
+                &Job::new("reuse"),
+            )
+            .err()
+            .ok_or("reuse accepted an unsafe manifest")?;
+        assert_eq!(
+            error.downcast_ref::<io::Error>().map(io::Error::kind),
+            Some(io::ErrorKind::PermissionDenied),
+            "strict={strict}: {error}"
+        );
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn strict_reuse_rejects_shared_writable_output() -> TestResult {
+    use std::{io, os::unix::fs::PermissionsExt};
+
+    let fixture = Fixture::new()?;
+    publish_result(&fixture, &Job::new("publish"), true)?;
+    fs::set_permissions(
+        fixture.output.join("artifact.bin"),
+        fs::Permissions::from_mode(0o664),
+    )?;
+    let existing = super::inspect(&fixture.output, ResultKind::Extract)?;
+
+    // Matching bytes are insufficient when another user can write the file
+    let error = existing
+        .reuse(
+            &fixture.identity,
+            Some(&fixture.input),
+            true,
+            &Job::new("reuse"),
+        )
+        .err()
+        .ok_or("strict reuse accepted a shared-writable file")?;
+    assert_eq!(
+        error.downcast_ref::<io::Error>().map(io::Error::kind),
+        Some(io::ErrorKind::PermissionDenied),
+        "{error}"
+    );
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn writable_subdirectory_invalidates_result() -> TestResult {
+    use std::os::unix::fs::PermissionsExt;
+
+    let fixture = Fixture::new()?;
+    publish_result(&fixture, &Job::new("publish"), true)?;
+    let artifact = fixture.output.join("artifact.bin");
+    fs::remove_file(&artifact)?;
+    fs::create_dir(&artifact)?;
+    fs::set_permissions(&artifact, fs::Permissions::from_mode(0o777))?;
+
+    assert!(super::inspect(&fixture.output, ResultKind::Extract).is_err());
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn strict_reuse_accepts_publication_with_group_umask() -> TestResult {
+    use std::{os::unix::fs::PermissionsExt, process::Command};
+
+    const CHILD: &str = "L2_TEST_RESULT_UMASK_CHILD";
+    if std::env::var_os(CHILD).is_some() {
+        let fixture = Fixture::new()?;
+        fs::set_permissions(fixture.root.path(), fs::Permissions::from_mode(0o700))?;
+        for operation in ["publish", "refresh"] {
+            publish_result(&fixture, &Job::new(operation), true)?;
+            let existing = super::inspect(&fixture.output, ResultKind::Extract)?;
+            assert!(
+                existing
+                    .reuse(
+                        &fixture.identity,
+                        Some(&fixture.input),
+                        true,
+                        &Job::new("reuse")
+                    )?
+                    .is_some_and(|result| result.complete)
+            );
+        }
+        return Ok(());
+    }
+
+    // Set the process umask in a child so concurrent tests keep their normal permissions
+    let output = Command::new("sh")
+        .args(["-c", "umask 002; exec \"$@\"", "group-umask"])
+        .arg(std::env::current_exe()?)
+        .args([
+            "--exact",
+            "result_directory::tests::strict_reuse::strict_reuse_accepts_publication_with_group_umask",
+        ])
+        .env(CHILD, "1")
+        .output()?;
+    assert!(
+        output.status.success(),
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
     );
     Ok(())
 }
@@ -83,7 +206,7 @@ fn strict_reuse_rejects_same_length_changes_to_each_non_artifact_output() -> Tes
         *first ^= 1;
         fs::write(path, bytes)?;
 
-        let existing = ResultDirectory::inspect(&fixture.output, ResultKind::Extract)?;
+        let existing = super::inspect(&fixture.output, ResultKind::Extract)?;
         assert!(
             existing
                 .reuse(
@@ -111,7 +234,39 @@ fn strict_reuse_rejects_same_length_changes_to_each_non_artifact_output() -> Tes
 }
 
 #[test]
-fn legacy_unhashed_output_requires_refresh_for_strict_reuse() -> TestResult {
+fn default_reuse_checks_output_digest() -> TestResult {
+    let fixture = Fixture::new()?;
+    publish_result(&fixture, &Job::new("publish"), false)?;
+    let mut manifest = read_manifest(&fixture.output)?;
+    let summary = json_field_mut(&mut manifest, "/l2solver_result/output_files")?
+        .as_array_mut()
+        .and_then(|outputs| {
+            outputs
+                .iter_mut()
+                .find(|output| output.get("file").and_then(Value::as_str) == Some("summary.txt"))
+        })
+        .ok_or("summary stamp is missing")?;
+    // Keep the file intact so only the digest contradicts the result receipt
+    *summary
+        .get_mut("sha256")
+        .ok_or("summary digest is missing")? = Value::String("0".repeat(64));
+    write_manifest(&fixture.output, &manifest)?;
+
+    let existing = super::inspect(&fixture.output, ResultKind::Extract)?;
+    let Err(error) = existing.reuse(
+        &fixture.identity,
+        Some(&fixture.input),
+        false,
+        &Job::new("reuse"),
+    ) else {
+        return Err("default reuse accepted an incorrect output digest".into());
+    };
+    assert!(error.to_string().contains("summary.txt"), "{error}");
+    Ok(())
+}
+
+#[test]
+fn unhashed_output_requires_refresh() -> TestResult {
     let fixture = Fixture::new()?;
     publish_result(&fixture, &Job::new("publish"), false)?;
     let mut manifest = read_manifest(&fixture.output)?;
@@ -127,26 +282,18 @@ fn legacy_unhashed_output_requires_refresh_for_strict_reuse() -> TestResult {
         .ok_or("summary digest is missing")? = Value::Null;
     write_manifest(&fixture.output, &manifest)?;
 
-    let existing = ResultDirectory::inspect(&fixture.output, ResultKind::Extract)?;
-    assert!(
-        existing
-            .reuse(
-                &fixture.identity,
-                Some(&fixture.input),
-                false,
-                &Job::new("reuse")
-            )?
-            .is_some()
-    );
-    let Err(error) = existing.reuse(
-        &fixture.identity,
-        Some(&fixture.input),
-        true,
-        &Job::new("reuse"),
-    ) else {
-        return Err("strict reuse accepted an unhashed output".into());
-    };
-    assert!(error.to_string().contains("--refresh"), "{error}");
+    let existing = super::inspect(&fixture.output, ResultKind::Extract)?;
+    for strict in [false, true] {
+        let Err(error) = existing.reuse(
+            &fixture.identity,
+            Some(&fixture.input),
+            strict,
+            &Job::new("reuse"),
+        ) else {
+            return Err("reuse accepted an unhashed output".into());
+        };
+        assert!(error.to_string().contains("--refresh"), "{error}");
+    }
     Ok(())
 }
 
@@ -183,17 +330,10 @@ fn publication_digest_buffer_obeys_the_job_memory_budget() -> TestResult {
 }
 
 #[test]
-fn strict_reuse_accounts_for_output_reads_and_admits_the_hash_buffer() -> TestResult {
+fn reuse_accounts_for_output_hash_reads() -> TestResult {
     let fixture = Fixture::new()?;
     publish_result(&fixture, &Job::new("publish"), false)?;
-    let existing = ResultDirectory::inspect(&fixture.output, ResultKind::Extract)?;
-    let memory = MemoryBudget::new(1024 * 1024);
-    let job = Job::with_memory_budget("strict reuse", &memory);
-    assert!(
-        existing
-            .reuse(&fixture.identity, Some(&fixture.input), true, &job)?
-            .is_some()
-    );
+    let existing = super::inspect(&fixture.output, ResultKind::Extract)?;
     let mut expected = 0_u64;
     for name in [
         "artifact.bin",
@@ -203,27 +343,31 @@ fn strict_reuse_accounts_for_output_reads_and_admits_the_hash_buffer() -> TestRe
     ] {
         expected += fs::metadata(fixture.output.join(name))?.len();
     }
-    assert_eq!(
-        job.snapshot()?.counters.get(&Counter::Bytes),
-        Some(&expected)
-    );
+    for strict in [false, true] {
+        let memory = MemoryBudget::new(1024 * 1024);
+        let job = Job::with_memory_budget("reuse", &memory);
+        assert!(
+            existing
+                .reuse(&fixture.identity, Some(&fixture.input), strict, &job)?
+                .is_some()
+        );
+        assert_eq!(
+            job.snapshot()?.counters.get(&Counter::Bytes),
+            Some(&expected)
+        );
 
-    let denied_memory = MemoryBudget::new(0);
-    let denied_job = Job::with_memory_budget("reuse without scratch", &denied_memory);
-    assert!(
-        existing
-            .reuse(&fixture.identity, Some(&fixture.input), false, &denied_job)?
-            .is_some(),
-        "fast reuse does not need a hashing buffer"
-    );
-    let Err(error) = existing.reuse(&fixture.identity, Some(&fixture.input), true, &denied_job)
-    else {
-        return Err("strict reuse ignored its digest buffer budget".into());
-    };
-    assert!(
-        crate::memory_error::find(error.as_ref()).is_some(),
-        "{error}"
-    );
+        let denied_memory = MemoryBudget::new(0);
+        let denied_job = Job::with_memory_budget("reuse without scratch", &denied_memory);
+        let Err(error) =
+            existing.reuse(&fixture.identity, Some(&fixture.input), strict, &denied_job)
+        else {
+            return Err("reuse ignored its digest buffer budget".into());
+        };
+        assert!(
+            crate::memory_error::find(error.as_ref()).is_some(),
+            "{error}"
+        );
+    }
     Ok(())
 }
 
@@ -231,7 +375,7 @@ fn strict_reuse_accounts_for_output_reads_and_admits_the_hash_buffer() -> TestRe
 fn cancelled_job_stops_strict_result_reuse() -> TestResult {
     let fixture = Fixture::new()?;
     publish_result(&fixture, &Job::new("publish"), false)?;
-    let existing = ResultDirectory::inspect(&fixture.output, ResultKind::Extract)?;
+    let existing = super::inspect(&fixture.output, ResultKind::Extract)?;
     let job = Job::new("cancelled reuse");
     job.request_cancel();
     assert!(
@@ -246,7 +390,7 @@ fn cancelled_job_stops_strict_result_reuse() -> TestResult {
 fn named_output_recheck_rejects_replacement_of_the_held_file() -> TestResult {
     let fixture = Fixture::new()?;
     publish_result(&fixture, &Job::new("publish"), false)?;
-    let existing = ResultDirectory::inspect(&fixture.output, ResultKind::Extract)?;
+    let existing = super::inspect(&fixture.output, ResultKind::Extract)?;
     let super::super::manifest::DirectoryState::Owned { prepared, .. } = &existing.state else {
         return Err("published result should be owned".into());
     };

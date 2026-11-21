@@ -5,6 +5,7 @@ import mmap
 import os
 import re
 import sqlite3
+import stat
 import time
 from pathlib import Path
 
@@ -31,6 +32,35 @@ def check_run_id(run_id):
         raise ValueError("run id must be a bounded ASCII directory component")
 
 
+def binary_identity(binary, expected_bytes=None):
+    # Inspect the opened file so replacement cannot switch it to a pipe
+    flags = os.O_RDONLY | getattr(os, "O_NONBLOCK", 0) | getattr(os, "O_NOFOLLOW", 0)
+    flags |= getattr(os, "O_BINARY", 0)
+    descriptor = os.open(binary, flags)
+    try:
+        metadata = os.fstat(descriptor)
+        if not stat.S_ISREG(metadata.st_mode):
+            raise ValueError("analyzer executable is not a regular file")
+        if expected_bytes is not None and metadata.st_size != expected_bytes:
+            raise ValueError("analyzer executable size changed")
+        # The first observed size also bounds later reads of a growing file
+        size = metadata.st_size if expected_bytes is None else expected_bytes
+        with os.fdopen(descriptor, "rb", closefd=False) as stream:
+            return hash_file(stream, expected_bytes=size), metadata.st_size
+    finally:
+        os.close(descriptor)
+
+
+def check_binary_unchanged(binary, expected_hash, expected_bytes, mode):
+    # A changed executable cannot support a trusted run receipt
+    try:
+        digest, _ = binary_identity(binary, expected_bytes)
+        if digest != expected_hash:
+            raise ValueError("analyzer executable hash changed")
+    except (OSError, ValueError) as error:
+        raise ValueError(f"analyzer executable changed during {mode} run") from error
+
+
 def artifact_bytes(directory):
     # Measure retained files, including logs, before the result receipt is published
     return sum(
@@ -40,14 +70,19 @@ def artifact_bytes(directory):
     )
 
 
-def output_bytes(directory):
-    # Exclude captured command logs from analyzer output size
+def output_bytes(directory, log_prefixes):
+    # Only the names reserved for command logs are excluded from output
+    log_paths = {
+        directory / f"{prefix}{stream}.log"
+        for prefix in log_prefixes
+        for stream in ("stdout", "stderr")
+    }
     return sum(
         path.stat().st_size
         for path in directory.rglob("*")
         if path.is_file()
         and not path.is_symlink()
-        and not path.name.endswith((".stdout.log", ".stderr.log"))
+        and path not in log_paths
     )
 
 
@@ -122,6 +157,7 @@ def run_sample(
         command.extend(("--output", "case.json"))
     else:
         command.extend(("--directory", "bundle"))
+    binary_hash, binary_bytes = binary_identity(binary)
     result = {
         "schema_version": 1,
         "run_id": run_id,
@@ -129,7 +165,7 @@ def run_sample(
         "mode": mode,
         "source": sample.metadata,
         "binary_name": binary.name,
-        "binary_sha256": hash_file(binary),
+        "binary_sha256": binary_hash,
         "timeout_seconds": timeout,
         "max_log_bytes": max_log_bytes,
         "arguments": command[1:],
@@ -141,7 +177,9 @@ def run_sample(
     started = time.monotonic()
     if mode == "index":
         result["binary_argument"] = binary_argument
-        return run_index_pipeline(sample, binary, directory, timeout, result, started)
+        return run_index_pipeline(
+            sample, binary, directory, timeout, result, started, binary_bytes
+        )
     analyzer_started = time.monotonic()
     try:
         code, failure, error, metrics = run_child(
@@ -160,6 +198,7 @@ def run_sample(
         else:
             validation_start = time.monotonic()
             try:
+                check_binary_unchanged(binary, result["binary_sha256"], binary_bytes, mode)
                 if mode == "case":
                     result["validation"] = validate_output(directory, sample, code)
                     result["case_bytes"] = (directory / "case.json").stat().st_size
@@ -199,12 +238,12 @@ def run_sample(
         )
     result["elapsed_seconds"] = time.monotonic() - started
     result["artifact_bytes"] = artifact_bytes(directory)
-    result["output_bytes"] = output_bytes(directory)
+    result["output_bytes"] = output_bytes(directory, ("",))
     write_json_new(directory / "result.json", result)
     return result
 
 
-def run_index_pipeline(sample, binary, directory, timeout, result, started):
+def run_index_pipeline(sample, binary, directory, timeout, result, started, binary_bytes):
     # Each fact export goes straight to its own file
     source_path = os.path.relpath(sample.capture, directory)
     commands = {
@@ -265,18 +304,15 @@ def run_index_pipeline(sample, binary, directory, timeout, result, started):
     )
     if stages_complete:
         try:
-            if hash_file(binary) != result["binary_sha256"]:
-                result.update(
-                    status="evidence_failure",
-                    error="analyzer executable changed during index run",
-                )
-            else:
-                validate_index_stage_outputs(sample, directory, result)
-        except OSError as error:
+            check_binary_unchanged(binary, result["binary_sha256"], binary_bytes, "index")
+            validate_index_stage_outputs(sample, directory, result)
+        except (OSError, ValueError) as error:
             result.update(status="evidence_failure", error=str(error)[:2048])
     result["elapsed_seconds"] = time.monotonic() - started
     result["artifact_bytes"] = artifact_bytes(directory)
-    result["output_bytes"] = output_bytes(directory)
+    result["output_bytes"] = output_bytes(
+        directory, (f"{stage}." for stage in result["stages"])
+    )
     if result["status"] == "complete":
         result["evidence_bytes"] = evidence_bytes(directory, "index")
     write_json_new(directory / "result.json", result)

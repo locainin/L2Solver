@@ -9,6 +9,7 @@ mod json_memory;
 mod memory;
 mod model;
 mod recovery_transition;
+mod resource_plan;
 
 pub use cache_fallback::{
     CacheFallbackKind, CacheFallbackRecord, CacheFallbackSummary, CacheStage,
@@ -16,8 +17,8 @@ pub use cache_fallback::{
 pub use json_memory::{JsonMemoryAdmission, JsonMemoryError, admit_json};
 pub use memory::{
     BufferedCase, BufferedCaseSnapshot, CgroupMemoryEvents, CgroupMemorySnapshot, MemoryBudget,
-    MemoryClass, MemoryError, MemoryLease, MemorySnapshot, MemoryWorkingSet, SystemMemorySnapshot,
-    WorkingSetSnapshot,
+    MemoryClass, MemoryError, MemoryLease, MemorySnapshot, MemoryWorkingSet, ProcessWorkingSet,
+    SystemMemorySnapshot, WorkingSetSnapshot,
 };
 pub use model::{
     Counter, Job, JobError, JobSnapshot, Phase, PhaseOutcome, PhaseSnapshot, PhaseState,
@@ -31,4 +32,9 @@ pub use recovery_transition::{
     RecoveryPublicationSample, RecoveryPublicationSourceBasis, RecoveryTransition,
     RecoveryTransitionOutcome, RecoveryTransitionRecord, RecoveryTransitionSample,
     RecoveryTransitionSourceRange, RecoveryTransitionStage, RecoveryTransitionSummary,
+};
+
+pub use resource_plan::{
+    HostCapacity, InputSize, ObjectLimitMode, ResourceLimits, ResourcePlan, ResourcePlanError,
+    workspace_capacity,
 };

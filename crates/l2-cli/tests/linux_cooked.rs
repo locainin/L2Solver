@@ -12,6 +12,14 @@ use std::{
 
 type TestResult<T = ()> = Result<T, Box<dyn Error>>;
 
+fn first_frame(output: &[u8]) -> TestResult<Value> {
+    let line = output
+        .split(|byte| *byte == b'\n')
+        .next()
+        .ok_or("missing frame")?;
+    Ok(serde_json::from_slice(line)?)
+}
+
 #[test]
 fn classic_cooked_dns_reports_header_metadata_and_exact_payload_location() -> TestResult {
     let dns = dns_query();
@@ -26,7 +34,7 @@ fn classic_cooked_dns_reports_header_metadata_and_exact_payload_location() -> Te
             "{}",
             String::from_utf8_lossy(&output.stderr)
         );
-        let record: Value = serde_json::from_slice(&output.stdout)?;
+        let record = first_frame(&output.stdout)?;
         assert_eq!(record.pointer("/status"), Some(&json!("parsed")));
         assert_eq!(record.pointer("/cooked/version"), Some(&json!(version)));
         assert_eq!(record.pointer("/cooked/packet_type"), Some(&json!("host")));
@@ -192,7 +200,7 @@ fn cooked_ipv6_tcp_payload_offsets_follow_each_link_header() -> TestResult {
         );
         let dump = run(&["capture", "dump", "-", "--format", "ndjson"], &capture)?;
         assert!(dump.status.success());
-        let record: Value = serde_json::from_slice(&dump.stdout)?;
+        let record = first_frame(&dump.stdout)?;
         assert_eq!(
             record.pointer("/ip/transport/payload/offset"),
             Some(&json!(header_len + 60))
@@ -459,7 +467,7 @@ fn cooked_address_length_and_packet_type_preserve_header_claims() -> TestResult 
     let capture = classic(113, &[(&frame, u32::try_from(frame.len())?)])?;
     let output = run(&["capture", "dump", "-", "--format", "ndjson"], &capture)?;
     assert!(output.status.success());
-    let result: Value = serde_json::from_slice(&output.stdout)?;
+    let result = first_frame(&output.stdout)?;
     assert_eq!(
         result.pointer("/cooked/packet_type"),
         Some(&json!("outgoing"))

@@ -24,7 +24,8 @@ fn counts_loss_continues_malformed() -> Result<(), Box<dyn std::error::Error>> {
     assert_eq!(summary.truncated, 1);
     let output = String::from_utf8(output)?;
     assert!(output.contains("LLDP Valid"));
-    assert!(output.ends_with("frames=2 malformed=1 invalid=0 unsupported=0 truncated=1\n"));
+    assert!(output.contains("frames=2 malformed=1 invalid=0 unsupported=0 truncated=1\n"));
+    assert!(output.contains("authority=absent acquisition_quality=unverified"));
     Ok(())
 }
 
@@ -86,10 +87,15 @@ fn reports_packet_block_loss_in_text_and_json() -> Result<(), Box<dyn std::error
     let text = String::from_utf8(text)?;
     assert!(text.contains("packet_block_packets_dropped=4"));
     assert!(text.contains("packet_blocks_with_unavailable_drop_count=2"));
+    assert!(text.contains("authority=source_declared acquisition_quality=unverified"));
 
     let mut json = Vec::new();
     source_collection::json(summary, &mut json)?;
     let json: serde_json::Value = serde_json::from_slice(&json)?;
+    assert_eq!(
+        json.get("authority"),
+        Some(&serde_json::json!("source_declared"))
+    );
     assert_eq!(
         json.pointer("/source_collection/packet_block_packets_dropped"),
         Some(&serde_json::json!(4))

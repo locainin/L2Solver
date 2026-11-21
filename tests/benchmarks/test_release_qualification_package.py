@@ -30,6 +30,13 @@ def candidate(tmp_path):
     helper.chmod(0o750)
     lock = tmp_path / "Cargo.lock"
     lock.write_bytes(b"version = 4\n")
+    build_record = {
+        "source_commit": COMMIT, "source_tree": "d" * 40,
+        "rustc_version": RUSTC, "cargo_version": CARGO,
+        "lock_sha256": hashlib.sha256(lock.read_bytes()).hexdigest(),
+        "artifacts": {path.name: hashlib.sha256(path.read_bytes()).hexdigest()
+                      for path in (binary, active, helper)},
+    }
     archive, checksum = package_release(
         binary,
         lock,
@@ -38,6 +45,7 @@ def candidate(tmp_path):
         source_tree="d" * 40,
         rustc_version=RUSTC,
         cargo_version=CARGO,
+        build_record=build_record,
     )
     return archive, checksum, binary, lock
 
@@ -180,7 +188,8 @@ def test_unpack_rejects_an_executable_that_differs_from_provenance(candidate, tm
 
 @pytest.mark.parametrize(
     ("field", "value"),
-    [("schema_version", True), ("command_kind", None), ("command_kind", "observed")],
+    [("schema_version", True), ("command_kind", None), ("command_kind", "rebuild_recipe"),
+     ("source_binding", None), ("source_binding", "unverified"), ("command", "different build")],
 )
 def test_unpack_rejects_invalid_schema_or_build_command_kind(candidate, tmp_path, field, value):
     archive, checksum, _, _ = candidate

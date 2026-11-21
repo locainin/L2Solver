@@ -9,8 +9,28 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
 
-from benchmarks.payload_lab.analysis import Analyzer, examine
+from benchmarks.payload_lab.analysis import Analyzer, captured_payload, examine
 from benchmarks.runner import process as process_module
+from benchmarks.runner.catalogue import hash_file
+
+RECEIVER = {"source": ["127.0.0.1", 1], "destination": ["127.0.0.1", 2]}
+
+
+def tshark_analyzer(root, *, change_during_query=False):
+    binary, tshark = root / "analyzer", root / "tshark"
+    binary.write_bytes(b"analyzer executable bytes")
+    tshark.write_text(
+        "#!/usr/bin/env python3\n"
+        "import sys\n"
+        f"if '-v' not in sys.argv and {change_during_query!r}:\n"
+        "    with open(__file__, 'ab') as executable:\n"
+        "        executable.write(b'\\n# changed\\n')\n"
+        "print('TShark test version' if '-v' in sys.argv else '1\\t6f6b')\n",
+        encoding="utf-8",
+    )
+    tshark.chmod(0o755)
+    with patch("benchmarks.payload_lab.analysis.shutil.which", return_value=str(tshark)):
+        return Analyzer(binary, root), tshark
 
 
 class AnalysisTests(unittest.TestCase):
@@ -19,27 +39,26 @@ class AnalysisTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             binary = root / "analyzer"
-            binary.write_bytes(b"pinned analyzer executable bytes")
-            helper = root / "owned-command"
-            helper.write_text(
+            binary.write_text(
                 "#!/usr/bin/env python3\n"
                 "import os, sys\n"
                 "os.write(1, b'out:' + b' '.join(arg.encode() for arg in sys.argv[1:]))\n"
                 "os.write(2, b'err')\n",
                 encoding="utf-8",
             )
-            helper.chmod(0o755)
+            binary.chmod(0o755)
 
             with patch(
                 "benchmarks.payload_lab.analysis.shutil.which",
-                return_value=str(helper),
+                return_value=str(binary),
             ):
                 analyzer = Analyzer(binary, root)
 
-            analyzer.command("analyzer.run", ["argument"], executable=str(helper))
+            analyzer.command("analyzer.run", ["argument"])
             self.assertTrue(analyzer.tshark_command("tshark.run", ["-n", "-v"]))
 
             self.assertEqual(len(analyzer.commands), 2)
+            self.assertEqual(analyzer.commands[0]["command"], [str(binary.resolve()), "argument"])
             for receipt in analyzer.commands:
                 with self.subTest(command=receipt["name"]):
                     self.assertEqual(receipt["exit_code"], 0)
@@ -76,20 +95,60 @@ class AnalysisTests(unittest.TestCase):
             self.assertEqual(analyzer.commands, [])
             self.assertFalse((root / "changed.stdout.log").exists())
 
-    def test_changed_tshark_executable_rejected(self):
+    def test_tshark_change_before_query(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
-            binary = root / "analyzer"
-            binary.write_bytes(b"analyzer executable bytes")
-            tshark = root / "tshark"
-            tshark.write_bytes(b"tshark executable bytes")
-            with patch("benchmarks.payload_lab.analysis.shutil.which", return_value=str(tshark)):
-                analyzer = Analyzer(binary, root)
+            analyzer, tshark = tshark_analyzer(root)
 
             tshark.write_bytes(b"changed tshark executable bytes")
 
             with self.assertRaisesRegex(ValueError, "TShark executable changed"):
-                analyzer.assert_tshark_unchanged()
+                captured_payload(
+                    analyzer,
+                    SimpleNamespace(name="changed", transport="udp", wire=b"ok"),
+                    RECEIVER,
+                )
+            self.assertEqual(analyzer.commands, [])
+            self.assertFalse((root / "changed.tshark.stdout.log").exists())
+
+    @unittest.skipUnless(os.name == "posix", "requires executable test scripts")
+    def test_tshark_change_during_query(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            analyzer, _ = tshark_analyzer(root, change_during_query=True)
+            analyzer.tshark_provenance()
+            with self.assertRaisesRegex(ValueError, "TShark executable changed"):
+                captured_payload(
+                    analyzer,
+                    SimpleNamespace(name="changed", transport="udp", wire=b"ok"),
+                    RECEIVER,
+                )
+            self.assertEqual(
+                [item["name"] for item in analyzer.commands],
+                ["tshark.version", "changed.tshark"],
+            )
+
+    @unittest.skipUnless(os.name == "posix", "requires executable test scripts")
+    def test_tshark_provenance_and_query_hash_boundaries(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            analyzer, tshark = tshark_analyzer(root)
+            provenance = analyzer.tshark_provenance()
+            with patch("benchmarks.payload_lab.analysis.hash_file", wraps=hash_file) as observed_hash:
+                for name in ("first", "second"):
+                    sample = SimpleNamespace(name=name, transport="udp", wire=b"ok")
+                    self.assertEqual(captured_payload(analyzer, sample, RECEIVER), [1])
+            analyzer.assert_tshark_unchanged()
+
+            self.assertEqual(provenance["version"], "TShark test version")
+            self.assertEqual(provenance["sha256"], hashlib.sha256(tshark.read_bytes()).hexdigest())
+            self.assertEqual(
+                [item["name"] for item in analyzer.commands],
+                ["tshark.version", "first.tshark", "second.tshark"],
+            )
+            # Two observations bracket each query
+            tshark_reads = [call for call in observed_hash.call_args_list if call.args[0] == tshark.resolve()]
+            self.assertEqual(len(tshark_reads), 4)
 
     def test_scoring_completes_without_optional_tshark(self):
         wire = b"retained offline payload"
@@ -101,7 +160,7 @@ class AnalysisTests(unittest.TestCase):
                 self.tshark_executable = None
                 self.commands = []
 
-            def command(self, name, arguments, executable=None):
+            def command(self, name, arguments):
                 self.commands.append(name)
 
             def read(self, name):

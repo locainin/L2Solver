@@ -106,7 +106,7 @@ fn summary(report: &CaptureTcpReport, output: &mut impl Write) -> io::Result<()>
     )?;
     writeln!(
         output,
-        "Sequence {} length {}: {} with one retained value, {} without a retained value, {} conflicting; {} positions affected by {} omitted observations",
+        "Sequence {} length {}: {} with one retained value, {} without a retained value, {} conflicting; {} positions affected by missing observations or span limits; {} observations omitted",
         report.range.start_sequence,
         report.range.length,
         report.range.observed_bytes,

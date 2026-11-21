@@ -183,7 +183,11 @@ fn build_scoped_case(
     if input.frames_seen < u64::try_from(input.records.len())? {
         return Err("capture count is smaller than retained record count".into());
     }
-    let report = reconstruction.finish()?;
+    let memory = case
+        .memory_budget()
+        .map(|budget| budget.try_reserve(crate::job::MemoryClass::Base, 0))
+        .transpose()?;
+    let report = reconstruction.finish_with_memory(memory)?;
     let omitted = scope.selected - u64::try_from(records.len())?;
     let mut complete = report.complete && omitted == 0 && case.collection_complete();
     if omitted != 0 {
@@ -194,6 +198,9 @@ fn build_scoped_case(
     }
     if scope.mode == InputSelection::SelectedRecords {
         case.add_limitation("This case contains explicitly selected original records; absence and event chains outside that selection remain unresolved")?;
+    }
+    if report.incomplete_tcp_headers != 0 {
+        case.add_limitation("Some TCP headers ended after the captured ports; matching tuple generations and sequences remain unresolved")?;
     }
     for limitation in [
         "Capture order and header addresses do not establish ownership, delivery, causality, or malicious intent",
@@ -240,6 +247,7 @@ fn populate(
         "input_selection":scope.mode,
         "reconstruction_limits": report.limits,
         "reconstruction_complete": report.complete, "unsupported_transport_frames": report.unsupported_frames,
+        "incomplete_tcp_headers": report.incomplete_tcp_headers,
         "omitted_fragments": report.omitted_fragments, "omitted_tcp_records": report.omitted_tcp_records,
         "omitted_sequence_ranges": report.omitted_ranges,
         "unmeasured_omitted_ranges": report.unmeasured_omitted_ranges,

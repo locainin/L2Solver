@@ -48,7 +48,7 @@ impl OutputFileStamp {
         hasher.job.check_cancelled().map_err(io::Error::other)?;
         let path = directory.join(file_name);
         let mut file = open_regular_path(&path)?;
-        let before = file.metadata()?;
+        let before = staged_output_metadata(&file)?;
         let before_stamp = metadata_stamp(file_name.to_owned(), None, &before);
         // Reuse the artifact's existing identity when the manifest provides one
         let sha256 = match manifest_sha256 {
@@ -70,7 +70,7 @@ impl OutputFileStamp {
         Ok(after_stamp)
     }
 
-    /// Verify one currently held file using fast metadata or its stored strong digest
+    /// Verify the bytes of one held file against its stored digest
     pub(super) fn verify(
         &self,
         prepared: &PreparedDirectoryReplacement,
@@ -80,6 +80,7 @@ impl OutputFileStamp {
         hasher.job.check_cancelled().map_err(io::Error::other)?;
         let mut file = prepared.open_file(&self.file)?;
         let before = file.metadata()?;
+        verify_reuse_file_permissions(prepared, &file, &before, &self.file)?;
         let current = metadata_stamp(self.file.clone(), self.sha256.clone(), &before);
         if current.byte_length != self.byte_length {
             return Err(changed_output(&self.file));
@@ -87,28 +88,68 @@ impl OutputFileStamp {
         if !strict && !same_fast_metadata(self, &current) {
             return Err(changed_output(&self.file));
         }
-        if strict {
-            let expected_sha256 = self.sha256.as_ref().ok_or_else(|| {
-                super::manifest::actionable_conflict(&format!(
-                    "result output has no stored digest: {}",
-                    self.file
-                ))
-            })?;
-            let digest = hasher.hash_file(&mut file, before.len())?;
-            let after = file.metadata()?;
-            let after_stamp = metadata_stamp(self.file.clone(), None, &after);
-            if &digest != expected_sha256
-                || !single_link(&after)
-                || !same_fast_metadata(&current, &after_stamp)
-            {
-                return Err(changed_output(&self.file));
-            }
-            // The name must still refer to the file that was just verified
-            verify_named_file(prepared, &self.file, &after)?;
+        // Current permissions and matching metadata say nothing about earlier open writers
+        let expected_sha256 = self.sha256.as_ref().ok_or_else(|| {
+            super::manifest::actionable_conflict(&format!(
+                "result output has no stored digest: {}",
+                self.file
+            ))
+        })?;
+        let digest = hasher.hash_file(&mut file, before.len())?;
+        #[cfg(test)]
+        if let Some(after_hash) = hasher.after_hash.take() {
+            after_hash(&file)?;
         }
+        let after = file.metadata()?;
+        let after_stamp = metadata_stamp(self.file.clone(), None, &after);
+        if &digest != expected_sha256
+            || !single_link(&after)
+            || !same_fast_metadata(&current, &after_stamp)
+        {
+            return Err(changed_output(&self.file));
+        }
+        // The name must still refer to the file that was just verified
+        verify_named_file(prepared, &self.file, &after)?;
         prepared.check_location()?;
         Ok(())
     }
+}
+
+pub(super) fn verify_reuse_file_permissions(
+    prepared: &PreparedDirectoryReplacement,
+    file: &std::fs::File,
+    metadata: &Metadata,
+    name: &str,
+) -> io::Result<()> {
+    #[cfg(target_os = "linux")]
+    {
+        use std::os::unix::fs::MetadataExt;
+
+        prepared.verify_file_permissions(file, metadata.uid(), metadata.mode(), name)
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = (prepared, file, metadata, name);
+        Ok(())
+    }
+}
+
+fn staged_output_metadata(file: &std::fs::File) -> io::Result<Metadata> {
+    let metadata = file.metadata()?;
+    #[cfg(target_os = "linux")]
+    {
+        use crate::publish::SHARED_WRITE;
+        use rustix::fs::{Mode, fchmod};
+        use std::os::unix::fs::MetadataExt;
+
+        let mode = Mode::from_raw_mode(metadata.mode());
+        if mode.intersects(SHARED_WRITE) {
+            // Stamp the final metadata so a permissive umask cannot make the result unreusable
+            fchmod(file, mode - SHARED_WRITE)?;
+            return file.metadata();
+        }
+    }
+    Ok(metadata)
 }
 
 pub(super) fn open_regular_path(path: &std::path::Path) -> io::Result<std::fs::File> {
@@ -142,6 +183,9 @@ pub(super) fn open_regular_path(path: &std::path::Path) -> io::Result<std::fs::F
 
 pub(super) struct OutputHasher<'a> {
     job: &'a Job,
+    // Let tests model a metadata change after reading the file
+    #[cfg(test)]
+    after_hash: Option<fn(&std::fs::File) -> io::Result<()>>,
     // Drop the allocation before releasing its shared memory charge
     buffer: Vec<u8>,
     memory: Option<MemoryLease>,
@@ -151,6 +195,8 @@ impl<'a> OutputHasher<'a> {
     pub(super) const fn new(job: &'a Job) -> Self {
         Self {
             job,
+            #[cfg(test)]
+            after_hash: None,
             buffer: Vec::new(),
             memory: None,
         }

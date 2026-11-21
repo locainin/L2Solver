@@ -179,14 +179,14 @@ const STATIC_CASE_LIMITATIONS: &[&str] = &[
     "DNS address uses describe later destination co-occurrence; TTL validity, resolver caching, application use, and causality are unresolved",
     "Exact tuple mismatches do not rule out NAT, proxies, protocol helpers, or omitted capture data",
     "A correlated session is an observed endpoint and timing match, not proof that the FTP command was accepted or caused the session",
-    "This indexed flow selection includes complete unfragmented transport envelopes only; raw fragments remain in the source and may require separate reconstruction",
+    "This indexed flow selection includes supported unfragmented transport envelopes and captured TCP prefixes; raw fragments remain in the source and may require separate reconstruction",
 ];
 
 fn static_case_limitation(message: &str) -> Option<&str> {
     let is_source_quality = message.starts_with("Source sha256:")
-        && message.ends_with(
-            "has unknown collection quality for one or more sections; analysis is scoped to captured bytes",
-        );
+        && (message.contains(" acquisition quality is unverified (authority: ")
+            && message.ends_with("); analysis is scoped to captured bytes")
+            || message.ends_with("has unknown collection quality for one or more sections; analysis is scoped to captured bytes"));
     STATIC_CASE_LIMITATIONS
         .contains(&message)
         .then_some(message)
@@ -197,15 +197,13 @@ pub(super) fn add_source_limitations(
     limitations: &mut LimitationSpool,
     source: &workbench::full_source::SourceCoverage,
 ) -> Result<(), Box<dyn Error>> {
-    if l2_workbench::capture_collection::has_unknown_quality(source.collection_summary) {
-        limitations.push_with_impact(
-            None,
-            String::from(
-                "Source collection quality was not reported for every capture section; analysis is scoped to captured bytes",
-            ),
-            false,
-        )?;
-    }
+    limitations.push_with_impact(
+        None,
+        String::from(
+            "Source acquisition quality is unverified; analysis is scoped to captured bytes",
+        ),
+        false,
+    )?;
     if l2_workbench::capture_collection::reports_incomplete_collection(source.collection_summary) {
         if source.collection_summary.incomplete_sections != 0 {
             limitations.push(
@@ -237,6 +235,31 @@ pub(super) fn add_source_limitations(
                     source
                         .collection_summary
                         .packet_blocks_with_unavailable_drop_count
+                ),
+            )?;
+        }
+        if let Some(drops @ 1..) = source.collection_summary.enhanced_packet_packets_dropped {
+            limitations.push(
+                None,
+                format!(
+                    "Enhanced Packet Blocks report {drops} packets dropped between captured packets"
+                ),
+            )?;
+        }
+        if let Some(drops @ 1..) = source
+            .collection_summary
+            .interface_statistics_interface_dropped
+        {
+            limitations.push(
+                None,
+                format!("Interface Statistics Blocks report {drops} cumulative interface drops"),
+            )?;
+        }
+        if let Some(drops @ 1..) = source.collection_summary.interface_statistics_os_dropped {
+            limitations.push(
+                None,
+                format!(
+                    "Interface Statistics Blocks report {drops} cumulative operating-system drops"
                 ),
             )?;
         }

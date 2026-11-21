@@ -1,10 +1,14 @@
 //! Report atomic publication outcomes without changing their operational result
 
-use crate::publish::DirectoryPublishError;
+use crate::{arguments::ProgressMode, publish::DirectoryPublishError};
 use l2_workbench::job::{
     Job, RecoveryPublicationSample, RecoveryPublicationSourceBasis, RecoveryTransition,
     RecoveryTransitionOutcome, RecoveryTransitionSample, RecoveryTransitionStage,
     cache::SourceIdentity,
+};
+use std::{
+    io::{self, Write},
+    path::Path,
 };
 
 pub fn initial_sample(source: Option<&SourceIdentity>) -> RecoveryPublicationSample {
@@ -21,6 +25,40 @@ pub fn initial_sample(source: Option<&SourceIdentity>) -> RecoveryPublicationSam
         },
         artifact: None,
         artifact_count: None,
+    }
+}
+
+pub fn retained_notice(path: &Path, progress: ProgressMode) {
+    // Publication has committed, so a closed diagnostic stream cannot undo its outcome
+    let mut diagnostic = io::stderr().lock();
+    if progress == ProgressMode::Json {
+        let mut event = serde_json::Map::new();
+        event.insert("type".into(), "retained_output".into());
+        event.insert("path".into(), path.display().to_string().into());
+        event.insert("disk_retention".into(), "until_explicit_removal".into());
+        #[cfg(unix)]
+        if path.to_str().is_none() {
+            use std::os::unix::ffi::OsStrExt;
+            event.insert(
+                "path_bytes".into(),
+                serde_json::json!(path.as_os_str().as_bytes()),
+            );
+        }
+        let _ = writeln!(diagnostic, "{}", serde_json::Value::Object(event));
+    } else {
+        #[expect(
+            clippy::unnecessary_debug_formatting,
+            reason = "Debug preserves non-Unicode path bytes"
+        )]
+        let display = if path.to_str().is_some() {
+            path.display().to_string().escape_debug().to_string()
+        } else {
+            format!("{:?}", path.as_os_str())
+        };
+        let _ = writeln!(
+            diagnostic,
+            "Previous output retained at {display}\nRetained output occupies disk space until explicitly removed"
+        );
     }
 }
 

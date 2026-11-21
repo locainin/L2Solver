@@ -45,15 +45,15 @@ impl Store {
     /// Returns database errors or malformed aggregate values
     pub fn inventory(&self) -> Result<Inventory> {
         let (sources,bytes,packets,unsupported): (u64,u64,u64,u64) = self.connection.query_row("SELECT COUNT(*),COALESCE(SUM(bytes),0),COALESCE(SUM(packets),0),COALESCE(SUM(unsupported),0) FROM sources", [], |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?)))?;
-        let (collection_summary, sources_with_unknown_collection_quality) =
-            collection_inventory(&self.connection)?;
+        let collection_summary = collection_inventory(&self.connection)?;
         Ok(Inventory {
             sources,
             bytes,
             packets,
             unsupported_transport_packets: unsupported,
             collection_summary,
-            sources_with_unknown_collection_quality,
+            // Stored acquisition conditions come from editable capture files
+            sources_with_unknown_collection_quality: sources,
             flows: self
                 .connection
                 .query_row("SELECT COUNT(*) FROM flows", [], |row| row.get(0))?,
@@ -71,7 +71,7 @@ impl Store {
                 "Tuple membership is capture-scoped and does not establish a TCP session, host ownership, delivery, or malicious intent",
                 "Raw capture bytes are retained once; packet extraction and selected-flow analysis reuse their exact original ranges",
                 "DNS associations use capture order and exact questions/endpoints; multiple pending requests remain ambiguous",
-                "Collection counters are source-reported; absent section declarations remain unknown rather than evidence of zero loss",
+                "Collection counters are source-reported; acquisition quality remains unverified for every capture file",
                 "Fragments, unsupported link layouts, and unsupported application syntax remain raw evidence and require further reconstruction",
                 "Shared-value groups compare literal IP addresses, ASCII-folded DNS question names, and full packet hashes; unavailable scope is reported, address matches do not establish host identity, and matching packet bytes may be correlated evidence",
             ],
@@ -126,20 +126,15 @@ impl Store {
     }
 }
 
-fn collection_inventory(connection: &Connection) -> Result<(CollectionSummary, u64)> {
+fn collection_inventory(connection: &Connection) -> Result<CollectionSummary> {
     let mut summary = CollectionSummary::default();
-    let mut unknown_sources = 0_u64;
     let mut statement = connection.prepare("SELECT collection_summary FROM sources ORDER BY id")?;
     let mut rows = statement.query([])?;
     while let Some(row) = rows.next()? {
         let value = crate::capture_collection::from_json(&row.get::<_, String>(0)?)?;
         merge_summary(&mut summary, value)?;
-        unknown_sources = add_counter(
-            unknown_sources,
-            u64::from(crate::capture_collection::has_unknown_quality(value)),
-        )?;
     }
-    Ok((summary, unknown_sources))
+    Ok(summary)
 }
 
 fn merge_summary(total: &mut CollectionSummary, next: CollectionSummary) -> Result<()> {
@@ -156,7 +151,27 @@ fn merge_summary(total: &mut CollectionSummary, next: CollectionSummary) -> Resu
         total.packet_blocks_with_unavailable_drop_count,
         next.packet_blocks_with_unavailable_drop_count,
     )?;
+    total.enhanced_packet_packets_dropped = add_optional_counter(
+        total.enhanced_packet_packets_dropped,
+        next.enhanced_packet_packets_dropped,
+    )?;
+    total.interface_statistics_interface_dropped = add_optional_counter(
+        total.interface_statistics_interface_dropped,
+        next.interface_statistics_interface_dropped,
+    )?;
+    total.interface_statistics_os_dropped = add_optional_counter(
+        total.interface_statistics_os_dropped,
+        next.interface_statistics_os_dropped,
+    )?;
     Ok(())
+}
+
+fn add_optional_counter(total: Option<u64>, next: Option<u64>) -> Result<Option<u64>> {
+    match (total, next) {
+        (None, None) => Ok(None),
+        (Some(value), None) | (None, Some(value)) => Ok(Some(value)),
+        (Some(total), Some(next)) => add_counter(total, next).map(Some),
+    }
 }
 
 fn add_counter(total: u64, next: u64) -> Result<u64> {

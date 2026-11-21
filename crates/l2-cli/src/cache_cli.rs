@@ -23,6 +23,18 @@ pub fn run(command: &CacheCommand, output: &mut impl Write) -> Result<(), Box<dy
                 indicatif::HumanBytes(stats.entry_bytes)
             )?;
             writeln!(output, "Job checkpoints: {}", stats.checkpoints)?;
+            writeln!(
+                output,
+                "SQLite state bytes: {} ({})",
+                stats.state_bytes,
+                indicatif::HumanBytes(stats.state_bytes)
+            )?;
+            writeln!(
+                output,
+                "SQLite state limit: {} ({})",
+                stats.state_limit_bytes,
+                indicatif::HumanBytes(stats.state_limit_bytes)
+            )?;
             if stats.over_limit_bytes != 0 {
                 writeln!(
                     output,

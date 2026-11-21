@@ -270,7 +270,7 @@ fn skipped_source_has_no_digest_and_cannot_be_reused_as_verified() -> Result<(),
 }
 
 #[test]
-fn strict_reuse_charges_the_complete_source_verification() -> Result<(), Box<dyn Error>> {
+fn reuse_charges_the_complete_source_verification() -> Result<(), Box<dyn Error>> {
     const LENGTH: u64 = 2 * 1024 * 1024;
     let directory = tempfile::tempdir()?;
     let input = directory.path().join("source.bin");
@@ -290,17 +290,19 @@ fn strict_reuse_charges_the_complete_source_verification() -> Result<(), Box<dyn
         },
     };
     assert!(!super::run(&options, &mut Vec::new())?);
-    options.recovery.strict_cache = true;
-    let job = Job::new("strict source quota");
-    let mut status = Vec::new();
-    assert!(!super::run_with_job(&options, &mut status, &job)?);
-    assert!(String::from_utf8(status)?.contains("Reused existing"));
-    let reads = job
-        .snapshot()?
-        .counters
-        .get(&Counter::SourceReadBytes)
-        .copied()
-        .ok_or("source read counter missing")?;
-    assert!(reads >= LENGTH && reads <= options.recovery.source_read_limit);
+    for strict in [false, true] {
+        options.recovery.strict_cache = strict;
+        let job = Job::new("source quota");
+        let mut status = Vec::new();
+        assert!(!super::run_with_job(&options, &mut status, &job)?);
+        assert!(String::from_utf8(status)?.contains("Reused existing"));
+        let reads = job
+            .snapshot()?
+            .counters
+            .get(&Counter::SourceReadBytes)
+            .copied()
+            .ok_or("source read counter missing")?;
+        assert!(reads >= LENGTH && reads <= options.recovery.source_read_limit);
+    }
     Ok(())
 }

@@ -87,17 +87,14 @@ def test_package_records_provenance_and_one_checksum_per_deliverable(tmp_path):
             Path(__file__).resolve().parents[2] / "NOTICE-JEMALLOC.txt"
         ).read_bytes()
 
-    # Compare with the actual release workflow so its recipe cannot silently drift
-    workflow = (
-        Path(__file__).resolve().parents[2] / ".github/workflows/release-linux.yml"
-    ).read_text()
-    build_step = workflow.split("      - name: Build Linux release candidate\n", 1)[
-        1
-    ].split("\n\n", 1)[0]
-    build_recipe = " ".join(line.strip() for line in build_step.splitlines()[1:])
+    build_recipe = (
+        "cargo build --locked --release --package l2-cli --package l2-active-cli "
+        "--package l2-active-linux --bin l2solver --bin l2solver-active "
+        "--bin l2solver-active-helper --target x86_64-unknown-linux-gnu"
+    )
 
     assert provenance == {
-        "schema_version": 3,
+        "schema_version": 4,
         "source_commit": "a" * 40,
         "source_tree": "b" * 40,
         "toolchain": {
@@ -116,6 +113,7 @@ def test_package_records_provenance_and_one_checksum_per_deliverable(tmp_path):
         "build": {
             "command": build_recipe,
             "command_kind": "rebuild_recipe",
+            "source_binding": "unverified",
         },
         "binary": {
             "name": "l2solver",
@@ -171,6 +169,17 @@ def test_package_archive_is_byte_for_byte_repeatable(tmp_path):
     second, _ = package_release(binary, lockfile, tmp_path / "second", **metadata)
 
     assert first.read_bytes() == second.read_bytes()
+
+
+def test_package_rejects_wrong_build_record(tmp_path):
+    binary, lockfile = create_inputs(tmp_path)
+    metadata = {"source_commit": "b" * 40, "source_tree": "c" * 40,
+                "rustc_version": "rustc", "cargo_version": "cargo"}
+    record = {**metadata, "lock_sha256": hashlib.sha256(lockfile.read_bytes()).hexdigest(),
+              "artifacts": {name: "0" * 64 for name in ("l2solver", "l2solver-active", "l2solver-active-helper")}}
+    with pytest.raises(ValueError, match="build"):
+        package_release(binary, lockfile, tmp_path / "dist", build_record=record, **metadata)
+    assert not (tmp_path / "dist").exists()
 
 
 def test_package_refuses_existing_output_and_symlinked_binary(tmp_path):
@@ -298,21 +307,124 @@ def test_package_refuses_active_binary_changes_during_write(tmp_path, monkeypatc
     assert not (tmp_path / "dist").exists()
 
 
-def test_cli_refuses_to_publish_if_source_identity_changes_while_archiving(tmp_path, monkeypatch):
-    binary, lockfile = create_inputs(tmp_path)
-    states = iter([
-        {"source_commit": "a" * 40, "source_tree": "b" * 40, "rustc_version": "rustc", "cargo_version": "cargo"},
-        {"source_commit": "a" * 40, "source_tree": "c" * 40, "rustc_version": "rustc", "cargo_version": "cargo"},
-    ])
+@pytest.mark.parametrize("stage", ["build", "archive"])
+def test_cli_refuses_changed_source(tmp_path, monkeypatch, stage):
+    create_inputs(tmp_path)
+    before = {"source_commit": "a" * 40, "source_tree": "b" * 40, "rustc_version": "rustc", "cargo_version": "cargo"}
+    changed = {**before, "source_tree": "c" * 40}
+    states = iter([before, changed] if stage == "build" else [before, before, changed])
+    monkeypatch.setattr(packager, "ROOT", tmp_path)
     monkeypatch.setattr(packager, "_release_metadata", lambda: next(states))
+
+    def build(target):
+        binary, _ = create_inputs(target)
+        paths = [binary, binary.with_name("l2solver-active"), binary.with_name("l2solver-active-helper")]
+        return {path.name: (path, hashlib.sha256(path.read_bytes()).hexdigest()) for path in paths}
+
+    monkeypatch.setattr(packager, "_build_candidate", build, raising=False)
     output = tmp_path / "dist"
-    result = packager.main([
-        "--binary", str(binary), "--active-binary", str(binary.with_name("l2solver-active")),
-        "--helper-binary", str(binary.with_name("l2solver-active-helper")),
-        "--lockfile", str(lockfile), "--output-directory", str(output),
-    ])
+    result = packager.main(["--output-directory", str(output)])
     assert result != 0
     assert not output.exists()
+
+
+def test_cli_packages_observed_private_build(tmp_path, monkeypatch):
+    metadata = {"source_commit": "a" * 40, "source_tree": "b" * 40,
+                "rustc_version": "rustc", "cargo_version": "cargo"}
+    (tmp_path / "Cargo.lock").write_text("version = 4\n")
+    monkeypatch.setattr(packager, "ROOT", tmp_path)
+    monkeypatch.setattr(packager, "_release_metadata", lambda: metadata)
+    observed = []
+
+    def build(target):
+        observed.append(target.stat().st_mode & 0o777)
+        binary, _ = create_inputs(target)
+        paths = [binary, binary.with_name("l2solver-active"), binary.with_name("l2solver-active-helper")]
+        return {path.name: (path, hashlib.sha256(path.read_bytes()).hexdigest()) for path in paths}
+
+    monkeypatch.setattr(packager, "_build_candidate", build, raising=False)
+    output = tmp_path / "dist"
+    assert packager.main(["--output-directory", str(output)]) == 0
+    assert observed == [0o700]
+    with tarfile.open(output / ARCHIVE_NAME, "r:gz") as package:
+        provenance = json.load(package.extractfile("PROVENANCE.json"))
+    assert provenance["source_commit"] == metadata["source_commit"]
+    assert provenance["build"]["command_kind"] == "observed"
+    assert provenance["build"]["source_binding"] == "verified"
+
+
+def test_cli_rejects_changed_build_artifact(tmp_path, monkeypatch):
+    metadata = {"source_commit": "a" * 40, "source_tree": "b" * 40,
+                "rustc_version": "rustc", "cargo_version": "cargo"}
+    (tmp_path / "Cargo.lock").write_text("version = 4\n")
+    monkeypatch.setattr(packager, "ROOT", tmp_path)
+    monkeypatch.setattr(packager, "_release_metadata", lambda: metadata)
+
+    def build(target):
+        binary, _ = create_inputs(target)
+        paths = [binary, binary.with_name("l2solver-active"), binary.with_name("l2solver-active-helper")]
+        artifacts = {path.name: (path, hashlib.sha256(path.read_bytes()).hexdigest()) for path in paths}
+        binary.write_text("changed after Cargo reported the artifact")
+        return artifacts
+
+    monkeypatch.setattr(packager, "_build_candidate", build, raising=False)
+    output = tmp_path / "dist"
+    assert packager.main(["--output-directory", str(output)]) != 0
+    assert not output.exists()
+
+
+def test_cli_checks_output_before_build(tmp_path, monkeypatch):
+    metadata = {"source_commit": "a" * 40, "source_tree": "b" * 40,
+                "rustc_version": "rustc", "cargo_version": "cargo"}
+    (tmp_path / "Cargo.lock").write_text("version = 4\n")
+    output = tmp_path / "dist"
+    output.mkdir()
+    monkeypatch.setattr(packager, "ROOT", tmp_path)
+    monkeypatch.setattr(packager, "_release_metadata", lambda: metadata)
+    monkeypatch.setattr(packager, "_build_candidate", lambda _: pytest.fail("build started"))
+    assert packager.main(["--output-directory", str(output)]) != 0
+
+
+def test_cli_refuses_root_build(tmp_path, monkeypatch):
+    monkeypatch.setattr(packager.os, "geteuid", lambda: 0)
+    monkeypatch.setattr(packager, "ROOT", tmp_path)
+    monkeypatch.setattr(packager, "_release_metadata", dict)
+    (tmp_path / "Cargo.lock").write_text("version = 4\n")
+    monkeypatch.setattr(packager, "_build_candidate", lambda _: pytest.fail("root build started"))
+    assert packager.main(["--output-directory", str(tmp_path / "dist")]) != 0
+
+
+@pytest.mark.parametrize("case", ["complete", "missing", "compile-error"])
+def test_private_cargo_build_artifacts(tmp_path, monkeypatch, case):
+    source = tmp_path / "source"
+    (source / "src/bin").mkdir(parents=True)
+    (source / "Cargo.toml").write_text('[package]\nname = "fixture"\nversion = "0.1.0"\nedition = "2021"\n')
+    names = ("l2solver", "l2solver-active", "l2solver-active-helper")
+    for name in names[:-1] if case == "missing" else names:
+        text = "invalid rust" if case == "compile-error" and name == names[0] else f'fn main() {{ println!("{name}"); }}\n'
+        (source / "src/bin" / f"{name}.rs").write_text(text)
+    target = tmp_path / "target"
+    target.mkdir(mode=0o700)
+    foreign_build = tmp_path / "shared-build"
+    monkeypatch.setenv("CARGO_BUILD_BUILD_DIR", str(foreign_build))
+    monkeypatch.setenv("CARGO_BUILD_TARGET_DIR", str(tmp_path / "shared-target"))
+    monkeypatch.setattr(packager, "ROOT", source)
+    monkeypatch.setattr(packager, "OBSERVED_BUILD_COMMAND", (
+        "cargo", "build", "--offline", "--bins", "--message-format=json-render-diagnostics",
+    ))
+    if case != "complete":
+        expected = "complete executable set" if case == "missing" else "locked release build failed"
+        with pytest.raises(ValueError, match=expected):
+            packager._build_candidate(target)
+    else:
+        artifacts = packager._build_candidate(target)
+        assert set(artifacts) == set(names)
+        for name, (path, digest) in artifacts.items():
+            assert path.is_relative_to(target)
+            assert digest == hashlib.sha256(path.read_bytes()).hexdigest()
+            assert subprocess.check_output([str(path)], text=True).strip() == name
+    assert not foreign_build.exists()
+    assert not (tmp_path / "shared-target").exists()
 
 
 def test_release_metadata_records_clean_commit_and_tree_and_rejects_untracked_source(tmp_path, monkeypatch):

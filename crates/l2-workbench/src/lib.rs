@@ -21,6 +21,7 @@ pub mod protocol;
 pub mod query;
 pub mod reconstruction;
 pub mod recovery;
+pub mod storage;
 pub mod store;
 pub mod tcp_range;
 pub mod tshark;

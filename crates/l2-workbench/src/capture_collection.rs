@@ -9,6 +9,10 @@ use std::error::Error as StdError;
 #[derive(Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 struct SummaryJson {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    authority: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    acquisition_quality: Option<String>,
     sections: u64,
     reported_sections: u64,
     incomplete_sections: u64,
@@ -18,11 +22,19 @@ struct SummaryJson {
     packet_block_packets_dropped: u64,
     #[serde(default)]
     packet_blocks_with_unavailable_drop_count: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    enhanced_packet_packets_dropped: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    interface_statistics_interface_dropped: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    interface_statistics_os_dropped: Option<u64>,
 }
 
 impl From<CollectionSummary> for SummaryJson {
     fn from(summary: CollectionSummary) -> Self {
         Self {
+            authority: Some(summary.authority().as_str().to_owned()),
+            acquisition_quality: Some("unverified".to_owned()),
             sections: summary.sections,
             reported_sections: summary.reported_sections,
             incomplete_sections: summary.incomplete_sections,
@@ -31,6 +43,9 @@ impl From<CollectionSummary> for SummaryJson {
             packet_block_packets_dropped: summary.packet_block_packets_dropped,
             packet_blocks_with_unavailable_drop_count: summary
                 .packet_blocks_with_unavailable_drop_count,
+            enhanced_packet_packets_dropped: summary.enhanced_packet_packets_dropped,
+            interface_statistics_interface_dropped: summary.interface_statistics_interface_dropped,
+            interface_statistics_os_dropped: summary.interface_statistics_os_dropped,
         }
     }
 }
@@ -44,7 +59,7 @@ impl TryFrom<SummaryJson> for CollectionSummary {
         {
             return Err("collection summary counters are inconsistent");
         }
-        Ok(Self {
+        let summary = Self {
             sections: value.sections,
             reported_sections: value.reported_sections,
             incomplete_sections: value.incomplete_sections,
@@ -53,7 +68,23 @@ impl TryFrom<SummaryJson> for CollectionSummary {
             packet_block_packets_dropped: value.packet_block_packets_dropped,
             packet_blocks_with_unavailable_drop_count: value
                 .packet_blocks_with_unavailable_drop_count,
-        })
+            enhanced_packet_packets_dropped: value.enhanced_packet_packets_dropped,
+            interface_statistics_interface_dropped: value.interface_statistics_interface_dropped,
+            interface_statistics_os_dropped: value.interface_statistics_os_dropped,
+        };
+        // Old stored summaries lack these fields; new ones cannot assert trust
+        if value
+            .authority
+            .as_deref()
+            .is_some_and(|authority| authority != summary.authority().as_str())
+            || value
+                .acquisition_quality
+                .as_deref()
+                .is_some_and(|quality| quality != "unverified")
+        {
+            return Err("collection summary authority is inconsistent");
+        }
+        Ok(summary)
     }
 }
 
@@ -94,18 +125,17 @@ pub fn to_value(summary: CollectionSummary) -> Result<Value, Error> {
     serde_json::to_value(SummaryJson::from(summary))
 }
 
-/// Return whether any collection section lacks a source declaration
-#[must_use]
-pub const fn has_unknown_quality(summary: CollectionSummary) -> bool {
-    summary.reported_sections == 0 || summary.sections > summary.reported_sections
-}
-
 /// Return whether a source declaration reports incomplete collection
 #[must_use]
 pub const fn reports_incomplete_collection(summary: CollectionSummary) -> bool {
     summary.incomplete_sections > 0
+        || summary.capture_dropped > 0
+        || summary.interface_dropped > 0
         || summary.packet_block_packets_dropped > 0
         || summary.packet_blocks_with_unavailable_drop_count > 0
+        || matches!(summary.enhanced_packet_packets_dropped, Some(1..))
+        || matches!(summary.interface_statistics_interface_dropped, Some(1..))
+        || matches!(summary.interface_statistics_os_dropped, Some(1..))
 }
 
 /// Add source-reported collection quality to an analysis Case
@@ -142,11 +172,10 @@ pub fn apply_to_case(
         }
         Err(error) => return Err(error.into()),
     }
-    if has_unknown_quality(summary) {
-        result.case.add_limitation(&format!(
-            "Source {source_id} has unknown collection quality for one or more sections; analysis is scoped to captured bytes"
-        ))?;
-    }
+    result.case.add_limitation(&format!(
+        "Source {source_id} acquisition quality is unverified (authority: {}); analysis is scoped to captured bytes",
+        summary.authority().as_str()
+    ))?;
     if summary.incomplete_sections > 0 {
         result.case.add_limitation(&format!(
             "Source {source_id} reports {} incomplete collection sections; analysis is scoped to the packets present",
@@ -163,6 +192,21 @@ pub fn apply_to_case(
         result.case.add_limitation(&format!(
             "Source {source_id} has {} obsolete Packet Blocks with an unavailable drop count; analysis is scoped to the packets present",
             summary.packet_blocks_with_unavailable_drop_count
+        ))?;
+    }
+    if let Some(drops @ 1..) = summary.enhanced_packet_packets_dropped {
+        result.case.add_limitation(&format!(
+            "Source {source_id} reports {drops} packets dropped between enhanced packets; analysis is scoped to the packets present"
+        ))?;
+    }
+    if let Some(drops @ 1..) = summary.interface_statistics_interface_dropped {
+        result.case.add_limitation(&format!(
+            "Source {source_id} reports {drops} interface drops in cumulative statistics; analysis is scoped to the packets present"
+        ))?;
+    }
+    if let Some(drops @ 1..) = summary.interface_statistics_os_dropped {
+        result.case.add_limitation(&format!(
+            "Source {source_id} reports {drops} operating-system drops in cumulative statistics; analysis is scoped to the packets present"
         ))?;
     }
     if reports_incomplete_collection(summary) {

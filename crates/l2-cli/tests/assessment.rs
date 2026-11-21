@@ -3,6 +3,9 @@ mod capture_paths;
 #[path = "../../../tests/fixtures/captures.rs"]
 pub mod captures;
 
+#[path = "assessment/limits.rs"]
+mod limits;
+
 use std::{
     path::PathBuf,
     process::{Command, Stdio},
@@ -34,8 +37,8 @@ mod text {
                 .is_some_and(|surface| findings < surface)
         }));
         assert!(text.contains("LLDP neighbor metadata is visible"));
-        assert!(text.contains("Capture"));
-        assert!(text.contains("COMPLETE"));
+        assert!(text.contains("Analysis     COMPLETE"));
+        assert!(text.contains("Acquisition  UNVERIFIED"));
         assert!(text.contains("Use -v for inventory and packet references"));
         assert!(!text.contains("\nInventory\n"));
         assert!(!text.contains("SEG-001"));

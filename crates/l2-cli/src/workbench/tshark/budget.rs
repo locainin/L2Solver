@@ -124,25 +124,6 @@ impl ObjectFileSnapshot {
     pub(super) fn matches(self, metadata: &Metadata) -> bool {
         Self::from_metadata(metadata) == Some(self)
     }
-
-    pub(super) fn matches_after_move(self, metadata: &Metadata) -> bool {
-        let Some(current) = Self::from_metadata(metadata) else {
-            return false;
-        };
-        #[cfg(unix)]
-        {
-            self.length == current.length
-                && self.device == current.device
-                && self.inode == current.inode
-                && self.modified_seconds == current.modified_seconds
-                && self.modified_nanoseconds == current.modified_nanoseconds
-        }
-        #[cfg(not(unix))]
-        {
-            let _ = current;
-            false
-        }
-    }
 }
 
 impl ObjectExportLimit {

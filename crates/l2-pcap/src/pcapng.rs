@@ -8,13 +8,14 @@ use crate::{
     CaptureLimits, Error,
     header::ByteOrder,
     pcapng_blocks::{
-        Block, ENHANCED_PACKET_BLOCK, INTERFACE_DESCRIPTION_BLOCK, PACKET_BLOCK,
-        SECTION_HEADER_BLOCK, SECTION_HEADER_MIN_LENGTH, SIMPLE_PACKET_BLOCK, parse_section_header,
-        read_block,
+        Block, ENHANCED_PACKET_BLOCK, INTERFACE_DESCRIPTION_BLOCK, INTERFACE_STATISTICS_BLOCK,
+        PACKET_BLOCK, SECTION_HEADER_BLOCK, SECTION_HEADER_MIN_LENGTH, SIMPLE_PACKET_BLOCK,
+        parse_section_header, read_block,
     },
     pcapng_interfaces::parse_interface,
     pcapng_model::InterfaceDescription,
     pcapng_packets::{decode_enhanced_packet, decode_packet_block, decode_simple_packet},
+    pcapng_statistics::{self, Statistics},
 };
 
 const MAX_INTERFACES: u32 = 64;
@@ -28,6 +29,7 @@ pub struct PcapNgReader<R: Read> {
     section: u32,
     order: ByteOrder,
     current_interfaces: Vec<InterfaceDescription>,
+    interface_statistics: Vec<Statistics>,
     collection_summary: crate::CollectionSummary,
     terminated: bool,
 }
@@ -57,6 +59,7 @@ impl<R: Read> PcapNgReader<R> {
             section: 0,
             order: ByteOrder::Little,
             current_interfaces: Vec::new(),
+            interface_statistics: Vec::new(),
             collection_summary: crate::CollectionSummary::default(),
             terminated: false,
         };
@@ -160,9 +163,19 @@ impl<R: Read> PcapNgReader<R> {
                         &self.current_interfaces,
                         block_offset,
                     )?;
+                    if let Some(drops) = packet.drops_count {
+                        let total = self
+                            .collection_summary
+                            .enhanced_packet_packets_dropped
+                            .unwrap_or(0)
+                            .checked_add(drops)
+                            .ok_or(Error::LossCounterOverflow)?;
+                        self.collection_summary.enhanced_packet_packets_dropped = Some(total);
+                    }
                     self.records_read += 1;
-                    return Ok(Some(packet));
+                    return Ok(Some(packet.frame));
                 }
+                INTERFACE_STATISTICS_BLOCK => self.observe_statistics(&bytes, block.order)?,
                 SIMPLE_PACKET_BLOCK => {
                     let packet = decode_simple_packet(
                         &bytes,
@@ -198,6 +211,7 @@ impl<R: Read> PcapNgReader<R> {
         self.collection_summary
             .observe(parse_section_header(bytes, block.order)?);
         self.current_interfaces.clear();
+        self.interface_statistics.clear();
         Ok(())
     }
 
@@ -221,6 +235,23 @@ impl<R: Read> PcapNgReader<R> {
             },
         )?;
         self.current_interfaces.push(description);
+        self.interface_statistics.push(Statistics::default());
         Ok(())
+    }
+
+    fn observe_statistics(&mut self, bytes: &[u8], order: ByteOrder) -> Result<(), Error> {
+        let (index, statistics) = pcapng_statistics::decode(bytes, order)?;
+        let position = usize::try_from(index).map_err(|_| Error::UnknownInterface {
+            section: self.section,
+            index,
+        })?;
+        let previous =
+            self.interface_statistics
+                .get_mut(position)
+                .ok_or(Error::UnknownInterface {
+                    section: self.section,
+                    index,
+                })?;
+        pcapng_statistics::observe(&mut self.collection_summary, previous, statistics)
     }
 }

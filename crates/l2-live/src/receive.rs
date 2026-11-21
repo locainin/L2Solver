@@ -12,6 +12,10 @@ use std::{
 #[path = "../tests/statistics/internal.rs"]
 mod statistics_tests;
 
+#[cfg(all(test, target_os = "linux"))]
+#[path = "../tests/receive/delivery.rs"]
+mod delivery_tests;
+
 /// Libpcap counters with their evidence-strength limitation made explicit
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct LiveStatistics {
@@ -77,6 +81,9 @@ impl LiveLink {
     }
 
     /// Open a supported data-link interface with explicit packet and duration limits
+    ///
+    /// The sysfs mount must show the calling thread's network namespace, because
+    /// a sysfs mount retains the namespace in which it was created
     ///
     /// # Errors
     /// Returns an error for unknown interfaces, unsupported datalinks, invalid limits or missing permissions
@@ -152,7 +159,10 @@ impl LiveLink {
         self.link_type
     }
 
-    /// Return the namespace and kernel interface bound to the capture socket
+    /// Return the checked namespace and interface identity for this live handle
+    ///
+    /// The interface object comes from the sysfs mount, which must show the
+    /// calling thread's network namespace
     ///
     /// # Errors
     /// Returns an error when the retained descriptors, name binding, socket
@@ -198,6 +208,12 @@ impl LinkIo for LiveLink {
                     )?;
                     // A change during acquisition invalidates the copied frame
                     self.revalidate_interface()?;
+                    #[cfg(all(test, target_os = "linux"))]
+                    delivery_tests::before_delivery();
+                    // A frame acquired too late cannot satisfy the packet limit
+                    if self.budget.poll(Instant::now()).is_some() {
+                        return Ok(None);
+                    }
                     self.budget.consume_packet();
                     return Ok(Some(frame));
                 }

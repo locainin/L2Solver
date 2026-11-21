@@ -132,7 +132,7 @@ const fn retryable_observation(error: MemoryError) -> bool {
     )
 }
 
-fn startup_growth(case: &Case) -> Result<u64, Box<dyn Error>> {
+pub(super) fn startup_growth(case: &Case) -> Result<u64, Box<dyn Error>> {
     let usage = case.resource_usage();
     let retained = match case.charged_memory_bytes() {
         Some(bytes) => bytes,

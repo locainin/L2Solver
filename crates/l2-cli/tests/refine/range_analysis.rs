@@ -260,10 +260,10 @@ fn large_sparse_input_carves_validated_cross_window_ranges_without_a_source_blob
     ))?;
     file.read_exact(&mut original_png)?;
     assert_eq!(original_png, png);
-    assert_fast_reuse(&options)
+    assert_warm_reuse(&options)
 }
 
-fn assert_fast_reuse(options: &RefineOptions) -> Result<(), Box<dyn Error>> {
+fn assert_warm_reuse(options: &RefineOptions) -> Result<(), Box<dyn Error>> {
     let job = l2_workbench::job::Job::new("large warm reuse");
     let mut reused_output = Vec::new();
     assert!(!run_with_job(options, &mut reused_output, &job)?);

@@ -8,12 +8,13 @@ ROOT = Path(__file__).resolve().parents[2]
 
 def test_review_upload_follows_candidate_checks_and_is_labeled_unqualified():
     workflow = (ROOT / ".github/workflows/release-linux.yml").read_text()
-    package = workflow.index("- name: Package build provenance and checksum")
+    package = workflow.index("- name: Build Linux release candidate")
     candidate = workflow.index(
         "- name: Check packaged executable and record blocked release work"
     )
     upload = workflow.index("- name: Upload unqualified review candidate")
     assert package < candidate < upload
+    assert "benchmarks.package_release" in workflow[package:candidate]
     candidate_step = workflow[candidate:upload]
     assert "benchmarks.qualification" in candidate_step
     assert "--candidate-only" in candidate_step

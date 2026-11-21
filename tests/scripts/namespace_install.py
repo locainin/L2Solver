@@ -1,11 +1,12 @@
 """Exercise the real privileged entry point inside an isolated tmpfs and chroot."""
 import errno
+import hashlib
 import json
 import os
-from pathlib import Path
 import shutil
 import subprocess
 import sys
+from pathlib import Path
 
 # Use the same synthetic HTTP builder as package qualification
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
@@ -114,10 +115,13 @@ def main():
     root.mkdir()
     # This tmpfs and every bind mount exist only in the private mount namespace
     binaries = Path(sys.argv[5]) if len(sys.argv) > 5 else None
-    # Payload and three installed generations coexist during the real lifecycle
-    size = str(sum((binaries / name).stat().st_size for name in (
-        "l2solver", "l2solver-active", "l2solver-active-helper",
-    )) * 4 + 64 * 1024 * 1024) if binaries else "32m"
+    size = "32m"
+    if binaries:
+        payload_bytes = sum((binaries / name).stat().st_size for name in (
+            "l2solver", "l2solver-active", "l2solver-active-helper",
+        ))
+        # The source, verified copy, two retained generations and new stage coexist
+        size = str(5 * payload_bytes + 64 * 1024 * 1024)
     run(["mount", "-t", "tmpfs", "-o", f"size={size},mode=755", "tmpfs", str(root)])
     (root / "usr").mkdir()
     run(["mount", "--bind", "/usr", str(root / "usr")])
@@ -131,10 +135,11 @@ def main():
             run(["mount", "--bind", str(source), str(root / name)])
             run(["mount", "-o", "remount,bind,ro", str(root / name)])
     (root / "stage/payload").mkdir(parents=True)
+    (root / "tmp").mkdir()
+    (root / "tmp").chmod(0o1777)
     if binaries:
-        for name in ("proc", "sys", "dev", "tmp"):
+        for name in ("proc", "sys", "dev"):
             (root / name).mkdir()
-        (root / "tmp").chmod(0o1777)
         run(["mount", "-t", "proc", "-o", "nosuid,nodev,noexec", "proc", str(root / "proc")])
         run(["mount", "-t", "sysfs", "-o", "ro,nosuid,nodev,noexec", "sysfs", str(root / "sys")])
         (root / "dev/null").touch()
@@ -164,6 +169,14 @@ def main():
         return run(["chroot", str(root), *args], success=success)
 
     def publish(*args, success=True):
+        if "--payload" in args:
+            names = ("l2solver", "l2solver-active", "l2solver-active-helper", "bash", "zsh", "fish", "NOTICE-JEMALLOC.txt", "receipt.json")
+            # Approve each complete fixture as the administrator in this private filesystem
+            if all((payload / name).is_file() for name in names):
+                files = {name: {"sha256": hashlib.sha256((payload / name).read_bytes()).hexdigest(),
+                                "size": (payload / name).stat().st_size} for name in names}
+                (root / "stage/approved.json").write_text(json.dumps({"schema": 1, "files": files}))
+            args = (*args, "--expected-manifest", "/stage/approved.json")
         return execute("/usr/bin/python3", "-I", "/stage/system_install.py", *args, success=success)
 
     getcap = "/usr/sbin/getcap" if (root / "usr/sbin/getcap").exists() else "/usr/bin/getcap"
@@ -337,7 +350,7 @@ else:
     # A lack of CAP_SETFCAP must refuse publication of a separate active install
     denied = execute(
         capsh, "--drop=cap_setfcap", "--", "-c",
-        "/usr/bin/python3 -I /stage/system_install.py --payload /stage/payload --prefix /blocked --enable-active",
+        "/usr/bin/python3 -I /stage/system_install.py --payload /stage/payload --expected-manifest /stage/approved.json --prefix /blocked --enable-active",
         success=False,
     )
     assert denied.returncode != 0

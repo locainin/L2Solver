@@ -45,7 +45,7 @@ pub enum CacheError {
     SizeOverflow,
     /// An entry cannot fit without evicting protected cache data
     QuotaExceeded {
-        /// Configured limit for indexed stage files
+        /// Applicable limit for indexed stage files or cache state
         limit_bytes: u64,
         /// Minimum bytes needed after safe eviction
         required_bytes: u64,
@@ -120,6 +120,11 @@ impl From<serde_json::Error> for CacheError {
 impl From<rusqlite::Error> for CacheError {
     fn from(error: rusqlite::Error) -> Self {
         match &error {
+            rusqlite::Error::SqliteFailure(code, _)
+                if code.code == rusqlite::ErrorCode::OperationInterrupted =>
+            {
+                Self::CacheBusy
+            }
             rusqlite::Error::SqliteFailure(code, _)
                 if matches!(
                     code.code,

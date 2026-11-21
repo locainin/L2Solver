@@ -40,6 +40,9 @@ pub(super) fn run(
             manifest_sha256,
             raw_collection_complete: manifest.raw_collection_complete,
             analysis_complete: manifest.analysis_complete,
+            acquisition_quality: crate::source_collection::AcquisitionQuality::unverified(
+                manifest.source.collection_summary.authority(),
+            ),
         })
     })?;
     write_receipt(output, format, directory, &receipt)?;
@@ -59,10 +62,11 @@ fn write_receipt(
             writeln!(output, "Created stream directory: {}", path.escape_debug())?;
             writeln!(
                 output,
-                "Pages: {}; raw collection: {}; analysis: {}",
+                "Pages: {}; raw records retained: {}; analysis: {}; acquisition: unverified (authority={})",
                 receipt.pages,
                 completeness(receipt.raw_collection_complete),
-                completeness(receipt.analysis_complete)
+                completeness(receipt.analysis_complete),
+                receipt.acquisition_quality.authority
             )?;
         }
         OutputFormat::Html => return Err("directory summaries support only text or JSON".into()),

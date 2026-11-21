@@ -64,7 +64,7 @@ fn run_with_memory_budget(
         .output
         .clone()
         .unwrap_or_else(|| output::default_output_path(&options.input));
-    let result_directory = ResultDirectory::inspect(&destination, ResultKind::Refine)?;
+    let result_directory = ResultDirectory::inspect(&destination, ResultKind::Refine, job)?;
     let policy = RefinePolicy::new(&options.recovery, options.salvage)?;
     let input_set =
         input::prepare_input_set_with_limit(&options.input, policy.source_read_limit, job, memory)?;
@@ -281,7 +281,7 @@ fn analyze_and_publish<W: Write>(
         job.finish(Phase::Publication, PhaseOutcome::Skipped)?;
     } else {
         job.check_cancelled()?;
-        result_directory.publish(identity, job, |staging| {
+        let ((), retained) = result_directory.publish(identity, job, |staging| {
             artifact_export::write_artifacts_into(staging, &selected)?;
             write_file_artifacts(
                 input_set,
@@ -304,6 +304,9 @@ fn analyze_and_publish<W: Write>(
             }
             Ok(())
         })?;
+        if let Some(retained) = retained {
+            crate::publication_transition::retained_notice(&retained, options.recovery.progress);
+        }
     }
     if !options.recovery.quiet {
         output::write_summary(

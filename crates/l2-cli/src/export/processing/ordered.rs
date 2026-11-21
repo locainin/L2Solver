@@ -50,7 +50,7 @@ where
     let mut pending = VecDeque::from(items);
     let (sender, receiver) = mpsc::sync_channel(count);
     pool.in_place_scope_fifo(|scope| {
-        let outcome = (|| {
+        let outcome: CollectedResult<()> = (|| {
             let mut next = 0;
             let mut active = 0;
             let mut admission_failed = false;
@@ -106,18 +106,45 @@ where
                     io::Error::other("recovery worker stopped before producing all results")
                 })?;
                 active -= 1;
-                store_result(
-                    &mut waiting,
-                    index,
-                    result.map_err(|error| error as Box<dyn Error>),
-                )?;
+                let result = result.map_err(|error| error as Box<dyn Error>);
+                store_result(&mut waiting, index, result)?;
             }
             Ok(())
         })();
-        // Workers can finish without blocking when publication or admission fails
-        drop(receiver);
-        outcome
+        drop(sender);
+        match outcome {
+            Err(error) if crate::recovery_job::is_cancellation(error.as_ref()) => {
+                finish_cancelled(waiting, receiver, error)
+            }
+            // Scope teardown joins workers even when a fatal failure ends publication
+            other => other,
+        }
     })
+}
+
+fn finish_cancelled<T>(
+    mut waiting: Vec<Option<CollectedResult<T>>>,
+    receiver: mpsc::Receiver<(usize, WorkerResult<T>)>,
+    cancellation: Box<dyn Error>,
+) -> CollectedResult<()> {
+    // Release retained Cases before waiting for workers that may need their memory
+    for slot in &mut waiting {
+        if matches!(slot, Some(Ok(_))) {
+            slot.take();
+        }
+    }
+    // Each admitted worker owns one sender; closure proves every completion was observed
+    for (index, result) in receiver {
+        if let Err(error) = result {
+            store_result(&mut waiting, index, Err(error as Box<dyn Error>))?;
+        }
+    }
+    let failure = waiting.into_iter().flatten().find_map(|result| {
+        result
+            .err()
+            .filter(|error| !crate::recovery_job::is_cancellation(error.as_ref()))
+    });
+    Err(failure.unwrap_or(cancellation))
 }
 
 fn store_result<T>(

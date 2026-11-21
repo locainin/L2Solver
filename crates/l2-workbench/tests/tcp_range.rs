@@ -328,3 +328,28 @@ fn range_supports_large_lengths() -> Result<(), Box<dyn Error>> {
     );
     Ok(())
 }
+
+#[test]
+fn alternating_conflicts_bound_spans() -> Result<(), Box<dyn Error>> {
+    let length = 32_768;
+    let base = vec![b'a'; length];
+    let conflict: Vec<_> = (0..length)
+        .map(|index| if index % 2 == 0 { b'a' } else { b'x' })
+        .collect();
+    let mut range = TcpRange::new(0, length)?;
+    range.observe(segment(0, 0x10, &base))?;
+    range.observe(segment(0, 0x10, &conflict))?;
+    let report = range.finish();
+    assert_eq!(report.conflicting_bytes, length / 2);
+    let detail_limit = l2_workbench::evidence::MAX_NODES / 16;
+    assert_eq!(report.spans.len(), detail_limit + 1);
+    assert_eq!(report.omitted_bytes, length - detail_limit);
+    assert!(!report.has_unique_coverage());
+    let omitted = report.spans.last().ok_or("missing omitted suffix")?;
+    assert_eq!(omitted.offset, detail_limit);
+    assert_eq!(omitted.length, length - detail_limit);
+    assert_eq!(omitted.status, SpanStatus::Omitted);
+    assert!(omitted.omitted_observation);
+    assert!(omitted.bytes.is_none());
+    Ok(())
+}

@@ -5,6 +5,41 @@ use l2_workbench::job::{Counter, Phase};
 use serde_json::json;
 
 #[test]
+fn concurrent_job_checkpoint_owner_is_rejected() -> Result<(), Box<dyn Error>> {
+    let temporary = tempfile::tempdir()?;
+    let cache = Cache::open_at(
+        temporary.path().join("cache"),
+        temporary.path().join("state"),
+        1024 * 1024,
+    )?;
+    let identity = ResultIdentity {
+        kind: ResultKind::Extract,
+        algorithm_version: 2,
+        source: SourceIdentity::from_sha256("a".repeat(64))?,
+        settings: json!({"profile":"normal"}),
+    };
+    let first = Job::new("first job");
+    let writer = CheckpointWriter::start(&cache, &identity, &first, false)?;
+    first.increment(Counter::Packets, 13)?;
+
+    let competing = Job::new("competing job");
+    assert!(matches!(
+        CheckpointWriter::start(&cache, &identity, &competing, false),
+        Err(CheckpointError::Cache(CacheError::LockBusy))
+    ));
+    writer.finish(false)?;
+
+    let resumed = Job::new("resumed job");
+    let resumed_writer = CheckpointWriter::start(&cache, &identity, &resumed, false)?;
+    assert_eq!(
+        resumed.snapshot()?.counters.get(&Counter::Packets),
+        Some(&13)
+    );
+    resumed_writer.finish(true)?;
+    Ok(())
+}
+
+#[test]
 fn job_checkpoint_does_not_replay_a_cases_uncommitted_progress() -> Result<(), Box<dyn Error>> {
     let temporary = tempfile::tempdir()?;
     let cache = Cache::open_at(

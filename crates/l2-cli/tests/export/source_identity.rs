@@ -9,31 +9,18 @@ use crate::workbench::{
 use l2_workbench::{sha256, tshark::SourceIdentity};
 
 #[test]
-fn accepts_matching_capture_identity() -> Result<(), Box<dyn std::error::Error>> {
+fn capture_identity_comparison() -> Result<(), Box<dyn std::error::Error>> {
     let bytes = b"capture bytes";
     let digest = sha256(bytes);
     let source = source_coverage(bytes, &digest)?;
-    let identity = SourceIdentity {
-        label: String::from("capture.pcap"),
-        length: u64::try_from(bytes.len())?,
-        sha256: digest,
-    };
-
-    assert!(capture_identity_matches(&source, &identity));
-    Ok(())
-}
-
-#[test]
-fn rejects_different_capture_identity() -> Result<(), Box<dyn std::error::Error>> {
-    let bytes = b"capture bytes";
-    let source = source_coverage(bytes, &sha256(bytes))?;
-    let identity = SourceIdentity {
-        label: String::from("capture.pcap"),
-        length: u64::try_from(bytes.len())?,
-        sha256: sha256(b"changed capture bytes"),
-    };
-
-    assert!(!capture_identity_matches(&source, &identity));
+    for (hash, expected) in [(digest, true), (sha256(b"changed capture bytes"), false)] {
+        let identity = SourceIdentity {
+            label: String::from("capture.pcap"),
+            length: u64::try_from(bytes.len())?,
+            sha256: hash,
+        };
+        assert_eq!(capture_identity_matches(&source, &identity), expected);
+    }
     Ok(())
 }
 
@@ -50,9 +37,9 @@ fn mismatch_omits_tshark_objects() -> Result<(), Box<dyn std::error::Error>> {
     let missing_directory = temporary.path().join("must-not-be-read");
     let mut artifacts = ArtifactCollection::new(temporary.path(), ArtifactLimits::default())?;
     let objects = ExportObjectSet {
-        temporary_directory: tempfile::tempdir()?,
+        containment: None,
+        temporary_directory: crate::workbench::Workspace::new(None)?,
         directories: vec![(String::from("http"), missing_directory)],
-        partial_directories: Vec::new(),
         source_identity: identity,
         budget: ObjectExportBudget {
             temporary_bytes: 1,
@@ -83,46 +70,6 @@ fn mismatch_omits_tshark_objects() -> Result<(), Box<dyn std::error::Error>> {
 }
 
 #[test]
-fn partial_tshark_export_does_not_publish_unfinished_objects()
--> Result<(), Box<dyn std::error::Error>> {
-    let bytes = b"capture bytes";
-    let digest = sha256(bytes);
-    let source = source_coverage(bytes, &digest)?;
-    let temporary = tempfile::tempdir()?;
-    let staging = temporary.path().join("staging");
-    let object_directory = temporary.path().join("objects");
-    std::fs::create_dir(&staging)?;
-    std::fs::create_dir(&object_directory)?;
-    std::fs::write(object_directory.join("partial.bin"), b"not proven complete")?;
-    let mut artifacts = ArtifactCollection::new(&staging, ArtifactLimits::default())?;
-    let objects = ExportObjectSet {
-        temporary_directory: tempfile::tempdir()?,
-        directories: vec![(String::from("http"), object_directory)],
-        partial_directories: Vec::new(),
-        source_identity: SourceIdentity {
-            label: String::from("capture.pcap"),
-            length: u64::try_from(bytes.len())?,
-            sha256: digest,
-        },
-        budget: ObjectExportBudget::default(),
-        usage: ObjectExportUsage::default(),
-        status: ObjectExportStatus::Partial,
-        issues: vec![String::from("temporary object limit reached")],
-    };
-
-    let (collection, issue) =
-        collect_matching_tshark_snapshot(&source, &objects, &mut artifacts, None)?;
-
-    assert_eq!(collection.objects_exported, 0);
-    assert_eq!(artifacts.coverage().references_selected, 0);
-    assert_eq!(collection.export_status, Some(ObjectExportStatus::Partial));
-    assert!(issue.is_none());
-    assert_eq!(collection.issues, objects.issues);
-    assert!(!tshark_is_complete(&collection, None));
-    Ok(())
-}
-
-#[test]
 fn partial_tshark_export_preserves_verified_objects_and_exact_limit_receipt()
 -> Result<(), Box<dyn std::error::Error>> {
     let bytes = b"capture bytes";
@@ -146,9 +93,9 @@ fn partial_tshark_export_preserves_verified_objects_and_exact_limit_receipt()
         "`TShark` object export stopped after observing temporary bytes above its budget of 8 (observed 15; tree-entry limits stop at the first extra entry, while byte and file totals may overshoot between scans)",
     );
     let objects = ExportObjectSet {
-        temporary_directory: tempfile::tempdir()?,
-        directories: Vec::new(),
-        partial_directories: vec![(String::from("http"), object_directory)],
+        containment: None,
+        temporary_directory: crate::workbench::Workspace::new(None)?,
+        directories: vec![(String::from("http"), object_directory)],
         source_identity: SourceIdentity {
             label: String::from("capture.pcap"),
             length: u64::try_from(bytes.len())?,

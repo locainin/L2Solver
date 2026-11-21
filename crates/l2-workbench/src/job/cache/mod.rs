@@ -11,6 +11,7 @@ mod manager;
 mod manifest;
 mod memory;
 mod model;
+mod pairing;
 mod retired;
 
 pub use entry::{CacheEntry, CommitOutcome, Lease};
@@ -20,7 +21,7 @@ pub use execution::{
 };
 pub use fingerprint::{FileTimestamp, SourceFingerprint, SourceIdentity};
 pub use key::StageKey;
-pub use manager::Cache;
+pub use manager::{Cache, JobCheckpointOwner};
 pub use model::{
     CacheReadPolicy, CacheStats, Checkpoint, CheckpointStatus, JOB_SNAPSHOT_VERSION, PruneReport,
     StageStatus,

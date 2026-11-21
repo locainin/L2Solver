@@ -13,6 +13,7 @@ pub const SECTION_HEADER_BLOCK: u32 = 0x0a0d_0d0a;
 pub const INTERFACE_DESCRIPTION_BLOCK: u32 = 1;
 pub const PACKET_BLOCK: u32 = 2;
 pub const SIMPLE_PACKET_BLOCK: u32 = 3;
+pub const INTERFACE_STATISTICS_BLOCK: u32 = 5;
 pub const ENHANCED_PACKET_BLOCK: u32 = 6;
 pub const BYTE_ORDER_MAGIC: u32 = 0x1a2b_3c4d;
 pub const GENERAL_HEADER_LENGTH: usize = 8;
@@ -114,6 +115,17 @@ pub fn read_i64(bytes: &[u8], offset: usize, order: ByteOrder) -> Result<i64, Er
     Ok(match order {
         ByteOrder::Little => i64::from_le_bytes(value),
         ByteOrder::Big => i64::from_be_bytes(value),
+    })
+}
+
+pub fn read_u64(bytes: &[u8], offset: usize, order: ByteOrder) -> Result<u64, Error> {
+    let source = bytes
+        .get(offset..offset + 8)
+        .ok_or(Error::InvalidHeaderLayout)?;
+    let value: [u8; 8] = source.try_into().map_err(|_| Error::InvalidHeaderLayout)?;
+    Ok(match order {
+        ByteOrder::Little => u64::from_le_bytes(value),
+        ByteOrder::Big => u64::from_be_bytes(value),
     })
 }
 

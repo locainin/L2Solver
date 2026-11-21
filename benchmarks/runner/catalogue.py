@@ -4,7 +4,9 @@ import hashlib
 import json
 import re
 import stat
+from contextlib import nullcontext
 from dataclasses import dataclass
+from io import IOBase
 from pathlib import Path
 from urllib.parse import urlsplit
 
@@ -106,7 +108,9 @@ def hash_file(path, *, expected_bytes=None):
         raise ValueError("expected_bytes must be a nonnegative integer")
     digest = hashlib.sha256()
     total = 0
-    with path.open("rb") as stream:
+    # Open streams remain owned by the caller
+    source = nullcontext(path) if isinstance(path, IOBase) else path.open("rb")
+    with source as stream:
         while True:
             # A file that grows after preflight cannot extend the approved read budget
             remaining = 1024 * 1024 if expected_bytes is None else min(

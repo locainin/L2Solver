@@ -47,7 +47,9 @@ impl CollectionReport {
         }
     }
 
-    /// Require the requested stop condition and authoritative zero-loss counters
+    /// Check whether the producer declares the requested goal and zero loss
+    ///
+    /// A report read from a capture file is a declaration, not independent proof
     #[must_use]
     pub const fn supports_complete_collection(self) -> bool {
         matches!(
@@ -108,9 +110,36 @@ pub struct CollectionSummary {
     pub packet_block_packets_dropped: u64,
     /// Packet Blocks whose legacy drop counter was unavailable
     pub packet_blocks_with_unavailable_drop_count: u64,
+    /// Sum of reported losses between Enhanced Packet Blocks, if any report exists
+    pub enhanced_packet_packets_dropped: Option<u64>,
+    /// Sum of per-interface maximum cumulative interface-drop snapshots
+    pub interface_statistics_interface_dropped: Option<u64>,
+    /// Sum of per-interface maximum cumulative operating-system-drop snapshots
+    pub interface_statistics_os_dropped: Option<u64>,
 }
 
 impl CollectionSummary {
+    /// Identify retained declarations without treating them as verified
+    ///
+    /// A zero legacy Packet Block counter is not retained separately from absence
+    #[must_use]
+    pub const fn authority(self) -> l2_capture::CollectionAuthority {
+        if self.reported_sections == 0
+            && self.incomplete_sections == 0
+            && self.capture_dropped == 0
+            && self.interface_dropped == 0
+            && self.packet_block_packets_dropped == 0
+            && self.packet_blocks_with_unavailable_drop_count == 0
+            && self.enhanced_packet_packets_dropped.is_none()
+            && self.interface_statistics_interface_dropped.is_none()
+            && self.interface_statistics_os_dropped.is_none()
+        {
+            l2_capture::CollectionAuthority::Absent
+        } else {
+            l2_capture::CollectionAuthority::SourceDeclared
+        }
+    }
+
     pub(super) fn observe(&mut self, report: Option<CollectionReport>) {
         // Section numbers and each counter are at most u32, so these u64 sums fit
         self.sections += 1;

@@ -102,6 +102,12 @@ pub struct CacheStats {
     pub over_limit_bytes: u64,
     /// Number of saved job checkpoints
     pub checkpoints: u64,
+    /// Current logical lengths of the state database, WAL, and shared-memory file
+    pub state_bytes: u64,
+    /// Derived database and WAL allowance for this cache handle
+    ///
+    /// WAL growth is checked at SQLite progress callbacks, so this is not an OS-enforced quota
+    pub state_limit_bytes: u64,
 }
 
 /// Results from an LRU prune or clear operation

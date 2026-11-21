@@ -166,7 +166,7 @@ pub enum Error {
         /// Maximum interfaces accepted in one section
         limit: u32,
     },
-    /// An enhanced packet refers to an interface not declared in its section
+    /// A block refers to an interface not declared in its section
     UnknownInterface {
         /// Section containing the reference
         section: u32,
@@ -219,6 +219,8 @@ pub enum Error {
     InvalidLinuxInterfaceIdentity,
     /// A recognized collection declaration is malformed or repeated
     InvalidCollectionReport,
+    /// Reported packet losses exceed the summary counter's range
+    LossCounterOverflow,
     /// A packet exceeded a canonical frame invariant
     Frame(FrameError),
     /// Source metadata failed its canonical boundary checks
@@ -414,7 +416,7 @@ fn format_pcapng_packet(error: &Error, f: &mut fmt::Formatter<'_>) -> Option<fmt
         ),
         Error::UnknownInterface { section, index } => write!(
             f,
-            "PCAPNG packet references unknown interface {index} in section {section}"
+            "PCAPNG block references unknown interface {index} in section {section}"
         ),
         Error::SimplePacketWithoutInterface => {
             f.write_str("PCAPNG simple packet has no interface description")
@@ -457,6 +459,7 @@ fn format_pcapng_packet(error: &Error, f: &mut fmt::Formatter<'_>) -> Option<fmt
         Error::InvalidCollectionReport => {
             f.write_str("invalid or duplicate PCAPNG collection declaration")
         }
+        Error::LossCounterOverflow => f.write_str("PCAPNG reported packet-loss counter overflow"),
         Error::Frame(error) => write!(f, "invalid captured frame: {error}"),
         Error::Metadata(error) => write!(f, "invalid capture metadata: {error}"),
         _ => return None,

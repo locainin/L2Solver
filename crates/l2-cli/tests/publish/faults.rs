@@ -21,8 +21,8 @@ fn old_output(destination: &Path) -> TestResult {
     Ok(())
 }
 
-fn assert_before_publication_errno(
-    result: Result<(), publish::DirectoryPublishError>,
+fn assert_before_publication_errno<T>(
+    result: Result<T, publish::DirectoryPublishError>,
     expected: i32,
 ) -> TestResult {
     let Err(publish::DirectoryPublishError::BeforePublication(error)) = result else {
@@ -113,7 +113,8 @@ fn real_full_filesystem_preserves_the_existing_directory() -> TestResult {
         eprintln!("real ENOSPC test needs an isolated small filesystem");
         return Ok(());
     };
-    let root = tempfile::tempdir_in(base)?;
+    let base = publish::test_hooks::enter_filesystem_fault_root(Path::new(&base))?;
+    let root = tempfile::tempdir_in(&base)?;
     let destination = root.path().join("bundle");
     old_output(&destination)?;
     let prepared = publish::prepare_directory_replacement(&destination)?;
@@ -139,9 +140,10 @@ fn real_read_only_filesystem_preserves_the_existing_directory() -> TestResult {
         eprintln!("real EROFS test needs an isolated read-only filesystem");
         return Ok(());
     };
-    let destination = Path::new(&base).join("bundle");
+    let base = publish::test_hooks::enter_filesystem_fault_root(Path::new(&base))?;
+    let destination = base.join("bundle");
     let prepared = publish::prepare_directory_replacement(&destination)?;
-    let Err(probe) = fs::write(Path::new(&base).join("readonly-probe"), b"probe") else {
+    let Err(probe) = fs::write(base.join("readonly-probe"), b"probe") else {
         return Err("read-only filesystem accepted the write probe".into());
     };
     let result = publish::replace_directory_with_precommit(&prepared, |_| Ok(()), || Ok(()));
@@ -149,7 +151,7 @@ fn real_read_only_filesystem_preserves_the_existing_directory() -> TestResult {
     assert_eq!(probe.raw_os_error(), Some(libc::EROFS));
     assert_before_publication_errno(result, libc::EROFS)?;
     assert_eq!(fs::read(destination.join("payload"))?, b"previous output");
-    assert_eq!(fs::read_dir(Path::new(&base))?.count(), 1);
+    assert_eq!(fs::read_dir(&base)?.count(), 1);
     Ok(())
 }
 

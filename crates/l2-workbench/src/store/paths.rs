@@ -66,6 +66,37 @@ impl Directory {
         self.file.sync_all()?;
         Ok(())
     }
+
+    pub fn available_bytes(&self) -> Result<u64> {
+        #[cfg(unix)]
+        {
+            // Use the held directory so a renamed path cannot redirect this check
+            let capacity = rustix::fs::fstatvfs(&self.file)?;
+            capacity
+                .f_bavail
+                .checked_mul(capacity.f_frsize)
+                .ok_or_else(|| invalid("workspace available space overflow"))
+        }
+        #[cfg(not(unix))]
+        {
+            Err(invalid(
+                "workspace available space is unavailable on this platform",
+            ))
+        }
+    }
+
+    pub fn file_bytes(&self) -> Result<u64> {
+        let mut total = 0_u64;
+        for entry in std::fs::read_dir(self.path())? {
+            let metadata = std::fs::symlink_metadata(entry?.path())?;
+            if metadata.is_file() {
+                total = total
+                    .checked_add(metadata.len())
+                    .ok_or_else(|| invalid("workspace source size overflow"))?;
+            }
+        }
+        Ok(total)
+    }
 }
 
 pub fn regular(path: &Path) -> Result<File> {

@@ -1,8 +1,5 @@
 use super::{Fixture, TestResult};
-use crate::{
-    publish,
-    result_directory::{ResultDirectory, ResultKind},
-};
+use crate::{publish, result_directory::ResultKind};
 use l2_workbench::job::{
     Counter, Job, MemoryBudget, MemoryClass, MemoryError, RecoveryCandidateSample,
     RecoveryFunnelAdmission, RecoveryFunnelAttribution, RecoveryFunnelEvent,
@@ -54,7 +51,7 @@ fn funnel_candidate(input_node_id: u64) -> RecoveryCandidateSample {
 #[test]
 fn successful_atomic_publication_binds_the_exact_artifact_and_source() -> TestResult {
     let fixture = Fixture::new()?;
-    let destination = ResultDirectory::inspect(&fixture.output, ResultKind::Extract)?;
+    let destination = super::inspect(&fixture.output, ResultKind::Extract)?;
     let job = Job::new("published result");
     let bytes = b"publication transition artifact";
     destination.publish(&fixture.identity, &job, |staging| {
@@ -81,7 +78,7 @@ fn successful_atomic_publication_binds_the_exact_artifact_and_source() -> TestRe
 #[test]
 fn small_receipt_publishes_with_a_bounded_memory_budget() -> TestResult {
     let fixture = Fixture::new()?;
-    let destination = ResultDirectory::inspect(&fixture.output, ResultKind::Extract)?;
+    let destination = super::inspect(&fixture.output, ResultKind::Extract)?;
     let memory = MemoryBudget::new(3 * 1024 * 1024);
     let job = Job::with_memory_budget("small publication receipt", &memory);
     let bytes = b"small receipt artifact";
@@ -89,7 +86,7 @@ fn small_receipt_publishes_with_a_bounded_memory_budget() -> TestResult {
         fixture.write_output(staging, "complete", bytes)
     })?;
     assert_eq!(fs::read(fixture.output.join("artifact.bin"))?, bytes);
-    ResultDirectory::inspect(&fixture.output, ResultKind::Extract)?;
+    super::inspect(&fixture.output, ResultKind::Extract)?;
     assert_eq!(memory.snapshot()?.used_bytes, 0);
     Ok(())
 }
@@ -97,7 +94,7 @@ fn small_receipt_publishes_with_a_bounded_memory_budget() -> TestResult {
 #[test]
 fn receipt_validation_reports_a_typed_memory_limit_without_publishing() -> TestResult {
     let fixture = Fixture::new()?;
-    let destination = ResultDirectory::inspect(&fixture.output, ResultKind::Extract)?;
+    let destination = super::inspect(&fixture.output, ResultKind::Extract)?;
     let limit = 3 * 1024 * 1024;
     let memory = MemoryBudget::new(limit);
     let occupied = memory.try_reserve(MemoryClass::Base, limit)?;
@@ -121,7 +118,7 @@ fn receipt_validation_reports_a_typed_memory_limit_without_publishing() -> TestR
 #[test]
 fn publication_retains_funnel_counts_when_candidate_details_exceed_receipt_limits() -> TestResult {
     let fixture = Fixture::new()?;
-    let destination = ResultDirectory::inspect(&fixture.output, ResultKind::Extract)?;
+    let destination = super::inspect(&fixture.output, ResultKind::Extract)?;
     let job = Job::new("bounded publication receipt");
     let worker = job.work_scope(&format!("{:064x}", 3))?;
     let input = RecoveryFunnelInput {
@@ -159,7 +156,7 @@ fn publication_retains_funnel_counts_when_candidate_details_exceed_receipt_limit
     })?;
 
     assert_eq!(fs::read(fixture.output.join("artifact.bin"))?, bytes);
-    ResultDirectory::inspect(&fixture.output, ResultKind::Extract)?;
+    super::inspect(&fixture.output, ResultKind::Extract)?;
     let manifest: Value = serde_json::from_slice(&fs::read(fixture.output.join("manifest.json"))?)?;
     assert_eq!(
         manifest.pointer("/l2solver_result/job/counters/candidates_examined"),
@@ -192,7 +189,7 @@ fn publication_retains_funnel_counts_when_candidate_details_exceed_receipt_limit
 #[test]
 fn publication_reports_omitted_cohorts_when_the_compact_receipt_is_still_too_large() -> TestResult {
     let fixture = Fixture::new()?;
-    let destination = ResultDirectory::inspect(&fixture.output, ResultKind::Extract)?;
+    let destination = super::inspect(&fixture.output, ResultKind::Extract)?;
     let job = Job::new("large bounded publication receipt");
     let worker = job.work_scope(&format!("{:064x}", 4))?;
     for index in 0..64_u8 {
@@ -226,7 +223,7 @@ fn publication_reports_omitted_cohorts_when_the_compact_receipt_is_still_too_lar
     })?;
 
     assert_eq!(fs::read(fixture.output.join("artifact.bin"))?, bytes);
-    ResultDirectory::inspect(&fixture.output, ResultKind::Extract)?;
+    super::inspect(&fixture.output, ResultKind::Extract)?;
     let manifest: Value = serde_json::from_slice(&fs::read(fixture.output.join("manifest.json"))?)?;
     assert_eq!(
         manifest.pointer("/l2solver_result/job/counters/cohorts"),
@@ -265,7 +262,7 @@ fn publication_reports_omitted_cohorts_when_the_compact_receipt_is_still_too_lar
 #[test]
 fn failed_writer_reports_unpublished_without_claiming_an_artifact() -> TestResult {
     let fixture = Fixture::new()?;
-    let destination = ResultDirectory::inspect(&fixture.output, ResultKind::Extract)?;
+    let destination = super::inspect(&fixture.output, ResultKind::Extract)?;
     let job = Job::new("failed result");
     let result = destination.publish(&fixture.identity, &job, |_staging| {
         Err::<(), _>(io::Error::other("synthetic writer failure").into())
@@ -287,7 +284,7 @@ fn failed_writer_reports_unpublished_without_claiming_an_artifact() -> TestResul
 #[test]
 fn committed_directory_with_failed_parent_sync_is_reported_as_durability_uncertain() -> TestResult {
     let fixture = Fixture::new()?;
-    let destination = ResultDirectory::inspect(&fixture.output, ResultKind::Extract)?;
+    let destination = super::inspect(&fixture.output, ResultKind::Extract)?;
     let job = Job::new("uncertain durability");
     publish::test_hooks::TEST_FAULT
         .with(|slot| slot.set(Some(publish::test_hooks::TestFault::DirectorySync)));

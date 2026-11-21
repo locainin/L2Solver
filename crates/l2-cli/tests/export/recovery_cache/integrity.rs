@@ -40,7 +40,7 @@ fn cached_coverage_cannot_claim_complete_collection_for_an_incomplete_case()
         assert!(
             super::super::cached_result(
                 &entry,
-                &super::super::source_id(&scope)?,
+                super::super::source_id(&scope)?,
                 kind,
                 &options,
                 None

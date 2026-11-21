@@ -8,6 +8,8 @@ import time
 from fractions import Fraction
 from pathlib import Path
 
+_CLEANUP_TIMEOUT_SECONDS = 5.0
+
 if __package__:
     from .runner.process import (
         DEFAULT_MAX_LOG_BYTES,
@@ -59,6 +61,38 @@ def read_counts(path):
 
 def event_counts(group):
     return read_counts(group / "memory.events")
+
+
+def _cleanup_workload(workload):
+    # The kernel kills the whole owned subtree even when a child starts a new session
+    deadline = time.monotonic() + _CLEANUP_TIMEOUT_SECONDS
+    kill_sent = False
+    while True:
+        populated = read_counts(workload / "cgroup.events").get("populated")
+        if populated == 0:
+            break
+        if populated != 1:
+            raise ValueError("invalid cgroup populated state")
+        if not kill_sent:
+            kill_fd = os.open(workload / "cgroup.kill", os.O_WRONLY | os.O_CLOEXEC)
+            try:
+                os.write(kill_fd, b"1")
+            finally:
+                os.close(kill_fd)
+            kill_sent = True
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise TimeoutError("workload cgroup remained populated during cleanup")
+        time.sleep(min(0.01, remaining))
+
+    def raise_scan_error(error):
+        raise error
+
+    # Empty child cgroups must be removed before their parent
+    for directory, _, _ in os.walk(workload, topdown=False, onerror=raise_scan_error):
+        if time.monotonic() >= deadline:
+            raise TimeoutError("workload cgroup cleanup timed out")
+        Path(directory).rmdir()
 
 
 def event_deltas(before, after):
@@ -203,7 +237,11 @@ def run_in_scope(
     (scope / "cgroup.subtree_control").write_text("+memory", encoding="ascii")
     workload = scope / "workload"
     workload.mkdir()
+    receipt = None
     try:
+        # Refuse to start if the kernel cannot safely stop the whole workload
+        kill_fd = os.open(workload / "cgroup.kill", os.O_WRONLY | os.O_CLOEXEC)
+        os.close(kill_fd)
         (workload / "memory.max").write_text(str(memory_max), encoding="ascii")
         (workload / "memory.swap.max").write_text("0", encoding="ascii")
         (workload / "memory.oom.group").write_text("1", encoding="ascii")
@@ -272,13 +310,27 @@ def run_in_scope(
             "monitor": metrics,
             "cgroup": cgroup,
         }
-        with (directory / "cgroup.json").open("x", encoding="utf-8") as output:
-            json.dump(receipt, output, indent=2, sort_keys=True)
-            output.write("\n")
-        return receipt
     finally:
-        # Only remove the owned empty group; never signal unrelated processes
-        workload.rmdir()
+        interrupted = sys.exception() is not None
+        try:
+            _cleanup_workload(workload)
+        except BaseException as error:
+            if receipt is not None:
+                receipt["cleanup_error"] = str(error)[:2048]
+                if receipt["status"] is None:
+                    receipt["status"] = "tool_failure"
+                    receipt["message"] = "workload cgroup cleanup failed"
+            raise
+        finally:
+            # A passing receipt must never appear before the workload is gone
+            if receipt is not None:
+                if interrupted and receipt["status"] is None:
+                    receipt["status"] = "tool_failure"
+                    receipt["message"] = "benchmark was interrupted"
+                with (directory / "cgroup.json").open("x", encoding="utf-8") as output:
+                    json.dump(receipt, output, indent=2, sort_keys=True)
+                    output.write("\n")
+    return receipt
 
 
 def main():

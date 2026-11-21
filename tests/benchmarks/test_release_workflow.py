@@ -26,7 +26,7 @@ def completion_check(tmp_path):
         workflow,
     )
     assert match, "release workflow must run all native completion parsers"
-    binary = tmp_path / "target/x86_64-unknown-linux-gnu/release/l2solver"
+    binary = tmp_path / "l2solver-candidate/l2solver"
     binary.parent.mkdir(parents=True)
     # A small fake generator lets each real shell exercise its own syntax errors
     binary.write_text(
@@ -48,7 +48,7 @@ def run_check(script, root, *, shell="", mode=""):
     return subprocess.run(
         ["bash", "-e", "-o", "pipefail", "-c", script],
         cwd=root,
-        env={**os.environ, "L2_TEST_BAD_SHELL": shell, "L2_TEST_BAD_MODE": mode},
+        env={**os.environ, "RUNNER_TEMP": str(root), "L2_TEST_BAD_SHELL": shell, "L2_TEST_BAD_MODE": mode},
         capture_output=True,
         text=True,
         timeout=20,

@@ -1,6 +1,6 @@
 use super::{
-    Fixture, ResultDirectory, ResultKind, TestResult, assert_invalid_snapshot_error, json_field,
-    read_manifest, set_json_field, write_manifest,
+    Fixture, ResultKind, TestResult, assert_invalid_snapshot_error, json_field, read_manifest,
+    set_json_field, write_manifest,
 };
 use l2_workbench::job::{
     Job, RecoveryTransition, RecoveryTransitionOutcome as Outcome, RecoveryTransitionStage as Stage,
@@ -103,6 +103,6 @@ fn result_receipt_accepts_all_128_distinct_transition_categories() -> TestResult
         serde_json::to_value(summary)?,
     )?;
     write_manifest(&fixture.output, &manifest)?;
-    ResultDirectory::inspect(&fixture.output, ResultKind::Extract)?;
+    super::inspect(&fixture.output, ResultKind::Extract)?;
     Ok(())
 }

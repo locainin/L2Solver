@@ -6,6 +6,9 @@ use l2_workbench::{
 use serde_json::json;
 use std::error::Error;
 
+#[path = "chains/deadline.rs"]
+mod deadline;
+
 #[test]
 fn event_chains_not_scopes_actors() -> Result<(), Box<dyn Error>> {
     let dir = tempfile::tempdir()?;
@@ -335,7 +338,7 @@ fn chain_deadline_blocking_visitor() -> Result<(), Box<dyn Error>> {
         steps: vec![EventSelector::default()],
         same_actor: true,
         max_gap_ticks: None,
-        limit: None,
+        limit: Some(1),
         joins: Vec::new(),
         max_elapsed_ms: ChainDeadline::limited(100),
     };
@@ -368,6 +371,7 @@ fn chain_deadline_blocking_visitor() -> Result<(), Box<dyn Error>> {
 
     let mut unlimited = plan;
     unlimited.max_elapsed_ms = ChainDeadline::unlimited();
+    unlimited.limit = None;
     let mut emitted = 0;
     journal.visit_chains(&unlimited, |_| {
         emitted += 1;

@@ -52,6 +52,7 @@ run_in_namespace() {
     l2_fault_area=$(mktemp -d "$root/l2-publish-faults.XXXXXXXX")
     l2_fault_full_mount="$l2_fault_area/full"
     l2_fault_readonly_mount="$l2_fault_area/read-only"
+    l2_fault_proc_mount="$l2_fault_area/proc"
     cleanup() {
         while mountpoint -q -- "$l2_fault_readonly_mount"; do
             umount -- "$l2_fault_readonly_mount"
@@ -59,11 +60,20 @@ run_in_namespace() {
         if mountpoint -q -- "$l2_fault_full_mount"; then
             umount -- "$l2_fault_full_mount"
         fi
+        if mountpoint -q -- "$l2_fault_proc_mount"; then
+            umount -- "$l2_fault_proc_mount"
+        fi
         if [[ -d "$l2_fault_readonly_mount" ]]; then
             rmdir -- "$l2_fault_readonly_mount"
         fi
         if [[ -d "$l2_fault_full_mount" ]]; then
             rmdir -- "$l2_fault_full_mount"
+        fi
+        if [[ -d "$l2_fault_proc_mount" ]]; then
+            rmdir -- "$l2_fault_proc_mount"
+        fi
+        if mountpoint -q -- "$l2_fault_area"; then
+            umount -- "$l2_fault_area"
         fi
         rmdir -- "$l2_fault_area"
     }
@@ -71,7 +81,11 @@ run_in_namespace() {
 
     # Propagation changes and mounts stay inside this unprivileged namespace
     mount --make-rprivate /
-    mkdir -- "$l2_fault_full_mount"
+    # The child must be able to identify its filesystem root in mountinfo
+    mount --bind "$l2_fault_area" "$l2_fault_area"
+    mkdir -- "$l2_fault_full_mount" "$l2_fault_proc_mount"
+    # The publisher needs proc-fd paths inside the private root used by the test child
+    mount --bind /proc "$l2_fault_proc_mount"
     mount -t tmpfs -o size=1m,mode=0700 tmpfs "$l2_fault_full_mount"
     if [[ -n "$binary" ]]; then
         L2_TEST_ENOSPC_ROOT="$l2_fault_full_mount" "$binary" \

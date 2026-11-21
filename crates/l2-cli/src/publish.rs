@@ -1,4 +1,8 @@
 //! Publish complete files and directories without replacing existing destinations
+//!
+//! Ownership checks assume trusted procfs setup and backing storage, including overlay layers.
+//! The final check and commit are separate syscalls, so this boundary assumes that a trusted
+//! owner or administrator does not change permissions or mount topology between them.
 
 use std::{
     error::Error,
@@ -9,6 +13,9 @@ use std::{
 };
 #[path = "publish/directory.rs"]
 mod directory;
+#[cfg(target_os = "linux")]
+#[path = "publish/trust_policy.rs"]
+mod trust_policy;
 pub use directory::create_directory;
 pub use directory::{
     DirectoryEntryKind, PreparedDirectoryReplacement, check_new_directory_destination,
@@ -87,9 +94,9 @@ use std::{io::Write, path::Component};
 /// Linux uses an unnamed `O_TMPFILE` inode and descriptor-relative operations
 /// so changed path components cannot redirect publication or cleanup
 ///
-/// Parent components must be real directories; symlinked components are
-/// rejected, `..` components are rejected, and an existing destination symlink
-/// is never followed or replaced
+/// Parents must be real directories owned by root or the effective user.
+/// Shared-writable parents must be sticky. Symlinks and `..` components are
+/// rejected, and an existing destination symlink is never followed or replaced
 ///
 /// # Errors
 /// Returns an unsupported error on platforms without the reviewed Linux
@@ -116,7 +123,10 @@ use {
     },
     std::{
         ffi::OsStr,
-        os::{fd::AsRawFd, unix::ffi::OsStrExt},
+        os::{
+            fd::{AsFd, AsRawFd},
+            unix::ffi::OsStrExt,
+        },
     },
 };
 
@@ -140,7 +150,8 @@ fn create_linux<T>(path: &Path, write: impl FnOnce(&mut File) -> io::Result<T>) 
     #[cfg(test)]
     test_hooks::pause_before_link()
         .map_err(|error| stage_error("pause before linking temporary output", &error))?;
-    link_from_fd(&file, &parent_fd, name, path)
+    recheck_output_parent(&parent_fd)
+        .and_then(|_| link_from_fd(&file, &parent_fd, name, path))
         .map_err(|error| stage_error("link temporary output", &error))?;
     #[cfg(test)]
     test_hooks::pause_after_link()
@@ -180,7 +191,64 @@ fn parent_and_name(path: &Path) -> io::Result<(&Path, &OsStr)> {
 }
 
 #[cfg(target_os = "linux")]
+/// Permission bits that grant writes beyond the owner
+pub const SHARED_WRITE: Mode = Mode::WGRP.union(Mode::WOTH);
+
+#[cfg(target_os = "linux")]
+fn verify_private_output_permissions(
+    trust: &trust_policy::TrustPolicy,
+    fd: impl AsFd,
+    owner: u32,
+    mode: u32,
+    label: &str,
+    previous_mount: Option<u64>,
+) -> io::Result<()> {
+    if Mode::from_raw_mode(mode).intersects(SHARED_WRITE) {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            format!("{label} has unsafe ownership or permissions"),
+        ));
+    }
+    trust
+        .verify_owner(fd, owner, previous_mount)
+        .map_err(|error| stage_error(label, &error))?;
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn check_trusted_output_dir(
+    trust: &trust_policy::TrustPolicy,
+    fd: &OwnedFd,
+    previous_mount: Option<u64>,
+) -> io::Result<u64> {
+    let stat = fs::fstat(fd)?;
+    let mode = Mode::from_raw_mode(stat.st_mode);
+    // A trusted sticky directory lets other users add names, while protecting existing names
+    if mode.intersects(SHARED_WRITE) && !mode.contains(Mode::SVTX) {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "output path contains an untrusted directory",
+        ));
+    }
+    trust.verify_owner(fd, stat.st_uid, previous_mount)
+}
+
+#[cfg(target_os = "linux")]
+const OUTPUT_DIRECTORY_FLAGS: OFlags = OFlags::RDONLY
+    .union(OFlags::DIRECTORY)
+    .union(OFlags::CLOEXEC)
+    .union(OFlags::NOFOLLOW);
+
+#[cfg(target_os = "linux")]
+const WALK_DIRECTORY_FLAGS: OFlags = OUTPUT_DIRECTORY_FLAGS.union(OFlags::PATH);
+
+#[cfg(target_os = "linux")]
 fn open_parent(parent: &Path) -> io::Result<OwnedFd> {
+    open_parent_with_trust(parent, &trust_policy::TrustPolicy::load()?)
+}
+
+#[cfg(target_os = "linux")]
+fn open_parent_with_trust(parent: &Path, trust: &trust_policy::TrustPolicy) -> io::Result<OwnedFd> {
     // Reject parent traversal before acquiring any descriptor
     if parent
         .components()
@@ -189,27 +257,93 @@ fn open_parent(parent: &Path) -> io::Result<OwnedFd> {
         return Err(reject_parent_directory_component());
     }
 
-    let flags = OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC | OFlags::NOFOLLOW;
-    // Start from a stable descriptor so each component can be checked without
-    // reopening the complete path after another process changes an ancestor
-    let mut current = if parent.is_absolute() {
-        fs::openat(CWD, Path::new("/"), flags, Mode::empty())?
+    let root = fs::openat(CWD, "/", WALK_DIRECTORY_FLAGS, Mode::empty())?;
+    let parent_path = if parent.is_absolute() {
+        open_trusted_components(trust, root, parent)?
     } else {
-        fs::openat(CWD, Path::new("."), flags, Mode::empty())?
+        // Hold the working directory while resolving and checking its full ancestry
+        let cwd = fs::openat(CWD, ".", WALK_DIRECTORY_FLAGS, Mode::empty())?;
+        open_relative_parent(trust, root, &cwd, &std::env::current_dir()?, parent)?
     };
-    for component in parent.components() {
+    // Search permission is enough during the walk, while the final parent needs fsync
+    Ok(fs::openat(
+        &parent_path,
+        ".",
+        OUTPUT_DIRECTORY_FLAGS,
+        Mode::empty(),
+    )?)
+}
+
+#[cfg(target_os = "linux")]
+fn open_relative_parent(
+    trust: &trust_policy::TrustPolicy,
+    root: OwnedFd,
+    held_cwd: &OwnedFd,
+    cwd_path: &Path,
+    parent: &Path,
+) -> io::Result<OwnedFd> {
+    let checked_cwd = open_trusted_components(trust, root, cwd_path)?;
+    // A reopened path must identify the working directory the call started from
+    if !same_directory_view(held_cwd, &checked_cwd)? {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "working directory changed while checking the output path",
+        ));
+    }
+    open_trusted_components(trust, checked_cwd, parent)
+}
+
+#[cfg(target_os = "linux")]
+fn same_directory_view(left: &OwnedFd, right: &OwnedFd) -> io::Result<bool> {
+    let left_stat = fs::fstat(left)?;
+    let right_stat = fs::fstat(right)?;
+    let same_device = left_stat.st_dev == right_stat.st_dev;
+    let same_inode = left_stat.st_ino == right_stat.st_ino;
+    Ok(
+        same_device
+            && same_inode
+            && trust_policy::mount_id(left)? == trust_policy::mount_id(right)?,
+    )
+}
+
+#[cfg(target_os = "linux")]
+fn recheck_output_parent(parent: &OwnedFd) -> io::Result<trust_policy::TrustPolicy> {
+    let proc_fd = open_proc_fd_directory()?;
+    let name = parent.as_raw_fd().to_string();
+    verify_proc_fd_entry(&proc_fd, parent, &name)?;
+    let path = fs::readlinkat(&proc_fd, name.as_str(), Vec::new())?;
+    let path = Path::new(OsStr::from_bytes(path.as_bytes()));
+    let trust = trust_policy::TrustPolicy::load()?;
+    if !path.is_absolute() || !same_directory_view(parent, &open_parent_with_trust(path, &trust)?)?
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "output parent changed while checking its current location",
+        ));
+    }
+    Ok(trust)
+}
+
+#[cfg(target_os = "linux")]
+fn open_trusted_components(
+    trust: &trust_policy::TrustPolicy,
+    mut current: OwnedFd,
+    path: &Path,
+) -> io::Result<OwnedFd> {
+    let mut mount = check_trusted_output_dir(trust, &current, None)?;
+    // Check each opened directory before resolving another name through it
+    for component in path.components() {
         let name: &OsStr = match component {
             Component::RootDir | Component::CurDir => continue,
             Component::Normal(name) => name,
-            Component::ParentDir => return Err(reject_parent_directory_component()),
-            Component::Prefix(_) => {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidInput,
-                    "output path has an unsupported prefix",
-                ));
+            Component::ParentDir | Component::Prefix(_) => {
+                return Err(reject_parent_directory_component());
             }
         };
-        current = fs::openat(&current, name, flags, Mode::empty())?;
+        let next = fs::openat(&current, name, WALK_DIRECTORY_FLAGS, Mode::empty())?;
+        // Keep the previous mount pinned while checking the next descriptor
+        mount = check_trusted_output_dir(trust, &next, Some(mount))?;
+        current = next;
     }
     Ok(current)
 }
@@ -317,34 +451,17 @@ fn link_from_fd(
 
 #[cfg(target_os = "linux")]
 fn open_proc_fd_directory() -> io::Result<OwnedFd> {
-    let flags = OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC | OFlags::NOFOLLOW;
-    let proc_fd =
-        fs::openat(CWD, Path::new("/proc/self/fd"), flags, Mode::empty()).map_err(|source| {
-            let error: io::Error = source.into();
-            if is_unavailable_proc_fd_error(&error) {
-                secure_publication_unavailable()
-            } else {
-                error
-            }
-        })?;
-    // A directory with this path is safe only when its mounted filesystem is procfs
-    validate_proc_fd_filesystem(&proc_fd).map_err(|_| secure_publication_unavailable())?;
-    Ok(proc_fd)
+    trust_policy::open_proc_fd_directory().map_err(|error| {
+        if is_unavailable_proc_fd_error(&error) {
+            secure_publication_unavailable()
+        } else {
+            error
+        }
+    })
 }
 
 #[cfg(target_os = "linux")]
-fn validate_proc_fd_filesystem(proc_fd: &OwnedFd) -> io::Result<()> {
-    const PROC_SUPER_MAGIC: u64 = 0x9fa0;
-
-    let filesystem = fs::fstatfs(proc_fd)?;
-    if u64::try_from(filesystem.f_type).ok() != Some(PROC_SUPER_MAGIC) {
-        return Err(io::Error::other("descriptor directory is not procfs"));
-    }
-    Ok(())
-}
-
-#[cfg(target_os = "linux")]
-fn verify_proc_fd_entry(proc_fd: &OwnedFd, file: &File, fd_name: &str) -> io::Result<()> {
+fn verify_proc_fd_entry(proc_fd: &OwnedFd, file: impl AsFd, fd_name: &str) -> io::Result<()> {
     // `statat` follows the proc-fd symlink when no no-follow flag is present
     let held = fs::fstat(file)?;
     let resolved = fs::statat(proc_fd, Path::new(fd_name), AtFlags::empty())?;

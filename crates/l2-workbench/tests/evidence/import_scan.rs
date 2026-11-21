@@ -5,7 +5,8 @@ use std::error::Error;
 fn import_ip_ascii_source_offsets() -> Result<(), Box<dyn Error>> {
     let mut case = Case::new();
     let bytes = b"host=192.0.2.1\nname=sample\n";
-    let report = case.scan_import("settings.txt", "text", bytes)?;
+    let report =
+        case.scan_import_with_options("settings.txt", "text", bytes, ImportScanOptions::default())?;
     assert_eq!(report.ipv4_literals, 1);
     assert!(report.ascii_strings >= 1);
     assert!(report.source_complete);
@@ -47,7 +48,12 @@ fn import_ip_ascii_source_offsets() -> Result<(), Box<dyn Error>> {
 #[test]
 fn finding_free_limited_coverage_visible() -> Result<(), Box<dyn Error>> {
     let mut case = Case::new();
-    let report = case.scan_import("bytes.bin", "binary", b"\0\xff")?;
+    let report = case.scan_import_with_options(
+        "bytes.bin",
+        "binary",
+        b"\0\xff",
+        ImportScanOptions::default(),
+    )?;
 
     assert_eq!(report.retained_findings, 0);
     assert!(report.source_complete);
@@ -61,7 +67,8 @@ fn finding_free_limited_coverage_visible() -> Result<(), Box<dyn Error>> {
 fn import_supported_file_signatures_candidates() -> Result<(), Box<dyn Error>> {
     let mut case = Case::new();
     let bytes = b"\x89PNG\r\n\x1a\nimported bytes";
-    let report = case.scan_import("image.bin", "binary", bytes)?;
+    let report =
+        case.scan_import_with_options("image.bin", "binary", bytes, ImportScanOptions::default())?;
 
     assert_eq!(report.file_signatures, 1);
     let signature = case
@@ -101,7 +108,12 @@ fn import_supported_file_signatures_candidates() -> Result<(), Box<dyn Error>> {
 fn import_ipv6_ranges_separate_wrappers() -> Result<(), Box<dyn Error>> {
     let mut case = Case::new();
     let bytes = b"[2001:db8::1] service=192.0.2.1:443";
-    let report = case.scan_import("addresses.txt", "text", bytes)?;
+    let report = case.scan_import_with_options(
+        "addresses.txt",
+        "text",
+        bytes,
+        ImportScanOptions::default(),
+    )?;
 
     assert_eq!(report.ipv6_literals, 1);
     assert_eq!(report.ipv4_literals, 1);
@@ -226,8 +238,13 @@ fn failed_import_leaves_case_unchanged() -> Result<(), Box<dyn Error>> {
     let before = case.try_clone()?;
 
     assert!(
-        case.scan_import("invalid\nlabel", "binary", b"contents")
-            .is_err()
+        case.scan_import_with_options(
+            "invalid\nlabel",
+            "binary",
+            b"contents",
+            ImportScanOptions::default()
+        )
+        .is_err()
     );
     assert_eq!(case, before);
     Ok(())
@@ -240,7 +257,12 @@ fn import_omitted_strings_finding_budget() -> Result<(), Box<dyn Error>> {
         bytes.extend_from_slice(b"text\0");
     }
     let mut case = Case::new();
-    let report = case.scan_import("many-strings.bin", "binary", &bytes)?;
+    let report = case.scan_import_with_options(
+        "many-strings.bin",
+        "binary",
+        &bytes,
+        ImportScanOptions::default(),
+    )?;
     assert!(report.source_complete);
     assert!(!report.scan_complete);
     assert!(case.collection_complete());
@@ -267,7 +289,12 @@ fn import_case_blob_not_retained() -> Result<(), Box<dyn Error>> {
         serde_json::json!({}),
     )?;
 
-    let report = case.scan_import("small.bin", "binary", b"\0\xff")?;
+    let report = case.scan_import_with_options(
+        "small.bin",
+        "binary",
+        b"\0\xff",
+        ImportScanOptions::default(),
+    )?;
 
     assert!(!report.blob_retained);
     assert!(!report.source_complete);

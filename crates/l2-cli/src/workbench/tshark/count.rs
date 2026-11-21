@@ -1,8 +1,14 @@
-use super::{PROFILE, PacketCountReceipt, PreparedCapture, require_success, run_phase};
+use super::{
+    model::PacketCountReceipt,
+    phase::{require_success, run_phase},
+    preparation::PreparedCapture,
+    profile::PROFILE,
+};
 use l2_workbench::sha256;
 use std::{error::Error, ffi::OsString};
 
 pub(super) struct CaptureCount {
+    pub(super) containment: Option<l2_workbench::tshark::ScopeReceipt>,
     pub(super) arguments: Vec<OsString>,
     pub(super) stderr: Vec<u8>,
     pub(super) receipt: PacketCountReceipt,
@@ -22,20 +28,14 @@ pub(super) fn capture(prepared: &PreparedCapture) -> Result<CaptureCount, Box<dy
         OsString::from("-e"),
         OsString::from("frame.number"),
     ];
-    let output = run_phase(
-        &prepared.executable,
-        &arguments,
-        &prepared.environment,
-        prepared.deadline,
-        prepared.metadata_maximum,
-        prepared.diagnostic_maximum,
-    )?;
+    let output = run_phase(prepared, &arguments, prepared.metadata_maximum)?;
     require_success("source packet count", output.status, &output.stderr)?;
     let receipt = PacketCountReceipt {
         count: parse(&output.stdout)?,
         output_sha256: sha256(&output.stdout),
     };
     Ok(CaptureCount {
+        containment: output.scope,
         arguments,
         // The output hash and count retain the evidence without keeping another large buffer
         stderr: output.stderr,

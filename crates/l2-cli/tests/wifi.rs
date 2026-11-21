@@ -292,6 +292,28 @@ fn wifi_command_surveys_typed_capture() -> Result<(), Box<dyn Error>> {
     assert!(text.contains("Open"));
     assert!(text.contains("WIFI-ENC-OPEN"));
     assert!(!text.contains("ap="));
+    assert!(text.contains("Analysis      COMPLETE"));
+    assert!(text.contains("Acquisition   UNVERIFIED (authority=absent)"));
+
+    let output = Command::new(env!("CARGO_BIN_EXE_l2solver"))
+        .args(["wifi", "assess"])
+        .arg(&path)
+        .args(["--format", "json"])
+        .output()?;
+    assert!(output.status.success());
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout)?;
+    assert_eq!(
+        json.get("analysis_complete"),
+        Some(&serde_json::json!(true))
+    );
+    assert_eq!(
+        json.pointer("/acquisition_quality/status"),
+        Some(&serde_json::json!("unverified"))
+    );
+    assert_eq!(
+        json.pointer("/acquisition_quality/authority"),
+        Some(&serde_json::json!("absent"))
+    );
     std::fs::remove_dir_all(path.parent().ok_or("capture has no parent")?)?;
     Ok(())
 }

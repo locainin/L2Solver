@@ -1,5 +1,11 @@
 use super::*;
 
+const MIB: u64 = 1024 * 1024;
+const TSHARK_MEMORY_MIB: u64 = 128;
+const TSHARK_OBJECT_MIB: u64 = 16;
+const TSHARK_OBJECT_FILES: u64 = 16_384;
+const TSHARK_TASKS: u64 = 16;
+
 pub fn extraction_command(root: &Path, capture: &Path, destination: &Path) -> Command {
     let mut command = Command::new(env!("CARGO_BIN_EXE_l2solver"));
     command
@@ -8,7 +14,19 @@ pub fn extraction_command(root: &Path, capture: &Path, destination: &Path) -> Co
         .arg("-o")
         .arg(destination)
         .env("XDG_CACHE_HOME", root.join("cache"))
-        .env("XDG_STATE_HOME", root.join("state"));
+        .env("XDG_STATE_HOME", root.join("state"))
+        // Fixed requests keep the published policy stable across cached invocations
+        .env("L2SOLVER_TSHARK_MEMORY_MIB", TSHARK_MEMORY_MIB.to_string())
+        .env("L2SOLVER_TSHARK_SWAP_MIB", "0")
+        .env("L2SOLVER_TSHARK_TASKS", TSHARK_TASKS.to_string())
+        .env("L2SOLVER_TSHARK_TEMPORARY_MIB", "64")
+        .env("L2SOLVER_TSHARK_TMP_MIB", "8")
+        .env("L2SOLVER_TSHARK_SHM_MIB", "8")
+        .env("L2SOLVER_TSHARK_OBJECT_MIB", TSHARK_OBJECT_MIB.to_string())
+        .env(
+            "L2SOLVER_TSHARK_OBJECT_FILES",
+            TSHARK_OBJECT_FILES.to_string(),
+        );
     command
 }
 
@@ -207,6 +225,88 @@ fn warm_cached_extraction_matches_cold_and_uncached_outputs() -> Result<(), Box<
         "no-cache run should recompute the same recovery candidates"
     );
     assert_eq!(fs::read(&capture)?, capture_with_http_body(BODY)?);
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn cache_containment_receipts() -> Result<(), Box<dyn Error>> {
+    let temporary = tempfile::tempdir()?;
+    let root = temporary.path();
+    let capture = root.join("capture.pcap");
+    let cold_destination = root.join("cold");
+    let warm_destination = root.join("warm");
+    let tshark = install_tshark(root, "")?;
+    fs::write(&capture, capture_with_http_body(BODY)?)?;
+
+    for destination in [&cold_destination, &warm_destination] {
+        let output = extraction_command(root, &capture, destination)
+            .env("PATH", &tshark)
+            .arg("--require-tshark")
+            .output()?;
+        assert_eq!(
+            output.status.code(),
+            Some(0),
+            "{}\n{}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr),
+            fs::read_to_string(destination.join("summary.txt")).unwrap_or_default()
+        );
+    }
+    assert_export_outputs_match(&cold_destination, &warm_destination)?;
+
+    let manifest_path = warm_destination.join("manifest.json");
+    let original = fs::read(&manifest_path)?;
+    for (path, invalid) in [
+        ("/tshark/containment", serde_json::Value::Null),
+        ("/tshark/containment/usage", serde_json::Value::Null),
+        (
+            "/tshark/containment/usage/memory_peak_bytes",
+            serde_json::Value::Null,
+        ),
+        (
+            "/tshark/containment/usage/memory_events",
+            serde_json::Value::Null,
+        ),
+        (
+            "/tshark/containment/usage/tasks_peak",
+            serde_json::json!(17),
+        ),
+        (
+            "/tshark/containment/usage/memory_peak_bytes",
+            serde_json::json!(129 * 1024 * 1024),
+        ),
+        (
+            "/tshark/containment/usage/memory_events/oom",
+            serde_json::json!(1),
+        ),
+        (
+            "/tshark/containment/usage/tasks_max_events",
+            serde_json::json!(1),
+        ),
+        (
+            "/tshark/containment/usage/observed_while_frozen",
+            serde_json::json!(false),
+        ),
+        (
+            "/tshark/containment/effective_memory_max_bytes",
+            serde_json::json!(129 * 1024 * 1024),
+        ),
+        (
+            "/tshark/containment/memory_max_bytes",
+            serde_json::json!(127 * 1024 * 1024),
+        ),
+    ] {
+        let mut modified: serde_json::Value = serde_json::from_slice(&original)?;
+        *modified
+            .pointer_mut(path)
+            .ok_or("receipt field is missing")? = invalid;
+        fs::write(&manifest_path, serde_json::to_vec(&modified)?)?;
+        assert!(
+            semantic_manifest(&warm_destination).is_err(),
+            "accepted {path}"
+        );
+    }
     Ok(())
 }
 
@@ -528,6 +628,7 @@ fn optional_file(path: PathBuf) -> Result<Option<Vec<u8>>, Box<dyn Error>> {
 fn semantic_manifest(directory: &Path) -> Result<serde_json::Value, Box<dyn Error>> {
     let mut manifest: serde_json::Value =
         serde_json::from_slice(&fs::read(directory.join("manifest.json"))?)?;
+    normalize_containment(&mut manifest)?;
     let receipt = manifest
         .as_object_mut()
         .and_then(|fields| fields.get_mut("l2solver_result"))
@@ -544,6 +645,98 @@ fn semantic_manifest(directory: &Path) -> Result<serde_json::Value, Box<dyn Erro
             .ok_or("result receipt output stamps are missing")?,
     )?;
     Ok(manifest)
+}
+
+fn normalize_containment(manifest: &mut serde_json::Value) -> Result<(), Box<dyn Error>> {
+    let tshark = manifest
+        .get_mut("tshark")
+        .and_then(serde_json::Value::as_object_mut)
+        .ok_or("TShark result is missing")?;
+    let complete = tshark.get("status").and_then(serde_json::Value::as_str) == Some("complete");
+    if complete {
+        let budget = tshark
+            .get("object_export_budget")
+            .and_then(serde_json::Value::as_object)
+            .ok_or("TShark object budget is missing")?;
+        if budget
+            .get("temporary_bytes")
+            .and_then(serde_json::Value::as_u64)
+            != Some(TSHARK_OBJECT_MIB * MIB)
+            || budget
+                .get("temporary_files")
+                .and_then(serde_json::Value::as_u64)
+                != Some(TSHARK_OBJECT_FILES)
+        {
+            return Err("TShark object budget differs from the test request".into());
+        }
+    }
+    let value = tshark
+        .get_mut("containment")
+        .ok_or("TShark containment field is missing")?;
+    if value.is_null() {
+        return if complete {
+            Err("completed TShark export is missing containment".into())
+        } else {
+            Ok(())
+        };
+    }
+    let scope: l2_workbench::tshark::ScopeReceipt = serde_json::from_value(value.clone())?;
+    validate_scope(scope)?;
+
+    // Keep the controls and failure counters comparable after checking the live peaks
+    let usage = value
+        .get_mut("usage")
+        .and_then(serde_json::Value::as_object_mut)
+        .ok_or("TShark resource usage is invalid")?;
+    usage.remove("memory_peak_bytes");
+    usage.remove("tasks_peak");
+    let events = usage
+        .get_mut("memory_events")
+        .and_then(serde_json::Value::as_object_mut)
+        .ok_or("TShark memory events are invalid")?;
+    events.remove("high");
+    events.remove("max");
+    Ok(())
+}
+
+fn validate_scope(scope: l2_workbench::tshark::ScopeReceipt) -> Result<(), Box<dyn Error>> {
+    let memory = TSHARK_MEMORY_MIB * MIB;
+    let high = memory - memory / 4;
+    if scope.memory_max_bytes != memory
+        || scope.memory_high_bytes != high
+        || scope.swap_max_bytes != 0
+        || scope.tasks_max != TSHARK_TASKS
+        || scope.effective_memory_max_bytes == 0
+        || scope.effective_memory_max_bytes > memory
+        || scope.effective_memory_high_bytes == 0
+        || scope.effective_memory_high_bytes > high
+        || scope.effective_memory_high_bytes > scope.effective_memory_max_bytes
+        || scope.effective_swap_max_bytes != 0
+        || scope.effective_tasks_max == 0
+        || scope.effective_tasks_max > TSHARK_TASKS
+    {
+        return Err("TShark containment limits differ from the test request".into());
+    }
+    let usage = scope.usage.ok_or("TShark resource usage is missing")?;
+    let memory_peak = usage
+        .memory_peak_bytes
+        .ok_or("TShark memory peak is missing")?;
+    let tasks_peak = usage.tasks_peak.ok_or("TShark task peak is missing")?;
+    let events = usage
+        .memory_events
+        .ok_or("TShark memory events are missing")?;
+    if !usage.observed_while_frozen
+        || memory_peak == 0
+        || memory_peak > scope.effective_memory_max_bytes
+        || tasks_peak == 0
+        || tasks_peak > scope.effective_tasks_max
+        || events.oom != 0
+        || events.oom_kill != 0
+        || usage.tasks_max_events != Some(0)
+    {
+        return Err("TShark frozen resource usage is invalid".into());
+    }
+    Ok(())
 }
 
 fn normalize_job_snapshot(snapshot: &mut serde_json::Value) -> Result<(), Box<dyn Error>> {

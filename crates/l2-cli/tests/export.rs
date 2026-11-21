@@ -16,6 +16,8 @@ mod cache_failure;
 mod relational;
 #[path = "export/repeated.rs"]
 mod repeated;
+#[path = "export/truncated.rs"]
+mod truncated;
 #[path = "export/tshark_identity.rs"]
 mod tshark_identity;
 #[path = "export/xor_messages.rs"]
@@ -507,7 +509,7 @@ fn deduplicates_shared_case_limitations_across_flows_and_cohorts() -> Result<(),
     );
     let summary = fs::read_to_string(destination.join("summary.txt"))?;
     assert!(summary.contains(
-        "Cohort reconstruction omissions: 0 TCP records, 0 fragments, 0 ranges, 0 TCP byte positions affected by omitted observations or rejected ranges, 0 TCP observations, 0 fragment byte positions affected by omitted observations or rejected ranges, 0 fragment observations, 0 state observations, 0 unmeasured ranges (in 0 of 1 Case)"
+        "Cohort reconstruction omissions: 0 TCP records, 0 fragments, 0 ranges, 0 TCP byte positions affected by omitted observations, span limits, or rejected ranges, 0 TCP observations, 0 fragment byte positions affected by omitted observations, span limits, or rejected ranges, 0 fragment observations, 0 state observations, 0 unmeasured ranges (in 0 of 1 Case)"
     ));
     Ok(())
 }
@@ -772,6 +774,30 @@ fn tshark_objects_use_safe_names() -> Result<(), Box<dyn Error>> {
     assert!(summary.contains("TShark objects exported: 1"));
     assert!(summary.contains("TShark packet provenance is not reported"));
     assert!(!summary.contains("SHA-256:"));
+    let manifest: serde_json::Value =
+        serde_json::from_slice(&fs::read(destination.join("manifest.json"))?)?;
+    assert_eq!(
+        manifest
+            .pointer("/tshark/status")
+            .and_then(serde_json::Value::as_str),
+        Some("complete")
+    );
+    assert_eq!(
+        manifest
+            .pointer("/tshark/containment/usage/observed_while_frozen")
+            .and_then(serde_json::Value::as_bool),
+        Some(true)
+    );
+    assert!(
+        manifest
+            .pointer("/tshark/containment/usage/memory_events")
+            .is_some_and(serde_json::Value::is_object)
+    );
+    assert!(
+        manifest
+            .pointer("/tshark/containment/usage/tasks_max_events")
+            .is_some_and(serde_json::Value::is_u64)
+    );
     Ok(())
 }
 
@@ -1016,37 +1042,69 @@ fn unsafe_tshark_files_are_skipped() -> Result<(), Box<dyn Error>> {
     let destination = temporary.path().join("output");
     let executable = install_tshark(
         temporary.path(),
-        "printf '%s' 'object bytes' > \"$destination/first\"\n/bin/ln \"$destination/first\" \"$destination/hard-link\"\n/bin/ln -s \"$destination/first\" \"$destination/symbolic-link\"",
-    )?;
-    fs::write(&capture, empty_capture())?;
-
-    let output = export_with_tshark(&capture, &destination, &executable)?;
-
-    assert_eq!(output.status.code(), Some(0));
-    assert_eq!(artifact_paths(&destination)?.len(), 0);
-    let summary = fs::read_to_string(destination.join("summary.txt"))?;
-    assert!(summary.contains("TShark objects exported: 0"));
-    assert!(summary.contains("unsafe object entry"));
-    Ok(())
-}
-
-#[cfg(unix)]
-#[test]
-fn tshark_stage_escape_aborts_publication() -> Result<(), Box<dyn Error>> {
-    let temporary = tempfile::tempdir()?;
-    let capture = temporary.path().join("capture.pcap");
-    let destination = temporary.path().join("output");
-    let executable = install_tshark(
-        temporary.path(),
-        "printf '%s' 'unexpected' > \"$destination/../../../escaped\"",
+        "printf '%s' 'unsafe object bytes' > \"$destination/first\"\n/bin/ln \"$destination/first\" \"$destination/hard-link\"\n/bin/ln -s \"$destination/first\" \"$destination/symbolic-link\"",
     )?;
     fs::write(&capture, capture_with_http_body(BODY)?)?;
 
     let output = export_with_tshark(&capture, &destination, &executable)?;
 
-    assert!(!output.status.success());
-    assert!(!destination.exists());
-    assert!(String::from_utf8_lossy(&output.stderr).contains("unexpected entry"));
+    assert_eq!(output.status.code(), Some(0));
+    let artifacts = artifact_paths(&destination)?;
+    assert_eq!(artifacts.len(), 1);
+    assert_eq!(
+        fs::read(artifacts.first().ok_or("native artifact is missing")?)?,
+        BODY
+    );
+    let summary = fs::read_to_string(destination.join("summary.txt"))?;
+    assert!(summary.contains("Native complete HTTP bodies: 1"));
+    assert!(summary.contains("TShark export: partial"));
+    assert!(summary.contains("TShark objects exported: 0"));
+    assert!(
+        summary.contains("TShark object output contained unsafe or changed entries"),
+        "{summary}"
+    );
+    Ok(())
+}
+
+#[cfg(unix)]
+#[test]
+fn tshark_stage_escape_native_export() -> Result<(), Box<dyn Error>> {
+    let temporary = tempfile::tempdir()?;
+    let capture = temporary.path().join("capture.pcap");
+    let destination = temporary.path().join("output");
+    let escaped = temporary.path().join("escaped");
+    let attack = format!(
+        "if printf '%s' 'unexpected' > \"$destination/../../../escaped\" 2>/dev/null; then printf '%s\\n' 'stage traversal stayed in sandbox' >&2; else printf '%s\\n' 'stage traversal denied' >&2; fi\nif printf '%s' 'unexpected' > {} 2>/dev/null; then printf '%s\\n' 'host escape succeeded' >&2; exit 91; fi\nprintf '%s\\n' 'host escape denied' >&2\nexit 92",
+        shell_quote(&escaped)
+    );
+    let executable = install_tshark(temporary.path(), &attack)?;
+    fs::write(&capture, capture_with_http_body(BODY)?)?;
+
+    let output = export_with_tshark(&capture, &destination, &executable)?;
+
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(!escaped.exists(), "sandbox wrote an escaped host file");
+    let artifacts = artifact_paths(&destination)?;
+    assert_eq!(artifacts.len(), 1);
+    assert_eq!(
+        fs::read(artifacts.first().ok_or("native artifact is missing")?)?,
+        BODY
+    );
+    let summary = fs::read_to_string(destination.join("summary.txt"))?;
+    assert!(summary.contains("Native complete HTTP bodies: 1"));
+    assert!(summary.contains("TShark export: partial"));
+    assert!(summary.contains("TShark objects exported: 0"));
+    assert!(summary.contains("host escape denied"), "{summary}");
+    assert!(
+        summary.contains("stage traversal stayed in sandbox")
+            || summary.contains("stage traversal denied"),
+        "{summary}"
+    );
     Ok(())
 }
 
@@ -1711,7 +1769,7 @@ fn reports_default_limit_reconstruction_omissions_from_supplementary_pages()
         u64::try_from(Limits::default().units + 2)?
     );
     assert_exact_supplementary_reconstruction_omissions(&manifest)?;
-    let page_omissions = "Supplementary page reconstruction omissions: 0 TCP records, 0 fragments, 1 ranges, 1 TCP byte positions affected by omitted observations or rejected ranges, 1 TCP observations, 0 fragment byte positions affected by omitted observations or rejected ranges, 0 fragment observations, 0 state observations, 0 unmeasured ranges (in 1 of 2 Cases)";
+    let page_omissions = "Supplementary page reconstruction omissions: 0 TCP records, 0 fragments, 1 ranges, 1 TCP byte positions affected by omitted observations, span limits, or rejected ranges, 1 TCP observations, 0 fragment byte positions affected by omitted observations, span limits, or rejected ranges, 0 fragment observations, 0 state observations, 0 unmeasured ranges (in 1 of 2 Cases)";
     assert!(summary.contains("Per-flow analysis: partial"));
     assert!(summary.contains(page_omissions), "{summary}");
     assert!(limitations.contains(page_omissions), "{limitations}");
@@ -1905,7 +1963,7 @@ fn assert_partial_flow_reconstruction_coverage(
         0
     );
     assert!(summary.contains(
-        "Flow reconstruction omissions: 0 TCP records, 0 fragments, 1 ranges, 12600000 TCP byte positions affected by omitted observations or rejected ranges, 210 TCP observations, 0 fragment byte positions affected by omitted observations or rejected ranges, 0 fragment observations, 0 state observations, 0 unmeasured ranges (in 1 of 2 Cases)"
+        "Flow reconstruction omissions: 0 TCP records, 0 fragments, 1 ranges, 12600000 TCP byte positions affected by omitted observations, span limits, or rejected ranges, 210 TCP observations, 0 fragment byte positions affected by omitted observations, span limits, or rejected ranges, 0 fragment observations, 0 state observations, 0 unmeasured ranges (in 1 of 2 Cases)"
     ), "{summary}");
     Ok(())
 }
@@ -1919,7 +1977,7 @@ fn assert_partial_flow_limitations(limitations: &str, long_flow_chunks: usize) {
     let selected = 1 + long_flow_chunks;
     let retained = long_flow_chunks;
     assert!(limitations.contains(&format!(
-        "Flow analysis selected {selected} records, retained {retained}, and omitted 1; retention ceilings reached: bytes; reconstruction omissions: 0 TCP records, 0 fragments, 1 ranges, 12600000 TCP byte positions affected by omitted observations or rejected ranges, 210 TCP observations, 0 fragment byte positions affected by omitted observations or rejected ranges, 0 fragment observations, 0 state observations, 0 unmeasured ranges"
+        "Flow analysis selected {selected} records, retained {retained}, and omitted 1; retention ceilings reached: bytes; reconstruction omissions: 0 TCP records, 0 fragments, 1 ranges, 12600000 TCP byte positions affected by omitted observations, span limits, or rejected ranges, 210 TCP observations, 0 fragment byte positions affected by omitted observations, span limits, or rejected ranges, 0 fragment observations, 0 state observations, 0 unmeasured ranges"
     )), "{limitations}");
     assert!(
         limitations
@@ -1961,7 +2019,7 @@ fn assert_partial_cohort_coverage(manifest: &serde_json::Value) -> Result<(), Bo
 }
 
 #[test]
-fn stdin_reports_tshark_omission() -> Result<(), Box<dyn Error>> {
+fn stdin_reports_missing_tshark() -> Result<(), Box<dyn Error>> {
     let temporary = tempfile::tempdir()?;
     let capture = capture_with_http_body(BODY)?;
     for (label, flags, expected_status) in [
@@ -1995,13 +2053,66 @@ fn stdin_reports_tshark_omission() -> Result<(), Box<dyn Error>> {
             BODY
         );
         let summary = fs::read_to_string(destination.join("summary.txt"))?;
-        assert!(summary.contains("TShark export omitted for standard input"));
+        assert!(summary.contains("TShark executable not found: tshark"));
         assert!(
         summary.contains(
             "Artifact discovery within retained supported-transport flow Cases, bounded unordered source/scope/IP-pair cohorts, and known TShark object types: partial"
         )
     );
     }
+    Ok(())
+}
+
+#[test]
+fn stdin_exports_tshark_objects() -> Result<(), Box<dyn Error>> {
+    let temporary = tempfile::tempdir()?;
+    let capture = capture_with_http_body(BODY)?;
+    let executable = install_tshark(
+        temporary.path(),
+        "printf '%s' 'stdin object' > \"$destination/object\"",
+    )?;
+    let destination = temporary.path().join("output");
+    let mut child = Command::new(env!("CARGO_BIN_EXE_l2solver"))
+        .args(["extract", "-", "--output"])
+        .arg(&destination)
+        .arg("--require-tshark")
+        .env("PATH", executable)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()?;
+    child
+        .stdin
+        .take()
+        .ok_or("child standard input is unavailable")?
+        .write_all(&capture)?;
+    let output = child.wait_with_output()?;
+    assert!(
+        output.status.success(),
+        "{}\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let artifacts = artifact_paths(&destination)?;
+    let bytes = artifacts
+        .iter()
+        .map(fs::read)
+        .collect::<Result<Vec<_>, _>>()?;
+    assert_eq!(bytes.len(), 2);
+    assert_eq!(
+        bytes
+            .iter()
+            .filter(|bytes| bytes.as_slice() == b"stdin object")
+            .count(),
+        1
+    );
+    assert_eq!(
+        bytes
+            .iter()
+            .filter(|bytes| bytes.as_slice() == BODY)
+            .count(),
+        1
+    );
     Ok(())
 }
 
@@ -2313,6 +2424,14 @@ fn install_tshark_for_protocol(
     let executable = executable_directory.join("tshark");
     let script = r#"#!/bin/sh
 set -eu
+if [ "$1" = -n ] && [ "$2" = -v ]; then
+  printf '%s\n' 'TShark (Wireshark) 4.6.9'
+  exit 0
+fi
+if [ "$1" = -G ] && [ "$2" = currentprefs ]; then
+  while IFS= read -r line; do printf '%s\n' "$line"; done < "$WIRESHARK_CONFIG_DIR/profiles/$5/preferences"
+  exit 0
+fi
 for argument in "$@"; do
   if [ "$argument" = help ]; then
     printf '%s\n' 'The available export object types for the "--export-objects" option are:' __TYPE_LIST__
@@ -2328,7 +2447,7 @@ for argument in "$@"; do
     -r) read_capture=1 ;;
   esac
 done
-case "$capture_file" in *'/.l2solver-'*'/capture.bin') ;; *) exit 67 ;; esac
+case "$capture_file" in /work/capture.bin) ;; *) exit 67 ;; esac
 [ -f "$capture_file" ] && [ ! -L "$capture_file" ] || exit 68
 for argument in "$@"; do
   case "$argument" in
@@ -2847,7 +2966,7 @@ fn packet_block_drop_count_makes_full_source_export_partial() -> Result<(), Box<
     let capture = temporary.path().join("packet-block-drops.pcapng");
     let destination = temporary.path().join("output");
     let source = capture_with_packet_block_drops(&capture_with_http_body(BODY)?, 7)?;
-    fs::write(&capture, source)?;
+    fs::write(&capture, &source)?;
 
     let output = export(&capture, Some(&destination))?;
 
@@ -2865,6 +2984,20 @@ fn packet_block_drop_count_makes_full_source_export_partial() -> Result<(), Box<
         limitations
             .contains("Obsolete Packet Blocks report 7 packets dropped between captured packets")
     );
+    let source_id = format!("sha256:{}", l2_workbench::sha256(&source));
+    let quality = format!(
+        "Source {source_id} acquisition quality is unverified (authority: source_declared); analysis is scoped to captured bytes"
+    );
+    assert!(
+        limitations.contains(&format!(
+            "Case limitation applies to 1 flow Cases and 0 cohort Cases: {quality}"
+        )),
+        "{limitations}"
+    );
+    assert!(
+        limitations.contains(&format!("- Flow 1: Source {source_id} reports 7 packets dropped between packets in obsolete Packet Blocks; analysis is scoped to the packets present")),
+        "{limitations}"
+    );
     let manifest: serde_json::Value =
         serde_json::from_slice(&fs::read(destination.join("manifest.json"))?)?;
     assert_eq!(
@@ -2878,6 +3011,20 @@ fn packet_block_drop_count_makes_full_source_export_partial() -> Result<(), Box<
             .pointer("/full_source_coverage/source/collection_summary/packet_block_packets_dropped")
             .and_then(serde_json::Value::as_u64),
         Some(7)
+    );
+    let components = manifest
+        .get("incomplete_components")
+        .and_then(serde_json::Value::as_array)
+        .ok_or("missing incomplete export components")?;
+    assert!(
+        components.iter().any(|component| {
+            component.get("component") == Some(&serde_json::json!("source_collection"))
+                && component.get("reason")
+                    == Some(&serde_json::json!(
+                        "7 packets reported dropped between obsolete Packet Blocks"
+                    ))
+        }),
+        "{components:?}"
     );
     Ok(())
 }
