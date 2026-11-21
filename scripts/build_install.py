@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
-"""Build the locked source as an ordinary user, then publish the reviewed payload."""
+"""Build a payload for separate administrator review and publication."""
 import argparse
 import hashlib
 import json
 import os
+import shlex
 import shutil
-import stat
 import subprocess
 import sys
 import tempfile
@@ -32,46 +32,26 @@ def source_state():
     }
 
 
-def stage_publisher(directory):
-    source = ROOT / "scripts/system_install.py"
-    # The launcher itself must come from a trusted checkout
-    system_install.safe_parents(source.parent)
-    temporary_root = Path(tempfile.gettempdir())
-    system_install.safe_parents(temporary_root)
-    if temporary_root.stat().st_uid not in (0, os.geteuid()):
-        raise ValueError(f"untrusted temporary directory: {temporary_root}")
-    parent = system_install.open_directory(source.parent)
-    try:
-        fd = os.open(source.name, os.O_RDONLY | os.O_NOFOLLOW, dir_fd=parent)
-        with os.fdopen(fd, "rb") as stream:
-            before = os.fstat(stream.fileno())
-            if (not stat.S_ISREG(before.st_mode) or before.st_uid not in (0, os.geteuid())
-                    or before.st_nlink != 1 or before.st_mode & 0o022):
-                raise ValueError(f"untrusted publisher: {source}")
-            original = hashlib.file_digest(stream, "sha256").hexdigest()
-            stream.seek(0)
-            publisher = directory / "system_install.py"
-            with publisher.open("xb") as target:
-                shutil.copyfileobj(stream, target)
-            stream.seek(0)
-            after_hash = hashlib.file_digest(stream, "sha256").hexdigest()
-            after = os.fstat(stream.fileno())
-            named = os.stat(source.name, dir_fd=parent, follow_symlinks=False)
-            if (original != after_hash or original != system_install.digest(publisher)
-                    or (before.st_dev, before.st_ino, before.st_size, before.st_mtime_ns, before.st_ctime_ns)
-                    != (after.st_dev, after.st_ino, after.st_size, after.st_mtime_ns, after.st_ctime_ns)
-                    or (after.st_dev, after.st_ino) != (named.st_dev, named.st_ino)):
-                raise ValueError("publisher changed while staging")
-            return publisher
-    finally:
-        os.close(parent)
+def payload_manifest(payload, artifacts):
+    return {"schema": 1, "files": {
+        name: artifacts[name] if name in artifacts else {
+            "sha256": system_install.digest(payload / name), "size": (payload / name).stat().st_size,
+        }
+        for name in system_install.PAYLOAD_FILES
+    }}
 
 
 def main():
-    parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--enable-active", action="store_true", help="explicitly grant CAP_NET_RAW only to the matching helper")
+    parser = argparse.ArgumentParser(
+        description=__doc__,
+        epilog=(
+            "An administrator must independently verify every file and digest against trusted references or a trusted build. "
+            "Publish with a reviewed, root-protected system_install.py and pass the separately protected approval as --expected-manifest."
+        ),
+    )
+    parser.add_argument("--output", type=Path, required=True, help="new directory for payload and proposed manifest")
     parser.add_argument("--live", action="store_true", help="also build optional libpcap receive support (requires libpcap development files)")
-    parser.add_argument("--prefix", type=Path, default=Path("/usr/local"), help="protected local prefix; default /usr/local")
+    parser.add_argument("--prefix", type=Path, default=Path("/usr/local"), help="intended prefix for completion suggestions; default /usr/local")
     args = parser.parse_args()
     if sys.platform != "linux" or os.geteuid() == 0:
         parser.error("run this Linux source installer as an ordinary user; Cargo must never run as root")
@@ -82,51 +62,45 @@ def main():
     args.prefix = Path(os.path.abspath(args.prefix))
     if args.prefix == Path("/"):
         parser.error("--prefix must be an absolute local installation directory")
-    for name in ("cargo", "rustc", "cc", "git", "sudo", "ldd"):
+    args.output = Path(os.path.abspath(args.output))
+    if os.path.lexists(args.output):
+        parser.error("--output must not already exist")
+    if not args.output.parent.is_dir():
+        parser.error("the --output parent directory must already exist")
+    for name in ("cargo", "rustc", "cc", "git", "ldd"):
         if not shutil.which(name):
             parser.error(f"missing dependency: {name}; install it and retry")
-    system_python = subprocess.run(
-        ["/usr/bin/python3", "-I", "-c", "import sys; sys.exit(sys.version_info < (3, 11))"],
-        check=False,
-    )
-    if system_python.returncode:
-        parser.error("/usr/bin/python3 must be Python 3.11 or newer")
-    # Confirm provenance before inspecting a protected prefix or starting a build
+    # Record provenance before starting the build
     try:
         before = source_state()
     except subprocess.CalledProcessError:
         parser.error("source installation requires a Git checkout with a committed HEAD; clone the repository and run this script from that checkout")
-    if args.enable_active:
-        for name in ("setcap", "getcap"):
-            if not shutil.which(name):
-                parser.error(f"missing dependency: {name}; install libcap tools and retry")
-    for name in (*BINARIES, "l2solver-uninstall"):
-        found = shutil.which(name)
-        expected = args.prefix / "bin" / name
-        if found and Path(found).absolute() != expected:
-            parser.error(f"PATH collision: {found}; resolve it before installing {expected}")
     if args.live:
         if not shutil.which("pkg-config"):
             parser.error("missing dependency: pkg-config; install it and retry")
         if subprocess.run(["pkg-config", "--exists", "libpcap"], check=False).returncode:
             parser.error("libpcap was not found; install libpcap development files and retry")
-    # Discover shell paths before sudo, with per-user startup files isolated
+    # Discover shell paths without running shell configuration as root
     selected = completion_paths.discover(args.prefix)
     completion_args = [part for shell, directory in selected.items()
                        for part in ("--completion-dir", f"{shell}={directory}")]
-    # Check local directory trust before validating protected records through sudo
-    system_install.safe_parents(args.prefix)
-    with tempfile.TemporaryDirectory(prefix="l2solver-install-") as directory:
+    with tempfile.TemporaryDirectory(prefix="l2solver-build-") as directory:
         workspace = Path(directory)
-        publisher = stage_publisher(workspace)
-        subprocess.run(["sudo", "/usr/bin/python3", "-I", str(publisher), "--check", "--prefix", str(args.prefix), *completion_args], check=True)
-        build_and_publish(args, completion_args, before, publisher, workspace)
-    print(f"Installed {args.prefix / 'bin/l2solver'}; receipt: {args.prefix / 'share/l2solver/current/receipt.json'}")
-    if not args.enable_active:
-        print("Active packet access is disabled; an administrator must explicitly enable the matching helper's CAP_NET_RAW capability")
+        artifacts = build_payload(args, before, workspace)
+        payload = workspace / "payload"
+        proposed = payload_manifest(payload, artifacts)
+        (workspace / "manifest.json").write_text(json.dumps(proposed, indent=2, sort_keys=True) + "\n")
+        # Exclusive creation avoids replacing an existing output directory
+        args.output.mkdir(mode=0o700)
+        shutil.move(payload, args.output / "payload")
+        shutil.move(workspace / "manifest.json", args.output / "manifest.json")
+    print(f"Prepared payload: {args.output / 'payload'}")
+    print(f"Proposed manifest: {args.output / 'manifest.json'}")
+    print("An administrator must independently verify every file and digest against trusted references or a trusted build before approving the proposed manifest")
+    print(f"Suggested completion options: {shlex.join(completion_args)}")
 
 
-def build_and_publish(args, completion_args, before, publisher, workspace):
+def build_payload(args, before, workspace):
     command = ["cargo", "build", "--release", "--locked", "-p", "l2-cli", "-p", "l2-active-cli", "-p", "l2-active-linux", "--bins", "--message-format=json-render-diagnostics"]
     if args.live:
         command.extend(["--features", "l2-cli/live"])
@@ -156,11 +130,14 @@ def build_and_publish(args, completion_args, before, publisher, workspace):
         raise ValueError("source commit changed during build; nothing installed")
     payload = workspace / "payload"
     payload.mkdir()
+    identities = {}
     for name, (source, expected) in artifacts.items():
         binary = payload / name
         shutil.copyfile(source, binary)
         if system_install.digest(binary) != expected:
             raise ValueError(f"Cargo artifact changed while staging: {name}")
+        # Keep Cargo's recorded digest rather than trusting a later payload rehash
+        identities[name] = {"sha256": expected, "size": binary.stat().st_size}
         binary.chmod(0o755)
         dependencies = subprocess.run(
             ["ldd", str(binary)], check=True, capture_output=True, text=True,
@@ -184,14 +161,14 @@ def build_and_publish(args, completion_args, before, publisher, workspace):
         "tracked_changes": output("git", "diff", "HEAD", "--stat"),
         "lock_sha256": hashlib.sha256((ROOT / "Cargo.lock").read_bytes()).hexdigest(),
         "cargo": output("cargo", "--version"), "rustc": output("rustc", "--version"),
-        "profile": "release", "live": args.live, "active_capability": args.enable_active,
+        "profile": "release", "live": args.live,
         "version": output(str(binary), "--version"), "command": command,
     }
     (payload / "receipt.json").write_text(json.dumps(receipt, indent=2) + "\n")
-    publish = ["sudo", "/usr/bin/python3", "-I", str(publisher), "--payload", str(payload), "--prefix", str(args.prefix), *completion_args]
-    if args.enable_active:
-        publish.append("--enable-active")
-    subprocess.run(publish, check=True)
+    # The administrator decides whether to make any copied binary executable
+    for name in BINARIES:
+        (payload / name).chmod(0o644)
+    return identities
 
 
 if __name__ == "__main__":

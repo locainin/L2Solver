@@ -1,23 +1,25 @@
 #!/usr/bin/python3 -I
 """Publish a reviewed, prebuilt Linux payload; also serve as the installed uninstaller."""
 import argparse
-import fcntl
 import errno
+import fcntl
 import hashlib
 import json
 import os
-from pathlib import Path
 import re
 import shutil
 import stat
 import subprocess
 import sys
 import tempfile
+from contextlib import contextmanager, nullcontext
+from pathlib import Path
 
 MAX_GENERATIONS = 16
 
 BINARIES = ("l2solver", "l2solver-active", "l2solver-active-helper")
 FILES = (*BINARIES, "l2solver-uninstall", "bash", "zsh", "fish", "NOTICE-JEMALLOC.txt", "receipt.json")
+PAYLOAD_FILES = tuple(name for name in FILES if name != "l2solver-uninstall")
 # Keep the original schema-1 file set fixed across later payload changes
 LEGACY_FILES = frozenset((
     "l2solver", "l2solver-active", "l2solver-active-helper", "l2solver-uninstall",
@@ -34,6 +36,114 @@ COMPLETION_CANDIDATES = {
 def digest(path):
     with path.open("rb") as stream:
         return hashlib.file_digest(stream, "sha256").hexdigest()
+
+
+def validate_trusted_metadata(info, *, directory):
+    valid_type = stat.S_ISDIR(info.st_mode) if directory else stat.S_ISREG(info.st_mode)
+    if (not valid_type or info.st_uid != 0 or info.st_mode & 0o022
+            or (not directory and info.st_nlink != 1)):
+        raise ValueError("untrusted administrator-controlled path")
+
+
+def trusted_file(path):
+    path = Path(path)
+    if not path.is_absolute() or path.parts[0] != "/" or ".." in path.parts or len(path.parts) < 2:
+        raise ValueError("untrusted administrator-controlled path")
+    flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
+    fd = os.open("/", flags)
+    try:
+        validate_trusted_metadata(os.fstat(fd), directory=True)
+        # Check each opened directory so an untrusted parent cannot redirect the lookup
+        for part in path.parts[1:-1]:
+            next_fd = os.open(part, flags, dir_fd=fd)
+            os.close(fd)
+            fd = next_fd
+            validate_trusted_metadata(os.fstat(fd), directory=True)
+        result = os.open(path.name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=fd)
+        try:
+            validate_trusted_metadata(os.fstat(result), directory=False)
+        except BaseException:
+            os.close(result)
+            raise
+        return result
+    except OSError as error:
+        raise ValueError(f"untrusted administrator-controlled path: {path}: {error}") from error
+    finally:
+        os.close(fd)
+
+
+def check_trusted_publisher():
+    # This check cannot make an untrusted script safe to start as root
+    os.close(trusted_file(Path(os.path.abspath(__file__))))
+
+
+def validate_expected_manifest(data):
+    if (not isinstance(data, dict) or set(data) != {"schema", "files"}
+            or type(data["schema"]) is not int or data["schema"] != 1
+            or not isinstance(data["files"], dict) or set(data["files"]) != set(PAYLOAD_FILES)):
+        raise ValueError("invalid approved manifest")
+    for entry in data["files"].values():
+        if (not isinstance(entry, dict) or set(entry) != {"sha256", "size"}
+                or not isinstance(entry["sha256"], str) or not re.fullmatch(r"[0-9a-f]{64}", entry["sha256"])
+                or type(entry["size"]) is not int or entry["size"] < 0):
+            raise ValueError("invalid approved manifest file entry")
+    return data["files"]
+
+
+def unique_pairs(pairs):
+    result = {}
+    for key, value in pairs:
+        if key in result:
+            raise ValueError("duplicate approved manifest key")
+        result[key] = value
+    return result
+
+
+def read_expected_manifest(path):
+    with os.fdopen(trusted_file(path), "rb") as stream:
+        data = stream.read(65_537)
+    if len(data) > 65_536:
+        raise ValueError("approved manifest is too large")
+    return validate_expected_manifest(json.loads(data, object_pairs_hook=unique_pairs))
+
+
+@contextmanager
+def verified_payload(payload, expected):
+    temporary_root = Path("/tmp")
+    info = temporary_root.lstat()
+    if (not stat.S_ISDIR(info.st_mode) or info.st_uid != 0
+            or (info.st_mode & 0o022 and not info.st_mode & stat.S_ISVTX)):
+        raise ValueError("untrusted temporary directory")
+    # A private root-owned directory keeps the checked bytes stable until publication
+    with tempfile.TemporaryDirectory(prefix="l2solver-approved-", dir=temporary_root) as directory:
+        staged = Path(directory)
+        source_fd = open_directory(payload)
+        try:
+            if set(os.listdir(source_fd)) != set(PAYLOAD_FILES):
+                raise ValueError("incomplete or unexpected payload files")
+            for name in PAYLOAD_FILES:
+                approved = expected[name]
+                fd = os.open(name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=source_fd)
+                with os.fdopen(fd, "rb") as source:
+                    info = os.fstat(source.fileno())
+                    if not stat.S_ISREG(info.st_mode) or info.st_size != approved["size"]:
+                        raise ValueError(f"payload size mismatch: {name}")
+                    target_fd = os.open(staged / name, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+                    with os.fdopen(target_fd, "wb") as target:
+                        remaining = approved["size"]
+                        while remaining:
+                            chunk = source.read(min(remaining, 1024 * 1024))
+                            if not chunk:
+                                raise ValueError(f"payload size mismatch: {name}")
+                            target.write(chunk)
+                            remaining -= len(chunk)
+                        if source.read(1):
+                            raise ValueError(f"payload size mismatch: {name}")
+                if digest(staged / name) != approved["sha256"]:
+                    raise ValueError(f"payload digest mismatch: {name}")
+        finally:
+            os.close(source_fd)
+        yield staged
 
 
 def safe_parents(path):
@@ -998,7 +1108,8 @@ def main():
             "To reactivate a retained older generation, retire inactive generations first, then reinstall it. "
             "Quarantined files are kept in <prefix>/share/.l2solver-quarantine/GENERATION for administrator inspection; "
             "remove a reviewed directory manually to free its slot. "
-            "If a first installation was interrupted, run the source publisher again to recover it."
+            "If a first installation was interrupted, run the trusted publisher again to recover it. "
+            "Independently verify every file and digest against trusted references or a trusted build before approving a manifest."
         ),
     )
     installed = Path(sys.argv[0]).name == "l2solver-uninstall"
@@ -1010,47 +1121,60 @@ def main():
     action.add_argument("--retire-inactive", action="store_true", help="remove intact inactive generations after all clients have stopped")
     action.add_argument("--quarantine-inactive", metavar="GENERATION", help="isolate one damaged inactive generation for administrator inspection")
     action.add_argument("--revoke-active", action="store_true", help="remove the current helper file capability without installing a generation")
+    parser.add_argument("--expected-manifest", type=Path, help="administrator-approved, root-protected payload manifest")
     parser.add_argument("--enable-active", action="store_true")
     parser.add_argument("--completion-dir", action="append", default=[], metavar="SHELL=PATH")
     args = parser.parse_args()
     if os.geteuid() != 0:
-        parser.error("the publication/uninstall step requires root; run scripts/install.sh as an ordinary user")
+        parser.error("the publication/uninstall step requires root")
     if not args.prefix.is_absolute():
         parser.error("prefix must be an absolute local installation directory")
     args.prefix = Path(os.path.abspath(args.prefix))
     if args.prefix == Path("/"):
         parser.error("prefix must be an absolute local installation directory")
+    if args.payload and not args.expected_manifest:
+        parser.error("--payload requires a separately approved --expected-manifest")
+    if args.expected_manifest and not args.payload:
+        parser.error("--expected-manifest requires --payload")
     completion_dirs = parse_completion_dirs(args.completion_dir)
-    # The shared lock lives outside the tree so uninstall cannot unlink a held lock
-    safe_parents(args.prefix)
-    ensure_directory(args.prefix)
-    fd = os.open(args.prefix, os.O_RDONLY | os.O_DIRECTORY)
-    try:
-        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        if args.check:
-            recover(args.prefix)
-            previous = read_manifest(args.prefix)
-            if previous is None:
-                for relative in links(args.prefix, completion_dirs):
-                    safe_parents((args.prefix / relative).parent)
-                    if os.path.lexists(args.prefix / relative):
-                        raise ValueError(f"foreign destination: {args.prefix / relative}")
-            elif completion_dirs is not None and previous["links"] != links(args.prefix, completion_dirs):
-                print("warning: retaining existing completion destinations from the protected manifest", file=sys.stderr)
-        elif args.retire_inactive:
-            retire_inactive(args.prefix)
-        elif args.quarantine_inactive:
-            quarantine_inactive(args.prefix, args.quarantine_inactive)
-        elif args.revoke_active:
-            revoke_active(args.prefix)
-        elif args.payload:
-            install(args.payload, args.prefix, args.enable_active, completion_dirs)
-        elif args.uninstall or installed:
-            uninstall(args.prefix)
-        else:
-            parser.error("--payload is required for installation")
-    finally:
-        os.close(fd)
+    if args.payload:
+        check_trusted_publisher()
+        expected = read_expected_manifest(args.expected_manifest)
+        source = verified_payload(args.payload, expected)
+    else:
+        source = nullcontext()
+    # Reject the payload before creating the prefix or recovering any transaction
+    with source as payload:
+        # The shared lock lives outside the tree so uninstall cannot unlink a held lock
+        safe_parents(args.prefix)
+        ensure_directory(args.prefix)
+        fd = os.open(args.prefix, os.O_RDONLY | os.O_DIRECTORY)
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            if args.check:
+                recover(args.prefix)
+                previous = read_manifest(args.prefix)
+                if previous is None:
+                    for relative in links(args.prefix, completion_dirs):
+                        safe_parents((args.prefix / relative).parent)
+                        if os.path.lexists(args.prefix / relative):
+                            raise ValueError(f"foreign destination: {args.prefix / relative}")
+                elif completion_dirs is not None and previous["links"] != links(args.prefix, completion_dirs):
+                    print("warning: retaining existing completion destinations from the protected manifest", file=sys.stderr)
+            elif args.retire_inactive:
+                retire_inactive(args.prefix)
+            elif args.quarantine_inactive:
+                quarantine_inactive(args.prefix, args.quarantine_inactive)
+            elif args.revoke_active:
+                revoke_active(args.prefix)
+            elif args.payload:
+                install(payload, args.prefix, args.enable_active, completion_dirs)
+            elif args.uninstall or installed:
+                uninstall(args.prefix)
+            else:
+                parser.error("--payload is required for installation")
+        finally:
+            os.close(fd)
 
 
 if __name__ == "__main__":
