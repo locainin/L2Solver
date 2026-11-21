@@ -1,7 +1,7 @@
 use std::{
     cell::{Cell, RefCell},
     io,
-    path::PathBuf,
+    path::{Path, PathBuf},
     thread,
     time::{Duration, Instant},
 };
@@ -43,6 +43,26 @@ pub fn set_before_directory_exchange(hook: impl FnOnce() -> io::Result<()> + 'st
 pub fn before_directory_exchange() -> io::Result<()> {
     let hook = BEFORE_DIRECTORY_EXCHANGE.with(|slot| slot.borrow_mut().take());
     hook.map_or(Ok(()), |hook| hook())
+}
+
+pub fn enter_filesystem_fault_root(base: &Path) -> io::Result<PathBuf> {
+    let parent_namespace = std::env::var_os("L2_TEST_PARENT_MOUNT_NAMESPACE")
+        .ok_or_else(|| io::Error::other("private mount namespace identity missing"))?;
+    if std::fs::read_link("/proc/self/ns/mnt")?.as_os_str() == parent_namespace {
+        return Err(io::Error::other(
+            "full-filesystem test requires a private mount namespace",
+        ));
+    }
+
+    let (Some(root), Some(name)) = (base.parent(), base.file_name()) else {
+        return Err(io::Error::other(
+            "filesystem fixture needs a named mount in a private root",
+        ));
+    };
+    // The host's root UID is unmapped. The harness creates a root owned by the mapped UID 0
+    rustix::process::chroot(root)?;
+    std::env::set_current_dir("/")?;
+    Ok(Path::new("/").join(name))
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

@@ -145,6 +145,7 @@ def test_case_buffer_only_runs_the_named_test_on_a_private_tmpfs(
         'if [[ "$1" == --list ]]; then printf "%s: test\\n" "$3"; exit; fi\n'
         '[[ "$1" == --exact && "$3" == --nocapture ]]\n'
         '[[ $(stat -f -c %T "$L2_TEST_ENOSPC_ROOT") == tmpfs ]]\n'
+        '[[ $(stat -f -c %T "${L2_TEST_ENOSPC_ROOT%/*}/proc") == proc ]]\n'
         '[[ $(readlink /proc/self/ns/mnt) != "$L2_TEST_PARENT_MOUNT_NAMESPACE" ]]\n'
         'printf "%s\\n" "case-buffer fixture invoked"\n'
     )

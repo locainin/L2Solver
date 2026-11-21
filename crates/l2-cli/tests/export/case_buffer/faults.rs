@@ -115,30 +115,14 @@ fn full_filesystem_child_rejects_the_parent_mount_namespace() -> TestResult {
 
 #[cfg(target_os = "linux")]
 fn verify_private_full_filesystem() -> Result<std::path::PathBuf, Box<dyn std::error::Error>> {
-    let parent = std::env::var_os("L2_TEST_PARENT_MOUNT_NAMESPACE")
-        .ok_or("private mount namespace identity missing")?;
-    if std::fs::read_link("/proc/self/ns/mnt")?.as_os_str() == parent.as_os_str() {
-        return Err("full-filesystem test requires a private mount namespace".into());
-    }
-    let base = std::path::PathBuf::from(
-        std::env::var_os("L2_TEST_ENOSPC_ROOT").ok_or("private full-filesystem root missing")?,
-    );
-    let output = std::process::Command::new("stat")
-        .args(["-f", "-c", "%T %S %b"])
-        .arg(&base)
-        .output()?;
-    if !output.status.success() {
-        return Err("cannot inspect the private full filesystem".into());
-    }
-    let details = std::str::from_utf8(&output.stdout)?;
-    let parts: Vec<_> = details.split_whitespace().collect();
-    let ["tmpfs", block_size, blocks] = parts.as_slice() else {
-        return Err("full-filesystem test requires a 1 MiB tmpfs".into());
-    };
-    let bytes = block_size
-        .parse::<u64>()?
-        .checked_mul(blocks.parse::<u64>()?);
-    if bytes != Some(u64::try_from(MIB)?) {
+    const TMPFS_MAGIC: u64 = 0x0102_1994;
+    let base =
+        std::env::var_os("L2_TEST_ENOSPC_ROOT").ok_or("private full-filesystem root missing")?;
+    let base = publish::test_hooks::enter_filesystem_fault_root(std::path::Path::new(&base))?;
+    // The child no longer has access to the host's stat executable
+    let fs = rustix::fs::statfs(&base)?;
+    let bytes = u64::try_from(fs.f_frsize)?.checked_mul(fs.f_blocks);
+    if u64::try_from(fs.f_type).ok() != Some(TMPFS_MAGIC) || bytes != Some(u64::try_from(MIB)?) {
         return Err("full-filesystem test requires a 1 MiB tmpfs".into());
     }
     Ok(base)
