@@ -43,7 +43,7 @@ pub struct PreparedDirectoryReplacement {
     #[cfg(target_os = "linux")]
     pub(super) target_identity: DirectoryIdentity,
     #[cfg(target_os = "linux")]
-    pub(super) parent_identity: DirectoryIdentity,
+    pub(super) trust: super::super::trust_policy::TrustPolicy,
 }
 
 #[cfg(target_os = "linux")]
@@ -86,20 +86,14 @@ impl PreparedDirectoryReplacement {
         #[cfg(target_os = "linux")]
         {
             let (parent_path, name) = super::super::parent_and_name(&self.destination_path)?;
-            let current_parent = super::super::open_parent(parent_path)?;
-            if identity_from_fd(&current_parent)? != self.parent_identity {
+            let current_parent = super::super::open_parent_with_trust(parent_path, &self.trust)?;
+            if !super::super::same_directory_view(&self.parent_fd, &current_parent)? {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidInput,
                     "destination parent changed after it was inspected",
                 ));
             }
-            if identity_from_fd(&self.target_fd)? != self.target_identity {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidInput,
-                    "held destination identity changed after inspection",
-                ));
-            }
-            verify_named_directory(&current_parent, name, self.target_identity)
+            self.check_target_at(&current_parent, name)
         }
         #[cfg(not(target_os = "linux"))]
         {
@@ -107,7 +101,53 @@ impl PreparedDirectoryReplacement {
         }
     }
 
-    /// List entries recursively without following symbolic links
+    /// Check that ownership and permissions on a held result file satisfy the output policy
+    ///
+    /// # Errors
+    /// Returns an error if the file has unsafe ownership, permissions, or mount mapping
+    #[cfg(target_os = "linux")]
+    pub fn verify_file_permissions(
+        &self,
+        file: &std::fs::File,
+        owner: u32,
+        mode: u32,
+        name: &str,
+    ) -> io::Result<()> {
+        let target_mount = super::super::trust_policy::mount_id(&self.target_fd)?;
+        // The target descriptor pins its previously verified mount
+        super::super::verify_private_output_permissions(
+            &self.trust,
+            file,
+            owner,
+            mode,
+            name,
+            Some(target_mount),
+        )
+    }
+
+    #[cfg(target_os = "linux")]
+    pub(super) fn check_target_at(
+        &self,
+        parent: &rustix::fd::OwnedFd,
+        name: &OsStr,
+    ) -> io::Result<()> {
+        let target_mount = super::super::trust_policy::mount_id(&self.target_fd)?;
+        if trusted_directory_identity(
+            &self.trust,
+            &self.target_fd,
+            "existing output directory",
+            Some(target_mount),
+        )? != self.target_identity
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "held destination identity changed after inspection",
+            ));
+        }
+        verify_named_directory(parent, name, self.target_identity)
+    }
+
+    /// List immediate entries without following symbolic links
     ///
     /// The result includes directories and special entries and is sorted by relative path.
     /// `max_entries` bounds memory use when inspecting an untrusted existing directory.
@@ -119,7 +159,7 @@ impl PreparedDirectoryReplacement {
         #[cfg(target_os = "linux")]
         {
             let mut entries = Vec::new();
-            collect_entries(&self.target_fd, Path::new(""), max_entries, &mut entries)?;
+            collect_entries(&self.target_fd, max_entries, &mut entries)?;
             entries.sort_by(|left, right| left.relative_path.cmp(&right.relative_path));
             Ok(entries)
         }
@@ -175,7 +215,6 @@ fn open_file_linux(
 #[cfg(target_os = "linux")]
 fn collect_entries(
     directory: &rustix::fd::OwnedFd,
-    prefix: &Path,
     max_entries: usize,
     entries: &mut Vec<DirectoryEntry>,
 ) -> io::Result<()> {
@@ -199,18 +238,13 @@ fn collect_entries(
         } else {
             DirectoryEntryKind::Other
         };
-        let relative_path = prefix.join(name);
         entries.push(DirectoryEntry {
-            relative_path: relative_path.clone(),
+            relative_path: PathBuf::from(name),
             kind,
             length: nonnegative_length(stat.st_size)?,
             link_count: stat.st_nlink,
         });
 
-        if file_type.is_dir() {
-            let child = open_directory_at(directory, name, Some(identity_from_stat(&stat)))?;
-            collect_entries(&child, &relative_path, max_entries, entries)?;
-        }
         Ok(())
     })
 }
@@ -338,8 +372,22 @@ pub(super) fn stat_identity_at(
 }
 
 #[cfg(target_os = "linux")]
-pub(super) fn identity_from_fd(fd: &rustix::fd::OwnedFd) -> io::Result<DirectoryIdentity> {
-    Ok(identity_from_stat(&rustix::fs::fstat(fd)?))
+pub(super) fn trusted_directory_identity(
+    trust: &super::super::trust_policy::TrustPolicy,
+    fd: &rustix::fd::OwnedFd,
+    label: &str,
+    previous_mount: Option<u64>,
+) -> io::Result<DirectoryIdentity> {
+    let stat = rustix::fs::fstat(fd)?;
+    super::super::verify_private_output_permissions(
+        trust,
+        fd,
+        stat.st_uid,
+        stat.st_mode,
+        label,
+        previous_mount,
+    )?;
+    Ok(identity_from_stat(&stat))
 }
 
 #[cfg(target_os = "linux")]

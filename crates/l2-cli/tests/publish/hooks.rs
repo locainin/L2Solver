@@ -124,11 +124,28 @@ mod tests {
     use rustix::fs::{self, CWD, Mode, OFlags};
 
     #[test]
-    fn proc_fd_validation_ordinary_directory() -> Result<(), Box<dyn std::error::Error>> {
+    fn relative_parent_cwd_identity() -> Result<(), Box<dyn std::error::Error>> {
+        let cwd = tempfile::tempdir()?;
+        let different_cwd = tempfile::tempdir()?;
         let flags = OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC | OFlags::NOFOLLOW;
-        let directory = fs::openat(CWD, Path::new("."), flags, Mode::empty())?;
+        let held_cwd = fs::openat(CWD, cwd.path(), flags, Mode::empty())?;
+        let trust = super::super::trust_policy::TrustPolicy::load()?;
 
-        assert!(super::super::validate_proc_fd_filesystem(&directory).is_err());
+        let root = fs::openat(CWD, "/", flags, Mode::empty())?;
+        super::super::open_relative_parent(&trust, root, &held_cwd, cwd.path(), Path::new("."))?;
+
+        let root = fs::openat(CWD, "/", flags, Mode::empty())?;
+        let result = super::super::open_relative_parent(
+            &trust,
+            root,
+            &held_cwd,
+            different_cwd.path(),
+            Path::new("missing"),
+        );
+        assert_eq!(
+            result.err().map(|error| error.kind()),
+            Some(io::ErrorKind::InvalidInput)
+        );
         Ok(())
     }
 

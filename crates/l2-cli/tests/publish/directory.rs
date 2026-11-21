@@ -3,7 +3,7 @@ use std::{
     error::Error,
     fs,
     io::Read,
-    os::unix::fs::symlink,
+    os::unix::fs::{MetadataExt, PermissionsExt, symlink},
     sync::{
         Arc, Mutex,
         atomic::{AtomicBool, Ordering},
@@ -144,6 +144,13 @@ fn prepared_directory_opens_files_without_following_links_and_inventories_entrie
     let prepared = publish::prepare_directory_replacement(&destination)?;
 
     let mut manifest = prepared.open_file("manifest.json")?;
+    let metadata = manifest.metadata()?;
+    prepared.verify_file_permissions(
+        &manifest,
+        metadata.uid(),
+        metadata.mode(),
+        "manifest.json",
+    )?;
     let mut manifest_bytes = Vec::new();
     manifest.read_to_end(&mut manifest_bytes)?;
     assert_eq!(manifest_bytes, b"{\"ok\":true}");
@@ -151,14 +158,28 @@ fn prepared_directory_opens_files_without_following_links_and_inventories_entrie
     assert!(prepared.open_file("../outside.txt").is_err());
     let entries = prepared.entries(8)?;
     assert!(entries.iter().any(|entry| {
-        entry.relative_path == std::path::Path::new("nested/payload")
-            && entry.kind == publish::DirectoryEntryKind::File
+        entry.relative_path == std::path::Path::new("nested")
+            && entry.kind == publish::DirectoryEntryKind::Directory
     }));
+    assert!(
+        !entries
+            .iter()
+            .any(|entry| entry.relative_path == std::path::Path::new("nested/payload"))
+    );
     assert!(entries.iter().any(|entry| {
         entry.relative_path == std::path::Path::new("outside-link")
             && entry.kind == publish::DirectoryEntryKind::Symlink
     }));
     assert_eq!(fs::read(&foreign)?, b"outside bytes");
+    manifest.set_permissions(fs::Permissions::from_mode(0o664))?;
+    let metadata = manifest.metadata()?;
+    assert_eq!(
+        prepared
+            .verify_file_permissions(&manifest, metadata.uid(), metadata.mode(), "manifest.json")
+            .err()
+            .map(|error| error.kind()),
+        Some(std::io::ErrorKind::PermissionDenied)
+    );
     Ok(())
 }
 
