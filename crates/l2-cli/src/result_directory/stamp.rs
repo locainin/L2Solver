@@ -70,7 +70,7 @@ impl OutputFileStamp {
         Ok(after_stamp)
     }
 
-    /// Verify one currently held file using fast metadata or its stored strong digest
+    /// Verify the bytes of one held file against its stored digest
     pub(super) fn verify(
         &self,
         prepared: &PreparedDirectoryReplacement,
@@ -88,25 +88,28 @@ impl OutputFileStamp {
         if !strict && !same_fast_metadata(self, &current) {
             return Err(changed_output(&self.file));
         }
-        if strict {
-            let expected_sha256 = self.sha256.as_ref().ok_or_else(|| {
-                super::manifest::actionable_conflict(&format!(
-                    "result output has no stored digest: {}",
-                    self.file
-                ))
-            })?;
-            let digest = hasher.hash_file(&mut file, before.len())?;
-            let after = file.metadata()?;
-            let after_stamp = metadata_stamp(self.file.clone(), None, &after);
-            if &digest != expected_sha256
-                || !single_link(&after)
-                || !same_fast_metadata(&current, &after_stamp)
-            {
-                return Err(changed_output(&self.file));
-            }
-            // The name must still refer to the file that was just verified
-            verify_named_file(prepared, &self.file, &after)?;
+        // Current permissions and matching metadata say nothing about earlier open writers
+        let expected_sha256 = self.sha256.as_ref().ok_or_else(|| {
+            super::manifest::actionable_conflict(&format!(
+                "result output has no stored digest: {}",
+                self.file
+            ))
+        })?;
+        let digest = hasher.hash_file(&mut file, before.len())?;
+        #[cfg(test)]
+        if let Some(after_hash) = hasher.after_hash.take() {
+            after_hash(&file)?;
         }
+        let after = file.metadata()?;
+        let after_stamp = metadata_stamp(self.file.clone(), None, &after);
+        if &digest != expected_sha256
+            || !single_link(&after)
+            || !same_fast_metadata(&current, &after_stamp)
+        {
+            return Err(changed_output(&self.file));
+        }
+        // The name must still refer to the file that was just verified
+        verify_named_file(prepared, &self.file, &after)?;
         prepared.check_location()?;
         Ok(())
     }
@@ -180,6 +183,9 @@ pub(super) fn open_regular_path(path: &std::path::Path) -> io::Result<std::fs::F
 
 pub(super) struct OutputHasher<'a> {
     job: &'a Job,
+    // Let tests model a metadata change after reading the file
+    #[cfg(test)]
+    after_hash: Option<fn(&std::fs::File) -> io::Result<()>>,
     // Drop the allocation before releasing its shared memory charge
     buffer: Vec<u8>,
     memory: Option<MemoryLease>,
@@ -189,6 +195,8 @@ impl<'a> OutputHasher<'a> {
     pub(super) const fn new(job: &'a Job) -> Self {
         Self {
             job,
+            #[cfg(test)]
+            after_hash: None,
             buffer: Vec::new(),
             memory: None,
         }

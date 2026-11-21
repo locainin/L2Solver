@@ -2,10 +2,7 @@ use super::{
     ResultDirectory, ResultIdentity, ReusedResult,
     manifest::{DirectoryState, actionable_conflict},
 };
-use l2_workbench::job::{
-    Counter, Job,
-    cache::{SourceFingerprint, SourceIdentity},
-};
+use l2_workbench::job::{Counter, Job, cache::SourceIdentity};
 use std::{error::Error, io, path::Path};
 
 pub(super) fn reuse(
@@ -50,14 +47,7 @@ pub(super) fn reuse_with_source_observer(
         )
         .into());
     }
-    verify_source(
-        &identity.source,
-        receipt,
-        current_input,
-        strict,
-        job,
-        &mut observe,
-    )?;
+    verify_source(&identity.source, receipt, current_input, job, &mut observe)?;
 
     verified_result(prepared, manifest, receipt, manifest_identity, strict, job).map(Some)
 }
@@ -110,11 +100,9 @@ pub(super) fn reuse_refinement(
     if !matches!(identity.source, SourceIdentity::Fast(_)) {
         return Err(invalid_source("refinement source hint is not a fast identity").into());
     }
-    if strict || identity.source != receipt.identity.source {
-        // Old strong receipts and changed metadata require the full ordered source digest
-        let strong_identity = strong_source()?;
-        verify_source(&strong_identity, receipt, None, true, job, &mut |_| {})?;
-    }
+    // A sample identifies candidates; reuse requires the full ordered source digest
+    let strong_identity = strong_source()?;
+    verify_source(&strong_identity, receipt, None, job, &mut |_| {})?;
     verified_result(prepared, manifest, receipt, manifest_identity, strict, job).map(Some)
 }
 
@@ -161,73 +149,28 @@ fn verify_source(
     source: &SourceIdentity,
     receipt: &super::manifest::ResultReceipt,
     current_input: Option<&Path>,
-    strict: bool,
     job: &Job,
     observe: &mut impl FnMut(usize),
 ) -> Result<(), Box<dyn Error>> {
-    if strict {
-        let digest = if let Some(input) = current_input {
-            let actual = hash_source(input, job, observe)?;
-            source_digest(&actual)
-                .map(str::to_owned)
-                .ok_or_else(|| invalid_source("current input has no strong SHA-256 identity"))?
-        } else {
-            source_digest(source).map(str::to_owned).ok_or_else(|| {
-                io::Error::new(
-                    io::ErrorKind::InvalidInput,
-                    "strict result reuse needs an input path or a strong source identity",
-                )
-            })?
-        };
-        if source_digest(source).is_some_and(|expected| expected != digest) {
-            return Err(actionable_conflict(
-                "source identity differs from the current input bytes",
-            )
-            .into());
-        }
-        if receipt.source_identity_sha256.as_deref() != Some(digest.as_str()) {
-            return Err(actionable_conflict("source bytes differ from the existing result").into());
-        }
-        return Ok(());
+    // A supplied path needs a fresh digest even when the identity already matches
+    let actual = current_input
+        .map(|input| hash_source(input, job, observe))
+        .transpose()?;
+    let digest = source_digest(actual.as_ref().unwrap_or(source)).ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "result reuse needs an input path or a strong source identity",
+        )
+    })?;
+    if source_digest(source).is_some_and(|expected| expected != digest) {
+        return Err(
+            actionable_conflict("source identity differs from the current input bytes").into(),
+        );
     }
-
-    if *source == receipt.identity.source {
-        if let (SourceIdentity::Fast(expected), Some(input)) = (source, current_input) {
-            let current = SourceFingerprint::fast_with_observer(input, |count| {
-                observe_source_read(job, count, observe)
-            })?;
-            if &current != expected {
-                return verify_source_by_digest(input, receipt, job, observe);
-            }
-        }
-        return Ok(());
+    if receipt.source_identity_sha256.as_deref() != Some(digest) {
+        return Err(actionable_conflict("source bytes differ from the existing result").into());
     }
-
-    if let Some(digest) = source_digest(source)
-        && receipt.source_identity_sha256.as_deref() == Some(digest)
-    {
-        return Ok(());
-    }
-    if let Some(input) = current_input {
-        return verify_source_by_digest(input, receipt, job, observe);
-    }
-    Err(actionable_conflict("source identity differs from the existing result").into())
-}
-
-fn verify_source_by_digest(
-    input: &Path,
-    receipt: &super::manifest::ResultReceipt,
-    job: &Job,
-    observe: &mut impl FnMut(usize),
-) -> Result<(), Box<dyn Error>> {
-    let actual = hash_source(input, job, observe)?;
-    let digest = source_digest(&actual)
-        .ok_or_else(|| invalid_source("current input has no strong SHA-256 identity"))?;
-    if receipt.source_identity_sha256.as_deref() == Some(digest) {
-        Ok(())
-    } else {
-        Err(actionable_conflict("source bytes differ from the existing result").into())
-    }
+    Ok(())
 }
 
 fn hash_source(

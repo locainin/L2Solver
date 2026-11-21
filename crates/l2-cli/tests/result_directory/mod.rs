@@ -1074,6 +1074,29 @@ fn cancelled_manifest_inspection_is_typed() -> TestResult {
 }
 
 #[test]
+fn manifest_inspection_preserves_memory_error() -> TestResult {
+    use l2_workbench::job::{MemoryBudget, MemoryError};
+
+    let fixture = Fixture::new()?;
+    fixture.publish("complete", b"artifact-content")?;
+    let memory = MemoryBudget::new(0);
+    let job = Job::with_memory_budget("inspect", &memory);
+
+    let error = ResultDirectory::inspect(&fixture.output, ResultKind::Extract, &job)
+        .err()
+        .ok_or("manifest inspection exceeded its budget")?;
+    assert!(
+        matches!(
+            error.downcast_ref::<MemoryError>(),
+            Some(MemoryError::Limit { .. })
+        ),
+        "memory error was wrapped: {error}"
+    );
+    assert_eq!(memory.snapshot()?.used_bytes, 0);
+    Ok(())
+}
+
+#[test]
 fn manifest_read_obeys_memory_budget() -> TestResult {
     use l2_workbench::job::{MemoryBudget, MemoryError};
     use std::io::Seek;

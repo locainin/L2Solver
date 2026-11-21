@@ -234,7 +234,39 @@ fn strict_reuse_rejects_same_length_changes_to_each_non_artifact_output() -> Tes
 }
 
 #[test]
-fn legacy_unhashed_output_requires_refresh_for_strict_reuse() -> TestResult {
+fn default_reuse_checks_output_digest() -> TestResult {
+    let fixture = Fixture::new()?;
+    publish_result(&fixture, &Job::new("publish"), false)?;
+    let mut manifest = read_manifest(&fixture.output)?;
+    let summary = json_field_mut(&mut manifest, "/l2solver_result/output_files")?
+        .as_array_mut()
+        .and_then(|outputs| {
+            outputs
+                .iter_mut()
+                .find(|output| output.get("file").and_then(Value::as_str) == Some("summary.txt"))
+        })
+        .ok_or("summary stamp is missing")?;
+    // Keep the file intact so only the digest contradicts the result receipt
+    *summary
+        .get_mut("sha256")
+        .ok_or("summary digest is missing")? = Value::String("0".repeat(64));
+    write_manifest(&fixture.output, &manifest)?;
+
+    let existing = super::inspect(&fixture.output, ResultKind::Extract)?;
+    let Err(error) = existing.reuse(
+        &fixture.identity,
+        Some(&fixture.input),
+        false,
+        &Job::new("reuse"),
+    ) else {
+        return Err("default reuse accepted an incorrect output digest".into());
+    };
+    assert!(error.to_string().contains("summary.txt"), "{error}");
+    Ok(())
+}
+
+#[test]
+fn unhashed_output_requires_refresh() -> TestResult {
     let fixture = Fixture::new()?;
     publish_result(&fixture, &Job::new("publish"), false)?;
     let mut manifest = read_manifest(&fixture.output)?;
@@ -251,25 +283,17 @@ fn legacy_unhashed_output_requires_refresh_for_strict_reuse() -> TestResult {
     write_manifest(&fixture.output, &manifest)?;
 
     let existing = super::inspect(&fixture.output, ResultKind::Extract)?;
-    assert!(
-        existing
-            .reuse(
-                &fixture.identity,
-                Some(&fixture.input),
-                false,
-                &Job::new("reuse")
-            )?
-            .is_some()
-    );
-    let Err(error) = existing.reuse(
-        &fixture.identity,
-        Some(&fixture.input),
-        true,
-        &Job::new("reuse"),
-    ) else {
-        return Err("strict reuse accepted an unhashed output".into());
-    };
-    assert!(error.to_string().contains("--refresh"), "{error}");
+    for strict in [false, true] {
+        let Err(error) = existing.reuse(
+            &fixture.identity,
+            Some(&fixture.input),
+            strict,
+            &Job::new("reuse"),
+        ) else {
+            return Err("reuse accepted an unhashed output".into());
+        };
+        assert!(error.to_string().contains("--refresh"), "{error}");
+    }
     Ok(())
 }
 
@@ -306,17 +330,10 @@ fn publication_digest_buffer_obeys_the_job_memory_budget() -> TestResult {
 }
 
 #[test]
-fn strict_reuse_accounts_for_output_reads_and_admits_the_hash_buffer() -> TestResult {
+fn reuse_accounts_for_output_hash_reads() -> TestResult {
     let fixture = Fixture::new()?;
     publish_result(&fixture, &Job::new("publish"), false)?;
     let existing = super::inspect(&fixture.output, ResultKind::Extract)?;
-    let memory = MemoryBudget::new(1024 * 1024);
-    let job = Job::with_memory_budget("strict reuse", &memory);
-    assert!(
-        existing
-            .reuse(&fixture.identity, Some(&fixture.input), true, &job)?
-            .is_some()
-    );
     let mut expected = 0_u64;
     for name in [
         "artifact.bin",
@@ -326,27 +343,31 @@ fn strict_reuse_accounts_for_output_reads_and_admits_the_hash_buffer() -> TestRe
     ] {
         expected += fs::metadata(fixture.output.join(name))?.len();
     }
-    assert_eq!(
-        job.snapshot()?.counters.get(&Counter::Bytes),
-        Some(&expected)
-    );
+    for strict in [false, true] {
+        let memory = MemoryBudget::new(1024 * 1024);
+        let job = Job::with_memory_budget("reuse", &memory);
+        assert!(
+            existing
+                .reuse(&fixture.identity, Some(&fixture.input), strict, &job)?
+                .is_some()
+        );
+        assert_eq!(
+            job.snapshot()?.counters.get(&Counter::Bytes),
+            Some(&expected)
+        );
 
-    let denied_memory = MemoryBudget::new(0);
-    let denied_job = Job::with_memory_budget("reuse without scratch", &denied_memory);
-    assert!(
-        existing
-            .reuse(&fixture.identity, Some(&fixture.input), false, &denied_job)?
-            .is_some(),
-        "fast reuse does not need a hashing buffer"
-    );
-    let Err(error) = existing.reuse(&fixture.identity, Some(&fixture.input), true, &denied_job)
-    else {
-        return Err("strict reuse ignored its digest buffer budget".into());
-    };
-    assert!(
-        crate::memory_error::find(error.as_ref()).is_some(),
-        "{error}"
-    );
+        let denied_memory = MemoryBudget::new(0);
+        let denied_job = Job::with_memory_budget("reuse without scratch", &denied_memory);
+        let Err(error) =
+            existing.reuse(&fixture.identity, Some(&fixture.input), strict, &denied_job)
+        else {
+            return Err("reuse ignored its digest buffer budget".into());
+        };
+        assert!(
+            crate::memory_error::find(error.as_ref()).is_some(),
+            "{error}"
+        );
+    }
     Ok(())
 }
 
