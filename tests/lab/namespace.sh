@@ -118,8 +118,13 @@ ip netns exec l2-b ping -c 3 -W 1 192.0.2.1 > "$output/namespace-survey-ping.txt
 wait_bounded_capture
 
 # Save the same kernel traffic with its Linux source identity and collection status
-timeout --kill-after=1s 10s ip netns exec l2-a "$binary" record port-a 2 \
-    "$output/namespace-record.pcapng" \
+# The recorder needs a filesystem root owned by the mapped user
+timeout --kill-after=1s 10s ip netns exec l2-a bwrap \
+    --cap-add CAP_NET_RAW --cap-add CAP_NET_ADMIN \
+    --ro-bind /usr /usr --ro-bind-try /lib /lib --ro-bind-try /lib64 /lib64 \
+    --ro-bind /sys /sys --ro-bind /proc /proc --dev /dev \
+    --ro-bind "$binary" /l2solver --bind "$output" /output \
+    -- /l2solver record port-a 2 /output/namespace-record.pcapng \
     > "$output/namespace-record.txt" 2> "$output/namespace-record-status.txt" &
 capture_pid=$!
 wait_ready "$output/namespace-record-status.txt" '^Recording ' 'Recorder'
