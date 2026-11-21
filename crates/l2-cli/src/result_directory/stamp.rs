@@ -48,7 +48,7 @@ impl OutputFileStamp {
         hasher.job.check_cancelled().map_err(io::Error::other)?;
         let path = directory.join(file_name);
         let mut file = open_regular_path(&path)?;
-        let before = file.metadata()?;
+        let before = staged_output_metadata(&file)?;
         let before_stamp = metadata_stamp(file_name.to_owned(), None, &before);
         // Reuse the artifact's existing identity when the manifest provides one
         let sha256 = match manifest_sha256 {
@@ -80,6 +80,7 @@ impl OutputFileStamp {
         hasher.job.check_cancelled().map_err(io::Error::other)?;
         let mut file = prepared.open_file(&self.file)?;
         let before = file.metadata()?;
+        verify_reuse_file_permissions(prepared, &file, &before, &self.file)?;
         let current = metadata_stamp(self.file.clone(), self.sha256.clone(), &before);
         if current.byte_length != self.byte_length {
             return Err(changed_output(&self.file));
@@ -109,6 +110,43 @@ impl OutputFileStamp {
         prepared.check_location()?;
         Ok(())
     }
+}
+
+pub(super) fn verify_reuse_file_permissions(
+    prepared: &PreparedDirectoryReplacement,
+    file: &std::fs::File,
+    metadata: &Metadata,
+    name: &str,
+) -> io::Result<()> {
+    #[cfg(target_os = "linux")]
+    {
+        use std::os::unix::fs::MetadataExt;
+
+        prepared.verify_file_permissions(file, metadata.uid(), metadata.mode(), name)
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = (prepared, file, metadata, name);
+        Ok(())
+    }
+}
+
+fn staged_output_metadata(file: &std::fs::File) -> io::Result<Metadata> {
+    let metadata = file.metadata()?;
+    #[cfg(target_os = "linux")]
+    {
+        use crate::publish::SHARED_WRITE;
+        use rustix::fs::{Mode, fchmod};
+        use std::os::unix::fs::MetadataExt;
+
+        let mode = Mode::from_raw_mode(metadata.mode());
+        if mode.intersects(SHARED_WRITE) {
+            // Stamp the final metadata so a permissive umask cannot make the result unreusable
+            fchmod(file, mode - SHARED_WRITE)?;
+            return file.metadata();
+        }
+    }
+    Ok(metadata)
 }
 
 pub(super) fn open_regular_path(path: &std::path::Path) -> io::Result<std::fs::File> {

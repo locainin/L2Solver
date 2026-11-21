@@ -34,12 +34,14 @@ pub(super) enum DirectoryState {
     Missing,
     /// An older extraction is safe but has no reusable receipt
     Legacy {
-        /// Held directory and its verified manifest
+        /// Held directory for identity and replacement checks
         prepared: publish::PreparedDirectoryReplacement,
+        /// Identity of the manifest that was parsed during inspection
+        manifest_identity: ManifestFileIdentity,
     },
     /// A result published with the current receipt format
     Owned {
-        /// Held directory and its verified manifest
+        /// Held directory for identity and replacement checks
         prepared: publish::PreparedDirectoryReplacement,
         /// Parsed manifest data used for the whitelist
         manifest: OwnedManifest,
@@ -183,7 +185,10 @@ fn inspect_existing(
     job: &Job,
 ) -> Result<super::ResultDirectory, Box<dyn Error>> {
     let prepared = publish::prepare_directory_replacement(path).map_err(|error| {
-        actionable_conflict(&format!("existing result destination is unsafe: {error}"))
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("existing result destination is unsafe: {error}; use -o PATH to choose another directory"),
+        )
     })?;
     let manifest_file = prepared.open_file(MANIFEST_FILE).map_err(|error| {
         if error.kind() == io::ErrorKind::NotFound {
@@ -193,13 +198,24 @@ fn inspect_existing(
             "could not safely open the existing result manifest: {error}"
         ))
     })?;
-    let (raw, manifest_identity) = read_manifest(manifest_file, job).map_err(|error| {
-        if error.is::<JobError>() || crate::memory_error::find(error.as_ref()).is_some() {
-            error
-        } else {
-            Box::new(ManifestInspectionError(error)) as Box<dyn Error>
-        }
-    })?;
+    let metadata = manifest_file.metadata()?;
+    // The manifest is ownership evidence for both refresh and reuse
+    super::stamp::verify_reuse_file_permissions(
+        &prepared,
+        &manifest_file,
+        &metadata,
+        MANIFEST_FILE,
+    )?;
+    let (raw, manifest_identity) =
+        deserialize_limited_manifest(manifest_file, &metadata, MAX_MANIFEST_BYTES, job).map_err(
+            |error| {
+                if error.is::<JobError>() || crate::memory_error::find(error.as_ref()).is_some() {
+                    error
+                } else {
+                    Box::new(ManifestInspectionError(error)) as Box<dyn Error>
+                }
+            },
+        )?;
     verify_named_manifest(&prepared, manifest_identity)?;
     inspect_prepared(path, kind, prepared, raw, manifest_identity).map_err(|error| {
         actionable_conflict(&format!(
@@ -260,14 +276,18 @@ fn inspect_prepared(
         }
     } else if kind == ResultKind::Extract {
         validate_directory_entries(&prepared, kind, &manifest, None)?;
-        DirectoryState::Legacy { prepared }
+        DirectoryState::Legacy {
+            prepared,
+            manifest_identity,
+        }
     } else {
         return Err(actionable_conflict(
             "existing directory is not a result owned by this workflow",
         )
         .into());
     };
-    if let DirectoryState::Owned { prepared, .. } | DirectoryState::Legacy { prepared } = &state {
+    if let DirectoryState::Owned { prepared, .. } | DirectoryState::Legacy { prepared, .. } = &state
+    {
         prepared.check_location()?;
     }
 
@@ -345,17 +365,11 @@ pub(super) fn staged_output_files(
     validate_staged_entries(path, kind, manifest, None)
 }
 
-fn read_manifest<T: DeserializeOwned>(
-    file: fs::File,
-    job: &Job,
-) -> Result<(T, ManifestFileIdentity), Box<dyn Error>> {
-    deserialize_limited_manifest(file, MAX_MANIFEST_BYTES, job)
-}
-
 fn read_manifest_path<T: DeserializeOwned>(path: &Path, job: &Job) -> Result<T, Box<dyn Error>> {
     let manifest_path = path.join(MANIFEST_FILE);
     let file = super::stamp::open_regular_path(&manifest_path)?;
-    let (value, identity) = deserialize_limited_manifest(file, MAX_MANIFEST_BYTES, job)?;
+    let metadata = file.metadata()?;
+    let (value, identity) = deserialize_limited_manifest(file, &metadata, MAX_MANIFEST_BYTES, job)?;
     let current = super::stamp::open_regular_path(&manifest_path)?;
     ensure_same_manifest_identity(
         identity,
@@ -366,10 +380,11 @@ fn read_manifest_path<T: DeserializeOwned>(path: &Path, job: &Job) -> Result<T, 
 
 fn deserialize_limited_manifest<T: DeserializeOwned>(
     mut file: fs::File,
+    metadata: &fs::Metadata,
     maximum_bytes: u64,
     job: &Job,
 ) -> Result<(T, ManifestFileIdentity), Box<dyn Error>> {
-    let before = ManifestFileIdentity::from_metadata(&file.metadata()?)?;
+    let before = ManifestFileIdentity::from_metadata(metadata)?;
     if before.length > maximum_bytes {
         return Err(invalid_result("result manifest exceeds the safe size limit").into());
     }
@@ -439,10 +454,9 @@ pub(super) fn verify_named_manifest(
     expected: ManifestFileIdentity,
 ) -> Result<(), Box<dyn Error>> {
     let file = prepared.open_file(MANIFEST_FILE)?;
-    ensure_same_manifest_identity(
-        expected,
-        ManifestFileIdentity::from_metadata(&file.metadata()?)?,
-    )?;
+    let metadata = file.metadata()?;
+    super::stamp::verify_reuse_file_permissions(prepared, &file, &metadata, MANIFEST_FILE)?;
+    ensure_same_manifest_identity(expected, ManifestFileIdentity::from_metadata(&metadata)?)?;
     prepared.check_location()?;
     Ok(())
 }
@@ -864,10 +878,15 @@ pub(super) fn append_receipt(
     }
 
     let temporary_path = manifest_path.with_extension("l2solver-tmp");
-    let mut destination = fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(&temporary_path)?;
+    let mut options = fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+
+        options.mode(0o644);
+    }
+    let mut destination = options.open(&temporary_path)?;
     source.seek(SeekFrom::Start(0))?;
     let _memory = job
         .memory_budget()

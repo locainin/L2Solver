@@ -5,6 +5,93 @@ use crate::result_directory::ResultKind;
 use l2_workbench::job::{Job, cache::SourceIdentity};
 use std::{fs, io};
 
+#[cfg(target_os = "linux")]
+fn existing_result(fixture: &Fixture, receipt: bool) -> TestResult {
+    if receipt {
+        fixture.publish("complete", b"existing")?;
+    } else {
+        fs::create_dir(&fixture.output)?;
+        fixture.write_output(&fixture.output, "complete", b"existing")?;
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn unsafe_manifest_cannot_authorize_refresh() -> TestResult {
+    use std::os::unix::fs::PermissionsExt;
+
+    for receipt in [false, true] {
+        for mode in [0o664, 0o646] {
+            let fixture = Fixture::new()?;
+            existing_result(&fixture, receipt)?;
+            let manifest = fixture.output.join("manifest.json");
+            let contents = fs::read(&manifest)?;
+            fs::set_permissions(&manifest, fs::Permissions::from_mode(mode))?;
+
+            let error = super::inspect(&fixture.output, ResultKind::Extract)
+                .err()
+                .ok_or("unsafe manifest authorized refresh")?;
+            assert_eq!(
+                error.downcast_ref::<io::Error>().map(io::Error::kind),
+                Some(io::ErrorKind::PermissionDenied),
+                "receipt={receipt}, mode={mode:o}: {error}"
+            );
+            assert_eq!(fs::read(manifest)?, contents);
+        }
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn unsafe_manifest_is_rejected_before_parsing() -> TestResult {
+    use std::os::unix::fs::PermissionsExt;
+
+    let fixture = Fixture::new()?;
+    fs::create_dir(&fixture.output)?;
+    let manifest = fixture.output.join("manifest.json");
+    fs::write(&manifest, b"invalid json")?;
+    fs::set_permissions(&manifest, fs::Permissions::from_mode(0o664))?;
+
+    let error = super::inspect(&fixture.output, ResultKind::Extract)
+        .err()
+        .ok_or("unsafe manifest was accepted")?;
+    assert_eq!(
+        error.downcast_ref::<io::Error>().map(io::Error::kind),
+        Some(io::ErrorKind::PermissionDenied),
+        "{error}"
+    );
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn refresh_rechecks_manifest_after_staging() -> TestResult {
+    use std::os::unix::fs::PermissionsExt;
+
+    for receipt in [false, true] {
+        let fixture = Fixture::new()?;
+        existing_result(&fixture, receipt)?;
+        let manifest = fixture.output.join("manifest.json");
+        let contents = fs::read(&manifest)?;
+        let destination = super::inspect(&fixture.output, ResultKind::Extract)?;
+
+        let error = destination
+            .publish(&fixture.identity, &Job::new("refresh"), |staging| {
+                // Model a permission change while the replacement is being prepared
+                fs::set_permissions(&manifest, fs::Permissions::from_mode(0o664))?;
+                fixture.write_output(staging, "complete", b"replacement")
+            })
+            .err()
+            .ok_or("refresh accepted an unsafe manifest")?;
+        assert!(error.to_string().contains("manifest.json"), "{error}");
+        assert_eq!(fs::read(manifest)?, contents);
+        assert_eq!(fs::read(fixture.output.join("artifact.bin"))?, b"existing");
+    }
+    Ok(())
+}
+
 #[test]
 fn explicit_refresh_atomically_replaces_an_owned_result_from_another_source() -> TestResult {
     let mut fixture = Fixture::new()?;

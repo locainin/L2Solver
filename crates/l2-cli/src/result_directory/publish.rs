@@ -63,8 +63,15 @@ pub(super) fn publish<T>(
             crate::publish::create_directory_with_precommit(&path, write_stage, before_commit)
                 .map(|()| None)
         }
-        manifest::DirectoryState::Legacy { prepared }
-        | manifest::DirectoryState::Owned { prepared, .. } => {
+        manifest::DirectoryState::Legacy {
+            prepared,
+            manifest_identity,
+        }
+        | manifest::DirectoryState::Owned {
+            prepared,
+            manifest_identity,
+            ..
+        } => {
             if let Err(error) = prepared.check_location() {
                 crate::publication_transition::record(
                     job,
@@ -73,8 +80,12 @@ pub(super) fn publish<T>(
                 );
                 return Err(Box::new(error));
             }
-            crate::publish::replace_directory_with_precommit(&prepared, write_stage, before_commit)
-                .map(|((), retained)| Some(retained))
+            crate::publish::replace_directory_with_precommit(&prepared, write_stage, || {
+                before_commit()?;
+                // Recheck the ownership evidence after staging and before replacement
+                manifest::verify_named_manifest(&prepared, manifest_identity)
+            })
+            .map(|((), retained)| Some(retained))
         }
     };
 

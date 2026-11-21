@@ -71,6 +71,130 @@ fn strict_reuse_accepts_unchanged_outputs_with_matching_digests() -> TestResult 
     Ok(())
 }
 
+#[cfg(target_os = "linux")]
+#[test]
+fn reuse_rechecks_manifest_permissions() -> TestResult {
+    use std::{io, os::unix::fs::PermissionsExt};
+
+    for strict in [false, true] {
+        let fixture = Fixture::new()?;
+        publish_result(&fixture, &Job::new("publish"), true)?;
+        let existing = super::inspect(&fixture.output, ResultKind::Extract)?;
+        fs::set_permissions(
+            fixture.output.join("manifest.json"),
+            fs::Permissions::from_mode(0o664),
+        )?;
+
+        let error = existing
+            .reuse(
+                &fixture.identity,
+                Some(&fixture.input),
+                strict,
+                &Job::new("reuse"),
+            )
+            .err()
+            .ok_or("reuse accepted an unsafe manifest")?;
+        assert_eq!(
+            error.downcast_ref::<io::Error>().map(io::Error::kind),
+            Some(io::ErrorKind::PermissionDenied),
+            "strict={strict}: {error}"
+        );
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn strict_reuse_rejects_shared_writable_output() -> TestResult {
+    use std::{io, os::unix::fs::PermissionsExt};
+
+    let fixture = Fixture::new()?;
+    publish_result(&fixture, &Job::new("publish"), true)?;
+    fs::set_permissions(
+        fixture.output.join("artifact.bin"),
+        fs::Permissions::from_mode(0o664),
+    )?;
+    let existing = super::inspect(&fixture.output, ResultKind::Extract)?;
+
+    // Matching bytes are insufficient when another user can write the file
+    let error = existing
+        .reuse(
+            &fixture.identity,
+            Some(&fixture.input),
+            true,
+            &Job::new("reuse"),
+        )
+        .err()
+        .ok_or("strict reuse accepted a shared-writable file")?;
+    assert_eq!(
+        error.downcast_ref::<io::Error>().map(io::Error::kind),
+        Some(io::ErrorKind::PermissionDenied),
+        "{error}"
+    );
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn writable_subdirectory_invalidates_result() -> TestResult {
+    use std::os::unix::fs::PermissionsExt;
+
+    let fixture = Fixture::new()?;
+    publish_result(&fixture, &Job::new("publish"), true)?;
+    let artifact = fixture.output.join("artifact.bin");
+    fs::remove_file(&artifact)?;
+    fs::create_dir(&artifact)?;
+    fs::set_permissions(&artifact, fs::Permissions::from_mode(0o777))?;
+
+    assert!(super::inspect(&fixture.output, ResultKind::Extract).is_err());
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn strict_reuse_accepts_publication_with_group_umask() -> TestResult {
+    use std::{os::unix::fs::PermissionsExt, process::Command};
+
+    const CHILD: &str = "L2_TEST_RESULT_UMASK_CHILD";
+    if std::env::var_os(CHILD).is_some() {
+        let fixture = Fixture::new()?;
+        fs::set_permissions(fixture.root.path(), fs::Permissions::from_mode(0o700))?;
+        for operation in ["publish", "refresh"] {
+            publish_result(&fixture, &Job::new(operation), true)?;
+            let existing = super::inspect(&fixture.output, ResultKind::Extract)?;
+            assert!(
+                existing
+                    .reuse(
+                        &fixture.identity,
+                        Some(&fixture.input),
+                        true,
+                        &Job::new("reuse")
+                    )?
+                    .is_some_and(|result| result.complete)
+            );
+        }
+        return Ok(());
+    }
+
+    // Set the process umask in a child so concurrent tests keep their normal permissions
+    let output = Command::new("sh")
+        .args(["-c", "umask 002; exec \"$@\"", "group-umask"])
+        .arg(std::env::current_exe()?)
+        .args([
+            "--exact",
+            "result_directory::tests::strict_reuse::strict_reuse_accepts_publication_with_group_umask",
+        ])
+        .env(CHILD, "1")
+        .output()?;
+    assert!(
+        output.status.success(),
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    Ok(())
+}
+
 #[test]
 fn strict_reuse_rejects_same_length_changes_to_each_non_artifact_output() -> TestResult {
     for name in ["summary.txt", "evidence.jsonl.gz", "limitations.txt"] {
