@@ -165,6 +165,7 @@ fn refine_help_describes_supported_inputs_and_owned_results()
 
     assert!(output.status.success());
     let help = String::from_utf8(output.stdout)?;
+    let normalized = help.split_whitespace().collect::<Vec<_>>().join(" ");
     for detail in [
         "ordinary file or export directory",
         ".bin",
@@ -178,17 +179,17 @@ fn refine_help_describes_supported_inputs_and_owned_results()
         "--dry-run",
         "--salvage",
         "supported partial archive members",
-        "matching owned result",
+        "Reuse verifies full SHA-256 digests of the source and output files",
+        "create a fresh result at a trusted destination",
         "atomically replaces",
         "Unrelated existing paths are refused",
+        "Use -- before a filename starting with -",
     ] {
         assert!(
-            help.contains(detail),
+            normalized.contains(detail),
             "missing {detail} from refine help:\n{help}"
         );
     }
-    let normalized = help.split_whitespace().collect::<Vec<_>>().join(" ");
-    assert!(normalized.contains("Use -- before a filename starting with -"));
     Ok(())
 }
 
