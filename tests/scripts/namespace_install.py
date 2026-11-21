@@ -115,10 +115,13 @@ def main():
     root.mkdir()
     # This tmpfs and every bind mount exist only in the private mount namespace
     binaries = Path(sys.argv[5]) if len(sys.argv) > 5 else None
-    # Payload and three installed generations coexist during the real lifecycle
-    size = str(sum((binaries / name).stat().st_size for name in (
-        "l2solver", "l2solver-active", "l2solver-active-helper",
-    )) * 4 + 64 * 1024 * 1024) if binaries else "32m"
+    size = "32m"
+    if binaries:
+        payload_bytes = sum((binaries / name).stat().st_size for name in (
+            "l2solver", "l2solver-active", "l2solver-active-helper",
+        ))
+        # The source, verified copy, two retained generations and new stage coexist
+        size = str(5 * payload_bytes + 64 * 1024 * 1024)
     run(["mount", "-t", "tmpfs", "-o", f"size={size},mode=755", "tmpfs", str(root)])
     (root / "usr").mkdir()
     run(["mount", "--bind", "/usr", str(root / "usr")])
